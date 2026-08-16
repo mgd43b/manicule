@@ -8,7 +8,7 @@ impossible rather than a convention a caller may accidentally bypass.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, cast, override, runtime_checkable
@@ -61,7 +61,12 @@ class RebuildStore(Protocol):
     """Durable shadow-generation operations required by the offline runner."""
 
     async def plan_rebuild(
-        self, snapshot_run_id: str, target: RebuildTarget, *, missing_limit: int
+        self,
+        snapshot_run_id: str,
+        target: RebuildTarget,
+        *,
+        missing_limit: int,
+        persist: bool = True,
     ) -> RebuildEstimate: ...
 
     async def checkpoint(self, generation_id: str) -> RebuildCheckpoint: ...
@@ -683,11 +688,17 @@ class OfflineGenerationRebuilder:
     """Bounded, resumable executor over one promoted source snapshot."""
 
     def __init__(
-        self, *, store: RebuildStore, blobs: RebuildBlobSource, deriver: OfflineDeriver
+        self,
+        *,
+        store: RebuildStore,
+        blobs: RebuildBlobSource,
+        deriver: OfflineDeriver,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
         self._blobs = blobs
         self._deriver = deriver
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     @staticmethod
     async def _join_irreversible[T](work: asyncio.Task[T]) -> T:
@@ -711,7 +722,9 @@ class OfflineGenerationRebuilder:
     ) -> RebuildEstimate:
         if missing_limit <= 0 or missing_limit > MAX_MISSING_DETAILS:
             raise ValueError("missing_limit must be between 1 and 1000")
-        return await self._store.plan_rebuild(snapshot_run_id, target, missing_limit=missing_limit)
+        return await self._store.plan_rebuild(
+            snapshot_run_id, target, missing_limit=missing_limit, persist=False
+        )
 
     async def run(  # noqa: PLR0912, PLR0915 - explicit terminal/refusal/lease stages
         self,
@@ -726,7 +739,9 @@ class OfflineGenerationRebuilder:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         owner = owner or f"offline-rebuild-{uuid4()}"
-        estimate = await self.dry_run(snapshot_run_id, target, missing_limit=missing_limit)
+        estimate = await self._store.plan_rebuild(
+            snapshot_run_id, target, missing_limit=missing_limit, persist=True
+        )
         if not estimate.runnable:
             raise RebuildRefusedError(
                 estimate.refusal or RebuildRefusalCode.MISSING_LOCAL_INPUT, estimate
@@ -736,7 +751,7 @@ class OfflineGenerationRebuilder:
         if estimate.estimated_temporary_bytes > target.max_temporary_bytes:
             raise RebuildRefusedError(RebuildRefusalCode.TEMP_DISK_BOUND, estimate)
 
-        now = datetime.now(UTC)
+        now = self._clock()
         checkpoint = await self._store.claim_generation(
             estimate.generation_id,
             owner,
@@ -753,7 +768,7 @@ class OfflineGenerationRebuilder:
                 checkpoint.predecessor_vector_publication_id,
                 owner=owner,
                 lease_generation=checkpoint.lease_generation,
-                now=datetime.now(UTC),
+                now=self._clock(),
                 cancel=cancel,
             )
 
@@ -763,7 +778,7 @@ class OfflineGenerationRebuilder:
                     checkpoint.generation_id,
                     owner=owner,
                     lease_generation=checkpoint.lease_generation,
-                    now=datetime.now(UTC),
+                    now=self._clock(),
                 )
             inputs = await self._store.snapshot_inputs(
                 checkpoint.generation_id,
@@ -779,7 +794,7 @@ class OfflineGenerationRebuilder:
                         RebuildRefusalCode.MEMORY_BOUND,
                         owner=owner,
                         lease_generation=checkpoint.lease_generation,
-                        now=datetime.now(UTC),
+                        now=self._clock(),
                     )
                     raise RebuildRefusedError(RebuildRefusalCode.MEMORY_BOUND, estimate)
                 data = await self._blobs.get_bounded(
@@ -796,7 +811,7 @@ class OfflineGenerationRebuilder:
                         RebuildRefusalCode.MISSING_LOCAL_INPUT,
                         owner=owner,
                         lease_generation=checkpoint.lease_generation,
-                        now=datetime.now(UTC),
+                        now=self._clock(),
                     )
                     raise RebuildRefusedError(RebuildRefusalCode.MISSING_LOCAL_INPUT, refreshed)
                 try:
@@ -819,7 +834,7 @@ class OfflineGenerationRebuilder:
                         code,
                         owner=owner,
                         lease_generation=checkpoint.lease_generation,
-                        now=datetime.now(UTC),
+                        now=self._clock(),
                     )
                     raise RebuildRefusedError(code, estimate) from exc
                 prepared.replacement.validate_identity()
@@ -829,7 +844,7 @@ class OfflineGenerationRebuilder:
                         RebuildRefusalCode.MEMORY_BOUND,
                         owner=owner,
                         lease_generation=checkpoint.lease_generation,
-                        now=datetime.now(UTC),
+                        now=self._clock(),
                     )
                     raise RebuildRefusedError(RebuildRefusalCode.MEMORY_BOUND, estimate)
                 try:
@@ -842,10 +857,10 @@ class OfflineGenerationRebuilder:
                         RebuildRefusalCode.TEMP_DISK_BOUND,
                         owner=owner,
                         lease_generation=checkpoint.lease_generation,
-                        now=datetime.now(UTC),
+                        now=self._clock(),
                     )
                     raise RebuildRefusedError(RebuildRefusalCode.TEMP_DISK_BOUND, estimate) from exc
-                renewed_at = datetime.now(UTC)
+                renewed_at = self._clock()
                 checkpoint = await self._store.renew_generation(
                     checkpoint.generation_id,
                     owner,
@@ -857,14 +872,14 @@ class OfflineGenerationRebuilder:
                     checkpoint.generation_id,
                     owner,
                     checkpoint.lease_generation,
-                    now=datetime.now(UTC),
+                    now=self._clock(),
                 )
                 await self._deriver.stage(prepared, publication_id=checkpoint.vector_publication_id)
                 await self._store.assert_generation_lease(
                     checkpoint.generation_id,
                     owner,
                     checkpoint.lease_generation,
-                    now=datetime.now(UTC),
+                    now=self._clock(),
                 )
                 checkpoint = await self._store.stage_replacements(
                     checkpoint.generation_id,
@@ -872,9 +887,9 @@ class OfflineGenerationRebuilder:
                     expected_next_sequence=checkpoint.next_sequence,
                     owner=owner,
                     lease_generation=checkpoint.lease_generation,
-                    now=datetime.now(UTC),
+                    now=self._clock(),
                 )
-                renewed_at = datetime.now(UTC)
+                renewed_at = self._clock()
                 checkpoint = await self._store.renew_generation(
                     checkpoint.generation_id,
                     owner,
@@ -888,47 +903,47 @@ class OfflineGenerationRebuilder:
                 checkpoint.generation_id,
                 owner=owner,
                 lease_generation=checkpoint.lease_generation,
-                now=datetime.now(UTC),
+                now=self._clock(),
             )
         checkpoint = await self._store.begin_validation(
             checkpoint.generation_id,
             owner=owner,
             lease_generation=checkpoint.lease_generation,
-            now=datetime.now(UTC),
+            now=self._clock(),
         )
         if cancel is not None and cancel.is_set():
             return await self._store.cancel_generation(
                 checkpoint.generation_id,
                 owner=owner,
                 lease_generation=checkpoint.lease_generation,
-                now=datetime.now(UTC),
+                now=self._clock(),
             )
         await self._store.assert_generation_lease(
             checkpoint.generation_id,
             owner,
             checkpoint.lease_generation,
-            now=datetime.now(UTC),
+            now=self._clock(),
         )
         await self._store.validate_generation(checkpoint.generation_id)
         await self._store.assert_generation_lease(
             checkpoint.generation_id,
             owner,
             checkpoint.lease_generation,
-            now=datetime.now(UTC),
+            now=self._clock(),
         )
         if cancel is not None and cancel.is_set():
             return await self._store.cancel_generation(
                 checkpoint.generation_id,
                 owner=owner,
                 lease_generation=checkpoint.lease_generation,
-                now=datetime.now(UTC),
+                now=self._clock(),
             )
         publish = asyncio.create_task(
             self._store.publish_generation(
                 checkpoint.generation_id,
                 owner=owner,
                 lease_generation=checkpoint.lease_generation,
-                now=datetime.now(UTC),
+                now=self._clock(),
             )
         )
         return await self._join_irreversible(publish)
@@ -949,6 +964,7 @@ def build_offline_rebuilder(
     middleware: MiddlewareRunner,
     parse_runner: BoundedParseRunner,
     detect_glossary: bool = True,
+    clock: Callable[[], datetime] | None = None,
 ) -> OfflineGenerationRebuilder:
     """Construct the production offline stack without a connector capability."""
     relational = ParserChunkerRelationalDeriver(
@@ -970,6 +986,7 @@ def build_offline_rebuilder(
             vectors=vectors,
             chunk_fingerprint=chunk_fingerprint,
         ),
+        clock=clock,
     )
 
 

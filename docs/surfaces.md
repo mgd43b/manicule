@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Thirty-three MCP tools and twenty-six CLI commands. They are not a one-to-one mapping: some
+Thirty-seven MCP tools and twenty-seven CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -280,7 +280,9 @@ server and the built command tree.
 | `lifecycle_delete_snapshot` | ✓ dry-run only | `snapshot-delete RUN_ID [--confirm TOKEN]` | aggregate unrecoverable item/byte impact and confirmation token |
 | `doctor` | ✓ | `doctor` | diagnostics |
 | `connector_list` | ✓ | `connector list` | configured sources |
-| `connector_sync` | ✓ | `connector sync` | run counters |
+| `snapshot_status` | ✓ | `connector snapshot` | aggregate durable snapshot status |
+| `snapshot_verify` | ✓ | `connector verify` | aggregate manifest integrity result |
+| `connector_sync` | ✓ | `connector sync [--acquire-only]` | run counters and shared lifecycle status |
 | `connector_login` | — | `connector login` | who a captured browser session belongs to |
 | `config_get` | ✓ | `config get` / `config show` | configuration, redacted |
 | `config_set` | ✓ | `config set` | the key, before and after |
@@ -310,6 +312,20 @@ server and the built command tree.
 | `completion` | — | `completion` | a shell script |
 | `auth_create_key` / `auth_list_keys` / `auth_revoke_key` | — | `auth …` | API keys |
 
+### 4.0.1 Shared lifecycle status
+
+Snapshot acquisition and derived-generation work carry one closed `lifecycle` object through the
+same envelope on CLI JSON, authenticated admin HTTP, stdio/control MCP, connector metadata and
+scheduler records. Human CLI renders the enclosing operation while JSON consumers receive the
+same object unchanged. It contains aggregate counts, snapshot completeness and promotion facts,
+watermark presence, backlog and offline-continuation facts, phase/outcome/rate/remaining work,
+producer identities where they are safe, and a typed aggregate capacity or missing-input refusal.
+
+An unavailable fact is null or empty, never an invented zero. The object cannot contain source
+ids, paths, URIs, titles, content or exception context. Re-embedding exposes fingerprints and a
+one-way identity of the live generation, not its private corpus-snapshot handle. Read-only MCP
+registration is unchanged: adding status fields does not add a write tool to the network surface.
+
 ### Operations with no MCP tool, and why
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
@@ -317,7 +333,7 @@ server and the built command tree.
 corpus-scanning `reembed` operations and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The thirty-three tools read
+assistant can call unattended should not be able to do any of that. The thirty-seven tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
 surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
 `collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
@@ -345,7 +361,7 @@ secret as a parameter, and a session cookie in a tool call is a session cookie i
 ### 4.1 What each tool says it does, and why that is not permission
 
 Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
-`idempotentHint`, `openWorldHint` — in `tools/list`. Eighteen of the thirty-three say they only
+`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-two of the thirty-seven say they only
 read.
 
 **They are a description, and nothing in manicule reads them back.** No tool is gated on its own

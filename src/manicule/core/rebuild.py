@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from manicule.core.acquisition import AcquiredSource
 from manicule.core.content import Chunk, Document
+from manicule.core.errors import ManiculeError
 from manicule.core.glossary import GlossaryEntry
 
 
@@ -45,6 +46,8 @@ class RebuildTarget(BaseModel):
     parser_set: tuple[str, ...]
     chunk_fingerprint: str = Field(min_length=1)
     embedding_fingerprint: str = Field(min_length=1)
+    embedding_config: str = ""
+    """Full serialized embedder configuration for publication; identity remains canonical."""
     glossary_fingerprint: str = Field(min_length=1)
     fts_tokenizer: str = Field(min_length=1)
     batch_documents: int = Field(default=32, gt=0, le=1024)
@@ -155,6 +158,7 @@ class RebuildCheckpoint(BaseModel):
 
     generation_id: str
     state: RebuildState
+    expected_items: int = Field(default=0, ge=0)
     next_sequence: int = Field(ge=0)
     documents_built: int = Field(ge=0)
     chunks_built: int = Field(ge=0)
@@ -183,7 +187,7 @@ def vector_publication_id(generation_id: str, owner: str, lease_generation: int)
     return f"{generation_id}.{lease_generation}.{owner_hash}"
 
 
-class RebuildRefusedError(RuntimeError):
+class RebuildRefusedError(ManiculeError):
     """A typed refusal containing only bounded aggregate-safe diagnostics."""
 
     def __init__(self, code: RebuildRefusalCode, estimate: RebuildEstimate) -> None:

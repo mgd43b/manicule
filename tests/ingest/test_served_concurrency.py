@@ -90,9 +90,19 @@ class PipelineIngestion:
         self.connectors = connectors
 
     async def sync(
-        self, connector: str, *, limit: int | None = None, watching: Watching | None = None
+        self,
+        connector: str,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+        acquire_only: bool = False,
     ) -> RunReport:
-        return await self.pipeline.run(self.connectors[connector], limit=limit, watching=watching)
+        return await self.pipeline.run(
+            self.connectors[connector],
+            limit=limit,
+            watching=watching,
+            acquire_only=acquire_only,
+        )
 
     async def connector(self, name: str) -> Connector:
         return self.connectors[name]

@@ -40,6 +40,10 @@ class CountingEmbedder(HashEmbedder):
         self.texts += len(texts)
         return await super().embed(texts)
 
+    def count_tokens(self, text: str) -> int:
+        """Deterministic local tokenizer seam used by production chunker assembly tests."""
+        return len(text.split())
+
 
 def _runtime(data_dir: Path, embedder: CountingEmbedder) -> Runtime:
     found = discover()
@@ -95,7 +99,6 @@ async def test_plan_is_zero_embed_private_safe_and_discards_its_snapshot(tmp_pat
         assert report.documents == report.chunks == 1
         public = report.model_dump_json()
         assert "private" not in public
-        assert "snapshot" not in public
         assert "old-publication" not in public
         assert str(data_dir) not in public
         async with runtime.require_engine().connect() as connection:

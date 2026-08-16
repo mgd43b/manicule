@@ -30,6 +30,7 @@ from manicule.app.ports import (
 from manicule.app.results import ApiKeySummary, Check
 from manicule.app.tenancy import belongs_to
 from manicule.config.settings import Settings
+from manicule.core.acquisition import AcquisitionRun
 from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
 from manicule.core.embedding import IndexFingerprints
@@ -39,6 +40,12 @@ from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.core.organization import Collection as DocumentCollection
 from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
 from manicule.core.provenance import PROVENANCE_KEY, Provenance
+from manicule.core.rebuild import (
+    RebuildCheckpoint,
+    RebuildEstimate,
+    RebuildRefusalCode,
+    RebuildState,
+)
 from manicule.core.retrieval import Candidate, Confidence, ConfidenceBand, Context, Query
 from manicule.core.source_lifecycle import (
     LifecycleOperation,
@@ -775,12 +782,15 @@ class FakeIngestion:
     report: RunReport = field(default_factory=lambda: RunReport(connector="local", discovered=1))
     paths: list[Path] = field(default_factory=list[Path])
     synced: list[str] = field(default_factory=list[str])
+    sync_acquire_only: list[bool] = field(default_factory=list[bool])
     reindexed: list[str] = field(default_factory=list[str])
     reembed_runs: dict[str, ReembedRun] = field(default_factory=dict[str, ReembedRun])
     reembed_recoveries: int = 0
     reembed_recovery_outcome: ReembedRecovery | None = None
     imported: list[Path] = field(default_factory=list[Path])
     connectors: dict[str, object] = field(default_factory=dict[str, object])
+    snapshot: AcquisitionRun | None = None
+    snapshot_verified: bool = True
     """Constructed connectors, by instance name, for :meth:`connector`.
 
     Deliberately populated by the test with an object built through the **real** factory rather
@@ -850,10 +860,16 @@ class FakeIngestion:
     """
 
     async def sync(
-        self, connector: str, *, limit: int | None = None, watching: Watching | None = None
+        self,
+        connector: str,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+        acquire_only: bool = False,
     ) -> RunReport:
         del limit
         self.synced.append(connector)
+        self.sync_acquire_only.append(acquire_only)
         if self.failure is not None:
             raise self.failure
         if watching is not None:
@@ -875,6 +891,60 @@ class FakeIngestion:
             msg = f"no connector named {name!r} in configuration"
             raise UnknownComponentError(msg)
         return built
+
+    async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
+        if self.snapshot is None or self.snapshot.connector != connector:
+            return None
+        return self.snapshot, False
+
+    async def snapshot_verify(self, run_id: str) -> tuple[AcquisitionRun, bool] | None:
+        if self.snapshot is None or self.snapshot.id != run_id:
+            return None
+        return self.snapshot, self.snapshot_verified
+
+    rebuild_missing_count: int = 0
+
+    async def rebuild_plan(self, snapshot_run_id: str) -> RebuildEstimate:
+        return RebuildEstimate(
+            generation_id="aggregate-generation",
+            snapshot_run_id=snapshot_run_id,
+            documents=2,
+            expected_items=2,
+            known_source_bytes=101,
+            estimated_chunks=7,
+            estimated_seconds=3.5,
+            estimated_peak_memory_bytes=2048,
+            estimated_temporary_bytes=4096,
+            missing_count=self.rebuild_missing_count,
+            refusal=(
+                RebuildRefusalCode.MISSING_LOCAL_INPUT if self.rebuild_missing_count else None
+            ),
+        )
+
+    async def rebuild_run(self, snapshot_run_id: str, owner: str) -> RebuildCheckpoint:
+        del snapshot_run_id, owner
+        return RebuildCheckpoint(
+            generation_id="aggregate-generation",
+            state=RebuildState.PUBLISHED,
+            expected_items=2,
+            next_sequence=2,
+            documents_built=2,
+            chunks_built=7,
+            vectors_reused=0,
+            vectors_embedded=7,
+        )
+
+    async def rebuild_status(self, generation_id: str) -> RebuildCheckpoint | None:
+        return RebuildCheckpoint(
+            generation_id=generation_id,
+            state=RebuildState.BUILDING,
+            expected_items=2,
+            next_sequence=1,
+            documents_built=1,
+            chunks_built=3,
+            vectors_reused=0,
+            vectors_embedded=3,
+        )
 
     async def reindex(self, document_id: str) -> ReindexReport:
         self.reindexed.append(document_id)

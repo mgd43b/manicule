@@ -124,6 +124,7 @@ class FakeStore:
         return RebuildCheckpoint(
             generation_id="generation-v2",
             state=state or (RebuildState.PUBLISHED if self.published else RebuildState.BUILDING),
+            expected_items=len(self.items),
             next_sequence=next_sequence,
             documents_built=len(self.staged),
             chunks_built=sum(len(value.chunks) for value in self.staged.values()),
@@ -135,9 +136,14 @@ class FakeStore:
         )
 
     async def plan_rebuild(
-        self, snapshot_run_id: str, target: RebuildTarget, *, missing_limit: int
+        self,
+        snapshot_run_id: str,
+        target: RebuildTarget,
+        *,
+        missing_limit: int,
+        persist: bool = True,
     ) -> RebuildEstimate:
-        del target, missing_limit
+        del target, missing_limit, persist
         if self.missing:
             return RebuildEstimate(
                 generation_id="generation-v2",

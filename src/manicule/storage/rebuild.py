@@ -147,6 +147,7 @@ def _checkpoint(
     return RebuildCheckpoint(
         generation_id=row.id,
         state=row.state,
+        expected_items=row.expected_item_count,
         next_sequence=row.next_sequence,
         documents_built=row.documents_built,
         chunks_built=row.chunks_built,
@@ -187,8 +188,13 @@ class SqliteRebuildStore(WorkspaceScoped):
             engine, workspace_id=workspace_id, sessions=sessions
         )
 
-    async def plan_rebuild(  # noqa: PLR0912 - bounded plan validates each refusal boundary
-        self, snapshot_run_id: str, target: RebuildTarget, *, missing_limit: int
+    async def plan_rebuild(  # noqa: PLR0911, PLR0912, PLR0915 - ordered validation boundary
+        self,
+        snapshot_run_id: str,
+        target: RebuildTarget,
+        *,
+        missing_limit: int,
+        persist: bool = True,
     ) -> RebuildEstimate:
         run = await self._acquisition.get_acquisition_run(snapshot_run_id)
         if run is None or run.promoted_at is None or not run.membership_hash:
@@ -228,6 +234,67 @@ class SqliteRebuildStore(WorkspaceScoped):
 
         target_json = target.model_dump(mode="json")
         target_digest = hashlib.sha256(_canonical(target_json)).hexdigest()
+
+        def estimate(generation_id: str) -> RebuildEstimate:
+            # Conservative estimates are deterministic functions of retained byte counts. They
+            # do not sample bodies, so a dry run cannot leak content or exceed its own bound.
+            estimated_chunks = (known_bytes + 511) // 512
+            peak = largest_input * 6 + (4096 if documents else 0)
+            temporary = known_bytes * 6 + estimated_chunks * 4096
+            return RebuildEstimate(
+                generation_id=generation_id,
+                snapshot_run_id=snapshot_run_id,
+                documents=documents,
+                expected_items=documents,
+                known_source_bytes=known_bytes,
+                estimated_chunks=estimated_chunks,
+                estimated_seconds=documents * 0.02 + known_bytes / 10_000_000,
+                estimated_peak_memory_bytes=peak,
+                estimated_temporary_bytes=temporary,
+                missing_count=missing_count,
+                missing=tuple(missing),
+                missing_truncated=missing_count > len(missing),
+                refusal=(RebuildRefusalCode.MISSING_LOCAL_INPUT if missing_count else None),
+            )
+
+        if not persist:
+            async with self._sessions() as session:
+                if not await self._is_only_promoted_scope(
+                    session, run.connector, run.scope_fingerprint
+                ):
+                    return self._refused_estimate(
+                        snapshot_run_id, target, RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+                    )
+                index_state = await session.get(models.IndexState, 1)
+                expected_vector_table = None if index_state is None else index_state.vector_table
+                expected_vector_inventory_digest = (
+                    None if index_state is None else index_state.vector_inventory_digest
+                )
+                publication_identity_digest = hashlib.sha256(
+                    _canonical(
+                        {
+                            "vector_table": expected_vector_table,
+                            "vector_inventory_digest": expected_vector_inventory_digest,
+                        }
+                    )
+                ).hexdigest()
+                generation_id = _generation_id(
+                    self._workspace_id,
+                    snapshot_run_id,
+                    target_digest,
+                    publication_identity_digest,
+                )
+                published = await self._published_replay(
+                    session,
+                    snapshot_run_id=snapshot_run_id,
+                    target_digest=target_digest,
+                    vector_table=expected_vector_table,
+                    vector_inventory_digest=expected_vector_inventory_digest,
+                )
+                if published is not None:
+                    generation_id = published.id
+            return estimate(generation_id)
+
         now = utcnow()
         async with self._sessions.begin() as session:
             # Take SQLite's writer slot before observing any global publication identity. This
@@ -331,29 +398,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             ):
                 raise RuntimeError("an existing rebuild plan names different snapshot evidence")
 
-        # Conservative estimates are deterministic functions of retained byte counts. They do
-        # not sample bodies, so a dry run cannot leak content and cannot exceed its own bound.
-        estimated_chunks = (known_bytes + 511) // 512
-        # One source is processed at a time. Charge raw/transformed/container copies, parser
-        # objects, chunk/embed text and a fixed model-call scratch floor before any body read.
-        peak = largest_input * 6 + (4096 if documents else 0)
-        # Source bytes + relational shadow JSON + vector columns + SQLite WAL/FTS/Lance
-        # write amplification. Deliberately conservative and based only on manifest counts.
-        temporary = known_bytes * 6 + estimated_chunks * 4096
-        return RebuildEstimate(
-            generation_id=generation_id,
-            snapshot_run_id=snapshot_run_id,
-            documents=documents,
-            expected_items=documents,
-            known_source_bytes=known_bytes,
-            estimated_chunks=estimated_chunks,
-            estimated_seconds=documents * 0.02 + known_bytes / 10_000_000,
-            estimated_peak_memory_bytes=peak,
-            estimated_temporary_bytes=temporary,
-            missing_count=missing_count,
-            missing=tuple(missing),
-            missing_truncated=missing_count > len(missing),
-        )
+        return estimate(generation_id)
 
     async def _published_replay(
         self,
@@ -595,7 +640,9 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RuntimeError("the rebuild snapshot is no longer promoted")
             snapshot_run_id = generation.snapshot_run_id
         records = await self._acquisition.list_acquisition_records(
-            snapshot_run_id, after_sequence=after_sequence, limit=min(limit, 1)
+            snapshot_run_id,
+            after_sequence=None if after_sequence < 0 else after_sequence,
+            limit=min(limit, 1),
         )
         result: list[SnapshotRebuildInput] = []
         for record in records:
@@ -910,7 +957,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 await session.execute(text(REBUILD_FTS))
             await session.execute(text(INTEGRITY_CHECK_FTS))
             state.chunk_fingerprint = target.chunk_fingerprint
-            state.embed_fingerprint = target.embedding_fingerprint
+            state.embed_fingerprint = target.embedding_config or target.embedding_fingerprint
             state.fts_tokenizer = target.fts_tokenizer
             state.vector_inventory_digest = await self._live_chunk_inventory_digest(session)
             generation.published_vector_inventory_digest = state.vector_inventory_digest
@@ -1069,16 +1116,20 @@ class SqliteRebuildStore(WorkspaceScoped):
             raise RuntimeError("replacement document belongs to another workspace")
         elif stored.publication_id == vector_publication:
             raise RuntimeError("duplicate document in replacement generation")
-        await session.execute(
-            delete(models.GlossaryEntry).where(models.GlossaryEntry.document_id == document.id)
-        )
-        await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
+        # Populate every non-null document field before the following deletes trigger ORM
+        # autoflush. A replacement published into an empty corpus creates this row; leaving it
+        # as only id/workspace until after a query makes SQLite correctly refuse the transient
+        # invalid shape before ``apply_document`` ever runs.
         apply_document(stored, document)
         stored.publication_id = vector_publication
         stored.parse_fp = replacement.parse_fingerprint
         stored.chunk_fp = target.chunk_fingerprint
         stored.embed_fp = target.embedding_fingerprint
         stored.glossary_fp = target.glossary_fingerprint
+        await session.execute(
+            delete(models.GlossaryEntry).where(models.GlossaryEntry.document_id == document.id)
+        )
+        await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
         await session.flush()
         for chunk in replacement.chunks:
             session.add(from_chunk(chunk, document.id, vector_publication))

@@ -80,6 +80,36 @@ async def reembed_resume(service: Service, caller: AdminPrincipal, run_id: str) 
     return await respond("reembed_resume", service, lambda: service.reembed_resume(run_id))
 
 
+@router.get(
+    "/rebuild/snapshots/{snapshot_id}",
+    name="rebuild_plan",
+    summary="Price a connector-free offline rebuild from retained source bytes.",
+)
+async def rebuild_plan(service: Service, caller: AdminPrincipal, snapshot_id: str) -> Response:
+    del caller
+    return await respond("rebuild_plan", service, lambda: service.rebuild_plan(snapshot_id))
+
+
+@router.post(
+    "/rebuild/snapshots/{snapshot_id}",
+    name="rebuild_run",
+    summary="Execute or resume an offline replacement generation.",
+)
+async def rebuild_run(service: Service, caller: AdminPrincipal, snapshot_id: str) -> Response:
+    del caller
+    return await respond("rebuild_run", service, lambda: service.rebuild_run(snapshot_id))
+
+
+@router.get(
+    "/rebuild/generations/{generation_id}",
+    name="rebuild_status",
+    summary="Read an offline replacement-generation checkpoint.",
+)
+async def rebuild_status(service: Service, caller: AdminPrincipal, generation_id: str) -> Response:
+    del caller
+    return await respond("rebuild_status", service, lambda: service.rebuild_status(generation_id))
+
+
 @router.post(
     "/reembed/{run_id}/abandon",
     name="reembed_abandon",
@@ -182,6 +212,26 @@ async def query_logs(
     )
 
 
+@router.get(
+    "/connectors/{name}/snapshot",
+    name="snapshot_status",
+    summary="Aggregate status of a connector's active durable snapshot.",
+)
+async def snapshot_status(service: Service, caller: AdminPrincipal, name: str) -> Response:
+    del caller
+    return await respond("snapshot_status", service, lambda: service.snapshot_status(name))
+
+
+@router.get(
+    "/snapshots/{snapshot_id}/verify",
+    name="snapshot_verify",
+    summary="Verify one workspace-owned durable snapshot manifest.",
+)
+async def snapshot_verify(service: Service, caller: AdminPrincipal, snapshot_id: str) -> Response:
+    del caller
+    return await respond("snapshot_verify", service, lambda: service.snapshot_verify(snapshot_id))
+
+
 @router.get("/audit-logs", name="audit_log", summary="The audit trail, newest first.")
 async def audit_logs(
     service: Service,
@@ -255,7 +305,9 @@ async def sync_connector(
     """
     del caller
     return await respond(
-        "connector_sync", service, lambda: service.connector_sync(name, limit=body.limit)
+        "connector_sync",
+        service,
+        lambda: service.connector_sync(name, limit=body.limit, acquire_only=body.acquire_only),
     )
 
 

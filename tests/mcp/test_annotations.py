@@ -26,6 +26,7 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -33,6 +34,8 @@ from fastmcp import Client
 from fastmcp.tools.function_tool import FunctionTool
 
 from manicule.app.service import ApplicationService
+from manicule.config.settings import ConnectorSettings
+from manicule.core.acquisition import AcquisitionRun, AcquisitionRunState
 from manicule.mcp.server import TOOL_NAMES, build_server
 from tests.app.fakes import FakeBackend, make_chunk, make_document
 from tests.mcp.qualification import COLLECTION, build_fixture
@@ -239,6 +242,27 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
     """
     service, backend = await build_fixture()
     await backend.ingestion_.reembed_start("read-run", "owner")
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    backend.settings.connectors["snapshot-source"] = ConnectorSettings.model_validate(
+        {"type": "filesystem", "options": {"root": "."}}
+    )
+    backend.ingestion_.snapshot = AcquisitionRun(
+        id="read-snapshot",
+        workspace_id=backend.workspace,
+        connector_id="read-connector",
+        connector="snapshot-source",
+        state=AcquisitionRunState.SETTLED,
+        lease_generation=0,
+        discovered_count=0,
+        acquired_count=0,
+        indexed_count=0,
+        unchanged_count=0,
+        retry_count=0,
+        metadata_bytes=0,
+        acquired_blob_bytes=0,
+        created_at=now,
+        updated_at=now,
+    )
     document_id = next(iter(backend.store.documents))
     collection_id = next(iter(backend.organization_.collections))
 
@@ -255,6 +279,10 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
         "stats": {},
         "doctor": {},
         "connector_list": {},
+        "snapshot_status": {"name": "snapshot-source"},
+        "snapshot_verify": {"snapshot_id": "read-snapshot"},
+        "rebuild_plan": {"snapshot_id": "read-snapshot"},
+        "rebuild_status": {"generation_id": "read-generation"},
         "config_get": {},
         "workspace_list": {},
         # `registry` left off deliberately. It is why this tool's `openWorldHint` is true, and

@@ -270,7 +270,10 @@ BINDERS: Mapping[str, Binder] = {
         args.optional_path("root"), source=args.text("source"), force=args.flag("force")
     ),
     "connector_sync": lambda service, args, report: service.connector_sync(
-        args.text("name"), limit=args.optional_count("limit"), watching=report
+        args.text("name"),
+        limit=args.optional_count("limit"),
+        watching=report,
+        acquire_only=args.flag("acquire_only"),
     ),
     "document_delete": lambda service, args, report: service.document_delete(
         args.text("document_id"), hard=args.flag("hard")
@@ -289,6 +292,11 @@ BINDERS: Mapping[str, Binder] = {
     "reembed_resume": lambda service, args, report: service.reembed_resume(args.text("run_id")),
     "reembed_abandon": lambda service, args, report: service.reembed_abandon(args.text("run_id")),
     "reembed_cleanup": lambda service, args, report: service.reembed_cleanup(args.text("run_id")),
+    "rebuild_plan": lambda service, args, report: service.rebuild_plan(args.text("snapshot_id")),
+    "rebuild_run": lambda service, args, report: service.rebuild_run(args.text("snapshot_id")),
+    "rebuild_status": lambda service, args, report: service.rebuild_status(
+        args.text("generation_id")
+    ),
     "import": lambda service, args, report: service.import_corpus(
         args.path("path"), force=args.flag("force")
     ),

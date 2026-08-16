@@ -15,7 +15,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from manicule.app.results import Envelope, ErrorInfo, IngestReport, Payload, failed, succeeded
+from manicule.app.results import (
+    Envelope,
+    ErrorInfo,
+    IngestReport,
+    Payload,
+    ReembedRunReport,
+    SnapshotStatusReport,
+    failed,
+    succeeded,
+)
 from manicule.app.tenancy import CrossWorkspaceError
 from manicule.core.errors import (
     ConfigError,
@@ -25,6 +34,7 @@ from manicule.core.errors import (
     UnknownComponentError,
     UnknownEntityError,
 )
+from manicule.core.rebuild import RebuildRefusedError
 from manicule.ingest.capacity import CapacityRefusedError
 
 if TYPE_CHECKING:
@@ -64,6 +74,9 @@ _HINTS: dict[type[Exception], str] = {
     ),
     CapacityRefusedError: (
         "Free durable ingest capacity or raise the configured limit, then retry."
+    ),
+    RebuildRefusedError: (
+        "Inspect `rebuild plan` for aggregate missing-input and capacity estimates, then retry."
     ),
 }
 """What to do about each kind of failure, in the words of whoever has to do it.
@@ -112,6 +125,34 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
             hint="Run the same ingest operation again; its watermark was not advanced.",
         )
         return failed(op, workspace, reason, payload=payload)
+    if (
+        isinstance(payload, SnapshotStatusReport)
+        and payload.verification_performed
+        and payload.lifecycle.outcome == "failed"
+    ):
+        return failed(
+            op,
+            workspace,
+            ErrorInfo(
+                type="SnapshotVerificationError",
+                message="the durable source snapshot failed manifest verification",
+                hint="Reacquire the source snapshot before rebuilding derived generations.",
+            ),
+        )
+    if (
+        isinstance(payload, ReembedRunReport)
+        and op in {"reembed_start", "reembed_resume"}
+        and payload.lifecycle.outcome in {"failed", "canceled", "refused"}
+    ):
+        return failed(
+            op,
+            workspace,
+            ErrorInfo(
+                type="ReembedLifecycleError",
+                message="the durable re-embedding operation did not complete successfully",
+                hint="Inspect `reembed status` before retrying or starting another run.",
+            ),
+        )
     return succeeded(op, workspace, payload)
 
 
@@ -130,12 +171,16 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         "document_get",
         "index_status",
         "reembed_status",
+        "rebuild_plan",
+        "rebuild_status",
         "stats",
         "collection_list",
         "collection_documents",
         "collection_counts",
         "collection_orphans",
         "connector_list",
+        "snapshot_status",
+        "snapshot_verify",
         "workspace_list",
         "auth_list_keys",
         # Reads of configuration and of what is installed. These touch no data directory at

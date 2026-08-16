@@ -367,7 +367,7 @@ async def test_downstream_backpressure_expires_the_cursor_before_the_next_page()
     report = await run
 
     assert report.error_type == "CursorExpiredError"
-    assert "longer than its 0.5s lifetime" in report.error_message
+    assert report.error_message == "source enumeration failed"
     assert not report.enumeration_completed
     assert not report.watermark_advanced
     assert report.stages.fetch_queue.blocked_puts > 0
@@ -631,7 +631,7 @@ async def test_a_partial_discovery_does_not_advance_the_watermark() -> None:
 
     assert not report.clean
     assert not report.watermark_advanced
-    assert "cursor expired" in report.error
+    assert report.error == "CursorExpiredError: source enumeration failed"
     recorded = _last_run(store)
     assert recorded["outcome"] == "incomplete"
     assert recorded["enumeration_completed"] is False

@@ -442,6 +442,8 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     table.add_row("enumeration completed", "yes" if payload.enumeration_completed else "no")
     table.add_row("watermark advanced", "yes" if payload.watermark_advanced else "no")
     table.add_row("retry required", "yes" if payload.retry_required else "no")
+    if payload.derivation_deferred:
+        table.add_row("derivation deferred", "yes (snapshot retained locally)")
     if payload.expanded:
         table.add_row("found inside others", str(payload.expanded))
     for status, count in sorted(payload.by_status.items()):
@@ -875,6 +877,20 @@ def render_connector_signed_in(out: Console, payload: r.ConnectorSignedIn) -> No
     out.print(f"  manicule will use it until {escape(payload.expires_at)}")
 
 
+def render_snapshot_status(out: Console, payload: r.SnapshotStatusReport) -> None:
+    """Render only aggregate manifest facts; member identities never reach the payload."""
+    progress = payload.lifecycle
+    out.print(
+        f"[bold]{escape(payload.state)}[/bold] {escape(payload.snapshot_id)} "
+        f"({progress.acquired_items}/{progress.enumerated_items} acquired)"
+    )
+    out.print(
+        f"verified: {'yes' if payload.verified else 'no'}; "
+        f"promoted: {'yes' if progress.snapshot_promoted else 'no'}; "
+        f"offline continuation: {'yes' if progress.can_continue_offline else 'no'}"
+    )
+
+
 def render_collection(out: Console, payload: r.CollectionSummary) -> None:
     out.print(f"[bold]{escape(payload.name)}[/bold] [dim]{escape(payload.id)}[/dim]")
     if payload.description:
@@ -970,6 +986,30 @@ def render_reembed_cleanup(out: Console, payload: r.ReembedCleanupReport) -> Non
     out.print(f"{action}: {escape(payload.run_id)}")
 
 
+def render_rebuild_plan(out: Console, payload: r.RebuildPlanReport) -> None:
+    outcome = "runnable" if payload.runnable else f"refused: {payload.refusal_code or 'unknown'}"
+    out.print(
+        f"[bold]{payload.documents}[/bold] documents, about "
+        f"[bold]{payload.estimated_chunks}[/bold] chunks; {escape(outcome)}"
+    )
+    out.print(
+        f"about {payload.estimated_seconds:.1f}s; peak memory "
+        f"{payload.estimated_peak_memory_bytes} bytes; temporary disk "
+        f"{payload.estimated_temporary_bytes} bytes"
+    )
+
+
+def render_rebuild_run(out: Console, payload: r.RebuildRunReport) -> None:
+    out.print(f"[bold]{escape(payload.state)}[/bold] {escape(payload.generation_id)}")
+    out.print(
+        f"{payload.documents_built}/{payload.expected_items} documents, "
+        f"{payload.chunks_built} chunks; "
+        f"{payload.vectors_reused} vectors reused, {payload.vectors_embedded} embedded"
+    )
+    if payload.diagnostic_code:
+        out.print(f"[red]diagnostic: {escape(payload.diagnostic_code)}[/red]")
+
+
 RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.AnswerResultPayload: lambda out, p: render_answer(out, _as(r.AnswerResultPayload, p)),
     r.SearchResult: lambda out, p: render_search(out, _as(r.SearchResult, p)),
@@ -984,7 +1024,12 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.ReembedCleanupReport: lambda out, p: render_reembed_cleanup(
         out, _as(r.ReembedCleanupReport, p)
     ),
+    r.RebuildPlanReport: lambda out, p: render_rebuild_plan(out, _as(r.RebuildPlanReport, p)),
+    r.RebuildRunReport: lambda out, p: render_rebuild_run(out, _as(r.RebuildRunReport, p)),
     r.IngestReport: lambda out, p: render_ingest(out, _as(r.IngestReport, p)),
+    r.SnapshotStatusReport: lambda out, p: render_snapshot_status(
+        out, _as(r.SnapshotStatusReport, p)
+    ),
     r.IndexStatus: lambda out, p: render_index_status(out, _as(r.IndexStatus, p)),
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),
     r.Diagnosis: lambda out, p: render_diagnosis(out, _as(r.Diagnosis, p)),

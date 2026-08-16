@@ -31,12 +31,14 @@ if TYPE_CHECKING:
 
     from manicule.app.results import ApiKeySummary, Check
     from manicule.config.settings import Settings
+    from manicule.core.acquisition import AcquisitionRun
     from manicule.core.content import Chunk, Document, DocumentStatus
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.organization import Collection as DocumentCollection
     from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
     from manicule.core.protocols import Connector
+    from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Filter, Query
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
     from manicule.generation.history import Turn
@@ -149,7 +151,12 @@ class Ingesting(Protocol):
         ...
 
     async def sync(
-        self, connector: str, *, limit: int | None = None, watching: Watching | None = None
+        self,
+        connector: str,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+        acquire_only: bool = False,
     ) -> RunReport:
         """Run one configured connector.
 
@@ -176,6 +183,16 @@ class Ingesting(Protocol):
                 translate it; the container raises it.
         """
         ...
+
+    async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None: ...
+
+    async def snapshot_verify(self, run_id: str) -> tuple[AcquisitionRun, bool] | None: ...
+
+    async def rebuild_plan(self, snapshot_run_id: str) -> RebuildEstimate: ...
+
+    async def rebuild_run(self, snapshot_run_id: str, owner: str) -> RebuildCheckpoint: ...
+
+    async def rebuild_status(self, generation_id: str) -> RebuildCheckpoint | None: ...
 
     async def reembed_plan(self) -> tuple[ReembedPlan, str, int]: ...
 

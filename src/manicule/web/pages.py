@@ -494,6 +494,7 @@ async def lifecycle_page(
     *,
     before: Annotated[datetime | None, Query()] = None,
     run_id: Annotated[str, Query(max_length=200)] = "",
+    generation_id: Annotated[str, Query(max_length=200)] = "",
 ) -> HTMLResponse:
     """Read-only lifecycle plans; destructive confirmation stays outside the browser."""
     panels = {
@@ -520,6 +521,13 @@ async def lifecycle_page(
             service,
             lambda: service.lifecycle_delete_snapshot(run_id, dry_run=True),
         )
+        panels["rebuild"] = await panel(
+            "rebuild_plan", service, lambda: service.rebuild_plan(run_id)
+        )
+    if generation_id:
+        panels["rebuild_status"] = await panel(
+            "rebuild_status", service, lambda: service.rebuild_status(generation_id)
+        )
     return render(
         "lifecycle.html",
         area="lifecycle",
@@ -527,7 +535,11 @@ async def lifecycle_page(
         service=service,
         caller=caller,
         panels=panels,
-        extra={"before": before.isoformat() if before is not None else "", "run_id": run_id},
+        extra={
+            "before": before.isoformat() if before is not None else "",
+            "run_id": run_id,
+            "generation_id": generation_id,
+        },
     )
 
 

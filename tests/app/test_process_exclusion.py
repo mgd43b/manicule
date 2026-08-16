@@ -583,10 +583,14 @@ def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exc
         "backup",
         "reembed-execute",
         "reembed-inspect",
+        "rebuild-execute",
+        "rebuild-resume",
         "cleanup-derived-generations",
         "release-source-history",
         "reset-derived",
         "snapshot-delete",
+        "connector-snapshot",
+        "connector-verify",
     }
     exceptions = {_normalized(name) for name in NO_RUNTIME_COMMANDS}
     unaccounted = commands - classified - exceptions - aliases

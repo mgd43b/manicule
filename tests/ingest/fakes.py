@@ -1131,6 +1131,7 @@ class ExpiringCursorConnector(ObservedConnector):
         self.enumeration_completed = asyncio.Event()
         self.cursors_issued = 0
         self.pages_requested = 0
+        self.maximum_cursor_age_seconds = 0.0
 
     @property
     @override
@@ -1160,7 +1161,7 @@ class ExpiringCursorConnector(ObservedConnector):
                 yield DiscoveredDoc(
                     ref=DocRef(
                         source_id=source_id,
-                        uri=f"https://source.example.test/documents/{source_id}",
+                        uri=f"https://wiki.example.test/documents/{source_id}",
                     ),
                     version_token=self.tokens.get(
                         source_id, content_hash(self.documents[source_id])
@@ -1170,6 +1171,7 @@ class ExpiringCursorConnector(ObservedConnector):
 
             if has_next:
                 held = self.clock() - received_at
+                self.maximum_cursor_age_seconds = max(self.maximum_cursor_age_seconds, held)
                 if held > self.cursor_lifetime_seconds:
                     msg = (
                         f"a synthetic search cursor was held for {held:g}s, longer than its "

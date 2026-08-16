@@ -108,12 +108,12 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_thirty_three_tools(service: ApplicationService) -> None:
-    """Thirty-three, named, and matching the declared surface."""
+def test_the_server_offers_exactly_thirty_seven_tools(service: ApplicationService) -> None:
+    """Thirty-seven, named, and matching the declared surface."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 33
+    assert len(offered) == 37
 
 
 def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
@@ -181,7 +181,7 @@ def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
     }.isdisjoint(TOOL_NAMES)
 
 
-def test_the_command_line_offers_exactly_twenty_six_commands() -> None:
+def test_the_command_line_offers_exactly_twenty_seven_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
@@ -213,6 +213,7 @@ def test_the_command_line_offers_exactly_twenty_six_commands() -> None:
         "index",
         "init",
         "plugin",
+        "rebuild",
         "reembed",
         "release-source-history",
         "reset-derived",
@@ -225,7 +226,7 @@ def test_the_command_line_offers_exactly_twenty_six_commands() -> None:
         "upgrade",
         "workspace",
     ]
-    assert len(names) == 26
+    assert len(names) == 27
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(
@@ -370,6 +371,20 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
         ("/ui/health", ("checks", 1, "detail")),
     ),
     ("connector_list", {}, ["connector", "list"], ("GET", "/api/v1/admin/connectors", {}), None),
+    (
+        "snapshot_status",
+        {"name": "missing-source"},
+        ["connector", "snapshot", "missing-source"],
+        ("GET", "/api/v1/admin/connectors/missing-source/snapshot", {}),
+        None,
+    ),
+    (
+        "snapshot_verify",
+        {"snapshot_id": "missing-snapshot"},
+        ["connector", "verify", "missing-snapshot"],
+        ("GET", "/api/v1/admin/snapshots/missing-snapshot/verify", {}),
+        None,
+    ),
     (
         "workspace_list",
         {},
@@ -630,6 +645,10 @@ def test_the_scheduler_lifecycle_plan_produces_the_same_read_only_envelope(
     scheduler = Scheduler(service, {})
     scheduled = asyncio.run(scheduler.plan_lifecycle(Command(tool, command_arguments)))
     assert _comparable(scheduled) == _comparable(_tool(service, tool, arguments))
+    data = cast("dict[str, Any]", scheduled["data"])
+    lifecycle = cast("dict[str, Any]", data["lifecycle"])
+    assert lifecycle["dry_run"] is True
+    assert lifecycle["outcome"] == "deferred"
 
 
 def test_the_scheduler_refuses_lifecycle_write_authority(service: ApplicationService) -> None:

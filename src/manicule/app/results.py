@@ -54,6 +54,108 @@ class Payload(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
+type LifecyclePhase = Literal[
+    "acquiring",
+    "verifying",
+    "rebuilding",
+    "reembedding",
+    "resetting",
+    "deleting",
+    "complete",
+    "failed",
+    "canceled",
+]
+type LifecycleOutcome = Literal[
+    "running", "complete", "bounded", "deferred", "incomplete", "refused", "failed", "canceled"
+]
+type LifecycleRefusalCode = Literal[
+    "capacity",
+    "snapshot_not_promoted",
+    "snapshot_changed",
+    "workspace_scope_changed",
+    "missing_local_input",
+    "memory_bound",
+    "temp_disk_bound",
+    "invalid_replacement",
+    "derivation_failed",
+    "confirmation_required",
+    "retention_policy",
+    "shared_reference",
+]
+type LifecycleResource = Literal[
+    "",
+    "journal_records",
+    "journal_metadata_bytes",
+    "acquired_blob_backlog_bytes",
+    "disk_headroom_bytes",
+]
+
+
+class LifecycleRefusal(Payload):
+    """Typed, aggregate-only reason lifecycle work cannot proceed.
+
+    Values are deliberately counts and resource names. Source identifiers, paths, URIs,
+    exception messages and content have no place in a status object that is returned by every
+    automation surface and may be retained by a scheduler.
+    """
+
+    code: LifecycleRefusalCode
+    count: int = Field(default=0, ge=0)
+    resource: LifecycleResource = ""
+    limit: int | None = Field(default=None, ge=0)
+    used: int | None = Field(default=None, ge=0)
+    requested: int | None = Field(default=None, ge=0)
+
+
+class LifecycleProgress(Payload):
+    """One aggregate status vocabulary shared by snapshot and derived operations.
+
+    Every field is safe to serialize, log and persist. Identities are opaque durable ids or
+    fingerprints, never source ids. Optional values mean the operation cannot know the fact;
+    they are not silently replaced with a plausible-looking zero or ``False``.
+    """
+
+    phase: LifecyclePhase
+    outcome: LifecycleOutcome
+    dry_run: bool = False
+
+    enumerated_items: int = Field(default=0, ge=0)
+    acquired_items: int = Field(default=0, ge=0)
+    reused_items: int = Field(default=0, ge=0)
+    omitted_items: int = Field(default=0, ge=0)
+    failed_items: int = Field(default=0, ge=0)
+    pending_items: int = Field(default=0, ge=0)
+
+    snapshot_completeness: Literal["", "complete", "partial"] = ""
+    reproducibility_policy: str = ""
+    snapshot_identity: str = ""
+    snapshot_promoted: bool | None = None
+    source_generation_identity: str = ""
+    derived_generation_identity: str = ""
+    candidate_watermark_present: bool | None = None
+    committed_watermark_present: bool | None = None
+
+    backlog_items: int = Field(default=0, ge=0)
+    backlog_bytes: int = Field(default=0, ge=0)
+    oldest_backlog_age_seconds: float | None = Field(default=None, ge=0)
+    can_continue_offline: bool = False
+
+    rate_items_per_second: float = Field(default=0, ge=0)
+    estimated_remaining_items: int = Field(default=0, ge=0)
+    estimated_remaining_seconds: float = Field(default=0, ge=0)
+    refusal: LifecycleRefusal | None = None
+
+    @model_validator(mode="after")
+    def terminal_and_refusal_are_consistent(self) -> Self:
+        if self.outcome == "refused" and self.refusal is None:
+            raise ValueError("a refused lifecycle outcome requires a typed refusal")
+        if self.outcome != "refused" and self.refusal is not None:
+            raise ValueError("a lifecycle refusal requires the refused outcome")
+        if self.outcome in {"complete", "failed", "canceled"} and self.pending_items:
+            raise ValueError("a terminal lifecycle outcome cannot retain pending items")
+        return self
+
+
 class ErrorInfo(Payload):
     """What went wrong, in the shape a caller can act on."""
 
@@ -689,6 +791,7 @@ class ReembedPlanReport(Payload):
     unrepairable_documents: int = Field(ge=0)
     target_identity: str = Field(description="SHA-256 identity of the exact target embedder.")
     target_dimension: int = Field(gt=0)
+    lifecycle: LifecycleProgress
 
 
 class ReembedRunReport(Payload):
@@ -706,6 +809,7 @@ class ReembedRunReport(Payload):
     published: bool
     target_identity: str
     target_dimension: int = Field(gt=0)
+    lifecycle: LifecycleProgress
 
 
 class ReembedCleanupReport(Payload):
@@ -713,6 +817,38 @@ class ReembedCleanupReport(Payload):
 
     run_id: str
     removed: bool
+
+
+class RebuildPlanReport(Payload):
+    """Aggregate-only dry run for one promoted retained snapshot."""
+
+    generation_id: str
+    snapshot_id: str
+    documents: int = Field(ge=0)
+    known_source_bytes: int = Field(ge=0)
+    estimated_chunks: int = Field(ge=0)
+    estimated_seconds: float = Field(ge=0)
+    estimated_peak_memory_bytes: int = Field(ge=0)
+    estimated_temporary_bytes: int = Field(ge=0)
+    missing_count: int = Field(ge=0)
+    refusal_code: str | None = None
+    runnable: bool
+    lifecycle: LifecycleProgress
+
+
+class RebuildRunReport(Payload):
+    """Durable aggregate checkpoint for an offline replacement generation."""
+
+    generation_id: str
+    state: str
+    expected_items: int = Field(ge=0)
+    next_sequence: int = Field(ge=0)
+    documents_built: int = Field(ge=0)
+    chunks_built: int = Field(ge=0)
+    vectors_reused: int = Field(ge=0)
+    vectors_embedded: int = Field(ge=0)
+    diagnostic_code: str | None = None
+    lifecycle: LifecycleProgress
 
 
 class LifecycleReport(Payload):
@@ -731,6 +867,9 @@ class LifecycleReport(Payload):
     released_bytes: int = Field(default=0, ge=0)
     confirmation: str | None = None
     source_contacted: bool = False
+    lifecycle: LifecycleProgress = Field(
+        default_factory=lambda: LifecycleProgress(phase="complete", outcome="complete")
+    )
 
 
 class StaleReparseReport(Payload):
@@ -1331,10 +1470,14 @@ class IngestReport(Payload):
     snapshot_omissions: int = Field(default=0, ge=0)
     snapshot_omission_reasons: dict[str, int] = Field(default_factory=dict)
     retry_required: bool = False
+    derivation_deferred: bool = False
     intentionally_bounded: bool = False
     unrecorded: int = Field(default=0, ge=0)
     incomplete_reason: ErrorInfo | None = None
     elapsed_ms: int = Field(default=0, ge=0)
+    lifecycle: LifecycleProgress = Field(
+        default_factory=lambda: LifecycleProgress(phase="complete", outcome="complete")
+    )
 
 
 # --- state, statistics and diagnosis -------------------------------------------------------
@@ -1470,6 +1613,7 @@ class ConnectorSummary(Payload):
     last_error_type: str = ""
     last_enumeration_completed: bool | None = None
     last_watermark_advanced: bool | None = None
+    last_lifecycle: LifecycleProgress | None = None
 
 
 class ConnectorList(Payload):
@@ -1477,6 +1621,17 @@ class ConnectorList(Payload):
 
     count: int = Field(ge=0)
     connectors: tuple[ConnectorSummary, ...] = ()
+
+
+class SnapshotStatusReport(Payload):
+    """Aggregate identity, integrity and progress for one durable source snapshot."""
+
+    connector: str
+    snapshot_id: str
+    state: str
+    verified: bool
+    verification_performed: bool = False
+    lifecycle: LifecycleProgress
 
 
 class SidecarSkip(Payload):

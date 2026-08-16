@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import resource
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast, override
@@ -47,20 +48,31 @@ from manicule.core.content import (
 )
 from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.core.ids import content_hash, document_id, vector_id
+from manicule.core.rebuild import RebuildCheckpoint, RebuildState, RebuildTarget
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
+from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline
+from manicule.ingest.rebuild import build_offline_rebuilder
 from manicule.ingest.recovery import requeue_interrupted
+from manicule.ingest.reembed import ReembedState, resume_reembed, start_reembed
 from manicule.ingest.reindex import re_parse, reindex_document
 from manicule.ingest.sweeps import sweep_vectors
 from manicule.ingest.workers import InProcessRunner
+from manicule.parsers.chain import ParserChain
+from manicule.parsers.config import PlaintextConfig
+from manicule.parsers.plaintext import PlaintextParser
+from manicule.parsers.versions import parse_fingerprint
 from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.docstore import SqliteDocStore
+from manicule.storage.models import FTS_TOKENIZER
+from manicule.storage.rebuild import SqliteRebuildStore
 from manicule.storage.vectors import LanceVectorStore
 from tests.app.fakes import FakeBackend
 from tests.fakes import HashEmbedder
 from tests.ingest import fakes
+from tests.ingest.test_shadow_reembed import Authority, Corpus, CountingEmbedder
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
@@ -73,15 +85,168 @@ if TYPE_CHECKING:
     from manicule.core.sources import DiscoveredDoc, DocRef
 
 
+class PublicationMemoryVectors(fakes.MemoryVectors):
+    """Deterministic publication adapter for the bounded 1,000-item acceptance scenario."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.publications: dict[str, dict[str, fakes.VectorRow]] = {"legacy": self.rows}
+        self.peak_upsert_items = 0
+        self.retrieval_probes = 0
+
+    @override
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        self.peak_upsert_items = max(self.peak_upsert_items, len(chunks))
+        rows = self.publications.setdefault(publication_id, {})
+        for chunk, vector in zip(chunks, vectors, strict=True):
+            rows[chunk.id] = fakes.VectorRow(
+                document_id=chunk.document_id,
+                vector=tuple(vector),
+                embed_text=chunk.embed_text,
+                identity=self._identity_of(chunk),
+            )
+
+    @override
+    async def count(self) -> int:
+        return sum(len(rows) for rows in self.publications.values())
+
+    async def publication_row_count(self, publication_id: str) -> int:
+        return len(self.publications.get(publication_id, {}))
+
+    async def publication_page_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        if self._fingerprint is None or self._fingerprint.canonical() != embedding_fingerprint:
+            return False
+        rows = self.publications.get(publication_id, {})
+        return all(
+            (row := rows.get(chunk.id)) is not None
+            and row.document_id == chunk.document_id
+            and row.embed_text == chunk.embed_text
+            and row.identity == self._identity_of(chunk)
+            for chunk in chunks
+        )
+
+    async def publication_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        return await self.publication_row_count(publication_id) == len(
+            chunks
+        ) and await self.publication_page_is_complete(
+            publication_id,
+            chunks,
+            embedding_fingerprint=embedding_fingerprint,
+        )
+
+    async def copy_publication(
+        self,
+        source_publication_id: str,
+        target_publication_id: str,
+        chunks: Sequence[Chunk],
+    ) -> None:
+        source = self.publications[source_publication_id]
+        target = self.publications.setdefault(target_publication_id, {})
+        for chunk in chunks:
+            target[chunk.id] = source[chunk.id]
+
+    async def retrieve_publication(
+        self, publication_id: str, chunk_ids: Sequence[str]
+    ) -> tuple[fakes.VectorRow, ...]:
+        """Exercise the fake's read boundary instead of inspecting its backing dictionary."""
+        self.retrieval_probes += 1
+        rows = self.publications.get(publication_id, {})
+        return tuple(row for chunk_id in chunk_ids if (row := rows.get(chunk_id)) is not None)
+
+
+class CountingPlaintextParser(PlaintextParser):
+    """Count local parsing without retaining any document identity or text."""
+
+    def __init__(self, config: PlaintextConfig) -> None:
+        super().__init__(config)
+        self.calls = 0
+        self.active_calls = 0
+        self.peak_active_calls = 0
+        self.peak_input_bytes = 0
+
+    @override
+    async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
+        self.calls += 1
+        self.active_calls += 1
+        self.peak_active_calls = max(self.peak_active_calls, self.active_calls)
+        self.peak_input_bytes = max(self.peak_input_bytes, len(raw.as_bytes()))
+        try:
+            async for block in super().parse(raw):
+                yield block
+        finally:
+            self.active_calls -= 1
+
+
+class ObservedRebuildStore(SqliteRebuildStore):
+    """Records externally visible publication pointer changes at the atomic store boundary."""
+
+    def __init__(self, *args: Any, live_store: SqliteDocStore, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._live_store = live_store
+        self.publication_transactions = 0
+        self.publication_pointer_transitions = 0
+
+    @override
+    async def publish_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> RebuildCheckpoint:
+        before = {
+            document.id: document.publication_id
+            for document in await self._live_store.list_documents(limit=1_000)
+        }
+        published = await super().publish_generation(
+            generation_id,
+            owner=owner,
+            lease_generation=lease_generation,
+            now=now,
+        )
+        after = {
+            document.id: document.publication_id
+            for document in await self._live_store.list_documents(limit=1_000)
+        }
+        self.publication_transactions += 1
+        self.publication_pointer_transitions += sum(
+            before.get(document_id) != publication_id
+            for document_id, publication_id in after.items()
+        )
+        return published
+
+
 def _pipeline(
     docs: SqliteDocStore,
     vectors: LanceVectorStore,
     blobs: BlobStore | None = None,
     embedder: HashEmbedder | None = None,
+    *,
+    durable_acquisition: bool = False,
 ) -> IngestPipeline:
     chunker = fakes.BlockChunker()
     return IngestPipeline(
         store=docs,
+        acquisitions=docs if durable_acquisition else None,
         chunker=chunker,
         embedder=embedder or HashEmbedder(),
         vectors=vectors,
@@ -1038,7 +1203,9 @@ async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
             async for found in super().discover(watermark):
                 yield found
                 if self.expires:
-                    raise CursorExpiredError("the search cursor expired")
+                    raise CursorExpiredError(
+                        "the search cursor expired at https://private.invalid/?token=fake-secret"
+                    )
 
     vectors = LanceVectorStore(data_dir / "vectors")
     await vectors.ensure_ready(HashEmbedder().fingerprint)
@@ -1057,6 +1224,8 @@ async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
     assert after_failure["last_synced_at"] is None
     assert after_failure["last_run"]["outcome"] == "incomplete"
     assert after_failure["last_run"]["watermark_advanced"] is False
+    assert "fake-secret" not in str(after_failure)
+    assert "private.invalid" not in failed.error
 
     connector.expires = False
     completed = await pipeline.run(connector)
@@ -1073,29 +1242,159 @@ async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
     await vectors.teardown()
 
 
-async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(
+async def test_acquire_only_promotes_then_an_ordinary_sync_resumes_entirely_offline(
     store: SqliteDocStore,
     engine: AsyncEngine,
     data_dir: Path,
 ) -> None:
-    """A 100-record source reaches its true end while embedding is still parked.
+    """Acquire-only is a durable boundary, not a mode that loses the local second half."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(
+        store,
+        vectors,
+        blobs=BlobStore(engine, data_dir),
+        durable_acquisition=True,
+    )
+
+    class SnapshotConnector(fakes.DictConnector):
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return Watermark(value="snapshot-3", observed_at=datetime(2026, 8, 15, tzinfo=UTC))
+
+    connector = SnapshotConnector(
+        {
+            "page-0001": "synthetic alpha",
+            "page-0002": "synthetic beta",
+            "page-0003": "synthetic gamma",
+        },
+        name="synthetic-wiki",
+    )
+
+    acquired = await pipeline.run(connector, acquire_only=True)
+    source_calls = tuple(connector.fetches)
+    promoted = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert acquired.enumeration_completed
+    assert acquired.watermark_advanced
+    assert acquired.snapshot_completeness == "complete"
+    assert acquired.pending_derivation
+    assert acquired.derivation_deferred
+    assert not acquired.retry_required
+    assert acquired.lifecycle_metadata()["outcome"] == "deferred"
+    assert acquired.indexed == 0
+    assert len(source_calls) == 3
+    assert promoted is not None
+    assert promoted.state is AcquisitionRunState.INDEXING
+
+    resumed = await pipeline.run(connector)
+
+    assert tuple(connector.fetches) == source_calls
+    assert resumed.indexed == 3
+    assert not resumed.pending_derivation
+    assert len(await store.list_documents()) == 3
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+
+    reused = await pipeline.run(connector)
+    lifecycle = reused.lifecycle_metadata()
+    assert tuple(connector.fetches) == source_calls
+    assert lifecycle["acquired_items"] == 0
+    assert lifecycle["reused_items"] == 3
+    await vectors.teardown()
+
+
+async def test_acquire_only_never_derives_a_strict_incomplete_snapshot_prefix(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """One retained member cannot escape before strict snapshot promotion succeeds."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(
+        store,
+        vectors,
+        blobs=BlobStore(engine, data_dir),
+        durable_acquisition=True,
+    )
+    connector = fakes.DictConnector(
+        {"accepted": "retained body", "refused": "private body"}, name="strict-acquire-only"
+    )
+    connector.fail_fetch.add("refused")
+
+    report = await pipeline.run(connector, acquire_only=True)
+    unsettled = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert report.snapshot_omissions == 1
+    assert report.retry_required
+    assert report.pending_derivation
+    assert not report.derivation_deferred
+    assert report.indexed == 0
+    assert await store.list_documents() == []
+    assert unsettled is not None
+    assert unsettled.state is AcquisitionRunState.ACQUIRING
+    await vectors.teardown()
+
+
+async def test_bounded_acquire_only_prefix_is_not_reported_as_offline_derivation(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    vectors = fakes.MemoryVectors()
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(
+        store,
+        vectors,  # pyright: ignore[reportArgumentType]
+        blobs=BlobStore(engine, data_dir),
+        durable_acquisition=True,
+    )
+
+    report = await pipeline.run(
+        fakes.DictConnector({"one": "alpha", "two": "beta"}),
+        limit=1,
+        acquire_only=True,
+    )
+    lifecycle = report.lifecycle_metadata()
+
+    assert report.limited
+    assert report.pending_derivation
+    assert not report.derivation_deferred
+    assert lifecycle["phase"] == "acquiring"
+    assert lifecycle["outcome"] == "bounded"
+    assert lifecycle["can_continue_offline"] is False
+    assert await store.count_documents() == 0
+
+
+async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(  # noqa: PLR0915 - one end-to-end evidence record
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The 1,000-document/500 ms acceptance cursor is drained before derivation.
 
     Ten synthetic page responses each take 19 ms on a manual clock, below the 500 ms cursor
     lifetime. Journal pages and both in-memory hand-offs are smaller than the corpus. The model
-    gate proves indexing has not drained anything to make enumeration succeed.
+    gate proves indexing has not drained anything to make enumeration succeed. All addresses use
+    the reserved ``wiki.example.test`` host and no wall clock or network participates.
     """
     clock = fakes.ManualClock()
     embedder = fakes.ClockedGatedEmbedder(clock, seconds_per_document=0.05)
     chunker = fakes.BlockChunker()
+    vectors = PublicationMemoryVectors()
+    await vectors.ensure_ready(embedder.fingerprint)
+    blobs = BlobStore(engine, data_dir)
+    parser = CountingPlaintextParser(PlaintextConfig())
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
-        blobs=BlobStore(engine, data_dir),
+        blobs=blobs,
         chunker=chunker,
         embedder=embedder,
-        vectors=fakes.MemoryVectors(),
-        runner=InProcessRunner({"lines": fakes.LineParser()}),
-        resolve_chain=lambda _: ["lines"],
+        vectors=vectors,
+        runner=InProcessRunner({"plaintext": parser}),
+        resolve_chain=lambda _: ["plaintext"],
         middleware=MiddlewareRunner(()),
         chunk_fingerprint=chunker.fingerprint,
         fetch_concurrency=2,
@@ -1104,9 +1403,12 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
         detect_glossary=False,
     )
     connector = fakes.ExpiringCursorConnector(
-        {f"synthetic-doc-{number:04d}": f"public synthetic line {number}" for number in range(100)},
+        {
+            f"synthetic-doc-{number:04d}": f"public synthetic line {number}"
+            for number in range(1_000)
+        },
         clock=clock,
-        page_size=10,
+        page_size=100,
         cursor_lifetime_seconds=0.5,
         response_seconds=0.019,
     )
@@ -1114,15 +1416,18 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     task = asyncio.create_task(pipeline.run(connector))
     try:
         await connector.enumeration_completed.wait()
-        await embedder.gate.wait_for(1)
+        await embedder.gate.wait_for(1, patience_s=60)
 
         durable = await store.latest_unsettled_acquisition_run(connector.name)
         assert durable is not None
-        assert durable.discovered_count == 100
+        assert durable.discovered_count == 1_000
         assert durable.enumeration_completed_at is not None
         assert durable.candidate_watermark == connector.watermark
         assert connector.pages_requested == 10
         assert clock.now == pytest.approx(0.19)
+        assert connector.maximum_cursor_age_seconds == 0
+        enumeration_seconds = clock.now
+        source_calls_before_derivation = len(connector.fetches)
         assert len(await store.list_acquisition_records(durable.id, limit=3)) == 3
         assert await store.get_watermark(connector.name) == connector.watermark, (
             "source coverage is checkpointed before the parked embedder completes"
@@ -1136,8 +1441,11 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
 
     assert report.error_type == ""
     assert report.enumeration_completed
-    assert report.indexed == 100
-    assert len(indexed) == 100
+    assert report.indexed == 1_000
+    assert len(indexed) == 1_000
+    assert await store.count_chunks() == 1_000
+    assert await vectors.count() == 1_000
+    assert len(connector.fetches) == source_calls_before_derivation == 1_000
     assert report.watermark_advanced
     assert await store.get_watermark(connector.name) == connector.watermark
     assert report.stages.fetch_queue.capacity == 2
@@ -1148,8 +1456,280 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     settled = await store.get_acquisition_run(durable.id)
     assert settled is not None
     assert settled.state is AcquisitionRunState.SETTLED
-    records = await store.list_acquisition_records(durable.id)
+    records = [record async for record in store.iter_acquisition_records(durable.id)]
     assert {record.state for record in records} == {AcquisitionRecordState.SETTLED}
+    blob_refs = {record.blob_ref for record in records if record.blob_ref is not None}
+    retained_bytes = sum(
+        record.acquired_source.byte_length
+        for record in records
+        if record.acquired_source is not None
+    )
+    compressed_bytes = sum(blobs.path_for(blob_ref).stat().st_size for blob_ref in blob_refs)
+    derivation_seconds = clock.now - enumeration_seconds
+    initial_publications = {
+        publication_id: rows for publication_id, rows in vectors.publications.items() if rows
+    }
+    assert sum(len(rows) for rows in initial_publications.values()) == 1_000
+
+    live_documents = await store.list_documents(limit=1_000)
+    corpus_rows = [
+        (document, await store.document_chunks(document.id)) for document in live_documents
+    ]
+    authority = Authority()
+    corpus = Corpus(authority, corpus_rows)
+    second_embedder = CountingEmbedder(dimension=7)
+    second_embedder.fingerprint = second_embedder.fingerprint.model_copy(
+        update={"model_id": "synthetic/second-model"}
+    )
+    parser_calls_before_reembed = parser.calls
+    source_calls_before_reembed = len(connector.fetches)
+    reembed = await start_reembed(
+        "synthetic-second-model",
+        owner_token="planning-owner",  # noqa: S106 - synthetic lease identity
+        corpus=corpus,
+        target=second_embedder.fingerprint,
+        journal=authority,
+        document_page=37,
+        target_batch_tokens=64,
+        chunks_per_second=2_000,
+    )
+    assert reembed.commitment.plan.documents == 1_000
+    assert reembed.commitment.plan.chunks == 1_000
+    assert reembed.commitment.plan.estimated_seconds == pytest.approx(0.5)
+
+    authority.fail_chunk_checkpoint_once = True
+    with pytest.raises(OSError, match="chunk checkpoint crash"):
+        await resume_reembed(
+            reembed.id,
+            owner_token="crashed-owner",  # noqa: S106 - synthetic lease identity
+            corpus=corpus,
+            embedder=second_embedder,
+            journal=authority,
+            shadow=authority,
+            publisher=authority,
+            document_page=37,
+            target_batch_tokens=64,
+        )
+    crashed = await authority.get(reembed.id)
+    assert crashed is not None
+    assert crashed.state is ReembedState.BUILDING
+    assert authority.live.generation_id == "live-old"
+    assert len(authority.rows[f"shadow:{reembed.id}"]) == 1
+
+    authority.pause_first_upsert = True
+    resume_task = asyncio.create_task(
+        resume_reembed(
+            reembed.id,
+            owner_token="resume-owner",  # noqa: S106 - synthetic lease identity
+            corpus=corpus,
+            embedder=second_embedder,
+            journal=authority,
+            shadow=authority,
+            publisher=authority,
+            document_page=37,
+            target_batch_tokens=64,
+        )
+    )
+    await authority.upsert_entered.wait()
+    assert authority.live.generation_id == "live-old"
+    old_index_rows: list[fakes.VectorRow] = []
+    for publication_id, rows in initial_publications.items():
+        old_index_rows.extend(await vectors.retrieve_publication(publication_id, tuple(rows)))
+    assert len(old_index_rows) == 1_000
+    authority.release_upsert.set()
+    reembedded = await resume_task
+    second_rows = authority.rows[reembedded.shadow_generation_id or ""]
+    assert reembedded.state is ReembedState.PUBLISHED
+    assert reembedded.chunks_completed == 1_000
+    assert len(second_rows) == 1_000
+    assert len({stored.chunk.id for stored, _ in second_rows.values()}) == 1_000
+    assert set(authority.live_during_upsert) == {"live-old"}
+    assert authority.live.generation_id == reembedded.shadow_generation_id
+    assert parser.calls == parser_calls_before_reembed
+    assert len(connector.fetches) == source_calls_before_reembed
+    parser_calls_during_second_model = parser.calls - parser_calls_before_reembed
+    assert vectors.retrieval_probes == len(initial_publications)
+
+    reset = await store.reset_derived()
+    assert reset.snapshot_items == 1_000
+    assert await store.count_chunks() == 0
+
+    installed_parse = parse_fingerprint("plaintext")
+    assert installed_parse is not None
+    target = RebuildTarget(
+        parser_routing="synthetic-plaintext-routing-v1",
+        parser_set=(installed_parse.canonical(),),
+        chunk_fingerprint=chunker.fingerprint.canonical(),
+        embedding_fingerprint=embedder.fingerprint.canonical(),
+        embedding_config=embedder.fingerprint.model_dump_json(),
+        glossary_fingerprint=glossary_fingerprint(enabled=False, middleware=()).canonical(),
+        fts_tokenizer=FTS_TOKENIZER,
+        batch_documents=7,
+        max_memory_bytes=64 * 1024 * 1024,
+        max_temporary_bytes=64 * 1024 * 1024,
+    )
+    rebuild_store = ObservedRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=blobs,
+        vectors=vectors,
+        live_store=store,
+    )
+    rebuild_clock = fakes.ManualLeaseClock()
+    rebuilder = build_offline_rebuilder(
+        store=rebuild_store,
+        blobs=blobs,
+        workspace_id=store.workspace_id,
+        source=connector.name,
+        parser_chain=ParserChain(
+            parsers={"plaintext": parser}, chains={fakes.MEDIA_TYPE: ("plaintext",)}
+        ),
+        routing_identity=target.parser_routing,
+        chunker=chunker,
+        embedder=embedder,
+        vectors=vectors,
+        chunk_fingerprint=chunker.fingerprint,
+        middleware=MiddlewareRunner(()),
+        parse_runner=InProcessRunner(
+            {"plaintext": parser}, middleware=MiddlewareRunner(()), chunker=chunker
+        ),
+        detect_glossary=False,
+        clock=rebuild_clock,
+    )
+    plan = await rebuilder.dry_run(durable.id, target)
+    source_calls_before_rebuild = len(connector.fetches)
+    parser_calls_before_rebuild = parser.calls
+    rebuilt = await rebuilder.run(durable.id, target, owner="synthetic-rebuild")
+
+    assert plan.runnable
+    assert plan.documents == 1_000
+    assert rebuilt.state is RebuildState.PUBLISHED
+    assert rebuilt.documents_built == 1_000
+    assert rebuilt.chunks_built == 1_000
+    assert len(connector.fetches) == source_calls_before_rebuild
+    assert await store.count_documents() == 1_000
+    assert await store.count_chunks() == 1_000
+    live_vector_count = await vectors.publication_row_count(rebuilt.vector_publication_id)
+    rebuilt_documents = await store.list_documents(limit=1_000)
+    rebuilt_chunk_ids = {
+        chunk.id
+        for document in rebuilt_documents
+        for chunk in await store.document_chunks(document.id)
+    }
+    assert live_vector_count == 1_000
+    assert await vectors.count() == 2_000, "the old publication remains readable until cleanup"
+    retained_old_rows: list[fakes.VectorRow] = []
+    for publication_id, rows in initial_publications.items():
+        retained_old_rows.extend(await vectors.retrieve_publication(publication_id, tuple(rows)))
+    assert len(retained_old_rows) == 1_000
+    observed_process_peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert observed_process_peak_rss > 0
+    evidence = {
+        "documents": 1_000,
+        "cursor_lifetime_seconds": 0.5,
+        "enumeration_seconds": enumeration_seconds,
+        "maximum_cursor_age_seconds": connector.maximum_cursor_age_seconds,
+        "journal_records_per_virtual_second": len(records) / enumeration_seconds,
+        "journal_peak_backlog_items": durable.acquired_count - durable.indexed_count,
+        "journal_records": len(records),
+        "new_body_requests": len(connector.fetches),
+        "changed_body_requests": 0,
+        "reused_body_requests": 0,
+        "failed_body_requests": report.unrecorded,
+        "retained_source_bytes": retained_bytes,
+        "compressed_blob_bytes": compressed_bytes,
+        "parse_documents_per_virtual_second": len(records) / derivation_seconds,
+        "chunks_per_virtual_second": report.indexed / derivation_seconds,
+        "embeds_per_virtual_second": report.indexed / derivation_seconds,
+        "fetch_queue_peak_items": report.stages.fetch_queue.peak_depth,
+        "parse_queue_peak_items": report.stages.parse_queue.peak_depth,
+        "peak_retained_bodies": report.stages.peak_bodies,
+        "reembed_peak_memory_estimate_bytes": reembed.commitment.plan.peak_memory_bytes,
+        "reembed_temp_disk_estimate_bytes": reembed.commitment.plan.temporary_disk_bytes,
+        "observed_peak_parser_input_bytes": parser.peak_input_bytes,
+        "observed_peak_parser_calls": parser.peak_active_calls,
+        "observed_peak_vector_upsert_items": vectors.peak_upsert_items,
+        "observed_process_peak_rss_native_units": observed_process_peak_rss,
+        "rebuild_memory_bound_bytes": target.max_memory_bytes,
+        "rebuild_temp_disk_bound_bytes": target.max_temporary_bytes,
+        "source_calls_during_derivation": len(connector.fetches) - source_calls_before_derivation,
+        "unique_source_documents": len(indexed),
+        "unique_source_blobs": len(blob_refs),
+        "unique_live_documents": len({document.id for document in rebuilt_documents}),
+        "unique_live_chunks": len(rebuilt_chunk_ids),
+        "unique_vectors": live_vector_count,
+        "offline_rebuild_documents": rebuilt.documents_built,
+        "source_calls_during_rebuild": len(connector.fetches) - source_calls_before_rebuild,
+        "parser_calls_during_local_snapshot_rebuild": parser.calls - parser_calls_before_rebuild,
+        "source_calls_during_second_model": len(connector.fetches) - source_calls_before_reembed,
+        "parser_calls_during_second_model": parser_calls_during_second_model,
+        "second_model_vectors": len(second_rows),
+        "crash_checkpoint_rows": 1,
+        "crash_checkpoint_state": crashed.state.value,
+        "old_index_reads_before_flip": len(old_index_rows),
+        "old_publication_reads_after_flip": len(retained_old_rows),
+        "publication_transactions_observed": rebuild_store.publication_transactions,
+        "publication_pointer_transitions": rebuild_store.publication_pointer_transitions,
+        "second_model_published": reembedded.state is ReembedState.PUBLISHED,
+        "published_generation": rebuilt.state is RebuildState.PUBLISHED,
+        "watermark_committed": report.watermark_advanced,
+        "snapshot_completeness": report.snapshot_completeness,
+    }
+    assert evidence == {
+        "documents": 1_000,
+        "cursor_lifetime_seconds": 0.5,
+        "enumeration_seconds": pytest.approx(0.19),
+        "maximum_cursor_age_seconds": 0,
+        "journal_records_per_virtual_second": pytest.approx(1_000 / 0.19),
+        "journal_peak_backlog_items": 1_000,
+        "journal_records": 1_000,
+        "new_body_requests": 1_000,
+        "changed_body_requests": 0,
+        "reused_body_requests": 0,
+        "failed_body_requests": 0,
+        "retained_source_bytes": retained_bytes,
+        "compressed_blob_bytes": compressed_bytes,
+        "parse_documents_per_virtual_second": pytest.approx(20),
+        "chunks_per_virtual_second": pytest.approx(20),
+        "embeds_per_virtual_second": pytest.approx(20),
+        "fetch_queue_peak_items": report.stages.fetch_queue.peak_depth,
+        "parse_queue_peak_items": report.stages.parse_queue.peak_depth,
+        "peak_retained_bodies": report.stages.peak_bodies,
+        "reembed_peak_memory_estimate_bytes": reembed.commitment.plan.peak_memory_bytes,
+        "reembed_temp_disk_estimate_bytes": reembed.commitment.plan.temporary_disk_bytes,
+        "observed_peak_parser_input_bytes": parser.peak_input_bytes,
+        "observed_peak_parser_calls": 1,
+        "observed_peak_vector_upsert_items": 1,
+        "observed_process_peak_rss_native_units": observed_process_peak_rss,
+        "rebuild_memory_bound_bytes": 64 * 1024 * 1024,
+        "rebuild_temp_disk_bound_bytes": 64 * 1024 * 1024,
+        "source_calls_during_derivation": 0,
+        "unique_source_documents": 1_000,
+        "unique_source_blobs": 1_000,
+        "unique_live_documents": 1_000,
+        "unique_live_chunks": 1_000,
+        "unique_vectors": 1_000,
+        "offline_rebuild_documents": 1_000,
+        "source_calls_during_rebuild": 0,
+        "parser_calls_during_local_snapshot_rebuild": 1_000,
+        "source_calls_during_second_model": 0,
+        "parser_calls_during_second_model": 0,
+        "second_model_vectors": 1_000,
+        "crash_checkpoint_rows": 1,
+        "crash_checkpoint_state": "building",
+        "old_index_reads_before_flip": 1_000,
+        "old_publication_reads_after_flip": 1_000,
+        "publication_transactions_observed": 1,
+        "publication_pointer_transitions": 1_000,
+        "second_model_published": True,
+        "published_generation": True,
+        "watermark_committed": True,
+        "snapshot_completeness": "complete",
+    }
+    rendered_evidence = json.dumps(evidence, sort_keys=True)
+    assert {"source_id", "uri", "title", "content", "secret"}.isdisjoint(evidence)
+    for private_value in ("wiki.example.test", "public synthetic line", "token="):
+        assert private_value not in rendered_evidence.lower()
 
 
 async def test_crash_during_enumeration_keeps_only_the_committed_prefix(

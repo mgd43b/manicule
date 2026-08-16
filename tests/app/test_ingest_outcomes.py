@@ -95,6 +95,12 @@ async def test_incomplete_sync_keeps_partial_data_in_a_failure_envelope() -> Non
     assert envelope.data["ingested"] == 180
     assert envelope.data["retry_required"] is True
     assert envelope.data["watermark_advanced"] is False
+    lifecycle = cast("dict[str, Any]", envelope.data["lifecycle"])
+    assert lifecycle["phase"] == "acquiring"
+    assert lifecycle["outcome"] == "incomplete"
+    assert lifecycle["enumerated_items"] == 200
+    assert lifecycle["pending_items"] == 0
+    assert lifecycle["committed_watermark_present"] is False
 
 
 async def test_partial_snapshot_omissions_reach_the_shared_operator_envelope() -> None:
@@ -163,6 +169,36 @@ async def test_pending_durable_derivation_is_a_retry_required_failure_envelope()
     assert envelope.error.type == "IncompleteIngestError"
 
 
+async def test_requested_acquire_only_is_a_successful_deferred_offline_outcome() -> None:
+    service, backend = _service(
+        RunReport(
+            connector="synthetic-wiki",
+            discovered=3,
+            pending_derivation=True,
+            derivation_deferred=True,
+            enumeration_completed=True,
+            watermark_advanced=True,
+            snapshot_completeness="complete",
+        )
+    )
+
+    envelope = await run_op(
+        "connector_sync",
+        service.workspace,
+        lambda: service.connector_sync("synthetic-wiki", acquire_only=True),
+    )
+
+    assert envelope.ok is True
+    assert backend.ingestion_.sync_acquire_only == [True]
+    assert envelope.data is not None
+    assert envelope.data["retry_required"] is False
+    assert envelope.data["derivation_deferred"] is True
+    lifecycle = cast("dict[str, Any]", envelope.data["lifecycle"])
+    assert lifecycle["phase"] == "rebuilding"
+    assert lifecycle["outcome"] == "deferred"
+    assert lifecycle["can_continue_offline"] is True
+
+
 async def test_capacity_refusal_is_typed_retryable_and_aggregate_only() -> None:
     service, _ = _service(_capacity_incomplete())
     envelope = await _envelope(service)
@@ -174,6 +210,16 @@ async def test_capacity_refusal_is_typed_retryable_and_aggregate_only() -> None:
     assert envelope.data["outcome"] == "incomplete"
     assert envelope.data["retry_required"] is True
     assert envelope.data["watermark_advanced"] is False
+    lifecycle = cast("dict[str, Any]", envelope.data["lifecycle"])
+    assert lifecycle["outcome"] == "refused"
+    assert lifecycle["refusal"] == {
+        "code": "capacity",
+        "count": 1,
+        "resource": "journal_metadata_bytes",
+        "limit": 100,
+        "used": 90,
+        "requested": 20,
+    }
     rendered = json.dumps(envelope.as_json(), sort_keys=True)
     assert "journal_metadata_bytes" in rendered
     for private in (
@@ -425,6 +471,10 @@ def test_http_and_mcp_report_the_same_incomplete_outcome() -> None:
     assert cast("dict[str, Any]", mcp_result["data"])["outcome"] == "incomplete"
     assert cast("dict[str, Any]", http["data"])["outcome"] == "incomplete"
     assert (
+        cast("dict[str, Any]", mcp_result["data"])["lifecycle"]
+        == cast("dict[str, Any]", http["data"])["lifecycle"]
+    )
+    assert (
         cast("dict[str, Any]", mcp_result["error"])["type"]
         == cast("dict[str, Any]", http["error"])["type"]
     )
@@ -463,6 +513,9 @@ async def test_scheduler_counts_a_returned_incomplete_report_as_a_failure(
     assert recorded.last_outcome == "incomplete"
     assert recorded.retry_required is True
     assert recorded.last_error_type == "CursorExpiredError"
+    assert recorded.last_lifecycle is not None
+    assert recorded.last_lifecycle.outcome == "incomplete"
+    assert recorded.last_lifecycle.enumerated_items == 200
     assert "will be retried" in capsys.readouterr().err
 
 
@@ -507,3 +560,26 @@ async def test_connector_list_exposes_the_last_machine_readable_outcome() -> Non
     assert summary.last_error_type == "CursorExpiredError"
     assert summary.last_enumeration_completed is False
     assert summary.last_watermark_advanced is False
+
+
+async def test_connector_metadata_and_list_share_the_closed_lifecycle_status() -> None:
+    report = _capacity_incomplete()
+
+    class DiagnosticStore(FakeStore):
+        @override
+        async def connector_metadata(self, connector: str) -> dict[str, object]:
+            assert connector == "synthetic-wiki"
+            return cast("dict[str, object]", report.as_metadata())
+
+    service, backend = _service(report)
+    backend.store = DiagnosticStore()
+    listed = await service.connector_list()
+    lifecycle = listed.connectors[0].last_lifecycle
+
+    assert lifecycle is not None
+    assert lifecycle.outcome == "refused"
+    assert lifecycle.refusal is not None
+    assert lifecycle.refusal.resource == "journal_metadata_bytes"
+    serialized = lifecycle.model_dump_json()
+    for private in ("source_id", "private-source-id", "private.invalid", "secret", "token="):
+        assert private not in serialized.lower()
