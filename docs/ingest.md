@@ -1606,6 +1606,11 @@ returns a non-2xx status and the CLI exits nonzero instead of presenting a trace
 so the active relational rows and vector pointer remain unchanged. Inspect `rebuild status`, fix
 the reported class of problem, then use `cleanup-derived-generations --yes` to remove the failed
 shadow generation before planning the retry; status itself remains a read of that durable record.
+Publication repeats snapshot, scope, fence, membership and vector-completeness checks inside the
+atomic transaction. A changed snapshot/scope/fence becomes a `RebuildLeaseError` conflict with a
+bounded durable diagnostic; incomplete replacement or vector evidence becomes
+`RebuildValidationError`. Neither path serializes the storage exception text, and both mark the
+still-owned generation failed before returning so cleanup and retry remain explicit.
 
 ### 10.5 Source and derived lifecycle boundaries
 

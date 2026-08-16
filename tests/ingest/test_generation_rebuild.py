@@ -21,6 +21,7 @@ from manicule.core.rebuild import (
     RebuildEstimate,
     RebuildLeaseConflictError,
     RebuildLeaseError,
+    RebuildPublicationConflictError,
     RebuildRefusalCode,
     RebuildRefusedError,
     RebuildState,
@@ -403,6 +404,37 @@ class StorageFailureStore(FakeStore):
         )
 
 
+class PublicationRuntimeFailureStore(FakeStore):
+    @override
+    async def publish_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> RebuildCheckpoint:
+        del generation_id, owner, lease_generation, now
+        raise RuntimeError(
+            "replacement vectors incomplete at /private/path for "
+            "https://wiki.example.test?cookie=secret"
+        )
+
+
+class PublicationConflictStore(FakeStore):
+    @override
+    async def publish_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> RebuildCheckpoint:
+        del generation_id, owner, lease_generation, now
+        raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+
+
 class ValidationFailureStore(FakeStore):
     @override
     async def validate_generation(self, generation_id: str) -> None:
@@ -467,6 +499,41 @@ async def test_publication_integrity_failure_is_bounded_and_marks_generation_fai
     rendered = str(caught.value).lower()
     for private in ("insert", "secret", "wiki.example.test", "/private", "sqlite"):
         assert private not in rendered
+
+
+@pytest.mark.asyncio
+async def test_publication_runtime_failure_is_bounded_and_marks_generation_failed() -> None:
+    item, body = source(0, "private source body")
+    store = PublicationRuntimeFailureStore([item])
+
+    with pytest.raises(RebuildValidationError) as caught:
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert store.published is False
+    rendered = str(caught.value).lower()
+    for private in ("incomplete", "secret", "wiki.example.test", "/private"):
+        assert private not in rendered
+
+
+@pytest.mark.asyncio
+async def test_publication_snapshot_conflict_is_bounded_and_marks_generation_failed() -> None:
+    item, body = source(0, "body")
+    store = PublicationConflictStore([item])
+
+    with pytest.raises(RebuildLeaseError, match="offline rebuild lease was lost"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.SNAPSHOT_CHANGED
+    assert store.published is False
 
 
 @pytest.mark.asyncio

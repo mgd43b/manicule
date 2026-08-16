@@ -34,6 +34,8 @@ from manicule.core.rebuild import (
     RebuildEstimate,
     RebuildLeaseConflictError,
     RebuildLeaseError,
+    RebuildPublicationConflictError,
+    RebuildPublicationValidationError,
     RebuildRefusalCode,
     RebuildRefusedError,
     RebuildState,
@@ -1025,6 +1027,28 @@ class OfflineGenerationRebuilder:
         )
         try:
             return await self._join_irreversible(publish)
+        except RebuildPublicationConflictError as exc:
+            await self._store.fail_generation(
+                checkpoint.generation_id,
+                exc.code,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+            raise RebuildLeaseError from exc
+        except (RebuildPublicationValidationError, RuntimeError, ValueError) as exc:
+            # The store's publication protocol reports bounded invariant failures as its typed
+            # validation error. RuntimeError remains a compatibility boundary for third-party
+            # stores implementing the protocol: its arbitrary text stays chained locally and
+            # never crosses an unattended surface.
+            await self._store.fail_generation(
+                checkpoint.generation_id,
+                RebuildRefusalCode.INVALID_REPLACEMENT,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+            raise RebuildValidationError from exc
         except (SQLAlchemyError, OSError) as exc:
             # Publication is one relational transaction, so this runs only after its rollback.
             # Marking the durable generation failed makes retry/cleanup explicit while the live

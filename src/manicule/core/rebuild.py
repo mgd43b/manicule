@@ -36,6 +36,7 @@ class RebuildRefusalCode(StrEnum):
     INVALID_REPLACEMENT = "invalid_replacement"
     DERIVATION_FAILED = "derivation_failed"
     STORAGE_FAILED = "storage_failed"
+    PUBLICATION_CONFLICT = "publication_conflict"
 
 
 class RebuildTarget(BaseModel):
@@ -205,6 +206,22 @@ class RebuildTerminalGenerationError(RebuildLeaseConflictError):
     """An internal worker attempted to claim a terminal generation."""
 
 
+class RebuildPublicationConflictError(RebuildLeaseConflictError):
+    """Publication evidence changed after validation but before the atomic swap."""
+
+    def __init__(self, code: RebuildRefusalCode) -> None:
+        super().__init__(code.value)
+        self.code = code
+
+
+class RebuildPublicationValidationError(RuntimeError):
+    """The staged replacement failed a bounded publication-time invariant."""
+
+    def __init__(self, code: RebuildRefusalCode = RebuildRefusalCode.INVALID_REPLACEMENT) -> None:
+        super().__init__(code.value)
+        self.code = code
+
+
 class RebuildOperationError(ManiculeError):
     """A private-safe expected failure of durable rebuild work.
 
@@ -259,6 +276,8 @@ __all__ = [
     "RebuildLeaseConflictError",
     "RebuildLeaseError",
     "RebuildOperationError",
+    "RebuildPublicationConflictError",
+    "RebuildPublicationValidationError",
     "RebuildRefusalCode",
     "RebuildRefusedError",
     "RebuildState",
