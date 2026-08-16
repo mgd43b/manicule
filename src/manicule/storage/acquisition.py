@@ -567,7 +567,7 @@ async def settle_published_snapshot(
             select(models.AcquisitionRun.id)
             .where(
                 models.AcquisitionRun.workspace_id == workspace_id,
-                models.AcquisitionRun.connector_id == run.connector_id,
+                models.AcquisitionRun.connector_name == run.connector_name,
                 models.AcquisitionRun.scope_fingerprint == run.scope_fingerprint,
                 models.AcquisitionRun.promoted_at.is_not(None),
             )
@@ -592,6 +592,10 @@ async def settle_published_snapshot(
     lifecycle = (
         dict(cast("dict[str, Any]", raw_lifecycle)) if isinstance(raw_lifecycle, dict) else {}
     )
+    completeness = (
+        SnapshotCompleteness(run.completeness).value if run.completeness is not None else ""
+    )
+    promotion_policy = SnapshotPromotionPolicy(run.promotion_policy).value
     lifecycle.update(
         {
             "phase": "complete",
@@ -602,8 +606,8 @@ async def settle_published_snapshot(
             "omitted_items": run.omission_count,
             "failed_items": run.retry_count,
             "pending_items": 0,
-            "snapshot_completeness": str(run.completeness or ""),
-            "reproducibility_policy": str(run.promotion_policy),
+            "snapshot_completeness": completeness,
+            "reproducibility_policy": promotion_policy,
             "snapshot_identity": run.id,
             "snapshot_promoted": True,
             "source_generation_identity": expected_membership_hash,
@@ -624,7 +628,7 @@ async def settle_published_snapshot(
             "outcome": "complete",
             "retry_required": False,
             "derivation_deferred": False,
-            "snapshot_completeness": str(run.completeness or ""),
+            "snapshot_completeness": completeness,
             "snapshot_omissions": run.omission_count,
             "lifecycle": lifecycle,
         }

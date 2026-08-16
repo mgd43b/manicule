@@ -466,6 +466,8 @@ async def test_runtime_rebuilds_a_promoted_snapshot_without_a_connector_capabili
         assert metadata_lifecycle["outcome"] == "complete"
         assert metadata_lifecycle["pending_items"] == 0
         assert metadata_lifecycle["backlog_items"] == 0
+        assert metadata_lifecycle["snapshot_completeness"] == "complete"
+        assert metadata_lifecycle["reproducibility_policy"] == "require_complete"
         public_metadata = json.dumps(metadata, sort_keys=True)
         assert "Network Operations Workspace" not in public_metadata
         assert "https://wiki.example.test/content/" not in public_metadata
