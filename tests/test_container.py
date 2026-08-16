@@ -107,6 +107,47 @@ def test_a_dependency_cycle_names_the_cycle(settings: Settings) -> None:
         container.get(keys.CHUNKER)
 
 
+def test_metadata_dependencies_never_construct_executable_components(settings: Settings) -> None:
+    built: list[str] = []
+    described: list[str] = []
+    registry = ComponentRegistry().bind("test")
+
+    def forbidden_embedder(_context: object) -> HashEmbedder:
+        built.append("executable")
+        return HashEmbedder()
+
+    def forbidden_chunker(_context: object) -> BlockChunker:
+        built.append("executable")
+        return BlockChunker()
+
+    registry.add(
+        keys.EMBEDDER.named("mlx"),
+        forbidden_embedder,
+        metadata_factory=lambda _: described.append("embed") or "embedding-id",
+    )
+    registry.add(
+        keys.CHUNKER.named("structural"),
+        forbidden_chunker,
+        metadata_factory=lambda context: (
+            described.append("chunk") or f"chunk-for-{context.components.get(keys.EMBEDDER)}"
+        ),
+    )
+    container = Container(settings, registry)
+
+    assert container.metadata(keys.CHUNKER) == "chunk-for-embedding-id"
+    assert container.metadata(keys.CHUNKER) == "chunk-for-embedding-id"
+    assert built == []
+    assert described == ["chunk", "embed"]
+
+
+def test_missing_metadata_refuses_instead_of_falling_back_to_a_factory(settings: Settings) -> None:
+    registry = ComponentRegistry().bind("test")
+    registry.add(keys.EMBEDDER.named("mlx"), lambda _: HashEmbedder())
+
+    with pytest.raises(ConfigError, match="no metadata-only identity"):
+        Container(settings, registry).metadata(keys.EMBEDDER)
+
+
 def test_a_factory_receives_its_validated_configuration(settings: Settings) -> None:
     seen: list[BuildContext] = []
     registry = ComponentRegistry().bind("test")

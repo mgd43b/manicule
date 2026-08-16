@@ -29,7 +29,10 @@ from manicule.plugins.registry import Factory
 
 if TYPE_CHECKING:
     from manicule.chunking import StructuralChunker
+    from manicule.config.settings import Settings
+    from manicule.core.fingerprints import ChunkFingerprint
     from manicule.core.protocols import Parser
+    from manicule.plugins.registry import MetadataContext
 
 CHUNKER_NAME = "structural"
 
@@ -230,12 +233,12 @@ def _build_chunker(context: BuildContext) -> StructuralChunker:
     return StructuralChunker(
         counter,
         embedder=embedder,
-        grammars=_grammar_versions(context),
+        grammars=_grammar_versions(context.settings),
         version_components=_pinned_versions(),
     )
 
 
-def _grammar_versions(context: BuildContext) -> dict[str, str]:
+def _grammar_versions(settings: Settings) -> dict[str, str]:
     """Grammar version by language, for ``ChunkFingerprint.grammars``.
 
     Read from **configuration**, not from the cache and not from a constructed parser.
@@ -259,7 +262,7 @@ def _grammar_versions(context: BuildContext) -> dict[str, str]:
     from manicule.parsers.config import SourceCodeConfig  # noqa: PLC0415 - see module docstring
     from manicule.parsers.grammars import grammar_versions  # noqa: PLC0415
 
-    declared = context.settings.component_config("parser", SOURCE_CODE_NAME)
+    declared = settings.component_config("parser", SOURCE_CODE_NAME)
     config = SourceCodeConfig.model_validate(dict(declared))
     return dict(grammar_versions(config.languages))
 
@@ -273,6 +276,34 @@ def _pinned_versions() -> dict[str, str]:
     dependency bump, with no test failing in between.
     """
     return {"html_text": parser_config.html_text_version()}
+
+
+def _chunker_metadata(context: MetadataContext) -> ChunkFingerprint:
+    """The structural chunk identity, derived without constructing its embedder dependency."""
+    from manicule.chunking.chunker import (  # noqa: PLC0415
+        CHUNKER_NAME as FINGERPRINT_NAME,
+    )
+    from manicule.chunking.chunker import (  # noqa: PLC0415
+        CHUNKER_VERSION,
+        MAX_TOKENS,
+        OVERLAP_TOKENS,
+    )
+    from manicule.core.embedding import EmbedFingerprint  # noqa: PLC0415
+    from manicule.core.fingerprints import ChunkFingerprint  # noqa: PLC0415
+
+    embedding = context.components.get(keys.EMBEDDER)
+    if not isinstance(embedding, EmbedFingerprint):
+        raise ConfigError("embedder metadata did not declare an embedding fingerprint")
+    components = _pinned_versions()
+    suffix = "".join(f";{name}={value}" for name, value in sorted(components.items()))
+    return ChunkFingerprint(
+        chunker=FINGERPRINT_NAME,
+        version=f"{CHUNKER_VERSION}{suffix}",
+        max_tokens=MAX_TOKENS,
+        overlap_tokens=OVERLAP_TOKENS,
+        tokenizer_id=embedding.tokenizer_id,
+        grammars=_grammar_versions(context.settings),
+    )
 
 
 class ParsingPlugin:
@@ -297,6 +328,7 @@ class ParsingPlugin:
         registry.add(
             keys.CHUNKER.named(CHUNKER_NAME),
             _build_chunker,
+            metadata_factory=_chunker_metadata,
             summary="512 tokens on embed_text, 64 overlap, boundaries from block structure.",
         )
 

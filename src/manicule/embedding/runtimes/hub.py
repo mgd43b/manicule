@@ -189,6 +189,24 @@ def cached_revision(repo: str, patterns: Sequence[str], revision: str | None = N
     return path.name if path.parent.name == "snapshots" else revision
 
 
+def cached_snapshot(repo: str, patterns: Sequence[str], revision: str | None = None) -> Path | None:
+    """Return a complete cached snapshot path without allowing a network request."""
+    local = Path(repo).expanduser()
+    if local.is_dir():
+        return local
+
+    from huggingface_hub import snapshot_download  # noqa: PLC0415 - metadata-only cache probe
+
+    try:
+        return Path(
+            snapshot_download(
+                repo, revision=revision, allow_patterns=list(patterns), local_files_only=True
+            )
+        )
+    except Exception:  # noqa: BLE001 - absence is the complete answer to this local probe
+        return None
+
+
 def _unavailable(repo: str, patterns: Sequence[str], exc: Exception) -> str:
     """What a query says when the model it needs was never put on this machine."""
     return (
@@ -207,6 +225,7 @@ __all__ = [
     "PROGRESS_ENV",
     "ModelUnavailableError",
     "cached_revision",
+    "cached_snapshot",
     "is_cached",
     "snapshot",
 ]

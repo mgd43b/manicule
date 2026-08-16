@@ -66,6 +66,14 @@ class ComponentResolver(Protocol):
         ...
 
 
+class ComponentMetadataResolver(Protocol):
+    """Resolve component declarations without invoking executable factories."""
+
+    def get(self, key: ComponentKey[object]) -> object:
+        """Return the configured component's metadata declaration."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class BuildContext:
     """Everything a factory is given.
@@ -96,7 +104,27 @@ class BuildContext:
     """
 
 
+@dataclass(frozen=True, slots=True)
+class MetadataContext:
+    """Configuration visible to a side-effect-free component metadata declaration."""
+
+    settings: Settings
+    config: BaseModel
+    data_dir: Path
+    cache_dir: Path
+    components: ComponentMetadataResolver
+
+
 type Factory[T] = Callable[[BuildContext], T]
+type MetadataFactory = Callable[[MetadataContext], object]
+
+
+@dataclass(frozen=True, slots=True)
+class MiddlewareMetadata:
+    """Fingerprint-relevant middleware declaration available without construction."""
+
+    name: str
+    mutates_embedded_text: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +143,8 @@ class ComponentRecord[T]:
     Routing a single document must not build every installed parser, because a parser's
     factory is exactly where its heavy imports live.
     """
+    metadata_factory: MetadataFactory | None = None
+    """Configured identity without constructing the executable component."""
 
     @property
     def key(self) -> ComponentKey[T]:
@@ -151,6 +181,7 @@ class ComponentRegistry:
         config_model: type[BaseModel] | None = None,
         summary: str = "",
         media_types: AbstractSet[str] = frozenset(),
+        metadata_factory: MetadataFactory | None = None,
     ) -> None:
         """Register a factory under ``key``.
 
@@ -198,6 +229,7 @@ class ComponentRegistry:
             config_model=config_model,
             summary=summary,
             media_types=frozenset(media_types),
+            metadata_factory=metadata_factory,
         )
         self._records[slot] = record
 
@@ -424,6 +456,9 @@ __all__ = [
     "ComponentResolver",
     "Discovery",
     "Factory",
+    "MetadataContext",
+    "MetadataFactory",
+    "MiddlewareMetadata",
     "describe",
     "discover",
     "installed_entry_points",

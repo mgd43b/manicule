@@ -165,6 +165,50 @@ def resolve_artifact(
             identity=f"artifact:{provider}:sha256:{digest}",
         )
 
+    return _remote_artifact(
+        provider, model_id, model_revision, repo, override=override, revision=revision
+    )
+
+
+def describe_artifact(
+    provider: str,
+    model_id: str,
+    model_revision: str | None,
+    *,
+    override: str = "",
+    revision: str = "",
+) -> WeightArtifact:
+    """Declare a pinned remote artifact identity without reading or resolving model weights."""
+    provider = provider.strip().lower()
+    if provider not in {"mlx", "onnx"}:
+        raise ConfigError(f"no built-in weight artifact contract exists for {provider!r}")
+    repo = (
+        mlx_repo(model_id, override=override)
+        if provider == "mlx"
+        else onnx_repo(model_id, override=override)
+    )
+    if Path(repo).expanduser().is_dir():
+        raise ConfigError(
+            "metadata-only rebuild planning cannot hash local model weights to discover "
+            "their identity; register a component metadata declaration with the exact "
+            "fingerprint instead"
+        )
+    return _remote_artifact(
+        provider, model_id, model_revision, repo, override=override, revision=revision
+    )
+
+
+def _remote_artifact(
+    provider: str,
+    model_id: str,
+    model_revision: str | None,
+    repo: str,
+    *,
+    override: str,
+    revision: str,
+) -> WeightArtifact:
+    """Exact identity for an immutable remote artifact; performs no I/O."""
+
     if revision and not override:
         raise ConfigError("`weights_revision` requires an explicit `weights` repository")
     resolved = revision
@@ -525,6 +569,7 @@ __all__ = [
     "WeightsRef",
     "builtin_model_revision",
     "builtin_revision",
+    "describe_artifact",
     "mlx_repo",
     "mlx_weights",
     "onnx_repo",

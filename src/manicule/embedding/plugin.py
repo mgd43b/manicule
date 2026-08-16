@@ -18,8 +18,10 @@ from manicule.embedding.config import EmbedderConfig, MlxEmbedderConfig
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
 
 if TYPE_CHECKING:
+    from manicule.core.embedding import EmbedFingerprint
     from manicule.core.protocols import Embedder
     from manicule.embedding.cards import ModelCard
+    from manicule.plugins.registry import MetadataContext, MetadataFactory
 
 MLX_NAME = "mlx"
 ONNX_NAME = "onnx"
@@ -106,6 +108,51 @@ def _build_onnx(context: BuildContext) -> Embedder:
     )
 
 
+def _metadata_for(provider: str) -> MetadataFactory:
+    """Declare the exact configured vector space from local metadata only."""
+
+    def metadata(context: MetadataContext) -> EmbedFingerprint:
+        from manicule.embedding.artifacts import (  # noqa: PLC0415
+            builtin_model_revision,
+            describe_artifact,
+        )
+        from manicule.embedding.cards import read_cached_card  # noqa: PLC0415
+
+        settings = context.config
+        if not isinstance(settings, EmbedderConfig):
+            raise ConfigError(
+                f"embedder metadata expected {EmbedderConfig.__name__}, got "
+                f"{type(settings).__name__}"
+            )
+        embedding = context.settings.embedding
+        revision = embedding.revision or builtin_model_revision(embedding.model)
+        try:
+            card = read_cached_card(
+                embedding.model,
+                revision=revision,
+                pooling_override=settings.pooling,
+                max_sequence_length_override=settings.max_sequence_length,
+            )
+            artifact = describe_artifact(
+                provider,
+                card.source_ref,
+                card.revision,
+                override=settings.weights,
+                revision=settings.weights_revision,
+            )
+        except ConfigError as exc:
+            raise ConfigError(
+                "configured embedding identity is unavailable for metadata-only rebuild planning"
+            ) from exc
+        return card.fingerprint(
+            backend=provider,
+            weights_ref=artifact.ref,
+            weights_identity=artifact.identity,
+        )
+
+    return metadata
+
+
 class EmbeddingPlugin:
     """The plugin object the ``embedding`` entry point resolves to."""
 
@@ -121,12 +168,14 @@ class EmbeddingPlugin:
             keys.EMBEDDER.named(MLX_NAME),
             _build_mlx,
             config_model=MlxEmbedderConfig,
+            metadata_factory=_metadata_for(MLX_NAME),
             summary="Metal-native, in-process, on Apple Silicon. Pools from token states.",
         )
         registry.add(
             keys.EMBEDDER.named(ONNX_NAME),
             _build_onnx,
             config_model=EmbedderConfig,
+            metadata_factory=_metadata_for(ONNX_NAME),
             summary="Portable, in-process, and the reference the MLX backend is measured "
             "against. Pools from token states.",
         )
