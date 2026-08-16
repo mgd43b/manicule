@@ -65,6 +65,15 @@ __all__ = [
     "announce",
 ]
 
+_LIFECYCLE_PLAN_OPS = frozenset(
+    {
+        "lifecycle_reset_derived",
+        "lifecycle_cleanup_generations",
+        "lifecycle_release_history",
+        "lifecycle_delete_snapshot",
+    }
+)
+
 
 class ControlHandler:
     """Runs what arrives on the control socket, and nothing else.
@@ -364,6 +373,23 @@ class Scheduler:
             task = asyncio.create_task(self._run(name, interval), name=f"schedule:{name}")
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
+
+    async def plan_lifecycle(self, command: commands.Command) -> dict[str, JsonValue]:
+        """Run one scheduler-owned lifecycle dry run through the canonical dispatcher.
+
+        Retention schedulers may inspect aggregate impact, but they receive no destructive
+        authority: the command must be one of the four lifecycle operations and must explicitly
+        carry ``dry_run=true``.  The returned envelope is consequently identical to a proxied
+        CLI invocation of the same plan.
+        """
+        if command.op not in _LIFECYCLE_PLAN_OPS or command.writes():
+            raise ValueError("the scheduler may run lifecycle aggregate dry runs only")
+        envelope = await run_op(
+            command.op,
+            self._service.workspace,
+            lambda: commands.run(self._service, command, lambda _message: None),
+        )
+        return envelope.as_json()
 
     async def _recover_reembedding(self) -> None:
         """Resume ownerless durable runs once at startup; run status remains authoritative."""

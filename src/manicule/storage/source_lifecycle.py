@@ -54,6 +54,16 @@ class SourceLifecycleMixin(WorkspaceScoped):
         async with self._sessions.begin() as session:
             chunk_count = await self._workspace_chunk_count(session)
             await session.execute(delete(models.Chunk).where(self._workspace_chunk()))
+            # A published generation is a replay receipt for the derived corpus we just
+            # removed.  Leaving it behind makes an identical-target rebuild return PUBLISHED
+            # without rebuilding anything.  Only completed publications are invalidated;
+            # planned/building/validating rows remain durable retry work.
+            await session.execute(
+                delete(models.DerivedGeneration).where(
+                    models.DerivedGeneration.workspace_id == self._workspace_id,
+                    models.DerivedGeneration.state == RebuildState.PUBLISHED,
+                )
+            )
             await session.execute(
                 update(models.Document)
                 .where(models.Document.workspace_id == self._workspace_id)
@@ -142,16 +152,16 @@ class SourceLifecycleMixin(WorkspaceScoped):
         )
 
     async def release_source_history(self, cutoff: datetime) -> LifecycleOutcome:
-        """Release only prior document versions selected by the caller's retention cutoff."""
+        """Release prior-version bytes without deleting the historical version record."""
         async with self._sessions.begin() as session:
             eligible = self._eligible_versions(cutoff)
             count = int(await session.scalar(select(func.count()).select_from(eligible)) or 0)
             bytes_ = await self._newly_unreferenced_version_bytes(session, eligible)
             if count:
                 await session.execute(
-                    delete(models.DocumentVersion).where(
-                        models.DocumentVersion.id.in_(select(eligible.c.id))
-                    )
+                    update(models.DocumentVersion)
+                    .where(models.DocumentVersion.id.in_(select(eligible.c.id)))
+                    .values(original_ref=None, bytes_released_at=utcnow())
                 )
         return LifecycleOutcome(
             operation=LifecycleOperation.RELEASE_SOURCE_HISTORY,
@@ -211,6 +221,8 @@ class SourceLifecycleMixin(WorkspaceScoped):
                 .where(
                     models.Connector.id == run.connector_id,
                     models.Connector.workspace_id == self._workspace_id,
+                    models.Connector.watermark_scope_fingerprint == run.scope_fingerprint,
+                    models.Connector.watermark == run.candidate_watermark,
                 )
                 .values(
                     watermark=None,
@@ -425,6 +437,8 @@ class SourceLifecycleMixin(WorkspaceScoped):
             .where(
                 models.Document.workspace_id == self._workspace_id,
                 models.DocumentVersion.created_at < cutoff,
+                models.DocumentVersion.original_ref.is_not(None),
+                models.DocumentVersion.bytes_released_at.is_(None),
             )
             .subquery()
         )

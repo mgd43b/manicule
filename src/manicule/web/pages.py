@@ -34,6 +34,7 @@ policy decision in a template.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query
@@ -477,6 +478,57 @@ async def reembed_page(
     run_id: Annotated[str, Query(max_length=200)] = "",
 ) -> HTMLResponse:
     return await _reembed_page(service, caller, run_id=run_id)
+
+
+# --- source and derived lifecycle --------------------------------------------------------------
+
+
+@router.get(
+    "/lifecycle",
+    name="ui_lifecycle",
+    summary="Dry-run source and derived lifecycle boundaries.",
+)
+async def lifecycle_page(
+    service: Service,
+    caller: Operator,
+    *,
+    before: Annotated[datetime | None, Query()] = None,
+    run_id: Annotated[str, Query(max_length=200)] = "",
+) -> HTMLResponse:
+    """Read-only lifecycle plans; destructive confirmation stays outside the browser."""
+    panels = {
+        "reset": await panel(
+            "lifecycle_reset_derived",
+            service,
+            lambda: service.lifecycle_reset_derived(dry_run=True),
+        ),
+        "cleanup": await panel(
+            "lifecycle_cleanup_generations",
+            service,
+            lambda: service.lifecycle_cleanup_generations(dry_run=True),
+        ),
+    }
+    if before is not None:
+        panels["history"] = await panel(
+            "lifecycle_release_history",
+            service,
+            lambda: service.lifecycle_release_history(before, dry_run=True),
+        )
+    if run_id:
+        panels["snapshot"] = await panel(
+            "lifecycle_delete_snapshot",
+            service,
+            lambda: service.lifecycle_delete_snapshot(run_id, dry_run=True),
+        )
+    return render(
+        "lifecycle.html",
+        area="lifecycle",
+        title="Lifecycle",
+        service=service,
+        caller=caller,
+        panels=panels,
+        extra={"before": before.isoformat() if before is not None else "", "run_id": run_id},
+    )
 
 
 # --- settings ---------------------------------------------------------------------------------

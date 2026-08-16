@@ -57,14 +57,15 @@ PAGE_FOR_AREA: dict[str, str] = {
     "workspaces": "/ui/workspaces",
     "admin": "/ui/admin",
     "reembed": "/ui/reembed",
+    "lifecycle": "/ui/lifecycle",
     "auth": "/ui/auth",
 }
 
 
-def test_the_thirteen_areas_are_the_twelve_pages_and_the_frame() -> None:
+def test_the_fourteen_areas_are_the_thirteen_pages_and_the_frame() -> None:
     """The area list and the pages cannot drift apart without this failing."""
     assert set(PAGE_FOR_AREA) | {"layout"} == set(AREAS)
-    assert len(AREAS) == 13
+    assert len(AREAS) == 14
 
 
 def test_every_navigable_area_is_in_the_navigation() -> None:

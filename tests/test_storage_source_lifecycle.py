@@ -40,6 +40,8 @@ async def _snapshot(
     source_id: str,
     state: AcquisitionRunState = AcquisitionRunState.SETTLED,
     promoted_at: datetime = NOW,
+    candidate_watermark: dict[str, str] | None = None,
+    watermark_committed_at: datetime | None = None,
 ) -> str:
     blob = await BlobStore(engine, data_dir).put(body, "text/plain")
     assert isinstance(blob, StoredBlob)
@@ -69,6 +71,8 @@ async def _snapshot(
                 enumeration_completed_at=NOW,
                 acquisition_completed_at=NOW,
                 promoted_at=promoted_at,
+                candidate_watermark=candidate_watermark,
+                watermark_committed_at=watermark_committed_at,
                 membership_hash=f"membership-{run_id}",
                 completeness=SnapshotCompleteness.COMPLETE,
                 discovered_count=1,
@@ -124,6 +128,34 @@ async def test_derived_reset_preserves_snapshot_versions_and_blob_gc_roots(
                 created_at=NOW - timedelta(days=60),
             )
         )
+        session.add(
+            models.DerivedGeneration(
+                id="published-before-reset",
+                workspace_id="default",
+                snapshot_run_id="snapshot-reset",
+                snapshot_membership_hash="membership-snapshot-reset",
+                expected_item_count=1,
+                target_digest="same-target",
+                publication_identity_digest="published-identity",
+                target={"parser": "same-target"},
+                state=RebuildState.PUBLISHED,
+                vector_publication_id="published-before-reset",
+                published_at=NOW,
+            )
+        )
+        session.add(
+            models.DerivedGeneration(
+                id="retry-after-reset",
+                workspace_id="default",
+                snapshot_run_id="snapshot-reset",
+                snapshot_membership_hash="membership-snapshot-reset",
+                expected_item_count=1,
+                target_digest="retry-target",
+                publication_identity_digest="retry-identity",
+                target={"parser": "retry-target"},
+                state=RebuildState.BUILDING,
+            )
+        )
 
     plan = await store.plan_reset_derived()
     outcome = await store.reset_derived()
@@ -138,6 +170,8 @@ async def test_derived_reset_preserves_snapshot_versions_and_blob_gc_roots(
     async with sessions() as session:
         assert await session.get(models.DocumentVersion, "version-1") is not None
         assert await session.get(models.AcquisitionRun, "snapshot-reset") is not None
+        assert await session.get(models.DerivedGeneration, "published-before-reset") is None
+        assert await session.get(models.DerivedGeneration, "retry-after-reset") is not None
     assert await BlobStore(engine, data_dir).collect_garbage() == []
 
 
@@ -265,7 +299,18 @@ async def test_history_release_is_policy_bounded_and_distinct_blob_safe(
     assert plan.eligible_bytes == 0
     assert outcome.removed_items == 2
     async with sessions() as session:
+        old_only = await session.get(models.DocumentVersion, "old-only")
+        old_shared = await session.get(models.DocumentVersion, "old-shared")
+        assert old_only is not None
+        assert old_shared is not None
+        assert old_only.original_ref is None
+        assert old_shared.original_ref is None
+        assert old_only.bytes_released_at is not None
+        assert old_shared.bytes_released_at is not None
         assert await session.get(models.DocumentVersion, "recent") is not None
+    repeated = await store.plan_source_history_release(NOW - timedelta(days=30))
+    assert repeated.eligible_items == 0
+    assert repeated.eligible_bytes == 0
 
 
 @pytest.mark.asyncio
@@ -275,7 +320,13 @@ async def test_snapshot_delete_requires_current_dry_run_and_preserves_retry_root
     data_dir: Path,
 ) -> None:
     unique_ref = await _snapshot(
-        engine, data_dir, run_id="delete-me", body=b"delete-only", source_id="delete-page"
+        engine,
+        data_dir,
+        run_id="delete-me",
+        body=b"delete-only",
+        source_id="delete-page",
+        candidate_watermark={"value": "snapshot-current"},
+        watermark_committed_at=NOW,
     )
     published = make_document(source="wiki", source_id="delete-page").model_copy(
         update={"original_ref": unique_ref}
@@ -347,6 +398,48 @@ async def test_snapshot_delete_requires_current_dry_run_and_preserves_retry_root
         assert connector is not None
         assert connector.watermark is None
         assert connector.watermark_scope_fingerprint is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_delete_preserves_a_connector_watermark_that_advanced_after_dry_run(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    await _snapshot(
+        engine,
+        data_dir,
+        run_id="delete-stale-watermark",
+        body=b"old snapshot",
+        source_id="old-page",
+        candidate_watermark={"value": "old"},
+        watermark_committed_at=NOW,
+    )
+    sessions = session_factory(engine)
+    async with sessions.begin() as session:
+        connector = await session.get(models.Connector, "wiki")
+        assert connector is not None
+        connector.watermark = {"value": "old"}
+        connector.watermark_scope_fingerprint = "scope-v1"
+        connector.last_synced_at = NOW
+    plan = await store.plan_snapshot_deletion("delete-stale-watermark")
+    assert plan.confirmation is not None
+
+    async with sessions.begin() as session:
+        connector = await session.get(models.Connector, "wiki")
+        assert connector is not None
+        connector.watermark = {"value": "new"}
+        connector.watermark_scope_fingerprint = "scope-v2"
+        connector.last_synced_at = NOW + timedelta(minutes=1)
+
+    await store.delete_snapshot("delete-stale-watermark", confirmation=plan.confirmation)
+
+    async with sessions() as session:
+        connector = await session.get(models.Connector, "wiki")
+        assert connector is not None
+        assert connector.watermark == {"value": "new"}
+        assert connector.watermark_scope_fingerprint == "scope-v2"
+        assert connector.last_synced_at == NOW + timedelta(minutes=1)
 
 
 @pytest.mark.asyncio
