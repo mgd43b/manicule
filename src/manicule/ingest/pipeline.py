@@ -594,6 +594,7 @@ class RunReport:
         model into ingest. The service validates the same closed shape before exposing it.
         """
         accepted = self.stages.accepted
+        reused = self.skipped_version + self.skipped_hash
         failed = self.by_status.get(DocumentStatus.FAILED.value, 0)
         pending = (
             max(0, accepted - self.indexed - self.skipped_version - self.skipped_hash)
@@ -633,8 +634,8 @@ class RunReport:
             ),
             "dry_run": False,
             "enumerated_items": self.discovered,
-            "acquired_items": max(0, accepted - self.snapshot_omissions),
-            "reused_items": self.skipped_version + self.skipped_hash,
+            "acquired_items": max(0, accepted - reused - self.snapshot_omissions),
+            "reused_items": reused,
             "omitted_items": self.snapshot_omissions,
             "failed_items": failed,
             "pending_items": pending,
@@ -1296,12 +1297,15 @@ class IngestPipeline:
                 )
                 run.acquisition_state = AcquisitionRunState.INDEXING
 
-        if run.acquire_only and run.acquisition_state is AcquisitionRunState.INDEXING:
-            # The promoted manifest and committed watermark are the acquire-only result. Leave
-            # the run in INDEXING so an ordinary subsequent sync resumes exclusively from its
-            # retained bytes; no connector discovery or fetch is needed for that transition.
-            run.report.pending_derivation = True
-            run.report.derivation_deferred = True
+        if run.acquire_only:
+            # Acquire-only is a hard boundary even when strict promotion failed. A complete
+            # snapshot remains in INDEXING for offline derivation; an incomplete one remains in
+            # ACQUIRING for source retry. Neither may publish the successfully retained prefix.
+            await self._mark_pending_derivation(run, acquisitions)
+            run.report.derivation_deferred = (
+                run.acquisition_state is AcquisitionRunState.INDEXING
+                and run.report.pending_derivation
+            )
             return
 
         await owned(self._index_acquired(run), "journal-indexing")
@@ -1466,8 +1470,8 @@ class IngestPipeline:
                 run.report.enumeration_completed = True
         except Exception as exc:  # noqa: BLE001 - an enumeration failure is not a crash
             run.report.error_type = type(exc).__name__
-            run.report.error_message = str(exc)
-            run.report.error = f"{type(exc).__name__}: {exc}"
+            run.report.error_message = "source enumeration failed"
+            run.report.error = f"{type(exc).__name__}: source enumeration failed"
         finally:
             closer = getattr(stream, "aclose", None)
             if closer is not None:
@@ -1530,8 +1534,8 @@ class IngestPipeline:
                 run.report.refuse_capacity(exc)
             else:
                 run.report.error_type = type(exc).__name__
-                run.report.error_message = str(exc)
-                run.report.error = f"{type(exc).__name__}: {exc}"
+                run.report.error_message = "source enumeration failed"
+                run.report.error = f"{type(exc).__name__}: source enumeration failed"
         finally:
             closer = getattr(stream, "aclose", None)
             if closer is not None:
@@ -2394,7 +2398,11 @@ class IngestPipeline:
             raw = await self._fetch(connector, discovered.ref)
         except Exception as exc:  # noqa: BLE001 - one source's failure is one document's
             return await self._fail(
-                existing, source, source_id, PipelineStage.FETCH, f"{type(exc).__name__}: {exc}"
+                existing,
+                source,
+                source_id,
+                PipelineStage.FETCH,
+                f"{type(exc).__name__}: source fetch failed",
             )
 
         return _Fetched(raw=raw, discovered=discovered, existing=existing)

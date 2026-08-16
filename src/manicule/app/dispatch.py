@@ -15,7 +15,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from manicule.app.results import Envelope, ErrorInfo, IngestReport, Payload, failed, succeeded
+from manicule.app.results import (
+    Envelope,
+    ErrorInfo,
+    IngestReport,
+    Payload,
+    ReembedRunReport,
+    SnapshotStatusReport,
+    failed,
+    succeeded,
+)
 from manicule.app.tenancy import CrossWorkspaceError
 from manicule.core.errors import (
     ConfigError,
@@ -112,6 +121,34 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
             hint="Run the same ingest operation again; its watermark was not advanced.",
         )
         return failed(op, workspace, reason, payload=payload)
+    if (
+        isinstance(payload, SnapshotStatusReport)
+        and payload.verification_performed
+        and payload.lifecycle.outcome == "failed"
+    ):
+        return failed(
+            op,
+            workspace,
+            ErrorInfo(
+                type="SnapshotVerificationError",
+                message="the durable source snapshot failed manifest verification",
+                hint="Reacquire the source snapshot before rebuilding derived generations.",
+            ),
+        )
+    if (
+        isinstance(payload, ReembedRunReport)
+        and op in {"reembed_start", "reembed_resume"}
+        and payload.lifecycle.outcome in {"failed", "canceled", "refused"}
+    ):
+        return failed(
+            op,
+            workspace,
+            ErrorInfo(
+                type="ReembedLifecycleError",
+                message="the durable re-embedding operation did not complete successfully",
+                hint="Inspect `reembed status` before retrying or starting another run.",
+            ),
+        )
     return succeeded(op, workspace, payload)
 
 

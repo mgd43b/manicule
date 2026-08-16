@@ -1041,7 +1041,9 @@ async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
             async for found in super().discover(watermark):
                 yield found
                 if self.expires:
-                    raise CursorExpiredError("the search cursor expired")
+                    raise CursorExpiredError(
+                        "the search cursor expired at https://private.invalid/?token=fake-secret"
+                    )
 
     vectors = LanceVectorStore(data_dir / "vectors")
     await vectors.ensure_ready(HashEmbedder().fingerprint)
@@ -1060,6 +1062,8 @@ async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
     assert after_failure["last_synced_at"] is None
     assert after_failure["last_run"]["outcome"] == "incomplete"
     assert after_failure["last_run"]["watermark_advanced"] is False
+    assert "fake-secret" not in str(after_failure)
+    assert "private.invalid" not in failed.error
 
     connector.expires = False
     completed = await pipeline.run(connector)
@@ -1129,6 +1133,45 @@ async def test_acquire_only_promotes_then_an_ordinary_sync_resumes_entirely_offl
     assert not resumed.pending_derivation
     assert len(await store.list_documents()) == 3
     assert await store.latest_unsettled_acquisition_run(connector.name) is None
+
+    reused = await pipeline.run(connector)
+    lifecycle = reused.lifecycle_metadata()
+    assert tuple(connector.fetches) == source_calls
+    assert lifecycle["acquired_items"] == 0
+    assert lifecycle["reused_items"] == 3
+    await vectors.teardown()
+
+
+async def test_acquire_only_never_derives_a_strict_incomplete_snapshot_prefix(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """One retained member cannot escape before strict snapshot promotion succeeds."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(
+        store,
+        vectors,
+        blobs=BlobStore(engine, data_dir),
+        durable_acquisition=True,
+    )
+    connector = fakes.DictConnector(
+        {"accepted": "retained body", "refused": "private body"}, name="strict-acquire-only"
+    )
+    connector.fail_fetch.add("refused")
+
+    report = await pipeline.run(connector, acquire_only=True)
+    unsettled = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert report.snapshot_omissions == 1
+    assert report.retry_required
+    assert report.pending_derivation
+    assert not report.derivation_deferred
+    assert report.indexed == 0
+    assert await store.list_documents() == []
+    assert unsettled is not None
+    assert unsettled.state is AcquisitionRunState.ACQUIRING
     await vectors.teardown()
 
 

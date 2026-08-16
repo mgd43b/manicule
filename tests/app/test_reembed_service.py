@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from manicule.app.dispatch import run_op
 from manicule.app.service import ApplicationService
 from manicule.core.errors import UnknownEntityError
 from manicule.ingest.reembed import ReembedState
@@ -63,3 +64,21 @@ async def test_resume_abandon_cleanup_and_missing_status_have_typed_semantics() 
 
     with pytest.raises(UnknownEntityError, match="no durable re-embedding run"):
         await service.reembed_status("missing")
+
+
+async def test_failed_reembed_execution_is_not_a_success_envelope() -> None:
+    backend = FakeBackend()
+    service = ApplicationService(backend)
+    started = await service.reembed_start("service-failed-envelope")
+    await service.reembed_abandon(started.run_id)
+
+    envelope = await run_op(
+        "reembed_resume",
+        service.workspace,
+        lambda: service.reembed_status(started.run_id),
+    )
+
+    assert envelope.ok is False
+    assert envelope.error is not None
+    assert envelope.error.type == "ReembedLifecycleError"
+    assert envelope.data is None

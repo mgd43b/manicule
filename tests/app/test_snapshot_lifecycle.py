@@ -97,3 +97,21 @@ def test_verify_is_read_only_aggregate_and_contains_no_manifest_member_detail() 
     rendered = str(result).lower()
     for private in ("source_id", "uri", "title", "body", "secret", "token="):
         assert private not in rendered
+
+
+def test_corrupt_verify_is_a_failed_envelope_on_http_and_mcp() -> None:
+    backend = _backend()
+    backend.ingestion_.snapshot_verified = False
+    service = ApplicationService(backend)
+    mcp = build_server(service)
+    tool = asyncio.run(mcp.call_tool("snapshot_verify", {"snapshot_id": "snapshot-aggregate-1"}))
+
+    with client_for(backend) as client:
+        response = client.get("/api/v1/admin/snapshots/snapshot-aggregate-1/verify")
+
+    http = cast("dict[str, Any]", response.json())
+    result = cast("dict[str, Any]", tool.structured_content)
+    assert response.status_code >= 400
+    assert http["ok"] is result["ok"] is False
+    assert cast("dict[str, Any]", http["error"])["type"] == "SnapshotVerificationError"
+    assert cast("dict[str, Any]", result["error"])["type"] == "SnapshotVerificationError"
