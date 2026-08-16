@@ -116,6 +116,7 @@ class SyncBody(Body):
     """A request to run one configured connector."""
 
     limit: int | None = Field(default=None, ge=1)
+    acquire_only: bool = False
 
 
 __all__ = [

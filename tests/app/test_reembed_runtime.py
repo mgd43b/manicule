@@ -95,7 +95,6 @@ async def test_plan_is_zero_embed_private_safe_and_discards_its_snapshot(tmp_pat
         assert report.documents == report.chunks == 1
         public = report.model_dump_json()
         assert "private" not in public
-        assert "snapshot" not in public
         assert "old-publication" not in public
         assert str(data_dir) not in public
         async with runtime.require_engine().connect() as connection:

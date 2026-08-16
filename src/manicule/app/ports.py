@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
     from manicule.app.results import ApiKeySummary, Check
     from manicule.config.settings import Settings
+    from manicule.core.acquisition import AcquisitionRun
     from manicule.core.content import Chunk, Document, DocumentStatus
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.fingerprints import GlossaryFingerprint
@@ -149,7 +150,12 @@ class Ingesting(Protocol):
         ...
 
     async def sync(
-        self, connector: str, *, limit: int | None = None, watching: Watching | None = None
+        self,
+        connector: str,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+        acquire_only: bool = False,
     ) -> RunReport:
         """Run one configured connector.
 
@@ -176,6 +182,10 @@ class Ingesting(Protocol):
                 translate it; the container raises it.
         """
         ...
+
+    async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None: ...
+
+    async def snapshot_verify(self, run_id: str) -> tuple[AcquisitionRun, bool] | None: ...
 
     async def reembed_plan(self) -> tuple[ReembedPlan, str, int]: ...
 

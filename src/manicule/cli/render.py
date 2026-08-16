@@ -442,6 +442,8 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     table.add_row("enumeration completed", "yes" if payload.enumeration_completed else "no")
     table.add_row("watermark advanced", "yes" if payload.watermark_advanced else "no")
     table.add_row("retry required", "yes" if payload.retry_required else "no")
+    if payload.derivation_deferred:
+        table.add_row("derivation deferred", "yes (snapshot retained locally)")
     if payload.expanded:
         table.add_row("found inside others", str(payload.expanded))
     for status, count in sorted(payload.by_status.items()):
@@ -875,6 +877,20 @@ def render_connector_signed_in(out: Console, payload: r.ConnectorSignedIn) -> No
     out.print(f"  manicule will use it until {escape(payload.expires_at)}")
 
 
+def render_snapshot_status(out: Console, payload: r.SnapshotStatusReport) -> None:
+    """Render only aggregate manifest facts; member identities never reach the payload."""
+    progress = payload.lifecycle
+    out.print(
+        f"[bold]{escape(payload.state)}[/bold] {escape(payload.snapshot_id)} "
+        f"({progress.acquired_items}/{progress.enumerated_items} acquired)"
+    )
+    out.print(
+        f"verified: {'yes' if payload.verified else 'no'}; "
+        f"promoted: {'yes' if progress.snapshot_promoted else 'no'}; "
+        f"offline continuation: {'yes' if progress.can_continue_offline else 'no'}"
+    )
+
+
 def render_collection(out: Console, payload: r.CollectionSummary) -> None:
     out.print(f"[bold]{escape(payload.name)}[/bold] [dim]{escape(payload.id)}[/dim]")
     if payload.description:
@@ -985,6 +1001,9 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
         out, _as(r.ReembedCleanupReport, p)
     ),
     r.IngestReport: lambda out, p: render_ingest(out, _as(r.IngestReport, p)),
+    r.SnapshotStatusReport: lambda out, p: render_snapshot_status(
+        out, _as(r.SnapshotStatusReport, p)
+    ),
     r.IndexStatus: lambda out, p: render_index_status(out, _as(r.IndexStatus, p)),
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),
     r.Diagnosis: lambda out, p: render_diagnosis(out, _as(r.Diagnosis, p)),

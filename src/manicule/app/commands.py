@@ -270,7 +270,10 @@ BINDERS: Mapping[str, Binder] = {
         args.optional_path("root"), source=args.text("source"), force=args.flag("force")
     ),
     "connector_sync": lambda service, args, report: service.connector_sync(
-        args.text("name"), limit=args.optional_count("limit"), watching=report
+        args.text("name"),
+        limit=args.optional_count("limit"),
+        watching=report,
+        acquire_only=args.flag("acquire_only"),
     ),
     "document_delete": lambda service, args, report: service.document_delete(
         args.text("document_id"), hard=args.flag("hard")

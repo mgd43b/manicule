@@ -30,6 +30,7 @@ from manicule.app.ports import (
 from manicule.app.results import ApiKeySummary, Check
 from manicule.app.tenancy import belongs_to
 from manicule.config.settings import Settings
+from manicule.core.acquisition import AcquisitionRun
 from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
 from manicule.core.embedding import IndexFingerprints
@@ -775,12 +776,15 @@ class FakeIngestion:
     report: RunReport = field(default_factory=lambda: RunReport(connector="local", discovered=1))
     paths: list[Path] = field(default_factory=list[Path])
     synced: list[str] = field(default_factory=list[str])
+    sync_acquire_only: list[bool] = field(default_factory=list[bool])
     reindexed: list[str] = field(default_factory=list[str])
     reembed_runs: dict[str, ReembedRun] = field(default_factory=dict[str, ReembedRun])
     reembed_recoveries: int = 0
     reembed_recovery_outcome: ReembedRecovery | None = None
     imported: list[Path] = field(default_factory=list[Path])
     connectors: dict[str, object] = field(default_factory=dict[str, object])
+    snapshot: AcquisitionRun | None = None
+    snapshot_verified: bool = True
     """Constructed connectors, by instance name, for :meth:`connector`.
 
     Deliberately populated by the test with an object built through the **real** factory rather
@@ -850,10 +854,16 @@ class FakeIngestion:
     """
 
     async def sync(
-        self, connector: str, *, limit: int | None = None, watching: Watching | None = None
+        self,
+        connector: str,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+        acquire_only: bool = False,
     ) -> RunReport:
         del limit
         self.synced.append(connector)
+        self.sync_acquire_only.append(acquire_only)
         if self.failure is not None:
             raise self.failure
         if watching is not None:
@@ -875,6 +885,16 @@ class FakeIngestion:
             msg = f"no connector named {name!r} in configuration"
             raise UnknownComponentError(msg)
         return built
+
+    async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
+        if self.snapshot is None or self.snapshot.connector != connector:
+            return None
+        return self.snapshot, False
+
+    async def snapshot_verify(self, run_id: str) -> tuple[AcquisitionRun, bool] | None:
+        if self.snapshot is None or self.snapshot.id != run_id:
+            return None
+        return self.snapshot, self.snapshot_verified
 
     async def reindex(self, document_id: str) -> ReindexReport:
         self.reindexed.append(document_id)

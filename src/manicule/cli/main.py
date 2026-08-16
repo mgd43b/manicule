@@ -601,6 +601,8 @@ PAYLOADS: dict[str, type[Payload]] = {
     "lifecycle_delete_snapshot": r.LifecycleReport,
     "doctor": r.Diagnosis,
     "connector_list": r.ConnectorList,
+    "snapshot_status": r.SnapshotStatusReport,
+    "snapshot_verify": r.SnapshotStatusReport,
     "connector_login": r.ConnectorSignedIn,
     "connector_sidecar": r.SidecarReport,
     "connector_sync": r.IngestReport,
@@ -1133,9 +1135,37 @@ def connector_list() -> None:
 def connector_sync(
     name: Annotated[str, typer.Argument(help="The configured source's name.")],
     limit: Annotated[int | None, typer.Option(help="Stop after this many documents.")] = None,
+    acquire_only: Annotated[
+        bool,
+        typer.Option(
+            "--acquire-only",
+            help="Promote retained source bytes and stop before local derivation.",
+        ),
+    ] = False,
 ) -> None:
     """Run one configured connector."""
-    submit(Command("connector_sync", {"name": name, "limit": limit}))
+    submit(
+        Command(
+            "connector_sync",
+            {"name": name, "limit": limit, "acquire_only": acquire_only},
+        )
+    )
+
+
+@connector_app.command("snapshot")
+def connector_snapshot(
+    name: Annotated[str, typer.Argument(help="The configured source's name.")],
+) -> None:
+    """Show aggregate status for the source's active durable snapshot."""
+    emit("snapshot_status", lambda service: service.snapshot_status(name))
+
+
+@connector_app.command("verify")
+def connector_verify(
+    snapshot_id: Annotated[str, typer.Argument(help="Opaque snapshot id from snapshot status.")],
+) -> None:
+    """Verify a durable snapshot manifest without reading source content."""
+    emit("snapshot_verify", lambda service: service.snapshot_verify(snapshot_id))
 
 
 @connector_app.command("sidecar")

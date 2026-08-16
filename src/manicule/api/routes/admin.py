@@ -182,6 +182,26 @@ async def query_logs(
     )
 
 
+@router.get(
+    "/connectors/{name}/snapshot",
+    name="snapshot_status",
+    summary="Aggregate status of a connector's active durable snapshot.",
+)
+async def snapshot_status(service: Service, caller: AdminPrincipal, name: str) -> Response:
+    del caller
+    return await respond("snapshot_status", service, lambda: service.snapshot_status(name))
+
+
+@router.get(
+    "/snapshots/{snapshot_id}/verify",
+    name="snapshot_verify",
+    summary="Verify one workspace-owned durable snapshot manifest.",
+)
+async def snapshot_verify(service: Service, caller: AdminPrincipal, snapshot_id: str) -> Response:
+    del caller
+    return await respond("snapshot_verify", service, lambda: service.snapshot_verify(snapshot_id))
+
+
 @router.get("/audit-logs", name="audit_log", summary="The audit trail, newest first.")
 async def audit_logs(
     service: Service,
@@ -255,7 +275,9 @@ async def sync_connector(
     """
     del caller
     return await respond(
-        "connector_sync", service, lambda: service.connector_sync(name, limit=body.limit)
+        "connector_sync",
+        service,
+        lambda: service.connector_sync(name, limit=body.limit, acquire_only=body.acquire_only),
     )
 
 

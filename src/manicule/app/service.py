@@ -22,6 +22,7 @@ structured content are the same bytes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -31,7 +32,7 @@ import secrets
 import time
 import tomllib
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
     from manicule.connectors.enriched import EnrichedProfile
     from manicule.connectors.filesystem import FilesystemConnector
     from manicule.connectors.sessions import SessionStore
+    from manicule.core.acquisition import AcquisitionRun
     from manicule.core.content import Chunk, Document
     from manicule.core.organization import Collection, Tag
     from manicule.core.retrieval import Confidence
@@ -136,6 +138,14 @@ def _reembed_run_report(run: ReembedRun) -> r.ReembedRunReport:
         ReembedState.SUPERSEDED,
         ReembedState.FAILED,
     }
+    target_identity = hashlib.sha256(run.commitment.target_fingerprint.encode("utf-8")).hexdigest()
+    failed = run.state in {ReembedState.SUPERSEDED, ReembedState.FAILED}
+    lifecycle_outcome: r.LifecycleOutcome = (
+        "complete" if run.state is ReembedState.PUBLISHED else "failed" if failed else "running"
+    )
+    lifecycle_phase: r.LifecyclePhase = (
+        "complete" if run.state is ReembedState.PUBLISHED else "failed" if failed else "reembedding"
+    )
     return r.ReembedRunReport(
         run_id=run.id,
         state=run.state.value,
@@ -147,10 +157,89 @@ def _reembed_run_report(run: ReembedRun) -> r.ReembedRunReport:
         retry_required=not terminal,
         terminal=terminal,
         published=run.state is ReembedState.PUBLISHED,
-        target_identity=hashlib.sha256(
-            run.commitment.target_fingerprint.encode("utf-8")
-        ).hexdigest(),
+        target_identity=target_identity,
         target_dimension=run.commitment.target_dimension,
+        lifecycle=r.LifecycleProgress(
+            phase=lifecycle_phase,
+            outcome=lifecycle_outcome,
+            enumerated_items=plan.chunks,
+            acquired_items=run.workspace_chunks_completed,
+            pending_items=0 if terminal else remaining_chunks,
+            source_generation_identity=hashlib.sha256(
+                run.commitment.snapshot.live.generation_id.encode("utf-8")
+            ).hexdigest(),
+            derived_generation_identity=target_identity,
+            can_continue_offline=True,
+            estimated_remaining_items=0 if terminal else remaining_chunks,
+            estimated_remaining_seconds=(0 if terminal else remaining_chunks * seconds_per_chunk),
+        ),
+    )
+
+
+def _snapshot_status_report(
+    run: AcquisitionRun, verified: bool, *, verification_performed: bool
+) -> r.SnapshotStatusReport:
+    """Project a private manifest onto the aggregate surface contract."""
+    from manicule.core.acquisition import AcquisitionRunState  # noqa: PLC0415
+
+    pending = max(0, run.acquired_count - run.indexed_count - run.unchanged_count)
+    corrupt = verification_performed and run.acquisition_completed_at is not None and not verified
+    terminal = run.state is AcquisitionRunState.SETTLED
+    phase: r.LifecyclePhase = (
+        "failed"
+        if corrupt
+        else "complete"
+        if terminal
+        else "rebuilding"
+        if run.state is AcquisitionRunState.INDEXING
+        else "acquiring"
+    )
+    outcome: r.LifecycleOutcome = (
+        "failed"
+        if corrupt
+        else "complete"
+        if terminal
+        else "incomplete"
+        if run.diagnostic is not None
+        else "running"
+    )
+    age = (
+        float(max(0, int((datetime.now(UTC) - run.updated_at).total_seconds())))
+        if pending and not terminal and not corrupt
+        else None
+    )
+    return r.SnapshotStatusReport(
+        connector=run.connector,
+        snapshot_id=run.id,
+        state=run.state.value,
+        verified=verified,
+        verification_performed=verification_performed,
+        lifecycle=r.LifecycleProgress(
+            phase=phase,
+            outcome=outcome,
+            enumerated_items=run.discovered_count,
+            acquired_items=run.acquired_count,
+            reused_items=run.unchanged_count,
+            omitted_items=run.omission_count,
+            failed_items=run.retry_count,
+            pending_items=0 if terminal or corrupt else pending,
+            snapshot_completeness=run.completeness.value if run.completeness else "",
+            reproducibility_policy=run.promotion_policy.value,
+            snapshot_identity=run.id,
+            snapshot_promoted=run.promoted_at is not None,
+            source_generation_identity=run.membership_hash or "",
+            candidate_watermark_present=run.candidate_watermark is not None,
+            committed_watermark_present=run.watermark_committed_at is not None,
+            backlog_items=0 if terminal or corrupt else pending,
+            backlog_bytes=0 if terminal or corrupt else run.acquired_blob_bytes,
+            oldest_backlog_age_seconds=age,
+            can_continue_offline=(
+                run.promoted_at is not None
+                and bool(run.membership_hash)
+                and (verified or not verification_performed)
+            ),
+            estimated_remaining_items=0 if terminal or corrupt else pending,
+        ),
     )
 
 
@@ -745,7 +834,12 @@ class ApplicationService:
         )
 
     async def connector_sync(
-        self, name: str, *, limit: int | None = None, watching: Watching | None = None
+        self,
+        name: str,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+        acquire_only: bool = False,
     ) -> r.IngestReport:
         """Run one configured connector.
 
@@ -777,7 +871,9 @@ class ApplicationService:
             )
             raise PolicyError(msg)
         ingestion = await self._backend.ingestion()
-        report = await ingestion.sync(name, limit=limit, watching=watching)
+        report = await ingestion.sync(
+            name, limit=limit, watching=watching, acquire_only=acquire_only
+        )
         return _ingest_payload(report, started)
 
     async def connector_login(
@@ -984,6 +1080,13 @@ class ApplicationService:
             )
             raw_enumeration_completed = last_run.get("enumeration_completed")
             raw_watermark_advanced = last_run.get("watermark_advanced")
+            raw_lifecycle = last_run.get("lifecycle")
+            last_lifecycle: r.LifecycleProgress | None = None
+            if isinstance(raw_lifecycle, dict):
+                # Connector metadata is diagnostic history and may predate this contract. One
+                # malformed old status must not hide the configured connector itself.
+                with contextlib.suppress(ValidationError):
+                    last_lifecycle = r.LifecycleProgress.model_validate(raw_lifecycle)
             summaries.append(
                 r.ConnectorSummary(
                     name=name,
@@ -1004,9 +1107,30 @@ class ApplicationService:
                     last_watermark_advanced=(
                         raw_watermark_advanced if isinstance(raw_watermark_advanced, bool) else None
                     ),
+                    last_lifecycle=last_lifecycle,
                 )
             )
         return r.ConnectorList(count=len(summaries), connectors=tuple(summaries))
+
+    async def snapshot_status(self, connector: str) -> r.SnapshotStatusReport:
+        """Read aggregate state for the active durable snapshot of one configured source."""
+        if connector not in self.settings.connectors:
+            raise UnknownEntityError(f"no connector named {connector!r}")
+        ingestion = await self._backend.ingestion()
+        found = await ingestion.snapshot_status(connector)
+        if found is None:
+            raise UnknownEntityError("this connector has no durable source snapshot")
+        run, verified = found
+        return _snapshot_status_report(run, verified, verification_performed=False)
+
+    async def snapshot_verify(self, run_id: str) -> r.SnapshotStatusReport:
+        """Verify one workspace-owned manifest without exposing any member identity."""
+        ingestion = await self._backend.ingestion()
+        found = await ingestion.snapshot_verify(run_id)
+        if found is None:
+            raise UnknownEntityError("no durable source snapshot has that id")
+        run, verified = found
+        return _snapshot_status_report(run, verified, verification_performed=True)
 
     async def connector_sidecar(
         self,
@@ -1302,6 +1426,17 @@ class ApplicationService:
             unrepairable_documents=plan.unrepairable_documents,
             target_identity=target_identity,
             target_dimension=target_dimension,
+            lifecycle=r.LifecycleProgress(
+                phase="complete",
+                outcome="complete",
+                dry_run=True,
+                enumerated_items=plan.chunks,
+                failed_items=plan.unrepairable_documents,
+                derived_generation_identity=target_identity,
+                can_continue_offline=True,
+                estimated_remaining_items=plan.chunks,
+                estimated_remaining_seconds=plan.estimated_seconds,
+            ),
         )
 
     async def reembed_start(self, run_id: str) -> r.ReembedRunReport:
@@ -4879,6 +5014,12 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
                 else "Run the same ingest operation again; its watermark was not advanced."
             ),
         )
+    elapsed_ms = _millis(started)
+    lifecycle = r.LifecycleProgress.model_validate(report.lifecycle_metadata()).model_copy(
+        update={
+            "rate_items_per_second": (report.discovered * 1000 / elapsed_ms if elapsed_ms else 0)
+        }
+    )
     return r.IngestReport(
         connector=report.connector,
         discovered=report.discovered,
@@ -4895,10 +5036,12 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         snapshot_omissions=report.snapshot_omissions,
         snapshot_omission_reasons=dict(report.snapshot_omission_reasons),
         retry_required=incomplete,
+        derivation_deferred=report.derivation_deferred,
         intentionally_bounded=bounded,
         unrecorded=report.unrecorded,
         incomplete_reason=reason,
-        elapsed_ms=_millis(started),
+        elapsed_ms=elapsed_ms,
+        lifecycle=lifecycle,
     )
 
 

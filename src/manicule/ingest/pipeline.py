@@ -443,8 +443,14 @@ class RunReport:
     watermark_advanced: bool = False
     """Whether this run persisted a new connector position."""
 
+    candidate_watermark_present: bool | None = None
+    """Whether a completed enumeration supplied a native candidate position."""
+
     pending_derivation: bool = False
     """Whether retained local work remains after this invocation returned normally."""
+
+    derivation_deferred: bool = False
+    """Whether pending derivation was the requested acquire-only terminal outcome."""
 
     snapshot_completeness: Literal["", "complete", "partial"] = ""
     snapshot_omissions: int = 0
@@ -479,7 +485,10 @@ class RunReport:
             self.snapshot_omissions > 0 and self.snapshot_completeness != "partial"
         )
         return bool(
-            self.error or self.unrecorded or self.pending_derivation or strict_snapshot_incomplete
+            self.error
+            or self.unrecorded
+            or (self.pending_derivation and not self.derivation_deferred)
+            or strict_snapshot_incomplete
         )
 
     def record(self, outcome: DocumentOutcome, *, expanded: bool = False) -> None:
@@ -571,9 +580,85 @@ class RunReport:
                 "snapshot_omissions": self.snapshot_omissions,
                 "snapshot_omission_reasons": dict(self.snapshot_omission_reasons),
                 "retry_required": self.retry_required,
+                "derivation_deferred": self.derivation_deferred,
                 "glossary_failures": list(self.glossary_failures),
                 "stages": self.stages.as_metadata(),
+                "lifecycle": self.lifecycle_metadata(),
             }
+        }
+
+    def lifecycle_metadata(self) -> Metadata:
+        """Aggregate lifecycle facts safe for connector metadata and scheduler status.
+
+        This deliberately returns plain metadata rather than importing the application result
+        model into ingest. The service validates the same closed shape before exposing it.
+        """
+        accepted = self.stages.accepted
+        failed = self.by_status.get(DocumentStatus.FAILED.value, 0)
+        pending = (
+            max(0, accepted - self.indexed - self.skipped_version - self.skipped_hash)
+            if self.pending_derivation
+            else self.unrecorded
+            + (self.snapshot_omissions if self.snapshot_completeness != "partial" else 0)
+        )
+        capacity = self.capacity_refusal
+        refusal: Metadata | None = None
+        if capacity is not None:
+            refusal = {
+                "code": "capacity",
+                "count": 1,
+                "resource": capacity.resource.value,
+                "limit": capacity.limit,
+                "used": capacity.used,
+                "requested": capacity.requested,
+            }
+        return {
+            "phase": (
+                "rebuilding"
+                if self.pending_derivation
+                else "acquiring"
+                if self.retry_required
+                else "complete"
+            ),
+            "outcome": (
+                "refused"
+                if capacity is not None
+                else "incomplete"
+                if self.retry_required
+                else "deferred"
+                if self.derivation_deferred
+                else "bounded"
+                if self.limited
+                else "complete"
+            ),
+            "dry_run": False,
+            "enumerated_items": self.discovered,
+            "acquired_items": max(0, accepted - self.snapshot_omissions),
+            "reused_items": self.skipped_version + self.skipped_hash,
+            "omitted_items": self.snapshot_omissions,
+            "failed_items": failed,
+            "pending_items": pending,
+            "snapshot_completeness": self.snapshot_completeness,
+            "reproducibility_policy": (
+                "allow_omissions" if self.snapshot_completeness == "partial" else ""
+            ),
+            "snapshot_identity": "",
+            "snapshot_promoted": bool(self.snapshot_completeness),
+            "source_generation_identity": "",
+            "derived_generation_identity": "",
+            "candidate_watermark_present": self.candidate_watermark_present,
+            "committed_watermark_present": self.watermark_advanced,
+            "backlog_items": pending,
+            "backlog_bytes": 0,
+            "oldest_backlog_age_seconds": None,
+            "can_continue_offline": (
+                self.pending_derivation
+                or (bool(self.snapshot_completeness) and self.snapshot_omissions == 0)
+            ),
+            "rate_items_per_second": 0,
+            "estimated_remaining_items": pending,
+            "estimated_remaining_seconds": 0,
+            "refusal": refusal,
         }
 
 
@@ -628,6 +713,7 @@ class _Sync:
     connector: Connector
     report: RunReport
     limit: int | None
+    acquire_only: bool
     watermark: Watermark | None
     refs: Conveyor[DiscoveredDoc | AcquisitionRecord]
     """Journal reader to fetch. Carries references, so depth costs metadata rather than bodies."""
@@ -848,7 +934,7 @@ class IngestPipeline:
         acquisitions = self._acquisitions
         if acquisitions is None:
             return _AcquisitionStart(watermark=watermark)
-        source_scope, scope_fingerprint = _snapshot_scope(connector)
+        source_scope, scope_fingerprint = snapshot_scope(connector)
         owner = f"pipeline:{uuid4().hex}"
         now = self._acquisition_clock()
         claimed = await acquisitions.claim_or_create_acquisition_run(
@@ -899,6 +985,7 @@ class IngestPipeline:
         *,
         limit: int | None = None,
         watching: Watching | None = None,
+        acquire_only: bool = False,
     ) -> RunReport:
         """Ingest everything a connector reports as changed since its watermark.
 
@@ -961,7 +1048,7 @@ class IngestPipeline:
                 )
         report = RunReport(connector=connector.name)
         if self._acquisitions is not None:
-            _, scope_fingerprint = _snapshot_scope(connector)
+            _, scope_fingerprint = snapshot_scope(connector)
             watermark = await self._acquisitions.get_acquisition_watermark(
                 connector.name, scope_fingerprint
             )
@@ -980,6 +1067,7 @@ class IngestPipeline:
             connector=connector,
             report=report,
             limit=limit,
+            acquire_only=acquire_only,
             watching=watching,
             watermark=acquisition.watermark,
             refs=Conveyor(
@@ -1015,6 +1103,8 @@ class IngestPipeline:
             run.report.snapshot_omission_reasons = {
                 code.value: count for code, count in run.snapshot_omission_reasons.items()
             }
+        if run.resume_completed:
+            run.report.candidate_watermark_present = run.candidate_watermark is not None
         # Peaks only. The active counts belong to whoever is inside the stage right now, and a
         # second operation sharing this pipeline is one of them.
         for gauge in (self._fetches, self._parsing, self._embedding.gauge):
@@ -1122,7 +1212,9 @@ class IngestPipeline:
         refs, bodies = run.refs, run.bodies
         await self._run_local_stages(run, producer, refs, bodies)
 
-    async def _drive_durable(self, run: _Sync) -> None:  # noqa: PLR0912 - durable state machine
+    async def _drive_durable(  # noqa: PLR0911, PLR0912, PLR0915 - durable state machine
+        self, run: _Sync
+    ) -> None:
         """Acquire a source snapshot first, then derive only from retained local bytes."""
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover - selected structurally
@@ -1149,6 +1241,10 @@ class IngestPipeline:
                     return
                 if not acquired:
                     await self._report_snapshot_omissions(run)
+                if run.acquire_only:
+                    await self._mark_pending_derivation(run, acquisitions)
+                    run.report.derivation_deferred = run.report.pending_derivation
+                    return
                 await owned(self._index_acquired(run), "journal-indexing")
                 await self._mark_pending_derivation(run, acquisitions)
                 return
@@ -1199,6 +1295,14 @@ class IngestPipeline:
                     now=now,
                 )
                 run.acquisition_state = AcquisitionRunState.INDEXING
+
+        if run.acquire_only and run.acquisition_state is AcquisitionRunState.INDEXING:
+            # The promoted manifest and committed watermark are the acquire-only result. Leave
+            # the run in INDEXING so an ordinary subsequent sync resumes exclusively from its
+            # retained bytes; no connector discovery or fetch is needed for that transition.
+            run.report.pending_derivation = True
+            run.report.derivation_deferred = True
+            return
 
         await owned(self._index_acquired(run), "journal-indexing")
         if run.acquisition_state is AcquisitionRunState.INDEXING and not run.stop.is_set():
@@ -1419,6 +1523,7 @@ class IngestPipeline:
                     now=now,
                 )
                 run.candidate_watermark = completed.candidate_watermark
+                run.report.candidate_watermark_present = completed.candidate_watermark is not None
                 run.report.enumeration_completed = True
         except Exception as exc:  # noqa: BLE001 - an enumeration/admission failure is reported
             if isinstance(exc, CapacityRefusedError):
@@ -3627,7 +3732,7 @@ def _raise_lost_acquisition_lease(run_id: str) -> None:
     raise AcquisitionLeaseLostError(msg)
 
 
-def _snapshot_scope(connector: Connector) -> tuple[str, str]:
+def snapshot_scope(connector: Connector) -> tuple[str, str]:
     """Read a connector's non-secret scope identity, with a safe whole-instance default."""
     declared = getattr(connector, "source_scope", None)
     source_scope = (

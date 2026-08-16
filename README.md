@@ -358,7 +358,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
 | `src/manicule/cli` | Twenty-two commands over that service, and nothing else |
-| `src/manicule/mcp` | Thirty-three MCP tools over that service, and nothing else |
+| `src/manicule/mcp` | Thirty-five MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |

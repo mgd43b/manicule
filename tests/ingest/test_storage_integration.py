@@ -78,10 +78,13 @@ def _pipeline(
     vectors: LanceVectorStore,
     blobs: BlobStore | None = None,
     embedder: HashEmbedder | None = None,
+    *,
+    durable_acquisition: bool = False,
 ) -> IngestPipeline:
     chunker = fakes.BlockChunker()
     return IngestPipeline(
         store=docs,
+        acquisitions=docs if durable_acquisition else None,
         chunker=chunker,
         embedder=embedder or HashEmbedder(),
         vectors=vectors,
@@ -1073,27 +1076,85 @@ async def test_cursor_expiry_preserves_sync_metadata_until_one_complete_retry(
     await vectors.teardown()
 
 
-async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(
+async def test_acquire_only_promotes_then_an_ordinary_sync_resumes_entirely_offline(
     store: SqliteDocStore,
     engine: AsyncEngine,
     data_dir: Path,
 ) -> None:
-    """A 100-record source reaches its true end while embedding is still parked.
+    """Acquire-only is a durable boundary, not a mode that loses the local second half."""
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    pipeline = _pipeline(
+        store,
+        vectors,
+        blobs=BlobStore(engine, data_dir),
+        durable_acquisition=True,
+    )
+
+    class SnapshotConnector(fakes.DictConnector):
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return Watermark(value="snapshot-3", observed_at=datetime(2026, 8, 15, tzinfo=UTC))
+
+    connector = SnapshotConnector(
+        {
+            "page-0001": "synthetic alpha",
+            "page-0002": "synthetic beta",
+            "page-0003": "synthetic gamma",
+        },
+        name="synthetic-wiki",
+    )
+
+    acquired = await pipeline.run(connector, acquire_only=True)
+    source_calls = tuple(connector.fetches)
+    promoted = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert acquired.enumeration_completed
+    assert acquired.watermark_advanced
+    assert acquired.snapshot_completeness == "complete"
+    assert acquired.pending_derivation
+    assert acquired.derivation_deferred
+    assert not acquired.retry_required
+    assert acquired.lifecycle_metadata()["outcome"] == "deferred"
+    assert acquired.indexed == 0
+    assert len(source_calls) == 3
+    assert promoted is not None
+    assert promoted.state is AcquisitionRunState.INDEXING
+
+    resumed = await pipeline.run(connector)
+
+    assert tuple(connector.fetches) == source_calls
+    assert resumed.indexed == 3
+    assert not resumed.pending_derivation
+    assert len(await store.list_documents()) == 3
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
+    await vectors.teardown()
+
+
+async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(  # noqa: PLR0915 - one end-to-end evidence record
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The 1,000-document/500 ms acceptance cursor is drained before derivation.
 
     Ten synthetic page responses each take 19 ms on a manual clock, below the 500 ms cursor
     lifetime. Journal pages and both in-memory hand-offs are smaller than the corpus. The model
-    gate proves indexing has not drained anything to make enumeration succeed.
+    gate proves indexing has not drained anything to make enumeration succeed. All addresses use
+    the reserved ``wiki.example.test`` host and no wall clock or network participates.
     """
     clock = fakes.ManualClock()
     embedder = fakes.ClockedGatedEmbedder(clock, seconds_per_document=0.05)
     chunker = fakes.BlockChunker()
+    vectors = fakes.MemoryVectors()
     pipeline = IngestPipeline(
         store=store,
         acquisitions=store,
         blobs=BlobStore(engine, data_dir),
         chunker=chunker,
         embedder=embedder,
-        vectors=fakes.MemoryVectors(),
+        vectors=vectors,
         runner=InProcessRunner({"lines": fakes.LineParser()}),
         resolve_chain=lambda _: ["lines"],
         middleware=MiddlewareRunner(()),
@@ -1104,9 +1165,12 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
         detect_glossary=False,
     )
     connector = fakes.ExpiringCursorConnector(
-        {f"synthetic-doc-{number:04d}": f"public synthetic line {number}" for number in range(100)},
+        {
+            f"synthetic-doc-{number:04d}": f"public synthetic line {number}"
+            for number in range(1_000)
+        },
         clock=clock,
-        page_size=10,
+        page_size=100,
         cursor_lifetime_seconds=0.5,
         response_seconds=0.019,
     )
@@ -1114,15 +1178,18 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     task = asyncio.create_task(pipeline.run(connector))
     try:
         await connector.enumeration_completed.wait()
-        await embedder.gate.wait_for(1)
+        await embedder.gate.wait_for(1, patience_s=60)
 
         durable = await store.latest_unsettled_acquisition_run(connector.name)
         assert durable is not None
-        assert durable.discovered_count == 100
+        assert durable.discovered_count == 1_000
         assert durable.enumeration_completed_at is not None
         assert durable.candidate_watermark == connector.watermark
         assert connector.pages_requested == 10
         assert clock.now == pytest.approx(0.19)
+        assert connector.maximum_cursor_age_seconds == 0
+        enumeration_seconds = clock.now
+        source_calls_before_derivation = len(connector.fetches)
         assert len(await store.list_acquisition_records(durable.id, limit=3)) == 3
         assert await store.get_watermark(connector.name) == connector.watermark, (
             "source coverage is checkpointed before the parked embedder completes"
@@ -1136,8 +1203,11 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
 
     assert report.error_type == ""
     assert report.enumeration_completed
-    assert report.indexed == 100
-    assert len(indexed) == 100
+    assert report.indexed == 1_000
+    assert len(indexed) == 1_000
+    assert len(vectors.rows) == 1_000
+    assert len({row.document_id for row in vectors.rows.values()}) == 1_000
+    assert len(connector.fetches) == source_calls_before_derivation == 1_000
     assert report.watermark_advanced
     assert await store.get_watermark(connector.name) == connector.watermark
     assert report.stages.fetch_queue.capacity == 2
@@ -1148,8 +1218,38 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     settled = await store.get_acquisition_run(durable.id)
     assert settled is not None
     assert settled.state is AcquisitionRunState.SETTLED
-    records = await store.list_acquisition_records(durable.id)
+    records = [record async for record in store.iter_acquisition_records(durable.id)]
     assert {record.state for record in records} == {AcquisitionRecordState.SETTLED}
+    evidence = {
+        "documents": 1_000,
+        "cursor_lifetime_seconds": 0.5,
+        "enumeration_seconds": enumeration_seconds,
+        "maximum_cursor_age_seconds": connector.maximum_cursor_age_seconds,
+        "journal_records": len(records),
+        "body_requests": len(connector.fetches),
+        "source_calls_during_derivation": len(connector.fetches) - source_calls_before_derivation,
+        "unique_source_documents": len(indexed),
+        "unique_vectors": len(vectors.rows),
+        "watermark_committed": report.watermark_advanced,
+        "snapshot_completeness": report.snapshot_completeness,
+    }
+    assert evidence == {
+        "documents": 1_000,
+        "cursor_lifetime_seconds": 0.5,
+        "enumeration_seconds": pytest.approx(0.19),
+        "maximum_cursor_age_seconds": 0,
+        "journal_records": 1_000,
+        "body_requests": 1_000,
+        "source_calls_during_derivation": 0,
+        "unique_source_documents": 1_000,
+        "unique_vectors": 1_000,
+        "watermark_committed": True,
+        "snapshot_completeness": "complete",
+    }
+    rendered_evidence = json.dumps(evidence, sort_keys=True)
+    assert {"source_id", "uri", "title", "content", "secret"}.isdisjoint(evidence)
+    for private_value in ("wiki.example.test", "public synthetic line", "token="):
+        assert private_value not in rendered_evidence.lower()
 
 
 async def test_crash_during_enumeration_keeps_only_the_committed_prefix(

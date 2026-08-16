@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
     from pydantic import JsonValue
 
+    from manicule.app.results import LifecycleProgress
     from manicule.app.service import ApplicationService
     from manicule.connectors.sessions import SessionVault
 
@@ -284,6 +285,7 @@ class ScheduledSource:
     last_outcome: str = ""
     retry_required: bool = False
     last_error_type: str = ""
+    last_lifecycle: LifecycleProgress | None = None
 
 
 @dataclass(slots=True)
@@ -552,6 +554,7 @@ class Scheduler:
                 record.awaiting_sign_in = False
                 record.last_outcome = report.outcome
                 record.retry_required = report.retry_required
+                record.last_lifecycle = report.lifecycle
                 record.last_error_type = (
                     report.incomplete_reason.type if report.incomplete_reason is not None else ""
                 )

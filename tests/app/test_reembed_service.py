@@ -22,6 +22,12 @@ async def test_plan_and_run_reports_never_serialize_private_commitment_fields() 
     assert plan.chunks == status.chunks == 7
     assert status.state == ReembedState.PLANNED
     assert status.retry_required
+    assert plan.lifecycle.dry_run
+    assert plan.lifecycle.estimated_remaining_items == 7
+    assert status.lifecycle.phase == "reembedding"
+    assert status.lifecycle.outcome == "running"
+    assert status.lifecycle.pending_items == 7
+    assert status.lifecycle.can_continue_offline
     exposed = plan.model_dump_json() + status.model_dump_json()
     for private in (
         "private-snapshot",
@@ -43,11 +49,16 @@ async def test_resume_abandon_cleanup_and_missing_status_have_typed_semantics() 
     assert completed.published
     assert completed.terminal
     assert not completed.retry_required
+    assert completed.lifecycle.phase == "complete"
+    assert completed.lifecycle.outcome == "complete"
+    assert completed.lifecycle.pending_items == 0
 
     abandoned = await service.reembed_start("service-abandon")
     abandoned = await service.reembed_abandon(abandoned.run_id)
     assert abandoned.state == ReembedState.FAILED
     assert abandoned.terminal
+    assert abandoned.lifecycle.phase == "failed"
+    assert abandoned.lifecycle.outcome == "failed"
     assert (await service.reembed_cleanup(abandoned.run_id)).removed
 
     with pytest.raises(UnknownEntityError, match="no durable re-embedding run"):

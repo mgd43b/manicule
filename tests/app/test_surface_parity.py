@@ -108,12 +108,12 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_thirty_three_tools(service: ApplicationService) -> None:
-    """Thirty-three, named, and matching the declared surface."""
+def test_the_server_offers_exactly_thirty_five_tools(service: ApplicationService) -> None:
+    """Thirty-five, named, and matching the declared surface."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 33
+    assert len(offered) == 35
 
 
 def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
@@ -370,6 +370,20 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
         ("/ui/health", ("checks", 1, "detail")),
     ),
     ("connector_list", {}, ["connector", "list"], ("GET", "/api/v1/admin/connectors", {}), None),
+    (
+        "snapshot_status",
+        {"name": "missing-source"},
+        ["connector", "snapshot", "missing-source"],
+        ("GET", "/api/v1/admin/connectors/missing-source/snapshot", {}),
+        None,
+    ),
+    (
+        "snapshot_verify",
+        {"snapshot_id": "missing-snapshot"},
+        ["connector", "verify", "missing-snapshot"],
+        ("GET", "/api/v1/admin/snapshots/missing-snapshot/verify", {}),
+        None,
+    ),
     (
         "workspace_list",
         {},

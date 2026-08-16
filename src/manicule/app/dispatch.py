@@ -136,6 +136,8 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         "collection_counts",
         "collection_orphans",
         "connector_list",
+        "snapshot_status",
+        "snapshot_verify",
         "workspace_list",
         "auth_list_keys",
         # Reads of configuration and of what is installed. These touch no data directory at

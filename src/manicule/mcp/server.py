@@ -1,4 +1,4 @@
-"""The MCP server: thirty-three tools, each a few lines over the application service.
+"""The MCP server: thirty-five tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -214,6 +214,8 @@ TOOL_NAMES: tuple[str, ...] = (
     "stats",
     "doctor",
     "connector_list",
+    "snapshot_status",
+    "snapshot_verify",
     "connector_sync",
     "config_get",
     "config_set",
@@ -859,15 +861,39 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         """List configured sources, with what each one's last sync recorded."""
         return await dispatch("connector_list", service.connector_list)
 
+    @register.tool(READS)
+    async def snapshot_status(name: str) -> dict[str, Any]:
+        """Read aggregate status for a configured source's active durable snapshot.
+
+        Args:
+            name: The configured connector instance name.
+        """
+        return await dispatch("snapshot_status", lambda: service.snapshot_status(name))
+
+    @register.tool(READS)
+    async def snapshot_verify(snapshot_id: str) -> dict[str, Any]:
+        """Verify a workspace-owned snapshot manifest without returning its members.
+
+        Args:
+            snapshot_id: The opaque id returned by snapshot status.
+        """
+        return await dispatch("snapshot_verify", lambda: service.snapshot_verify(snapshot_id))
+
     @register.tool(hints(reads=False, removes=False, repeatable=False, reaches_out=True))
-    async def connector_sync(name: str, limit: int | None = None) -> dict[str, Any]:
+    async def connector_sync(
+        name: str, limit: int | None = None, acquire_only: bool = False
+    ) -> dict[str, Any]:
         """Run one configured connector, ingesting what changed since its watermark.
 
         Args:
             name: The instance name from the ``connectors`` section of configuration.
             limit: Stop after this many discovered documents.
+            acquire_only: Promote the retained snapshot and leave derivation for a later resume.
         """
-        return await dispatch("connector_sync", lambda: service.connector_sync(name, limit=limit))
+        return await dispatch(
+            "connector_sync",
+            lambda: service.connector_sync(name, limit=limit, acquire_only=acquire_only),
+        )
 
     # --- configuration --------------------------------------------------------------------
 
@@ -991,6 +1017,8 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             stats,
             doctor,
             connector_list,
+            snapshot_status,
+            snapshot_verify,
             connector_sync,
             config_get,
             config_set,

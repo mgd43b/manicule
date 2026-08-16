@@ -855,6 +855,14 @@ authentication loss afterwards cannot block parsing, embedding or publication be
 phases make no connector calls. Missing, stale and deleted source bodies likewise remain typed
 acquisition retries and cannot publish older bytes.
 
+`connector sync --acquire-only` stops at that exact durable boundary. A complete or
+policy-accepted partial manifest is promoted and its candidate watermark is committed, the run
+remains in `INDEXING`, and the result says local derivation is pending and can continue offline.
+Running ordinary `connector sync` again claims that run and drains the retained envelopes before
+it considers a new enumeration; the acquisition test records the source call count on both sides
+of the resume and requires it not to move. This is a mode of the existing configured connector,
+not a second crawler or an export path.
+
 First indexing, offline-snapshot indexing and re-parse all enter the same derivation function
 with a retained reference. That function parses the bytes it was given and records that existing
 reference; it does not retain the top-level body again. Container members are different documents

@@ -56,6 +56,7 @@ if TYPE_CHECKING:
         Telemetry,
     )
     from manicule.config.settings import Settings
+    from manicule.core.acquisition import AcquisitionRun
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.protocols import Connector, Embedder, Parser, VectorStore
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
@@ -903,11 +904,19 @@ class _Ingestion:
         return report
 
     async def sync(
-        self, connector: str, *, limit: int | None = None, watching: Watching | None = None
+        self,
+        connector: str,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+        acquire_only: bool = False,
     ) -> RunReport:
         pipeline = await self._runtime.pipeline()
         return await pipeline.run(
-            await self._runtime.connector(connector), limit=limit, watching=watching
+            await self._runtime.connector(connector),
+            limit=limit,
+            watching=watching,
+            acquire_only=acquire_only,
         )
 
     async def connector(self, name: str) -> Connector:
@@ -919,6 +928,37 @@ class _Ingestion:
         readings of one configuration.
         """
         return await self._runtime.connector(name)
+
+    async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
+        """Read the active or newest promoted manifest for one exact connector scope."""
+        from manicule.ingest.pipeline import snapshot_scope  # noqa: PLC0415
+        from manicule.ingest.ports import AcquisitionStore  # noqa: PLC0415
+
+        store = await self._runtime.documents()
+        if not isinstance(store, AcquisitionStore):
+            return None
+        built = await self._runtime.connector(connector)
+        _, scope_fingerprint = snapshot_scope(built)
+        run = await store.latest_unsettled_acquisition_run(
+            connector, scope_fingerprint=scope_fingerprint
+        )
+        if run is None:
+            run = await store.latest_promoted_snapshot(connector, scope_fingerprint)
+        if run is None:
+            return None
+        return run, False
+
+    async def snapshot_verify(self, run_id: str) -> tuple[AcquisitionRun, bool] | None:
+        """Verify one workspace-owned manifest by opaque id, without reading source content."""
+        from manicule.ingest.ports import AcquisitionStore  # noqa: PLC0415
+
+        store = await self._runtime.documents()
+        if not isinstance(store, AcquisitionStore):
+            return None
+        run = await store.get_acquisition_run(run_id)
+        if run is None:
+            return None
+        return run, await store.verify_snapshot_manifest(run.id)
 
     async def reembed_plan(self) -> tuple[ReembedPlan, str, int]:
         """Price from a transient durable snapshot, with no embedding or source access."""
