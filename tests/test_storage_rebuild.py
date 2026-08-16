@@ -295,6 +295,9 @@ async def test_derived_reset_turns_same_target_published_replay_into_actionable_
     assert (await rebuilds.checkpoint(replay.generation_id)).state is RebuildState.PUBLISHED
 
     await store.reset_derived()
+    async for page in store.obsolete_generation_publications():
+        for generation in page:
+            await store.cleanup_obsolete_generation(generation.generation_id)
 
     actionable = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
     assert actionable.generation_id == published.generation_id

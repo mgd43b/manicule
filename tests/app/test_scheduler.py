@@ -10,6 +10,7 @@ assertion is about an arrival rather than an elapsed time.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -126,6 +127,16 @@ def test_each_source_keeps_its_own_interval() -> None:
     assert Scheduler.configure(service) == {"handbook": 3600, "runbooks": 600}
 
 
+def test_lifecycle_planning_cadence_is_carried_by_production_configuration() -> None:
+    service, _ = service_with({})
+    service.settings.storage.lifecycle_plan_schedule_s = 300
+
+    configured = Scheduler.configure(service)
+
+    assert configured == {}
+    assert configured.lifecycle_interval_s == 300
+
+
 # --- what it does ---------------------------------------------------------------------------------
 
 
@@ -151,6 +162,46 @@ async def test_a_scheduled_sync_runs_without_a_command_being_typed() -> None:
 
     assert clock.asked[0] == 600, "the loop waited for something other than its interval"
     assert scheduler.scheduled["handbook"].runs == 1
+
+
+async def test_configured_lifecycle_plans_run_as_a_real_aggregate_only_scheduler_job() -> None:
+    service, _ = service_with({})
+    service.settings.storage.lifecycle_plan_schedule_s = 300
+    service.settings.storage.source_history_retention_days = 30
+    service.settings.storage.snapshot_plan_run_id = "snapshot-run"
+    clock = Clock()
+    scheduler = Scheduler(
+        service,
+        Scheduler.configure(service),
+        sleep=clock.sleep,
+        now=lambda: datetime(2026, 8, 15, 12, tzinfo=UTC),
+    )
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        assert scheduler.lifecycle is not None
+        assert scheduler.lifecycle.runs == 0
+        await clock.tick()
+        assert scheduler.lifecycle.runs == 1
+    finally:
+        await scheduler.aclose()
+
+    assert clock.asked[0] == 300
+    assert scheduler.lifecycle is not None
+    assert scheduler.lifecycle.failures == 0
+    assert set(scheduler.lifecycle.reports) == {
+        "lifecycle_reset_derived",
+        "lifecycle_cleanup_generations",
+        "lifecycle_release_history",
+        "lifecycle_delete_snapshot",
+    }
+    assert {report["operation"] for report in scheduler.lifecycle.reports.values()} == {
+        "reset_derived",
+        "cleanup_derived_generations",
+        "release_source_history",
+        "delete_snapshot",
+    }
 
 
 async def test_nothing_is_synced_at_startup() -> None:

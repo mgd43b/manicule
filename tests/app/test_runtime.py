@@ -16,7 +16,7 @@ import asyncio
 import os
 import stat
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -27,6 +27,7 @@ from manicule.app.runtime import (
     AssemblyError,
     Runtime,
     _Ingestion,  # pyright: ignore[reportPrivateUsage] - direct runtime boundary test
+    _Maintenance,  # pyright: ignore[reportPrivateUsage] - lifecycle ordering boundary
     _recover_reembed_runs,  # pyright: ignore[reportPrivateUsage]
 )
 from manicule.app.service import ApplicationService, pre_upgrade_destination
@@ -34,6 +35,7 @@ from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
 from manicule.core.errors import InsecureTargetError
+from manicule.core.source_lifecycle import LifecycleOperation, LifecycleOutcome
 from manicule.generation.config import GENERATOR_NAME
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
@@ -76,6 +78,56 @@ async def test_reembed_restart_recovery_deduplicates_failure_classes() -> None:
     assert outcome.recovered == 0
     assert outcome.failures == 2
     assert outcome.failure_types == ("RuntimeError",)
+
+
+async def test_reset_commits_visibility_before_vectors_and_joins_cleanup_on_cancellation() -> None:
+    order: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Lifecycle:
+        async def legacy_vector_binding(self) -> tuple[str | None, bool]:
+            return "reembed-old", True
+
+        async def reset_derived(self) -> LifecycleOutcome:
+            order.append("relational")
+            return LifecycleOutcome(operation=LifecycleOperation.RESET_DERIVED)
+
+    class Vectors:
+        async def delete_bound_publication(
+            self, vector_table: str | None, publication_id: str
+        ) -> int:
+            assert vector_table == "reembed-old"
+            assert publication_id == "legacy"
+            order.append("vector")
+            entered.set()
+            await release.wait()
+            return 1
+
+    class RuntimeStub:
+        async def vectors(self) -> Vectors:
+            return Vectors()
+
+    maintenance = _Maintenance(cast("Runtime", RuntimeStub()))
+
+    async def cleanup() -> LifecycleOutcome:
+        order.append("finalize")
+        return LifecycleOutcome(
+            operation=LifecycleOperation.CLEANUP_DERIVED_GENERATIONS,
+            removed_items=1,
+        )
+
+    maintenance.cleanup_derived_generations = cleanup
+    task = asyncio.create_task(
+        maintenance._reset_derived_joined(cast("Any", Lifecycle()))  # pyright: ignore[reportPrivateUsage]
+    )
+    await entered.wait()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert order == ["relational", "vector", "finalize"]
 
 
 async def test_reembed_restart_recovery_does_not_swallow_cancellation() -> None:

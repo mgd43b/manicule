@@ -1275,6 +1275,24 @@ class PublishedLanceVectorStore:
         async with self._operation() as store:
             return await store.delete_publication(publication_id)
 
+    async def delete_bound_publication(self, vector_table: str | None, publication_id: str) -> int:
+        """Delete from the generation recorded at planning, independent of today's pointer.
+
+        Cleanup may retry after #187 has swapped the live pointer. The immutable generation row
+        is the authority for which physical directory received the namespace; following the
+        current pointer here would delete a same-named namespace from the wrong generation.
+        """
+        key = _published_generation_key(vector_table)
+        directory = self._directory / "generations" / key if key != "legacy" else self._directory
+        store = self._stores.setdefault(key, LanceVectorStore(directory))
+        if key == "legacy":
+            return await store.delete_publication(publication_id)
+        if not directory.exists():
+            return 0
+        async with generation_pin(directory):
+            await store.open_existing()
+            return await store.delete_publication(publication_id)
+
     async def publication_page_is_complete(
         self,
         publication_id: str,

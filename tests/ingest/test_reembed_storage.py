@@ -100,6 +100,34 @@ class FailingEmbedder(HashEmbedder):
         raise OSError("synthetic embedding failure")
 
 
+async def test_bound_publication_cleanup_does_not_follow_a_later_pointer(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The recorded #187 table binding chooses the directory, not today's live pointer."""
+    embed = fingerprint()
+    root = LanceVectorStore(data_dir / VECTORS_DIRNAME)
+    old_generation = LanceVectorStore(data_dir / VECTORS_DIRNAME / "generations" / "reembed-old")
+    await root.ensure_ready(embed)
+    await old_generation.ensure_ready(embed)
+    root_chunk = make_chunk(make_document(source_id="root"), 0, "root")
+    old_chunk = make_chunk(make_document(source_id="old"), 0, "old")
+    await root.upsert([root_chunk], [[1.0] + [0.0] * 7], publication_id="same-name")
+    await old_generation.upsert([old_chunk], [[0.0, 1.0] + [0.0] * 6], publication_id="same-name")
+    live = PublishedLanceVectorStore(data_dir / VECTORS_DIRNAME, engine)
+
+    assert await live.delete_bound_publication(None, "same-name") == 1
+    await root.teardown()
+    root = LanceVectorStore(data_dir / VECTORS_DIRNAME)
+    assert await root.publication_row_count("same-name") == 0
+    assert await old_generation.publication_row_count("same-name") == 1
+
+    assert await live.delete_bound_publication("reembed-old", "same-name") == 1
+    await old_generation.teardown()
+    old_generation = LanceVectorStore(data_dir / VECTORS_DIRNAME / "generations" / "reembed-old")
+    assert await old_generation.publication_row_count("same-name") == 0
+
+
 class RefusingCreateJournal:
     def __init__(self, failure: BaseException) -> None:
         self.failure = failure

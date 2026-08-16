@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, cast
 
-from sqlalchemy import delete, exists, func, select, true, union, update
+from sqlalchemy import delete, exists, func, or_, select, union, update
 
 from manicule.core.acquisition import AcquisitionRunState
 from manicule.core.content import DocumentStatus
@@ -28,10 +29,24 @@ from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from sqlalchemy import CursorResult
     from sqlalchemy.ext.asyncio import AsyncSession
     from sqlalchemy.sql.elements import ColumnElement
     from sqlalchemy.sql.selectable import Select, Subquery
+
+GENERATION_CLEANUP_PAGE = 128
+RESET_PUBLICATION = "reset-derived"
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationPublication:
+    """One retryable physical cleanup unit with its immutable #187 binding."""
+
+    generation_id: str
+    vector_publication_id: str | None
+    expected_vector_table: str | None
 
 
 class SourceLifecycleMixin(WorkspaceScoped):
@@ -49,19 +64,43 @@ class SourceLifecycleMixin(WorkspaceScoped):
             # `eligible_bytes` is intentionally zero: source bytes are outside this operation.
         ).model_copy(update={"eligible_items": chunks})
 
+    async def legacy_vector_binding(self) -> tuple[str | None, bool]:
+        """The one legacy namespace reset must remove, without listing its documents."""
+        async with self._sessions() as session:
+            vector_table = await session.scalar(
+                select(models.IndexState.vector_table).where(models.IndexState.id == 1)
+            )
+            has_legacy = bool(
+                await session.scalar(
+                    select(
+                        exists().where(
+                            models.Document.workspace_id == self._workspace_id,
+                            models.Document.publication_id == "legacy",
+                        )
+                    )
+                )
+            )
+        return vector_table, has_legacy
+
     async def reset_derived(self) -> LifecycleOutcome:
-        """Remove derived rows while retaining documents, versions, manifests and blobs."""
+        """Retire derived visibility while retaining retryable physical cleanup metadata."""
         async with self._sessions.begin() as session:
             chunk_count = await self._workspace_chunk_count(session)
             await session.execute(delete(models.Chunk).where(self._workspace_chunk()))
-            # A published generation is a replay receipt for the derived corpus we just
-            # removed.  Leaving it behind makes an identical-target rebuild return PUBLISHED
-            # without rebuilding anything.  Only completed publications are invalidated;
-            # planned/building/validating rows remain durable retry work.
+            # Retire rather than delete: the row is the durable binding needed to remove its
+            # physical publication after this relational transaction commits. A crash between
+            # the two phases therefore leaves cleanup discoverable and retryable.
             await session.execute(
-                delete(models.DerivedGeneration).where(
+                update(models.DerivedGeneration)
+                .where(
                     models.DerivedGeneration.workspace_id == self._workspace_id,
                     models.DerivedGeneration.state == RebuildState.PUBLISHED,
+                )
+                .values(
+                    state=RebuildState.CANCELED,
+                    published_at=None,
+                    diagnostic_code=None,
+                    updated_at=utcnow(),
                 )
             )
             await session.execute(
@@ -76,6 +115,7 @@ class SourceLifecycleMixin(WorkspaceScoped):
                     embed_fp=None,
                     glossary_fp=None,
                     indexed_at=None,
+                    publication_id=RESET_PUBLICATION,
                     updated_at=utcnow(),
                 )
             )
@@ -87,58 +127,89 @@ class SourceLifecycleMixin(WorkspaceScoped):
 
     async def plan_derived_generation_cleanup(self) -> LifecyclePlan:
         async with self._sessions() as session:
-            eligible = await self._obsolete_generation_ids(session)
-            temporary = await self._generation_bytes(session, eligible)
-            protected = (
-                await session.execute(
+            eligible = self._obsolete_generation_predicate()
+            count = int(
+                await session.scalar(
+                    select(func.count(models.DerivedGeneration.id)).where(eligible)
+                )
+                or 0
+            )
+            temporary = int(
+                await session.scalar(
+                    select(func.coalesce(func.sum(models.DerivedGenerationItem.temporary_bytes), 0))
+                    .join(
+                        models.DerivedGeneration,
+                        models.DerivedGeneration.id == models.DerivedGenerationItem.generation_id,
+                    )
+                    .where(eligible)
+                )
+                or 0
+            )
+            total = int(
+                await session.scalar(
                     select(func.count(models.DerivedGeneration.id)).where(
-                        models.DerivedGeneration.workspace_id == self._workspace_id,
-                        models.DerivedGeneration.id.not_in(eligible) if eligible else true(),
+                        models.DerivedGeneration.workspace_id == self._workspace_id
                     )
                 )
-            ).scalar_one()
+                or 0
+            )
         return LifecyclePlan(
             operation=LifecycleOperation.CLEANUP_DERIVED_GENERATIONS,
-            eligible_items=len(eligible),
+            eligible_items=count,
             eligible_bytes=temporary,
-            protected_items=int(protected),
+            protected_items=total - count,
         )
 
-    async def cleanup_derived_generations(self) -> LifecycleOutcome:
-        """Delete only terminal generations that cannot be the published generation."""
+    async def cleanup_obsolete_generation(self, generation_id: str) -> tuple[int, int]:
+        """CAS-delete one still-obsolete generation after its physical namespace is gone."""
         async with self._sessions.begin() as session:
-            eligible = await self._obsolete_generation_ids(session)
-            temporary = await self._generation_bytes(session, eligible)
-            if eligible:
-                await session.execute(
-                    delete(models.DerivedGeneration).where(
-                        models.DerivedGeneration.workspace_id == self._workspace_id,
-                        models.DerivedGeneration.id.in_(eligible),
+            eligible = self._obsolete_generation_predicate(generation_id=generation_id)
+            temporary = int(
+                await session.scalar(
+                    select(func.coalesce(func.sum(models.DerivedGenerationItem.temporary_bytes), 0))
+                    .join(
+                        models.DerivedGeneration,
+                        models.DerivedGeneration.id == models.DerivedGenerationItem.generation_id,
                     )
+                    .where(eligible)
                 )
-        return LifecycleOutcome(
-            operation=LifecycleOperation.CLEANUP_DERIVED_GENERATIONS,
-            removed_items=len(eligible),
-            released_bytes=temporary,
-        )
-
-    async def obsolete_vector_publications(self) -> tuple[str, ...]:
-        """Internal physical vector namespaces selected by the same cleanup predicate."""
-        async with self._sessions() as session:
-            eligible = await self._obsolete_generation_ids(session)
-            if not eligible:
-                return ()
-            return tuple(
-                publication
-                for publication in (
-                    await session.execute(
-                        select(models.DerivedGeneration.vector_publication_id).where(
-                            models.DerivedGeneration.id.in_(eligible)
-                        )
-                    )
-                ).scalars()
-                if publication is not None
+                or 0
             )
+            result = cast(
+                "CursorResult[object]",
+                await session.execute(delete(models.DerivedGeneration).where(eligible)),
+            )
+            return result.rowcount, temporary if result.rowcount else 0
+
+    async def obsolete_generation_publications(
+        self, *, page_size: int = GENERATION_CLEANUP_PAGE
+    ) -> AsyncIterator[tuple[GenerationPublication, ...]]:
+        """Yield stable keyset pages; never materialize the workspace generation inventory."""
+        if page_size < 1 or page_size > GENERATION_CLEANUP_PAGE:
+            raise ValueError(f"generation cleanup page size must be 1..{GENERATION_CLEANUP_PAGE}")
+        after = ""
+        while True:
+            async with self._sessions() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            models.DerivedGeneration.id,
+                            models.DerivedGeneration.vector_publication_id,
+                            models.DerivedGeneration.expected_vector_table,
+                        )
+                        .where(
+                            self._obsolete_generation_predicate(),
+                            models.DerivedGeneration.id > after,
+                        )
+                        .order_by(models.DerivedGeneration.id)
+                        .limit(page_size)
+                    )
+                ).all()
+            if not rows:
+                return
+            page = tuple(GenerationPublication(*row) for row in rows)
+            yield page
+            after = page[-1].generation_id
 
     async def plan_source_history_release(self, cutoff: datetime) -> LifecyclePlan:
         async with self._sessions() as session:
@@ -375,60 +446,35 @@ class SourceLifecycleMixin(WorkspaceScoped):
             )
         )
 
-    async def _obsolete_generation_ids(self, session: AsyncSession) -> list[str]:
-        rows = list(
-            (
-                await session.execute(
-                    select(
-                        models.DerivedGeneration.id,
-                        models.DerivedGeneration.state,
-                        models.DerivedGeneration.vector_publication_id,
-                        models.DerivedGeneration.published_at,
-                    ).where(models.DerivedGeneration.workspace_id == self._workspace_id)
-                )
-            ).tuples()
-        )
-        live_publications = set(
-            (
-                await session.execute(
-                    select(models.Document.publication_id).where(
-                        models.Document.workspace_id == self._workspace_id
-                    )
-                )
-            ).scalars()
-        )
-        published = [row for row in rows if row[1] is RebuildState.PUBLISHED]
+    def _obsolete_generation_predicate(
+        self, *, generation_id: str | None = None
+    ) -> ColumnElement[bool]:
+        generation = models.DerivedGeneration
         newest_published = (
-            max(
-                published,
-                key=lambda row: (
-                    row[3].isoformat() if row[3] is not None else "",
-                    row[0],
-                ),
-            )[0]
-            if published
-            else None
-        )
-        return [
-            row[0]
-            for row in rows
-            if row[1] in {RebuildState.FAILED, RebuildState.CANCELED, RebuildState.PUBLISHED}
-            and row[0] != newest_published
-            and row[2] not in live_publications
-        ]
-
-    @staticmethod
-    async def _generation_bytes(session: AsyncSession, generation_ids: list[str]) -> int:
-        if not generation_ids:
-            return 0
-        return int(
-            await session.scalar(
-                select(
-                    func.coalesce(func.sum(models.DerivedGenerationItem.temporary_bytes), 0)
-                ).where(models.DerivedGenerationItem.generation_id.in_(generation_ids))
+            select(generation.id)
+            .where(
+                generation.workspace_id == self._workspace_id,
+                generation.state == RebuildState.PUBLISHED,
             )
-            or 0
+            .order_by(generation.published_at.desc(), generation.id.desc())
+            .limit(1)
+            .scalar_subquery()
         )
+        live = exists().where(
+            models.Document.workspace_id == self._workspace_id,
+            models.Document.publication_id == generation.id,
+        )
+        predicate = (
+            (generation.workspace_id == self._workspace_id)
+            & generation.state.in_(
+                {RebuildState.FAILED, RebuildState.CANCELED, RebuildState.PUBLISHED}
+            )
+            & or_(generation.state != RebuildState.PUBLISHED, generation.id != newest_published)
+            & ~live
+        )
+        if generation_id is not None:
+            predicate &= generation.id == generation_id
+        return predicate
 
     def _eligible_versions(self, cutoff: datetime) -> Subquery:
         return (
@@ -525,4 +571,8 @@ class SourceLifecycleMixin(WorkspaceScoped):
         return hashlib.sha256(evidence.encode()).hexdigest()
 
 
-__all__ = ["SourceLifecycleMixin"]
+__all__ = [
+    "GENERATION_CLEANUP_PAGE",
+    "GenerationPublication",
+    "SourceLifecycleMixin",
+]

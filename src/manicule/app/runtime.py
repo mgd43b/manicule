@@ -1601,37 +1601,16 @@ class _Maintenance:
     async def reset_index(self) -> tuple[int, int, bool]:
         """Delete derived chunks and vectors while retaining source manifests and documents.
 
-        Vectors are removed **per document, here**, rather than left to the tombstone sweep.
-        A reset that returned with the vectors still present would leave a search answering
-        from an index the caller was told had been emptied — and the sweep runs on a cadence,
-        so "eventually" could be an hour.
+        Relational visibility is retired first. Physical publications are then removed by their
+        durable generation/table bindings, never by document across every namespace; that keeps
+        BUILDING and VALIDATING retry work intact. The owned cleanup is joined through caller
+        cancellation, so return or cancellation both leave the reset settled.
         """
-        from manicule.core.retrieval import Filter  # noqa: PLC0415
-
         store = await self._runtime.documents()
         documents = await store.count_documents()
         chunks = await store.count_chunks()
-        vectors = await self._runtime.vectors()
-        removed = False
-        selector = Filter(workspace_ids=frozenset({self._runtime.workspace}))
-        offset = 0
-        while True:
-            page = await store.list_documents(selector, limit=200, offset=offset)
-            if not page:
-                break
-            for document in page:
-                try:
-                    await vectors.delete_document(document.id)
-                except ManiculeError:
-                    # An index that never received a vector has no table to delete from, and
-                    # that is not a failed reset. Recorded rather than raised, so the caller
-                    # is told what actually happened.
-                    removed = removed or False
-                else:
-                    removed = True
-            offset += len(page)
         lifecycle = self._source_lifecycle(store)
-        await lifecycle.reset_derived()
+        removed = await self._reset_derived_joined(lifecycle)
         return documents, chunks, removed
 
     async def plan_reset_derived(self) -> LifecyclePlan:
@@ -1644,7 +1623,8 @@ class _Maintenance:
         )
 
         plan = await self.plan_reset_derived()
-        await self.reset_index()
+        lifecycle = self._source_lifecycle(await self._runtime.documents())
+        await self._reset_derived_joined(lifecycle)
         return LifecycleOutcome(
             operation=LifecycleOperation.RESET_DERIVED,
             removed_items=plan.eligible_items,
@@ -1659,14 +1639,73 @@ class _Maintenance:
     async def cleanup_derived_generations(self) -> LifecycleOutcome:
         lifecycle = self._source_lifecycle(await self._runtime.documents())
         vectors = await self._runtime.vectors()
-        remover = getattr(vectors, "delete_publication", None)
+        remover = getattr(vectors, "delete_bound_publication", None)
         if remover is None:
             raise ManiculeError(
-                "derived-generation cleanup requires a vector backend with named publications"
+                "derived-generation cleanup requires a vector backend with bound publications"
             )
-        for publication in await lifecycle.obsolete_vector_publications():
-            await remover(publication)
-        return await lifecycle.cleanup_derived_generations()
+        removed = 0
+        released = 0
+        async for page in lifecycle.obsolete_generation_publications():
+            for generation in page:
+                if generation.vector_publication_id is not None:
+                    await remover(
+                        generation.expected_vector_table,
+                        generation.vector_publication_id,
+                    )
+                count, bytes_ = await lifecycle.cleanup_obsolete_generation(
+                    generation.generation_id
+                )
+                removed += count
+                released += bytes_
+        from manicule.core.source_lifecycle import (  # noqa: PLC0415
+            LifecycleOperation,
+            LifecycleOutcome,
+        )
+
+        return LifecycleOutcome(
+            operation=LifecycleOperation.CLEANUP_DERIVED_GENERATIONS,
+            removed_items=removed,
+            released_bytes=released,
+        )
+
+    async def _reset_derived_joined(self, lifecycle: SqliteDocStore) -> bool:
+        """Commit visibility first, then join owned physical cleanup through cancellation."""
+        import asyncio  # noqa: PLC0415 - only this lifecycle boundary owns a task
+
+        async def settle() -> bool:
+            from manicule.storage.vectors import LEGACY_PUBLICATION  # noqa: PLC0415
+
+            vector_table, has_legacy = await lifecycle.legacy_vector_binding()
+            await lifecycle.reset_derived()
+            removed = False
+            vectors = await self._runtime.vectors()
+            remover = getattr(vectors, "delete_bound_publication", None)
+            if remover is None:
+                raise ManiculeError(
+                    "derived reset requires a vector backend with bound publications"
+                )
+            if has_legacy:
+                removed = bool(await remover(vector_table, LEGACY_PUBLICATION))
+            outcome = await self.cleanup_derived_generations()
+            return removed or outcome.removed_items > 0
+
+        work = asyncio.create_task(settle(), name="lifecycle:reset-derived")
+        interrupted = False
+        while True:
+            try:
+                result = await asyncio.shield(work)
+            except asyncio.CancelledError:
+                if work.cancelled():
+                    raise
+                interrupted = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+            else:
+                if interrupted:
+                    raise asyncio.CancelledError
+                return result
 
     async def plan_source_history_release(self, cutoff: datetime) -> LifecyclePlan:
         return await self._source_lifecycle(

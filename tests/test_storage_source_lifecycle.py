@@ -170,7 +170,9 @@ async def test_derived_reset_preserves_snapshot_versions_and_blob_gc_roots(
     async with sessions() as session:
         assert await session.get(models.DocumentVersion, "version-1") is not None
         assert await session.get(models.AcquisitionRun, "snapshot-reset") is not None
-        assert await session.get(models.DerivedGeneration, "published-before-reset") is None
+        retired = await session.get(models.DerivedGeneration, "published-before-reset")
+        assert retired is not None
+        assert retired.state is RebuildState.CANCELED
         assert await session.get(models.DerivedGeneration, "retry-after-reset") is not None
     assert await BlobStore(engine, data_dir).collect_garbage() == []
 
@@ -209,6 +211,7 @@ async def test_generation_cleanup_preserves_live_latest_and_resumable_generation
             ("old", RebuildState.PUBLISHED, "old-vectors", NOW - timedelta(days=1)),
             ("current", RebuildState.PUBLISHED, "current-vectors", NOW),
             ("retry", RebuildState.BUILDING, "retry-vectors", None),
+            ("certified", RebuildState.VALIDATING, "certified-vectors", None),
         ):
             session.add(
                 models.DerivedGeneration(
@@ -236,15 +239,89 @@ async def test_generation_cleanup_preserves_live_latest_and_resumable_generation
                 )
             )
     plan = await store.plan_derived_generation_cleanup()
-    outcome = await store.cleanup_derived_generations()
+    removed = 0
+    released = 0
+    async for page in store.obsolete_generation_publications():
+        for generation in page:
+            count, bytes_ = await store.cleanup_obsolete_generation(generation.generation_id)
+            removed += count
+            released += bytes_
 
     assert plan.eligible_items == 2
     assert plan.eligible_bytes == 20
-    assert outcome.removed_items == 2
+    assert removed == 2
+    assert released == 20
     async with sessions() as session:
         remaining = set((await session.execute(select(models.DerivedGeneration.id))).scalars())
-    assert remaining == {"current", "retry"}
-    assert (await store.cleanup_derived_generations()).removed_items == 0
+    assert remaining == {"current", "retry", "certified"}
+    assert [page async for page in store.obsolete_generation_publications()] == []
+
+
+@pytest.mark.asyncio
+async def test_generation_cleanup_is_keyset_bounded_and_crash_retryable(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+) -> None:
+    sessions = session_factory(engine)
+    async with sessions.begin() as session:
+        session.add(
+            models.Connector(
+                id="wiki", workspace_id="default", name="wiki", type="synthetic", config={}
+            )
+        )
+        await session.flush()
+        session.add(
+            models.AcquisitionRun(
+                id="snapshot-many-generations",
+                workspace_id="default",
+                connector_id="wiki",
+                connector_name="wiki",
+                source_scope="all",
+                scope_fingerprint="scope-v1",
+                state=AcquisitionRunState.SETTLED,
+                promoted_at=NOW,
+                acquisition_completed_at=NOW,
+                membership_hash="members",
+            )
+        )
+        await session.flush()
+        session.add_all(
+            [
+                models.DerivedGeneration(
+                    id=f"obsolete-{index:04d}",
+                    workspace_id="default",
+                    snapshot_run_id="snapshot-many-generations",
+                    snapshot_membership_hash="members",
+                    expected_item_count=0,
+                    target_digest=f"target-{index}",
+                    publication_identity_digest=f"identity-{index}",
+                    target={},
+                    state=RebuildState.CANCELED,
+                    vector_publication_id=f"vectors-{index}",
+                    expected_vector_table=f"reembed-table-{index}",
+                )
+                for index in range(257)
+            ]
+        )
+
+    pages = [page async for page in store.obsolete_generation_publications(page_size=17)]
+    assert sum(len(page) for page in pages) == 257
+    assert max(map(len, pages)) == 17
+    assert [item.generation_id for page in pages for item in page] == sorted(
+        item.generation_id for page in pages for item in page
+    )
+    assert pages[0][0].expected_vector_table == "reembed-table-0"
+    with pytest.raises(ValueError, match=r"1\.\.128"):
+        await anext(store.obsolete_generation_publications(page_size=129))
+
+    # A crash after the idempotent physical delete but before the relational CAS leaves the
+    # durable cleanup unit selectable on retry.
+    first = pages[0][0]
+    retried = [page async for page in store.obsolete_generation_publications(page_size=1)]
+    assert retried[0][0] == first
+    assert await store.cleanup_obsolete_generation(first.generation_id) == (1, 0)
+    after = [page async for page in store.obsolete_generation_publications(page_size=1)]
+    assert after[0][0].generation_id != first.generation_id
 
 
 @pytest.mark.asyncio

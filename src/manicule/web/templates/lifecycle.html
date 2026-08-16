@@ -23,7 +23,7 @@
 <section class="panel">
   <h2>Historical source retention</h2>
   <form method="get" action="/ui/lifecycle">
-    <label>Release bytes before <input name="before" value="{{ before }}" type="datetime-local" required></label>
+    <label>Release bytes before <input name="before" value="{{ before }}" type="text" placeholder="2026-07-01T00:00:00Z" pattern=".*(Z|[+-][0-9]{2}:[0-9]{2})" required></label>
     <button type="submit">Dry run</button>
   </form>
 </section>
