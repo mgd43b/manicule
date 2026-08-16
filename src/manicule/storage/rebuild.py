@@ -31,7 +31,12 @@ from manicule.core.rebuild import (
 )
 from manicule.ingest.reembed import SnapshotChunk, SnapshotChunkDigester
 from manicule.storage import models
-from manicule.storage.acquisition import AcquisitionJournalMixin, snapshot_manifest_matches
+from manicule.storage.acquisition import (
+    AcquisitionConflictError,
+    AcquisitionJournalMixin,
+    settle_published_snapshot,
+    snapshot_manifest_matches,
+)
 from manicule.storage.fts import (
     CREATE_TRIGGERS,
     DROP_TRIGGERS,
@@ -503,6 +508,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             )
             generation = await self._required_generation(session, generation_id)
             if generation.state is RebuildState.PUBLISHED:
+                await self._settle_published_generation(session, generation, now=now)
                 return _checkpoint(generation)
             if generation.state in {RebuildState.FAILED, RebuildState.CANCELED}:
                 raise RebuildTerminalGenerationError("generation is terminal")
@@ -857,6 +863,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         async with self._sessions.begin() as session:
             existing = await self._required_generation(session, generation_id)
             if existing.state is RebuildState.PUBLISHED:
+                await self._settle_published_generation(session, existing, now=now)
                 return _checkpoint(existing)
             claimed = cast(
                 "CursorResult[Any]",
@@ -1002,8 +1009,31 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation.state = RebuildState.PUBLISHED
             generation.published_at = now
             generation.updated_at = now
+            await self._settle_published_generation(session, generation, now=now)
             await session.flush()
             return _checkpoint(generation)
+
+    async def _settle_published_generation(
+        self,
+        session: AsyncSession,
+        generation: models.DerivedGeneration,
+        *,
+        now: datetime,
+    ) -> None:
+        """Join the live-generation flip to its exact source-work settlement."""
+        await self._verify_complete_header(session, generation)
+        try:
+            await settle_published_snapshot(
+                session,
+                workspace_id=self._workspace_id,
+                run_id=generation.snapshot_run_id,
+                expected_membership_hash=generation.snapshot_membership_hash,
+                expected_item_count=generation.expected_item_count,
+                derived_generation_identity=generation.id,
+                now=now,
+            )
+        except AcquisitionConflictError as exc:
+            raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED) from exc
 
     async def _require_live_vector_binding(
         self, session: AsyncSession, generation: models.DerivedGeneration

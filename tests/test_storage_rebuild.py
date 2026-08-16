@@ -11,6 +11,7 @@ from sqlalchemy import delete, event, select, text, update
 from manicule.core.acquisition import (
     AcquiredSource,
     AcquisitionRecordState,
+    AcquisitionRunState,
     AcquisitionSource,
 )
 from manicule.core.anchors import Unlocated
@@ -90,6 +91,21 @@ class FailingGlossaryPublicationStore(SqliteRebuildStore):
         return result
 
 
+class FailingSettlementPublicationStore(SqliteRebuildStore):
+    """Inject a failure after journal settlement but before the shared commit."""
+
+    @override
+    async def _settle_published_generation(
+        self,
+        session: AsyncSession,
+        generation: models.DerivedGeneration,
+        *,
+        now: datetime,
+    ) -> None:
+        await super()._settle_published_generation(session, generation, now=now)
+        raise RuntimeError("synthetic settlement commit failure")
+
+
 async def promoted_snapshot(
     store: SqliteDocStore,
     engine: AsyncEngine,
@@ -102,7 +118,7 @@ async def promoted_snapshot(
 ) -> tuple[str, str, RawDocument]:
     raw = RawDocument(
         source_id=source_id,
-        uri=f"https://source.invalid/{source_id}",
+        uri=f"https://wiki.example.test/content/{source_id}",
         media_type="text/plain",
         content="replacement searchable text",
     )
@@ -536,6 +552,101 @@ async def test_glossary_publication_failure_rolls_back_every_relational_live_row
             await connection.execute(select(models.IndexState.id).where(models.IndexState.id == 1))
         ).scalar_one_or_none() is None
     assert (await rebuilds.checkpoint(claimed.generation_id)).state is RebuildState.VALIDATING
+
+
+async def test_publication_and_acquisition_settlement_share_one_rollback_boundary(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    rebuilds, claimed, documents = await staged_glossary_generation(
+        store, engine, data_dir, rebuild_type=FailingSettlementPublicationStore
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic settlement commit failure"):
+        await rebuilds.publish_generation(
+            claimed.generation_id,
+            owner="glossary-publisher",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+
+    async with engine.connect() as connection:
+        generation_state = await connection.scalar(
+            select(models.DerivedGeneration.state).where(
+                models.DerivedGeneration.id == claimed.generation_id
+            )
+        )
+        snapshot_id = await connection.scalar(
+            select(models.DerivedGeneration.snapshot_run_id).where(
+                models.DerivedGeneration.id == claimed.generation_id
+            )
+        )
+        run_state = await connection.scalar(
+            select(models.AcquisitionRun.state).where(models.AcquisitionRun.id == snapshot_id)
+        )
+        record_states = (
+            (
+                await connection.execute(
+                    select(models.AcquisitionRecord.state).where(
+                        models.AcquisitionRecord.run_id == snapshot_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert generation_state is RebuildState.VALIDATING
+    assert run_state is AcquisitionRunState.ACQUIRING
+    assert set(record_states) == {AcquisitionRecordState.ACQUIRED}
+    assert [await store.get_document(document.id) for document in documents] == [None, None]
+
+
+async def test_published_replay_repairs_a_legacy_unsettled_handoff_exactly_once(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    rebuilds, claimed, _ = await staged_glossary_generation(store, engine, data_dir)
+    published = await rebuilds.publish_generation(
+        claimed.generation_id,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    sessions = session_factory(engine)
+    async with sessions.begin() as session:
+        generation = await session.get(models.DerivedGeneration, claimed.generation_id)
+        assert generation is not None
+        run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
+        assert run is not None
+        run.state = AcquisitionRunState.INDEXING
+        run.indexed_count = 0
+        run.acquired_blob_bytes = 1
+        await session.execute(
+            update(models.AcquisitionRecord)
+            .where(models.AcquisitionRecord.run_id == run.id)
+            .values(state=AcquisitionRecordState.INDEXING)
+        )
+        snapshot_id = run.id
+
+    replayed = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "stale-response-owner",
+        now=NOW + timedelta(seconds=1),
+        expires_at=NOW + timedelta(minutes=1),
+    )
+    repaired = await store.get_acquisition_run(snapshot_id)
+    records = await store.list_acquisition_records(snapshot_id)
+
+    assert replayed == published
+    assert repaired is not None
+    assert repaired.state is AcquisitionRunState.SETTLED
+    assert repaired.indexed_count == repaired.discovered_count
+    assert repaired.retry_count == 0
+    assert repaired.acquired_blob_bytes == 0
+    assert {record.state for record in records} == {AcquisitionRecordState.SETTLED}
+    assert await store.verify_snapshot_manifest(snapshot_id)
 
 
 @pytest.mark.asyncio
