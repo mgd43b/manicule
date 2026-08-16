@@ -43,6 +43,7 @@ from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.core.rebuild import (
     RebuildCheckpoint,
     RebuildEstimate,
+    RebuildRefusalCode,
     RebuildState,
 )
 from manicule.core.retrieval import Candidate, Confidence, ConfidenceBand, Context, Query
@@ -901,6 +902,8 @@ class FakeIngestion:
             return None
         return self.snapshot, self.snapshot_verified
 
+    rebuild_missing_count: int = 0
+
     async def rebuild_plan(self, snapshot_run_id: str) -> RebuildEstimate:
         return RebuildEstimate(
             generation_id="aggregate-generation",
@@ -912,7 +915,10 @@ class FakeIngestion:
             estimated_seconds=3.5,
             estimated_peak_memory_bytes=2048,
             estimated_temporary_bytes=4096,
-            missing_count=0,
+            missing_count=self.rebuild_missing_count,
+            refusal=(
+                RebuildRefusalCode.MISSING_LOCAL_INPUT if self.rebuild_missing_count else None
+            ),
         )
 
     async def rebuild_run(self, snapshot_run_id: str, owner: str) -> RebuildCheckpoint:

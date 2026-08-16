@@ -254,6 +254,9 @@ class SqliteRebuildStore(WorkspaceScoped):
                 missing_count=missing_count,
                 missing=tuple(missing),
                 missing_truncated=missing_count > len(missing),
+                refusal=(
+                    RebuildRefusalCode.MISSING_LOCAL_INPUT if missing_count else None
+                ),
             )
 
         if not persist:

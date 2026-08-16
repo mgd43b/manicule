@@ -136,6 +136,19 @@ async def test_rebuild_plan_is_deferred_and_live_status_reports_remaining_items(
     assert status.lifecycle.estimated_remaining_items == 1
 
 
+async def test_rebuild_plan_missing_inputs_is_a_typed_refused_surface_result() -> None:
+    backend = _backend()
+    backend.ingestion_.rebuild_missing_count = 1
+
+    plan = await ApplicationService(backend).rebuild_plan("snapshot-aggregate-1")
+
+    assert not plan.runnable
+    assert plan.refusal_code == "missing_local_input"
+    assert plan.lifecycle.outcome == "refused"
+    assert plan.lifecycle.refusal is not None
+    assert plan.lifecycle.refusal.code == "missing_local_input"
+
+
 async def test_rebuild_refusal_is_a_typed_failure_envelope() -> None:
     estimate = RebuildEstimate(
         generation_id="aggregate-generation",
