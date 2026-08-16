@@ -1254,6 +1254,8 @@ class SqliteRebuildStore(WorkspaceScoped):
             replacement = _REPLACEMENT.validate_python(row.payload)
             replacement.validate_identity()
             self._require_snapshot_match(replacement, snapshot)
+        except RebuildPublicationValidationError:
+            raise
         except (RuntimeError, ValueError) as exc:
             raise RebuildPublicationValidationError from exc
         return replacement

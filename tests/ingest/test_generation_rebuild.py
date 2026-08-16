@@ -435,6 +435,20 @@ class PublicationConflictStore(FakeStore):
         raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
 
 
+class PublicationLeaseLossStore(FakeStore):
+    @override
+    async def publish_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> RebuildCheckpoint:
+        del generation_id, owner, lease_generation, now
+        raise RebuildLeaseConflictError("private replacement owner")
+
+
 class ValidationFailureStore(FakeStore):
     @override
     async def validate_generation(self, generation_id: str) -> None:
@@ -533,6 +547,22 @@ async def test_publication_snapshot_conflict_is_bounded_and_marks_generation_fai
         ).run("promoted-run", target())
 
     assert store.failed_code is RebuildRefusalCode.SNAPSHOT_CHANGED
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+async def test_publication_lease_loss_does_not_fail_a_generation_owned_by_another_worker() -> None:
+    item, body = source(0, "body")
+    store = PublicationLeaseLossStore([item])
+
+    with pytest.raises(RebuildLeaseError, match="offline rebuild lease was lost"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is None
     assert store.published is False
 
 

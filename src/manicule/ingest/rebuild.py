@@ -1036,6 +1036,10 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
             raise RebuildLeaseError from exc
+        except RebuildLeaseConflictError:
+            # The publication transaction can discover that this worker no longer owns the
+            # lease. The new owner alone may mutate the durable generation from here.
+            raise
         except (RebuildPublicationValidationError, RuntimeError, ValueError) as exc:
             # The store's publication protocol reports bounded invariant failures as its typed
             # validation error. RuntimeError remains a compatibility boundary for third-party
