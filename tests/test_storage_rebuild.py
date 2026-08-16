@@ -35,10 +35,11 @@ from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.engine import session_factory
 from manicule.storage.rebuild import RebuildLeaseConflictError, SqliteRebuildStore
-from manicule.storage.vectors import LanceVectorStore
+from manicule.storage.vectors import LanceVectorStore, VectorStoreStateError
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -803,6 +804,40 @@ async def test_second_connector_promotion_fences_a_single_scope_rebuild(
     assert caught.value.code is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
 
 
+async def test_resume_refuses_a_snapshot_that_lost_promotion_with_a_bounded_conflict(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, _, _ = await promoted_snapshot(store, engine, data_dir)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    await rebuilds.claim_generation(
+        plan.generation_id,
+        "resume-worker",
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    async with session_factory(engine).begin() as session:
+        await session.execute(
+            update(models.AcquisitionRun)
+            .where(models.AcquisitionRun.id == run_id)
+            .values(promoted_at=None, watermark_committed_at=None)
+        )
+
+    with pytest.raises(RebuildPublicationConflictError) as caught:
+        await rebuilds.snapshot_inputs(plan.generation_id, after_sequence=-1, limit=1)
+    assert caught.value.code is RebuildRefusalCode.SNAPSHOT_CHANGED
+
+
 async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # noqa: PLR0915
     store: SqliteDocStore,
     engine: AsyncEngine,
@@ -900,6 +935,43 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         lease_generation=claimed.lease_generation,
         now=NOW,
     )
+    with pytest.raises(RebuildPublicationConflictError) as moved:
+        await rebuilds.stage_replacements(
+            estimate.generation_id,
+            [(0, replacement)],
+            expected_next_sequence=0,
+            owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+    assert moved.value.code is RebuildRefusalCode.PUBLICATION_CONFLICT
+
+    sessions = session_factory(engine)
+    async with sessions.begin() as session:
+        await session.execute(
+            update(models.DerivedGeneration)
+            .where(models.DerivedGeneration.id == estimate.generation_id)
+            .values(next_sequence=0)
+        )
+    changed = replacement.model_copy(
+        update={"document": replacement.document.model_copy(update={"title": "changed retry"})}
+    )
+    with pytest.raises(RebuildPublicationValidationError) as invalid:
+        await rebuilds.stage_replacements(
+            estimate.generation_id,
+            [(0, changed)],
+            expected_next_sequence=0,
+            owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+    assert invalid.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
+    async with sessions.begin() as session:
+        await session.execute(
+            update(models.DerivedGeneration)
+            .where(models.DerivedGeneration.id == estimate.generation_id)
+            .values(next_sequence=1)
+        )
 
     # Shadow rows and vectors exist, but every ordinary reader still sees one coherent old
     # publication until validation and the relational flip commit.
@@ -915,8 +987,6 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         now=NOW,
     )
     await rebuilds.validate_generation(estimate.generation_id)
-    sessions = session_factory(engine)
-
     # A #187 pointer swap after staging must win the CAS without publishing relational rows.
     async with sessions.begin() as session:
         index_state = await session.get(models.IndexState, 1)
@@ -1135,6 +1205,8 @@ async def test_expired_owner_is_fenced_after_takeover(  # noqa: PLR0915 - one ta
     assert second.vector_publication_id != first.vector_publication_id
     assert second.predecessor_vector_publication_id == first.vector_publication_id
     original_copy = vectors.copy_publication
+    original_page_complete = vectors.publication_page_is_complete
+    original_row_count = vectors.publication_row_count
 
     async def certified_publication() -> str | None:
         sessions = session_factory(engine)
@@ -1151,6 +1223,113 @@ async def test_expired_owner_is_fenced_after_takeover(  # noqa: PLR0915 - one ta
         await original_copy(*args, **kwargs)  # pyright: ignore[reportArgumentType]
         raise RuntimeError("worker crashed after the first replay page")
 
+    async def corrupt_source_page(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise VectorStoreStateError("private vector path /private/vectors")
+
+    monkeypatch.setattr(vectors, "copy_publication", corrupt_source_page)
+    with pytest.raises(RebuildPublicationValidationError) as invalid:
+        await rebuilds.copy_checkpointed_vectors(
+            plan.generation_id,
+            first.vector_publication_id,
+            owner="second",
+            lease_generation=second.lease_generation,
+            now=takeover_now,
+        )
+    assert invalid.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert "/private" not in str(invalid.value)
+    assert await certified_publication() == first.vector_publication_id
+    monkeypatch.setattr(vectors, "copy_publication", original_copy)
+
+    async def corrupt_replay_page(
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        if publication_id == second.vector_publication_id:
+            return False
+        return await original_page_complete(
+            publication_id,
+            chunks,
+            embedding_fingerprint=embedding_fingerprint,
+        )
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", corrupt_replay_page)
+    with pytest.raises(RebuildPublicationValidationError) as invalid:
+        await rebuilds.copy_checkpointed_vectors(
+            plan.generation_id,
+            first.vector_publication_id,
+            owner="second",
+            lease_generation=second.lease_generation,
+            now=takeover_now,
+        )
+    assert invalid.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert await certified_publication() == first.vector_publication_id
+
+    async def unavailable_replay_page(
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        if publication_id == second.vector_publication_id:
+            raise ValueError("private page bound /private/vectors")
+        return await original_page_complete(
+            publication_id,
+            chunks,
+            embedding_fingerprint=embedding_fingerprint,
+        )
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", unavailable_replay_page)
+    with pytest.raises(RebuildPublicationValidationError) as invalid:
+        await rebuilds.copy_checkpointed_vectors(
+            plan.generation_id,
+            first.vector_publication_id,
+            owner="second",
+            lease_generation=second.lease_generation,
+            now=takeover_now,
+        )
+    assert invalid.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert "/private" not in str(invalid.value)
+    assert await certified_publication() == first.vector_publication_id
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", original_page_complete)
+
+    async def corrupt_replay_inventory(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        return 2
+
+    monkeypatch.setattr(vectors, "publication_row_count", corrupt_replay_inventory)
+    with pytest.raises(RebuildPublicationValidationError) as invalid:
+        await rebuilds.copy_checkpointed_vectors(
+            plan.generation_id,
+            first.vector_publication_id,
+            owner="second",
+            lease_generation=second.lease_generation,
+            now=takeover_now,
+        )
+    assert invalid.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert await certified_publication() == first.vector_publication_id
+
+    async def unavailable_replay_inventory(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise VectorStoreStateError("private inventory /private/vectors")
+
+    monkeypatch.setattr(vectors, "publication_row_count", unavailable_replay_inventory)
+    with pytest.raises(RebuildPublicationValidationError) as invalid:
+        await rebuilds.copy_checkpointed_vectors(
+            plan.generation_id,
+            first.vector_publication_id,
+            owner="second",
+            lease_generation=second.lease_generation,
+            now=takeover_now,
+        )
+    assert invalid.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert "/private" not in str(invalid.value)
+    assert await certified_publication() == first.vector_publication_id
+
+    monkeypatch.setattr(vectors, "publication_row_count", original_row_count)
     monkeypatch.setattr(vectors, "copy_publication", crash_after_page)
     with pytest.raises(RuntimeError, match="crashed after the first replay page"):
         await rebuilds.copy_checkpointed_vectors(
