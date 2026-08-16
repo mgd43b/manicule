@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import httpx
@@ -37,7 +40,6 @@ from tests.ingest import fakes
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
 
 
 def _runtime(
@@ -562,3 +564,45 @@ async def test_runtime_rebuild_honors_disabled_glossary_identity_without_source_
         document = (await documents.list_documents())[0]
         assert await documents.glossary_entries(document.id) == []
         assert await documents.glossary_lineage(document.id) == disabled
+
+
+def test_process_smoke_restarts_and_settles_without_duplicate_work(tmp_path: Path) -> None:
+    tool = Path(__file__).parents[2] / "tools" / "smoke_offline_rebuild_settlement.py"
+    completed = subprocess.run(  # noqa: S603 - current interpreter and repository-owned tool
+        [
+            sys.executable,
+            str(tool),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--source-dir",
+            str(tmp_path / "source"),
+            "--max-rss-bytes",
+            str(512 * 1024 * 1024),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert payload["ok"] is True
+    assert payload["peak_rss_bytes"] <= payload["rss_bound_bytes"]
+    assert payload["phases"]["acquire"]["embed_texts"] == 0
+    assert payload["phases"]["publish"]["vectors_embedded"] == 3
+    assert payload["phases"]["restart"]["verified"] is True
+    assert payload["phases"]["restart"]["pending_items"] == 0
+    assert payload["phases"]["restart"]["foreign_key_violations"] == 0
+    assert payload["phases"]["second"]["vectors_reused"] == 3
+    assert (
+        payload["phases"]["second"]["generation_id"]
+        != payload["phases"]["publish"]["generation_id"]
+    )
+    assert payload["phases"]["unchanged"] == {
+        "counts": {"blobs": 3, "chunks": 3, "documents": 3, "generations": 2},
+        "counts_unchanged": True,
+        "embed_texts": 0,
+        "ingested": 0,
+        "max_rss_bytes": payload["phases"]["unchanged"]["max_rss_bytes"],
+        "reused_items": 3,
+    }

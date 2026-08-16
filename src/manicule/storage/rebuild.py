@@ -11,7 +11,13 @@ from pydantic import TypeAdapter
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from manicule.core.acquisition import AcquiredSource, AcquisitionSource, SnapshotCompleteness
+from manicule.core.acquisition import (
+    AcquiredSource,
+    AcquisitionSource,
+    SnapshotCompleteness,
+    SnapshotItemOutcome,
+    SnapshotPromotionPolicy,
+)
 from manicule.core.errors import ManiculeError
 from manicule.core.ids import document_id, glossary_entry_id
 from manicule.core.rebuild import (
@@ -241,26 +247,35 @@ class SqliteRebuildStore(WorkspaceScoped):
         missing: list[MissingSnapshotInput] = []
         missing_count = 0
         documents = 0
+        manifest_items = 0
         known_bytes = 0
         largest_input = 0
         async for record in self._acquisition.iter_acquisition_records(snapshot_run_id):
-            if record.sequence != documents:
+            if record.sequence != manifest_items:
                 return self._refused_estimate(
                     snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
                 )
-            documents += 1
+            manifest_items += 1
             if (
                 record.blob_ref is None
                 or record.acquired_source is None
                 or not await self._blobs.contains(record.blob_ref)
             ):
+                if (
+                    run.promotion_policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS
+                    and record.snapshot_outcome is SnapshotItemOutcome.OMITTED
+                    and record.blob_ref is None
+                    and record.acquired_source is None
+                ):
+                    continue
                 missing_count += 1
                 if len(missing) < missing_limit:
                     missing.append(MissingSnapshotInput(sequence=record.sequence))
             else:
+                documents += 1
                 known_bytes += record.acquired_source.byte_length
                 largest_input = max(largest_input, record.acquired_source.byte_length)
-        if documents != run.discovered_count:
+        if manifest_items != run.discovered_count:
             return self._refused_estimate(
                 snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
             )
@@ -575,7 +590,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             if run is None or not await self._is_only_promoted_scope(
                 session, run.connector_name, run.scope_fingerprint
             ):
-                raise RebuildLeaseConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED.value)
+                raise RebuildPublicationConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED)
             await self._require_live_vector_binding(session, generation)
 
     async def copy_checkpointed_vectors(  # noqa: PLR0912 - explicit replay validation stages
@@ -680,22 +695,61 @@ class SqliteRebuildStore(WorkspaceScoped):
             if run is None or run.workspace_id != self._workspace_id or run.promoted_at is None:
                 raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
             snapshot_run_id = generation.snapshot_run_id
-        records = await self._acquisition.list_acquisition_records(
-            snapshot_run_id,
-            after_sequence=None if after_sequence < 0 else after_sequence,
-            limit=min(limit, 1),
-        )
+        async with self._sessions() as session:
+            snapshot_after = -1
+            if after_sequence >= 0:
+                previous = await session.get(
+                    models.DerivedGenerationItem, (generation_id, after_sequence)
+                )
+                if previous is None:
+                    raise RebuildPublicationValidationError
+                try:
+                    previous_source_id = _REPLACEMENT.validate_python(
+                        previous.payload
+                    ).document.source_id
+                except ValueError as exc:
+                    raise RebuildPublicationValidationError from exc
+                prior_snapshot_sequence = await session.scalar(
+                    select(models.AcquisitionRecord.sequence).where(
+                        models.AcquisitionRecord.run_id == snapshot_run_id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                        models.AcquisitionRecord.source_id == previous_source_id,
+                        models.AcquisitionRecord.blob_ref.is_not(None),
+                        models.AcquisitionRecord.acquired_source.is_not(None),
+                    )
+                )
+                if prior_snapshot_sequence is None:
+                    raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+                snapshot_after = prior_snapshot_sequence
+            records = list(
+                (
+                    await session.execute(
+                        select(models.AcquisitionRecord)
+                        .where(
+                            models.AcquisitionRecord.run_id == snapshot_run_id,
+                            models.AcquisitionRecord.workspace_id == self._workspace_id,
+                            models.AcquisitionRecord.blob_ref.is_not(None),
+                            models.AcquisitionRecord.acquired_source.is_not(None),
+                            models.AcquisitionRecord.sequence > snapshot_after,
+                        )
+                        .order_by(models.AcquisitionRecord.sequence)
+                        .limit(limit)
+                    )
+                ).scalars()
+            )
         result: list[SnapshotRebuildInput] = []
-        for record in records:
+        for offset, record in enumerate(records, start=after_sequence + 1):
             if record.blob_ref is None or record.acquired_source is None:
                 raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+            acquired = AcquiredSource.model_validate(record.acquired_source)
+            source = AcquisitionSource.model_validate(record.source_record)
             result.append(
                 SnapshotRebuildInput(
-                    sequence=record.sequence,
+                    sequence=offset,
                     blob_ref=record.blob_ref,
-                    source=record.acquired_source,
-                    title=record.source.title,
-                    version_token=(record.fetched_version_token or record.source.version_token),
+                    source=acquired,
+                    title=source.title,
+                    version_token=(record.fetched_version_token or source.version_token),
                 )
             )
         return result
@@ -1238,7 +1292,6 @@ class SqliteRebuildStore(WorkspaceScoped):
             or run.workspace_id != self._workspace_id
             or run.promoted_at is None
             or run.membership_hash != generation.snapshot_membership_hash
-            or run.discovered_count != generation.expected_item_count
             or not await snapshot_manifest_matches(
                 session, run.id, generation.snapshot_membership_hash
             )
@@ -1256,6 +1309,19 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
             )
         ).scalar_one()
+        distinct_item_sources = (
+            await session.execute(
+                select(
+                    func.count(
+                        func.distinct(
+                            func.json_extract(
+                                models.DerivedGenerationItem.payload, "$.document.source_id"
+                            )
+                        )
+                    )
+                ).where(models.DerivedGenerationItem.generation_id == generation.id)
+            )
+        ).scalar_one()
         snapshot_count = (
             await session.execute(
                 select(func.count(models.AcquisitionRecord.sequence)).where(
@@ -1264,8 +1330,77 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
             )
         ).scalar_one()
-        if item_count != generation.expected_item_count or snapshot_count != item_count:
+        evidence_count = (
+            await session.execute(
+                select(func.count(models.AcquisitionRecord.sequence)).where(
+                    models.AcquisitionRecord.run_id == generation.snapshot_run_id,
+                    models.AcquisitionRecord.workspace_id == self._workspace_id,
+                    models.AcquisitionRecord.blob_ref.is_not(None),
+                    models.AcquisitionRecord.acquired_source.is_not(None),
+                )
+            )
+        ).scalar_one()
+        omitted_count = (
+            await session.execute(
+                select(func.count(models.AcquisitionRecord.sequence)).where(
+                    models.AcquisitionRecord.run_id == generation.snapshot_run_id,
+                    models.AcquisitionRecord.workspace_id == self._workspace_id,
+                    models.AcquisitionRecord.snapshot_outcome == SnapshotItemOutcome.OMITTED,
+                    models.AcquisitionRecord.blob_ref.is_(None),
+                    models.AcquisitionRecord.acquired_source.is_(None),
+                )
+            )
+        ).scalar_one()
+        completeness = None if run.completeness is None else SnapshotCompleteness(run.completeness)
+        partial_is_honest = (
+            completeness is SnapshotCompleteness.PARTIAL
+            and SnapshotPromotionPolicy(run.promotion_policy)
+            is SnapshotPromotionPolicy.ALLOW_OMISSIONS
+            and omitted_count == run.omission_count
+            and snapshot_count == evidence_count + omitted_count
+        )
+        complete_is_honest = (
+            completeness is SnapshotCompleteness.COMPLETE
+            and run.omission_count == 0
+            and omitted_count == 0
+            and snapshot_count == evidence_count
+        )
+        if (
+            item_count != generation.expected_item_count
+            or distinct_item_sources != item_count
+            or evidence_count != item_count
+            or snapshot_count != run.discovered_count
+            or not (partial_is_honest or complete_is_honest)
+        ):
             raise RebuildPublicationValidationError
+        await self._verify_retained_evidence(session, generation.snapshot_run_id)
+
+    async def _verify_retained_evidence(self, session: AsyncSession, snapshot_run_id: str) -> None:
+        """Re-hash every represented source blob at the publication transaction fence."""
+        after = -1
+        while True:
+            rows = list(
+                (
+                    await session.execute(
+                        select(models.AcquisitionRecord)
+                        .where(
+                            models.AcquisitionRecord.run_id == snapshot_run_id,
+                            models.AcquisitionRecord.workspace_id == self._workspace_id,
+                            models.AcquisitionRecord.blob_ref.is_not(None),
+                            models.AcquisitionRecord.acquired_source.is_not(None),
+                            models.AcquisitionRecord.sequence > after,
+                        )
+                        .order_by(models.AcquisitionRecord.sequence)
+                        .limit(_EVIDENCE_PAGE)
+                    )
+                ).scalars()
+            )
+            if not rows:
+                return
+            for row in rows:
+                if row.blob_ref is None or not await self._blobs.contains(row.blob_ref):
+                    raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+            after = rows[-1].sequence
 
     async def _evidence_page(
         self,
@@ -1287,25 +1422,31 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
             ).scalars()
         )
-        snapshots = list(
-            (
+        snapshots: list[models.AcquisitionRecord] = []
+        for item in items:
+            try:
+                source_id = _REPLACEMENT.validate_python(item.payload).document.source_id
+            except ValueError as exc:
+                raise RebuildPublicationValidationError from exc
+            snapshot = (
                 await session.execute(
-                    select(models.AcquisitionRecord)
-                    .where(
+                    select(models.AcquisitionRecord).where(
                         models.AcquisitionRecord.run_id == generation.snapshot_run_id,
                         models.AcquisitionRecord.workspace_id == self._workspace_id,
-                        models.AcquisitionRecord.sequence > after,
+                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.blob_ref.is_not(None),
+                        models.AcquisitionRecord.acquired_source.is_not(None),
                     )
-                    .order_by(models.AcquisitionRecord.sequence)
-                    .limit(_EVIDENCE_PAGE)
                 )
-            ).scalars()
-        )
+            ).scalar_one_or_none()
+            if snapshot is None:
+                raise RebuildPublicationValidationError
+            snapshots.append(snapshot)
         expected = list(range(after + 1, after + 1 + len(items)))
         if (
             not items
             or [item.sequence for item in items] != expected
-            or [snapshot.sequence for snapshot in snapshots] != expected
+            or len(snapshots) != len(items)
         ):
             raise RebuildPublicationValidationError
         return list(zip(items, snapshots, strict=True))

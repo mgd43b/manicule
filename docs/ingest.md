@@ -866,19 +866,31 @@ not a second crawler or an export path.
 An offline generation publication is the other consumer of that hand-off. Its relational pointer
 swap and the settlement of the exact acquisition manifest share one SQLite transaction. The
 publication transaction rechecks workspace, connector instance, promoted snapshot identity,
-canonical membership hash, generation lease/fence, staged replacement inventory and live vector
-binding before it changes either side. It then moves the represented retained records to terminal
-derivation state, refreshes the run counters and marks the run `SETTLED` in the same commit that
-makes the generation `PUBLISHED`. A published replay repeats those checks and idempotently repairs
-an older published-but-`INDEXING` hand-off before reporting success.
+canonical membership hash, generation lease/fence, staged replacement inventory, live vector
+binding, and the existence and content hash of every represented retained blob before it changes
+either side. It then moves the represented retained records to terminal derivation state and
+refreshes the run counters in the same commit that makes the generation `PUBLISHED`. A complete
+manifest becomes `SETTLED`. An allowed-partial manifest derives only its evidence-bearing members;
+its typed omitted records remain omitted and visible as pending source retry even though the
+derivation run is settled, rather than requiring fabricated derived rows or being hidden by
+settlement. The next source sync therefore starts retryable source work instead of reopening the
+frozen derived hand-off. A published replay repeats those checks and
+idempotently repairs an older published-but-`INDEXING` hand-off before reporting success.
 
-Settlement is not source deletion. Acquisition backlog counters become zero, while the manifest's
-blob references remain unchanged and continue to pin the promoted source bytes. Snapshot
-verification, connector-free rebuild planning and later rebuilds under another derived identity
-therefore remain available. Releasing source history or deleting a snapshot is still a separate,
-guarded lifecycle operation. Aggregate status consequently changes from `rebuilding`/`running`
-with pending work to `complete`/`complete` with zero pending and backlog items; it exposes snapshot
-and generation identities but never member ids, titles, URLs, bodies, blob hashes or credentials.
+Settlement is not source deletion. For a complete snapshot, acquisition backlog counters become
+zero and aggregate status changes from `rebuilding`/`running` to `complete`/`complete`. For an
+allowed-partial snapshot, typed omissions remain visible as pending source backlog and aggregate
+status stays `acquiring`/`incomplete`; that retry cannot continue offline even though later derived
+identities can still rebuild the represented members without source access. In both cases the
+manifest's blob references remain unchanged and continue to pin the represented source bytes.
+Snapshot verification, connector-free rebuild planning and later rebuilds under another derived
+identity therefore remain available. Releasing source history or deleting a snapshot is still a
+separate, guarded lifecycle operation. Status exposes snapshot and generation identities but never
+member ids, titles, URLs, bodies, blob hashes or credentials.
+The rerunnable `tools/smoke_offline_rebuild_settlement.py` harness exercises acquire-only,
+connector-disabled publication, a fresh-process status/verification read, a second derived
+identity, and an unchanged sync in separate processes. Its JSON result records aggregate
+foreign-key/pointer/ownership checks and a normalized peak-RSS bound.
 
 First indexing, offline-snapshot indexing and re-parse all enter the same derivation function
 with a retained reference. That function parses the bytes it was given and records that existing

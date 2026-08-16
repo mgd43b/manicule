@@ -459,7 +459,6 @@ async def settle_published_snapshot(
         or run.promoted_at is None
         or run.acquisition_completed_at is None
         or run.membership_hash != expected_membership_hash
-        or run.discovered_count != expected_item_count
         or run.state
         not in {
             AcquisitionRunState.ACQUIRING,
@@ -481,7 +480,20 @@ async def settle_published_snapshot(
             )
         )
     ).scalar_one()
-    if record_count != expected_item_count:
+    evidence_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(models.AcquisitionRecord)
+            .where(
+                models.AcquisitionRecord.run_id == run_id,
+                models.AcquisitionRecord.workspace_id == workspace_id,
+                models.AcquisitionRecord.connector_id == run.connector_id,
+                models.AcquisitionRecord.blob_ref.is_not(None),
+                models.AcquisitionRecord.acquired_source.is_not(None),
+            )
+        )
+    ).scalar_one()
+    if record_count != run.discovered_count or evidence_count != expected_item_count:
         raise AcquisitionConflictError("published generation inventory does not match its snapshot")
 
     # RETRY is eligible only when the publication boundary has already validated retained
@@ -493,6 +505,8 @@ async def settle_published_snapshot(
             models.AcquisitionRecord.run_id == run_id,
             models.AcquisitionRecord.workspace_id == workspace_id,
             models.AcquisitionRecord.connector_id == run.connector_id,
+            models.AcquisitionRecord.blob_ref.is_not(None),
+            models.AcquisitionRecord.acquired_source.is_not(None),
             models.AcquisitionRecord.state.in_(
                 (
                     AcquisitionRecordState.ACQUIRED,
@@ -510,6 +524,8 @@ async def settle_published_snapshot(
             .where(
                 models.AcquisitionRecord.run_id == run_id,
                 models.AcquisitionRecord.workspace_id == workspace_id,
+                models.AcquisitionRecord.blob_ref.is_not(None),
+                models.AcquisitionRecord.acquired_source.is_not(None),
                 models.AcquisitionRecord.state.in_(
                     (
                         AcquisitionRecordState.DISCOVERED,
@@ -559,6 +575,11 @@ async def settle_published_snapshot(
     run.unchanged_count = counts.get(AcquisitionRecordState.UNCHANGED, 0)
     run.retry_count = counts.get(AcquisitionRecordState.RETRY, 0)
     run.acquired_blob_bytes = 0
+    partial_pending = (
+        run.completeness is not None
+        and SnapshotCompleteness(run.completeness) is SnapshotCompleteness.PARTIAL
+        and run.omission_count > 0
+    )
     run.state = AcquisitionRunState.SETTLED
     run.diagnostic = None
     run.updated_at = now
@@ -596,16 +617,17 @@ async def settle_published_snapshot(
         SnapshotCompleteness(run.completeness).value if run.completeness is not None else ""
     )
     promotion_policy = SnapshotPromotionPolicy(run.promotion_policy).value
+    pending_items = run.omission_count if partial_pending else 0
     lifecycle.update(
         {
-            "phase": "complete",
-            "outcome": "complete",
+            "phase": "acquiring" if partial_pending else "complete",
+            "outcome": "incomplete" if partial_pending else "complete",
             "enumerated_items": run.discovered_count,
             "acquired_items": run.acquired_count,
             "reused_items": run.unchanged_count,
             "omitted_items": run.omission_count,
             "failed_items": run.retry_count,
-            "pending_items": 0,
+            "pending_items": pending_items,
             "snapshot_completeness": completeness,
             "reproducibility_policy": promotion_policy,
             "snapshot_identity": run.id,
@@ -614,19 +636,19 @@ async def settle_published_snapshot(
             "derived_generation_identity": derived_generation_identity,
             "candidate_watermark_present": run.candidate_watermark is not None,
             "committed_watermark_present": run.watermark_committed_at is not None,
-            "backlog_items": 0,
+            "backlog_items": pending_items,
             "backlog_bytes": 0,
             "oldest_backlog_age_seconds": None,
-            "can_continue_offline": True,
-            "estimated_remaining_items": 0,
+            "can_continue_offline": not partial_pending,
+            "estimated_remaining_items": pending_items,
             "estimated_remaining_seconds": 0,
             "refusal": None,
         }
     )
     last_run.update(
         {
-            "outcome": "complete",
-            "retry_required": False,
+            "outcome": "incomplete" if partial_pending else "complete",
+            "retry_required": partial_pending,
             "derivation_deferred": False,
             "snapshot_completeness": completeness,
             "snapshot_omissions": run.omission_count,

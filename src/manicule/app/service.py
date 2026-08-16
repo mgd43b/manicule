@@ -194,14 +194,22 @@ def _snapshot_status_report(
     """Project a private manifest onto the aggregate surface contract."""
     from manicule.core.acquisition import AcquisitionRunState  # noqa: PLC0415
 
-    pending = max(0, run.acquired_count - run.indexed_count - run.unchanged_count)
+    derivation_pending = max(0, run.acquired_count - run.indexed_count - run.unchanged_count)
+    omission_pending = (
+        run.omission_count
+        if run.completeness is not None and run.completeness.value == "partial"
+        else 0
+    )
+    pending = derivation_pending + omission_pending
     corrupt = verification_performed and run.acquisition_completed_at is not None and not verified
-    terminal = run.state is AcquisitionRunState.SETTLED
+    terminal = run.state is AcquisitionRunState.SETTLED and omission_pending == 0
     phase: r.LifecyclePhase = (
         "failed"
         if corrupt
         else "complete"
         if terminal
+        else "acquiring"
+        if omission_pending
         else "rebuilding"
         if run.state is AcquisitionRunState.INDEXING
         else "acquiring"
@@ -212,7 +220,7 @@ def _snapshot_status_report(
         else "complete"
         if terminal
         else "incomplete"
-        if run.diagnostic is not None
+        if run.diagnostic is not None or omission_pending
         else "running"
     )
     age = (
@@ -249,6 +257,7 @@ def _snapshot_status_report(
                 run.promoted_at is not None
                 and bool(run.membership_hash)
                 and (verified or not verification_performed)
+                and omission_pending == 0
             ),
             estimated_remaining_items=0 if terminal or corrupt else pending,
         ),
