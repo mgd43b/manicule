@@ -295,6 +295,11 @@ class Runtime:
         return self._settings
 
     @property
+    def container(self) -> Container:
+        """Configured component graph shared by ingestion and offline derivation assembly."""
+        return self._container
+
+    @property
     def workspace(self) -> str:
         return self._settings.workspace
 
@@ -959,6 +964,117 @@ class _Ingestion:
         if run is None:
             return None
         return run, await store.verify_snapshot_manifest(run.id)
+
+    async def _rebuild_components(self, snapshot_run_id: str):  # noqa: ANN202
+        """Assemble the connector-free production offline rebuild stack and exact target."""
+        import json  # noqa: PLC0415
+
+        from manicule.core.rebuild import RebuildTarget  # noqa: PLC0415
+        from manicule.ingest.rebuild import build_offline_rebuilder  # noqa: PLC0415
+        from manicule.ingest.workers import WorkerPool, worker_config  # noqa: PLC0415
+        from manicule.parsers.chain import ParserChain  # noqa: PLC0415
+        from manicule.parsers.versions import parse_fingerprint  # noqa: PLC0415
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.blobs import BlobStore  # noqa: PLC0415
+        from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+        from manicule.storage.rebuild import SqliteRebuildStore  # noqa: PLC0415
+
+        documents = await self._runtime.documents()
+        if not isinstance(documents, SqliteDocStore):
+            raise ManiculeError("offline rebuild requires the built-in SQLite document store")
+        snapshot = await documents.get_acquisition_run(snapshot_run_id)
+        if snapshot is None:
+            raise UnknownEntityError("no durable source snapshot has that id")
+        blobs = await self._runtime.blobs()
+        if not isinstance(blobs, BlobStore):
+            raise ManiculeError("offline rebuild requires retained local source bytes")
+        vectors = await self._runtime.prepared_vectors()
+        store = SqliteRebuildStore(
+            self._runtime.require_engine(),
+            workspace_id=self._runtime.workspace,
+            blobs=blobs,
+            vectors=vectors,  # pyright: ignore[reportArgumentType]
+        )
+        chunker = await self._runtime.container.aget(keys.CHUNKER)
+        embedder = await self._runtime.container.aget(keys.EMBEDDER)
+        middleware = await self._runtime.middleware()
+        chunk_fingerprint = chunker.fingerprint.with_middleware(middleware.declarations())
+        settings = self._runtime.settings
+        parser_names = tuple(self._runtime.container.registry.names(ComponentKind.PARSER))
+        parser_set = tuple(
+            fingerprint.canonical()
+            for name in parser_names
+            if (fingerprint := parse_fingerprint(name)) is not None
+        )
+        routing = hashlib.sha256(
+            json.dumps(
+                {
+                    "fallbacks": settings.parser_fallbacks,
+                    "parsers": parser_names,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        glossary = await self.glossary_fingerprint()
+        target = RebuildTarget(
+            parser_routing=routing,
+            parser_set=parser_set,
+            chunk_fingerprint=chunk_fingerprint.canonical(),
+            embedding_fingerprint=embedder.fingerprint.canonical(),
+            embedding_config=embedder.fingerprint.model_dump_json(),
+            glossary_fingerprint=glossary.canonical(),
+            fts_tokenizer=models.FTS_TOKENIZER,
+            batch_documents=max(1, min(32, settings.ingest.max_documents_per_worker)),
+            max_memory_bytes=settings.ingest.parse_memory_limit_mb * 1024 * 1024,
+            max_temporary_bytes=settings.ingest.max_acquired_blob_backlog_bytes,
+        )
+        runner = WorkerPool(
+            worker_config(settings, chunker=chunker, embedder=embedder),
+            workers=settings.ingest.parse_workers,
+            timeout_s=settings.ingest.parse_timeout_s,
+            poll_interval_s=settings.ingest.memory_poll_interval_s,
+            max_documents=settings.ingest.max_documents_per_worker,
+        )
+        rebuilder = build_offline_rebuilder(
+            store=store,
+            blobs=blobs,
+            workspace_id=self._runtime.workspace,
+            source=snapshot.connector,
+            parser_chain=cast("ParserChain", _ContainerChain(self._runtime.container)),
+            routing_identity=routing,
+            chunker=chunker,
+            embedder=embedder,
+            vectors=vectors,
+            chunk_fingerprint=chunk_fingerprint,
+            middleware=middleware,
+            parse_runner=runner,
+        )
+        return store, rebuilder, target
+
+    async def rebuild_plan(self, snapshot_run_id: str):  # noqa: ANN202
+        _, rebuilder, target = await self._rebuild_components(snapshot_run_id)
+        return await rebuilder.dry_run(snapshot_run_id, target)
+
+    async def rebuild_run(self, snapshot_run_id: str, owner: str):  # noqa: ANN202
+        _, rebuilder, target = await self._rebuild_components(snapshot_run_id)
+        return await rebuilder.run(snapshot_run_id, target, owner=owner)
+
+    async def rebuild_status(self, generation_id: str):  # noqa: ANN202
+        from manicule.storage.rebuild import SqliteRebuildStore  # noqa: PLC0415
+
+        blobs = await self._runtime.blobs()
+        vectors = await self._runtime.prepared_vectors()
+        store = SqliteRebuildStore(
+            self._runtime.require_engine(),
+            workspace_id=self._runtime.workspace,
+            blobs=blobs,  # pyright: ignore[reportArgumentType]
+            vectors=vectors,  # pyright: ignore[reportArgumentType]
+        )
+        try:
+            return await store.checkpoint(generation_id)
+        except KeyError:
+            return None
 
     async def reembed_plan(self) -> tuple[ReembedPlan, str, int]:
         """Price from a transient durable snapshot, with no embedding or source access."""

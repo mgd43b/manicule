@@ -986,6 +986,29 @@ def render_reembed_cleanup(out: Console, payload: r.ReembedCleanupReport) -> Non
     out.print(f"{action}: {escape(payload.run_id)}")
 
 
+def render_rebuild_plan(out: Console, payload: r.RebuildPlanReport) -> None:
+    outcome = "runnable" if payload.runnable else f"refused: {payload.refusal_code or 'unknown'}"
+    out.print(
+        f"[bold]{payload.documents}[/bold] documents, about "
+        f"[bold]{payload.estimated_chunks}[/bold] chunks; {escape(outcome)}"
+    )
+    out.print(
+        f"about {payload.estimated_seconds:.1f}s; peak memory "
+        f"{payload.estimated_peak_memory_bytes} bytes; temporary disk "
+        f"{payload.estimated_temporary_bytes} bytes"
+    )
+
+
+def render_rebuild_run(out: Console, payload: r.RebuildRunReport) -> None:
+    out.print(f"[bold]{escape(payload.state)}[/bold] {escape(payload.generation_id)}")
+    out.print(
+        f"{payload.documents_built} documents, {payload.chunks_built} chunks; "
+        f"{payload.vectors_reused} vectors reused, {payload.vectors_embedded} embedded"
+    )
+    if payload.diagnostic_code:
+        out.print(f"[red]diagnostic: {escape(payload.diagnostic_code)}[/red]")
+
+
 RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.AnswerResultPayload: lambda out, p: render_answer(out, _as(r.AnswerResultPayload, p)),
     r.SearchResult: lambda out, p: render_search(out, _as(r.SearchResult, p)),
@@ -1000,6 +1023,8 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.ReembedCleanupReport: lambda out, p: render_reembed_cleanup(
         out, _as(r.ReembedCleanupReport, p)
     ),
+    r.RebuildPlanReport: lambda out, p: render_rebuild_plan(out, _as(r.RebuildPlanReport, p)),
+    r.RebuildRunReport: lambda out, p: render_rebuild_run(out, _as(r.RebuildRunReport, p)),
     r.IngestReport: lambda out, p: render_ingest(out, _as(r.IngestReport, p)),
     r.SnapshotStatusReport: lambda out, p: render_snapshot_status(
         out, _as(r.SnapshotStatusReport, p)

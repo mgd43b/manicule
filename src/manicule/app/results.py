@@ -819,6 +819,37 @@ class ReembedCleanupReport(Payload):
     removed: bool
 
 
+class RebuildPlanReport(Payload):
+    """Aggregate-only dry run for one promoted retained snapshot."""
+
+    generation_id: str
+    snapshot_id: str
+    documents: int = Field(ge=0)
+    known_source_bytes: int = Field(ge=0)
+    estimated_chunks: int = Field(ge=0)
+    estimated_seconds: float = Field(ge=0)
+    estimated_peak_memory_bytes: int = Field(ge=0)
+    estimated_temporary_bytes: int = Field(ge=0)
+    missing_count: int = Field(ge=0)
+    refusal_code: str | None = None
+    runnable: bool
+    lifecycle: LifecycleProgress
+
+
+class RebuildRunReport(Payload):
+    """Durable aggregate checkpoint for an offline replacement generation."""
+
+    generation_id: str
+    state: str
+    next_sequence: int = Field(ge=0)
+    documents_built: int = Field(ge=0)
+    chunks_built: int = Field(ge=0)
+    vectors_reused: int = Field(ge=0)
+    vectors_embedded: int = Field(ge=0)
+    diagnostic_code: str | None = None
+    lifecycle: LifecycleProgress
+
+
 class LifecycleReport(Payload):
     """Aggregate-only plan or outcome for one explicit retention boundary."""
 
@@ -835,6 +866,9 @@ class LifecycleReport(Payload):
     released_bytes: int = Field(default=0, ge=0)
     confirmation: str | None = None
     source_contacted: bool = False
+    lifecycle: LifecycleProgress = Field(
+        default_factory=lambda: LifecycleProgress(phase="complete", outcome="complete")
+    )
 
 
 class StaleReparseReport(Payload):

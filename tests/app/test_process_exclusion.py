@@ -583,6 +583,8 @@ def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exc
         "backup",
         "reembed-execute",
         "reembed-inspect",
+        "rebuild-execute",
+        "rebuild-resume",
         "cleanup-derived-generations",
         "release-source-history",
         "reset-derived",

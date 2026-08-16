@@ -280,7 +280,9 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
         "doctor": {},
         "connector_list": {},
         "snapshot_status": {"name": "snapshot-source"},
-        "snapshot_verify": {"snapshot_id": "read-snapshot"},
+            "snapshot_verify": {"snapshot_id": "read-snapshot"},
+            "rebuild_plan": {"snapshot_id": "read-snapshot"},
+            "rebuild_status": {"generation_id": "read-generation"},
         "config_get": {},
         "workspace_list": {},
         # `registry` left off deliberately. It is why this tool's `openWorldHint` is true, and

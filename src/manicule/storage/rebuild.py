@@ -595,7 +595,9 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RuntimeError("the rebuild snapshot is no longer promoted")
             snapshot_run_id = generation.snapshot_run_id
         records = await self._acquisition.list_acquisition_records(
-            snapshot_run_id, after_sequence=after_sequence, limit=min(limit, 1)
+            snapshot_run_id,
+            after_sequence=None if after_sequence < 0 else after_sequence,
+            limit=min(limit, 1),
         )
         result: list[SnapshotRebuildInput] = []
         for record in records:
@@ -910,7 +912,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 await session.execute(text(REBUILD_FTS))
             await session.execute(text(INTEGRITY_CHECK_FTS))
             state.chunk_fingerprint = target.chunk_fingerprint
-            state.embed_fingerprint = target.embedding_fingerprint
+            state.embed_fingerprint = target.embedding_config or target.embedding_fingerprint
             state.fts_tokenizer = target.fts_tokenizer
             state.vector_inventory_digest = await self._live_chunk_inventory_digest(session)
             generation.published_vector_inventory_digest = state.vector_inventory_digest
@@ -1069,16 +1071,20 @@ class SqliteRebuildStore(WorkspaceScoped):
             raise RuntimeError("replacement document belongs to another workspace")
         elif stored.publication_id == vector_publication:
             raise RuntimeError("duplicate document in replacement generation")
-        await session.execute(
-            delete(models.GlossaryEntry).where(models.GlossaryEntry.document_id == document.id)
-        )
-        await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
+        # Populate every non-null document field before the following deletes trigger ORM
+        # autoflush. A replacement published into an empty corpus creates this row; leaving it
+        # as only id/workspace until after a query makes SQLite correctly refuse the transient
+        # invalid shape before ``apply_document`` ever runs.
         apply_document(stored, document)
         stored.publication_id = vector_publication
         stored.parse_fp = replacement.parse_fingerprint
         stored.chunk_fp = target.chunk_fingerprint
         stored.embed_fp = target.embedding_fingerprint
         stored.glossary_fp = target.glossary_fingerprint
+        await session.execute(
+            delete(models.GlossaryEntry).where(models.GlossaryEntry.document_id == document.id)
+        )
+        await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
         await session.flush()
         for chunk in replacement.chunks:
             session.add(from_chunk(chunk, document.id, vector_publication))

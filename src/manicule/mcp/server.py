@@ -1,4 +1,4 @@
-"""The MCP server: thirty-five tools, each a few lines over the application service.
+"""The MCP server: thirty-seven tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -216,6 +216,8 @@ TOOL_NAMES: tuple[str, ...] = (
     "connector_list",
     "snapshot_status",
     "snapshot_verify",
+    "rebuild_plan",
+    "rebuild_status",
     "connector_sync",
     "config_get",
     "config_set",
@@ -879,6 +881,24 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         """
         return await dispatch("snapshot_verify", lambda: service.snapshot_verify(snapshot_id))
 
+    @register.tool(READS)
+    async def rebuild_plan(snapshot_id: str) -> dict[str, Any]:
+        """Price an offline replacement generation without parsing, embedding, or source access.
+
+        Args:
+            snapshot_id: Opaque promoted snapshot identity returned by snapshot status.
+        """
+        return await dispatch("rebuild_plan", lambda: service.rebuild_plan(snapshot_id))
+
+    @register.tool(READS)
+    async def rebuild_status(generation_id: str) -> dict[str, Any]:
+        """Read one durable offline replacement-generation checkpoint.
+
+        Args:
+            generation_id: Opaque generation identity returned by rebuild plan.
+        """
+        return await dispatch("rebuild_status", lambda: service.rebuild_status(generation_id))
+
     @register.tool(hints(reads=False, removes=False, repeatable=False, reaches_out=True))
     async def connector_sync(
         name: str, limit: int | None = None, acquire_only: bool = False
@@ -1019,6 +1039,8 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             connector_list,
             snapshot_status,
             snapshot_verify,
+            rebuild_plan,
+            rebuild_status,
             connector_sync,
             config_get,
             config_set,

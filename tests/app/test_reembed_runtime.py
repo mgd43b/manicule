@@ -40,6 +40,10 @@ class CountingEmbedder(HashEmbedder):
         self.texts += len(texts)
         return await super().embed(texts)
 
+    def count_tokens(self, text: str) -> int:
+        """Deterministic local tokenizer seam used by production chunker assembly tests."""
+        return len(text.split())
+
 
 def _runtime(data_dir: Path, embedder: CountingEmbedder) -> Runtime:
     found = discover()

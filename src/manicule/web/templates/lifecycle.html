@@ -12,6 +12,10 @@
     <dt>Snapshot items</dt><dd>{{ envelope.data.snapshot_items }}</dd>
     <dt>Unrecoverable items</dt><dd>{{ envelope.data.unrecoverable_items }}</dd>
     <dt>Unrecoverable bytes</dt><dd>{{ envelope.data.unrecoverable_bytes }}</dd>
+    <dt>Phase</dt><dd>{{ envelope.data.lifecycle.phase }}</dd>
+    <dt>Outcome</dt><dd>{{ envelope.data.lifecycle.outcome }}</dd>
+    <dt>Can continue offline</dt><dd>{{ envelope.data.lifecycle.can_continue_offline }}</dd>
+    <dt>Pending items</dt><dd>{{ envelope.data.lifecycle.pending_items }}</dd>
   </dl>
   {% else %}{{ m.failed(envelope) }}{% endif %}
 </section>
@@ -38,4 +42,40 @@
   <p>This page never deletes a snapshot. Confirmation remains a separate operator action.</p>
 </section>
 {% if panels.snapshot is defined %}{{ lifecycle_plan("Snapshot deletion plan", panels.snapshot) }}{% endif %}
+{% if panels.rebuild is defined %}
+<section class="panel">
+  <h2>Offline rebuild plan</h2>
+  {% if panels.rebuild.ok %}
+  <dl>
+    <dt>Generation</dt><dd>{{ panels.rebuild.data.generation_id }}</dd>
+    <dt>Documents</dt><dd>{{ panels.rebuild.data.documents }}</dd>
+    <dt>Known source bytes</dt><dd>{{ panels.rebuild.data.known_source_bytes }}</dd>
+    <dt>Runnable</dt><dd>{{ panels.rebuild.data.runnable }}</dd>
+    <dt>Phase</dt><dd>{{ panels.rebuild.data.lifecycle.phase }}</dd>
+  </dl>
+  {% else %}{{ m.failed(panels.rebuild) }}{% endif %}
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>Offline rebuild status</h2>
+  <form method="get" action="/ui/lifecycle">
+    <input type="hidden" name="run_id" value="{{ run_id }}">
+    <label>Generation ID <input name="generation_id" value="{{ generation_id }}" maxlength="200" required></label>
+    <button type="submit">Inspect</button>
+  </form>
+</section>
+{% if panels.rebuild_status is defined %}
+<section class="panel">
+  <h2>Offline rebuild checkpoint</h2>
+  {% if panels.rebuild_status.ok %}
+  <dl>
+    <dt>State</dt><dd>{{ panels.rebuild_status.data.state }}</dd>
+    <dt>Documents built</dt><dd>{{ panels.rebuild_status.data.documents_built }}</dd>
+    <dt>Chunks built</dt><dd>{{ panels.rebuild_status.data.chunks_built }}</dd>
+    <dt>Phase</dt><dd>{{ panels.rebuild_status.data.lifecycle.phase }}</dd>
+  </dl>
+  {% else %}{{ m.failed(panels.rebuild_status) }}{% endif %}
+</section>
+{% endif %}
 {% endblock %}

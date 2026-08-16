@@ -400,6 +400,11 @@ reembed_app = typer.Typer(
     no_args_is_help=True,
     cls=CommandsShareTheRootOptions,
 )
+rebuild_app = typer.Typer(
+    help="Offline replacement generations from durable source snapshots.",
+    no_args_is_help=True,
+    cls=CommandsShareTheRootOptions,
+)
 app.add_typer(document_app, name="document")
 app.add_typer(collection_app, name="collection")
 app.add_typer(connector_app, name="connector")
@@ -408,6 +413,7 @@ app.add_typer(plugin_app, name="plugin")
 app.add_typer(config_app, name="config")
 app.add_typer(auth_app, name="auth")
 app.add_typer(reembed_app, name="reembed")
+app.add_typer(rebuild_app, name="rebuild")
 
 
 JsonOption = Annotated[bool, typer.Option("--json", help=JSON_HELP)]
@@ -595,6 +601,9 @@ PAYLOADS: dict[str, type[Payload]] = {
     "reembed_status": r.ReembedRunReport,
     "reembed_abandon": r.ReembedRunReport,
     "reembed_cleanup": r.ReembedCleanupReport,
+    "rebuild_plan": r.RebuildPlanReport,
+    "rebuild_run": r.RebuildRunReport,
+    "rebuild_status": r.RebuildRunReport,
     "lifecycle_reset_derived": r.LifecycleReport,
     "lifecycle_cleanup_generations": r.LifecycleReport,
     "lifecycle_release_history": r.LifecycleReport,
@@ -1001,6 +1010,31 @@ def reembed_cleanup(
 ) -> None:
     """Delete terminal non-live shadow storage."""
     submit(Command("reembed_cleanup", {"run_id": run_id}))
+
+
+@rebuild_app.command("plan")
+def rebuild_plan(
+    snapshot_id: Annotated[str, typer.Argument(help="Promoted durable source snapshot id.")],
+) -> None:
+    """Price a connector-free rebuild without parsing or embedding."""
+    emit("rebuild_plan", lambda service: service.rebuild_plan(snapshot_id))
+
+
+@rebuild_app.command("execute")
+@rebuild_app.command("resume")
+def rebuild_run(
+    snapshot_id: Annotated[str, typer.Argument(help="Promoted durable source snapshot id.")],
+) -> None:
+    """Execute or resume the deterministic generation for this snapshot and configuration."""
+    submit(Command("rebuild_run", {"snapshot_id": snapshot_id}))
+
+
+@rebuild_app.command("status")
+def rebuild_status(
+    generation_id: Annotated[str, typer.Argument(help="Opaque replacement generation id.")],
+) -> None:
+    """Read a durable offline rebuild checkpoint."""
+    emit("rebuild_status", lambda service: service.rebuild_status(generation_id))
 
 
 # --- collection -------------------------------------------------------------------------------

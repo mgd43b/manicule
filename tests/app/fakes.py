@@ -40,6 +40,11 @@ from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.core.organization import Collection as DocumentCollection
 from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
 from manicule.core.provenance import PROVENANCE_KEY, Provenance
+from manicule.core.rebuild import (
+    RebuildCheckpoint,
+    RebuildEstimate,
+    RebuildState,
+)
 from manicule.core.retrieval import Candidate, Confidence, ConfidenceBand, Context, Query
 from manicule.core.source_lifecycle import (
     LifecycleOperation,
@@ -895,6 +900,43 @@ class FakeIngestion:
         if self.snapshot is None or self.snapshot.id != run_id:
             return None
         return self.snapshot, self.snapshot_verified
+
+    async def rebuild_plan(self, snapshot_run_id: str) -> RebuildEstimate:
+        return RebuildEstimate(
+            generation_id="aggregate-generation",
+            snapshot_run_id=snapshot_run_id,
+            documents=2,
+            expected_items=2,
+            known_source_bytes=101,
+            estimated_chunks=7,
+            estimated_seconds=3.5,
+            estimated_peak_memory_bytes=2048,
+            estimated_temporary_bytes=4096,
+            missing_count=0,
+        )
+
+    async def rebuild_run(self, snapshot_run_id: str, owner: str) -> RebuildCheckpoint:
+        del snapshot_run_id, owner
+        return RebuildCheckpoint(
+            generation_id="aggregate-generation",
+            state=RebuildState.PUBLISHED,
+            next_sequence=2,
+            documents_built=2,
+            chunks_built=7,
+            vectors_reused=0,
+            vectors_embedded=7,
+        )
+
+    async def rebuild_status(self, generation_id: str) -> RebuildCheckpoint | None:
+        return RebuildCheckpoint(
+            generation_id=generation_id,
+            state=RebuildState.BUILDING,
+            next_sequence=1,
+            documents_built=1,
+            chunks_built=3,
+            vectors_reused=0,
+            vectors_embedded=3,
+        )
 
     async def reindex(self, document_id: str) -> ReindexReport:
         self.reindexed.append(document_id)

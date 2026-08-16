@@ -292,6 +292,11 @@ BINDERS: Mapping[str, Binder] = {
     "reembed_resume": lambda service, args, report: service.reembed_resume(args.text("run_id")),
     "reembed_abandon": lambda service, args, report: service.reembed_abandon(args.text("run_id")),
     "reembed_cleanup": lambda service, args, report: service.reembed_cleanup(args.text("run_id")),
+    "rebuild_plan": lambda service, args, report: service.rebuild_plan(args.text("snapshot_id")),
+    "rebuild_run": lambda service, args, report: service.rebuild_run(args.text("snapshot_id")),
+    "rebuild_status": lambda service, args, report: service.rebuild_status(
+        args.text("generation_id")
+    ),
     "import": lambda service, args, report: service.import_corpus(
         args.path("path"), force=args.flag("force")
     ),

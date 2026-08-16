@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.content import Chunk, Document
     from manicule.core.organization import Collection, Tag
+    from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Confidence
     from manicule.embedding.artifacts import WeightsPlan
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
@@ -244,6 +245,13 @@ def _snapshot_status_report(
 
 
 def _lifecycle_plan_report(plan: LifecyclePlan) -> r.LifecycleReport:
+    phase: r.LifecyclePhase = (
+        "resetting"
+        if plan.operation.value == "reset_derived"
+        else "deleting"
+        if plan.operation.value in {"release_source_history", "delete_snapshot"}
+        else "rebuilding"
+    )
     return r.LifecycleReport(
         operation=plan.operation.value,
         dry_run=True,
@@ -255,10 +263,30 @@ def _lifecycle_plan_report(plan: LifecyclePlan) -> r.LifecycleReport:
         unrecoverable_items=plan.unrecoverable_items,
         unrecoverable_bytes=plan.unrecoverable_bytes,
         confirmation=plan.confirmation,
+        lifecycle=r.LifecycleProgress(
+            phase=phase,
+            outcome="running",
+            dry_run=True,
+            enumerated_items=plan.eligible_items + plan.protected_items,
+            pending_items=plan.eligible_items,
+            snapshot_completeness="complete" if plan.snapshot_items else "",
+            snapshot_promoted=True if plan.snapshot_items else None,
+            backlog_items=plan.eligible_items,
+            backlog_bytes=plan.eligible_bytes,
+            can_continue_offline=plan.snapshot_items > 0,
+            estimated_remaining_items=plan.eligible_items,
+        ),
     )
 
 
 def _lifecycle_outcome_report(outcome: LifecycleOutcome) -> r.LifecycleReport:
+    phase: r.LifecyclePhase = (
+        "resetting"
+        if outcome.operation.value == "reset_derived"
+        else "deleting"
+        if outcome.operation.value in {"release_source_history", "delete_snapshot"}
+        else "rebuilding"
+    )
     return r.LifecycleReport(
         operation=outcome.operation.value,
         dry_run=False,
@@ -266,6 +294,88 @@ def _lifecycle_outcome_report(outcome: LifecycleOutcome) -> r.LifecycleReport:
         released_bytes=outcome.released_bytes,
         snapshot_items=outcome.snapshot_items,
         source_contacted=outcome.source_contacted,
+        lifecycle=r.LifecycleProgress(
+            phase=phase,
+            outcome="complete",
+            acquired_items=outcome.removed_items,
+            snapshot_completeness="complete" if outcome.snapshot_items else "",
+            snapshot_promoted=True if outcome.snapshot_items else None,
+            can_continue_offline=outcome.snapshot_items > 0,
+        ),
+    )
+
+
+def _rebuild_plan_report(estimate: RebuildEstimate) -> r.RebuildPlanReport:
+    refusal = (
+        r.LifecycleRefusal(code=estimate.refusal.value, count=estimate.missing_count)
+        if estimate.refusal is not None
+        else None
+    )
+    return r.RebuildPlanReport(
+        generation_id=estimate.generation_id,
+        snapshot_id=estimate.snapshot_run_id,
+        documents=estimate.documents,
+        known_source_bytes=estimate.known_source_bytes,
+        estimated_chunks=estimate.estimated_chunks,
+        estimated_seconds=estimate.estimated_seconds,
+        estimated_peak_memory_bytes=estimate.estimated_peak_memory_bytes,
+        estimated_temporary_bytes=estimate.estimated_temporary_bytes,
+        missing_count=estimate.missing_count,
+        refusal_code=estimate.refusal.value if estimate.refusal else None,
+        runnable=estimate.runnable,
+        lifecycle=r.LifecycleProgress(
+            phase="rebuilding",
+            outcome="running" if estimate.runnable else "refused",
+            dry_run=True,
+            enumerated_items=estimate.documents,
+            failed_items=estimate.missing_count,
+            pending_items=estimate.documents,
+            snapshot_completeness="complete" if estimate.runnable else "",
+            snapshot_identity=estimate.snapshot_run_id,
+            snapshot_promoted=estimate.runnable,
+            source_generation_identity=estimate.snapshot_run_id,
+            derived_generation_identity=estimate.generation_id,
+            backlog_items=estimate.documents,
+            backlog_bytes=estimate.known_source_bytes,
+            can_continue_offline=estimate.runnable,
+            estimated_remaining_items=estimate.documents,
+            estimated_remaining_seconds=estimate.estimated_seconds,
+            refusal=refusal,
+        ),
+    )
+
+
+def _rebuild_run_report(checkpoint: RebuildCheckpoint) -> r.RebuildRunReport:
+    terminal = checkpoint.state.value in {"published", "failed", "canceled"}
+    failed = checkpoint.state.value == "failed"
+    canceled = checkpoint.state.value == "canceled"
+    outcome: r.LifecycleOutcome = (
+        "failed" if failed else "canceled" if canceled else "complete" if terminal else "running"
+    )
+    phase: r.LifecyclePhase = (
+        "failed" if failed else "canceled" if canceled else "complete" if terminal else "rebuilding"
+    )
+    return r.RebuildRunReport(
+        generation_id=checkpoint.generation_id,
+        state=checkpoint.state.value,
+        next_sequence=checkpoint.next_sequence,
+        documents_built=checkpoint.documents_built,
+        chunks_built=checkpoint.chunks_built,
+        vectors_reused=checkpoint.vectors_reused,
+        vectors_embedded=checkpoint.vectors_embedded,
+        diagnostic_code=(
+            checkpoint.diagnostic_code.value if checkpoint.diagnostic_code is not None else None
+        ),
+        lifecycle=r.LifecycleProgress(
+            phase=phase,
+            outcome=outcome,
+            acquired_items=checkpoint.documents_built,
+            reused_items=checkpoint.vectors_reused,
+            pending_items=0,
+            derived_generation_identity=checkpoint.generation_id,
+            can_continue_offline=not terminal,
+            estimated_remaining_items=0,
+        ),
     )
 
 
@@ -1131,6 +1241,26 @@ class ApplicationService:
             raise UnknownEntityError("no durable source snapshot has that id")
         run, verified = found
         return _snapshot_status_report(run, verified, verification_performed=True)
+
+    async def rebuild_plan(self, snapshot_id: str) -> r.RebuildPlanReport:
+        """Price a connector-free replacement generation from retained source bytes."""
+        ingestion = await self._backend.ingestion()
+        return _rebuild_plan_report(await ingestion.rebuild_plan(snapshot_id))
+
+    async def rebuild_run(self, snapshot_id: str) -> r.RebuildRunReport:
+        """Execute or resume the deterministic generation for one snapshot and target."""
+        ingestion = await self._backend.ingestion()
+        return _rebuild_run_report(
+            await ingestion.rebuild_run(snapshot_id, secrets.token_urlsafe(24))
+        )
+
+    async def rebuild_status(self, generation_id: str) -> r.RebuildRunReport:
+        """Read one workspace-owned offline rebuild checkpoint."""
+        ingestion = await self._backend.ingestion()
+        checkpoint = await ingestion.rebuild_status(generation_id)
+        if checkpoint is None:
+            raise UnknownEntityError("no durable offline rebuild has that generation id")
+        return _rebuild_run_report(checkpoint)
 
     async def connector_sidecar(
         self,

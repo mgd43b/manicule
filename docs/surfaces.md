@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Thirty-five MCP tools and twenty-eight CLI commands. They are not a one-to-one mapping: some
+Thirty-seven MCP tools and twenty-seven CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -333,7 +333,7 @@ registration is unchanged: adding status fields does not add a write tool to the
 corpus-scanning `reembed` operations and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The thirty-five tools read
+assistant can call unattended should not be able to do any of that. The thirty-seven tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
 surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
 `collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
@@ -361,7 +361,7 @@ secret as a parameter, and a session cookie in a tool call is a session cookie i
 ### 4.1 What each tool says it does, and why that is not permission
 
 Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
-`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty of the thirty-five say they only
+`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-two of the thirty-seven say they only
 read.
 
 **They are a description, and nothing in manicule reads them back.** No tool is gated on its own

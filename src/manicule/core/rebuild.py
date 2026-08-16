@@ -45,6 +45,8 @@ class RebuildTarget(BaseModel):
     parser_set: tuple[str, ...]
     chunk_fingerprint: str = Field(min_length=1)
     embedding_fingerprint: str = Field(min_length=1)
+    embedding_config: str = ""
+    """Full serialized embedder configuration for publication; identity remains canonical."""
     glossary_fingerprint: str = Field(min_length=1)
     fts_tokenizer: str = Field(min_length=1)
     batch_documents: int = Field(default=32, gt=0, le=1024)

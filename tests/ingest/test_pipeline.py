@@ -839,7 +839,8 @@ async def test_a_discovery_failure_marks_the_run_unclean_without_losing_what_was
 
     assert report.indexed == 1
     assert not report.clean
-    assert "cursor expired" in report.error
+    assert report.error == "RuntimeError: source enumeration failed"
+    assert "cursor expired" not in report.error
 
 
 async def test_ingesting_the_same_bytes_twice_produces_the_same_chunk_ids() -> None:
