@@ -89,6 +89,31 @@ def test_http_and_mcp_return_the_same_aggregate_snapshot_status() -> None:
     assert lifecycle["can_continue_offline"] is True
 
 
+async def test_settled_partial_snapshot_keeps_source_retry_pending() -> None:
+    backend = _backend()
+    snapshot = backend.ingestion_.snapshot
+    assert snapshot is not None
+    backend.ingestion_.snapshot = snapshot.model_copy(
+        update={
+            "state": AcquisitionRunState.SETTLED,
+            "completeness": SnapshotCompleteness.PARTIAL,
+            "promotion_policy": SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+            "discovered_count": 3,
+            "acquired_count": 2,
+            "indexed_count": 2,
+            "omission_count": 1,
+            "acquired_blob_bytes": 0,
+        }
+    )
+
+    status = await ApplicationService(backend).snapshot_status("synthetic-wiki")
+
+    assert status.lifecycle.phase == "acquiring"
+    assert status.lifecycle.outcome == "incomplete"
+    assert status.lifecycle.pending_items == status.lifecycle.backlog_items == 1
+    assert status.lifecycle.can_continue_offline is False
+
+
 def test_verify_is_read_only_aggregate_and_contains_no_manifest_member_detail() -> None:
     backend = _backend()
     service = ApplicationService(backend)

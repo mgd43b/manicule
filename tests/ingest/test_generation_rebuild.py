@@ -529,11 +529,63 @@ class PublicationLeaseLossStore(FakeStore):
         raise RebuildLeaseConflictError("private replacement owner")
 
 
+@dataclass
+class AssertLeaseSeamStore(FakeStore):
+    conflict_at: int = 3
+    true_lease_loss: bool = False
+    successor_took_over_before_fail: bool = False
+    assert_calls: int = 0
+
+    @override
+    async def assert_generation_lease(
+        self,
+        generation_id: str,
+        owner: str,
+        lease_generation: int,
+        *,
+        now: object,
+    ) -> None:
+        del generation_id, owner, lease_generation, now
+        self.assert_calls += 1
+        if self.assert_calls != self.conflict_at:
+            return
+        if self.true_lease_loss:
+            raise RebuildLeaseConflictError("private successor owner")
+        raise RebuildPublicationConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED)
+
+    @override
+    async def fail_generation(
+        self,
+        generation_id: str,
+        code: RebuildRefusalCode,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> RebuildCheckpoint:
+        if self.successor_took_over_before_fail:
+            raise RebuildLeaseConflictError("private successor owner")
+        return await super().fail_generation(
+            generation_id,
+            code,
+            owner=owner,
+            lease_generation=lease_generation,
+            now=now,
+        )
+
+
 class ValidationFailureStore(FakeStore):
     @override
     async def validate_generation(self, generation_id: str) -> None:
         del generation_id
         raise RuntimeError("invalid row https://wiki.example.test/private token=secret")
+
+
+class ValidationConflictStore(FakeStore):
+    @override
+    async def validate_generation(self, generation_id: str) -> None:
+        del generation_id
+        raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
 
 
 class ValidationStorageFailureStore(FakeStore):
@@ -675,6 +727,58 @@ async def test_changed_resume_manifest_is_bounded_and_marks_generation_failed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("conflict_at", [3, 4], ids=["pre-validation", "pre-publication"])
+async def test_owned_assert_lease_conflict_fails_the_generation_at_both_seams(
+    conflict_at: int,
+) -> None:
+    item, body = source(0, "body")
+    store = AssertLeaseSeamStore([item], conflict_at=conflict_at)
+
+    with pytest.raises(RebuildLeaseError, match="offline rebuild lease was lost"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict_at", [3, 4], ids=["pre-validation", "pre-publication"])
+async def test_true_assert_lease_loss_never_mutates_successor_state(conflict_at: int) -> None:
+    item, body = source(0, "body")
+    store = AssertLeaseSeamStore([item], conflict_at=conflict_at, true_lease_loss=True)
+
+    with pytest.raises(RebuildLeaseError, match="offline rebuild lease was lost"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is None
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+async def test_successor_takeover_between_owned_conflict_and_failure_never_mutates_it() -> None:
+    item, body = source(0, "body")
+    store = AssertLeaseSeamStore([item], conflict_at=3, successor_took_over_before_fail=True)
+
+    with pytest.raises(RebuildLeaseError, match="offline rebuild lease was lost"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is None
+    assert store.published is False
+
+
+@pytest.mark.asyncio
 async def test_corrupt_checkpoint_is_bounded_and_marks_generation_failed() -> None:
     item, body = source(0, "body")
     store = CorruptCheckpointStore([item])
@@ -719,6 +823,22 @@ async def test_validation_failure_is_bounded_and_marks_generation_failed() -> No
         ).run("promoted-run", target())
 
     assert store.failed_code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+async def test_validation_snapshot_conflict_is_bounded_and_marks_generation_failed() -> None:
+    item, body = source(0, "body")
+    store = ValidationConflictStore([item])
+
+    with pytest.raises(RebuildLeaseError, match="offline rebuild lease was lost"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.SNAPSHOT_CHANGED
     assert store.published is False
 
 

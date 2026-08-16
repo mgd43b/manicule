@@ -1037,12 +1037,15 @@ class OfflineGenerationRebuilder:
                 lease_generation=checkpoint.lease_generation,
                 now=self._clock(),
             )
-        await self._store.assert_generation_lease(
-            checkpoint.generation_id,
-            owner,
-            checkpoint.lease_generation,
-            now=self._clock(),
-        )
+        try:
+            await self._store.assert_generation_lease(
+                checkpoint.generation_id,
+                owner,
+                checkpoint.lease_generation,
+                now=self._clock(),
+            )
+        except RebuildPublicationConflictError as exc:
+            await self._fail_build_conflict(checkpoint, owner, exc)
         try:
             await self._store.validate_generation(checkpoint.generation_id)
         except (SQLAlchemyError, OSError) as exc:
@@ -1054,6 +1057,8 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
             raise RebuildStorageError from exc
+        except RebuildPublicationConflictError as exc:
+            await self._fail_build_conflict(checkpoint, owner, exc)
         except RebuildPublicationValidationError as exc:
             await self._store.fail_generation(
                 checkpoint.generation_id,
@@ -1072,12 +1077,15 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
             raise RebuildValidationError from exc
-        await self._store.assert_generation_lease(
-            checkpoint.generation_id,
-            owner,
-            checkpoint.lease_generation,
-            now=self._clock(),
-        )
+        try:
+            await self._store.assert_generation_lease(
+                checkpoint.generation_id,
+                owner,
+                checkpoint.lease_generation,
+                now=self._clock(),
+            )
+        except RebuildPublicationConflictError as exc:
+            await self._fail_build_conflict(checkpoint, owner, exc)
         if cancel is not None and cancel.is_set():
             return await self._store.cancel_generation(
                 checkpoint.generation_id,

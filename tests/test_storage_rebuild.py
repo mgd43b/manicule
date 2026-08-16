@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast, override
 
@@ -10,9 +11,14 @@ from sqlalchemy import delete, event, select, text, update
 
 from manicule.core.acquisition import (
     AcquiredSource,
+    AcquisitionDiagnostic,
+    AcquisitionFailureCode,
     AcquisitionRecordState,
     AcquisitionRunState,
     AcquisitionSource,
+    AcquisitionStage,
+    SnapshotCompleteness,
+    SnapshotPromotionPolicy,
 )
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, RawDocument
@@ -277,6 +283,124 @@ async def promoted_snapshot_many(
         now=NOW,
     )
     return run.id, tuple(blob_refs)
+
+
+async def promoted_partial_snapshot(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> tuple[str, tuple[RawDocument, RawDocument], tuple[str, str]]:
+    """Promote retained members on either side of one typed omission."""
+    run = await store.create_acquisition_run(
+        "promoted-partial-run",
+        "wiki",
+        source_scope="scope:partial-v1",
+        scope_fingerprint="partial-v1",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+    claimed = await store.claim_acquisition_run(
+        run.id, "partial-worker", now=NOW, expires_at=NOW + timedelta(minutes=5)
+    )
+    assert claimed is not None
+    raws = (
+        RawDocument(
+            source_id="retained-zero",
+            uri="https://wiki.example.test/content/retained-zero",
+            media_type="text/plain",
+            content="retained zero",
+        ),
+        RawDocument(
+            source_id="retained-two",
+            uri="https://wiki.example.test/content/retained-two",
+            media_type="text/plain",
+            content="retained two",
+        ),
+    )
+    source_ids = (raws[0].source_id, "omitted-one", raws[1].source_id)
+    for sequence, source_id in enumerate(source_ids):
+        raw = raws[0] if sequence == 0 else raws[1] if sequence == 2 else None
+        source = AcquisitionSource.from_discovered(
+            DiscoveredDoc(
+                ref=DocRef(
+                    source_id=source_id,
+                    uri=f"https://wiki.example.test/content/{source_id}",
+                ),
+                version_token="v2",  # noqa: S106 - source revision, not a credential
+                media_type="text/plain",
+                size_bytes=0 if raw is None else len(raw.as_bytes()),
+            )
+        )
+        await store.append_acquisition_record(
+            run.id,
+            sequence,
+            source,
+            lease_owner="partial-worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        Watermark(value="partial-v2", observed_at=NOW),
+        lease_owner="partial-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    blobs = BlobStore(engine, data_dir)
+    refs: list[str] = []
+    for raw in raws:
+        blob = await blobs.put(raw.as_bytes(), raw.media_type)
+        assert isinstance(blob, StoredBlob)
+        refs.append(blob.hash)
+        await store.transition_acquisition_record(
+            run.id,
+            raw.source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="partial-worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+        await store.transition_acquisition_record(
+            run.id,
+            raw.source_id,
+            AcquisitionRecordState.ACQUIRING,
+            AcquisitionRecordState.ACQUIRED,
+            lease_owner="partial-worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+            blob_ref=blob.hash,
+            acquired_source=AcquiredSource.from_raw(raw),
+            fetched_version_token="v2",  # noqa: S106 - source revision, not a credential
+        )
+    await store.transition_acquisition_record(
+        run.id,
+        "omitted-one",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="partial-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+        diagnostic=AcquisitionDiagnostic(
+            stage=AcquisitionStage.ACQUISITION,
+            code=AcquisitionFailureCode.AUTHENTICATION,
+        ),
+    )
+    completed = await store.complete_snapshot_acquisition(
+        run.id,
+        lease_owner="partial-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    assert completed.omission_count == 1
+    promoted = await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="partial-v1",
+        lease_owner="partial-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    assert promoted.completeness is SnapshotCompleteness.PARTIAL
+    return run.id, raws, (refs[0], refs[1])
 
 
 async def publish_one_replacement(
@@ -600,6 +724,171 @@ async def test_publication_and_acquisition_settlement_share_one_rollback_boundar
     assert run_state is AcquisitionRunState.ACQUIRING
     assert set(record_states) == {AcquisitionRecordState.ACQUIRED}
     assert [await store.get_document(document.id) for document in documents] == [None, None]
+
+
+async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omission_pending(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, raws, blob_refs = await promoted_partial_snapshot(store, engine, data_dir)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    assert plan.runnable
+    assert plan.documents == plan.expected_items == 2
+    assert plan.missing_count == 0
+    batch = await rebuilds.snapshot_inputs(plan.generation_id, after_sequence=-1, limit=10)
+    assert [(item.sequence, item.source.source_id) for item in batch] == [
+        (0, "retained-zero"),
+        (1, "retained-two"),
+    ]
+    first = await rebuilds.snapshot_inputs(plan.generation_id, after_sequence=-1, limit=1)
+    assert [(item.sequence, item.source.source_id) for item in first] == [(0, "retained-zero")]
+
+    claimed = await rebuilds.claim_generation(
+        plan.generation_id,
+        "partial-publisher",
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    replacements: list[tuple[int, DerivedReplacement]] = []
+    for sequence, (raw, blob_ref) in enumerate(zip(raws, blob_refs, strict=True)):
+        document = make_document(
+            source="wiki",
+            source_id=raw.source_id,
+            body=raw.as_bytes(),
+            uri=raw.uri,
+            media_type=raw.media_type,
+        ).model_copy(
+            update={
+                "publication_id": plan.generation_id,
+                "original_ref": blob_ref,
+                "version_token": "v2",
+                "status": DocumentStatus.INDEXED,
+            }
+        )
+        chunk = make_chunk(document, 0, raw.as_text())
+        replacements.append(
+            (
+                sequence,
+                DerivedReplacement(
+                    document=document,
+                    chunks=(chunk,),
+                    parse_fingerprint="plain@2",
+                    vector_embedded=1,
+                ),
+            )
+        )
+        await vectors.upsert(
+            [chunk],
+            [[1.0, 0.0, 0.0, 0.0]],
+            publication_id=claimed.vector_publication_id,
+        )
+    staged = await rebuilds.stage_replacements(
+        plan.generation_id,
+        replacements,
+        expected_next_sequence=0,
+        owner="partial-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    second = await rebuilds.snapshot_inputs(plan.generation_id, after_sequence=0, limit=1)
+    assert [(item.sequence, item.source.source_id) for item in second] == [(1, "retained-two")]
+    await rebuilds.begin_validation(
+        plan.generation_id,
+        owner="partial-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    await rebuilds.validate_generation(plan.generation_id)
+    published = await rebuilds.publish_generation(
+        plan.generation_id,
+        owner="partial-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+    assert staged.documents_built == 2
+    assert published.state is RebuildState.PUBLISHED
+    persisted = await store.get_acquisition_run(run_id)
+    records = await store.list_acquisition_records(run_id)
+    assert persisted is not None
+    assert persisted.state is AcquisitionRunState.SETTLED
+    assert persisted.omission_count == 1
+    assert [record.state for record in records] == [
+        AcquisitionRecordState.SETTLED,
+        AcquisitionRecordState.OMITTED,
+        AcquisitionRecordState.SETTLED,
+    ]
+    metadata = await store.connector_metadata("wiki")
+    last_run = cast("dict[str, Any]", metadata["last_run"])
+    lifecycle = cast("dict[str, Any]", last_run["lifecycle"])
+    assert last_run["outcome"] == "incomplete"
+    assert last_run["retry_required"] is True
+    assert lifecycle["pending_items"] == lifecycle["backlog_items"] == 1
+    assert lifecycle["omitted_items"] == 1
+    assert lifecycle["snapshot_completeness"] == "partial"
+    assert lifecycle["reproducibility_policy"] == "allow_omissions"
+    assert lifecycle["can_continue_offline"] is False
+    assert await store.verify_snapshot_manifest(run_id)
+    assert await store.latest_unsettled_acquisition_run("wiki") is None
+    rendered = json.dumps(metadata, sort_keys=True)
+    assert "retained zero" not in rendered
+    assert "wiki.example.test" not in rendered
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+async def test_publication_rechecks_retained_blob_integrity_before_settlement(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    damage: str,
+) -> None:
+    rebuilds, claimed, _ = await staged_glossary_generation(store, engine, data_dir)
+    async with engine.connect() as connection:
+        snapshot_id = await connection.scalar(
+            select(models.DerivedGeneration.snapshot_run_id).where(
+                models.DerivedGeneration.id == claimed.generation_id
+            )
+        )
+        blob_ref = await connection.scalar(
+            select(models.AcquisitionRecord.blob_ref)
+            .where(models.AcquisitionRecord.run_id == snapshot_id)
+            .order_by(models.AcquisitionRecord.sequence)
+            .limit(1)
+        )
+    assert isinstance(snapshot_id, str)
+    assert isinstance(blob_ref, str)
+    path = BlobStore(engine, data_dir).path_for(blob_ref)
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"synthetic corrupt evidence")
+
+    with pytest.raises(RebuildPublicationConflictError) as caught:
+        await rebuilds.publish_generation(
+            claimed.generation_id,
+            owner="glossary-publisher",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+
+    assert caught.value.code is RebuildRefusalCode.SNAPSHOT_CHANGED
+    assert (await rebuilds.checkpoint(claimed.generation_id)).state is RebuildState.VALIDATING
+    persisted = await store.get_acquisition_run(snapshot_id)
+    assert persisted is not None
+    assert persisted.state is AcquisitionRunState.ACQUIRING
+    assert {record.state for record in await store.list_acquisition_records(snapshot_id)} == {
+        AcquisitionRecordState.ACQUIRED
+    }
 
 
 async def test_published_replay_repairs_a_legacy_unsettled_handoff_exactly_once(
