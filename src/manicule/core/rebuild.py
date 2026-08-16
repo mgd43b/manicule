@@ -35,6 +35,7 @@ class RebuildRefusalCode(StrEnum):
     TEMP_DISK_BOUND = "temp_disk_bound"
     INVALID_REPLACEMENT = "invalid_replacement"
     DERIVATION_FAILED = "derivation_failed"
+    STORAGE_FAILED = "storage_failed"
 
 
 class RebuildTarget(BaseModel):

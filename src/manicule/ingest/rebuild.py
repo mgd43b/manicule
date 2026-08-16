@@ -984,6 +984,15 @@ class OfflineGenerationRebuilder:
         )
         try:
             await self._store.validate_generation(checkpoint.generation_id)
+        except (SQLAlchemyError, OSError) as exc:
+            await self._store.fail_generation(
+                checkpoint.generation_id,
+                RebuildRefusalCode.STORAGE_FAILED,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+            raise RebuildStorageError from exc
         except (RuntimeError, ValueError) as exc:
             await self._store.fail_generation(
                 checkpoint.generation_id,
@@ -1022,7 +1031,7 @@ class OfflineGenerationRebuilder:
             # generation and vector pointer remain untouched.
             await self._store.fail_generation(
                 checkpoint.generation_id,
-                RebuildRefusalCode.DERIVATION_FAILED,
+                RebuildRefusalCode.STORAGE_FAILED,
                 owner=owner,
                 lease_generation=checkpoint.lease_generation,
                 now=self._clock(),

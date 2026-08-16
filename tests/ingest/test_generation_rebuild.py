@@ -410,6 +410,17 @@ class ValidationFailureStore(FakeStore):
         raise RuntimeError("invalid row https://wiki.example.test/private token=secret")
 
 
+class ValidationStorageFailureStore(FakeStore):
+    @override
+    async def validate_generation(self, generation_id: str) -> None:
+        del generation_id
+        raise IntegrityError(
+            "SELECT private_column FROM private_table WHERE secret = ?",
+            ("cookie=secret",),
+            RuntimeError("/private/machine/workspace.sqlite"),
+        )
+
+
 @dataclass
 class ClaimFailureStore(FakeStore):
     claim_failure: Exception = field(default_factory=RebuildLeaseConflictError)
@@ -451,7 +462,7 @@ async def test_publication_integrity_failure_is_bounded_and_marks_generation_fai
         ).run("promoted-run", target())
 
     assert str(caught.value) == "offline rebuild storage failed"
-    assert store.failed_code is RebuildRefusalCode.DERIVATION_FAILED
+    assert store.failed_code is RebuildRefusalCode.STORAGE_FAILED
     assert store.published is False
     rendered = str(caught.value).lower()
     for private in ("insert", "secret", "wiki.example.test", "/private", "sqlite"):
@@ -471,6 +482,22 @@ async def test_validation_failure_is_bounded_and_marks_generation_failed() -> No
         ).run("promoted-run", target())
 
     assert store.failed_code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+async def test_validation_storage_failure_is_bounded_and_marks_generation_failed() -> None:
+    item, body = source(0, "body")
+    store = ValidationStorageFailureStore([item])
+
+    with pytest.raises(RebuildStorageError, match="offline rebuild storage failed"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.STORAGE_FAILED
     assert store.published is False
 
 
