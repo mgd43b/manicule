@@ -197,7 +197,23 @@ class SqliteRebuildStore(WorkspaceScoped):
     async def _publication_row_count(self, publication_id: str) -> int:
         try:
             return await self._required_vectors().publication_row_count(publication_id)
-        except ManiculeError as exc:
+        except (ManiculeError, ValueError) as exc:
+            raise RebuildPublicationValidationError from exc
+
+    async def _publication_page_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        try:
+            return await self._required_vectors().publication_page_is_complete(
+                publication_id,
+                chunks,
+                embedding_fingerprint=embedding_fingerprint,
+            )
+        except (ManiculeError, ValueError) as exc:
             raise RebuildPublicationValidationError from exc
 
     async def plan_rebuild(  # noqa: PLR0911, PLR0912, PLR0915 - ordered validation boundary
@@ -619,12 +635,12 @@ class SqliteRebuildStore(WorkspaceScoped):
                             target_publication,
                             page,
                         )
-                        page_complete = await self._required_vectors().publication_page_is_complete(
+                        page_complete = await self._publication_page_is_complete(
                             target_publication,
                             page,
                             embedding_fingerprint=target.embedding_fingerprint,
                         )
-                    except ManiculeError as exc:
+                    except (ManiculeError, ValueError) as exc:
                         raise RebuildPublicationValidationError from exc
                     if not page_complete:
                         raise RebuildPublicationValidationError
@@ -820,7 +836,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     chunks = replacement.flattened_chunks()
                     expected_vectors += len(chunks)
                     for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                        if not await self._required_vectors().publication_page_is_complete(
+                        if not await self._publication_page_is_complete(
                             physical_publication,
                             page,
                             embedding_fingerprint=target.embedding_fingerprint,
@@ -933,7 +949,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     chunks = replacement.flattened_chunks()
                     expected_vectors += len(chunks)
                     for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                        if not await self._required_vectors().publication_page_is_complete(
+                        if not await self._publication_page_is_complete(
                             physical_publication,
                             page,
                             embedding_fingerprint=target.embedding_fingerprint,
