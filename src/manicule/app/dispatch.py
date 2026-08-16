@@ -20,6 +20,7 @@ from manicule.app.results import (
     ErrorInfo,
     IngestReport,
     Payload,
+    RebuildRunReport,
     ReembedRunReport,
     SnapshotStatusReport,
     failed,
@@ -34,7 +35,14 @@ from manicule.core.errors import (
     UnknownComponentError,
     UnknownEntityError,
 )
-from manicule.core.rebuild import RebuildRefusedError
+from manicule.core.rebuild import (
+    RebuildDerivationError,
+    RebuildLeaseError,
+    RebuildRefusedError,
+    RebuildStorageError,
+    RebuildTerminalError,
+    RebuildValidationError,
+)
 from manicule.ingest.capacity import CapacityRefusedError
 
 if TYPE_CHECKING:
@@ -77,6 +85,26 @@ _HINTS: dict[type[Exception], str] = {
     ),
     RebuildRefusedError: (
         "Inspect `rebuild plan` for aggregate missing-input and capacity estimates, then retry."
+    ),
+    RebuildStorageError: (
+        "Inspect `rebuild status`; then check storage health and run the derived-generation "
+        "cleanup plan before retrying."
+    ),
+    RebuildDerivationError: (
+        "Inspect `rebuild status`; correct the parser or derivation configuration, clean the "
+        "failed derived generation, then retry."
+    ),
+    RebuildLeaseError: (
+        "Another worker owns or superseded this generation. Inspect `rebuild status` before "
+        "retrying."
+    ),
+    RebuildValidationError: (
+        "Inspect `rebuild status`; clean the failed derived generation before retrying with a "
+        "corrected target."
+    ),
+    RebuildTerminalError: (
+        "Inspect `rebuild status`, then run the derived-generation cleanup plan before planning "
+        "and executing the rebuild again."
     ),
 }
 """What to do about each kind of failure, in the words of whoever has to do it.
@@ -153,6 +181,12 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
                 hint="Inspect `reembed status` before retrying or starting another run.",
             ),
         )
+    if (
+        isinstance(payload, RebuildRunReport)
+        and op == "rebuild_run"
+        and payload.lifecycle.outcome in {"failed", "canceled"}
+    ):
+        return failed(op, workspace, error_info(RebuildTerminalError()))
     return succeeded(op, workspace, payload)
 
 

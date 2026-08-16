@@ -18,9 +18,11 @@ from manicule.core.rebuild import (
     MissingSnapshotInput,
     RebuildCheckpoint,
     RebuildEstimate,
+    RebuildLeaseConflictError,
     RebuildRefusalCode,
     RebuildState,
     RebuildTarget,
+    RebuildTerminalGenerationError,
     SnapshotRebuildInput,
     vector_publication_id,
 )
@@ -83,10 +85,6 @@ class GenerationVectorInventory(Protocol):
     async def copy_publication(
         self, source_publication_id: str, target_publication_id: str, chunks: Sequence[Chunk]
     ) -> None: ...
-
-
-class RebuildLeaseConflictError(RuntimeError):
-    """A rebuild worker lost or failed to acquire its monotonic lease fence."""
 
 
 def _canonical(value: object) -> bytes:
@@ -477,7 +475,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             if generation.state is RebuildState.PUBLISHED:
                 return _checkpoint(generation)
             if generation.state in {RebuildState.FAILED, RebuildState.CANCELED}:
-                raise RebuildLeaseConflictError("generation is terminal")
+                raise RebuildTerminalGenerationError("generation is terminal")
             if generation.lease_expires_at is not None and generation.lease_expires_at > now:
                 if generation.lease_owner != owner:
                     raise RebuildLeaseConflictError("generation has another live owner")
@@ -1364,4 +1362,10 @@ class SqliteRebuildStore(WorkspaceScoped):
         return row
 
 
-__all__ = ["BlobInventory", "GenerationVectorInventory", "SqliteRebuildStore"]
+__all__ = [
+    "BlobInventory",
+    "GenerationVectorInventory",
+    "RebuildLeaseConflictError",
+    "RebuildTerminalGenerationError",
+    "SqliteRebuildStore",
+]

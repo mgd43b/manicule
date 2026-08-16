@@ -1594,6 +1594,19 @@ irreversible task: cancellation waits for its atomic outcome instead of abandoni
 commit. Resumption starts at the durable
 sequence checkpoint rather than redoing committed batches.
 
+Expected failures cross the application boundary as a closed, aggregate-only vocabulary:
+`RebuildStorageError`, `RebuildDerivationError`, `RebuildLeaseError`,
+`RebuildValidationError`, and `RebuildTerminalError`. Their client messages never reuse driver,
+parser, SQL or filesystem exception text; the original exception remains chained only for local
+operator diagnostics. CLI JSON, the served control socket, admin HTTP, MCP and Web all use the
+same envelope and recovery hint. Storage failures are temporarily unavailable, lease and terminal
+claims are conflicts, and derivation or validation failures are unprocessable. HTTP therefore
+returns a non-2xx status and the CLI exits nonzero instead of presenting a traceback or a plain
+500. A publication transaction is allowed to roll back before the generation is marked failed,
+so the active relational rows and vector pointer remain unchanged. Inspect `rebuild status`, fix
+the reported class of problem, then use `cleanup-derived-generations --yes` to remove the failed
+shadow generation before planning the retry; status itself remains a read of that durable record.
+
 ### 10.5 Source and derived lifecycle boundaries
 
 Lifecycle work is four operations, not one broadly destructive reset:

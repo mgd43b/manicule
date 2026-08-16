@@ -2,24 +2,33 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import pytest
 from manicule_plugin_hostile import HangingMiddleware, HostileConfig
+from sqlalchemy.exc import IntegrityError
 
 from manicule.core.acquisition import AcquiredSource
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, PipelineStage, RawDocument
+from manicule.core.errors import ParseError
 from manicule.core.ids import content_hash
 from manicule.core.rebuild import (
     DerivedReplacement,
     MissingSnapshotInput,
     RebuildCheckpoint,
+    RebuildDerivationError,
     RebuildEstimate,
+    RebuildLeaseConflictError,
+    RebuildLeaseError,
     RebuildRefusalCode,
     RebuildRefusedError,
     RebuildState,
+    RebuildStorageError,
     RebuildTarget,
+    RebuildTerminalError,
+    RebuildTerminalGenerationError,
+    RebuildValidationError,
     SnapshotRebuildInput,
 )
 from manicule.ingest.glossary_lineage import glossary_fingerprint
@@ -116,6 +125,7 @@ class FakeStore:
     publish_started: asyncio.Event | None = None
     publish_release: asyncio.Event | None = None
     claimed_owners: list[str] = field(default_factory=list[str])
+    failed_code: RebuildRefusalCode | None = None
 
     def _checkpoint(self, state: RebuildState | None = None) -> RebuildCheckpoint:
         next_sequence = 0
@@ -307,7 +317,8 @@ class FakeStore:
         lease_generation: int,
         now: object,
     ) -> RebuildCheckpoint:
-        del generation_id, code, owner, lease_generation, now
+        del generation_id, owner, lease_generation, now
+        self.failed_code = code
         return self._checkpoint(RebuildState.FAILED)
 
 
@@ -372,6 +383,140 @@ class FakeDeriver:
 
     async def stage(self, prepared: PreparedReplacement, *, publication_id: str) -> None:
         del prepared, publication_id
+
+
+class StorageFailureStore(FakeStore):
+    @override
+    async def publish_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> RebuildCheckpoint:
+        del generation_id, owner, lease_generation, now
+        raise IntegrityError(
+            "INSERT INTO private_table VALUES (?)",
+            ("https://wiki.example.test/private?cookie=secret",),
+            RuntimeError("/private/machine/workspace.sqlite"),
+        )
+
+
+class ValidationFailureStore(FakeStore):
+    @override
+    async def validate_generation(self, generation_id: str) -> None:
+        del generation_id
+        raise RuntimeError("invalid row https://wiki.example.test/private token=secret")
+
+
+@dataclass
+class ClaimFailureStore(FakeStore):
+    claim_failure: Exception = field(default_factory=RebuildLeaseConflictError)
+
+    @override
+    async def claim_generation(
+        self, generation_id: str, owner: str, *, now: object, expires_at: object
+    ) -> RebuildCheckpoint:
+        del generation_id, owner, now, expires_at
+        raise self.claim_failure
+
+
+class DerivationFailure(FakeDeriver):
+    @override
+    async def prepare(
+        self,
+        raw: RawDocument,
+        target: RebuildTarget,
+        *,
+        generation_id: str,
+        blob_ref: str,
+        title: str,
+        version_token: str | None,
+    ) -> PreparedReplacement:
+        del raw, target, generation_id, blob_ref, title, version_token
+        raise ParseError("secret body at /private/path from https://wiki.example.test")
+
+
+@pytest.mark.asyncio
+async def test_publication_integrity_failure_is_bounded_and_marks_generation_failed() -> None:
+    item, body = source(0, "private source body")
+    store = StorageFailureStore([item])
+
+    with pytest.raises(RebuildStorageError) as caught:
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert str(caught.value) == "offline rebuild storage failed"
+    assert store.failed_code is RebuildRefusalCode.DERIVATION_FAILED
+    assert store.published is False
+    rendered = str(caught.value).lower()
+    for private in ("insert", "secret", "wiki.example.test", "/private", "sqlite"):
+        assert private not in rendered
+
+
+@pytest.mark.asyncio
+async def test_validation_failure_is_bounded_and_marks_generation_failed() -> None:
+    item, body = source(0, "body")
+    store = ValidationFailureStore([item])
+
+    with pytest.raises(RebuildValidationError, match="offline rebuild validation failed"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.INVALID_REPLACEMENT
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+async def test_derivation_failure_is_bounded_and_marks_generation_failed() -> None:
+    item, body = source(0, "body")
+    store = FakeStore([item])
+
+    with pytest.raises(RebuildDerivationError, match="offline rebuild derivation failed"):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=DerivationFailure(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.DERIVATION_FAILED
+    assert store.published is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("internal", "public", "message"),
+    [
+        (
+            RebuildLeaseConflictError("owner secret"),
+            RebuildLeaseError,
+            "offline rebuild lease was lost",
+        ),
+        (
+            RebuildTerminalGenerationError("terminal secret"),
+            RebuildTerminalError,
+            "offline rebuild generation is terminal",
+        ),
+    ],
+)
+async def test_internal_claim_failures_cross_as_bounded_public_errors(
+    internal: Exception, public: type[Exception], message: str
+) -> None:
+    item, body = source(0, "body")
+
+    with pytest.raises(public, match=message):
+        await OfflineGenerationRebuilder(
+            store=ClaimFailureStore([item], claim_failure=internal),
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
 
 
 @pytest.mark.asyncio

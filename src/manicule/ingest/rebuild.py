@@ -14,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, cast, override, runtime_checkable
 from uuid import uuid4
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from manicule.core.content import (
     Chunk,
     Document,
@@ -22,16 +24,24 @@ from manicule.core.content import (
     PipelineStage,
     RawDocument,
 )
+from manicule.core.errors import ManiculeError
 from manicule.core.glossary import GlossaryEntry
 from manicule.core.ids import content_hash, document_id
 from manicule.core.rebuild import (
     DerivedReplacement,
     RebuildCheckpoint,
+    RebuildDerivationError,
     RebuildEstimate,
+    RebuildLeaseConflictError,
+    RebuildLeaseError,
     RebuildRefusalCode,
     RebuildRefusedError,
     RebuildState,
+    RebuildStorageError,
     RebuildTarget,
+    RebuildTerminalError,
+    RebuildTerminalGenerationError,
+    RebuildValidationError,
     SnapshotRebuildInput,
 )
 from manicule.ingest.embedding import embed_or_reuse
@@ -726,7 +736,36 @@ class OfflineGenerationRebuilder:
             snapshot_run_id, target, missing_limit=missing_limit, persist=False
         )
 
-    async def run(  # noqa: PLR0912, PLR0915 - explicit terminal/refusal/lease stages
+    async def run(
+        self,
+        snapshot_run_id: str,
+        target: RebuildTarget,
+        *,
+        missing_limit: int = 100,
+        cancel: asyncio.Event | None = None,
+        owner: str | None = None,
+        lease_seconds: int = 300,
+    ) -> RebuildCheckpoint:
+        """Execute with one bounded public failure vocabulary at the durable boundary."""
+        try:
+            return await self._run(
+                snapshot_run_id,
+                target,
+                missing_limit=missing_limit,
+                cancel=cancel,
+                owner=owner,
+                lease_seconds=lease_seconds,
+            )
+        except RebuildTerminalGenerationError as exc:
+            raise RebuildTerminalError from exc
+        except RebuildLeaseConflictError as exc:
+            raise RebuildLeaseError from exc
+        except (SQLAlchemyError, OSError) as exc:
+            # Driver messages can contain statement text and bound parameter values. The cause
+            # is retained for server diagnostics but can never cross the application boundary.
+            raise RebuildStorageError from exc
+
+    async def _run(  # noqa: PLR0912, PLR0915 - explicit terminal/refusal/lease stages
         self,
         snapshot_run_id: str,
         target: RebuildTarget,
@@ -761,7 +800,7 @@ class OfflineGenerationRebuilder:
         if checkpoint.state is RebuildState.PUBLISHED:
             return checkpoint
         if checkpoint.state in {RebuildState.FAILED, RebuildState.CANCELED}:
-            raise RuntimeError(f"generation is terminal: {checkpoint.state.value}")
+            raise RebuildTerminalError
         if checkpoint.predecessor_vector_publication_id is not None:
             await self._store.copy_checkpointed_vectors(
                 checkpoint.generation_id,
@@ -837,7 +876,26 @@ class OfflineGenerationRebuilder:
                         now=self._clock(),
                     )
                     raise RebuildRefusedError(code, estimate) from exc
-                prepared.replacement.validate_identity()
+                except ManiculeError as exc:
+                    await self._store.fail_generation(
+                        checkpoint.generation_id,
+                        RebuildRefusalCode.DERIVATION_FAILED,
+                        owner=owner,
+                        lease_generation=checkpoint.lease_generation,
+                        now=self._clock(),
+                    )
+                    raise RebuildDerivationError from exc
+                try:
+                    prepared.replacement.validate_identity()
+                except ValueError as exc:
+                    await self._store.fail_generation(
+                        checkpoint.generation_id,
+                        RebuildRefusalCode.INVALID_REPLACEMENT,
+                        owner=owner,
+                        lease_generation=checkpoint.lease_generation,
+                        now=self._clock(),
+                    )
+                    raise RebuildValidationError from exc
                 if prepared.memory_bytes > target.max_memory_bytes:
                     await self._store.fail_generation(
                         checkpoint.generation_id,
@@ -924,7 +982,17 @@ class OfflineGenerationRebuilder:
             checkpoint.lease_generation,
             now=self._clock(),
         )
-        await self._store.validate_generation(checkpoint.generation_id)
+        try:
+            await self._store.validate_generation(checkpoint.generation_id)
+        except (RuntimeError, ValueError) as exc:
+            await self._store.fail_generation(
+                checkpoint.generation_id,
+                RebuildRefusalCode.INVALID_REPLACEMENT,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+            raise RebuildValidationError from exc
         await self._store.assert_generation_lease(
             checkpoint.generation_id,
             owner,
@@ -946,7 +1014,20 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
         )
-        return await self._join_irreversible(publish)
+        try:
+            return await self._join_irreversible(publish)
+        except (SQLAlchemyError, OSError) as exc:
+            # Publication is one relational transaction, so this runs only after its rollback.
+            # Marking the durable generation failed makes retry/cleanup explicit while the live
+            # generation and vector pointer remain untouched.
+            await self._store.fail_generation(
+                checkpoint.generation_id,
+                RebuildRefusalCode.DERIVATION_FAILED,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+            raise RebuildStorageError from exc
 
 
 def build_offline_rebuilder(
