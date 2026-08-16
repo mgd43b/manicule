@@ -184,7 +184,9 @@ async def _run_with_current_omissions(
     Strict snapshots deliberately remain unfrozen while a missing body can be retried, so their
     stored final omission fields are still zero. Status and the immediate acquisition result
     nevertheless need the current bounded aggregate; derive it in SQL without loading member
-    identities or mutating the retryable manifest.
+    identities or mutating the retryable manifest. Migrated unverified records intentionally
+    remain ``UNCHANGED`` so they can be reacquired, but their missing evidence remains an
+    omission; modern unchanged records always carry validated reusable evidence.
     """
     result = _run(row)
     if row.acquisition_completed_at is not None:
@@ -193,14 +195,13 @@ async def _run_with_current_omissions(
         models.AcquisitionRecord.blob_ref.is_(None),
         models.AcquisitionRecord.acquired_source.is_(None),
     )
+    reportable = models.AcquisitionRecord.state.in_(
+        (AcquisitionRecordState.RETRY, AcquisitionRecordState.UNCHANGED)
+    )
     reason_rows = (
         await session.execute(
             select(models.AcquisitionRecord.snapshot_diagnostic, func.count())
-            .where(
-                models.AcquisitionRecord.run_id == row.id,
-                models.AcquisitionRecord.state == AcquisitionRecordState.RETRY,
-                missing,
-            )
+            .where(models.AcquisitionRecord.run_id == row.id, reportable, missing)
             .group_by(models.AcquisitionRecord.snapshot_diagnostic)
         )
     ).all()
