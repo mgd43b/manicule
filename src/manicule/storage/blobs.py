@@ -94,6 +94,130 @@ class StagingCleanup:
     truncated: bool
 
 
+class EvidencePinFence:
+    """Canonical retained representations and a bounded managed-writer fence."""
+
+    def __init__(self, store: BlobStore, root: Path) -> None:
+        self._store = store
+        self._root = root
+        self._shard_bitmap = 0
+        self._publication_locked = False
+
+    def _remember_shard(self, digest: str) -> None:
+        self._shard_bitmap |= 1 << self._store.evidence_lock_shard(digest)
+
+    def _pin_path(self, digest: str) -> Path:
+        return self._root / digest
+
+    @staticmethod
+    def _valid_digest(digest: str) -> bool:
+        return len(digest) == GC_IDENTITY_HEX_LENGTH and all(
+            character in "0123456789abcdef" for character in digest
+        )
+
+    async def pin(
+        self,
+        digest: str,
+        *,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+    ) -> str | None:
+        """Pin the currently named inode and return its cheap verified identity."""
+
+        if not self._valid_digest(digest):
+            return None
+
+        self._remember_shard(digest)
+        async with self._store.evidence_locks([digest]):
+            return await asyncio.to_thread(
+                self._store.pin_evidence_representation,
+                digest,
+                self._pin_path(digest),
+                size_bytes,
+                stored_bytes,
+                compression,
+            )
+
+    async def verify(
+        self,
+        digest: str,
+        *,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+    ) -> str | None:
+        """Promote and hash one canonical representation under only its digest shard."""
+        if not self._valid_digest(digest):
+            return None
+        self._remember_shard(digest)
+        async with self._store.evidence_locks([digest]):
+            pinned = await asyncio.to_thread(
+                self._store.pin_evidence_representation,
+                digest,
+                self._pin_path(digest),
+                size_bytes,
+                stored_bytes,
+                compression,
+            )
+            if pinned is None:
+                return None
+            verified = await self._store.evidence_identity(
+                digest,
+                size_bytes=size_bytes,
+                stored_bytes=stored_bytes,
+                compression=compression,
+                verify_content=True,
+            )
+            return pinned if verified == pinned else None
+
+    async def validate(
+        self,
+        digest: str,
+        *,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+    ) -> str | None:
+        """Recheck the pinned inode and its public name immediately before commit."""
+
+        if not self._valid_digest(digest):
+            return None
+
+        self._remember_shard(digest)
+        if self._publication_locked:
+            return await asyncio.to_thread(
+                self._store.validate_evidence_pin,
+                digest,
+                self._pin_path(digest),
+                size_bytes,
+                stored_bytes,
+                compression,
+            )
+        async with self._store.evidence_locks([digest]):
+            return await asyncio.to_thread(
+                self._store.validate_evidence_pin,
+                digest,
+                self._pin_path(digest),
+                size_bytes,
+                stored_bytes,
+                compression,
+            )
+
+    @contextlib.asynccontextmanager
+    async def publication_fence(self) -> AsyncGenerator[None]:
+        """Hold only represented lock shards across cheap final probes and DB commit."""
+        shards = [
+            shard for shard in range(DURABLE_LOCK_SHARDS) if self._shard_bitmap & (1 << shard)
+        ]
+        async with self._store.evidence_lock_shards(shards):
+            self._publication_locked = True
+            try:
+                yield
+            finally:
+                self._publication_locked = False
+
+
 def should_compress(media_type: str | None) -> bool:
     """Whether this media type is worth compressing.
 
@@ -144,8 +268,37 @@ class BlobStore:
         """Where a blob lives. Sharded two levels, so no directory holds the whole corpus."""
         return self._root / "blake2b" / digest[:2] / digest[2:4] / digest
 
+    def evidence_path_for(self, digest: str) -> Path:
+        """Canonical retained representation after offline verification promotes it."""
+        return self._root / "evidence-pins" / "by-digest" / digest
+
+    def _authoritative_path(self, digest: str) -> Path:
+        canonical = self.evidence_path_for(digest)
+        try:
+            canonical.lstat()
+        except FileNotFoundError:
+            return self.path_for(digest)
+        return canonical
+
     def _stage_path(self, key: str) -> Path:
         return self._root / "acquisition-staging" / self._stage_name(key)
+
+    @contextlib.asynccontextmanager
+    async def evidence_locks(self, digests: Sequence[str]) -> AsyncGenerator[None]:
+        """Coordinate canonical evidence with managed writers using bounded lock shards."""
+        async with self._durable_locks([f"blob:{digest}" for digest in sorted(digests)]):
+            yield
+
+    @staticmethod
+    def evidence_lock_shard(digest: str) -> int:
+        """Return the stable managed-writer lock shard for one content digest."""
+        return BlobStore._durable_lock_shard(f"blob:{digest}")
+
+    @contextlib.asynccontextmanager
+    async def evidence_lock_shards(self, shards: Sequence[int]) -> AsyncGenerator[None]:
+        """Hold an already-derived, cardinality-bounded evidence shard set."""
+        async with self._durable_lock_shards(shards):
+            yield
 
     @staticmethod
     def _stage_name(key: str) -> str:
@@ -472,7 +625,7 @@ class BlobStore:
 
         for digest, token in pending_claims:
             if self._gc_identity_safe(digest, token):
-                charge(self.path_for(digest), f"{digest}.{token}")
+                charge(self._authoritative_path(digest), f"{digest}.{token}")
 
         root = self._gc_root()
         try:
@@ -688,7 +841,8 @@ class BlobStore:
     ) -> StoredBlob:
         digest = content_hash(data)
         if staging_key is None:
-            return await self._store_blob_locked(data, media_type)
+            async with self._durable_locks([f"blob:{digest}"]):
+                return await self._store_blob_locked(data, media_type)
         keys = [f"blob:{digest}", f"marker:{self._stage_name(staging_key)}"]
         async with self._durable_locks(keys):
             return await self._store_blob_locked(
@@ -718,7 +872,7 @@ class BlobStore:
             stored_bytes=len(proposed),
             compression=compression,
         )
-        destination = self.path_for(digest)
+        destination = self._authoritative_path(digest)
         publication_completed = False
         publication_created = False
         marker_completed = False
@@ -875,20 +1029,30 @@ class BlobStore:
     @contextlib.asynccontextmanager
     async def _durable_locks(self, keys: Sequence[str]) -> AsyncGenerator[None]:
         """Lock stable shards so cardinality cannot turn recovery metadata into an inode leak."""
-        shards = sorted(
-            {
-                int.from_bytes(hashlib.blake2b(key.encode(), digest_size=2).digest())
-                % DURABLE_LOCK_SHARDS
-                for key in keys
-            }
+        shards = sorted({self._durable_lock_shard(key) for key in keys})
+        async with self._durable_lock_shards(shards):
+            yield
+
+    @staticmethod
+    def _durable_lock_shard(key: str) -> int:
+        return (
+            int.from_bytes(hashlib.blake2b(key.encode(), digest_size=2).digest(), byteorder="big")
+            % DURABLE_LOCK_SHARDS
         )
+
+    @contextlib.asynccontextmanager
+    async def _durable_lock_shards(self, shards: Sequence[int]) -> AsyncGenerator[None]:
+        """Acquire validated stable shard ids in global order."""
+        ordered = sorted(set(shards))
+        if any(shard < 0 or shard >= DURABLE_LOCK_SHARDS for shard in ordered):
+            raise ValueError("invalid durable lock shard")
 
         def acquire() -> list[int]:
             root = self._root / "acquisition-locks"
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
             descriptors: list[int] = []
             try:
-                for shard in shards:
+                for shard in ordered:
                     descriptor = os.open(root / f"{shard:02x}.lock", os.O_CREAT | os.O_RDWR, 0o600)
                     fcntl.flock(descriptor, fcntl.LOCK_EX)
                     descriptors.append(descriptor)
@@ -1259,8 +1423,9 @@ class BlobStore:
                 return None
             if compression not in {"gzip", "none"}:
                 return None
-            raw = await asyncio.to_thread(self.path_for(blob_ref).read_bytes)
-            data = gzip.decompress(raw) if compression == "gzip" else raw
+            data = await asyncio.to_thread(
+                self._read_blob, self._authoritative_path(blob_ref), compression
+            )
             acquired.raw(data)
             retained = await self.retain(data, acquired.media_type)
             if retained.ref != blob_ref:
@@ -1291,15 +1456,21 @@ class BlobStore:
             row = await session.get(models.Blob, digest)
         if row is None or row.algo.startswith(GC_PENDING_PREFIX):
             return None
-        path = self.path_for(digest)
-        if not path.exists():
+        path = self._authoritative_path(digest)
+        try:
+            return await asyncio.to_thread(self._read_blob, path, row.compression)
+        except FileNotFoundError:
             return None
-        return await asyncio.to_thread(self._read_blob, path, row.compression)
 
     @staticmethod
     def _read_blob(path: Path, compression: str) -> bytes:
         """Keep filesystem latency and decompression CPU off the acquisition event loop."""
-        raw = path.read_bytes()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(descriptor, "rb") as handle:
+            raw = handle.read()
         return gzip.decompress(raw) if compression == "gzip" else raw
 
     async def get_bounded(self, digest: str, *, max_bytes: int) -> bytes | None:
@@ -1315,21 +1486,32 @@ class BlobStore:
             row = await session.get(models.Blob, digest)
         if row is None or row.size_bytes > max_bytes:
             return None
-        path = self.path_for(digest)
+        path = self._authoritative_path(digest)
 
         def bounded_read() -> bytes | None:
+            descriptor: int | None = None
             try:
-                if not path.is_file():
+                descriptor = os.open(
+                    path,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                )
+                observed = os.fstat(descriptor)
+                if not stat.S_ISREG(observed.st_mode):
                     return None
-                if row.compression == "gzip":
-                    with gzip.open(path, "rb") as handle:
-                        data = handle.read(max_bytes + 1)
-                else:
-                    if path.stat().st_size > max_bytes:
-                        return None
-                    data = path.read_bytes()
+                with os.fdopen(descriptor, "rb") as raw:
+                    descriptor = None
+                    if row.compression == "gzip":
+                        with gzip.GzipFile(fileobj=raw) as handle:
+                            data = handle.read(max_bytes + 1)
+                    else:
+                        if observed.st_size > max_bytes:
+                            return None
+                        data = raw.read()
             except (OSError, EOFError):
                 return None
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
             return data if len(data) <= max_bytes else None
 
         return await asyncio.to_thread(bounded_read)
@@ -1362,10 +1544,11 @@ class BlobStore:
         )
 
     @contextlib.asynccontextmanager
-    async def evidence_fence(self, digests: Sequence[str]) -> AsyncGenerator[None]:
-        """Exclude managed representation changes while a verified publication commits."""
-        async with self._durable_locks([f"blob:{digest}" for digest in digests]):
-            yield
+    async def evidence_fence(self) -> AsyncGenerator[EvidencePinFence]:
+        """Expose canonical pins; each operation locks only its represented digest shard."""
+        root = self._root / "evidence-pins" / "by-digest"
+        await asyncio.to_thread(self._mkdir_durable, root)
+        yield EvidencePinFence(self, root)
 
     async def evidence_identity(
         self,
@@ -1382,7 +1565,7 @@ class BlobStore:
         hash outside SQLite's writer transaction, persist the identity, and later reject a
         replaced, truncated, removed, or metadata-changed representation with only ``stat``.
         """
-        path = self.path_for(digest)
+        path = self._authoritative_path(digest)
 
         def inspect() -> str | None:  # noqa: PLR0911 - every invalid representation fails closed
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -1414,41 +1597,149 @@ class BlobStore:
                 return None
             finally:
                 os.close(descriptor)
-            fields = (
-                "v1",
-                digest,
-                size_bytes,
-                stored_bytes,
-                compression,
-                before.st_dev,
-                before.st_ino,
-                before.st_mode,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            )
-            observed = (
-                after.st_dev,
-                after.st_ino,
-                after.st_mode,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
-            named_observed = (
-                named.st_dev,
-                named.st_ino,
-                named.st_mode,
-                named.st_size,
-                named.st_mtime_ns,
-                named.st_ctime_ns,
-            )
-            if observed != fields[5:] or named_observed != observed:
+            observed = self._representation_stat(after)
+            if (
+                observed != self._representation_stat(before)
+                or self._representation_stat(named) != observed
+            ):
                 return None
-            encoded = json.dumps(fields, separators=(",", ":")).encode()
-            return hashlib.sha256(encoded).hexdigest()
+            return self._representation_identity(
+                digest, size_bytes, stored_bytes, compression, after
+            )
 
         return await asyncio.to_thread(inspect)
+
+    @staticmethod
+    def _representation_stat(
+        observed: os.stat_result,
+    ) -> tuple[int, int, int, int, int, int, int, int, int]:
+        return (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_mode,
+            observed.st_nlink,
+            observed.st_uid,
+            observed.st_gid,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_ctime_ns,
+        )
+
+    @classmethod
+    def _representation_identity(
+        cls,
+        digest: str,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+        observed: os.stat_result,
+    ) -> str:
+        fields = (
+            "v1",
+            digest,
+            size_bytes,
+            stored_bytes,
+            compression,
+            *cls._representation_stat(observed),
+        )
+        return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()
+
+    def pin_evidence_representation(
+        self,
+        digest: str,
+        pin: Path,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+    ) -> str | None:
+        """Promote one legacy representation to its canonical no-follow pin name."""
+        path = self._authoritative_path(digest)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            return None
+        created = False
+        retained_pin = False
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_size != stored_bytes:
+                return None
+            try:
+                os.link(path, pin, follow_symlinks=False)
+                created = True
+            except FileExistsError:
+                pass
+            if opened.st_mode & 0o222:
+                # Retained blobs are immutable after their no-clobber publication.  Make that
+                # contract effective for ordinary uncoordinated writers as well; a caller that
+                # deliberately chmods it back still changes ctime and fails the final fence.
+                os.fchmod(descriptor, stat.S_IRUSR)
+                os.fsync(descriptor)
+            if created:
+                self._fsync_directory(pin.parent)
+            linked = os.fstat(descriptor)
+            named = path.stat(follow_symlinks=False)
+            pinned = pin.stat(follow_symlinks=False)
+            observed = self._representation_stat(linked)
+            if (
+                self._representation_stat(named) != observed
+                or self._representation_stat(pinned) != observed
+            ):
+                return None
+            if created and path != pin:
+                # The pin is now the authoritative retained representation, not verification
+                # metadata for a mutable alias.  Sync it before retiring the legacy name so a
+                # crash always leaves at least one durable link to the exact verified inode.
+                retained_pin = True
+                self._unlink_durable(path)
+            retained = os.fstat(descriptor)
+            pinned = pin.stat(follow_symlinks=False)
+            if self._representation_stat(pinned) != self._representation_stat(retained):
+                return None
+            retained_pin = True
+            return self._representation_identity(
+                digest, size_bytes, stored_bytes, compression, retained
+            )
+        except OSError:
+            return None
+        finally:
+            os.close(descriptor)
+            if created and not retained_pin:
+                with contextlib.suppress(OSError):
+                    pin.unlink()
+                    self._fsync_directory(pin.parent)
+
+    def validate_evidence_pin(
+        self,
+        digest: str,
+        pin: Path,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+    ) -> str | None:
+        """Validate the authoritative retained inode with no content read."""
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(pin, flags)
+            pinned = os.fstat(descriptor)
+            named_pin = pin.stat(follow_symlinks=False)
+            observed = self._representation_stat(pinned)
+            if (
+                not stat.S_ISREG(pinned.st_mode)
+                or pinned.st_size != stored_bytes
+                or self._representation_stat(named_pin) != observed
+            ):
+                return None
+            return self._representation_identity(
+                digest, size_bytes, stored_bytes, compression, pinned
+            )
+        except OSError:
+            return None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     async def collect_garbage(self) -> Sequence[str]:
         """Delete blobs nothing references. Mark and sweep, never refcounts.
@@ -1635,6 +1926,29 @@ class BlobStore:
             return False
         return await self._remove_owned_with_retry(intent)
 
+    async def _remove_evidence_pin(self, digest: str) -> bool:
+        pin = self._root / "evidence-pins" / "by-digest" / digest
+        if not pin.parent.exists():
+            return True
+        return await self._remove_owned_with_retry(pin)
+
+    async def _remove_evidence_pin_if_unowned(self, digest: str) -> bool:
+        async with self._sessions() as session:
+            if await session.get(models.Blob, digest) is not None:
+                return True
+        return await self._remove_evidence_pin(digest)
+
+    async def _remove_legacy_alias_if_unowned(self, digest: str) -> bool:
+        async with self._sessions() as session:
+            if await session.get(models.Blob, digest) is not None:
+                return True
+        legacy = self.path_for(digest)
+        try:
+            await asyncio.to_thread(legacy.lstat)
+        except FileNotFoundError:
+            return True
+        return await self._remove_owned_with_retry(legacy)
+
     @staticmethod
     def _read_gc_intent(path: Path) -> tuple[str, str, int] | None:
         try:
@@ -1734,11 +2048,16 @@ class BlobStore:
             return False
         return quarantine.exists() or destination.exists()
 
-    async def _run_gc_intent(self, digest: str, token: str) -> bool:  # noqa: PLR0911
+    async def _run_gc_intent(self, digest: str, token: str) -> bool:
+        """Serialize managed collection with verification/publication inode pins."""
+        async with self._durable_locks([f"blob:{digest}"]):
+            return await self._run_gc_intent_locked(digest, token)
+
+    async def _run_gc_intent_locked(self, digest: str, token: str) -> bool:  # noqa: PLR0911
         """Resume one deletion intent without holding SQLite across filesystem durability."""
         if not self._gc_identity_safe(digest, token):
             return False
-        destination = self.path_for(digest)
+        destination = self._authoritative_path(digest)
         quarantine, intent = self._gc_paths(digest, token)
         async with self._sessions() as session:
             row = await session.get(models.Blob, digest)
@@ -1756,7 +2075,10 @@ class BlobStore:
                 )
                 referenced = await self._blob_is_referenced(session, digest)
         if pending_row is None or pending_stored is None:
-            return await self._remove_gc_artifacts(quarantine, intent)
+            pin_removed = await self._remove_evidence_pin_if_unowned(digest)
+            alias_removed = await self._remove_legacy_alias_if_unowned(digest)
+            artifacts_removed = await self._remove_gc_artifacts(quarantine, intent)
+            return pin_removed and alias_removed and artifacts_removed
         if referenced:
             if not await asyncio.to_thread(
                 self._gc_recovery_is_valid,
@@ -1814,9 +2136,19 @@ class BlobStore:
                 await self._remove_owned_with_retry(intent)
                 return False
             else:
+                # The immediate transaction prevents a new durable reference between this
+                # last reference probe and row deletion.  Remove the inode pin first so a
+                # failed unlink leaves a retryable, capacity-accounted Blob row rather than a
+                # stale pin that could conflict with later storage of the same content hash.
+                if not await self._remove_evidence_pin(digest):
+                    await session.rollback()
+                    return False
                 await session.execute(delete(models.Blob).where(models.Blob.hash == digest))
                 await session.commit()
-        return await self._remove_gc_artifacts(quarantine, intent)
+        pin_removed = await self._remove_evidence_pin_if_unowned(digest)
+        alias_removed = await self._remove_legacy_alias_if_unowned(digest)
+        artifacts_removed = await self._remove_gc_artifacts(quarantine, intent)
+        return pin_removed and alias_removed and artifacts_removed
 
     async def orphaned_files(self) -> Sequence[Path]:
         """Files on disk that no ``blobs`` row claims.
@@ -1828,10 +2160,14 @@ class BlobStore:
             return []
         async with self._sessions() as session:
             known = set((await session.execute(select(models.Blob.hash))).scalars().all())
-        blob_root = self._root / "blake2b"
-        if not blob_root.exists():
-            return []
-        return [path for path in blob_root.rglob("*") if path.is_file() and path.name not in known]
+        roots = (self._root / "blake2b", self._root / "evidence-pins" / "by-digest")
+        return [
+            path
+            for root in roots
+            if root.exists()
+            for path in root.rglob("*")
+            if path.is_file() and path.name not in known
+        ]
 
 
 __all__ = [

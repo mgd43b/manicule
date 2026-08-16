@@ -827,7 +827,7 @@ async def test_permanent_owned_unlink_refusal_is_capacity_accounted_without_loop
         assert (await connection.execute(text("SELECT COUNT(*) FROM blobs"))).scalar_one() == 0
 
 
-async def test_same_digest_waiter_committed_before_cleanup_keeps_the_shared_file(
+async def test_same_digest_waiter_waits_for_cleanup_then_republishes(
     engine: AsyncEngine,
     data_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -868,11 +868,14 @@ async def test_same_digest_waiter_committed_before_cleanup_keeps_the_shared_file
     owner = asyncio.create_task(blobs.retain_acquisition("run\0owner", raw))
     await cleanup_arrived.wait()
 
-    waiter = await blobs.put(payload, "application/octet-stream")
-    assert isinstance(waiter, StoredBlob)
+    waiter_task = asyncio.create_task(blobs.put(payload, "application/octet-stream"))
+    await asyncio.sleep(0)
+    assert not waiter_task.done(), "same-digest managed writers must share the cleanup fence"
     release_cleanup.set()
     with pytest.raises(CapacityRefusedError):
         await owner
+    waiter = await waiter_task
+    assert isinstance(waiter, StoredBlob)
 
     assert blobs.path_for(waiter.hash).exists()
     assert await blobs.get(waiter.hash) == payload
@@ -1358,10 +1361,14 @@ async def test_gc_pending_refuses_same_digest_adoption_until_retry(
     collection = asyncio.create_task(blobs.collect_garbage())
     assert await asyncio.to_thread(filesystem_arrived.wait, 5)
 
-    with pytest.raises(CapacityRefusedError):
-        await blobs.put(payload, "application/octet-stream")
+    adoption = asyncio.create_task(blobs.put(payload, "application/octet-stream"))
+    await asyncio.sleep(0)
+    assert not adoption.done()
     release_filesystem.set()
     assert await collection == [stored.hash]
+    adopted = await adoption
+    assert isinstance(adopted, StoredBlob)
+    assert adopted.hash == stored.hash
 
     retried = await blobs.put(payload, "application/octet-stream")
     assert isinstance(retried, StoredBlob)
@@ -2514,3 +2521,77 @@ async def test_reading_a_blob_that_was_never_stored_is_not_an_error(
     """A document whose bytes were refused by the cap still has to be readable as a document."""
     blobs = BlobStore(engine, data_dir)
     assert await blobs.get(content_hash(b"never stored")) is None
+
+
+async def test_evidence_pin_serializes_gc_and_is_reclaimed_with_unowned_blob(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    stored = await blobs.put(b"synthetic pinned evidence", "application/octet-stream")
+    assert isinstance(stored, StoredBlob)
+    pin_path = data_dir / "blobs" / "evidence-pins" / "by-digest" / stored.hash
+
+    async with blobs.evidence_fence() as pins:
+        identity = await pins.pin(
+            stored.hash,
+            size_bytes=stored.size_bytes,
+            stored_bytes=stored.stored_bytes,
+            compression=stored.compression,
+        )
+        assert identity is not None
+        assert pin_path.exists()
+        legacy = blobs.path_for(stored.hash)
+        assert not legacy.exists()
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_bytes(b"retired alias is not authoritative")
+        assert await blobs.get(stored.hash) == b"synthetic pinned evidence"
+        token = await blobs._mark_gc_candidate(stored.hash)  # pyright: ignore[reportPrivateUsage]
+        assert token is not None
+        async with pins.publication_fence():
+            collection = asyncio.create_task(
+                blobs._run_gc_intent(stored.hash, token)  # pyright: ignore[reportPrivateUsage]
+            )
+            await asyncio.sleep(0.05)
+            assert not collection.done()
+
+    assert await collection
+    assert not blobs.path_for(stored.hash).exists()
+    assert not pin_path.exists()
+
+
+async def test_failed_post_link_identity_probe_removes_new_pin(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    payload = b"synthetic post-link replacement"
+    stored = await blobs.put(payload, "application/octet-stream")
+    assert isinstance(stored, StoredBlob)
+    public = blobs.path_for(stored.hash)
+    pin = data_dir / "blobs" / "evidence-pins" / "by-digest" / stored.hash
+    real_link = os.link
+
+    def replace_public_after_link(
+        source: os.PathLike[str] | str,
+        destination: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        real_link(source, destination, follow_symlinks=follow_symlinks)
+        source_path = Path(source)
+        source_path.unlink()
+        source_path.write_bytes(payload)
+
+    monkeypatch.setattr(os, "link", replace_public_after_link)
+    async with blobs.evidence_fence() as pins:
+        identity = await pins.pin(
+            stored.hash,
+            size_bytes=stored.size_bytes,
+            stored_bytes=stored.stored_bytes,
+            compression=stored.compression,
+        )
+
+    assert identity is None
+    assert public.exists()
+    assert not pin.exists()
