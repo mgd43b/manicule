@@ -35,6 +35,7 @@ class RebuildRefusalCode(StrEnum):
     TEMP_DISK_BOUND = "temp_disk_bound"
     INVALID_REPLACEMENT = "invalid_replacement"
     DERIVATION_FAILED = "derivation_failed"
+    STORAGE_FAILED = "storage_failed"
 
 
 class RebuildTarget(BaseModel):
@@ -196,14 +197,75 @@ class RebuildRefusedError(ManiculeError):
         self.estimate = estimate
 
 
+class RebuildLeaseConflictError(RuntimeError):
+    """An internal rebuild worker lost or failed to acquire its monotonic fence."""
+
+
+class RebuildTerminalGenerationError(RebuildLeaseConflictError):
+    """An internal worker attempted to claim a terminal generation."""
+
+
+class RebuildOperationError(ManiculeError):
+    """A private-safe expected failure of durable rebuild work.
+
+    Concrete subclasses deliberately carry no arbitrary exception text. Storage drivers,
+    parsers and vector backends routinely include SQL parameters, source identifiers or local
+    paths in their messages; the original exception remains available through ``__cause__`` for
+    operator diagnostics, while every unattended surface receives this bounded vocabulary.
+    """
+
+
+class RebuildStorageError(RebuildOperationError):
+    """Durable rebuild storage could not complete an expected operation."""
+
+    def __init__(self) -> None:
+        super().__init__("offline rebuild storage failed")
+
+
+class RebuildDerivationError(RebuildOperationError):
+    """A retained input could not be converted into a replacement."""
+
+    def __init__(self) -> None:
+        super().__init__("offline rebuild derivation failed")
+
+
+class RebuildLeaseError(RebuildOperationError):
+    """The worker no longer owns the generation's durable fence."""
+
+    def __init__(self) -> None:
+        super().__init__("offline rebuild lease was lost")
+
+
+class RebuildValidationError(RebuildOperationError):
+    """The complete staged replacement did not pass publication validation."""
+
+    def __init__(self) -> None:
+        super().__init__("offline rebuild validation failed")
+
+
+class RebuildTerminalError(RebuildOperationError):
+    """Execution was requested for a failed or canceled generation."""
+
+    def __init__(self) -> None:
+        super().__init__("offline rebuild generation is terminal")
+
+
 __all__ = [
     "DerivedReplacement",
     "MissingSnapshotInput",
     "RebuildCheckpoint",
+    "RebuildDerivationError",
     "RebuildEstimate",
+    "RebuildLeaseConflictError",
+    "RebuildLeaseError",
+    "RebuildOperationError",
     "RebuildRefusalCode",
     "RebuildRefusedError",
     "RebuildState",
+    "RebuildStorageError",
     "RebuildTarget",
+    "RebuildTerminalError",
+    "RebuildTerminalGenerationError",
+    "RebuildValidationError",
     "SnapshotRebuildInput",
 ]

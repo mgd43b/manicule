@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from manicule.app import results as r
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
@@ -54,6 +55,14 @@ from manicule.core.content import PREVIOUS_IDENTITY, DocumentStatus
 from manicule.core.errors import ConfigError, ManiculeError, PolicyError, UnknownEntityError
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id
+from manicule.core.rebuild import (
+    RebuildLeaseConflictError,
+    RebuildLeaseError,
+    RebuildOperationError,
+    RebuildStorageError,
+    RebuildTerminalError,
+    RebuildTerminalGenerationError,
+)
 from manicule.core.retrieval import Filter, Query, RetrievalProfile
 from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
 from manicule.core.version import CORE_VERSION
@@ -1247,19 +1256,46 @@ class ApplicationService:
     async def rebuild_plan(self, snapshot_id: str) -> r.RebuildPlanReport:
         """Price a connector-free replacement generation from retained source bytes."""
         ingestion = await self._backend.ingestion()
-        return _rebuild_plan_report(await ingestion.rebuild_plan(snapshot_id))
+        try:
+            estimate = await ingestion.rebuild_plan(snapshot_id)
+        except RebuildOperationError:
+            raise
+        except RebuildTerminalGenerationError as exc:
+            raise RebuildTerminalError from exc
+        except RebuildLeaseConflictError as exc:
+            raise RebuildLeaseError from exc
+        except (SQLAlchemyError, OSError) as exc:
+            raise RebuildStorageError from exc
+        return _rebuild_plan_report(estimate)
 
     async def rebuild_run(self, snapshot_id: str) -> r.RebuildRunReport:
         """Execute or resume the deterministic generation for one snapshot and target."""
         ingestion = await self._backend.ingestion()
-        return _rebuild_run_report(
-            await ingestion.rebuild_run(snapshot_id, secrets.token_urlsafe(24))
-        )
+        try:
+            checkpoint = await ingestion.rebuild_run(snapshot_id, secrets.token_urlsafe(24))
+        except RebuildOperationError:
+            raise
+        except RebuildTerminalGenerationError as exc:
+            raise RebuildTerminalError from exc
+        except RebuildLeaseConflictError as exc:
+            raise RebuildLeaseError from exc
+        except (SQLAlchemyError, OSError) as exc:
+            raise RebuildStorageError from exc
+        return _rebuild_run_report(checkpoint)
 
     async def rebuild_status(self, generation_id: str) -> r.RebuildRunReport:
         """Read one workspace-owned offline rebuild checkpoint."""
         ingestion = await self._backend.ingestion()
-        checkpoint = await ingestion.rebuild_status(generation_id)
+        try:
+            checkpoint = await ingestion.rebuild_status(generation_id)
+        except RebuildOperationError:
+            raise
+        except RebuildTerminalGenerationError as exc:
+            raise RebuildTerminalError from exc
+        except RebuildLeaseConflictError as exc:
+            raise RebuildLeaseError from exc
+        except (SQLAlchemyError, OSError) as exc:
+            raise RebuildStorageError from exc
         if checkpoint is None:
             raise UnknownEntityError("no durable offline rebuild has that generation id")
         return _rebuild_run_report(checkpoint)

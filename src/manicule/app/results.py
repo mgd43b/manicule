@@ -78,6 +78,7 @@ type LifecycleRefusalCode = Literal[
     "temp_disk_bound",
     "invalid_replacement",
     "derivation_failed",
+    "storage_failed",
     "confirmation_required",
     "retention_policy",
     "shared_reference",

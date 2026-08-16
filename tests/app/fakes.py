@@ -903,8 +903,11 @@ class FakeIngestion:
         return self.snapshot, self.snapshot_verified
 
     rebuild_missing_count: int = 0
+    rebuild_failure: Exception | None = None
 
     async def rebuild_plan(self, snapshot_run_id: str) -> RebuildEstimate:
+        if self.rebuild_failure is not None:
+            raise self.rebuild_failure
         return RebuildEstimate(
             generation_id="aggregate-generation",
             snapshot_run_id=snapshot_run_id,
@@ -923,6 +926,8 @@ class FakeIngestion:
 
     async def rebuild_run(self, snapshot_run_id: str, owner: str) -> RebuildCheckpoint:
         del snapshot_run_id, owner
+        if self.rebuild_failure is not None:
+            raise self.rebuild_failure
         return RebuildCheckpoint(
             generation_id="aggregate-generation",
             state=RebuildState.PUBLISHED,
@@ -935,6 +940,8 @@ class FakeIngestion:
         )
 
     async def rebuild_status(self, generation_id: str) -> RebuildCheckpoint | None:
+        if self.rebuild_failure is not None:
+            raise self.rebuild_failure
         return RebuildCheckpoint(
             generation_id=generation_id,
             state=RebuildState.BUILDING,
