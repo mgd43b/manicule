@@ -834,9 +834,9 @@ the page path on migrated temporary SQLite storage:
 
 | Records | Source pages | Scalar writer tx / SQL statements | Page writer tx / SQL statements | Scalar / page seconds |
 |---:|---:|---:|---:|---:|
-| 250 | 1 | 250 / 2,000 | 1 / 8 | 0.646 / 0.029 |
-| 2,500 | 10 | 2,500 / 20,000 | 10 / 80 | 6.275 / 0.263 |
-| 10,000 | 40 | 10,000 / 80,000 | 40 / 320 | 25.092 / 1.150 |
+| 250 | 1 | 250 / 2,250 | 1 / 8 | 0.649 / 0.028 |
+| 2,500 | 10 | 2,500 / 22,500 | 10 / 80 | 6.381 / 0.263 |
+| 10,000 | 40 | 10,000 / 90,000 | 40 / 320 | 26.147 / 1.150 |
 
 The 10,251-record real-client integration uses 41 full 250-record pages and one final record.
 Each committed page advances a deterministic clock by 0.1 seconds under a 0.2-second trusted

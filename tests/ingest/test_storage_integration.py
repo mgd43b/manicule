@@ -3773,10 +3773,12 @@ async def test_served_source_deletion_recovery_reuses_exact_evidence_and_keeps_s
         )
 
     first = await pipeline().run(connector, acquire_only=True)
+    assert first.snapshot_omission_reasons == {"source_deleted": 1}, (
+        "the first run must reach its typed deletion outcome before inventory is inspected"
+    )
     predecessor = await store.latest_unsettled_acquisition_run(connector.name)
     assert predecessor is not None
     assert predecessor.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
-    assert first.snapshot_omission_reasons == {"source_deleted": 1}
     if remove_missing_identity:
         del connector.documents[connector.missing]
 
