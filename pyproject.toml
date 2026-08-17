@@ -38,7 +38,7 @@ dependencies = [
 # (empty until then) so that the boundary between core and implementations is visible in one
 # place rather than discovered by accident.
 storage = [        # #2
-  "sqlalchemy[asyncio]>=2.0.51",
+  "sqlalchemy[asyncio]>=2.0.52",
   "aiosqlite>=0.20",
   "alembic>=1.14",
   "lancedb>=0.17",
@@ -107,7 +107,7 @@ generation = [     # #7
   # The floor is not decoration. §4.2's `ollama_chat` routing, §4.6's retry gate, §4.8's
   # `BadRequestError` hierarchy and §4.10's usage fallbacks are behaviors verified against
   # this release; lowering it means re-verifying those four rather than merely resolving.
-  "litellm>=1.83",
+  "litellm>=1.96.2",
   # The generation-side token estimate (docs/retrieval.md §7.2, generation.md §9.2). Already
   # present under `parsers` for the chunker's provisional counter; declared here too so that
   # installing only the generation extra gets a working estimator.
@@ -154,7 +154,7 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #1
   # The ASGI server. `standard` is deliberately not used: it pulls `httptools`, `uvloop` and
   # `watchfiles`, and the bind address here is decided by `manicule.app.bind` rather than by
   # anything uvicorn defaults to. BSD-3-Clause.
-  "uvicorn>=0.32",
+  "uvicorn>=0.52.3",
   # The websocket protocol implementation uvicorn dispatches to. Without it a `ws://` client
   # is refused at the handshake by a server that otherwise looks healthy. BSD-3-Clause.
   "websockets>=13.0",
