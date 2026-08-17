@@ -104,6 +104,98 @@ async def test_marker_name_index_upgrades_from_already_applied_inventory_revisio
 
 
 @pytest.mark.contract
+async def test_workspace_snapshot_downgrade_refuses_single_new_format_generation(
+    data_dir: Path,
+) -> None:
+    import hashlib  # noqa: PLC0415
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from manicule.core.rebuild import RebuildState  # noqa: PLC0415
+    from manicule.core.sources import Watermark  # noqa: PLC0415
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine)
+        store = SqliteDocStore(engine)
+        await store.ensure_workspace()
+        now = datetime(2026, 8, 17, tzinfo=UTC)
+        created = await store.create_acquisition_run(
+            "single-new-format-snapshot",
+            "wiki",
+            scope_fingerprint="scope-v1",
+        )
+        claimed = await store.claim_acquisition_run(
+            created.id,
+            "worker",
+            now=now,
+            expires_at=now + timedelta(minutes=1),
+        )
+        assert claimed is not None
+        await store.complete_acquisition_enumeration(
+            claimed.id,
+            Watermark(value="v1", observed_at=now),
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=now,
+        )
+        await store.complete_snapshot_acquisition(
+            claimed.id,
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=now,
+        )
+        promoted = await store.promote_snapshot_and_commit_watermark(
+            claimed.id,
+            expected_scope_fingerprint="scope-v1",
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=now,
+        )
+        assert promoted.membership_hash is not None
+        combined = hashlib.sha256(
+            json.dumps(
+                [[promoted.id, promoted.membership_hash, 0]],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        async with session_factory(engine).begin() as session:
+            session.add(
+                models.DerivedGeneration(
+                    id="single-new-format-generation",
+                    workspace_id=store.workspace_id,
+                    snapshot_run_id=promoted.id,
+                    snapshot_membership_hash=combined,
+                    expected_item_count=0,
+                    target_digest="target",
+                    publication_identity_digest="publication",
+                    target={},
+                    state=RebuildState.PLANNED,
+                )
+            )
+            session.add(
+                models.DerivedGenerationSnapshot(
+                    generation_id="single-new-format-generation",
+                    ordinal=0,
+                    run_id=promoted.id,
+                    connector_name="wiki",
+                    scope_fingerprint="scope-v1",
+                    membership_hash=promoted.membership_hash,
+                    expected_item_count=0,
+                )
+            )
+
+        with pytest.raises(RuntimeError, match=r"single-source|new-format"):
+            await downgrade(engine, "b9e14c72a6f0")
+        assert await current(engine) == head_revision()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
 async def test_every_revision_downgrades_and_upgrades_back_to_the_same_schema(
     data_dir: Path,
 ) -> None:

@@ -2947,6 +2947,18 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                                     replacement.acquisition_completed_at.is_(None),
                                 )
                             ),
+                            ~exists(
+                                select(models.DerivedGeneration.id).where(
+                                    models.DerivedGeneration.snapshot_run_id
+                                    == models.AcquisitionRun.id
+                                )
+                            ),
+                            ~exists(
+                                select(models.DerivedGenerationSnapshot.run_id).where(
+                                    models.DerivedGenerationSnapshot.run_id
+                                    == models.AcquisitionRun.id
+                                )
+                            ),
                             or_(
                                 models.AcquisitionRun.superseded_at.is_not(None),
                                 and_(

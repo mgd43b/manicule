@@ -941,18 +941,30 @@ class SqliteRebuildStore(WorkspaceScoped):
                 if skip >= snapshot.expected_item_count:
                     skip -= snapshot.expected_item_count
                     continue
+                ranked = (
+                    select(
+                        models.AcquisitionRecord.id.label("record_id"),
+                        func.row_number()
+                        .over(order_by=models.AcquisitionRecord.sequence)
+                        .label("retained_ordinal"),
+                    )
+                    .where(
+                        models.AcquisitionRecord.run_id == snapshot.run_id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                        models.AcquisitionRecord.blob_ref.is_not(None),
+                        models.AcquisitionRecord.acquired_source.is_not(None),
+                    )
+                    .subquery()
+                )
                 records = list(
                     (
                         await session.execute(
                             select(models.AcquisitionRecord)
+                            .join(ranked, ranked.c.record_id == models.AcquisitionRecord.id)
                             .where(
-                                models.AcquisitionRecord.run_id == snapshot.run_id,
-                                models.AcquisitionRecord.workspace_id == self._workspace_id,
-                                models.AcquisitionRecord.blob_ref.is_not(None),
-                                models.AcquisitionRecord.acquired_source.is_not(None),
+                                ranked.c.retained_ordinal > skip,
                             )
-                            .order_by(models.AcquisitionRecord.sequence)
-                            .offset(skip)
+                            .order_by(ranked.c.retained_ordinal)
                             .limit(limit - len(result))
                         )
                     ).scalars()
@@ -1277,19 +1289,33 @@ class SqliteRebuildStore(WorkspaceScoped):
             if await self._publication_row_count(physical_publication) != expected_vectors:
                 raise RebuildPublicationValidationError
 
-            for snapshot in snapshots:
-                run = snapshot_runs[snapshot.run_id]
-                if run.completeness is SnapshotCompleteness.COMPLETE:
-                    await session.execute(
-                        update(models.Document)
-                        .where(
-                            models.Document.workspace_id == self._workspace_id,
-                            models.Document.source == snapshot.connector_name,
-                            models.Document.deleted_at.is_(None),
-                            models.Document.publication_id != physical_publication,
+            connectors = {snapshot.connector_name for snapshot in snapshots}
+            complete_connectors = {
+                connector
+                for connector in connectors
+                if all(
+                    snapshot.connector_name != connector
+                    or (
+                        snapshot_runs[snapshot.run_id].completeness is not None
+                        and SnapshotCompleteness(
+                            snapshot_runs[snapshot.run_id].completeness
                         )
-                        .values(deleted_at=utcnow())
+                        is SnapshotCompleteness.COMPLETE
                     )
+                    for snapshot in snapshots
+                )
+            }
+            for connector in complete_connectors:
+                await session.execute(
+                    update(models.Document)
+                    .where(
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.source == connector,
+                        models.Document.deleted_at.is_(None),
+                        models.Document.publication_id != physical_publication,
+                    )
+                    .values(deleted_at=utcnow())
+                )
 
             state = await session.get(models.IndexState, 1)
             current_tokenizer = models.FTS_TOKENIZER if state is None else state.fts_tokenizer
@@ -1396,31 +1422,43 @@ class SqliteRebuildStore(WorkspaceScoped):
     async def _latest_promoted_runs(
         self, session: AsyncSession
     ) -> list[models.AcquisitionRun]:
-        rows = list(
+        ranked = (
+            select(
+                models.AcquisitionRun.id.label("run_id"),
+                func.row_number()
+                .over(
+                    partition_by=models.AcquisitionRun.connector_name,
+                    order_by=(
+                        models.AcquisitionRun.promoted_at.desc(),
+                        models.AcquisitionRun.created_at.desc(),
+                        models.AcquisitionRun.id.desc(),
+                    ),
+                )
+                .label("scope_rank"),
+            )
+            .join(
+                models.Connector,
+                (models.Connector.id == models.AcquisitionRun.connector_id)
+                & (models.Connector.workspace_id == models.AcquisitionRun.workspace_id),
+            )
+            .where(
+                models.AcquisitionRun.workspace_id == self._workspace_id,
+                models.AcquisitionRun.promoted_at.is_not(None),
+                models.AcquisitionRun.superseded_at.is_(None),
+                models.Connector.deleted_at.is_(None),
+            )
+            .subquery()
+        )
+        return list(
             (
                 await session.execute(
                     select(models.AcquisitionRun)
-                    .where(
-                        models.AcquisitionRun.workspace_id == self._workspace_id,
-                        models.AcquisitionRun.promoted_at.is_not(None),
-                    )
-                    .order_by(
-                        models.AcquisitionRun.connector_name,
-                        models.AcquisitionRun.scope_fingerprint,
-                        models.AcquisitionRun.promoted_at.desc(),
-                        models.AcquisitionRun.id.desc(),
-                    )
+                    .join(ranked, ranked.c.run_id == models.AcquisitionRun.id)
+                    .where(ranked.c.scope_rank == 1)
+                    .order_by(models.AcquisitionRun.connector_name)
                 )
             ).scalars()
         )
-        latest: list[models.AcquisitionRun] = []
-        seen: set[tuple[str, str]] = set()
-        for row in rows:
-            scope = (row.connector_name, row.scope_fingerprint)
-            if scope not in seen:
-                seen.add(scope)
-                latest.append(row)
-        return latest
 
     async def _generation_snapshot_rows(
         self, session: AsyncSession, generation_id: str

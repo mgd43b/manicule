@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from itertools import pairwise
+from typing import cast
 
 import pytest
 
@@ -294,6 +295,67 @@ def test_an_oversized_table_splits_by_rows_and_repeats_the_header() -> None:
         "a part whose header is repeated into its text must address the header rows too, or "
         "the citation resolves to fewer rows than it quotes"
     )
+
+
+@pytest.mark.parametrize("with_header", [True, False])
+def test_one_oversized_table_row_is_lossless_and_every_fragment_is_bounded(
+    with_header: bool,
+) -> None:
+    header = "Header | Value"
+    row = f"Item | {'x' * 350}"
+    rows = [header, row] if with_header else [row]
+    refs = ["A1:B1", "A2:B2"] if with_header else ["A1:B1"]
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=128, overlap_tokens=0, breadcrumb_tokens=16, min_tokens=1
+    )
+    metadata = cast(
+        "Metadata",
+        {"rows": rows, "header_rows": 1 if with_header else 0, "row_refs": refs},
+    )
+    table = ParsedBlock(
+        kind=BlockKind.TABLE,
+        text="\n".join(rows),
+        anchor=CellAnchor(sheet="Synthetic", ref="A1:B2" if with_header else "A1:B1"),
+        metadata=metadata,
+    )
+
+    chunks = chunker.chunk(document(title="Synthetic table"), [table])
+
+    assert len(chunks) > 1
+    assert all(chunk.token_count <= 128 for chunk in chunks)
+    assert all(chunk.metadata.get("hard_split_at") == "row" for chunk in chunks)
+    if with_header:
+        prefix = f"{header}\n"
+        assert all(chunk.text.startswith(prefix) for chunk in chunks)
+        assert "".join(chunk.text.removeprefix(prefix) for chunk in chunks) == row
+    else:
+        assert "".join(chunk.text for chunk in chunks) == row
+
+
+def test_an_oversized_header_and_row_fall_back_to_a_lossless_bounded_split() -> None:
+    header = "H" * 150
+    row = "R" * 200
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=128, overlap_tokens=0, breadcrumb_tokens=16, min_tokens=1
+    )
+    metadata: Metadata = {
+        "rows": [header, row],
+        "header_rows": 1,
+        "row_refs": ["A1", "A2"],
+    }
+    table = ParsedBlock(
+        kind=BlockKind.TABLE,
+        text=f"{header}\n{row}",
+        anchor=CellAnchor(sheet="Synthetic", ref="A1:A2"),
+        metadata=metadata,
+    )
+
+    chunks = chunker.chunk(document(title="Synthetic table"), [table])
+
+    assert chunks
+    assert "".join(chunk.text for chunk in chunks) == table.text
+    assert all(chunk.token_count <= 128 for chunk in chunks)
+    assert all(chunk.metadata.get("hard_split_at") == "row" for chunk in chunks)
 
 
 # A header row wide enough that the table alone exceeds the 448-token text budget, which is

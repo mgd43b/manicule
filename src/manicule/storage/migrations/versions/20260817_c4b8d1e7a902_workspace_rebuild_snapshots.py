@@ -76,6 +76,17 @@ def downgrade() -> None:
             "refusing to downgrade workspace rebuild snapshots while multi-source "
             "derived generations exist"
         )
+    new_format = sa.text(
+        "SELECT count(*) FROM derived_generation_snapshots AS snapshots "
+        "JOIN derived_generations AS generations ON generations.id = snapshots.generation_id "
+        "WHERE snapshots.run_id != generations.snapshot_run_id "
+        "OR snapshots.membership_hash != generations.snapshot_membership_hash"
+    )
+    if op.get_bind().execute(new_format).scalar_one():
+        raise RuntimeError(
+            "refusing to downgrade workspace rebuild snapshots while new-format "
+            "derived generations exist"
+        )
     op.drop_table("derived_generation_snapshots")
     with op.batch_alter_table("derived_generations") as batch:
         batch.drop_constraint("uq_derived_generation_plan", type_="unique")

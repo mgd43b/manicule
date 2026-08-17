@@ -284,6 +284,7 @@ async def promoted_snapshot(
     connector: str = "wiki",
     scope_fingerprint: str = "scope-v1",
     source_id: str = "page-1",
+    emits_watermark: bool = True,
 ) -> tuple[str, str, RawDocument]:
     raw = RawDocument(
         source_id=source_id,
@@ -319,7 +320,7 @@ async def promoted_snapshot(
     )
     await store.complete_acquisition_enumeration(
         run.id,
-        Watermark(value="v2", observed_at=NOW),
+        Watermark(value="v2", observed_at=NOW) if emits_watermark else None,
         lease_owner="worker",
         lease_generation=claimed.lease_generation,
         now=NOW,
@@ -900,12 +901,39 @@ async def test_publication_and_acquisition_settlement_share_one_rollback_boundar
     assert [await store.get_document(document.id) for document in documents] == [None, None]
 
 
-async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omission_pending(
+async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omission_pending(  # noqa: PLR0915
     store: SqliteDocStore,
     engine: AsyncEngine,
     data_dir: Path,
 ) -> None:
+    old_complete_run, _, _ = await promoted_snapshot(
+        store,
+        engine,
+        data_dir,
+        run_id="old-complete-scope",
+        scope_fingerprint="old-complete-v1",
+        source_id="old-scope-page",
+    )
+    async with session_factory(engine).begin() as session:
+        await session.execute(
+            update(models.AcquisitionRecord)
+            .where(models.AcquisitionRecord.run_id == old_complete_run)
+            .values(state=AcquisitionRecordState.SETTLED)
+        )
+        await session.execute(
+            update(models.AcquisitionRun)
+            .where(models.AcquisitionRun.id == old_complete_run)
+            .values(state=AcquisitionRunState.SETTLED)
+        )
     run_id, raws, blob_refs = await promoted_partial_snapshot(store, engine, data_dir)
+    omitted_live = make_document(
+        source="wiki",
+        source_id="omitted-one",
+        body=b"live content retained while the current scope is partial",
+        uri="https://wiki.example.test/content/omitted-one",
+        media_type="text/plain",
+    )
+    await store.upsert_document(omitted_live)
     target, embed = rebuild_target()
     vectors = LanceVectorStore(data_dir / "vectors")
     await vectors.ensure_ready(embed)
@@ -1012,6 +1040,7 @@ async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omiss
     assert lifecycle["snapshot_completeness"] == "partial"
     assert lifecycle["reproducibility_policy"] == "allow_omissions"
     assert lifecycle["can_continue_offline"] is False
+    assert await store.get_document(omitted_live.id) is not None
     assert await store.verify_snapshot_manifest(run_id)
     assert await store.latest_unsettled_acquisition_run("wiki") is None
     rendered = json.dumps(metadata, sort_keys=True)
@@ -2034,6 +2063,131 @@ async def test_multi_source_generation_resumes_and_publishes_once_atomically(
     assert published.state is RebuildState.PUBLISHED
     assert await store.get_document(first_replacement.document.id) is not None
     assert await store.get_document(second_replacement.document.id) is not None
+
+
+async def test_current_promoted_scope_without_a_watermark_is_still_plannable(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    await promoted_snapshot(
+        store,
+        engine,
+        data_dir,
+        run_id="prior-watermarked-scope",
+        scope_fingerprint="watermarked-scope",
+        source_id="prior-watermarked-page",
+    )
+    run_id, _, raw = await promoted_snapshot(
+        store,
+        engine,
+        data_dir,
+        run_id="new-no-watermark-scope",
+        scope_fingerprint="no-watermark-scope",
+        source_id="new-no-watermark-page",
+        emits_watermark=False,
+    )
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    assert plan.runnable, plan
+    inputs = await rebuilds.snapshot_inputs(plan.generation_id, after_sequence=-1, limit=10)
+
+    assert plan.documents == 1
+    assert [item.source.source_id for item in inputs] == [raw.source_id]
+
+
+async def test_complete_snapshot_publication_removes_stale_same_source_documents(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, blob_ref, raw = await promoted_snapshot(store, engine, data_dir)
+    stale = make_document(
+        source="wiki",
+        source_id="stale-outside-manifest",
+        body=b"stale live content",
+        uri="https://wiki.example.test/content/stale-outside-manifest",
+        media_type="text/plain",
+    )
+    await store.upsert_document(stale)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    replacement = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=raw.as_bytes(),
+        uri=raw.uri,
+        media_type=raw.media_type,
+    )
+
+    published = await publish_one_replacement(
+        rebuilds,
+        vectors,
+        estimate_id=plan.generation_id,
+        target=target,
+        document=replacement,
+        raw=raw,
+        blob_ref=blob_ref,
+        owner="complete-cleanup-publisher",
+    )
+
+    assert published.state is RebuildState.PUBLISHED
+    assert await store.get_document(stale.id) is None
+
+
+async def test_generation_bound_snapshot_is_not_removed_by_history_cleanup(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, _, _ = await promoted_snapshot(store, engine, data_dir)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    sessions = session_factory(engine)
+    old = datetime(2020, 1, 1, tzinfo=UTC)
+    async with sessions.begin() as session:
+        await session.execute(
+            update(models.AcquisitionRecord)
+            .where(models.AcquisitionRecord.run_id == run_id)
+            .values(state=AcquisitionRecordState.SETTLED, updated_at=old)
+        )
+        await session.execute(
+            update(models.AcquisitionRun)
+            .where(models.AcquisitionRun.id == run_id)
+            .values(state=AcquisitionRunState.SETTLED, updated_at=old)
+        )
+
+    removed = await store.cleanup_acquisition_history(
+        datetime(2100, 1, 1, tzinfo=UTC), limit=10
+    )
+
+    assert removed == 0
+    assert await store.get_acquisition_run(run_id) is not None
 
 
 async def test_rebuild_plan_reports_aggregate_chunk_budget_diagnostics(

@@ -80,7 +80,7 @@ breadcrumb-adjusted text budget and added overlap afterwards, so a near-full pro
 group could exceed the fingerprint it claimed. Its code-line fallback also preserved one
 oversized line whole. Version 3 repacks against each chunk's exact rendered breadcrumb,
 admits only the overlap that still fits, and hard-splits every remaining oversized unit.
-Those changes move boundaries, so retained-source offline rebuild is required; relabelling
+Those changes move boundaries, so retained-source offline rebuild is required; relabeling
 the existing generation would leave its stored chunks and vectors falsely current.
 """
 
@@ -130,6 +130,8 @@ class _Unit:
     starts_section: bool = False
     source_ordinal: int = -1
     source_contiguous: bool = False
+    repeated_prefix: str = ""
+    """Structural context that must begin every hard-split fragment, such as a table header."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,7 +407,8 @@ class StructuralChunker:
 
         units: list[_Unit] = []
         for part_index, indices in enumerate(parts, start=1):
-            text = "\n".join([*header, *(rows[i] for i in indices)])
+            prefix = f"{header_text}\n" if header else ""
+            text = f"{prefix}{'\n'.join(rows[i] for i in indices)}"
             unit = self._unit(
                 block,
                 text,
@@ -413,7 +416,7 @@ class StructuralChunker:
                 rows=[indices[0] + 1, indices[-1] + 1],
             )
             anchor = _narrow_cell_anchor(block.anchor, refs, header_rows, indices)
-            units.append(replace(unit, anchor=anchor))
+            units.append(replace(unit, anchor=anchor, repeated_prefix=prefix))
         if any(unit.tokens > self._text_budget for unit in units):
             # A single row does not fit. Splitting it further is a cell-level operation the
             # parser's rendering does not expose, so the row is treated as prose: it is
@@ -424,10 +427,42 @@ class StructuralChunker:
                 for split in (
                     [unit]
                     if unit.tokens <= self._text_budget
-                    else self._split_text(unit.text, unit, hard_split_kind="row")
+                    else (
+                        self._hard_split_repeating_prefix(unit, "row")
+                        if unit.repeated_prefix
+                        else self._split_text(unit.text, unit, hard_split_kind="row")
+                    )
                 )
             ]
         return units
+
+    def _hard_split_repeating_prefix(self, unit: _Unit, kind: str) -> list[_Unit]:
+        """Split a table row while retaining its parser-declared header on every fragment."""
+        prefix = unit.repeated_prefix
+        if not prefix or not unit.text.startswith(prefix):  # pragma: no cover - internal invariant
+            return self._hard_split(unit, kind)
+        remaining = unit.text[len(prefix) :]
+        pieces: list[_Unit] = []
+        while remaining:
+            cut = self._longest_prefix_satisfying(
+                remaining,
+                lambda candidate: self._counter(f"{prefix}{candidate}") <= self._text_budget,
+            )
+            if cut == 0:
+                # Repeating a header wider than the budget is physically impossible. Keep the
+                # complete table losslessly indexable and mark the structural hard split,
+                # instead of turning an oversized header into a document-level refusal.
+                fallback = replace(unit, repeated_prefix="")
+                return self._split_text(fallback.text, fallback, hard_split_kind=kind)
+            head, remaining = remaining[:cut], remaining[cut:]
+            text = f"{prefix}{head}"
+            metadata: Metadata = {
+                **unit.metadata,
+                "hard_split": True,
+                "hard_split_at": kind,
+            }
+            pieces.append(replace(unit, text=text, tokens=self._counter(text), metadata=metadata))
+        return pieces
 
     def _split_lines(self, block: ParsedBlock) -> list[_Unit]:
         """Last-resort split for a code block the parser could not divide further.
@@ -602,23 +637,40 @@ class StructuralChunker:
             return [unit]
 
         pieces: list[_Unit] = []
-        remaining = unit.text
+        repeated_prefix = unit.repeated_prefix
+        if repeated_prefix and (
+            not unit.text.startswith(repeated_prefix) or not fits_text(repeated_prefix)
+        ):
+            repeated_prefix = ""
+        remaining = unit.text[len(repeated_prefix) :] if repeated_prefix else unit.text
         while remaining:
 
-            def fits_prefix(prefix: str) -> bool:
-                return fits_text(prefix)
+            def fits_prefix(candidate: str) -> bool:
+                return fits_text(f"{repeated_prefix}{candidate}")
 
             cut = self._longest_prefix_satisfying(remaining, fits_prefix)
             if cut == 0:
-                msg = "the rendered breadcrumb leaves no room for even one content character"
+                msg = (
+                    "the rendered breadcrumb and repeated table header leave no room for "
+                    "even one content character"
+                )
                 raise ChunkingError(msg)
             head, remaining = remaining[:cut], remaining[cut:]
             metadata: Metadata = {
                 **unit.metadata,
                 "hard_split": True,
-                "hard_split_at": "final_budget",
+                "hard_split_at": "row" if unit.repeated_prefix else "final_budget",
             }
-            pieces.append(replace(unit, text=head, tokens=self._counter(head), metadata=metadata))
+            text = f"{repeated_prefix}{head}"
+            pieces.append(
+                replace(
+                    unit,
+                    text=text,
+                    tokens=self._counter(text),
+                    metadata=metadata,
+                    repeated_prefix=repeated_prefix,
+                )
+            )
         return pieces
 
     def _rendered_count(self, crumb: str, text: str) -> int:
