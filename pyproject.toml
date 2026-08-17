@@ -204,7 +204,7 @@ dev = [
   # balance and cannot cost coverage. It has no configuration file of its own — every option is
   # a flag, and the ones CI passes are in `.github/workflows/ci.yml`.
   "pytest-split>=0.10",
-  "ruff>=0.8",
+  "ruff>=0.16.3",
   "pyright>=1.1.390",
   # Fixture generation (docs/parsing.md §3.5): fixtures are built by a checked-in script
   # wherever generation is possible, so their structure is reviewable as code rather than as
