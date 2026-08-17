@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
+import tracemalloc
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any, cast, override
 
@@ -47,12 +51,15 @@ from manicule.storage.vectors import LanceVectorStore, VectorStoreStateError
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from pathlib import Path
+    from collections.abc import Callable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 NOW = datetime(2026, 8, 15, 12, tzinfo=UTC)
+
+
+def open_descriptor_count() -> int:
+    return len(list(Path("/dev/fd").iterdir()))
 
 
 class ReplayBarrierRebuildStore(SqliteRebuildStore):
@@ -87,6 +94,8 @@ class CountingEvidenceBlobStore(BlobStore):
 
     full_verifications = 0
     cheap_probes = 0
+    pin_probes = 0
+    final_probes = 0
 
     @override
     async def evidence_identity(
@@ -110,6 +119,32 @@ class CountingEvidenceBlobStore(BlobStore):
             verify_content=verify_content,
         )
 
+    @override
+    def pin_evidence_representation(
+        self,
+        digest: str,
+        pin: Path,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+    ) -> str | None:
+        self.pin_probes += 1
+        return super().pin_evidence_representation(
+            digest, pin, size_bytes, stored_bytes, compression
+        )
+
+    @override
+    def validate_evidence_pin(
+        self,
+        digest: str,
+        pin: Path,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+    ) -> str | None:
+        self.final_probes += 1
+        return super().validate_evidence_pin(digest, pin, size_bytes, stored_bytes, compression)
+
 
 class GatedEvidenceBlobStore(CountingEvidenceBlobStore):
     """Pause after one full streamed hash and before fence persistence."""
@@ -118,6 +153,7 @@ class GatedEvidenceBlobStore(CountingEvidenceBlobStore):
     verification_release: asyncio.Event
     armed = False
     blocked = False
+    active_digest: str | None = None
 
     @override
     async def evidence_identity(
@@ -138,8 +174,32 @@ class GatedEvidenceBlobStore(CountingEvidenceBlobStore):
         )
         if verify_content and self.armed and not self.blocked:
             self.blocked = True
+            self.active_digest = digest
             self.verification_started.set()
             await self.verification_release.wait()
+        return identity
+
+
+class EarlyAliasMutationBlobStore(BlobStore):
+    """Mutate a retired alias after the first member's locked final probe."""
+
+    mutation: Callable[[str], None] | None = None
+    final_probes = 0
+
+    @override
+    def validate_evidence_pin(
+        self,
+        digest: str,
+        pin: Path,
+        size_bytes: int,
+        stored_bytes: int,
+        compression: str,
+    ) -> str | None:
+        identity = super().validate_evidence_pin(digest, pin, size_bytes, stored_bytes, compression)
+        self.final_probes += 1
+        if self.final_probes == 1 and self.mutation is not None:
+            self.mutation(digest)
+            self.mutation = None
         return identity
 
 
@@ -185,6 +245,32 @@ class FailingSettlementPublicationStore(SqliteRebuildStore):
     ) -> None:
         await super()._settle_published_generation(session, generation, now=now)
         raise RuntimeError("synthetic settlement commit failure")
+
+
+class MutatingAfterEvidenceProbeStore(SqliteRebuildStore):
+    """Change the public representation after pins exist but before SQLite publication."""
+
+    mutation: Callable[[], None] | None = None
+
+    @override
+    async def _publish_generation_atomic(self, *args: Any, **kwargs: Any) -> RebuildCheckpoint:
+        if self.mutation is not None:
+            self.mutation()
+            self.mutation = None
+        return await super()._publish_generation_atomic(*args, **kwargs)
+
+
+class GatedAfterEvidenceProbeStore(SqliteRebuildStore):
+    """Pause after durable pins are established and before SQLite gets a writer."""
+
+    probe_complete: asyncio.Event
+    publication_release: asyncio.Event
+
+    @override
+    async def _publish_generation_atomic(self, *args: Any, **kwargs: Any) -> RebuildCheckpoint:
+        self.probe_complete.set()
+        await self.publication_release.wait()
+        return await super()._publish_generation_atomic(*args, **kwargs)
 
 
 async def promoted_snapshot(
@@ -931,7 +1017,7 @@ async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omiss
     assert "wiki.example.test" not in rendered
 
 
-@pytest.mark.parametrize("damage", ["missing", "corrupt", "ref", "manifest"])
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "symlink", "ref", "manifest"])
 async def test_publication_rechecks_retained_blob_integrity_before_settlement(
     store: SqliteDocStore,
     engine: AsyncEngine,
@@ -954,11 +1040,17 @@ async def test_publication_rechecks_retained_blob_integrity_before_settlement(
     assert isinstance(snapshot_id, str)
     assert isinstance(blob_ref, str)
     blobs = BlobStore(engine, data_dir)
-    path = blobs.path_for(blob_ref)
+    path = blobs.evidence_path_for(blob_ref)
     if damage == "missing":
         path.unlink()
     elif damage == "corrupt":
+        path.chmod(0o600)
         path.write_bytes(b"synthetic corrupt evidence")
+    elif damage == "symlink":
+        replacement = path.with_name(f"{path.name}.synthetic-replacement")
+        replacement.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(replacement)
     elif damage == "ref":
         replacement = await blobs.put(b"synthetic replacement evidence", "text/plain")
         assert isinstance(replacement, StoredBlob)
@@ -1036,10 +1128,183 @@ async def test_slow_evidence_verification_does_not_hold_sqlite_writer_slot(
     elapsed = monotonic() - started
 
     assert elapsed < 5
+
+    assert blobs.active_digest is not None
+    blocked_shard = blobs.evidence_lock_shard(blobs.active_digest)
+    candidate = 0
+    while True:
+        unrelated_payload = f"unrelated managed blob {candidate}".encode()
+        unrelated_digest = content_hash(unrelated_payload)
+        if blobs.evidence_lock_shard(unrelated_digest) != blocked_shard:
+            break
+        candidate += 1
+    started = monotonic()
+    async with asyncio.timeout(5):
+        unrelated = await blobs.put(unrelated_payload, "application/octet-stream")
+        assert isinstance(unrelated, StoredBlob)
+        token = await blobs._mark_gc_candidate(  # pyright: ignore[reportPrivateUsage]
+            unrelated.hash
+        )
+        assert token is not None
+        assert await blobs._run_gc_intent(  # pyright: ignore[reportPrivateUsage]
+            unrelated.hash, token
+        )
+    assert monotonic() - started < 5
+
     blobs.verification_release.set()
     rebuilds, claimed, _ = await build
     generation = await rebuilds.checkpoint(claimed.generation_id)
     assert generation.state is RebuildState.VALIDATING
+
+
+async def test_early_alias_replacement_during_locked_final_scan_uses_canonical_bytes(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    blobs = EarlyAliasMutationBlobStore(engine, data_dir)
+    rebuilds, claimed, documents = await staged_glossary_generation(
+        store, engine, data_dir, blobs=blobs
+    )
+    blob_refs = {document.original_ref for document in documents}
+    assert None not in blob_refs
+    retained = {ref: await blobs.get(ref) for ref in cast("set[str]", blob_refs)}
+    assert all(body is not None for body in retained.values())
+    for ref in retained:
+        alias = blobs.path_for(ref)
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        alias.write_bytes(b"retired alias before final scan")
+    mutated: list[str] = []
+
+    def replace_alias(blob_ref: str) -> None:
+        alias = blobs.path_for(blob_ref)
+        alias.unlink()
+        alias.write_bytes(b"retired alias replaced after early probe")
+        mutated.append(blob_ref)
+
+    blobs.mutation = replace_alias
+    published = await rebuilds.publish_generation(
+        claimed.generation_id,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+    assert published.state is RebuildState.PUBLISHED
+    assert blobs.final_probes >= 4
+    assert len(mutated) == 1
+    assert await blobs.get(mutated[0]) == retained[mutated[0]]
+    assert blobs.path_for(mutated[0]).read_bytes() == b"retired alias replaced after early probe"
+
+
+@pytest.mark.parametrize("mutation", ["in_place", "unlink", "replacement", "symlink"])
+async def test_canonical_fence_refuses_pin_changes_but_ignores_retired_alias(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    mutation: str,
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    rebuilds, claimed, documents = await staged_glossary_generation(
+        store,
+        engine,
+        data_dir,
+        rebuild_type=MutatingAfterEvidenceProbeStore,
+        blobs=blobs,
+    )
+    assert isinstance(rebuilds, MutatingAfterEvidenceProbeStore)
+    blob_ref = documents[0].original_ref
+    assert blob_ref is not None
+    alias = blobs.path_for(blob_ref)
+    pin = blobs.evidence_path_for(blob_ref)
+    before = pin.stat()
+    stored = pin.read_bytes()
+    retained = await blobs.get(blob_ref)
+    assert retained is not None
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    alias.write_bytes(stored)
+
+    def mutate() -> None:
+        if mutation == "in_place":
+            changed = bytes([stored[0] ^ 1]) + stored[1:]
+            pin.chmod(0o600)
+            pin.write_bytes(changed)
+            os.utime(pin, ns=(before.st_atime_ns, before.st_mtime_ns))
+            pin.chmod(stat.S_IRUSR)
+        elif mutation == "unlink":
+            alias.unlink()
+        elif mutation == "replacement":
+            alias.unlink()
+            alias.write_bytes(stored[::-1])
+            os.utime(alias, ns=(before.st_atime_ns, before.st_mtime_ns))
+        else:
+            alias.unlink()
+            alias.symlink_to(pin)
+
+    rebuilds.mutation = mutate
+    if mutation == "in_place":
+        with pytest.raises(RebuildPublicationConflictError) as caught:
+            await rebuilds.publish_generation(
+                claimed.generation_id,
+                owner="glossary-publisher",
+                lease_generation=claimed.lease_generation,
+                now=NOW,
+            )
+        assert caught.value.code is RebuildRefusalCode.SNAPSHOT_CHANGED
+        assert (await rebuilds.checkpoint(claimed.generation_id)).state is RebuildState.VALIDATING
+    else:
+        published = await rebuilds.publish_generation(
+            claimed.generation_id,
+            owner="glossary-publisher",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+        assert published.state is RebuildState.PUBLISHED
+        assert await blobs.get(blob_ref) == retained
+
+
+async def test_canceled_publication_after_pin_probe_retries_from_durable_pins(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    blobs = BlobStore(engine, data_dir)
+    rebuilds, claimed, _ = await staged_glossary_generation(
+        store,
+        engine,
+        data_dir,
+        rebuild_type=GatedAfterEvidenceProbeStore,
+        blobs=blobs,
+    )
+    assert isinstance(rebuilds, GatedAfterEvidenceProbeStore)
+    rebuilds.probe_complete = asyncio.Event()
+    rebuilds.publication_release = asyncio.Event()
+    publication = asyncio.create_task(
+        rebuilds.publish_generation(
+            claimed.generation_id,
+            owner="glossary-publisher",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+    )
+    await asyncio.wait_for(rebuilds.probe_complete.wait(), timeout=5)
+    publication.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await publication
+
+    retry = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=LanceVectorStore(data_dir / "vectors"),
+    )
+    published = await retry.publish_generation(
+        claimed.generation_id,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    assert published.state is RebuildState.PUBLISHED
 
 
 async def test_canceled_evidence_verification_leaves_no_fence_and_retry_recovers(
@@ -1146,7 +1411,8 @@ async def test_publication_uses_one_durable_hash_fence_without_rehashing(
     blobs = CountingEvidenceBlobStore(engine, data_dir)
     rebuilds, claimed, _ = await staged_glossary_generation(store, engine, data_dir, blobs=blobs)
     full_before_publication = blobs.full_verifications
-    cheap_before_publication = blobs.cheap_probes
+    pins_before_publication = blobs.pin_probes
+    final_before_publication = blobs.final_probes
     # One planning pass and one durable verification pass over two unique retained blobs.
     assert full_before_publication == 4
 
@@ -1159,7 +1425,10 @@ async def test_publication_uses_one_durable_hash_fence_without_rehashing(
 
     assert published.state is RebuildState.PUBLISHED
     assert blobs.full_verifications == full_before_publication
-    assert blobs.cheap_probes == cheap_before_publication + 2
+    assert blobs.cheap_probes == 0
+    assert blobs.pin_probes == pins_before_publication + 2
+    # One locked pre-transaction scan and one immediately-precommit scan; both are stat-only.
+    assert blobs.final_probes == final_before_publication + 4
     sessions = session_factory(engine)
     async with sessions() as session:
         generation = await session.get(models.DerivedGeneration, claimed.generation_id)
@@ -1167,6 +1436,74 @@ async def test_publication_uses_one_durable_hash_fence_without_rehashing(
     assert generation.evidence_inventory_digest
     assert generation.evidence_verification_digest
     assert generation.evidence_verification_lease_generation == claimed.lease_generation
+
+
+async def test_many_unique_evidence_streams_with_fixed_shard_and_descriptor_state(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    item_count = 300
+    raws = tuple(
+        RawDocument(
+            source_id=f"bounded-{index:04d}",
+            uri=f"https://wiki.example.test/bounded/{index:04d}",
+            media_type="text/plain",
+            content=f"unique synthetic retained representation {index:04d}",
+        )
+        for index in range(item_count)
+    )
+    run_id, _ = await promoted_snapshot_many(store, engine, data_dir, raws)
+    target, _ = rebuild_target()
+    blobs = BlobStore(engine, data_dir)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=blobs,
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=1)
+    sessions = session_factory(engine)
+    record_selects = 0
+
+    def count_record_selects(*args: object) -> None:
+        nonlocal record_selects
+        statement = args[2]
+        if isinstance(statement, str) and "FROM acquisition_records" in statement:
+            record_selects += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_record_selects)
+    tracemalloc.start()
+    try:
+        descriptors_before = await asyncio.to_thread(open_descriptor_count)
+        async with blobs.evidence_fence() as pins, sessions() as session:
+            generation = await session.get(models.DerivedGeneration, plan.generation_id)
+            assert generation is not None
+            digest = await rebuilds._evidence_inventory_digest(  # pyright: ignore[reportPrivateUsage]
+                session, generation
+            )
+            verified = await rebuilds._evidence_verification_digest(  # pyright: ignore[reportPrivateUsage]
+                session,
+                generation,
+                digest,
+                verify_content=True,
+                pins=pins,
+            )
+            shard_bitmap = pins._shard_bitmap  # pyright: ignore[reportPrivateUsage]
+            identity_rows = len(session.identity_map)
+        descriptors_after = await asyncio.to_thread(open_descriptor_count)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        event.remove(engine.sync_engine, "before_cursor_execute", count_record_selects)
+
+    assert digest
+    assert verified
+    assert record_selects == 2
+    assert identity_rows <= 1
+    assert shard_bitmap.bit_count() <= 256
+    assert descriptors_after <= descriptors_before + 2
+    assert len(list((blobs.root / "evidence-pins" / "by-digest").iterdir())) == item_count
+    assert peak < 12 * 1024 * 1024
 
 
 async def test_published_replay_repairs_a_legacy_unsettled_handoff_exactly_once(

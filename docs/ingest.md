@@ -868,13 +868,30 @@ swap and the settlement of the exact acquisition manifest share one SQLite trans
 reserving SQLite's writer slot, validation streams and hashes each unique represented blob once,
 then durably records a private digest binding the workspace, generation lease, promoted run,
 canonical membership, exact evidence inventory, blob descriptors and stable filesystem
-representations. Publication takes the blob representation fence, compares cheap current
-identities with that durable verification, and holds the fence across the short atomic database
-operation. Inside that operation it rechecks the persisted verification identity plus workspace,
-connector instance, promoted snapshot, membership, lease/fence, staged replacement inventory and
-live vector binding; it performs no corpus blob reads. A crash before the verification digest is
-committed leaves no usable fence, a stale lease cannot commit one, and retry or legacy published
-replay verifies outside the writer transaction before proceeding. Publication then moves the
+representations. Inventory and unique-representation rows are scalar-streamed in fixed pages into
+incremental canonical digests; neither the read-only verification nor the writer transaction
+constructs a corpus-sized tuple, identity map, duplicate representation list or lock-key set.
+The first verification promotes each unique blob to one durable content-addressed canonical name,
+then retires its legacy sharded alias. The canonical name is the retained representation used by
+all later rebuild, acquisition-resume and ordinary blob reads; it is not evidence for an alias
+whose continued binding publication depends upon. Promotion and the full streamed hash hold only
+that digest's managed-writer shard, so unrelated retention and collection remain live for the
+entire corpus scan. The verifier remembers only a 256-bit used-shard bitmap. Publication acquires
+those used shards after hashing, reopens canonical names with `O_NOFOLLOW`, and streams cheap
+inode/stat checks while holding the bounded shard set across the short atomic database operation.
+Managed writes and garbage collection take the same per-blob shards; GC quarantines the canonical
+representation and removes it only after the blob row is unowned. Immediately after the database
+flush and before commit, publication repeats the streamed canonical checks. A cooperating managed
+writer therefore cannot alter, replace, unlink or collect an early member between its check and
+commit, while replacement or loss of a retired alias is harmless. That last check also binds the
+persisted verification identity plus workspace, connector instance,
+promoted snapshot, membership, lease/fence, staged replacement inventory and live vector binding;
+it performs no corpus blob reads. A crash before the verification digest is committed leaves no
+usable fence, a stale lease cannot commit one, and retry or legacy published replay verifies
+outside the writer transaction before proceeding. POSIX provides no portable defense against a
+hostile process with the same UID deliberately chmodding and rewriting the read-only canonical
+inode behind the lock protocol; that actor is outside this local storage trust model rather than a
+guarantee hidden behind timestamp heuristics. Publication then moves the
 represented retained records to terminal derivation state and refreshes the run counters in the
 same commit that makes the generation `PUBLISHED`. A complete
 manifest becomes `SETTLED`. An allowed-partial manifest derives only its evidence-bearing members;
