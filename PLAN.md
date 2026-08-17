@@ -124,16 +124,19 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 | Structured | custom | stdlib `json`/`tomllib`, **PyYAML** | |
 | Archive | placeholder | **zipfile** + recurse into the parser chain | OpenDocuments never implemented this |
 
-### What the GPL-3.0 relicense changed here, and what it did not
+### What the licensing has settled on, and what it never changed
 
-The project is GPL-3.0-or-later (`LICENSE`), so copyleft dependencies are no longer excluded
-by default. Two parsing decisions were made on license grounds and they move in opposite
+The project is MIT (`LICENSE`). It was GPL-3.0-or-later for a period, to accommodate the MLX
+embedding runtime; that runtime now ships as its own GPL-3.0-or-later distribution
+(`packages/manicule-mlx`) and core is permissive again, so copyleft dependencies are excluded
+from `manicule` itself. Two parsing decisions were made on license grounds and they move in
 directions:
 
-- **`extract-msg` (GPL-3.0) is cleanly unblocked.** GPL-3.0 code in a GPL-3.0 project carries
+- **`extract-msg` (GPL-3.0) stays blocked.** A copyleft dependency in an MIT project carries
   no additional obligation. [#21](https://github.com/mgd43b/manicule/issues/21) gets much
   simpler: it becomes a dependency, not a hand-written MAPI property reader.
-- **PyMuPDF (AGPL-3.0) is *not* simply unblocked, and the PDF decision does not change.**
+- **PyMuPDF (AGPL-3.0) would be rejected under either license, and the PDF decision does not
+  change.**
   GPLv3 §13 permits combining with AGPLv3 code, but the combination then carries AGPL §13:
   anyone who *runs* it as a network service owes source to its users. manicule ships an HTTP
   API and a web UI, so that is a live obligation in team mode rather than a formality.

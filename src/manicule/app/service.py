@@ -51,8 +51,15 @@ from manicule.config.settings import (
     looks_secret,
 )
 from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome
+from manicule.container import keys
 from manicule.core.content import PREVIOUS_IDENTITY, DocumentStatus
-from manicule.core.errors import ConfigError, ManiculeError, PolicyError, UnknownEntityError
+from manicule.core.errors import (
+    ConfigError,
+    ManiculeError,
+    PolicyError,
+    UnknownComponentError,
+    UnknownEntityError,
+)
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id
 from manicule.core.rebuild import (
@@ -3129,6 +3136,22 @@ class ApplicationService:
         """
         return await asyncio.to_thread(self._inspect_models, provider=provider)
 
+    def _embedder_config_model(self, provider: str) -> type[BaseModel] | None:
+        """The configuration model the named embedder registered, or ``None``.
+
+        ``None`` means "nothing installed provides this embedder, or it declared no
+        configuration model" — both of which leave the caller with no settings to validate and
+        nothing to say about the artifact beyond the defaults.
+        """
+        discovery = self._backend.discovery
+        if discovery is None:
+            return None
+        try:
+            record = discovery.registry.record(keys.EMBEDDER.named(provider))
+        except UnknownComponentError:
+            return None
+        return record.config_model
+
     def _weights_plan(self, provider: str | None) -> WeightsPlan | None:
         """The artifact the configured backend will load, or ``None`` with no embedding extra."""
         from manicule.embedding.artifacts import (  # noqa: PLC0415 - an extra
@@ -3137,10 +3160,7 @@ class ApplicationService:
             planned_weights,
         )
         from manicule.embedding.cards import CARD_FILES  # noqa: PLC0415 - an extra
-        from manicule.embedding.config import (  # noqa: PLC0415 - an extra
-            EmbedderConfig,
-            MlxEmbedderConfig,
-        )
+        from manicule.embedding.config import EmbedderConfig  # noqa: PLC0415 - an extra
         from manicule.embedding.runtimes.hub import (  # noqa: PLC0415 - an extra
             cached_revision,
         )
@@ -3165,12 +3185,32 @@ class ApplicationService:
         weights = ""
         try:
             raw = settings.component_config("embedder", chosen)
-            if chosen == "mlx":
-                config = MlxEmbedderConfig.model_validate(raw)
-            elif chosen == "onnx":
-                config = EmbedderConfig.model_validate(raw)
+            # Validate against the model the backend **registered**, not against a name this
+            # function knows. Backends ship their own `EmbedderConfig` subclass from their own
+            # distribution — `manicule-mlx` adds a Metal cache bound — and `extra="forbid"`
+            # means validating one of those against the base model fails on its own setting. An
+            # earlier version branched on the literals "mlx" and "onnx", so it could only ever
+            # be right about the backends that happened to be in-tree the day it was written.
+            #
+            # When the registry cannot answer — no discovery, or an embedder nothing installed
+            # provides — fall back to the two fields this function actually reads rather than
+            # skipping validation. Those live on the base model, so a mutable `weights_revision`
+            # is still refused; what is given up is only the rejection of a *foreign* key, which
+            # is a different diagnostic's job. Skipping instead would make `doctor` quietly
+            # weaker exactly where it has least information.
+            model_for_config = self._embedder_config_model(chosen)
+            if model_for_config is None:
+                base = set(EmbedderConfig.model_fields)
+                config: EmbedderConfig = EmbedderConfig.model_validate(
+                    {key: value for key, value in raw.items() if key in base}
+                )
             else:
-                return planned_weights(chosen, model, model_revision=model_revision)
+                validated = model_for_config.model_validate(raw)
+                if not isinstance(validated, EmbedderConfig):
+                    # A registered model that is not an `EmbedderConfig` cannot carry
+                    # `weights`/`weights_revision`, so there is no plan to make from it.
+                    return planned_weights(chosen, model, model_revision=model_revision)
+                config = validated
             weights = config.weights
             revision = config.weights_revision
             if (

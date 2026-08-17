@@ -64,7 +64,7 @@ def wired(settings: Settings) -> tuple[Container, list[str]]:
         config_model=ParserConfig,
         media_types={MEDIA_TYPE},
     )
-    registry.add(keys.EMBEDDER.named("mlx"), lambda _: HashEmbedder())
+    registry.add(keys.EMBEDDER.named("onnx"), lambda _: HashEmbedder())
     registry.add(keys.CHUNKER.named("structural"), lambda _: BlockChunker())
     registry.add(keys.MIDDLEWARE.named("first"), lambda _: Recorder("first", log))
     registry.add(keys.MIDDLEWARE.named("second"), lambda _: Recorder("second", log))
@@ -121,7 +121,7 @@ def test_metadata_dependencies_never_construct_executable_components(settings: S
         return BlockChunker()
 
     registry.add(
-        keys.EMBEDDER.named("mlx"),
+        keys.EMBEDDER.named("onnx"),
         forbidden_embedder,
         metadata_factory=lambda _: described.append("embed") or "embedding-id",
     )
@@ -142,7 +142,7 @@ def test_metadata_dependencies_never_construct_executable_components(settings: S
 
 def test_missing_metadata_refuses_instead_of_falling_back_to_a_factory(settings: Settings) -> None:
     registry = ComponentRegistry().bind("test")
-    registry.add(keys.EMBEDDER.named("mlx"), lambda _: HashEmbedder())
+    registry.add(keys.EMBEDDER.named("onnx"), lambda _: HashEmbedder())
 
     with pytest.raises(ConfigError, match="no metadata-only identity"):
         Container(settings, registry).metadata(keys.EMBEDDER)
@@ -211,11 +211,11 @@ def test_a_setting_of_the_wrong_type_names_the_field(settings: Settings) -> None
 def test_configuring_a_component_that_declares_no_model_is_rejected(settings: Settings) -> None:
     """Silently ignoring it would leave the setting looking like it was in force."""
     registry = ComponentRegistry().bind("test")
-    registry.add(keys.EMBEDDER.named("mlx"), lambda _: HashEmbedder())
+    registry.add(keys.EMBEDDER.named("onnx"), lambda _: HashEmbedder())
     configured = settings.model_copy(
         update={
             "plugins": settings.plugins.model_copy(
-                update={"config": {"embedder.mlx": {"anything": 1}}}
+                update={"config": {"embedder.onnx": {"anything": 1}}}
             )
         }
     )
@@ -322,7 +322,9 @@ async def test_health_says_which_component_is_unwell(settings: Settings) -> None
     class Unwell(Recorder):
         @override
         async def health(self) -> HealthReport:
-            return HealthReport.degraded("running on the fallback runtime", remedy="install mlx")
+            return HealthReport.degraded(
+                "running on the fallback runtime", remedy="install manicule-mlx"
+            )
 
     registry = ComponentRegistry().bind("test")
     registry.add(keys.MIDDLEWARE.named("fine"), lambda _: Recorder("fine", []))
@@ -488,7 +490,7 @@ def test_the_gate_reports_everything_wrong_at_once(settings: Settings) -> None:
 
 def test_a_complete_configuration_builds(settings: Settings) -> None:
     registry = ComponentRegistry().bind("test")
-    registry.add(keys.EMBEDDER.named("mlx"), lambda _: HashEmbedder())
+    registry.add(keys.EMBEDDER.named("onnx"), lambda _: HashEmbedder())
     registry.add(keys.CHUNKER.named("structural"), lambda _: BlockChunker())
     # By the name `llm.generator` selects, which is the registered *component* rather
     # than the vendor `llm.provider` names — one implementation reaches every vendor.
@@ -500,4 +502,4 @@ def test_a_complete_configuration_builds(settings: Settings) -> None:
 
     container = build_container(settings, discovery=Discovery(registry=registry))
     assert isinstance(container.get(keys.EMBEDDER), Embedder)
-    assert container.describe() == ["embedder:mlx"]
+    assert container.describe() == ["embedder:onnx"]

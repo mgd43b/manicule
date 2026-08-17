@@ -666,7 +666,14 @@ class EmbeddingSettings(Section):
     """
 
     provider: str = Field(
-        default="mlx", min_length=1, description="Which embedder implementation to use."
+        default="onnx",
+        min_length=1,
+        description="Which embedder implementation to use. ``onnx`` is the one manicule ships "
+        "and runs everywhere. ``mlx`` is Metal-native and roughly four to five times faster on "
+        "Apple Silicon, and it is a separate install — ``manicule-mlx``, which is "
+        "GPL-3.0-or-later where manicule is MIT. Switching between them never re-embeds: "
+        "``backend`` is excluded from the embedding fingerprint's identity, and the two agree "
+        "to cosine 0.99999998.",
     )
     model: str = Field(default="BAAI/bge-m3", min_length=1)
     revision: str | None = Field(default=None, min_length=1)

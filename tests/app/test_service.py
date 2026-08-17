@@ -1225,8 +1225,15 @@ async def test_upgrade_names_a_destination_without_creating_one(tmp_path: Path) 
 
 
 @pytest.fixture
-def weights_on_disk(monkeypatch: pytest.MonkeyPatch) -> Callable[[bool], None]:
+def weights_on_disk(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> Callable[[bool], None]:
     """Decide what the model cache holds, without one being on the machine running the test.
+
+    Also selects the MLX backend, which these cases are about. It used to be the default and is
+    now a separate distribution, so a test that says nothing gets `onnx` — and would assert
+    about a different artifact while looking unchanged. `doctor` plans weights for whichever
+    backend is *configured*, which is the behavior under test either way.
 
     The probe is a real cache lookup, so on a developer's laptop it answers "present" and on a
     fresh CI runner it answers "absent" — which would make every assertion below true or false
@@ -1235,6 +1242,10 @@ def weights_on_disk(monkeypatch: pytest.MonkeyPatch) -> Callable[[bool], None]:
     """
 
     def decide(present: bool) -> None:
+        backend.settings = Settings(
+            embedding={"provider": "mlx"}  # pyright: ignore[reportArgumentType] - validated
+        )
+
         def cached(*_args: object, **_kwargs: object) -> bool:
             return present
 
@@ -1303,7 +1314,10 @@ async def test_doctor_recognizes_a_fully_local_model_without_a_download(
     directory = write_model(tmp_path / "local-model")
     (directory / "model.safetensors").write_bytes(b"weights")
     backend.settings = Settings(
-        embedding={"model": str(directory)}  # pyright: ignore[reportArgumentType]
+        # `mlx` named rather than defaulted: safetensors is the artifact *that* backend reads,
+        # and the default is now `onnx`, which would look for `onnx/model.onnx` and correctly
+        # report this local directory as holding nothing it can run.
+        embedding={"model": str(directory), "provider": "mlx"}  # pyright: ignore[reportArgumentType]
     )
 
     diagnosis = await ApplicationService(backend).doctor()
@@ -1317,6 +1331,7 @@ async def test_doctor_recognizes_a_fully_local_model_without_a_download(
 
 async def test_doctor_refuses_a_mutable_remote_weights_revision(backend: FakeBackend) -> None:
     backend.settings = Settings(
+        embedding={"provider": "mlx"},  # pyright: ignore[reportArgumentType] - validated
         plugins={  # pyright: ignore[reportArgumentType] - validated settings fixture
             "config": {
                 "embedder.mlx": {
@@ -1324,7 +1339,7 @@ async def test_doctor_refuses_a_mutable_remote_weights_revision(backend: FakeBac
                     "weights_revision": "main",
                 }
             }
-        }
+        },
     )
 
     diagnosis = await ApplicationService(backend).doctor()
@@ -1338,9 +1353,10 @@ async def test_doctor_refuses_a_mutable_remote_weights_revision(backend: FakeBac
 
 async def test_doctor_refuses_a_non_string_weights_revision(backend: FakeBackend) -> None:
     backend.settings = Settings(
+        embedding={"provider": "mlx"},  # pyright: ignore[reportArgumentType] - validated
         plugins={  # pyright: ignore[reportArgumentType] - malformed raw plugin config is the case
             "config": {"embedder.mlx": {"weights_revision": 123}}
-        }
+        },
     )
 
     diagnosis = await ApplicationService(backend).doctor()
@@ -1417,6 +1433,7 @@ async def test_doctor_refuses_a_revision_claim_for_local_weights(
     backend: FakeBackend, tmp_path: Path
 ) -> None:
     backend.settings = Settings(
+        embedding={"provider": "mlx"},  # pyright: ignore[reportArgumentType] - validated
         plugins={  # pyright: ignore[reportArgumentType] - validated settings fixture
             "config": {
                 "embedder.mlx": {
@@ -1424,7 +1441,7 @@ async def test_doctor_refuses_a_revision_claim_for_local_weights(
                     "weights_revision": "1" * 40,
                 }
             }
-        }
+        },
     )
 
     diagnosis = await ApplicationService(backend).doctor()

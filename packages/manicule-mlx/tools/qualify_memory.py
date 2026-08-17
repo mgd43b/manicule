@@ -163,12 +163,12 @@ async def run_child(passes: int, cache_limit_mb: int | None) -> None:
     # Deferred, and it matters: only the child may import MLX. The parent measures a process
     # holding Metal allocations, and it cannot be one of them.
     import mlx.core as mx  # noqa: PLC0415
-
-    from manicule.embedding.cards import read_card  # noqa: PLC0415
     from manicule.embedding.runtimes.mlx_backend import (  # noqa: PLC0415
         DEFAULT_CACHE_LIMIT_BYTES,
         MlxEmbedder,
     )
+
+    from manicule.embedding.cards import read_card  # noqa: PLC0415
 
     limit = DEFAULT_CACHE_LIMIT_BYTES if cache_limit_mb is None else cache_limit_mb * 1024 * 1024
     card = read_card(MODEL)

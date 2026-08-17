@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from manicule.testing.fixtures import manicule_environment, settings
+from manicule.testing.fixtures import manicule_environment, model_cache, settings
 from tests.corpus import build_all
 from tests.storage_helpers import data_dir, engine, store
 
@@ -33,29 +33,6 @@ __all__ = [
     "store",
     "vocabulary_cache",
 ]
-
-
-@pytest.fixture(scope="session", autouse=True)
-def model_cache() -> None:
-    """Pin the Hugging Face cache to this machine's real one, for the whole session.
-
-    The same hazard as ``grammar_cache`` below, arriving through a different library.
-    ``manicule_environment`` redirects ``XDG_CACHE_HOME`` at every test, and recent
-    ``huggingface_hub`` resolves its cache through that variable — so a model sitting on disk
-    becomes invisible the moment a test imports the hub lazily, and every embedding suite skips
-    on a machine where the weights are right there. Worse in CI, where the pre-seed step would
-    download several hundred megabytes into a directory nothing later reads, and the suite would
-    report green having checked nothing.
-
-    Session-scoped and autouse so it runs while the environment is still the real one. The
-    resolved path is written back to ``HF_HUB_CACHE``, which takes precedence over both
-    ``HF_HOME`` and the XDG variable, so a later redirection cannot move it.
-    """
-    try:
-        import huggingface_hub.constants as hub  # noqa: PLC0415 - an embeddings extra
-    except ImportError:
-        return
-    os.environ["HF_HUB_CACHE"] = str(hub.HF_HUB_CACHE)
 
 
 @pytest.fixture(scope="session", autouse=True)

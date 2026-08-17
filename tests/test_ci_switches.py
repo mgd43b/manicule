@@ -41,7 +41,20 @@ from typing import Any, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
-TESTS = REPO_ROOT / "tests"
+
+SUITE_ROOTS = (
+    REPO_ROOT / "tests",
+    REPO_ROOT / "packages",
+    REPO_ROOT / "src" / "manicule" / "testing",
+)
+"""Everywhere a switch can be read from.
+
+Three roots rather than one, and the second two were added by the same change. A backend may
+ship as its own distribution — ``manicule-mlx`` is the first — so a suite governed by
+``REQUIRE_EMBEDDING_MODELS`` now lives under ``packages/``; and the gate it calls was published
+into ``manicule.testing`` so that out-of-tree suite could reach it. Scanning only ``tests/``
+after that move reported the switch as set by CI and read by nobody, which is the failure this
+file exists to catch — pointed at itself."""
 
 SWITCH = re.compile(r"\bREQUIRE_[A-Z0-9_]+\b")
 """What a switch is called. The prefix is the convention and it is deliberately **outside**
@@ -84,16 +97,25 @@ def suite_switches() -> dict[str, set[Path]]:
     """Every ``REQUIRE_*`` the suite reads, mapped to the files that read it.
 
     A switch is a **string literal**, because that is the only form the environment is ever
-    asked for. A bare identifier is excluded when the same file defines it — those are the
-    constants holding a switch name (``REQUIRE_BUNDLE_ENV = "REQUIRE_GRAMMAR_BUNDLE"``), and
-    counting them would report a switch named after a variable that no CI job could ever set.
+    asked for. Two kinds of literal are excluded, and both are names *of* a switch rather than
+    a switch:
+
+    * a constant the same file defines (``REQUIRE_BUNDLE_ENV = "REQUIRE_GRAMMAR_BUNDLE"``), and
+    * a constant the same file **imports or re-exports**. This second exclusion arrived with
+      the MLX split: ``tests/embedding_support.py`` became a re-export shim, so
+      ``REQUIRE_MODELS_ENV`` stopped being assigned there and started appearing as a bare
+      string in ``__all__`` — where the old rule read it as a switch called
+      ``REQUIRE_MODELS_ENV`` that no CI job could ever set, because no such variable exists.
     """
     found: dict[str, set[Path]] = {}
-    for path in sorted(TESTS.rglob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        defined = set(re.findall(r"^([A-Z0-9_]+)\s*(?::[^=]+)?=", source, re.MULTILINE))
-        for name in set(re.findall(r'"(REQUIRE_[A-Z0-9_]+)"', source)) - defined:
-            found.setdefault(name, set()).add(path)
+    for root in SUITE_ROOTS:
+        for path in sorted(root.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            defined = set(re.findall(r"^([A-Z0-9_]+)\s*(?::[^=]+)?=", source, re.MULTILINE))
+            imported = set(re.findall(r"^\s+([A-Z][A-Z0-9_]+),\s*$", source, re.MULTILINE))
+            names = set(re.findall(r'"(REQUIRE_[A-Z0-9_]+)"', source))
+            for name in names - defined - imported:
+                found.setdefault(name, set()).add(path)
     return found
 
 
@@ -134,20 +156,23 @@ def affected_modules(readers: set[Path]) -> set[Path]:
     named = {name for path in readers if path not in modules for name in gates(path)}
     if not named:
         return modules
-    for path in TESTS.rglob("test_*.py"):
-        source = path.read_text(encoding="utf-8")
-        if any(re.search(rf"\b{name}\b", source) for name in named):
-            modules.add(path)
+    for root in SUITE_ROOTS:
+        for path in root.rglob("test_*.py"):
+            source = path.read_text(encoding="utf-8")
+            if any(re.search(rf"\b{name}\b", source) for name in named):
+                modules.add(path)
     return modules
 
 
 def selected_by(command: str, module: Path) -> bool:
     """Whether ``command`` would collect ``module``.
 
-    A ``pytest`` invocation naming no path under ``tests/`` runs everything, which is the
-    ubuntu matrix's whole-suite run. One that names paths runs only what is under them.
+    A ``pytest`` invocation naming no path under ``tests/`` or ``packages/`` runs everything,
+    which is the ubuntu matrix's whole-suite run. One that names paths runs only what is under
+    them. ``packages/`` counts because a suite governed by one of these switches now lives
+    there: the MLX backend ships as its own distribution and tests itself.
     """
-    named = [Path(word) for word in command.split() if word.startswith("tests/")]
+    named = [Path(word) for word in command.split() if word.startswith(("tests/", "packages/"))]
     if not named:
         return True
     relative = module.relative_to(REPO_ROOT)

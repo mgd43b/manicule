@@ -258,7 +258,7 @@ def settings(**overrides: Any) -> Settings:
     """Settings with nothing reaching the network unless a test asks for it."""
     base: dict[str, Any] = {
         "llm": {"provider": "ollama", "model": "qwen2.5:14b"},
-        "embedding": {"provider": "mlx"},
+        "embedding": {"provider": "onnx"},
     }
     base.update(overrides)
     return Settings(**base)

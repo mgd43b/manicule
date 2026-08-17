@@ -11,6 +11,7 @@ resolution-markers = [
 [manifest]
 members = [
     "manicule",
+    "manicule-mlx",
     "manicule-plugin-example",
     "manicule-plugin-hostile",
 ]
@@ -1678,7 +1679,6 @@ connectors = [
 ]
 embeddings = [
     { name = "huggingface-hub" },
-    { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "numpy" },
     { name = "onnxruntime" },
     { name = "tokenizers" },
@@ -1732,6 +1732,7 @@ dev = [
     { name = "coverage" },
     { name = "httpx2" },
     { name = "manicule", extra = ["browser-auth", "connectors", "embeddings", "generation", "ingest", "parsers", "retrieval", "serve", "storage"] },
+    { name = "manicule-mlx" },
     { name = "manicule-plugin-example" },
     { name = "manicule-plugin-hostile" },
     { name = "openpyxl" },
@@ -1756,7 +1757,6 @@ requires-dist = [
     { name = "lancedb", marker = "extra == 'storage'", specifier = ">=0.17" },
     { name = "litellm", marker = "extra == 'generation'", specifier = ">=1.83" },
     { name = "markdown-it-py", marker = "extra == 'parsers'", specifier = ">=3.0" },
-    { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'embeddings'", specifier = ">=0.1.0" },
     { name = "nbformat", marker = "extra == 'parsers'", specifier = ">=5.10" },
     { name = "numpy", marker = "extra == 'embeddings'", specifier = ">=2.0" },
     { name = "onnxruntime", marker = "extra == 'embeddings'", specifier = ">=1.20" },
@@ -1803,6 +1803,7 @@ dev = [
     { name = "manicule", extras = ["retrieval"], editable = "." },
     { name = "manicule", extras = ["serve"], editable = "." },
     { name = "manicule", extras = ["storage"], editable = "." },
+    { name = "manicule-mlx", editable = "packages/manicule-mlx" },
     { name = "manicule-plugin-example", editable = "packages/manicule-plugin-example" },
     { name = "manicule-plugin-hostile", editable = "packages/manicule-plugin-hostile" },
     { name = "openpyxl", specifier = ">=3.1" },
@@ -1813,6 +1814,23 @@ dev = [
     { name = "pytest-split", specifier = ">=0.10" },
     { name = "reportlab", specifier = ">=4.2" },
     { name = "ruff", specifier = ">=0.8" },
+]
+
+[[package]]
+name = "manicule-mlx"
+version = "0.1.0"
+source = { editable = "packages/manicule-mlx" }
+dependencies = [
+    { name = "manicule" },
+    { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "numpy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "manicule", editable = "." },
+    { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.1.0" },
+    { name = "numpy", specifier = ">=2.0" },
 ]
 
 [[package]]

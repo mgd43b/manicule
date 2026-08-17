@@ -169,7 +169,7 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 LABEL org.opencontainers.image.title="manicule" \
       org.opencontainers.image.description="Self-hosted document search and answers, with citations that resolve." \
       org.opencontainers.image.source="https://github.com/mgd43b/manicule" \
-      org.opencontainers.image.licenses="GPL-3.0-or-later"
+      org.opencontainers.image.licenses="MIT"
 
 # A fixed uid, so a bind-mounted host directory has one predictable owner to match. `--system`
 # is not used: this account owns a home directory, because the grammar cache lives in it.

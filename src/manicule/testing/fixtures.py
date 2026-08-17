@@ -76,4 +76,33 @@ def settings() -> Settings:
     return Settings()
 
 
-__all__ = ["manicule_environment", "settings"]
+@pytest.fixture(scope="session", autouse=True)
+def model_cache() -> None:
+    """Pin the Hugging Face cache to this machine's real one, for the whole session.
+
+    :func:`manicule_environment` redirects ``XDG_CACHE_HOME`` at every test, and recent
+    ``huggingface_hub`` resolves its cache through that variable — so a model sitting on disk
+    becomes invisible the moment a test imports the hub lazily, and every embedding suite skips
+    on a machine where the weights are right there. Worse in CI, where the pre-seed step would
+    download several hundred megabytes into a directory nothing later reads, and the job would
+    report green having checked nothing.
+
+    Session-scoped and autouse so it runs while the environment is still the real one. The
+    resolved path is written back to ``HF_HUB_CACHE``, which takes precedence over both
+    ``HF_HOME`` and the XDG variable, so a later redirection cannot move it.
+
+    **Published here rather than kept in manicule's own conftest**, because an embedding backend
+    may ship as its own distribution — ``manicule-mlx`` is the first — and its suite is redirected
+    by exactly the same fixture and hidden from exactly the same weights. Keeping this private
+    reproduced the documented failure the moment the parity tests moved: armed with
+    ``REQUIRE_EMBEDDING_MODELS``, thirteen cases failed reporting weights absent that were
+    sitting in the cache.
+    """
+    try:
+        import huggingface_hub.constants as hub  # noqa: PLC0415 - an embeddings extra
+    except ImportError:
+        return
+    os.environ["HF_HUB_CACHE"] = str(hub.HF_HUB_CACHE)
+
+
+__all__ = ["manicule_environment", "model_cache", "settings"]
