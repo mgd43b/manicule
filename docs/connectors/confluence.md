@@ -390,10 +390,14 @@ requests carrying two. It scales with the configuration instead of with the acco
   twice and its end never. A cursor held longer than `cursor_lifetime_seconds` (default 300)
   is refused **before the request is sent**, so the run fails legibly and is re-run against an
   unadvanced watermark. A `next` link addressing a cursor already followed is refused for the
-  same reason: a loop over a paginated search reads as a very large space.
+  same reason: a loop over a paginated search reads as a very large space. Followed-request
+  fingerprints live in a temporary disk-backed exact-membership ledger with a capped SQLite page
+  cache, so exact long-cycle detection does not grow process memory with the number of pages. A
+  digest collision refuses the request and therefore fails closed.
 
   **The durable pipeline's side is a journal boundary, not downstream backpressure.** When that
-  path is wired, every discovered identity commits before the connector is advanced, and local
+  path is wired, each bounded source response commits atomically before the connector follows its
+  next cursor, and local
   fetch/parse/embed work starts from the journal after enumeration. A slow embedder therefore
   cannot hold a live cursor at all (`ingest.md` §8.3.1); source and journal delays still can,
   which is why the typed expiry guard remains. The explicitly supported nonjournal fallback
@@ -699,6 +703,11 @@ yet reached as deleted: one transient error, and the corpus is soft-deleted
 ([`ingest.md`](../ingest.md) §11.1 carries the pipeline's half of this — clean completion
 only, a deletion ceiling, and soft delete only). The connector's half is to fail loudly, so
 that "everything is gone" and "nothing answered" never look alike.
+
+Reconciliation uses the same response-page hand-off as discovery. The durable inventory commits
+each ids-only source page before another cursor is requested, including an empty page after scope
+filtering. It does not infer a boundary from a local item count, so a configured 250-result page
+cannot be split by the pipeline's unrelated inventory write size.
 
 ## 4. Fetching content
 

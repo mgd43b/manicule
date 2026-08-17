@@ -21,6 +21,7 @@ import pytest
 
 from manicule.connectors import ConnectorError, CursorExpiredError, UntrustedLinkError
 from manicule.connectors.client import ConfluenceClient
+from manicule.connectors.confluence import ConfluenceConnector
 from manicule.connectors.pagination import NextPage, next_page, split_query
 from manicule.testing import closing
 from tests.connectors.fake_confluence import CLOUD_BASE, FakeConfluence, FakePage
@@ -35,6 +36,58 @@ def _instance(count: int = 5) -> FakeConfluence:
         ],
         page_size=2,
     )
+
+
+async def test_discovery_preserves_an_empty_filtered_source_page_boundary() -> None:
+    """A page with no usable rows is still a cursor-lifetime and durability boundary."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/space/ENG"):
+            return httpx.Response(200, json={"key": "ENG"})
+        if request.url.path.endswith("/rest/api/content/search"):
+            if request.url.params.get("cursor") == "page+2":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "id": "usable",
+                                "type": "page",
+                                "title": "Public synthetic page",
+                                "space": {"key": "ENG"},
+                                "version": {
+                                    "number": 1,
+                                    "when": "2026-08-09T14:30:00+00:00",
+                                },
+                                "_links": {"webui": "/spaces/ENG/pages/usable"},
+                            }
+                        ],
+                        "_links": {"base": CLOUD_BASE},
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [{"id": "filtered", "type": "blogpost"}],
+                    "_links": {
+                        "base": CLOUD_BASE,
+                        "next": "/rest/api/content/search?cursor=page%2B2",
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected synthetic request path {request.url.path}")
+
+    config = cloud_config(spaces=["ENG"], include_attachments=False, page_size=250)
+    client = ConfluenceClient(config, transport=httpx.MockTransport(handle), clock=lambda: 0.0)
+    connector = ConfluenceConnector(config, client)
+    await connector.setup()
+    try:
+        batches = [tuple(batch) async for batch in connector.discover_batches(None)]
+    finally:
+        await connector.teardown()
+
+    assert [ids(batch) for batch in batches] == [[], ["usable"]]
+    assert connector.watermark is not None
 
 
 def test_a_cursor_keeps_its_plus_when_a_link_is_split() -> None:

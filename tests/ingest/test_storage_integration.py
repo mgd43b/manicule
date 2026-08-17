@@ -26,6 +26,7 @@ from manicule.app.served import ControlHandler
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpiredError
+from manicule.connectors.confluence import ConfluenceConnector
 from manicule.connectors.sessions import SessionVault
 from manicule.core.acquisition import (
     AcquiredSource,
@@ -76,6 +77,9 @@ from manicule.storage.models import FTS_TOKENIZER
 from manicule.storage.rebuild import SqliteRebuildStore
 from manicule.storage.vectors import LanceVectorStore
 from tests.app.fakes import FakeBackend, FakeIngestion
+from tests.connectors.fake_confluence import FakeConfluence, FakePage
+from tests.connectors.support import Clock as ConfluenceClock
+from tests.connectors.support import client_for, cloud_config
 from tests.fakes import HashEmbedder
 from tests.ingest import fakes
 from tests.ingest.test_shadow_reembed import Authority, Corpus, CountingEmbedder
@@ -1494,6 +1498,122 @@ async def test_bounded_acquire_only_prefix_is_not_reported_as_offline_derivation
     assert lifecycle["outcome"] == "bounded"
     assert lifecycle["can_continue_offline"] is False
     assert await store.count_documents() == 0
+
+
+async def test_real_confluence_pages_admit_10251_records_to_true_end(
+    engine: AsyncEngine,
+) -> None:
+    """The real HTTP/page adapter and SQLite journal cross forty exact 250 boundaries."""
+
+    class EnumerationObservedError(RuntimeError):
+        pass
+
+    clock = ConfluenceClock()
+
+    class MeasuredJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine, max_journal_records=20_000)
+            self.batch_sizes: list[int] = []
+            self.completions = 0
+
+        @override
+        async def append_acquisition_records(
+            self,
+            run_id: str,
+            sequence: int,
+            sources: Sequence[AcquisitionSource],
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> Sequence[AcquisitionRecord]:
+            admitted = await super().append_acquisition_records(
+                run_id,
+                sequence,
+                sources,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+            self.batch_sizes.append(len(sources))
+            clock.advance(0.1)
+            return admitted
+
+        @override
+        async def complete_acquisition_enumeration(
+            self,
+            run_id: str,
+            candidate_watermark: Watermark | None,
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> AcquisitionRun:
+            self.completions += 1
+            return await super().complete_acquisition_enumeration(
+                run_id,
+                candidate_watermark,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+
+    class EnumerationPipeline(IngestPipeline):
+        async def _acquire_journal(self, run: object) -> bool:  # type: ignore[override]
+            del run
+            raise EnumerationObservedError
+
+    total = 10_251
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id=f"synthetic-{number:05d}",
+                title=f"Public synthetic {number}",
+                space="ENG",
+            )
+            for number in range(total)
+        ],
+        page_size=250,
+    )
+    config = cloud_config(
+        base_url=instance.base_url,
+        spaces=["ENG"],
+        include_attachments=False,
+        page_size=250,
+        cursor_lifetime_seconds=0.2,
+    )
+    _, client = client_for(instance, config, clock=clock)
+    connector = ConfluenceConnector(config, client, name="synthetic-large-wiki")
+    store = MeasuredJournal()
+    await store.ensure_workspace()
+    await connector.setup()
+    try:
+        report = await EnumerationPipeline(store=store, acquisitions=store).run(
+            connector, acquire_only=True
+        )
+    finally:
+        await connector.teardown()
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert report.error_type == "EnumerationObservedError"
+    assert durable.discovered_count == total
+    assert durable.enumeration_completed_at is not None
+    connector_watermark = connector.watermark
+    assert connector_watermark is not None
+    assert durable.candidate_watermark is not None
+    assert durable.candidate_watermark.value == connector_watermark.value
+    assert durable.candidate_watermark.metadata == connector_watermark.metadata
+    assert store.completions == 1
+    assert store.batch_sizes == [250] * 41 + [1]
+    assert max(store.batch_sizes) == 250
+    search_requests = [
+        request
+        for request in instance.requests
+        if request.url.path.endswith("/rest/api/content/search")
+    ]
+    assert len(search_requests) == 42
+    assert clock.now == pytest.approx(4.2)
 
 
 async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(  # noqa: PLR0915 - one end-to-end evidence record

@@ -96,13 +96,19 @@ from manicule.core.errors import (
     StorageBusyError,
 )
 from manicule.core.ids import content_hash, document_id
+from manicule.core.protocols import BatchedDiscoveryConnector
 from manicule.core.provenance import Provenance
 from manicule.core.sources import DiscoveredDoc
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError
 from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
-from manicule.ingest.ports import AcquisitionStore, FencedIngestStore, GlossaryWriter
+from manicule.ingest.ports import (
+    AcquisitionStore,
+    BatchedAcquisitionStore,
+    FencedIngestStore,
+    GlossaryWriter,
+)
 from manicule.ingest.refusals import require_measured
 from manicule.ingest.stages import Conveyor, CountedLock, Gauge, StageReport
 from manicule.ingest.workers import AttemptResult, default_worker_count
@@ -1622,8 +1628,35 @@ class IngestPipeline:
             # worker waits for an item that is never coming and the run never returns.
             refs.finish()
 
-    async def _enumerate_to_journal(self, run: _Sync) -> None:
-        """Commit each source record before asking discovery for the next one.
+    @staticmethod
+    async def _durable_discovery_batches(
+        run: _Sync,
+    ) -> AsyncGenerator[Sequence[DiscoveredDoc], None]:
+        """Normalize optional source pages while retaining cancellation-safe stream closure."""
+        connector = run.connector
+        if isinstance(connector, BatchedDiscoveryConnector):
+            source = connector.discover_batches(run.watermark)
+            try:
+                async for batch in source:
+                    yield batch
+            finally:
+                closer = getattr(source, "aclose", None)
+                if closer is not None:
+                    await closer()
+            return
+        source = connector.discover(run.watermark)
+        try:
+            async for discovered in source:
+                yield (discovered,)
+        finally:
+            closer = getattr(source, "aclose", None)
+            if closer is not None:
+                await closer()
+
+    async def _enumerate_to_journal(  # noqa: PLR0912, PLR0915 - every exit guards completion
+        self, run: _Sync
+    ) -> None:
+        """Commit each source response before asking discovery for the next one.
 
         There is intentionally no downstream hand-off in this loop. The connector can be
         delayed only by its own work, journal admission, or lease maintenance; parsing and
@@ -1637,24 +1670,52 @@ class IngestPipeline:
         if run.limit is not None and run.accepted >= run.limit:
             run.report.limited = True
             return
-        stream = run.connector.discover(run.watermark)
+        stream = self._durable_discovery_batches(run)
         try:
-            async for discovered in stream:
+            async for discovered_batch in stream:
                 if run.stop.is_set():
                     break
+                if not discovered_batch:
+                    if run.limit is not None and run.accepted >= run.limit:
+                        run.report.limited = True
+                        break
+                    continue
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now)
-                appended = await acquisitions.append_acquisition_record(
-                    run.acquisition_run_id,
-                    run.accepted,
-                    AcquisitionSource.from_discovered(discovered),
-                    lease_owner=run.lease_owner,
-                    lease_generation=run.lease_generation,
-                    now=now,
+                sources = tuple(
+                    AcquisitionSource.from_discovered(found) for found in discovered_batch
                 )
-                if appended.sequence != run.accepted:
-                    continue
-                run.accepted += 1
+                appended: Sequence[AcquisitionRecord]
+                if isinstance(acquisitions, BatchedAcquisitionStore) and run.limit is None:
+                    appended = await acquisitions.append_acquisition_records(
+                        run.acquisition_run_id,
+                        run.accepted,
+                        sources,
+                        lease_owner=run.lease_owner,
+                        lease_generation=run.lease_generation,
+                        now=now,
+                    )
+                else:
+                    scalar_appended: list[AcquisitionRecord] = []
+                    for source in sources:
+                        if run.limit is not None and run.accepted >= run.limit:
+                            break
+                        record = await acquisitions.append_acquisition_record(
+                            run.acquisition_run_id,
+                            run.accepted,
+                            source,
+                            lease_owner=run.lease_owner,
+                            lease_generation=run.lease_generation,
+                            now=now,
+                        )
+                        scalar_appended.append(record)
+                        if record.sequence == run.accepted:
+                            run.accepted += 1
+                    appended = scalar_appended
+                run.accepted = max(
+                    run.accepted,
+                    max((record.sequence for record in appended), default=run.accepted - 1) + 1,
+                )
                 if run.limit is not None and run.accepted >= run.limit:
                     run.report.limited = True
                     break

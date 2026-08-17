@@ -550,6 +550,22 @@ class AcquisitionStore(Protocol):
 
 
 @runtime_checkable
+class BatchedAcquisitionStore(Protocol):
+    """Optional atomic admission for one bounded source-native discovery response."""
+
+    async def append_acquisition_records(
+        self,
+        run_id: str,
+        sequence: int,
+        sources: Sequence[AcquisitionSource],
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> Sequence[AcquisitionRecord]: ...
+
+
+@runtime_checkable
 class ReconciliationStore(Protocol):
     """Storage-owned proof that a full inventory completed for one immutable scope."""
 
@@ -712,6 +728,7 @@ class GlossaryStore(GlossaryWriter, Protocol):
 
 __all__ = [
     "AcquisitionStore",
+    "BatchedAcquisitionStore",
     "FencedIngestStore",
     "GlossaryStore",
     "GlossaryWriter",

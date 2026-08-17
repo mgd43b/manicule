@@ -204,6 +204,73 @@ async def test_append_is_durable_idempotent_and_run_scoped(store: SqliteDocStore
         )
 
 
+async def test_batch_append_is_atomic_contiguous_and_replay_safe(store: SqliteDocStore) -> None:
+    run = await _claimed_run(store, "batch-run")
+    first_page = tuple(_source(f"page-{number}") for number in range(3))
+
+    first = await store.append_acquisition_records(
+        run.id,
+        0,
+        first_page,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    replay = await store.append_acquisition_records(
+        run.id,
+        3,
+        (first_page[0], _source("page-3"), _source("page-3")),
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+
+    assert [record.sequence for record in first] == [0, 1, 2]
+    assert [record.sequence for record in replay] == [0, 3, 3]
+    persisted = await store.get_acquisition_run(run.id)
+    assert persisted is not None
+    assert persisted.discovered_count == 4
+    assert [
+        record.sequence for record in await store.list_acquisition_records(run.id, limit=10)
+    ] == [0, 1, 2, 3]
+
+
+async def test_batch_conflict_and_capacity_refusal_acknowledge_no_partial_page(
+    engine: AsyncEngine,
+) -> None:
+    limited = SqliteDocStore(engine, max_journal_records=2)
+    await limited.ensure_workspace()
+    run = await _claimed_run(limited, "batch-refusal")
+
+    with pytest.raises(CapacityRefusedError) as refused:
+        await limited.append_acquisition_records(
+            run.id,
+            0,
+            tuple(_source(f"page-{number}") for number in range(3)),
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+    assert refused.value.diagnostic.resource is CapacityResource.JOURNAL_RECORDS
+    assert refused.value.diagnostic.requested == 3
+    persisted = await limited.get_acquisition_run(run.id)
+    assert persisted is not None
+    assert persisted.discovered_count == 0
+    assert await limited.list_acquisition_records(run.id) == []
+
+    conflicting = _source("same", uri="https://example.test/changed")
+    with pytest.raises(AcquisitionConflictError, match="different data"):
+        await limited.append_acquisition_records(
+            run.id,
+            0,
+            (_source("same"), conflicting),
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+    assert await limited.list_acquisition_records(run.id) == []
+
+
 async def test_records_page_forward_by_sequence_without_loading_the_run(
     store: SqliteDocStore,
 ) -> None:

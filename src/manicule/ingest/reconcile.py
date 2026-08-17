@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, overload
 from uuid import uuid4
 
+from manicule.core.protocols import BatchedReconciliationConnector
 from manicule.ingest.ports import ReconciliationStore
 
 if TYPE_CHECKING:
@@ -303,20 +304,28 @@ async def _reconcile_durable(
     if completed is None:
         run_id = uuid4().hex
         await store.begin_reconciliation_inventory(run_id, connector.name, scope)
-        page: list[SourceId] = []
         seen = 0
         try:
-            async for source_id in connector.reconcile():
-                page.append(source_id)
-                if len(page) == _INVENTORY_PAGE_SIZE:
+            if isinstance(connector, BatchedReconciliationConnector):
+                async for source_page in connector.reconcile_batches():
+                    if not source_page:
+                        continue
+                    seen += await store.append_reconciliation_inventory_page(
+                        run_id, connector.name, scope, source_page
+                    )
+            else:
+                page: list[SourceId] = []
+                async for source_id in connector.reconcile():
+                    page.append(source_id)
+                    if len(page) == _INVENTORY_PAGE_SIZE:
+                        seen += await store.append_reconciliation_inventory_page(
+                            run_id, connector.name, scope, page
+                        )
+                        page.clear()
+                if page:
                     seen += await store.append_reconciliation_inventory_page(
                         run_id, connector.name, scope, page
                     )
-                    page.clear()
-            if page:
-                seen += await store.append_reconciliation_inventory_page(
-                    run_id, connector.name, scope, page
-                )
             completed = await store.complete_reconciliation_inventory(
                 run_id, connector.name, scope, now=moment
             )
