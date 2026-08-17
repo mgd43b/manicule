@@ -93,6 +93,7 @@ from manicule.core.errors import (
     ChunkingError,
     ContextOverflowError,
     MiddlewareViolationError,
+    StorageBusyError,
 )
 from manicule.core.ids import content_hash, document_id
 from manicule.core.provenance import Provenance
@@ -541,6 +542,16 @@ class RunReport:
         # refusal in this same run.
         self.glossary_failures.clear()
         self.capacity_refusal = error.diagnostic
+        self.error_type = type(error).__name__
+        self.error_message = str(error)
+        self.error = f"{self.error_type}: {self.error_message}"
+
+    def refuse_storage_busy(self, error: StorageBusyError) -> None:
+        """Make exhausted writer retries an aggregate-only retry-required outcome."""
+        # A worker may have recorded glossary diagnostics before another worker exhausted its
+        # bounded writer retries. Those diagnostics contain document identities and arbitrary
+        # detector details, neither of which belongs in an orderly storage-busy report.
+        self.glossary_failures.clear()
         self.error_type = type(error).__name__
         self.error_message = str(error)
         self.error = f"{self.error_type}: {self.error_message}"
@@ -1189,6 +1200,17 @@ class IngestPipeline:
             await asyncio.shield(stages)
         except asyncio.CancelledError:
             await self._stop_within_grace(run, stages)
+            if run.acquisitions is not None:
+                # The TaskGroup is fully joined first, so no worker can mutate after release.
+                # Cancellation leaves the committed prefix resumable immediately rather than
+                # retaining a logical generation lease until its wall-clock expiry.
+                with contextlib.suppress(Exception):
+                    await run.acquisitions.release_acquisition_lease(
+                        run.acquisition_run_id,
+                        run.lease_owner,
+                        run.lease_generation,
+                        now=self._acquisition_clock(),
+                    )
             raise
         except ExceptionGroup as failures:
             # A stage failed for a reason that is not a document's: the document store went
@@ -1200,15 +1222,21 @@ class IngestPipeline:
             capacity_failures = [
                 failure for failure in leaves if isinstance(failure, CapacityRefusedError)
             ]
+            busy_failures = [failure for failure in leaves if isinstance(failure, StorageBusyError)]
             non_capacity = [
-                failure for failure in leaves if not isinstance(failure, CapacityRefusedError)
+                failure
+                for failure in leaves
+                if not isinstance(failure, (CapacityRefusedError, StorageBusyError))
             ]
             if not non_capacity:
                 # A refusal is an orderly, retryable stop even when several workers observe the
                 # same exhausted resource together.  Releasing the lease here is what makes the
                 # retry immediate rather than delayed until the crash fence expires.
                 crashed = False
-                run.report.refuse_capacity(capacity_failures[0])
+                if capacity_failures:
+                    run.report.refuse_capacity(capacity_failures[0])
+                else:
+                    run.report.refuse_storage_busy(busy_failures[0])
             else:
                 crashed = True
                 first, detail = _failure_detail(non_capacity)
@@ -1289,9 +1317,12 @@ class IngestPipeline:
             )
         except Exception as exc:  # noqa: BLE001 - diagnostics must not hide the run outcome
             if not crashed:
-                run.report.error_type = type(exc).__name__
-                run.report.error_message = str(exc)
-                run.report.error = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, StorageBusyError):
+                    run.report.refuse_storage_busy(exc)
+                else:
+                    run.report.error_type = type(exc).__name__
+                    run.report.error_message = str(exc)
+                    run.report.error = f"{type(exc).__name__}: {exc}"
         if not recorded and not crashed:
             msg = "the acquisition generation changed before diagnostics and release"
             run.report.error_type = AcquisitionLeaseLostError.__name__
@@ -1800,7 +1831,7 @@ class IngestPipeline:
                 reusable = await self._validated_reusable_snapshot(run, record)
                 if reusable is not None:
                     await self._keep_acquisition_lease_live(
-                        run, acquisitions, self._acquisition_clock(), force=True
+                        run, acquisitions, self._acquisition_clock()
                     )
                     await acquisitions.settle_unchanged_acquisition_record(
                         run.acquisition_run_id,
@@ -1848,7 +1879,7 @@ class IngestPipeline:
                 diagnostic = _acquisition_diagnostic(exc)
                 self._note_inventory_failure(run, diagnostic)
                 await self._keep_acquisition_lease_live(
-                    run, acquisitions, self._acquisition_clock(), force=True
+                    run, acquisitions, self._acquisition_clock()
                 )
                 await acquisitions.transition_acquisition_record(
                     run.acquisition_run_id,
@@ -1873,9 +1904,7 @@ class IngestPipeline:
                 _report_progress(run)
                 continue
 
-            await self._keep_acquisition_lease_live(
-                run, acquisitions, self._acquisition_clock(), force=True
-            )
+            await self._keep_acquisition_lease_live(run, acquisitions, self._acquisition_clock())
             await acquisitions.transition_acquisition_record(
                 run.acquisition_run_id,
                 record.source.source_id,
@@ -1956,9 +1985,7 @@ class IngestPipeline:
         reusable = await self._validated_superseded_reuse(run, record)
         if reusable is None or reusable.acquired_source is None:
             return False
-        await self._keep_acquisition_lease_live(
-            run, acquisitions, self._acquisition_clock(), force=True
-        )
+        await self._keep_acquisition_lease_live(run, acquisitions, self._acquisition_clock())
         await acquisitions.transition_acquisition_record(
             run.acquisition_run_id,
             record.source.source_id,

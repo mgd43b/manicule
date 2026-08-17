@@ -21,6 +21,7 @@ from manicule.cli import main as cli
 from manicule.cli import proxy
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors.sessions import SessionVault
+from manicule.core.errors import StorageBusyError
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.pipeline import RunReport
 from manicule.mcp.server import build_server
@@ -71,6 +72,21 @@ def _capacity_incomplete() -> RunReport:
             )
         )
     )
+    return report
+
+
+def _storage_busy_incomplete() -> RunReport:
+    report = RunReport(
+        connector="synthetic-wiki",
+        discovered=2,
+        by_status={"indexed": 1},
+        enumeration_completed=False,
+        glossary_failures=[
+            "private-document-id from private-source-id: glossary detection failed for "
+            "https://private.invalid/source?token=fake-secret-cinder"
+        ],
+    )
+    report.refuse_storage_busy(StorageBusyError())
     return report
 
 
@@ -280,6 +296,57 @@ async def test_capacity_refusal_is_typed_retryable_and_aggregate_only() -> None:
         "token=",
     ):
         assert private not in persisted.lower()
+
+
+async def test_storage_busy_report_and_control_envelope_are_aggregate_only(
+    tmp_path: Path,
+) -> None:
+    report = _storage_busy_incomplete()
+    assert report.glossary_failures == []
+    assert report.error_type == "StorageBusyError"
+    assert report.discovered == 2
+    assert report.indexed == 1
+
+    service, _ = _service(report)
+    path = control.socket_path(tmp_path)
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+    await server.start()
+    try:
+        envelope = await control.connect(
+            path,
+            control.Invoke(
+                op="connector_sync", arguments={"name": "synthetic-wiki", "limit": None}
+            ),
+            on_progress=lambda _: None,
+        )
+    finally:
+        await server.aclose()
+
+    assert envelope["ok"] is False
+    error = cast("dict[str, Any]", envelope["error"])
+    assert error["type"] == "StorageBusyError"
+    assert error["hint"] == ("Run the same ingest operation again; its watermark was not advanced.")
+    data = cast("dict[str, Any]", envelope["data"])
+    assert data["discovered"] == 2
+    assert data["ingested"] == 1
+    assert data["retry_required"] is True
+
+    rendered = json.dumps(
+        {"report": report.as_metadata(), "envelope": envelope}, sort_keys=True
+    ).lower()
+    for private in (
+        "document_id",
+        "source_id",
+        "private-document-id",
+        "private-source-id",
+        "private.invalid",
+        "uri",
+        "title",
+        "body",
+        "secret",
+        "token=",
+    ):
+        assert private not in rendered
 
 
 async def test_watch_batch_preserves_a_child_capacity_refusal(tmp_path: Path) -> None:

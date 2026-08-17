@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -29,7 +30,7 @@ from manicule.core.acquisition import (
     SnapshotPromotionPolicy,
 )
 from manicule.core.content import Metadata, RawDocument
-from manicule.core.errors import UnknownEntityError
+from manicule.core.errors import StorageBusyError, UnknownEntityError
 from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityRefusedError, CapacityResource
@@ -601,15 +602,9 @@ async def test_concurrent_idempotent_writers_recheck_before_the_disk_floor(
     first = SqliteDocStore(engine, min_disk_headroom_bytes=8)
     second = SqliteDocStore(engine, min_disk_headroom_bytes=8)
     await first.ensure_workspace()
-    original_guard = SqliteDocStore._begin_capacity_guard  # pyright: ignore[reportPrivateUsage]
 
     async def race_once(*operations: Awaitable[object]) -> list[object]:
-        barrier = asyncio.Barrier(2)
         disk_checks = 0
-
-        async def gated_guard(session: AsyncSession) -> None:
-            await barrier.wait()
-            await original_guard(session)
 
         def falling_headroom(path: object) -> SimpleNamespace:
             nonlocal disk_checks
@@ -621,7 +616,6 @@ async def test_concurrent_idempotent_writers_recheck_before_the_disk_floor(
                 free=500 if disk_checks == 1 else 1,
             )
 
-        monkeypatch.setattr(SqliteDocStore, "_begin_capacity_guard", staticmethod(gated_guard))
         monkeypatch.setattr("manicule.storage.acquisition.shutil.disk_usage", falling_headroom)
         outcomes = await asyncio.gather(*operations)
         assert disk_checks == 1, "the idempotent loser performed a growth-only floor check"
@@ -2653,6 +2647,276 @@ async def test_concurrent_blob_reservations_preserve_backlog_and_publications(
     resumed = await recovered.get_acquisition_run(lease.id)
     assert resumed is not None
     assert resumed.acquired_blob_bytes == 10, "settled bytes no longer consume backlog capacity"
+
+
+async def test_eight_reuse_workers_serialize_before_read_and_keep_exact_deduped_counters(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All workers reach writer admission together; none performs a deferred lock upgrade."""
+    store = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=100)
+    peer = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=100)
+    await store.ensure_workspace()
+    blob = await BlobStore(engine, data_dir, min_disk_headroom_bytes=1).put(b"same", "text/plain")
+    assert isinstance(blob, StoredBlob)
+    lease = await _claimed_run(store)
+    for sequence in range(8):
+        source_id = f"page-{sequence}"
+        await store.append_acquisition_record(
+            lease.id,
+            sequence,
+            _source(source_id),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+        await store.transition_acquisition_record(
+            lease.id,
+            source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+
+    original = store._begin_capacity_guard  # pyright: ignore[reportPrivateUsage]
+    arrived = 0
+    first_inside = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def simultaneous_admission(session: AsyncSession) -> None:
+        nonlocal arrived
+        arrived += 1
+        if arrived == 1:
+            first_inside.set()
+            await release_first.wait()
+        await original(session)
+
+    monkeypatch.setattr(store, "_begin_capacity_guard", simultaneous_admission)
+    monkeypatch.setattr(peer, "_begin_capacity_guard", simultaneous_admission)
+    tasks = [
+        asyncio.create_task(
+            (store if sequence % 2 == 0 else peer).transition_acquisition_record(
+                lease.id,
+                f"page-{sequence}",
+                AcquisitionRecordState.ACQUIRING,
+                AcquisitionRecordState.ACQUIRED,
+                lease_owner="worker",
+                lease_generation=lease.lease_generation,
+                now=_NOW,
+                blob_ref=blob.hash,
+                acquired_source=_acquired(b"same", f"page-{sequence}"),
+                snapshot_outcome=SnapshotItemOutcome.REUSED,
+            )
+        )
+        for sequence in range(8)
+    ]
+    await first_inside.wait()
+    await asyncio.sleep(0)
+    assert arrived == 1, "seven managed writers are queued before opening transactions"
+    release_first.set()
+    outcomes = await asyncio.gather(*tasks)
+
+    assert len(outcomes) == 8
+    run = await store.get_acquisition_run(lease.id)
+    assert run is not None
+    assert (run.acquired_count, run.reused_count, run.retry_count) == (8, 8, 0)
+    assert run.acquired_blob_bytes == blob.stored_bytes
+    async with store.sessions() as session:
+        total = (
+            await session.execute(
+                text("SELECT acquired_blob_bytes FROM acquisition_backlog_capacity WHERE id = 1")
+            )
+        ).scalar_one()
+        references = (
+            await session.execute(
+                text("SELECT reference_count FROM acquisition_blob_backlog WHERE blob_ref = :ref"),
+                {"ref": blob.hash},
+            )
+        ).scalar_one()
+    assert total == blob.stored_bytes
+    assert references == 8
+
+
+async def test_canceled_writer_waiter_is_removed_without_leaking_admission(
+    store: SqliteDocStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = await _claimed_run(store)
+    for sequence in range(3):
+        await store.append_acquisition_record(
+            lease.id,
+            sequence,
+            _source(f"page-{sequence}"),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+    original = store._begin_capacity_guard  # pyright: ignore[reportPrivateUsage]
+    first_inside = asyncio.Event()
+    release_first = asyncio.Event()
+    arrived = 0
+
+    async def gated_admission(session: AsyncSession) -> None:
+        nonlocal arrived
+        arrived += 1
+        if arrived == 1:
+            first_inside.set()
+            await release_first.wait()
+        await original(session)
+
+    monkeypatch.setattr(store, "_begin_capacity_guard", gated_admission)
+
+    async def transition(sequence: int) -> None:
+        await store.transition_acquisition_record(
+            lease.id,
+            f"page-{sequence}",
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+
+    owner = asyncio.create_task(transition(0))
+    await first_inside.wait()
+    canceled_waiter = asyncio.create_task(transition(1))
+    successor = asyncio.create_task(transition(2))
+    await asyncio.sleep(0)
+    canceled_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await canceled_waiter
+    release_first.set()
+    await asyncio.gather(owner, successor)
+
+    assert arrived == 2
+    async with store.sessions.begin() as session:
+        await session.execute(text("BEGIN IMMEDIATE"))
+
+
+async def test_busy_writer_retry_closes_each_attempt_and_returns_a_safe_typed_exhaustion(
+    store: SqliteDocStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = await _claimed_run(store)
+    for sequence in range(2):
+        await store.append_acquisition_record(
+            lease.id,
+            sequence,
+            _source(f"page-{sequence}"),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+    original = store._begin_capacity_guard  # pyright: ignore[reportPrivateUsage]
+    attempts = 0
+
+    async def twice_busy(session: AsyncSession) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = sqlite3.OperationalError("private SQL and path must not survive")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+        await original(session)
+
+    monkeypatch.setattr(store, "_begin_capacity_guard", twice_busy)
+    acquired = await store.transition_acquisition_record(
+        lease.id,
+        "page-0",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    assert acquired.state is AcquisitionRecordState.ACQUIRING
+    assert attempts == 3
+
+    async def always_busy(_session: AsyncSession) -> None:
+        error = sqlite3.OperationalError("SELECT private FROM /machine/path")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise error
+
+    monkeypatch.setattr(store, "_begin_capacity_guard", always_busy)
+    with pytest.raises(StorageBusyError) as exhausted:
+        await store.transition_acquisition_record(
+            lease.id,
+            "page-1",
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+    assert "SELECT" not in str(exhausted.value)
+    monkeypatch.setattr(store, "_begin_capacity_guard", original)
+    async with store.sessions.begin() as session:
+        await session.execute(text("BEGIN IMMEDIATE"))
+
+
+@pytest.mark.parametrize("release_path", ["direct", "terminal_metadata"])
+async def test_busy_release_generation_is_immediately_reclaimable_after_writer_recovers(
+    store: SqliteDocStore,
+    monkeypatch: pytest.MonkeyPatch,
+    release_path: str,
+) -> None:
+    lease = await _claimed_run(store)
+    original = store._begin_capacity_guard  # pyright: ignore[reportPrivateUsage]
+
+    async def always_busy(_session: AsyncSession) -> None:
+        error = sqlite3.OperationalError("UPDATE private lease at /machine/path")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise error
+
+    monkeypatch.setattr(store, "_begin_capacity_guard", always_busy)
+    release = (
+        store.release_acquisition_lease(
+            run_id=lease.id,
+            owner="worker",
+            generation=lease.lease_generation,
+            now=_NOW,
+        )
+        if release_path == "direct"
+        else store.record_acquisition_run_metadata(
+            run_id=lease.id,
+            owner="worker",
+            generation=lease.lease_generation,
+            now=_NOW,
+            updates={"outcome": "incomplete"},
+            release=True,
+        )
+    )
+    with pytest.raises(StorageBusyError):
+        await release
+
+    monkeypatch.setattr(store, "_begin_capacity_guard", original)
+    successor_store = SqliteDocStore(store.engine)
+    successor = await successor_store.claim_acquisition_run(
+        lease.id,
+        "successor",
+        now=_NOW,
+        expires_at=_NOW + timedelta(minutes=1),
+    )
+
+    assert successor is not None
+    assert successor.lease_owner == "successor"
+    assert successor.lease_generation == lease.lease_generation + 1
+    writer_state = acquisition_storage._engine_writer_state(  # pyright: ignore[reportPrivateUsage]
+        successor_store
+    )
+    assert all(key[1] != lease.id for key in writer_state.abandoned_leases)
+    assert (
+        await store.claim_acquisition_run(
+            lease.id,
+            "unfenced-third-owner",
+            now=_NOW,
+            expires_at=_NOW + timedelta(minutes=1),
+        )
+        is None
+    )
 
 
 async def test_shared_blob_is_charged_once_and_remains_pinned_until_every_record_settles(

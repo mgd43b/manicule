@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import resource
+import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast, override
@@ -19,10 +20,13 @@ from typing import TYPE_CHECKING, cast, override
 import pytest
 from sqlalchemy import text
 
+from manicule.app import control
 from manicule.app.dispatch import run_op
+from manicule.app.served import ControlHandler
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpiredError
+from manicule.connectors.sessions import SessionVault
 from manicule.core.acquisition import (
     AcquiredSource,
     AcquisitionDiagnostic,
@@ -31,6 +35,7 @@ from manicule.core.acquisition import (
     AcquisitionInventoryState,
     AcquisitionRecord,
     AcquisitionRecordState,
+    AcquisitionRun,
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
@@ -54,7 +59,7 @@ from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.middleware import MiddlewareRunner
-from manicule.ingest.pipeline import IngestPipeline
+from manicule.ingest.pipeline import IngestPipeline, RunReport, Watching
 from manicule.ingest.rebuild import build_offline_rebuilder
 from manicule.ingest.recovery import requeue_interrupted
 from manicule.ingest.reembed import ReembedState, resume_reembed, start_reembed
@@ -70,7 +75,7 @@ from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.models import FTS_TOKENIZER
 from manicule.storage.rebuild import SqliteRebuildStore
 from manicule.storage.vectors import LanceVectorStore
-from tests.app.fakes import FakeBackend
+from tests.app.fakes import FakeBackend, FakeIngestion
 from tests.fakes import HashEmbedder
 from tests.ingest import fakes
 from tests.ingest.test_shadow_reembed import Authority, Corpus, CountingEmbedder
@@ -1063,6 +1068,129 @@ async def test_capacity_only_exception_group_releases_lease_for_immediate_retry(
     pipeline.refusing = False
     resumed = await pipeline.run(connector)
     assert resumed.error == ""
+
+
+async def test_busy_terminal_release_is_fenced_for_immediate_pipeline_retry(
+    engine: AsyncEngine,
+    data_dir: Path,
+    tmp_path: Path,
+) -> None:
+    class BusyTerminalStore(SqliteDocStore):
+        fail_terminal = True
+        terminal_call = False
+
+        @override
+        async def _begin_capacity_guard(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, session: AsyncSession
+        ) -> None:
+            if self.terminal_call:
+                error = sqlite3.OperationalError("UPDATE private terminal metadata")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
+            await super()._begin_capacity_guard(session)
+
+        @override
+        async def record_acquisition_run_metadata(
+            self,
+            run_id: str,
+            owner: str,
+            generation: int,
+            *,
+            now: datetime,
+            updates: Mapping[str, Any],
+            release: bool,
+        ) -> bool:
+            self.terminal_call = self.fail_terminal and release
+            try:
+                return await super().record_acquisition_run_metadata(
+                    run_id,
+                    owner,
+                    generation,
+                    now=now,
+                    updates=updates,
+                    release=release,
+                )
+            finally:
+                if self.terminal_call:
+                    self.fail_terminal = False
+                self.terminal_call = False
+
+    store = BusyTerminalStore(engine)
+    await store.ensure_workspace()
+
+    class RetryPipeline(IngestPipeline):
+        seed_private_glossary = True
+
+        @override
+        async def _drive(self, run: Any) -> None:
+            if self.seed_private_glossary:
+                run.report.glossary_failures.append(
+                    "private-document-id from private-source-id: glossary detection failed for "
+                    "https://private.invalid/source?token=fake-secret-cinder"
+                )
+                return
+            await super()._drive(run)
+
+    chunker = fakes.BlockChunker()
+    pipeline = RetryPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir, min_disk_headroom_bytes=1),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner([]),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+    connector = fakes.DictConnector({"public-retry": "public body"})
+
+    first = await pipeline.run(connector)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert first.error_type == "StorageBusyError"
+    assert first.glossary_failures == []
+    assert durable is not None
+    assert durable.lease_owner is not None, "the injected external writer prevented persistence"
+
+    backend = FakeBackend()
+    backend.ingestion_.report = first
+    backend.settings.connectors[connector.name] = ConnectorSettings.model_validate(
+        {"type": "filesystem", "options": {"root": "."}}
+    )
+    service = ApplicationService(backend)
+    path = control.socket_path(tmp_path)
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+    await server.start()
+    try:
+        envelope = await control.connect(
+            path,
+            control.Invoke(op="connector_sync", arguments={"name": connector.name, "limit": None}),
+            on_progress=lambda _: None,
+        )
+    finally:
+        await server.aclose()
+
+    assert envelope["ok"] is False
+    assert cast("dict[str, Any]", envelope["error"])["type"] == "StorageBusyError"
+    assert cast("dict[str, Any]", envelope["data"])["retry_required"] is True
+    public = json.dumps(
+        {"report": first.as_metadata(), "envelope": envelope}, sort_keys=True
+    ).lower()
+    for private in (
+        "private-document-id",
+        "private-source-id",
+        "private.invalid",
+        "fake-secret-cinder",
+        "token=",
+    ):
+        assert private not in public
+
+    pipeline.seed_private_glossary = False
+    resumed = await pipeline.run(connector)
+    assert resumed.error == ""
     assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
@@ -1773,9 +1901,11 @@ async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
     assert await store.get_watermark(connector.name) is None
 
 
+@pytest.mark.parametrize("release_busy", [False, True])
 async def test_crash_after_enumeration_preserves_the_marker_records_and_candidate(
     engine: AsyncEngine,
     data_dir: Path,
+    release_busy: bool,
 ) -> None:
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
 
@@ -1784,6 +1914,32 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
             super().__init__(engine)
             self.reader_arrived = asyncio.Event()
             self.release_reader = asyncio.Event()
+            self.releasing = False
+
+        @override
+        async def _begin_capacity_guard(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, session: AsyncSession
+        ) -> None:
+            if self.releasing:
+                error = sqlite3.OperationalError("UPDATE private cancellation cleanup")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
+            await super()._begin_capacity_guard(session)
+
+        @override
+        async def release_acquisition_lease(
+            self,
+            run_id: str,
+            owner: str,
+            generation: int,
+            *,
+            now: datetime,
+        ) -> bool:
+            self.releasing = release_busy
+            try:
+                return await super().release_acquisition_lease(run_id, owner, generation, now=now)
+            finally:
+                self.releasing = False
 
         @override
         async def list_acquisition_records(
@@ -1845,6 +2001,7 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     assert durable.discovered_count == 10
     assert durable.enumeration_completed_at is not None
     assert durable.candidate_watermark == connector.watermark
+    assert (durable.lease_owner is not None) is release_busy
     records = await store.list_acquisition_records(durable.id)
     assert len(records) == 10
     assert {record.state for record in records} == {AcquisitionRecordState.DISCOVERED}
@@ -1852,11 +2009,6 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     assert await store.get_watermark(connector.name) is None
 
     pages_before_resume = connector.pages_requested
-    with pytest.raises(RuntimeError, match="could not be claimed"):
-        await pipeline().run(connector)
-    assert connector.pages_requested == pages_before_resume
-
-    lease_clock.advance(301)
     resumed = await pipeline().run(connector)
 
     assert connector.pages_requested == pages_before_resume, "the source was rediscovered"
@@ -3348,6 +3500,223 @@ async def test_source_deleted_reenumerates_and_reuses_the_retained_prefix(
     assert fenced.superseded_at is not None
     assert fenced.lease_owner is None
     assert fenced.lease_generation > stale_generation
+
+
+@pytest.mark.parametrize(
+    ("documents", "remove_missing_identity", "poll_status"),
+    [
+        pytest.param(8_001, True, True, id="eight-thousand-reuses-with-polling"),
+        pytest.param(8_001, False, False, id="eight-thousand-still-missing-without-polling"),
+    ],
+)
+async def test_served_source_deletion_recovery_reuses_exact_evidence_and_keeps_server_healthy(  # noqa: PLR0915, PLR0917 - end-to-end acceptance matrix
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    documents: int,
+    remove_missing_identity: bool,
+    poll_status: bool,
+) -> None:
+    """The large recovery and its next connector cross the real control socket."""
+
+    class RecoveringConnector(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    f"synthetic-{index:05d}": "public shared retained body"
+                    for index in range(documents)
+                },
+                name=f"served-recovery-{documents}",
+            )
+            self.missing = f"synthetic-{documents - 1:05d}"
+            self.discovery_pass = 0
+            self.attempts: list[str] = []
+            self._watermark = Watermark(
+                value=f"served-candidate-{documents}",
+                observed_at=datetime(2026, 8, 17, tzinfo=UTC),
+            )
+
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return self._watermark
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.discovery_pass += 1
+            async for discovered in super().discover(watermark):
+                yield discovered
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            self.attempts.append(ref.source_id)
+            if ref.source_id == self.missing:
+                raise NotFoundError("synthetic source item is no longer available")
+            if self.discovery_pass > 1:
+                raise AssertionError("exact retained survivors must not be fetched again")
+            return await super().fetch(ref)
+
+    connector = RecoveringConnector()
+    next_connector = fakes.DictConnector(
+        {"public-next": "public next body"}, name=f"served-next-{documents}"
+    )
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir, min_disk_headroom_bytes=1),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            fetch_concurrency=8,
+            acquisition_lease_s=1_800,
+            detect_glossary=False,
+        )
+
+    first = await pipeline().run(connector, acquire_only=True)
+    predecessor = await store.latest_unsettled_acquisition_run(connector.name)
+    assert predecessor is not None
+    assert predecessor.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
+    assert first.snapshot_omission_reasons == {"source_deleted": 1}
+    if remove_missing_identity:
+        del connector.documents[connector.missing]
+
+    reuse_arrived = asyncio.Event()
+    release_reuse = asyncio.Event()
+    gate_reuse = True
+    original_transition = store.transition_acquisition_record
+
+    async def gated_transition(
+        run_id: str,
+        source_id: str,
+        expected: AcquisitionRecordState,
+        target: AcquisitionRecordState,
+        **kwargs: Any,
+    ) -> AcquisitionRecord:
+        nonlocal gate_reuse
+        if (
+            gate_reuse
+            and expected is AcquisitionRecordState.ACQUIRING
+            and target is AcquisitionRecordState.ACQUIRED
+            and kwargs.get("snapshot_outcome") is SnapshotItemOutcome.REUSED
+        ):
+            reuse_arrived.set()
+            await release_reuse.wait()
+        return await original_transition(run_id, source_id, expected, target, **kwargs)
+
+    monkeypatch.setattr(store, "transition_acquisition_record", gated_transition)
+    recovery_connector = connector
+
+    class PipelineIngestion(FakeIngestion):
+        @override
+        async def sync(
+            self,
+            connector: str,
+            *,
+            limit: int | None = None,
+            watching: Watching | None = None,
+            acquire_only: bool = False,
+        ) -> RunReport:
+            del watching
+            selected = (
+                recovery_connector if connector == recovery_connector.name else next_connector
+            )
+            return await pipeline().run(selected, limit=limit, acquire_only=acquire_only)
+
+        @override
+        async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
+            active = await store.latest_unsettled_acquisition_run(connector)
+            return None if active is None else (active, False)
+
+    backend = FakeBackend()
+    backend.store = cast("Any", store)
+    backend.ingestion_ = PipelineIngestion()
+    for name in (connector.name, next_connector.name):
+        backend.settings.connectors[name] = ConnectorSettings.model_validate(
+            {"type": "filesystem", "options": {"root": "."}}
+        )
+    service = ApplicationService(backend)
+    path = control.socket_path(tmp_path)
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+    await server.start()
+    try:
+        recovery = asyncio.create_task(
+            control.connect(
+                path,
+                control.Invoke(
+                    op="connector_sync",
+                    arguments={"name": connector.name, "limit": None, "acquire_only": True},
+                ),
+                on_progress=lambda _: None,
+            )
+        )
+        await asyncio.wait_for(reuse_arrived.wait(), timeout=120)
+        if poll_status:
+            snapshot_envelope, listing_envelope = await asyncio.gather(
+                control.connect(
+                    path,
+                    control.Invoke(op="snapshot_status", arguments={"name": connector.name}),
+                    on_progress=lambda _: None,
+                ),
+                control.connect(
+                    path,
+                    control.Invoke(op="connector_list"),
+                    on_progress=lambda _: None,
+                ),
+            )
+            assert snapshot_envelope["ok"] is True
+            snapshot_data = cast("dict[str, Any]", snapshot_envelope["data"])
+            lifecycle = cast("dict[str, Any]", snapshot_data["lifecycle"])
+            assert cast("int", lifecycle["reused_items"]) < documents
+            assert listing_envelope["ok"] is True
+            listing_data = cast("dict[str, Any]", listing_envelope["data"])
+            connectors = cast("list[dict[str, Any]]", listing_data["connectors"])
+            assert {summary["name"] for summary in connectors} == {
+                connector.name,
+                next_connector.name,
+            }
+        gate_reuse = False
+        release_reuse.set()
+        envelope = await asyncio.wait_for(recovery, timeout=180)
+
+        replacement = await store.latest_unsettled_acquisition_run(connector.name)
+        assert replacement is not None
+        survivors = documents - 1
+        assert replacement.reused_count == survivors
+        assert connector.attempts.count(connector.missing) == (2 - int(remove_missing_identity))
+        assert len(connector.attempts) == documents + int(not remove_missing_identity)
+        if remove_missing_identity:
+            assert envelope["ok"] is True
+            assert replacement.inventory_state is AcquisitionInventoryState.RECONCILED
+            assert replacement.reconciled_deleted_count == 1
+            assert replacement.promoted_at is not None
+            assert replacement.watermark_committed_at is not None
+        else:
+            assert envelope["ok"] is False
+            assert replacement.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
+            assert replacement.promoted_at is None
+            assert replacement.watermark_committed_at is None
+
+        following = await control.connect(
+            path,
+            control.Invoke(
+                op="connector_sync",
+                arguments={"name": next_connector.name, "limit": None, "acquire_only": True},
+            ),
+            on_progress=lambda _: None,
+        )
+        assert following["ok"] is True
+    finally:
+        release_reuse.set()
+        await server.aclose()
 
 
 @pytest.mark.parametrize(

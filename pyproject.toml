@@ -73,7 +73,7 @@ ingest = [         # #5
 parsers = [
   # Every one of these is permissively licensed; docs/parsing.md §12 records the rejections
   # (PyMuPDF, extract-msg) and why a copyleft dependency is refused at selection time.
-  "pypdfium2>=4.30",
+  "pypdfium2>=5.13.0",
   "tree-sitter>=0.23",
   "tree-sitter-language-pack>=0.7",
   "selectolax>=0.3.21",
@@ -206,7 +206,7 @@ dev = [
   # balance and cannot cost coverage. It has no configuration file of its own — every option is
   # a flag, and the ones CI passes are in `.github/workflows/ci.yml`.
   "pytest-split>=0.10",
-  "ruff>=0.8",
+  "ruff>=0.16.3",
   "pyright>=1.1.390",
   # Fixture generation (docs/parsing.md §3.5): fixtures are built by a checked-in script
   # wherever generation is possible, so their structure is reviewable as code rather than as

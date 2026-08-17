@@ -219,6 +219,9 @@ Connector syncs additionally report `data.outcome` as `complete`, `bounded`, or 
 An incomplete sync exits non-zero and keeps its partial counters in `data`; a requested
 `--limit` is `bounded`, exits zero, and never advances the watermark. A document-level failure
 that left a durable repairable row does not by itself make the source enumeration incomplete.
+If an external SQLite writer remains present beyond the bounded retry policy, the failure type is
+`StorageBusyError`; retrying resumes the committed acquisition prefix without advancing the
+watermark or exposing SQL and local paths in the envelope.
 
 **The HTTP API** is twelve route groups over the same service — health, documents, chat with SSE
 streaming, conversations and shareable links, collections, tags, admin, plugins, auth, a
