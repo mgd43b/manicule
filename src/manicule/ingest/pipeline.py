@@ -1670,6 +1670,7 @@ class IngestPipeline:
         if run.limit is not None and run.accepted >= run.limit:
             run.report.limited = True
             return
+        native_pages = isinstance(run.connector, BatchedDiscoveryConnector)
         stream = self._durable_discovery_batches(run)
         try:
             while not run.stop.is_set():
@@ -1694,7 +1695,11 @@ class IngestPipeline:
                     AcquisitionSource.from_discovered(found) for found in discovered_batch
                 )
                 appended: Sequence[AcquisitionRecord]
-                if isinstance(acquisitions, BatchedAcquisitionStore) and run.limit is None:
+                if (
+                    native_pages
+                    and isinstance(acquisitions, BatchedAcquisitionStore)
+                    and run.limit is None
+                ):
                     appended = await acquisitions.append_acquisition_records(
                         run.acquisition_run_id,
                         run.accepted,

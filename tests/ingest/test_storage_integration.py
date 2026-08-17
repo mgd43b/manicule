@@ -1514,7 +1514,29 @@ async def test_real_confluence_pages_admit_10251_records_to_true_end(
         def __init__(self) -> None:
             super().__init__(engine, max_journal_records=20_000)
             self.batch_sizes: list[int] = []
+            self.scalar_appends = 0
             self.completions = 0
+
+        @override
+        async def append_acquisition_record(
+            self,
+            run_id: str,
+            sequence: int,
+            source: AcquisitionSource,
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> AcquisitionRecord:
+            self.scalar_appends += 1
+            return await super().append_acquisition_record(
+                run_id,
+                sequence,
+                source,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
 
         @override
         async def append_acquisition_records(
@@ -1605,6 +1627,7 @@ async def test_real_confluence_pages_admit_10251_records_to_true_end(
     assert durable.candidate_watermark.value == connector_watermark.value
     assert durable.candidate_watermark.metadata == connector_watermark.metadata
     assert store.completions == 1
+    assert store.scalar_appends == 0, "native Confluence pages must use atomic batch admission"
     assert store.batch_sizes == [250] * 41 + [1]
     assert max(store.batch_sizes) == 250
     search_requests = [
@@ -1614,6 +1637,79 @@ async def test_real_confluence_pages_admit_10251_records_to_true_end(
     ]
     assert len(search_requests) == 42
     assert clock.now == pytest.approx(4.2)
+
+
+async def test_nonbatched_connector_uses_the_dedicated_scalar_admission(
+    engine: AsyncEngine,
+) -> None:
+    """A singleton compatibility wrapper is not a native source-page capability."""
+
+    class EnumerationObservedError(RuntimeError):
+        pass
+
+    class DispatchJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.scalar_appends = 0
+            self.batch_appends = 0
+
+        @override
+        async def append_acquisition_record(
+            self,
+            run_id: str,
+            sequence: int,
+            source: AcquisitionSource,
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> AcquisitionRecord:
+            self.scalar_appends += 1
+            return await super().append_acquisition_record(
+                run_id,
+                sequence,
+                source,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+
+        @override
+        async def append_acquisition_records(
+            self,
+            run_id: str,
+            sequence: int,
+            sources: Sequence[AcquisitionSource],
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> Sequence[AcquisitionRecord]:
+            self.batch_appends += 1
+            return await super().append_acquisition_records(
+                run_id,
+                sequence,
+                sources,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+
+    class EnumerationPipeline(IngestPipeline):
+        async def _acquire_journal(self, run: object) -> bool:  # type: ignore[override]
+            del run
+            raise EnumerationObservedError
+
+    journal = DispatchJournal()
+    await journal.ensure_workspace()
+    report = await EnumerationPipeline(store=journal, acquisitions=journal).run(
+        fakes.DictConnector({"one": "public one", "two": "public two"}),
+        acquire_only=True,
+    )
+
+    assert report.error_type == "EnumerationObservedError"
+    assert journal.scalar_appends == 2
+    assert journal.batch_appends == 0
 
 
 async def test_cancellation_after_page_commit_does_not_request_the_next_cursor(
