@@ -266,6 +266,7 @@ BINDERS: Mapping[str, Binder] = {
     "config_set": lambda service, args, report: service.config_set(
         args.text("key"), args.text("value")
     ),
+    "connector_list": lambda service, args, report: service.connector_list(),
     "connector_sidecar": lambda service, args, report: service.connector_sidecar(
         args.optional_path("root"), source=args.text("source"), force=args.flag("force")
     ),
@@ -328,6 +329,7 @@ BINDERS: Mapping[str, Binder] = {
     "restore": lambda service, args, report: service.restore(
         args.path("source"), force=args.flag("force")
     ),
+    "snapshot_status": lambda service, args, report: service.snapshot_status(args.text("name")),
     "upgrade": lambda service, args, report: service.upgrade(
         version=args.optional_text("version"), skip_backup=args.flag("skip_backup")
     ),

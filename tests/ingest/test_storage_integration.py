@@ -3478,7 +3478,7 @@ async def test_source_deleted_reenumerates_and_reuses_the_retained_prefix(
     ("documents", "remove_missing_identity", "poll_status"),
     [
         pytest.param(8_001, True, True, id="eight-thousand-reuses-with-polling"),
-        pytest.param(65, False, False, id="still-missing-without-polling"),
+        pytest.param(8_001, False, False, id="eight-thousand-still-missing-without-polling"),
     ],
 )
 async def test_served_source_deletion_recovery_reuses_exact_evidence_and_keeps_server_healthy(  # noqa: PLR0915, PLR0917 - end-to-end acceptance matrix
@@ -3632,11 +3632,26 @@ async def test_served_source_deletion_recovery_reuses_exact_evidence_and_keeps_s
         )
         await asyncio.wait_for(reuse_arrived.wait(), timeout=120)
         if poll_status:
-            snapshot, listing = await asyncio.gather(
-                service.snapshot_status(connector.name), service.connector_list()
+            snapshot_envelope, listing_envelope = await asyncio.gather(
+                control.connect(
+                    path,
+                    control.Invoke(op="snapshot_status", arguments={"name": connector.name}),
+                    on_progress=lambda _: None,
+                ),
+                control.connect(
+                    path,
+                    control.Invoke(op="connector_list"),
+                    on_progress=lambda _: None,
+                ),
             )
-            assert snapshot.lifecycle.reused_items < documents
-            assert {summary.name for summary in listing.connectors} == {
+            assert snapshot_envelope["ok"] is True
+            snapshot_data = cast("dict[str, Any]", snapshot_envelope["data"])
+            lifecycle = cast("dict[str, Any]", snapshot_data["lifecycle"])
+            assert cast("int", lifecycle["reused_items"]) < documents
+            assert listing_envelope["ok"] is True
+            listing_data = cast("dict[str, Any]", listing_envelope["data"])
+            connectors = cast("list[dict[str, Any]]", listing_data["connectors"])
+            assert {summary["name"] for summary in connectors} == {
                 connector.name,
                 next_connector.name,
             }
