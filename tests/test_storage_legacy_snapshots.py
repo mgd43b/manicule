@@ -676,19 +676,59 @@ async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
     store = SqliteDocStore(engine)
     await store.ensure_workspace()
     blobs = BlobStore(engine, data_dir)
-    _, retained = await _legacy_document(store, blobs, "slow", b"slow but still owned")
-    target = blobs.path_for(retained.hash)
-    read_bytes = Path.read_bytes
+    await _legacy_document(store, blobs, "slow", b"slow but still owned")
 
-    def blocking_read(path: Path) -> bytes:
-        if path == target:
-            time.sleep(0.12)
-        return read_bytes(path)
+    # **Slow the read where the read actually happens.** This used to patch `Path.read_bytes`,
+    # which was right when it was written and stopped being right in #219 (c08122d8), where
+    # `BlobStore` moved to `os.open`/`os.fdopen` descriptors. Nothing failed: the patch simply
+    # stopped matching, no validation was ever slowed, the heartbeat was never exercised, and
+    # the test passed for nothing across every release since. Sabotaging the heartbeat to sleep
+    # ten times the lease instead of renewing still left it green, in 0.4s.
+    #
+    # `_read_blob` is the seam because it *is* the blocking filesystem read — `get` hands it to
+    # `asyncio.to_thread` precisely to keep that latency off the event loop, which is the same
+    # property this test depends on: the delay must occupy a worker thread and leave the loop
+    # free for the heartbeat. A `time.sleep` on the loop would prove nothing except that a
+    # blocked loop cannot renew a lease.
+    #
+    # It patches every call rather than matching one path. Path matching is what rotted the
+    # first time, and it was fragile even before #219: `get` resolves through
+    # `_authoritative_path`, which returns an evidence pin when one exists and the sharded path
+    # otherwise, so `path_for` was only ever one of two right answers. Exactly one read happens
+    # here, verified below, so "every call" and "the validation read" are the same set.
+    # The ratios carry the meaning; the absolute scale only has to survive a loaded CI runner.
+    # Validation outlasts one whole lease, and the heartbeat renews at LEASE_DURATION/3, so a
+    # correct implementation renews twice during the read and a broken one loses the lease.
+    #
+    # The scale was 60 ms with a 120 ms read. That is not survivable on CI's two-core runners:
+    # a heartbeat *due* in 20 ms is not necessarily *scheduled* within the 60 ms before the
+    # lease expires, and a tenth of a second of scheduler jitter is ordinary there. Ten times
+    # slower keeps every ratio, buys 400 ms of slack per renewal, and costs about a second.
+    lease = timedelta(milliseconds=600)
+    read_seconds = 2 * lease.total_seconds()
 
-    monkeypatch.setattr(legacy_snapshots, "LEASE_DURATION", timedelta(milliseconds=60))
-    monkeypatch.setattr(Path, "read_bytes", blocking_read)
+    reads: list[Path] = []
+    # Reaching a private static method is the point: it is the seam where the blocking read
+    # happens, and a public wrapper would not be one.
+    original_read_blob = BlobStore._read_blob  # pyright: ignore[reportPrivateUsage]
+
+    def slow_read_blob(path: Path, compression: str) -> bytes:
+        reads.append(path)
+        time.sleep(read_seconds)
+        return original_read_blob(path, compression)
+
+    monkeypatch.setattr(legacy_snapshots, "LEASE_DURATION", lease)
+    monkeypatch.setattr(BlobStore, "_read_blob", staticmethod(slow_read_blob))
     migrated = await migrate_legacy_snapshots(store, blobs)
 
+    # **The guard against this test going quiet again.** Everything below passes whether or not
+    # validation was slow, so without this the suite cannot tell "the heartbeat held the lease"
+    # from "no read was ever delayed". That distinction is the entire test.
+    assert reads, (
+        "no blob read was intercepted, so validation was never slowed and the lease heartbeat "
+        "was not exercised — this test is asserting nothing. BlobStore's read path has moved "
+        "again; re-point the patch at it rather than deleting this assertion."
+    )
     assert (migrated.retained, migrated.promoted, migrated.deferred) == (1, 1, 0)
     assert await store.verify_snapshot_manifest((await _legacy_run(store, "wiki")).id)
 
