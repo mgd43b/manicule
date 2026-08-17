@@ -1073,6 +1073,7 @@ async def test_capacity_only_exception_group_releases_lease_for_immediate_retry(
 async def test_busy_terminal_release_is_fenced_for_immediate_pipeline_retry(
     engine: AsyncEngine,
     data_dir: Path,
+    tmp_path: Path,
 ) -> None:
     class BusyTerminalStore(SqliteDocStore):
         fail_terminal = True
@@ -1118,24 +1119,16 @@ async def test_busy_terminal_release_is_fenced_for_immediate_pipeline_retry(
     await store.ensure_workspace()
 
     class RetryPipeline(IngestPipeline):
-        refuse = True
+        seed_private_glossary = True
 
         @override
         async def _drive(self, run: Any) -> None:
-            if self.refuse:
-                raise ExceptionGroup(
-                    "synthetic capacity stop",
-                    [
-                        CapacityRefusedError(
-                            CapacityDiagnostic(
-                                resource=CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES,
-                                limit=1,
-                                used=1,
-                                requested=1,
-                            )
-                        )
-                    ],
+            if self.seed_private_glossary:
+                run.report.glossary_failures.append(
+                    "private-document-id from private-source-id: glossary detection failed for "
+                    "https://private.invalid/source?token=fake-secret-cinder"
                 )
+                return
             await super()._drive(run)
 
     chunker = fakes.BlockChunker()
@@ -1158,9 +1151,44 @@ async def test_busy_terminal_release_is_fenced_for_immediate_pipeline_retry(
     durable = await store.latest_unsettled_acquisition_run(connector.name)
 
     assert first.error_type == "StorageBusyError"
+    assert first.glossary_failures == []
     assert durable is not None
     assert durable.lease_owner is not None, "the injected external writer prevented persistence"
-    pipeline.refuse = False
+
+    backend = FakeBackend()
+    backend.ingestion_.report = first
+    backend.settings.connectors[connector.name] = ConnectorSettings.model_validate(
+        {"type": "filesystem", "options": {"root": "."}}
+    )
+    service = ApplicationService(backend)
+    path = control.socket_path(tmp_path)
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+    await server.start()
+    try:
+        envelope = await control.connect(
+            path,
+            control.Invoke(op="connector_sync", arguments={"name": connector.name, "limit": None}),
+            on_progress=lambda _: None,
+        )
+    finally:
+        await server.aclose()
+
+    assert envelope["ok"] is False
+    assert cast("dict[str, Any]", envelope["error"])["type"] == "StorageBusyError"
+    assert cast("dict[str, Any]", envelope["data"])["retry_required"] is True
+    public = json.dumps(
+        {"report": first.as_metadata(), "envelope": envelope}, sort_keys=True
+    ).lower()
+    for private in (
+        "private-document-id",
+        "private-source-id",
+        "private.invalid",
+        "fake-secret-cinder",
+        "token=",
+    ):
+        assert private not in public
+
+    pipeline.seed_private_glossary = False
     resumed = await pipeline.run(connector)
     assert resumed.error == ""
     assert await store.latest_unsettled_acquisition_run(connector.name) is None

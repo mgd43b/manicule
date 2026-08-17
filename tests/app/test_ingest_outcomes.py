@@ -82,7 +82,7 @@ def _storage_busy_incomplete() -> RunReport:
         by_status={"indexed": 1},
         enumeration_completed=False,
         glossary_failures=[
-            "private-document-id: glossary detection failed for "
+            "private-document-id from private-source-id: glossary detection failed for "
             "https://private.invalid/source?token=fake-secret-cinder"
         ],
     )
@@ -338,6 +338,7 @@ async def test_storage_busy_report_and_control_envelope_are_aggregate_only(
         "document_id",
         "source_id",
         "private-document-id",
+        "private-source-id",
         "private.invalid",
         "uri",
         "title",

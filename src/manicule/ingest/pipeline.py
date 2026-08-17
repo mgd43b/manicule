@@ -1317,9 +1317,12 @@ class IngestPipeline:
             )
         except Exception as exc:  # noqa: BLE001 - diagnostics must not hide the run outcome
             if not crashed:
-                run.report.error_type = type(exc).__name__
-                run.report.error_message = str(exc)
-                run.report.error = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, StorageBusyError):
+                    run.report.refuse_storage_busy(exc)
+                else:
+                    run.report.error_type = type(exc).__name__
+                    run.report.error_message = str(exc)
+                    run.report.error = f"{type(exc).__name__}: {exc}"
         if not recorded and not crashed:
             msg = "the acquisition generation changed before diagnostics and release"
             run.report.error_type = AcquisitionLeaseLostError.__name__
