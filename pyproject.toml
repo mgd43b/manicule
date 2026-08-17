@@ -71,7 +71,7 @@ ingest = [         # #5
 parsers = [
   # Every one of these is permissively licensed; docs/parsing.md §12 records the rejections
   # (PyMuPDF, extract-msg) and why a copyleft dependency is refused at selection time.
-  "pypdfium2>=4.30",
+  "pypdfium2>=5.13.0",
   "tree-sitter>=0.23",
   "tree-sitter-language-pack>=0.7",
   "selectolax>=0.3.21",
