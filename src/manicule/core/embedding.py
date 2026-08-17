@@ -593,6 +593,18 @@ def require_within_context(
         )
         raise ContextOverflowError(msg)
 
+    if chunk_fingerprint is not None:
+        budget = chunk_fingerprint.max_tokens
+        outside_budget = [chunk.token_count for chunk in chunks if chunk.token_count > budget]
+        if outside_budget:
+            msg = (
+                f"{len(outside_budget)} chunk(s) exceed their fingerprinted {budget}-token "
+                f"final embed_text budget; the maximum is {max(outside_budget)} tokens. "
+                f"A larger model context does not change the chunk policy. Rechunk from "
+                f"retained source bytes into a replacement generation."
+            )
+            raise ContextOverflowError(msg)
+
     limit = fingerprint.max_sequence_length
     oversized = sorted(
         (chunk for chunk in chunks if chunk.token_count > limit),

@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, Self, cast, runtime_checkab
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from manicule.chunking import finalize_chunks
 from manicule.ingest.limits import (
     ADDRESS_SPACE_HEADROOM,
     kill,
@@ -269,6 +270,7 @@ class InProcessRunner:
         transformed = await self._middleware.after_parse(document, blocks)
         chunks = tuple(self._chunker.chunk(document, transformed))
         chunks = tuple(await self._middleware.after_chunk(document, chunks)) if chunks else ()
+        chunks = tuple(finalize_chunks(self._chunker, chunks))
         if detect_glossary:
             from manicule.ingest.glossary import detect_entries  # noqa: PLC0415
 
@@ -556,6 +558,7 @@ async def _stage_in_child(
     blocks = await runner.after_parse(request.document, request.blocks)
     chunks = tuple(configured_chunker.chunk(request.document, blocks))
     chunks = tuple(await runner.after_chunk(request.document, chunks)) if chunks else ()
+    chunks = tuple(finalize_chunks(configured_chunker, chunks))
     if request.detect_glossary:
         from manicule.ingest.glossary import detect_entries  # noqa: PLC0415
 

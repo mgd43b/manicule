@@ -230,8 +230,8 @@ class ChunkFingerprint(Fingerprint):
             else ""
         )
         return (
-            f"{self.chunker} {self.version} ({self.max_tokens}+{self.overlap_tokens} tokens, "
-            f"{self.tokenizer_id}{mutating})"
+            f"{self.chunker} {self.version} ({self.max_tokens}-token final embed_text budget, "
+            f"up to {self.overlap_tokens} overlap, {self.tokenizer_id}{mutating})"
         )
 
 

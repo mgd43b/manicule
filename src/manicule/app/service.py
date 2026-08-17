@@ -3233,7 +3233,7 @@ class ApplicationService:
         if not key:
             return r.ConfigValue(key="", value=redacted, source=str(config_file()))
         value: JsonValue = redacted
-        for part in key.split("."):
+        for part in _config_key_parts(key):
             if not isinstance(value, dict) or part not in value:
                 msg = f"no such setting: {key!r}"
                 raise UnknownEntityError(msg)
@@ -3257,7 +3257,7 @@ class ApplicationService:
         if not key:
             msg = "config set needs a dotted key, for example 'rag.profile'"
             raise ConfigError(msg)
-        parts = key.split(".")
+        parts = _config_key_parts(key)
         if looks_secret(parts[-1]):
             msg = (
                 f"{key!r} is a credential. Set it in the environment instead — the config "
@@ -3272,9 +3272,11 @@ class ApplicationService:
         # The whole read-modify-validate-write runs in a worker thread. It is blocking file
         # I/O in an async method, and pydantic-settings re-reads the file and the environment
         # while validating, so this is more than the one write it looks like.
-        await asyncio.to_thread(
-            _update_config, path, lambda document: _assign(document, parts, parsed)
-        )
+        def mutate(document: dict[str, Any]) -> None:
+            _assign(document, parts, parsed)
+            _validate_structural_chunker_config(document, parts)
+
+        await asyncio.to_thread(_update_config, path, mutate)
         return r.ConfigChange(key=key, previous=previous, value=parsed, path=str(path))
 
     async def _current_value(self, parts: Sequence[str]) -> JsonValue:
@@ -5639,6 +5641,39 @@ def _assign(document: dict[str, Any], parts: Sequence[str], value: JsonValue) ->
             cursor[part] = existing
         cursor = cast("dict[str, Any]", existing)
     cursor[parts[-1]] = value
+
+
+def _config_key_parts(key: str) -> list[str]:
+    """Resolve a dotted CLI key, including component slots whose names contain one dot."""
+    raw = key.replace('"', "").split(".")
+    component_field_parts = 5
+    if len(raw) >= component_field_parts and raw[:2] == ["plugins", "config"]:
+        return [*raw[:2], f"{raw[2]}.{raw[3]}", *raw[4:]]
+    return raw
+
+
+def _validate_structural_chunker_config(
+    document: Mapping[str, object], parts: Sequence[str]
+) -> None:
+    """Reject an accepted-but-inert component edit before the config file is written."""
+    if list(parts[:3]) != ["plugins", "config", "chunker.structural"]:
+        return
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from manicule.parsers.config import StructuralChunkerConfig  # noqa: PLC0415
+
+    plugins = _as_mapping(document.get("plugins"))
+    configured = _as_mapping(plugins.get("config"))
+    raw = _as_mapping(configured.get("chunker.structural"))
+    try:
+        StructuralChunkerConfig.model_validate(raw)
+    except ValidationError as exc:
+        detail = "; ".join(
+            f"{'.'.join(str(item) for item in error['loc'])}: {error['msg']}"
+            for error in exc.errors()
+        )
+        msg = f'invalid plugins.config."chunker.structural": {detail}'
+        raise ConfigError(msg) from exc
 
 
 def _as_list(value: object) -> list[object]:
