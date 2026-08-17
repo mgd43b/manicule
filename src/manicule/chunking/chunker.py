@@ -231,7 +231,7 @@ class StructuralChunker:
                 f"{self._embedder.fingerprint.describe()} attends to {limit}. Text past the "
                 f"limit is dropped with no error raised, so every oversized chunk would be "
                 f"indexed as its opening tokens while still claiming all of its text. "
-                f"Set plugins.config.\"chunker.structural\".max_tokens to {limit} or lower, "
+                f'Set plugins.config."chunker.structural".max_tokens to {limit} or lower, '
                 f"or choose a model with a longer sequence length."
             )
             raise ContextOverflowError(msg)
@@ -475,10 +475,9 @@ class StructuralChunker:
         units: list[_Unit] = []
         current: list[tuple[int, str]] = []
         source_lines = block.text.splitlines(keepends=True) or [block.text]
-        exact_line_mapping = (
-            isinstance(block.anchor, LineAnchor)
-            and block.anchor.end - block.anchor.start + 1 == len(source_lines)
-        )
+        exact_line_mapping = isinstance(
+            block.anchor, LineAnchor
+        ) and block.anchor.end - block.anchor.start + 1 == len(source_lines)
 
         def materialize(selected: Sequence[tuple[int, str]]) -> _Unit:
             text = "".join(value for _, value in selected)
@@ -630,9 +629,7 @@ class StructuralChunker:
                 fitted.append(current)
         return fitted
 
-    def _fit_final_unit(
-        self, unit: _Unit, fits_text: Callable[[str], bool]
-    ) -> list[_Unit]:
+    def _fit_final_unit(self, unit: _Unit, fits_text: Callable[[str], bool]) -> list[_Unit]:
         if fits_text(unit.text):
             return [unit]
 

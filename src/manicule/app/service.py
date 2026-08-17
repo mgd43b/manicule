@@ -3275,6 +3275,7 @@ class ApplicationService:
         previous = await self._current_value(parts)
 
         path = config_file()
+
         # The whole read-modify-validate-write runs in a worker thread. It is blocking file
         # I/O in an async method, and pydantic-settings re-reads the file and the environment
         # while validating, so this is more than the one write it looks like.

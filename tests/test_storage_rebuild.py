@@ -2182,9 +2182,7 @@ async def test_generation_bound_snapshot_is_not_removed_by_history_cleanup(
             .values(state=AcquisitionRunState.SETTLED, updated_at=old)
         )
 
-    removed = await store.cleanup_acquisition_history(
-        datetime(2100, 1, 1, tzinfo=UTC), limit=10
-    )
+    removed = await store.cleanup_acquisition_history(datetime(2100, 1, 1, tzinfo=UTC), limit=10)
 
     assert removed == 0
     assert await store.get_acquisition_run(run_id) is not None

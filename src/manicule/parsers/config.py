@@ -106,6 +106,7 @@ class StructuralChunkerConfig(BaseModel):
             raise ValueError("overlap_tokens must be lower than max_tokens")
         return self
 
+
 # --- media types -------------------------------------------------------------------------
 #
 # What routes to each parser. Declared narrowly and by name: no parser claims a wildcard, so

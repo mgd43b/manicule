@@ -387,10 +387,7 @@ class SqliteRebuildStore(WorkspaceScoped):
 
         combined_membership = hashlib.sha256(
             _canonical(
-                [
-                    [run.id, run.membership_hash, retained]
-                    for run, retained in snapshot_bindings
-                ]
+                [[run.id, run.membership_hash, retained] for run, retained in snapshot_bindings]
             )
         ).hexdigest()
         run_ids = tuple(run.id for run, _ in snapshot_bindings)
@@ -675,8 +672,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 .where(
                     models.DerivedGeneration.workspace_id == self._workspace_id,
                     models.DerivedGeneration.snapshot_run_id == snapshot_run_id,
-                    models.DerivedGeneration.snapshot_membership_hash
-                    == snapshot_membership_hash,
+                    models.DerivedGeneration.snapshot_membership_hash == snapshot_membership_hash,
                     models.DerivedGeneration.target_digest == target_digest,
                     models.DerivedGeneration.state == RebuildState.PUBLISHED,
                     models.DerivedGeneration.expected_vector_table == vector_table,
@@ -982,9 +978,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                             blob_ref=record.blob_ref,
                             source=acquired,
                             title=source.title,
-                            version_token=(
-                                record.fetched_version_token or source.version_token
-                            ),
+                            version_token=(record.fetched_version_token or source.version_token),
                         )
                     )
                 if len(result) == limit:
@@ -1235,8 +1229,7 @@ class SqliteRebuildStore(WorkspaceScoped):
 
             highest_fence = (
                 await session.execute(
-                    select(func.max(models.DerivedGeneration.fence_generation))
-                    .where(
+                    select(func.max(models.DerivedGeneration.fence_generation)).where(
                         models.DerivedGeneration.workspace_id == self._workspace_id,
                         models.DerivedGeneration.state.in_(
                             (
@@ -1297,9 +1290,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     snapshot.connector_name != connector
                     or (
                         snapshot_runs[snapshot.run_id].completeness is not None
-                        and SnapshotCompleteness(
-                            snapshot_runs[snapshot.run_id].completeness
-                        )
+                        and SnapshotCompleteness(snapshot_runs[snapshot.run_id].completeness)
                         is SnapshotCompleteness.COMPLETE
                     )
                     for snapshot in snapshots
@@ -1403,9 +1394,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     now=now,
                 )
             except AcquisitionConflictError as exc:
-                raise RebuildPublicationConflictError(
-                    RebuildRefusalCode.SNAPSHOT_CHANGED
-                ) from exc
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED) from exc
 
     async def _require_live_vector_binding(
         self, session: AsyncSession, generation: models.DerivedGeneration
@@ -1419,9 +1408,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         ):
             raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
 
-    async def _latest_promoted_runs(
-        self, session: AsyncSession
-    ) -> list[models.AcquisitionRun]:
+    async def _latest_promoted_runs(self, session: AsyncSession) -> list[models.AcquisitionRun]:
         ranked = (
             select(
                 models.AcquisitionRun.id.label("run_id"),
@@ -1473,9 +1460,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             ).scalars()
         )
 
-    async def _snapshot_set_is_current(
-        self, session: AsyncSession, run_ids: Sequence[str]
-    ) -> bool:
+    async def _snapshot_set_is_current(self, session: AsyncSession, run_ids: Sequence[str]) -> bool:
         latest = await self._latest_promoted_runs(session)
         if tuple(row.id for row in latest) != tuple(run_ids):
             return False
@@ -1959,10 +1944,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
         combined = hashlib.sha256(
             _canonical(
-                [
-                    [row.run_id, row.membership_hash, row.expected_item_count]
-                    for row in snapshots
-                ]
+                [[row.run_id, row.membership_hash, row.expected_item_count] for row in snapshots]
             )
         ).hexdigest()
         legacy_single = (
@@ -1982,9 +1964,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 or run.membership_hash != snapshot.membership_hash
                 or run.connector_name != snapshot.connector_name
                 or run.scope_fingerprint != snapshot.scope_fingerprint
-                or not await snapshot_manifest_matches(
-                    session, run.id, snapshot.membership_hash
-                )
+                or not await snapshot_manifest_matches(session, run.id, snapshot.membership_hash)
             ):
                 raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
             counts = (
@@ -2100,8 +2080,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     select(models.AcquisitionRecord)
                     .join(
                         models.DerivedGenerationSnapshot,
-                        models.DerivedGenerationSnapshot.run_id
-                        == models.AcquisitionRecord.run_id,
+                        models.DerivedGenerationSnapshot.run_id == models.AcquisitionRecord.run_id,
                     )
                     .where(
                         models.DerivedGenerationSnapshot.generation_id == generation.id,

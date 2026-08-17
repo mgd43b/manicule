@@ -132,9 +132,7 @@ async def test_post_chunk_middleware_growth_is_recounted_and_refused_before_embe
         mutates_embedded_text = True
 
         @override
-        async def after_chunk(
-            self, document: Document, chunks: list[Chunk]
-        ) -> list[Chunk]:
+        async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
             del document
             return [
                 item.model_copy(

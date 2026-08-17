@@ -42,16 +42,14 @@ def upgrade() -> None:
         sa.Column("expected_item_count", sa.Integer(), nullable=False),
         sa.CheckConstraint(
             "ordinal >= 0 AND expected_item_count >= 0",
-            name=op.f("ck_derived_generation_snapshots_derived_generation_snapshot_counts_are_not_negative"),
+            name=op.f(
+                "ck_derived_generation_snapshots_derived_generation_snapshot_counts_are_not_negative"
+            ),
         ),
-        sa.ForeignKeyConstraint(
-            ["generation_id"], ["derived_generations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["generation_id"], ["derived_generations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["run_id"], ["acquisition_runs.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("generation_id", "ordinal"),
-        sa.UniqueConstraint(
-            "generation_id", "run_id", name="uq_generation_snapshot_run"
-        ),
+        sa.UniqueConstraint("generation_id", "run_id", name="uq_generation_snapshot_run"),
     )
     op.execute(
         sa.text(

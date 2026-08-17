@@ -311,11 +311,7 @@ async def test_configured_structural_budget_refuses_the_real_path_before_constru
         Settings(
             data_dir=data_dir,
             embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
-            plugins={
-                "config": {
-                    "chunker.structural": {"max_tokens": 768, "overlap_tokens": 96}
-                }
-            },  # pyright: ignore[reportArgumentType]
+            plugins={"config": {"chunker.structural": {"max_tokens": 768, "overlap_tokens": 96}}},  # pyright: ignore[reportArgumentType]
         ),
         discovery=found,
     )

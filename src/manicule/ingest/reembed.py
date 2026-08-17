@@ -720,9 +720,7 @@ async def _build(
         chunk_fingerprint = None
         if document.chunk_fingerprint is not None:
             try:
-                chunk_fingerprint = ChunkFingerprint.model_validate_json(
-                    document.chunk_fingerprint
-                )
+                chunk_fingerprint = ChunkFingerprint.model_validate_json(document.chunk_fingerprint)
             except ValueError as exc:
                 raise ReembedError(
                     "the immutable snapshot has an invalid chunk fingerprint"
