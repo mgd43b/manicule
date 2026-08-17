@@ -148,6 +148,36 @@ async def test_strict_snapshot_omission_is_an_incomplete_retryable_failure_envel
     assert envelope.error.type == "IncompleteIngestError"
 
 
+async def test_inventory_recovery_reaches_the_shared_private_safe_envelope() -> None:
+    service, _ = _service(
+        RunReport(
+            connector="synthetic-wiki",
+            discovered=9,
+            snapshot_omissions=1,
+            snapshot_omission_reasons={"source_deleted": 1},
+            inventory_recovery="reenumeration_required",
+        )
+    )
+
+    envelope = await _envelope(service)
+
+    assert envelope.ok is False
+    assert envelope.data is not None
+    assert envelope.data["inventory_recovery"] == "reenumeration_required"
+    assert envelope.data["reconciled_deleted_items"] == 0
+    lifecycle = cast("dict[str, Any]", envelope.data["lifecycle"])
+    assert lifecycle["inventory_recovery"] == "reenumeration_required"
+    assert lifecycle["reconciled_deleted_items"] == 0
+    assert envelope.error is not None
+    assert envelope.error.message == (
+        "a fresh source inventory is required before this snapshot can be promoted"
+    )
+    assert "fence the stale inventory" in envelope.error.hint
+    rendered = str(envelope.as_json())
+    assert "source-id" not in rendered
+    assert "https://wiki.example.test/private" not in rendered
+
+
 async def test_pending_durable_derivation_is_a_retry_required_failure_envelope() -> None:
     service, _ = _service(
         RunReport(

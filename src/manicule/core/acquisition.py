@@ -30,6 +30,15 @@ class AcquisitionRunState(StrEnum):
     SETTLED = "settled"
 
 
+class AcquisitionInventoryState(StrEnum):
+    """Whether this run's completed identity inventory can still prove source coverage."""
+
+    CURRENT = "current"
+    REENUMERATION_REQUIRED = "reenumeration_required"
+    REENUMERATING = "reenumerating"
+    RECONCILED = "reconciled"
+
+
 class AcquisitionRecordState(StrEnum):
     """Durable state of one source identity within a run."""
 
@@ -251,6 +260,9 @@ class AcquisitionRun(BaseModel):
     watermark_committed_at: datetime | None = None
     superseded_at: datetime | None = None
     superseded_by: str | None = None
+    supersedes_run_id: str | None = None
+    inventory_state: AcquisitionInventoryState = AcquisitionInventoryState.CURRENT
+    reconciled_deleted_count: int = Field(default=0, ge=0)
     membership_hash: str | None = None
     completeness: SnapshotCompleteness | None = None
     omission_count: int = Field(default=0, ge=0)
@@ -262,6 +274,7 @@ class AcquisitionRun(BaseModel):
     acquired_count: int = Field(ge=0)
     indexed_count: int = Field(ge=0)
     unchanged_count: int = Field(ge=0)
+    reused_count: int = Field(default=0, ge=0)
     retry_count: int = Field(ge=0)
     metadata_bytes: int = Field(ge=0)
     acquired_blob_bytes: int = Field(ge=0)
@@ -296,6 +309,7 @@ __all__ = [
     "AcquisitionDiagnostic",
     "AcquisitionFailureCode",
     "AcquisitionFence",
+    "AcquisitionInventoryState",
     "AcquisitionRecord",
     "AcquisitionRecordState",
     "AcquisitionRun",

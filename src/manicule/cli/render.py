@@ -442,6 +442,10 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     table.add_row("enumeration completed", "yes" if payload.enumeration_completed else "no")
     table.add_row("watermark advanced", "yes" if payload.watermark_advanced else "no")
     table.add_row("retry required", "yes" if payload.retry_required else "no")
+    if payload.inventory_recovery:
+        table.add_row("inventory recovery", escape(payload.inventory_recovery))
+    if payload.reconciled_deleted_items:
+        table.add_row("disappeared items reconciled", str(payload.reconciled_deleted_items))
     if payload.derivation_deferred:
         table.add_row("derivation deferred", "yes (snapshot retained locally)")
     if payload.expanded:
@@ -457,7 +461,13 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     if payload.retry_required:
         detail = payload.incomplete_reason.message if payload.incomplete_reason else "unknown"
         out.print(f"[red]the run did not finish: {escape(detail)}[/red]")
-        out.print("[dim]the watermark was not advanced, so running it again resumes[/dim]")
+        if payload.inventory_recovery == "reenumeration_required":
+            out.print(
+                "[dim]the watermark was not advanced; running again starts a fresh fenced "
+                "source enumeration[/dim]"
+            )
+        else:
+            out.print("[dim]the watermark was not advanced, so running it again resumes[/dim]")
         return
     if payload.intentionally_bounded:
         out.print(
@@ -545,6 +555,7 @@ def render_connectors(out: Console, payload: r.ConnectorList) -> None:
         "documents",
         "last outcome",
         "retry",
+        "inventory recovery",
         box=None,
         pad_edge=False,
     )
@@ -557,6 +568,12 @@ def render_connectors(out: Console, payload: r.ConnectorList) -> None:
             "—" if connector.documents is None else str(connector.documents),
             connector.last_outcome or "—",
             "[red]yes[/red]" if connector.retry_required else "no",
+            (
+                connector.last_lifecycle.inventory_recovery
+                if connector.last_lifecycle is not None
+                and connector.last_lifecycle.inventory_recovery
+                else "—"
+            ),
         )
     out.print(table)
     if not payload.connectors:
@@ -889,6 +906,11 @@ def render_snapshot_status(out: Console, payload: r.SnapshotStatusReport) -> Non
         f"promoted: {'yes' if progress.snapshot_promoted else 'no'}; "
         f"offline continuation: {'yes' if progress.can_continue_offline else 'no'}"
     )
+    if progress.inventory_recovery:
+        out.print(
+            f"inventory recovery: {escape(progress.inventory_recovery)}; "
+            f"disappeared items reconciled: {progress.reconciled_deleted_items}"
+        )
 
 
 def render_collection(out: Console, payload: r.CollectionSummary) -> None:

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 from pydantic import TypeAdapter
 from sqlalchemy import and_, case, delete, exists, func, literal, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import aliased
 
 from manicule.core.acquisition import (
     UNSET,
@@ -18,6 +19,7 @@ from manicule.core.acquisition import (
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
     AcquisitionFence,
+    AcquisitionInventoryState,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRun,
@@ -156,6 +158,9 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         watermark_committed_at=row.watermark_committed_at,
         superseded_at=row.superseded_at,
         superseded_by=row.superseded_by,
+        supersedes_run_id=row.supersedes_run_id,
+        inventory_state=AcquisitionInventoryState(row.inventory_state),
+        reconciled_deleted_count=row.reconciled_deleted_count,
         membership_hash=row.membership_hash,
         completeness=row.completeness,
         omission_count=row.omission_count,
@@ -167,6 +172,7 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         acquired_count=row.acquired_count,
         indexed_count=row.indexed_count,
         unchanged_count=row.unchanged_count,
+        reused_count=row.reused_count,
         retry_count=row.retry_count,
         metadata_bytes=row.metadata_bytes,
         acquired_blob_bytes=row.acquired_blob_bytes,
@@ -236,6 +242,27 @@ def _record(row: models.AcquisitionRecord) -> AcquisitionRecord:
         diagnostic=_safe_diagnostic(row.diagnostic),
         created_at=row.created_at,
         updated_at=row.updated_at,
+    )
+
+
+def _source_evidence_is_reusable(current: AcquisitionSource, reusable: AcquisitionRecord) -> bool:
+    """Require one authoritative revision and the exact discovery/envelope identity."""
+    envelope = reusable.acquired_source
+    proven_version = (
+        reusable.fetched_version_token
+        if reusable.fetched_version_token is not None
+        else reusable.source.version_token
+    )
+    return (
+        current.version_token is not None
+        and reusable.source == current
+        and envelope is not None
+        and proven_version == current.version_token
+        and reusable.blob_ref == envelope.content_hash
+        and envelope.source_id == current.source_id
+        and envelope.uri == current.ref.uri
+        and (current.media_type is None or envelope.media_type == current.media_type)
+        and (current.size_bytes is None or envelope.byte_length == current.size_bytes)
     )
 
 
@@ -573,6 +600,16 @@ async def settle_published_snapshot(
         )
     ).scalar_one()
     run.unchanged_count = counts.get(AcquisitionRecordState.UNCHANGED, 0)
+    run.reused_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(models.AcquisitionRecord)
+            .where(
+                models.AcquisitionRecord.run_id == run_id,
+                models.AcquisitionRecord.snapshot_outcome == SnapshotItemOutcome.REUSED,
+            )
+        )
+    ).scalar_one()
     run.retry_count = counts.get(AcquisitionRecordState.RETRY, 0)
     run.acquired_blob_bytes = 0
     partial_pending = (
@@ -624,7 +661,7 @@ async def settle_published_snapshot(
             "outcome": "incomplete" if partial_pending else "complete",
             "enumerated_items": run.discovered_count,
             "acquired_items": run.acquired_count,
-            "reused_items": run.unchanged_count,
+            "reused_items": run.reused_count,
             "omitted_items": run.omission_count,
             "failed_items": run.retry_count,
             "pending_items": pending_items,
@@ -820,6 +857,8 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         version_token: str | None,
     ) -> AcquisitionRecord | None:
         """Find validated retained bytes for an unchanged revision in the same exact scope."""
+        if version_token is None:
+            return None
         async with self._sessions() as session:
             run = (
                 await session.execute(
@@ -868,10 +907,11 @@ class AcquisitionJournalMixin(WorkspaceScoped):
     async def reusable_record_from_verified_snapshot(
         self,
         run_id: str,
-        source_id: str,
-        version_token: str | None,
+        source: AcquisitionSource,
     ) -> AcquisitionRecord | None:
         """Look up retained evidence after this operation verified ``run_id`` once."""
+        if source.version_token is None:
+            return None
         async with self._sessions() as session:
             run = await self._run_row(session, run_id)
             if (
@@ -886,19 +926,73 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     select(models.AcquisitionRecord)
                     .where(
                         models.AcquisitionRecord.run_id == run.id,
-                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.source_id == source.source_id,
                         models.AcquisitionRecord.blob_ref.is_not(None),
                         models.AcquisitionRecord.acquired_source.is_not(None),
                         or_(
-                            models.AcquisitionRecord.fetched_version_token == version_token,
+                            models.AcquisitionRecord.fetched_version_token == source.version_token,
                             models.AcquisitionRecord.source_record["version_token"].as_string()
-                            == version_token,
+                            == source.version_token,
                         ),
                     )
                     .limit(1)
                 )
             ).scalar_one_or_none()
-            return None if row is None else _record(row)
+            if row is None:
+                return None
+            reusable = _record(row)
+            return reusable if _source_evidence_is_reusable(source, reusable) else None
+
+    async def reusable_record_from_superseded_run(
+        self,
+        run_id: str,
+        source: AcquisitionSource,
+    ) -> AcquisitionRecord | None:
+        """Return exact retained evidence owned by this replacement's fenced predecessor."""
+        if source.version_token is None:
+            return None
+        async with self._sessions() as session:
+            replacement = await self._run_row(session, run_id)
+            if (
+                replacement is None
+                or replacement.workspace_id != self._workspace_id
+                or replacement.supersedes_run_id is None
+                or replacement.inventory_state
+                not in {
+                    AcquisitionInventoryState.RECONCILED,
+                    AcquisitionInventoryState.REENUMERATING,
+                    AcquisitionInventoryState.REENUMERATION_REQUIRED,
+                }
+            ):
+                return None
+            predecessor = await self._run_row(session, replacement.supersedes_run_id)
+            if (
+                predecessor is None
+                or predecessor.workspace_id != replacement.workspace_id
+                or predecessor.connector_id != replacement.connector_id
+                or predecessor.source_scope != replacement.source_scope
+                or predecessor.scope_fingerprint != replacement.scope_fingerprint
+                or predecessor.superseded_by != replacement.id
+                or predecessor.superseded_at is None
+            ):
+                return None
+            row = (
+                await session.execute(
+                    select(models.AcquisitionRecord)
+                    .where(
+                        models.AcquisitionRecord.run_id == predecessor.id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                        models.AcquisitionRecord.source_id == source.source_id,
+                        models.AcquisitionRecord.blob_ref.is_not(None),
+                        models.AcquisitionRecord.acquired_source.is_not(None),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            reusable = _record(row)
+            return reusable if _source_evidence_is_reusable(source, reusable) else None
 
     async def verify_snapshot_manifest(self, run_id: str) -> bool:
         """Verify the canonical evidence digest without loading an unbounded manifest."""
@@ -1026,7 +1120,11 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     and candidate.watermark_committed_at is not None
                     and candidate.candidate_watermark == connector_row.watermark
                 )
-                if base_is_current or committed_is_current:
+                if (
+                    candidate.inventory_state
+                    is not AcquisitionInventoryState.REENUMERATION_REQUIRED
+                    and (base_is_current or committed_is_current)
+                ):
                     safe.append(candidate)
             # Ordering above makes the first safe run authoritative. Every other overlap is
             # fenced in this same writer transaction, including an older live owner with the
@@ -1034,6 +1132,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             # API exists to reconcile on upgraded databases.
             row = safe[0] if safe else None
             superseded = [candidate for candidate in candidates if candidate is not row]
+            invalidated = next(
+                (
+                    candidate
+                    for candidate in superseded
+                    if candidate.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
+                    and candidate.scope_fingerprint == scope_fingerprint
+                ),
+                None,
+            )
             for candidate in superseded:
                 candidate.superseded_at = utcnow()
                 candidate.lease_owner = None
@@ -1052,6 +1159,12 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     state=AcquisitionRunState.ENUMERATING,
                     base_watermark=connector_row.watermark,
                     base_watermark_scope_fingerprint=connector_row.watermark_scope_fingerprint,
+                    supersedes_run_id=None if invalidated is None else invalidated.id,
+                    inventory_state=(
+                        AcquisitionInventoryState.CURRENT
+                        if invalidated is None
+                        else AcquisitionInventoryState.REENUMERATING
+                    ),
                     lease_owner=owner,
                     lease_generation=1,
                     lease_expires_at=expires_at,
@@ -1282,7 +1395,30 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 if row.candidate_watermark != candidate or row.enumeration_completed_at is None:
                     msg = f"acquisition run {run_id!r} cannot complete enumeration from {row.state}"
                     raise AcquisitionConflictError(msg)
-            return _run(await self._required_run_row(session, run_id))
+            row = await self._required_run_row(session, run_id)
+            if (
+                row.inventory_state is AcquisitionInventoryState.REENUMERATING
+                and row.supersedes_run_id is not None
+            ):
+                prior_record = aliased(models.AcquisitionRecord)
+                current_record = aliased(models.AcquisitionRecord)
+                row.reconciled_deleted_count = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(prior_record)
+                        .where(
+                            prior_record.run_id == row.supersedes_run_id,
+                            ~exists().where(
+                                and_(
+                                    current_record.run_id == row.id,
+                                    current_record.source_id == prior_record.source_id,
+                                )
+                            ),
+                        )
+                    )
+                ).scalar_one()
+                row.inventory_state = AcquisitionInventoryState.RECONCILED
+            return _run(row)
 
     @translate_storage_capacity_errors
     async def claim_acquisition_run(
@@ -1561,10 +1697,17 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         acquired_source: AcquiredSource | None = None,
         fetched_version_token: str | UnsetValue | None = UNSET,
         diagnostic: AcquisitionDiagnostic | None = None,
+        snapshot_outcome: SnapshotItemOutcome | None = None,
     ) -> AcquisitionRecord:
         """Move one record under both a state CAS and the owning run's lease fence."""
         if target not in _RECORD_TRANSITIONS[expected]:
             msg = f"invalid acquisition record transition: {expected} -> {target}"
+            raise InvalidAcquisitionTransitionError(msg)
+        if snapshot_outcome is not None and (
+            target is not AcquisitionRecordState.ACQUIRED
+            or snapshot_outcome is not SnapshotItemOutcome.REUSED
+        ):
+            msg = "an explicit snapshot outcome is valid only for acquired reused evidence"
             raise InvalidAcquisitionTransitionError(msg)
         if target is AcquisitionRecordState.ACQUIRED and blob_ref is None:
             msg = "an acquired record requires a retained blob reference"
@@ -1633,7 +1776,9 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if acquired_source is not None:
                 values["acquired_source"] = acquired_source.model_dump(mode="json")
             if target is AcquisitionRecordState.ACQUIRED:
-                values["snapshot_outcome"] = SnapshotItemOutcome.RETAINED
+                values["snapshot_outcome"] = (
+                    SnapshotItemOutcome.RETAINED if snapshot_outcome is None else snapshot_outcome
+                )
             elif target is AcquisitionRecordState.UNCHANGED:
                 values["snapshot_outcome"] = (
                     SnapshotItemOutcome.REUSED
@@ -1769,6 +1914,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 raise AcquisitionConflictError(msg)
             run = await self._required_run_row(session, run_id)
             await self._refresh_counters(session, run)
+            if (
+                target is AcquisitionRecordState.RETRY
+                and diagnostic is not None
+                and diagnostic.stage is AcquisitionStage.ACQUISITION
+                and diagnostic.code is AcquisitionFailureCode.SOURCE_DELETED
+                and run.enumeration_completed_at is not None
+            ):
+                run.inventory_state = AcquisitionInventoryState.REENUMERATION_REQUIRED
+                run.updated_at = utcnow()
             row = (
                 await session.execute(
                     select(models.AcquisitionRecord).where(
@@ -2218,6 +2372,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             msg = "cleanup limit must be positive"
             raise ValueError(msg)
         async with self._sessions.begin() as session:
+            replacement = aliased(models.AcquisitionRun)
             run_ids = (
                 (
                     await session.execute(
@@ -2228,6 +2383,13 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                             ~exists(
                                 select(models.AcquisitionMarker.name).where(
                                     models.AcquisitionMarker.run_id == models.AcquisitionRun.id
+                                )
+                            ),
+                            ~exists(
+                                select(replacement.id).where(
+                                    replacement.supersedes_run_id == models.AcquisitionRun.id,
+                                    replacement.state != AcquisitionRunState.SETTLED,
+                                    replacement.acquisition_completed_at.is_(None),
                                 )
                             ),
                             or_(
@@ -2403,6 +2565,16 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             )
         ).scalar_one()
         run.unchanged_count = counts.get(AcquisitionRecordState.UNCHANGED, 0)
+        run.reused_count = (
+            await session.execute(
+                select(func.count())
+                .select_from(models.AcquisitionRecord)
+                .where(
+                    models.AcquisitionRecord.run_id == run.id,
+                    models.AcquisitionRecord.snapshot_outcome == SnapshotItemOutcome.REUSED,
+                )
+            )
+        ).scalar_one()
         run.retry_count = counts.get(AcquisitionRecordState.RETRY, 0)
         live_blob_hashes = (
             select(models.AcquisitionRecord.blob_ref.label("hash"))

@@ -855,13 +855,39 @@ authentication loss afterwards cannot block parsing, embedding or publication be
 phases make no connector calls. Missing, stale and deleted source bodies likewise remain typed
 acquisition retries and cannot publish older bytes.
 
+**A confirmed post-enumeration deletion invalidates that inventory, not just one body.** The
+first `source_deleted` fetch remains a safe retry: the completed manifest is not promoted and its
+candidate watermark is not committed. The run records `reenumeration_required`. On the next
+ordinary sync, the connector claim transaction fences and supersedes that run, creates exactly one
+replacement from the last committed watermark, and reports `reenumerating`. Authentication,
+transport and capacity retries continue claiming their existing manifest because they do not prove
+that its identity inventory changed.
+
+Only true exhaustion of the replacement discovery stream changes recovery to `reconciled` and
+counts identities absent from the replacement. A limit, cancellation, expired cursor or discovery
+failure leaves the replacement unfinished and cannot serve as deletion evidence. During bounded
+acquisition, each replacement record may adopt retained bytes from its exact superseded run only
+when workspace, connector instance, scope, source identity, revision token, blob reference, hash,
+length and acquired-source envelope agree. The blob is reopened and validated before adoption;
+changed, absent or corrupt evidence is fetched normally. Shared content hashes remain one distinct
+backlog-capacity charge, and cleanup preserves the predecessor while an unfinished replacement
+still depends on it. If an item is enumerated again but still returns not-found, the replacement is
+marked for another fresh enumeration and remains unpromoted. Strict and allow-omissions policies
+both refuse promotion of an inventory known to be stale.
+
+The aggregate fields `inventory_recovery`, `reused_items` and `reconciled_deleted_items` appear in
+ingest results, connector lifecycle status and snapshot status. They contain no source identity,
+title, URL, blob hash, credential or exception text. Existing databases are migrated by marking
+completed, unpromoted runs with a typed `source_deleted` retry as `reenumeration_required`; their
+retained prefix and candidate watermark are not rewritten.
+
 `connector sync --acquire-only` stops at that exact durable boundary. A complete or
-policy-accepted partial manifest is promoted and its candidate watermark is committed, the run
-remains in `INDEXING`, and the result says local derivation is pending and can continue offline.
-Running ordinary `connector sync` again claims that run and drains the retained envelopes before
-it considers a new enumeration; the acquisition test records the source call count on both sides
-of the resume and requires it not to move. This is a mode of the existing configured connector,
-not a second crawler or an export path.
+inventory-valid policy-accepted partial manifest is promoted and its candidate watermark is
+committed, the run remains in `INDEXING`, and the result says local derivation is pending and can
+continue offline. Running ordinary `connector sync` again claims that run and drains the retained
+envelopes before it considers a new enumeration; the acquisition test records the source call
+count on both sides of the resume and requires it not to move. This is a mode of the existing
+configured connector, not a second crawler or an export path.
 
 An offline generation publication is the other consumer of that hand-off. Its relational pointer
 swap and the settlement of the exact acquisition manifest share one SQLite transaction. Before
@@ -911,10 +937,12 @@ Snapshot verification, connector-free rebuild planning and later rebuilds under 
 identity therefore remain available. Releasing source history or deleting a snapshot is still a
 separate, guarded lifecycle operation. Status exposes snapshot and generation identities but never
 member ids, titles, URLs, bodies, blob hashes or credentials.
-The rerunnable `tools/smoke_offline_rebuild_settlement.py` harness exercises acquire-only,
-connector-disabled publication, a fresh-process status/verification read, a second derived
-identity, and an unchanged sync in separate processes. Its JSON result records aggregate
-foreign-key/pointer/ownership checks and a normalized peak-RSS bound.
+The rerunnable `tools/smoke_offline_rebuild_settlement.py` harness exercises a post-enumeration
+deletion, the safe incomplete result, a fresh-process fenced replacement, zero-fetch reuse of
+every retained current body, one reconciled disappearance, connector-disabled publication, a
+fresh-process status/verification read, a second derived identity, and an unchanged sync. Its JSON
+result records aggregate foreign-key/pointer/ownership checks plus named peak-RSS and
+data-directory bounds for the fixed synthetic corpus.
 
 First indexing, offline-snapshot indexing and re-parse all enter the same derivation function
 with a retained reference. That function parses the bytes it was given and records that existing
@@ -1857,9 +1885,11 @@ contains no mutation controls or JavaScript handlers. MCP retains the aggregate 
 
 ## 11. `reconcile()` and deletion
 
-Incremental sync cannot detect deletion, because a deleted document simply stops appearing —
-which is why `reconcile` is a separate protocol method rather than an implementation detail
-(`contracts.md` §3).
+An ordinary between-enumeration absence is invisible to incremental sync because a deleted
+document simply stops appearing — which is why `reconcile` is a separate protocol method rather
+than an implementation detail (`contracts.md` §3). A typed `source_deleted` after a completed
+enumeration is different: §8.3.1 invalidates that manifest and requires a fresh complete
+enumeration before the absence may be reconciled.
 
 **Cadence.** After every full sync, and on a schedule (`reconcile_interval`, default weekly)
 for connectors that only ever sync incrementally. Deletion detection that runs only when

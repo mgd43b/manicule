@@ -158,12 +158,50 @@ They are here to set expectations about orders of magnitude. They are not benchm
 busier machine moves them: the 38-second run above took 54 seconds with a container build
 alongside it.
 
+### Durable connector hand-off and offline rebuild
+
+A configured connector can stop after it has promoted a complete, locally retained source
+snapshot. The snapshot can then be verified and rebuilt without constructing the connector or
+contacting the source:
+
+```bash
+manicule connector sync handbook --acquire-only
+manicule connector snapshot handbook --json       # copy data.snapshot_id
+manicule connector verify SNAPSHOT_ID
+manicule rebuild plan SNAPSHOT_ID
+manicule rebuild execute SNAPSHOT_ID
+manicule rebuild status GENERATION_ID
+```
+
+There is no separate settlement command: successful publication atomically settles the exact
+acquisition manifest it consumed, and rebuild has no connector or source fallback. Until
+multi-snapshot coordination is built, planning deliberately refuses an installation that is not
+exactly one promoted connector scope with no live documents outside that workspace and source.
+
+`connector snapshot` and `connector list` expose aggregate recovery state. Authentication,
+transport, capacity and temporary body failures retry the same valid manifest. A confirmed
+post-enumeration `source_deleted` reports `reenumeration_required`; the next ordinary sync fences
+that run, starts one replacement from the last committed watermark and reports `reenumerating`.
+Matching retained bodies are validated and reused. Only a replacement discovery that reaches its
+real end may report `reconciled` and remove an absent identity from required membership. A limit,
+expired cursor, cancellation or failed discovery never proves deletion.
+
+Strict policy never promotes while a current member lacks validated evidence. An
+`allow_omissions` snapshot remains honestly partial, and it cannot turn a known-stale inventory
+green. Once a promoted snapshot publishes, source acquisition and derived publication settle in
+the same transaction; a complete snapshot reaches zero backlog while its retained source bytes
+remain available for later connector-free rebuilds. Status exposes counts and typed states, never
+source ids, paths, URLs, bodies, blob hashes, credentials or copied source exceptions. The full
+contract and recovery details are in
+[`docs/ingest.md`](docs/ingest.md#831-durable-discovery-then-bounded-hand-offs) and the
+shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifecycle-status).
+
 ## The four surfaces
 
 | Surface | Started by | Shape |
 |---|---|---|
-| **MCP** | `manicule start --mcp-only` | 28 tools over stdio, which opens no socket; 13 read-only tools at `/mcp/` when served over a port |
-| **Command line** | `manicule <command>` | 21 commands; `--json` anywhere data is emitted |
+| **MCP** | `manicule start --mcp-only` | 37 tools over stdio, which opens no socket; 22 read-only tools at `/mcp/` when served over a port |
+| **Command line** | `manicule <command>` | 27 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 12 areas of server-rendered HTML, 11 in the navigation |
 
@@ -172,7 +210,7 @@ them to it: for the same operation and the same arguments the CLI under `--json`
 and the HTTP route return **byte-identical** envelopes, and the browser page is asserted to
 show what that envelope said rather than anything it worked out for itself.
 
-**The command line** is twenty-one commands; `manicule --help` lists them. Under `--json` the
+**The command line** is twenty-seven commands; `manicule --help` lists them. Under `--json` the
 result envelope is the whole of stdout — no prose, no progress, nothing else — and a failure is
 that same envelope with `"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads
 well-formed JSON whether the command succeeded or not.
@@ -225,7 +263,7 @@ of Node. It also adds **no operation** — every page reads through a service me
 has a route, so there is no upload and no configuration write here either.
 [`docs/web.md`](docs/web.md) has the reasoning, including what that costs.
 
-**The MCP server** is the primary interface: twenty-eight tools over the same service, speaking
+**The MCP server** is the primary interface: thirty-seven tools over the same service, speaking
 stdio by default, which opens no socket at all. To let Claude Code use your index:
 
 ```bash
@@ -261,11 +299,11 @@ $ manicule serve                    # holds the data directory, runs the schedul
 One process owns the data directory at a time. `manicule serve` is that process for as long as
 it runs, and three things follow:
 
-- **Write commands go to it.** `connector sync`, `index`, `document reindex` and the repair
-  verbs detect the running server and forward to it over a `0600` Unix domain socket, streaming
-  progress back. You get the same result, the same output and the same exit status you would
-  have got locally, because it is the same operation. With no server they refuse and say to
-  start one — they never start one for you.
+- **Write commands go to it.** `connector sync`, `index`, `document reindex`, `rebuild execute`
+  and the repair verbs detect the running server and forward to it over a `0600` Unix domain
+  socket, streaming progress back. You get the same result, the same output and the same exit
+  status you would have got locally, because it is the same operation. With no server they refuse
+  and say to start one — they never start one for you.
 - **Reads never need it.** `search`, `ask`, `doctor` and `document list` take no lock and work
   whether or not a server is running.
 - **Confluence sessions live in its memory and nowhere else** — no keychain, no file, no
@@ -357,7 +395,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/container` | Typed resolution and lifecycle. Assembled at startup, injected |
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
-| `src/manicule/cli` | Twenty-two commands over that service, and nothing else |
+| `src/manicule/cli` | Twenty-seven commands over that service, and nothing else |
 | `src/manicule/mcp` | Thirty-seven MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |

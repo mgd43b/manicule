@@ -274,6 +274,9 @@ server and the built command tree.
 | `reembed_status` | ✓ | `reembed status` / `reembed inspect` | private-safe aggregate durable progress |
 | `reembed_abandon` | — | `reembed abandon` | terminal state without a live-pointer change |
 | `reembed_cleanup` | — | `reembed cleanup` | whether terminal non-live storage was removed |
+| `rebuild_plan` | ✓ | `rebuild plan` | connector-free snapshot cost and capacity estimate |
+| `rebuild_run` | — | `rebuild execute` / `rebuild resume` | durable derived generation publication |
+| `rebuild_status` | ✓ | `rebuild status` | private-safe aggregate rebuild checkpoint |
 | `lifecycle_reset_derived` | ✓ dry-run only | `reset-derived --dry-run/--yes` | aggregate derived rows removed; source roots retained |
 | `lifecycle_cleanup_generations` | ✓ dry-run only | `cleanup-derived-generations [--yes]` | eligible/protected generations and temporary bytes |
 | `lifecycle_release_history` | ✓ dry-run only | `release-source-history BEFORE [--yes]` | policy-eligible history and uniquely released bytes |
@@ -319,18 +322,27 @@ same envelope on CLI JSON, authenticated admin HTTP, stdio/control MCP, connecto
 scheduler records. Human CLI renders the enclosing operation while JSON consumers receive the
 same object unchanged. It contains aggregate counts, snapshot completeness and promotion facts,
 watermark presence, backlog and offline-continuation facts, phase/outcome/rate/remaining work,
-producer identities where they are safe, and a typed aggregate capacity or missing-input refusal.
+producer identities where they are safe, inventory recovery state and reconciled deletion count,
+and a typed aggregate capacity or missing-input refusal.
 
 An unavailable fact is null or empty, never an invented zero. The object cannot contain source
 ids, paths, URIs, titles, content or exception context. Re-embedding exposes fingerprints and a
 one-way identity of the live generation, not its private corpus-snapshot handle. Read-only MCP
 registration is unchanged: adding status fields does not add a write tool to the network surface.
 
+`inventory_recovery` has four public-safe values: empty means ordinary same-manifest work;
+`reenumeration_required` means a completed inventory was invalidated and cannot promote;
+`reenumerating` means its fenced replacement is discovering from the committed position; and
+`reconciled` means that replacement reached authoritative exhaustion. `reused_items` counts
+validated retained bodies, and `reconciled_deleted_items` counts predecessor identities absent
+from that complete replacement. Neither count identifies a member. Incomplete enumeration keeps
+the recovery active and the deletion count at zero.
+
 ### Operations with no MCP tool, and why
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
 `connector_sidecar`, `collection_orphans`, `document_reindex_stale`, the five mutating or
-corpus-scanning `reembed` operations and the `auth` verbs are
+corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
 assistant can call unattended should not be able to do any of that. The thirty-seven tools read

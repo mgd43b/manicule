@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         AcquisitionRun,
         AcquisitionRunState,
         AcquisitionSource,
+        SnapshotItemOutcome,
     )
     from manicule.core.content import (
         Chunk,
@@ -468,6 +469,7 @@ class AcquisitionStore(Protocol):
         acquired_source: AcquiredSource | None = None,
         fetched_version_token: str | UnsetValue | None = UNSET,
         diagnostic: AcquisitionDiagnostic | None = None,
+        snapshot_outcome: SnapshotItemOutcome | None = None,
     ) -> AcquisitionRecord: ...
 
     async def settle_unchanged_acquisition_record(
@@ -533,8 +535,11 @@ class AcquisitionStore(Protocol):
     async def reusable_record_from_verified_snapshot(
         self,
         run_id: str,
-        source_id: str,
-        version_token: str | None,
+        source: AcquisitionSource,
+    ) -> AcquisitionRecord | None: ...
+
+    async def reusable_record_from_superseded_run(
+        self, run_id: str, source: AcquisitionSource
     ) -> AcquisitionRecord | None: ...
 
     async def get_acquisition_watermark(

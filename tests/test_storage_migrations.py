@@ -187,6 +187,98 @@ async def test_a_migration_over_a_populated_database_keeps_the_rows(data_dir: Pa
 
 
 @pytest.mark.contract
+async def test_source_deleted_recovery_migration_marks_only_completed_stuck_inventories(
+    data_dir: Path,
+) -> None:
+    engine = create_engine(data_dir)
+    timestamp = "2026-08-16T13:00:00+00:00"
+    try:
+        await upgrade(engine, revision="c97a3e2b10f4")
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces (id, name, mode, settings, created_at) VALUES "
+                    "('default', 'Default', 'personal', '{}', :timestamp)"
+                ),
+                {"timestamp": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO connectors "
+                    "(id, workspace_id, name, type, config, watermark, sync_interval_seconds, "
+                    "status, metadata, created_at) VALUES "
+                    "('default:synthetic-wiki', 'default', 'synthetic-wiki', 'wiki', '{}', "
+                    "NULL, 300, 'active', '{}', :timestamp)"
+                ),
+                {"timestamp": timestamp},
+            )
+            for run_id, completed in (("stuck-deleted", True), ("bounded-deleted", False)):
+                await connection.execute(
+                    text(
+                        "INSERT INTO acquisition_runs "
+                        "(id, workspace_id, connector_id, connector_name, source_scope, "
+                        "scope_fingerprint, scope_inventory_complete, promotion_policy, state, "
+                        "enumeration_completed_at, omission_count, omission_reasons, "
+                        "lease_generation, discovered_count, acquired_count, indexed_count, "
+                        "unchanged_count, retry_count, metadata_bytes, acquired_blob_bytes, "
+                        "created_at, updated_at) VALUES "
+                        "(:run_id, 'default', 'default:synthetic-wiki', 'synthetic-wiki', "
+                        "'instance:synthetic-wiki', 'synthetic-scope', 1, 'require_complete', "
+                        "'acquiring', :completed, 0, '{}', 1, 1, 0, 0, 0, 1, 1, 0, "
+                        ":timestamp, :timestamp)"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "completed": timestamp if completed else None,
+                        "timestamp": timestamp,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO acquisition_records "
+                        "(id, run_id, workspace_id, connector_id, sequence, source_id, "
+                        "source_record, state, snapshot_outcome, attempts, diagnostic, "
+                        "created_at, updated_at) "
+                        "VALUES (:record_id, :run_id, 'default', 'default:synthetic-wiki', 0, "
+                        ":source_id, '{}', :state, :outcome, 1, :diagnostic, :timestamp, "
+                        ":timestamp)"
+                    ),
+                    {
+                        "record_id": f"record-{run_id}",
+                        "run_id": run_id,
+                        "source_id": f"synthetic-{run_id}",
+                        "state": "retry" if completed else "unchanged",
+                        "outcome": None if completed else "reused",
+                        "diagnostic": json.dumps(
+                            {
+                                "stage": "acquisition",
+                                "code": "source_deleted",
+                                "retryable": True,
+                            }
+                        ),
+                        "timestamp": timestamp,
+                    },
+                )
+
+        await upgrade(engine)
+        async with engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT id, inventory_state, reused_count FROM acquisition_runs ORDER BY id"
+                    )
+                )
+            ).all()
+            states = {str(row[0]): (str(row[1]), int(row[2])) for row in rows}
+        assert states == {
+            "bounded-deleted": ("current", 1),
+            "stuck-deleted": ("reenumeration_required", 0),
+        }
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
 async def test_downgrade_refuses_to_expose_retired_real_vector_generations(
     data_dir: Path,
 ) -> None:
