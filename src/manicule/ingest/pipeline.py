@@ -546,6 +546,16 @@ class RunReport:
         self.error_message = str(error)
         self.error = f"{self.error_type}: {self.error_message}"
 
+    def refuse_storage_busy(self, error: StorageBusyError) -> None:
+        """Make exhausted writer retries an aggregate-only retry-required outcome."""
+        # A worker may have recorded glossary diagnostics before another worker exhausted its
+        # bounded writer retries. Those diagnostics contain document identities and arbitrary
+        # detector details, neither of which belongs in an orderly storage-busy report.
+        self.glossary_failures.clear()
+        self.error_type = type(error).__name__
+        self.error_message = str(error)
+        self.error = f"{self.error_type}: {self.error_message}"
+
     def settle(self) -> None:
         """Put the order-sensitive parts into an order that does not depend on who finished first.
 
@@ -1226,10 +1236,7 @@ class IngestPipeline:
                 if capacity_failures:
                     run.report.refuse_capacity(capacity_failures[0])
                 else:
-                    busy = busy_failures[0]
-                    run.report.error_type = type(busy).__name__
-                    run.report.error_message = str(busy)
-                    run.report.error = f"{type(busy).__name__}: {busy}"
+                    run.report.refuse_storage_busy(busy_failures[0])
             else:
                 crashed = True
                 first, detail = _failure_detail(non_capacity)
