@@ -191,20 +191,29 @@ already on disk. No schema change is required to support plurality, and none is 
 ```toml
 [embedding]
 model = "BAAI/bge-m3"          # the default
-provider = "mlx"               # or "onnx"
+provider = "onnx"              # the default; "mlx" needs `manicule-mlx` installed
 
-[plugins.config."embedder.mlx"]
+[plugins.config."embedder.onnx"]
 weights = ""                   # the artifact to execute, when it is not the model's own repo
 weights_revision = ""          # required immutable commit for an explicit remote artifact
 pooling = ""                   # only for a model that declares none; contradicting one is refused
 max_sequence_length = 0        # only for a model that declares none, in usable content tokens
+
+[plugins.config."embedder.mlx"]  # only meaningful with `manicule-mlx` installed
+weights = ""                   # the four above are shared: every backend has them
+weights_revision = ""
+pooling = ""
+max_sequence_length = 0
 cache_limit_mb = 2048          # ceiling on MLX's retained Metal buffers (§3.5)
 ```
 
-`cache_limit_mb` is the only setting here that is one backend's alone, and it is on the MLX
-config model rather than the shared one so that writing it under
-`[plugins.config."embedder.onnx"]` is *refused*. onnxruntime has no such allocator, and quietly
-accepting the setting would leave an operator believing they had bounded something.
+`cache_limit_mb` is the only setting here that is one backend's alone, and it lives on a config
+model that backend declares — in its own distribution, since the MLX backend ships as
+`manicule-mlx` — rather than on the shared one. That is what makes writing it under
+`[plugins.config."embedder.onnx"]` *refused* rather than ignored: onnxruntime has no such
+allocator, and quietly accepting the setting would leave an operator believing they had bounded
+something. The mechanism is `extra="forbid"` on a per-backend model, and it is available to any
+out-of-tree backend for the same reason.
 
 A model outside the known-good set is accepted, and everything that decides vector-space
 compatibility is read from **its own repository** rather than from a table — which is stronger

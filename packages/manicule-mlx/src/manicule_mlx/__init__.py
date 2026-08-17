@@ -2,8 +2,15 @@
 
 There is no shorter route into manicule than this one. The backend claims the ``embedder.mlx``
 slot through the public ``manicule.plugins`` entry-point group, exactly as any other plugin
-would, and ``[embedding] provider = "mlx"`` resolves to it. manicule has no special knowledge
-that this package exists.
+would, and ``[embedding] provider = "mlx"`` resolves to it through ordinary discovery.
+
+manicule knows this package's *name* in exactly one place, and it is not a structural
+dependency: ``manicule.plugins.registry.KNOWN_DISTRIBUTIONS`` maps ``embedder.mlx`` to an
+install hint, so that a configuration naming ``mlx`` on an installation without it gets "install
+manicule-mlx" rather than a correct but unhelpful "no embedder named 'mlx'. Available: onnx".
+`mlx` was manicule's default until this package existed, so that configuration is a thing people
+actually have. Nothing else in manicule refers to it, and `tests/test_license_boundary.py`
+fails if manicule ever grows a real dependency on it.
 
 **Nothing here imports MLX.** Registration needs only the configuration model, so an
 installation that has this package present but selects ``onnx`` never loads Metal. The runtime
