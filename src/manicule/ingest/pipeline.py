@@ -1677,6 +1677,12 @@ class IngestPipeline:
                     discovered_batch = await anext(stream)
                 except StopAsyncIteration:
                     break
+                # Cancellation can arrive while the connector itself is suspended inside
+                # ``anext``. The pre-call check prevents a new request after a committed page;
+                # this post-call check prevents a response already in flight from being
+                # admitted after the stop.
+                if run.stop.is_set():
+                    break
                 if not discovered_batch:
                     if run.limit is not None and run.accepted >= run.limit:
                         run.report.limited = True
