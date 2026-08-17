@@ -709,11 +709,12 @@ only, a deletion ceiling, and soft delete only). The connector's half is to fail
 that "everything is gone" and "nothing answered" never look alike.
 
 Reconciliation uses the same response-page hand-off as discovery. The durable inventory commits
-each ids-only source page before another cursor is requested, including an empty page after scope
-filtering. It does not infer a boundary from a local item count, so a configured 250-result page
-cannot be split by the pipeline's unrelated inventory write size. Subtree reconciliation builds
-its bounded membership index as it yields those native search pages; it never drains the tree and
-re-slices the completed result locally.
+each nonempty ids-only source page before another cursor is requested; an empty page after scope
+filtering has nothing to write and is acknowledged at the same boundary without inventing a
+transaction. It does not infer a boundary from a local item count, so a configured 250-result
+page cannot be split by the pipeline's unrelated inventory write size. Subtree reconciliation
+builds its bounded membership index as it yields those native search pages; it never drains the
+tree and re-slices the completed result locally.
 
 ## 4. Fetching content
 
