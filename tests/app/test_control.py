@@ -559,3 +559,52 @@ async def test_an_unexpected_handler_failure_returns_one_private_safe_envelope(
         assert following["ok"] is True
     finally:
         await server.aclose()
+
+
+async def test_client_disconnect_does_not_cancel_work_or_poison_the_next_request(
+    socket_for: Callable[[], Path],
+) -> None:
+    """The server owns accepted work even when the client stops waiting for its envelope."""
+
+    class Completing(Echo):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hold = True
+            self.entered = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        @override
+        async def handle(
+            self, request: control.Request, report: Callable[[str], None]
+        ) -> dict[str, JsonValue]:
+            try:
+                self.entered.set()
+                return await super().handle(request, report)
+            finally:
+                self.finished.set()
+
+    path = socket_for()
+    handler = Completing()
+    server = await serving(path, handler)
+    reader, writer = await asyncio.open_unix_connection(path)
+    del reader
+    try:
+        writer.write(control.Invoke(op="connector_sync").to_line())
+        await writer.drain()
+        await asyncio.wait_for(handler.entered.wait(), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+
+        handler.released.set()
+        await asyncio.wait_for(handler.finished.wait(), timeout=5)
+        following = await control.connect(
+            path, control.Invoke(op="connector_list"), on_progress=lambda _: None
+        )
+        assert following["ok"] is True
+        assert [getattr(request, "op", "") for request in handler.seen] == [
+            "connector_sync",
+            "connector_list",
+        ]
+    finally:
+        handler.released.set()
+        await server.aclose()

@@ -8,6 +8,9 @@ import hmac
 import json
 import shutil
 import sqlite3
+import threading
+import weakref
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import TYPE_CHECKING, Any, cast
 
@@ -73,6 +76,82 @@ _OMISSION_REASONS = TypeAdapter(dict[AcquisitionFailureCode, int])
 _SQLITE_BUSY_RETRY_DELAYS = (0.0, 0.01, 0.05)
 
 
+def _empty_abandoned_leases() -> set[tuple[str, str, str, int]]:
+    return set()
+
+
+@dataclass
+class _EngineWriterState:
+    """One cancellation-safe admission queue and abandoned-lease set per engine."""
+
+    admission: asyncio.Lock = field(default_factory=asyncio.Lock)
+    abandoned_leases: set[tuple[str, str, str, int]] = field(
+        default_factory=_empty_abandoned_leases
+    )
+
+
+_ENGINE_WRITER_STATES: weakref.WeakKeyDictionary[Any, _EngineWriterState] = (
+    weakref.WeakKeyDictionary()
+)
+_ENGINE_WRITER_STATES_LOCK = threading.Lock()
+
+
+def _engine_writer_state(store: WorkspaceScoped) -> _EngineWriterState:
+    """Return process-local coordination shared by all workspace handles for an engine."""
+    engine = store.engine
+    with _ENGINE_WRITER_STATES_LOCK:
+        state = _ENGINE_WRITER_STATES.get(engine)
+        if state is None:
+            state = _EngineWriterState()
+            _ENGINE_WRITER_STATES[engine] = state
+        return state
+
+
+def _lease_key(
+    store: WorkspaceScoped,
+    run_id: str,
+    owner: str,
+    generation: int,
+) -> tuple[str, str, str, int]:
+    return (store.workspace_id, run_id, owner, generation)
+
+
+def _operation_releases_lease(operation_name: str, kwargs: Mapping[str, Any]) -> bool:
+    return operation_name == "release_acquisition_lease" or (
+        operation_name == "record_acquisition_run_metadata" and kwargs.get("release") is True
+    )
+
+
+def _release_key_from_call(
+    store: WorkspaceScoped, args: tuple[Any, ...], kwargs: Mapping[str, Any]
+) -> tuple[str, str, str, int]:
+    def argument(position: int, name: str) -> Any:  # noqa: ANN401
+        try:
+            return args[position]
+        except IndexError:
+            return kwargs[name]
+
+    run_id = argument(1, "run_id")
+    owner = argument(2, "owner")
+    generation = argument(3, "generation")
+    return _lease_key(store, cast("str", run_id), cast("str", owner), cast("int", generation))
+
+
+def _clear_replaced_lease_tokens(
+    state: _EngineWriterState,
+    store: WorkspaceScoped,
+    run_id: str,
+    generation: int,
+) -> None:
+    state.abandoned_leases.difference_update(
+        {
+            key
+            for key in state.abandoned_leases
+            if key[0] == store.workspace_id and key[1] == run_id and key[3] < generation
+        }
+    )
+
+
 def _sqlite_busy(error: BaseException) -> bool:
     """Recognize SQLITE_BUSY through SQLAlchemy without retaining its SQL-shaped wrapper."""
     pending: list[BaseException] = [error]
@@ -104,21 +183,53 @@ def translate_storage_capacity_errors[F: Callable[..., Coroutine[Any, Any, Any]]
 
     @wraps(operation)
     async def bounded(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-        exhausted = False
-        for delay in _SQLITE_BUSY_RETRY_DELAYS:
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                return await capacity_safe(*args, **kwargs)
-            except Exception as error:
-                if not _sqlite_busy(error):
-                    raise
-                exhausted = True
-        if exhausted:
-            # Outside the handler: no SQL, path, bound value, or exception chain survives into
-            # the durable report or served control envelope.
-            raise StorageBusyError from None
-        raise AssertionError("SQLite retry policy has no attempts")  # pragma: no cover
+        store = args[0]
+        state = _engine_writer_state(store)
+        releases_lease = _operation_releases_lease(operation.__name__, kwargs)
+        release_key = _release_key_from_call(store, args, kwargs) if releases_lease else None
+        # asyncio.Lock queues managed writers before they open a transaction. Cancellation of a
+        # waiter removes it from the queue; cancellation of an owner exits this context only
+        # after the operation's session context has rolled back and closed.
+        async with state.admission:
+            exhausted = False
+            for delay in _SQLITE_BUSY_RETRY_DELAYS:
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    result = await capacity_safe(*args, **kwargs)
+                except Exception as error:
+                    if not _sqlite_busy(error):
+                        raise
+                    exhausted = True
+                else:
+                    if releases_lease:
+                        if release_key is None:  # pragma: no cover - derived with releases_lease
+                            raise AssertionError("release operation has no generation key")
+                        state.abandoned_leases.discard(release_key)
+                    if (
+                        operation.__name__
+                        in {
+                            "claim_acquisition_run",
+                            "claim_or_create_acquisition_run",
+                        }
+                        and result is not None
+                    ):
+                        _clear_replaced_lease_tokens(
+                            state, store, result.id, result.lease_generation
+                        )
+                    return result
+            if exhausted:
+                if releases_lease:
+                    # SQLite could not persist the cleanup. Remember only this exact fenced
+                    # generation so a later local invocation may replace it once the external
+                    # writer is gone; a different owner/generation can never use this token.
+                    if release_key is None:  # pragma: no cover - derived with releases_lease
+                        raise AssertionError("release operation has no generation key")
+                    state.abandoned_leases.add(release_key)
+                # Outside the handler: no SQL, path, bound value, or exception chain survives
+                # into the durable report or served control envelope.
+                raise StorageBusyError from None
+            raise AssertionError("SQLite retry policy has no attempts")  # pragma: no cover
 
     return cast("F", bounded)
 
@@ -1397,8 +1508,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 return _run(row)
             for obsolete in superseded:
                 obsolete.superseded_by = row.id
-            if row.lease_owner is not None and (
-                row.lease_expires_at is None or row.lease_expires_at > now
+            abandoned = (
+                row.lease_owner is not None
+                and _lease_key(self, row.id, row.lease_owner, row.lease_generation)
+                in _engine_writer_state(self).abandoned_leases
+            )
+            if (
+                row.lease_owner is not None
+                and (row.lease_expires_at is None or row.lease_expires_at > now)
+                and not abandoned
             ):
                 return None
             row.lease_owner = owner
@@ -1647,6 +1765,25 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         if expires_at <= now:
             msg = "lease expiry must be after now"
             raise ValueError(msg)
+        writer_state = _engine_writer_state(self)
+        abandoned = [
+            (prior_owner, generation)
+            for workspace_id, abandoned_run_id, prior_owner, generation in (
+                writer_state.abandoned_leases
+            )
+            if workspace_id == self._workspace_id and abandoned_run_id == run_id
+        ]
+        claimable = [
+            models.AcquisitionRun.lease_owner.is_(None),
+            models.AcquisitionRun.lease_expires_at <= now,
+        ]
+        claimable.extend(
+            and_(
+                models.AcquisitionRun.lease_owner == prior_owner,
+                models.AcquisitionRun.lease_generation == generation,
+            )
+            for prior_owner, generation in abandoned
+        )
         async with self._sessions.begin() as session:
             result = cast(
                 "CursorResult[Any]",
@@ -1657,10 +1794,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         models.AcquisitionRun.workspace_id == self._workspace_id,
                         models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
                         models.AcquisitionRun.superseded_at.is_(None),
-                        or_(
-                            models.AcquisitionRun.lease_owner.is_(None),
-                            models.AcquisitionRun.lease_expires_at <= now,
-                        ),
+                        or_(*claimable),
                     )
                     .values(
                         lease_owner=owner,
@@ -1672,7 +1806,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             )
             if result.rowcount != 1:
                 return None
-            return _run(await self._required_run_row(session, run_id))
+            claimed = _run(await self._required_run_row(session, run_id))
+        writer_state.abandoned_leases.difference_update(
+            {
+                key
+                for key in writer_state.abandoned_leases
+                if key[0] == self._workspace_id and key[1] == run_id
+            }
+        )
+        return claimed
 
     @translate_storage_capacity_errors
     async def renew_acquisition_lease(
@@ -1756,6 +1898,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         if release:
             values.update(lease_owner=None, lease_expires_at=None)
         async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
             matched = cast(
                 "CursorResult[Any]",
                 await session.execute(
