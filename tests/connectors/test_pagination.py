@@ -13,12 +13,13 @@ A suite that walked two pages of a well-behaved cursor would certify nothing at 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import cast
+from typing import Any, cast
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
 
+import manicule.connectors.client as client_module
 from manicule.connectors import ConnectorError, CursorExpiredError, UntrustedLinkError
 from manicule.connectors.client import ConfluenceClient
 from manicule.connectors.confluence import ConfluenceConnector
@@ -240,6 +241,48 @@ async def test_a_cursor_held_longer_than_its_lifetime_is_refused() -> None:
                 await anext(stream)
     finally:
         await connector.teardown()
+
+
+async def test_cursor_history_io_is_included_in_the_cursor_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled disk ledger cannot open an unchecked expiry window before request two."""
+    instance = _instance()
+    clock = Clock()
+    original = client_module._CursorHistory.add  # pyright: ignore[reportPrivateUsage]
+
+    def delayed_add(
+        history: Any,
+        url: str,
+        params: list[tuple[str, str]],
+    ) -> bool:
+        added = original(history, url, params)
+        clock.advance(61.0)
+        return added
+
+    monkeypatch.setattr("manicule.connectors.client._CursorHistory.add", delayed_add)
+    connector = await connected(
+        instance,
+        cloud_config(
+            base_url=instance.base_url,
+            spaces=("ENG",),
+            cursor_lifetime_seconds=60.0,
+        ),
+        clock=clock,
+    )
+    try:
+        async with closing(connector.discover(None)) as stream:
+            await anext(stream)
+            await anext(stream)
+            with pytest.raises(CursorExpiredError, match="cursor_lifetime_seconds"):
+                await anext(stream)
+    finally:
+        await connector.teardown()
+
+    searches = [
+        request for request in instance.requests if request.url.path.endswith("/content/search")
+    ]
+    assert len(searches) == 1, "the expired second cursor must not reach the transport"
 
 
 async def test_a_next_link_that_repeats_without_a_cursor_stops_the_walk() -> None:

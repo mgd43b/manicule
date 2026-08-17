@@ -393,7 +393,9 @@ requests carrying two. It scales with the configuration instead of with the acco
   same reason: a loop over a paginated search reads as a very large space. Followed-request
   fingerprints live in a temporary disk-backed exact-membership ledger with a capped SQLite page
   cache, so exact long-cycle detection does not grow process memory with the number of pages. A
-  digest collision refuses the request and therefore fails closed.
+  digest collision refuses the request and therefore fails closed. The cursor-age check runs
+  after that disk write, immediately before the next request, so a stalled ledger cannot create
+  an unchecked expiry window of its own.
 
   **The durable pipeline's side is a journal boundary, not downstream backpressure.** When that
   path is wired, each bounded source response commits atomically before the connector follows its
@@ -529,7 +531,9 @@ query is sent at all and the run costs the page tree only. With it on, a scoped 
 resolves the whole subtree's page ids once (ids and ancestor ids, bounded by the subtree rather
 than by the space) so that an attachment added to a page that has *not* changed since the
 watermark can still be placed. That is an ids-only enumeration of the subtree per run, and it is
-what makes the incremental attachment case correct rather than approximately correct.
+what makes the incremental attachment case correct rather than approximately correct. The
+membership index is an exact temporary SQLite table with a fixed page cache, deleted when the
+enumeration closes; only the current response page is retained in process memory.
 
 ### Changing the roots
 
@@ -707,7 +711,9 @@ that "everything is gone" and "nothing answered" never look alike.
 Reconciliation uses the same response-page hand-off as discovery. The durable inventory commits
 each ids-only source page before another cursor is requested, including an empty page after scope
 filtering. It does not infer a boundary from a local item count, so a configured 250-result page
-cannot be split by the pipeline's unrelated inventory write size.
+cannot be split by the pipeline's unrelated inventory write size. Subtree reconciliation builds
+its bounded membership index as it yields those native search pages; it never drains the tree and
+re-slices the completed result locally.
 
 ## 4. Fetching content
 

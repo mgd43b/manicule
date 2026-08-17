@@ -15,7 +15,7 @@ import resource
 import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
 from sqlalchemy import text
@@ -1614,6 +1614,77 @@ async def test_real_confluence_pages_admit_10251_records_to_true_end(
     ]
     assert len(search_requests) == 42
     assert clock.now == pytest.approx(4.2)
+
+
+async def test_cancellation_after_page_commit_does_not_request_the_next_cursor(
+    engine: AsyncEngine,
+) -> None:
+    """The stop barrier is before ``anext`` rather than after a discarded response."""
+
+    class PausedJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.committed = asyncio.Event()
+            self.release = asyncio.Event()
+
+        @override
+        async def append_acquisition_records(
+            self,
+            run_id: str,
+            sequence: int,
+            sources: Sequence[AcquisitionSource],
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> Sequence[AcquisitionRecord]:
+            admitted = await super().append_acquisition_records(
+                run_id,
+                sequence,
+                sources,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+            self.committed.set()
+            await self.release.wait()
+            return admitted
+
+    class StopObservedPipeline(IngestPipeline):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.stopping = asyncio.Event()
+
+        @override
+        async def _stop_within_grace(self, run: Any, stages: asyncio.Task[None]) -> None:
+            run.stop.set()
+            self.stopping.set()
+            await super()._stop_within_grace(run, stages)
+
+    journal = PausedJournal()
+    await journal.ensure_workspace()
+    pipeline = StopObservedPipeline(store=journal, acquisitions=journal)
+    connector = fakes.ExpiringCursorConnector(
+        {f"synthetic-{number}": "public" for number in range(4)},
+        clock=fakes.ManualClock(),
+        page_size=2,
+        cursor_lifetime_seconds=60,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector, acquire_only=True))
+    await journal.committed.wait()
+    assert connector.pages_requested == 1
+    task.cancel()
+    await pipeline.stopping.wait()
+    journal.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert connector.pages_requested == 1
+    durable = await journal.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == 2
+    assert durable.enumeration_completed_at is None
 
 
 async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(  # noqa: PLR0915 - one end-to-end evidence record

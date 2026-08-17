@@ -855,6 +855,23 @@ async def test_discovery_and_reconciliation_report_the_same_scope() -> None:
     assert discovered == reconciled
 
 
+async def test_scoped_reconciliation_preserves_native_search_page_boundaries() -> None:
+    """Page two is not requested until page one has been handed to durable reconciliation."""
+    instance = _instance(page_size=2)
+    connector = await connected(instance, _scoped(instance, page_size=2))
+    try:
+        async with closing(connector.reconcile_batches()) as batches:
+            first = await anext(batches)
+            assert len(first) == 2
+            assert len(instance.queries()) == 1
+
+            second = await anext(batches)
+            assert len(second) == 2
+            assert len(instance.queries()) == 2
+    finally:
+        await connector.teardown()
+
+
 async def test_a_failure_part_way_through_a_scoped_reconciliation_raises() -> None:
     """The ids seen so far are not the truth, and diffing them soft-deletes the difference.
 

@@ -1672,8 +1672,10 @@ class IngestPipeline:
             return
         stream = self._durable_discovery_batches(run)
         try:
-            async for discovered_batch in stream:
-                if run.stop.is_set():
+            while not run.stop.is_set():
+                try:
+                    discovered_batch = await anext(stream)
+                except StopAsyncIteration:
                     break
                 if not discovered_batch:
                     if run.limit is not None and run.accepted >= run.limit:
@@ -1719,7 +1721,7 @@ class IngestPipeline:
                 if run.limit is not None and run.accepted >= run.limit:
                     run.report.limited = True
                     break
-            else:
+            if not run.stop.is_set() and not run.report.limited:
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now)
                 completed = await acquisitions.complete_acquisition_enumeration(

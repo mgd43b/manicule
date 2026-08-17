@@ -31,7 +31,6 @@ import logging
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from itertools import islice
 from typing import cast
 from urllib.parse import quote
 
@@ -397,17 +396,23 @@ class ConfluenceConnector:
         spaces = await self._spaces()
         scope = await self._scope(spaces)
 
-        for space in spaces if scope is None else scope.spaces():
-            newest: datetime | None = None
-            async for batch in self._changed_in_batches(space, scope, self._since(carried, space)):
-                newest = cql.latest([newest, *(when for _, when in batch)])
-                yield tuple(found for found, _ in batch)
-            # Only after the space's enumeration has run to completion: a watermark advanced
-            # from a partial walk skips whatever the rest of the walk would have returned, and
-            # nothing ever looks for it again.
-            if newest is not None:
-                self._observed[space] = newest
-        self._enumerated = True
+        try:
+            for space in spaces if scope is None else scope.spaces():
+                newest: datetime | None = None
+                async for batch in self._changed_in_batches(
+                    space, scope, self._since(carried, space)
+                ):
+                    newest = cql.latest([newest, *(when for _, when in batch)])
+                    yield tuple(found for found, _ in batch)
+                # Only after the space's enumeration has run to completion: a watermark advanced
+                # from a partial walk skips whatever the rest of the walk would have returned, and
+                # nothing ever looks for it again.
+                if newest is not None:
+                    self._observed[space] = newest
+            self._enumerated = True
+        finally:
+            if scope is not None:
+                scope.close()
 
     async def _changed_in(
         self, space: str, scope: Subtree | None, since: str | None
@@ -766,24 +771,25 @@ class ConfluenceConnector:
                     )
             return
 
-        for space in scope.spaces():
-            # The page enumeration and the scope are one thing: `members` is the live query,
-            # already checked page by page against the configured roots and already guarded
-            # against a subtree that only looks empty.
-            members = await scope.members(space)
-            member_ids = iter(members)
-            while page := tuple(islice(member_ids, self._config.page_size)):
-                yield page
-            if not self._config.include_attachments:
-                continue
-            query = self._content_query(space, types=(ATTACHMENT,), ordered=False)
-            async for page in self._search_batches(query, expand="container"):
-                yield tuple(
-                    source_id
-                    for result, _ in page
-                    if (source_id := _str(result.get("id")))
-                    and _str(_obj(result.get("container")).get("id")) in members
-                )
+        try:
+            for space in scope.spaces():
+                # The page enumeration and the scope are one thing: each native search page is
+                # yielded for durable reconciliation before its next cursor is requested.
+                async for page in scope.member_batches(space):
+                    yield page
+                if not self._config.include_attachments:
+                    continue
+                members = await scope.members(space)
+                query = self._content_query(space, types=(ATTACHMENT,), ordered=False)
+                async for page in self._search_batches(query, expand="container"):
+                    yield tuple(
+                        source_id
+                        for result, _ in page
+                        if (source_id := _str(result.get("id")))
+                        and _str(_obj(result.get("container")).get("id")) in members
+                    )
+        finally:
+            scope.close()
 
     # --- fetch ---------------------------------------------------------------------------
 

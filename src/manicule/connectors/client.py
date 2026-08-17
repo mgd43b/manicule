@@ -278,6 +278,11 @@ class ConfluenceClient:
                 if following is None:
                     return
 
+                # The history insertion is disk-backed on purpose. Include that I/O in the
+                # cursor's held time: checking before it would leave an unguarded stall between
+                # the check and the next request, which is precisely where an expired cursor
+                # must never be followed.
+                is_new = followed.add(following.url, following.params)
                 held = self._clock() - received
                 if held > self._config.cursor_lifetime_seconds:
                     msg = (
@@ -292,7 +297,7 @@ class ConfluenceClient:
                     )
                     raise CursorExpiredError(msg)
 
-                if not followed.add(following.url, following.params):
+                if not is_new:
                     msg = (
                         f"pagination was sent back to a page it has already followed "
                         f"(cursor {following.cursor[:24]!r}). Continuing would enumerate the same "
