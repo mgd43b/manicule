@@ -1,7 +1,7 @@
 # manicule
 
 [![CI](https://github.com/mgd43b/manicule/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mgd43b/manicule/actions/workflows/ci.yml)
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
 
 Self-hosted retrieval infrastructure for AI assistants. **MCP is the primary interface**: an
@@ -476,15 +476,28 @@ uv run ruff check . && uv run pyright
 
 ## License
 
-**GPL-3.0-or-later.** See [`LICENSE`](LICENSE).
+**MIT.** See [`LICENSE`](LICENSE).
 
-The embedding runtime decided this. `mlx-embeddings` is GPL-3.0, and running embeddings
-in-process on Apple silicon is what keeps installing manicule a single command with no model
-server to operate alongside it. Changing the license was chosen over changing the dependency.
+Nothing in manicule's dependency closure is copyleft. A plugin you write is yours to license as
+you choose, and so is anything you build on top.
 
-**This reaches plugins.** They load in-process, in the same address space, through
-`importlib.metadata` entry points — not over a socket or a subprocess boundary. A plugin
-distributed to others is very likely a derivative work under the GPL, which was not true when
-this project was MIT. It is stated here rather than discovered by whoever publishes the first
-one. Nothing in this repository decides it for you: take advice if you intend to distribute a
-plugin under other terms.
+**One optional package is not MIT, and it is packaged separately for exactly that reason.**
+[`manicule-mlx`](packages/manicule-mlx) is the Metal-native embedding backend for Apple silicon,
+roughly four to five times faster than the default on the indexing path. It links
+`mlx-embeddings`, which is GPL-3.0, so that package is **GPL-3.0-or-later**. manicule was
+GPL-3.0-or-later itself until the backend moved out of it.
+
+What that means:
+
+- `uv pip install manicule` — an MIT program, with `onnx` as the embedding backend. Runs
+  everywhere.
+- `uv pip install manicule manicule-mlx` — faster on Apple silicon, and the combination on your
+  machine is GPL-3.0. Running it obliges you to nothing; the GPL's obligations attach to
+  *distribution*.
+- A plugin that imports `manicule_mlx` is very likely a derivative work of it. A plugin that
+  does not, is not.
+
+**Switching backends never re-embeds.** `backend` is excluded from the embedding fingerprint's
+identity, and the two agree to cosine 0.99999998 with identical retrieval ranking — asserted in
+`packages/manicule-mlx/tests/test_parity.py` rather than assumed. Installing or removing the
+package is an operation, not a migration.

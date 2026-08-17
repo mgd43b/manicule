@@ -16,9 +16,9 @@ finding, and a report that omits the misleading number cannot show that.
 
 Usage::
 
-    uv run tools/qualify_mlx_memory.py                       # 120 passes, human-readable
-    uv run tools/qualify_mlx_memory.py --json report.json    # and a report to attach
-    uv run tools/qualify_mlx_memory.py --passes 200
+    uv run packages/manicule-mlx/tools/qualify_memory.py                    # 120 passes
+    uv run packages/manicule-mlx/tools/qualify_memory.py --json report.json # and a report
+    uv run packages/manicule-mlx/tools/qualify_memory.py --passes 200
 
 **It downloads nothing.** The MLX weights for the model must already be cached; without them it
 refuses rather than fetching several gigabytes. That is what lets it be wired to the existing
@@ -40,7 +40,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = PACKAGE_ROOT.parent.parent
+# Both distributions, so this runs from a checkout without either being installed. `manicule`
+# lives in the repository root's `src/` and this package's backend in its own — the two were
+# one tree until the MLX backend moved out, which is why there are two entries rather than one.
+sys.path.insert(0, str(PACKAGE_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 GIB = 1024**3
@@ -163,12 +168,12 @@ async def run_child(passes: int, cache_limit_mb: int | None) -> None:
     # Deferred, and it matters: only the child may import MLX. The parent measures a process
     # holding Metal allocations, and it cannot be one of them.
     import mlx.core as mx  # noqa: PLC0415
-
-    from manicule.embedding.cards import read_card  # noqa: PLC0415
-    from manicule.embedding.runtimes.mlx_backend import (  # noqa: PLC0415
+    from manicule_mlx.backend import (  # noqa: PLC0415
         DEFAULT_CACHE_LIMIT_BYTES,
         MlxEmbedder,
     )
+
+    from manicule.embedding.cards import read_card  # noqa: PLC0415
 
     limit = DEFAULT_CACHE_LIMIT_BYTES if cache_limit_mb is None else cache_limit_mb * 1024 * 1024
     card = read_card(MODEL)

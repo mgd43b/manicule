@@ -146,12 +146,19 @@ EMBEDDING_LIBRARIES = (
     "mlx_embeddings",
     "transformers",
 )
-"""The libraries the built-in embedders are built on.
+"""The libraries an embedding backend is built on, built-in or not.
 
 Installed in this environment on at least one platform, so — like
 :data:`PARSING_LIBRARIES` — the claim is "an installed package is not loaded until something
 needs it" rather than "a missing package stays missing". ``mlx`` and ``mlx_embeddings`` are
 Apple-only and absent elsewhere; the check is the same either way.
+
+``mlx`` and ``mlx_embeddings`` reach this environment through ``manicule-mlx``, which is a
+separate distribution and not a dependency of manicule — and that makes the check say more than
+it used to, not less. Discovery imports *every* installed plugin's entry point, this one
+included, so a green run is evidence that registering the MLX backend costs nothing until
+something selects it. A ``manicule_mlx/__init__.py`` that imported its own backend eagerly
+would fail here.
 """
 
 

@@ -21,7 +21,7 @@ import pytest
 from manicule.core.retrieval import ConfidenceBand, Query
 from manicule.retrieval.confidence import DEFINITION_CITED, NOTHING_RESEMBLES
 from manicule.retrieval.expansion import ExpansionPolicy
-from tests.embedding_support import FULL_MODEL, require_model, requires_mlx
+from tests.embedding_support import FULL_MODEL, require_model
 from tests.glossary import corpus, system
 
 if TYPE_CHECKING:
@@ -32,12 +32,18 @@ LIMIT = 10
 
 
 async def _embedder() -> Embedder:
-    requires_mlx(FULL_MODEL)
-    require_model(FULL_MODEL, mlx=True)
-    from manicule.embedding.cards import read_card  # noqa: PLC0415 - an embeddings extra
-    from manicule.embedding.runtimes.mlx_backend import MlxEmbedder  # noqa: PLC0415
+    """The real model, on the backend this distribution ships.
 
-    built = MlxEmbedder(read_card(FULL_MODEL))
+    Was MLX, for no reason beyond it having been the default. The measurement below is a
+    retrieval-quality claim about *vectors*, and the two backends agree on those to cosine
+    0.99999998 — so the figures are unchanged, and manicule's own suite no longer needs the
+    separately licensed `manicule-mlx` installed to reproduce them.
+    """
+    require_model(FULL_MODEL, onnx=True)
+    from manicule.embedding.cards import read_card  # noqa: PLC0415 - an embeddings extra
+    from manicule.embedding.runtimes.onnx_backend import OnnxEmbedder  # noqa: PLC0415
+
+    built = OnnxEmbedder(read_card(FULL_MODEL))
     await built.setup()
     return built
 

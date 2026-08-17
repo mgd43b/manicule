@@ -16,7 +16,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 from importlib.metadata import EntryPoint, entry_points
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, override
+from typing import TYPE_CHECKING, Final, Protocol, override
 
 from pydantic import BaseModel
 
@@ -30,6 +30,24 @@ if TYPE_CHECKING:
 
 ENTRY_POINT_GROUP = "manicule.plugins"
 """The one group. Built-in and third-party components are indistinguishable here."""
+
+KNOWN_DISTRIBUTIONS: Final[Mapping[tuple[ComponentKind, str], str]] = {
+    (ComponentKind.EMBEDDER, "mlx"): (
+        "The MLX backend ships separately, as `manicule-mlx`: install it with "
+        "`uv pip install manicule-mlx` on Apple Silicon. It is GPL-3.0-or-later where manicule "
+        "is MIT, which is why it is a second install rather than an extra. Switching to it "
+        "never re-embeds — `backend` is excluded from the embedding fingerprint's identity."
+    ),
+}
+"""Components manicule knows the name of but does not ship, mapped to how to get them.
+
+Deliberately small, and deliberately not a plugin index. It exists for one failure: a
+configuration that names `mlx` — which was manicule's default until the backend moved to its own
+distribution — on an installation that has never had it. Without this the message is a correct
+"no embedder named 'mlx'. Available: onnx", which reads as though the name were a typo rather
+than a package the operator can install. Anything genuinely third-party stays absent from here;
+guessing a distribution name for a component we do not ship would be worse than saying nothing.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,11 +264,14 @@ class ComponentRegistry:
         found = self._records.get((key.kind, key.name))
         if found is None:
             available = ", ".join(self.names(key.kind)) or "none installed"
+            remedy = KNOWN_DISTRIBUTIONS.get((key.kind, key.name))
             msg = (
                 f"no {key.kind.value} named {key.name!r}. Available: {available}. "
                 f"Plugins are found through the {ENTRY_POINT_GROUP!r} entry-point group; "
                 f"a plugin that is installed but not listed here did not register it."
             )
+            if remedy is not None:
+                msg = f"{msg} {remedy}"
             raise UnknownComponentError(msg)
         return found  # pyright: ignore[reportReturnType] - key's type parameter is the contract
 

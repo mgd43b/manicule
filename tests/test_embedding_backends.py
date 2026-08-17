@@ -1,21 +1,21 @@
-"""Real weights, both runtimes, and the measurement that keeps ``backend`` out of identity.
+"""Real weights on the backend this distribution ships, and what a declaration cannot decide.
 
-The synthetic suites check everything that can be decided from a declaration. Two things
-cannot, and they are here:
+The synthetic suites check everything that follows from a model's declaration. What does not:
+**an export\'s convenience output is not reliably the model\'s own pooling**, and the shapes it
+arrives in vary per export with nothing in the names to tell them apart. That can only be shown
+against real weights, and it is shown here.
 
-**The convenience fields lie, differently, per runtime.** For ``bge-m3``, ``mlx-embeddings``
-computes ``text_embeds`` with mean pooling although the model declares CLS, while the ONNX
-export's ``sentence_embedding`` *is* the declared pooling. The same shortcut is wrong on one
-backend and right on the other, which is why neither is taken and why this can only be shown
-against real weights.
-
-**The runtimes agree.** ``EmbedFingerprint`` excludes ``backend`` from identity so that a
-corpus moves between machines without a re-embed. That exclusion is a claim about numbers, and
-this file is where the claim is checked. If it ever fails, the correction is to move
-``backend`` into ``IDENTITY_FIELDS`` — not to widen the tolerance.
+**The cross-backend parity measurement is no longer in this file, and not in this
+distribution.** ``EmbedFingerprint`` still excludes ``backend`` from identity so that a corpus
+moves between machines — and between runtimes — without a re-embed, and that exclusion is still
+manicule\'s claim. But the second runtime ships separately now: ``mlx-embeddings`` is GPL-3.0,
+so the Metal backend lives in ``manicule-mlx``. The measurement that licenses the exclusion is
+``packages/manicule-mlx/tests/test_parity.py``, which depends on manicule, imports both
+backends, and runs in the same CI job. Keeping the two packages in one repository is what keeps
+that claim checked rather than merely asserted.
 
 Weights are found in the local model cache and never downloaded from here; a missing model
-skips, or fails under ``MANICULE_REQUIRE_EMBEDDING_MODELS``, which CI sets.
+skips, or fails under ``REQUIRE_EMBEDDING_MODELS``, which CI sets.
 """
 
 # The two "reach past the abstraction" tests below read a backend's raw output on purpose, to
@@ -29,12 +29,7 @@ skips, or fails under ``MANICULE_REQUIRE_EMBEDDING_MODELS``, which CI sets.
 
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
-import threading
 from collections.abc import Iterator
-from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import numpy as np
@@ -42,24 +37,15 @@ import pytest
 
 from manicule.core.embedding import Pooling
 from manicule.core.errors import ContextOverflowError
-from manicule.core.lifecycle import Metric
 from manicule.core.protocols import Embedder, TokenStateEmbedder
 from manicule.embedding.cards import read_card
-from manicule.embedding.pooling import l2_normalize, pool
+from manicule.embedding.pooling import l2_normalize
 from manicule.testing import (
     assert_embedder_contract,
     assert_protocol_signatures,
     assert_refuses_oversized_chunks,
 )
-from tests.embedding_support import (
-    FULL_MODEL,
-    PARITY_MODEL,
-    REQUIRE_MODELS_ENV,
-    is_required,
-    require_model,
-    requires_metal_allocator,
-    requires_mlx,
-)
+from tests.embedding_support import FULL_MODEL, PARITY_MODEL, require_model
 
 if TYPE_CHECKING:
     from manicule.embedding.base import PooledEmbedder
@@ -86,7 +72,12 @@ fp16 and fails this.
 COMPONENT_TOLERANCE: Final = 1e-3
 """Largest permitted per-component difference. Cosine alone would pass a scaled vector."""
 
-BACKENDS: Final[tuple[str, ...]] = ("mlx", "onnx")
+BACKENDS: Final[tuple[str, ...]] = ("onnx",)
+"""The backends *this distribution* ships, which is one.
+
+Kept as a tuple rather than inlined because it is the parameter these suites vary, and because
+a second in-tree backend would be added here rather than by rewriting every decorator. A
+backend in another distribution tests itself: see the module docstring."""
 
 DEFAULT_CACHE_ENTRIES: Final = 10_000
 """What the backends default to. Restated rather than imported so that a test varying the
@@ -123,17 +114,11 @@ async def embedder_for(
         return cached
 
     from manicule.embedding.artifacts import builtin_model_revision  # noqa: PLC0415
+    from manicule.embedding.runtimes.onnx_backend import OnnxEmbedder  # noqa: PLC0415
 
     card = read_card(model_id, revision=builtin_model_revision(model_id))
     entries = DEFAULT_CACHE_ENTRIES if cache_entries is None else cache_entries
-    if backend == "mlx":
-        from manicule.embedding.runtimes.mlx_backend import MlxEmbedder  # noqa: PLC0415
-
-        built: PooledEmbedder = MlxEmbedder(card, cache_entries=entries)
-    else:
-        from manicule.embedding.runtimes.onnx_backend import OnnxEmbedder  # noqa: PLC0415
-
-        built = OnnxEmbedder(card, cache_entries=entries)
+    built: PooledEmbedder = OnnxEmbedder(card, cache_entries=entries)
     await built.setup()
     if cache_entries is None:
         _LOADED[key] = built
@@ -142,9 +127,7 @@ async def embedder_for(
 
 def require(model_id: str, backend: str) -> None:
     """Skip — or fail under CI — unless this model can run on this backend here."""
-    if backend == "mlx":
-        requires_mlx(model_id)
-    require_model(model_id, mlx=backend == "mlx", onnx=backend == "onnx")
+    require_model(model_id, onnx=backend == "onnx")
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -181,46 +164,6 @@ async def test_a_real_embedder_meets_the_shipped_conformance_suites(
     assert_protocol_signatures(embedder, TokenStateEmbedder)
     await assert_embedder_contract(embedder, list(TEXTS))
     await assert_refuses_oversized_chunks(embedder.embed_chunks, embedder)
-
-
-@pytest.mark.parametrize("model_id", [PARITY_MODEL, FULL_MODEL])
-async def test_the_mlx_convenience_field_is_the_wrong_reduction_for_this_model(
-    model_id: str,
-) -> None:
-    """``text_embeds`` is mean-pooled unconditionally, and these models declare CLS.
-
-    Asserting that our vectors *match* the convenience field would be asserting the bug. So the
-    assertion is that they differ — and, to show the difference is the reduction rather than
-    noise, that the convenience field reproduces our *mean* pool exactly.
-    """
-    require(model_id, "mlx")
-    embedder = await embedder_for(model_id, "mlx")
-    assert embedder.fingerprint.pooling is Pooling.CLS
-
-    from manicule.embedding.runtimes import mlx_core  # noqa: PLC0415 - guarded by require() above
-
-    mx = mlx_core()
-    encoded = await embedder.encode(list(TEXTS))
-    ours = np.asarray(await embedder.embed(list(TEXTS)), dtype=np.float32)
-
-    ids, mask = embedder._tokenize(TEXTS)
-    model = embedder._model
-    output = model(mx.array(ids), attention_mask=mx.array(mask))
-    convenience = np.asarray(output.text_embeds.astype(mx.float32), dtype=np.float32)
-
-    states = np.asarray(encoded.states, dtype=np.float32)
-    mean_pooled = l2_normalize(pool(states, np.asarray(mask), Pooling.MEAN))
-
-    against_convenience = [float(a @ b) for a, b in zip(ours, convenience, strict=True)]
-    assert max(against_convenience) < 0.95, (
-        f"the convenience field agreed with the model's declared pooling ({against_convenience}). "
-        f"If mlx-embeddings has started honoring 1_Pooling/config.json this test should be "
-        f"rewritten, not deleted — but check before believing it"
-    )
-    assert np.allclose(mean_pooled, convenience, atol=1e-3), (
-        "the convenience field should be exactly our mean pool, which is what makes the "
-        "disagreement above a difference of reduction rather than of arithmetic"
-    )
 
 
 @pytest.mark.parametrize("model_id", [PARITY_MODEL, FULL_MODEL])
@@ -268,55 +211,6 @@ async def test_an_onnx_export_offers_no_reliable_shortcut_either(model_id: str) 
         f"{model_id}'s pooled ONNX output disagrees with the model's declared pooling "
         f"({cosines}); recorded here because it is the mirror image of the MLX case"
     )
-
-
-@pytest.mark.parametrize("model_id", [PARITY_MODEL, FULL_MODEL])
-async def test_the_two_runtimes_produce_the_same_vectors(model_id: str) -> None:
-    """The measurement that lets ``backend`` stay out of fingerprint identity.
-
-    A failure here is not a flake and is not fixed by widening the tolerance: it means one
-    runtime is not computing what the other is, and the correct response is to move ``backend``
-    into ``EmbedFingerprint.IDENTITY_FIELDS``, which makes a runtime change a loud error with a
-    re-embed path.
-    """
-    require(model_id, "mlx")
-    require(model_id, "onnx")
-
-    mlx_vectors = np.asarray(await (await embedder_for(model_id, "mlx")).embed(list(TEXTS)))
-    onnx_vectors = np.asarray(await (await embedder_for(model_id, "onnx")).embed(list(TEXTS)))
-
-    cosines = [float(a @ b) for a, b in zip(mlx_vectors, onnx_vectors, strict=True)]
-    worst = min(cosines)
-    largest = float(np.max(np.abs(mlx_vectors - onnx_vectors)))
-
-    assert worst > COSINE_TOLERANCE, (
-        f"MLX and onnxruntime disagree on {model_id}: worst cosine {worst}, per vector "
-        f"{cosines}. Move `backend` into EmbedFingerprint.IDENTITY_FIELDS rather than "
-        f"loosening this number — a corpus is not portable if this is false"
-    )
-    assert largest < COMPONENT_TOLERANCE, (
-        f"largest component difference {largest} on {model_id}; cosine alone would pass a "
-        f"uniformly scaled vector"
-    )
-
-
-@pytest.mark.parametrize("model_id", [PARITY_MODEL, FULL_MODEL])
-async def test_the_two_runtimes_record_interchangeable_identities(model_id: str) -> None:
-    """Byte-equal canonical fingerprints, which is what an index actually compares.
-
-    The runtime and the artifact are both recorded and neither is in identity — so the MLX
-    conversion and the ONNX export of one model write against the same index, and a machine
-    that changes runtime does not re-embed.
-    """
-    require(model_id, "mlx")
-    require(model_id, "onnx")
-
-    mlx_print = (await embedder_for(model_id, "mlx")).fingerprint
-    onnx_print = (await embedder_for(model_id, "onnx")).fingerprint
-
-    assert mlx_print.canonical() == onnx_print.canonical()
-    assert mlx_print.backend != onnx_print.backend
-    assert mlx_print.matches(onnx_print)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -386,75 +280,3 @@ async def test_a_real_model_refuses_text_it_would_truncate(backend: str) -> None
 
     with pytest.raises(ContextOverflowError, match=f"{limit}-token limit"):
         await embedder.embed([" ".join(["word"] * (limit + 50))])
-
-
-async def test_mlx_memory_metrics_are_readable_off_the_worker_thread() -> None:
-    """Reading the allocator gauges from another thread must not abort the process.
-
-    This backend already aborts — ``libc++abi: terminating … There is no Stream(gpu, N) in
-    current thread``, uncatchable — when a graph built on one thread is evaluated on another,
-    which is why the embedder owns exactly one worker. ``metrics()`` is the one MLX call that
-    deliberately does *not* run there: it is synchronous, and an operator scrapes it from the
-    event loop or from a metrics thread while a forward pass is in flight on the worker.
-
-    That is safe because MLX's **allocator** is process-global while its **streams** are
-    thread-local, and these gauges query the allocator. Safe by a different mechanism than the
-    rest of the class, so it is asserted rather than assumed — the failure mode is a dead
-    server, not a red test.
-    """
-    require(PARITY_MODEL, "mlx")
-    requires_metal_allocator()
-    embedder = await embedder_for(PARITY_MODEL, "mlx")
-    await embedder.embed(["a short text, so that something has been allocated"])
-
-    from_a_foreign_thread: list[Metric] = []
-    thread = threading.Thread(
-        target=lambda: from_a_foreign_thread.extend(embedder.metrics()),
-    )
-    thread.start()
-    thread.join()
-
-    published = {metric.name for metric in from_a_foreign_thread}
-    assert {"mlx_active_bytes", "mlx_cache_bytes", "mlx_peak_bytes"} <= published
-    assert next(m for m in from_a_foreign_thread if m.name == "mlx_active_bytes").value > 0
-
-
-def test_repeated_embedding_holds_a_bounded_physical_footprint() -> None:
-    """The MLX allocator bound, measured on real weights rather than asserted on a fake.
-
-    Runs ``tools/qualify_mlx_memory.py``, which embeds one text at a time and measures the
-    child process from *outside* with ``footprint``. That indirection is the whole point: MLX
-    allocates through Metal, ``ps`` does not report Metal buffers, and before the bound landed
-    this workload took physical footprint from 2.45 to 25.0 GiB while RSS fell. A test that
-    measured resident memory would have reported success throughout.
-
-    **Gated on the model being named rather than merely cached.** It is minutes of real forward
-    passes, so it runs when somebody has asked for ``BAAI/bge-m3`` explicitly — which is also
-    what keeps 4.6 GB of weights out of every CI run.
-    """
-    if not is_required(FULL_MODEL):
-        pytest.skip(f"set {REQUIRE_MODELS_ENV} to include {FULL_MODEL} to run the qualification")
-    require_model(FULL_MODEL, mlx=True)
-    requires_mlx(FULL_MODEL)
-    requires_metal_allocator()
-
-    completed = subprocess.run(  # noqa: S603 - our own script, fixed arguments
-        [
-            sys.executable,
-            str(Path(__file__).resolve().parent.parent / "tools" / "qualify_mlx_memory.py"),
-            "--passes",
-            "40",
-            "--settle-passes",
-            "5",
-            "--quiet",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=1800,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    report = json.loads(completed.stdout)
-    assert report["passes_measured"] >= 40
-    assert report["max_content_tokens"] <= report["content_token_ceiling"]

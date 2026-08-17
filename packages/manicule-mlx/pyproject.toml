@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manicule-mlx"
+version = "0.1.0"
+description = "Metal-native embedding backend for manicule, on Apple Silicon."
+readme = "README.md"
+# GPL-3.0-or-later, and this is the package that carries it. `mlx-embeddings` is GPL-3.0, and
+# manicule itself is MIT — so the backend that links it lives here rather than there. See
+# README.md; the split is the whole reason this distribution exists.
+license = "GPL-3.0-or-later"
+requires-python = ">=3.12"
+authors = [{ name = "manicule contributors" }]
+keywords = ["manicule", "embeddings", "mlx", "apple-silicon"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+
+dependencies = [
+  "manicule",
+  # Pooling happens in manicule's own numpy, from the token states this backend hands back.
+  "numpy>=2.0",
+  # The GPL-3.0 dependency, and Apple-only by construction. Marked rather than left to fail at
+  # install time on Linux, where CI runs: there the distribution installs and the backend
+  # refuses at setup, which is what the tests are written against.
+  "mlx-embeddings>=0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+# The same public entry-point group every plugin uses, built-in or not. The name here must
+# equal `PluginManifest.name` — the registry rejects the mismatch rather than resolving it.
+[project.entry-points."manicule.plugins"]
+mlx = "manicule_mlx:PLUGIN"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manicule_mlx"]
+
+# There is deliberately no `[tool.pyright]` here. pyright reads one configuration for the whole
+# checked tree, so a section in this file would be silently ignored — the quietest kind of
+# wrong. The execution environment relaxing this package's untyped, platform-bound seam is
+# declared in the *root* pyproject.toml beside the others.

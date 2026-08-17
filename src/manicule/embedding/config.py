@@ -54,26 +54,12 @@ class EmbedderConfig(BaseModel):
     )
 
 
-class MlxEmbedderConfig(EmbedderConfig):
-    """:class:`EmbedderConfig`, plus the one setting that is MLX's alone.
+# A backend with a setting of its own subclasses `EmbedderConfig` in its **own** distribution
+# and registers that subclass — `manicule-mlx` does exactly this for its Metal cache bound.
+# There is deliberately no per-backend model here: one that named a mechanism only some
+# backends have would have to be accepted by all of them, and `extra="forbid"` is doing real
+# work. A cache limit written under `[plugins.config."embedder.onnx"]` names something
+# onnxruntime does not have, and silently accepting it would leave an operator believing they
+# had bounded something.
 
-    Separate from the shared model because ``extra="forbid"`` is doing real work: a cache limit
-    written under ``[plugins.config."embedder.onnx"]`` names a mechanism onnxruntime does not
-    have, and silently accepting it would leave an operator believing they had bounded
-    something.
-    """
-
-    cache_limit_mb: int = Field(
-        default=2048,
-        ge=0,
-        description="Ceiling on MLX's Metal **free-buffer cache** — buffers a forward pass has "
-        "finished with that MLX keeps for reuse instead of returning to the system. Its own "
-        "default is near the whole machine (measured: 60.8 GiB of a 64 GiB Mac), so an "
-        "unbounded run retains every distinct buffer size it has ever seen and climbs until "
-        "macOS intervenes. ``0`` returns every buffer immediately, which is bounded but "
-        "forfeits reuse. This is retained memory, not a working-set limit: a forward pass "
-        "larger than this still runs.",
-    )
-
-
-__all__ = ["EmbedderConfig", "MlxEmbedderConfig"]
+__all__ = ["EmbedderConfig"]

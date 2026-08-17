@@ -1,9 +1,13 @@
 """The MLX backend: Metal-native execution, in-process, on Apple Silicon.
 
-Primary on the hardware manicule is built for, and the reason the project is
-GPL-3.0-or-later: ``mlx-embeddings`` is GPL-3.0 (``docs/embeddings.md`` §1.1).
+The fast path on the hardware manicule is built for, and the reason this is a separate
+distribution: ``mlx-embeddings`` is GPL-3.0, so the backend that links it carries the copyleft
+obligation on its own rather than imposing it on an MIT project (``README.md``,
+``docs/embeddings.md`` §1.1). This file is GPL-3.0-or-later. What it imports from
+manicule is MIT, which is the direction that composes.
 
-It is also version 0.1.0, and it earns the caution. ``models/xlm_roberta.py`` computes
+``mlx-embeddings`` is also version 0.1.0, and it earns the caution.
+``models/xlm_roberta.py`` computes
 ``text_embeds = normalize_embeddings(mean_pooling(sequence_output, attention_mask))``
 **unconditionally**, for every XLM-RoBERTa checkpoint — including ``bge-m3``, which declares
 CLS pooling. Reaching for the obviously named field returns a correctly shaped, correctly
@@ -26,6 +30,12 @@ import numpy as np
 
 from manicule.core.errors import ConfigError
 from manicule.core.lifecycle import HealthReport, Metric
+
+# Everything below is manicule's published plugin surface, and this import list is now a
+# compatibility boundary between two distributions rather than an internal detail. The
+# underscore-prefixed methods `PooledEmbedder` asks a backend to implement are contract despite
+# their names; `PluginManifest.core_version` in __init__.py is what pins the range they hold
+# over.
 from manicule.embedding.artifacts import mlx_weights, resolve_artifact
 from manicule.embedding.base import PooledEmbedder
 from manicule.embedding.cards import ModelCard

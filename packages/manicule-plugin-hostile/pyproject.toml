@@ -7,7 +7,7 @@ name = "manicule-plugin-hostile"
 version = "0.1.0"
 description = "Parsers that hang and allocate without bound, so isolation can be proven."
 readme = "README.md"
-license = "GPL-3.0-or-later"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = ["manicule"]
 
