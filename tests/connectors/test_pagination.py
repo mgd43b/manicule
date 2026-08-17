@@ -13,14 +13,16 @@ A suite that walked two pages of a well-behaved cursor would certify nothing at 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import cast
+from typing import Any, cast
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
 
+import manicule.connectors.client as client_module
 from manicule.connectors import ConnectorError, CursorExpiredError, UntrustedLinkError
 from manicule.connectors.client import ConfluenceClient
+from manicule.connectors.confluence import ConfluenceConnector
 from manicule.connectors.pagination import NextPage, next_page, split_query
 from manicule.testing import closing
 from tests.connectors.fake_confluence import CLOUD_BASE, FakeConfluence, FakePage
@@ -35,6 +37,58 @@ def _instance(count: int = 5) -> FakeConfluence:
         ],
         page_size=2,
     )
+
+
+async def test_discovery_preserves_an_empty_filtered_source_page_boundary() -> None:
+    """A page with no usable rows is still a cursor-lifetime and durability boundary."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/space/ENG"):
+            return httpx.Response(200, json={"key": "ENG"})
+        if request.url.path.endswith("/rest/api/content/search"):
+            if request.url.params.get("cursor") == "page+2":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "id": "usable",
+                                "type": "page",
+                                "title": "Public synthetic page",
+                                "space": {"key": "ENG"},
+                                "version": {
+                                    "number": 1,
+                                    "when": "2026-08-09T14:30:00+00:00",
+                                },
+                                "_links": {"webui": "/spaces/ENG/pages/usable"},
+                            }
+                        ],
+                        "_links": {"base": CLOUD_BASE},
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [{"id": "filtered", "type": "blogpost"}],
+                    "_links": {
+                        "base": CLOUD_BASE,
+                        "next": "/rest/api/content/search?cursor=page%2B2",
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected synthetic request path {request.url.path}")
+
+    config = cloud_config(spaces=["ENG"], include_attachments=False, page_size=250)
+    client = ConfluenceClient(config, transport=httpx.MockTransport(handle), clock=lambda: 0.0)
+    connector = ConfluenceConnector(config, client)
+    await connector.setup()
+    try:
+        batches = [tuple(batch) async for batch in connector.discover_batches(None)]
+    finally:
+        await connector.teardown()
+
+    assert [ids(batch) for batch in batches] == [[], ["usable"]]
+    assert connector.watermark is not None
 
 
 def test_a_cursor_keeps_its_plus_when_a_link_is_split() -> None:
@@ -187,6 +241,48 @@ async def test_a_cursor_held_longer_than_its_lifetime_is_refused() -> None:
                 await anext(stream)
     finally:
         await connector.teardown()
+
+
+async def test_cursor_history_io_is_included_in_the_cursor_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled disk ledger cannot open an unchecked expiry window before request two."""
+    instance = _instance()
+    clock = Clock()
+    original = client_module._CursorHistory.add  # pyright: ignore[reportPrivateUsage]
+
+    def delayed_add(
+        history: Any,
+        url: str,
+        params: list[tuple[str, str]],
+    ) -> bool:
+        added = original(history, url, params)
+        clock.advance(61.0)
+        return added
+
+    monkeypatch.setattr("manicule.connectors.client._CursorHistory.add", delayed_add)
+    connector = await connected(
+        instance,
+        cloud_config(
+            base_url=instance.base_url,
+            spaces=("ENG",),
+            cursor_lifetime_seconds=60.0,
+        ),
+        clock=clock,
+    )
+    try:
+        async with closing(connector.discover(None)) as stream:
+            await anext(stream)
+            await anext(stream)
+            with pytest.raises(CursorExpiredError, match="cursor_lifetime_seconds"):
+                await anext(stream)
+    finally:
+        await connector.teardown()
+
+    searches = [
+        request for request in instance.requests if request.url.path.endswith("/content/search")
+    ]
+    assert len(searches) == 1, "the expired second cursor must not reach the transport"
 
 
 async def test_a_next_link_that_repeats_without_a_cursor_stops_the_walk() -> None:

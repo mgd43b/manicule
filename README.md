@@ -186,6 +186,15 @@ Matching retained bodies are validated and reused. Only a replacement discovery 
 real end may report `reconciled` and remove an absent identity from required membership. A limit,
 expired cursor, cancellation or failed discovery never proves deletion.
 
+Confluence discovery and deletion enumeration preserve the source's own response-page boundary.
+Each page (at most 250 records) is admitted atomically before `_links.next` is followed, so a
+large space pays one capacity-guarded SQLite writer transaction per source page rather than one
+per record. Cursor expiry, repetition, corruption and cross-origin guards remain fail-closed; a
+10,251-record synthetic run crosses the 10,000 boundary and records true completion only after
+the final one-record page. Cursor-cycle history and subtree membership use temporary,
+fixed-cache SQLite indexes, keeping pagination and subtree scope bookkeeping independent of
+corpus size in process memory.
+
 Strict policy never promotes while a current member lacks validated evidence. An
 `allow_omissions` snapshot remains honestly partial, and it cannot turn a known-stale inventory
 green. Once a promoted snapshot publishes, source acquisition and derived publication settle in

@@ -761,7 +761,7 @@ unchanged or retained and associated with its complete fetched source envelope b
 candidate watermark can become the connector watermark.
 
 ```
-discover → acquisition journal             one task; commit before advancing
+discover → acquisition journal             one task; commit source page before next cursor
    │  bounded sequence-paged reader
    │  fetch hand-off      depth = queue_depth_factor × fetch_concurrency
    ▼
@@ -778,7 +778,7 @@ ingest × (parse_workers + 1)               parse in the pool, chunk, embed unde
 
 | Stage | Width | Where the bound comes from |
 |---|---|---|
-| discover → journal | 1 | One cursor; each identity commits before the next source record is requested |
+| discover → journal | 1 | One cursor; one source-native page (at most 250 Confluence records) commits atomically before its next cursor is requested |
 | journal reader | 1 | Waits for hand-off room, then reads one durable record |
 | fetch | `fetch_concurrency` (8) | One task per permitted in-flight fetch |
 | parse | at most `parse_workers + 1` attempts | The ingest workers are the only callers of the pool |
@@ -809,11 +809,43 @@ stages and costs only that one archive's serialization.
 
 ### 8.3.1 Durable discovery, then bounded hand-offs
 
-Discovery does not feed the fetch queue. It appends one validated source record to the
-acquisition journal, waits for that transaction to commit, and only then asks the connector for
-the next record. On true iterator exhaustion it atomically records the completion marker and
+Discovery does not feed the fetch queue. A connector with expiring page cursors exposes its
+source-native response boundary; the pipeline validates and admits that bounded page in one
+capacity-guarded transaction, then and only then asks the connector to follow `_links.next`.
+Connectors without that optional surface retain scalar admission. On true iterator exhaustion
+the pipeline atomically records the completion marker and
 the connector's candidate watermark. A limit, cancellation, cursor/source failure or journal
 admission failure leaves that marker absent.
+
+The page transaction preserves scalar identity semantics. Already-durable replay rows are
+validated and reused; only novel identities receive contiguous sequence numbers. Record and
+metadata capacity are reserved as one aggregate delta against all unsettled runs across every
+workspace under the same `BEGIN IMMEDIATE` as the inserts. A refusal, lease loss, cancellation,
+process death or SQLite rollback therefore leaves the preceding full-page prefix, never half a
+page or a counter ahead of its rows. An all-old replay page is answered by the read path without
+opening a writer transaction.
+
+The defect this replaces held one Confluence cursor while every result in its page independently
+performed the optimistic replay reads, `BEGIN IMMEDIATE`, global capacity sums, run-counter
+update, insert and row verification. At 250 results that was 250 serialized writer sections before
+the next cursor could be requested. The reproducible synthetic benchmark
+`python -m tests.benchmarks.acquisition_enumeration` measures the compatibility scalar path and
+the page path on migrated temporary SQLite storage:
+
+| Records | Source pages | Scalar writer tx / SQL statements | Page writer tx / SQL statements | Scalar / page seconds |
+|---:|---:|---:|---:|---:|
+| 250 | 1 | 250 / 2,250 | 1 / 8 | 0.649 / 0.028 |
+| 2,500 | 10 | 2,500 / 22,500 | 10 / 80 | 6.381 / 0.263 |
+| 10,000 | 40 | 10,000 / 90,000 | 40 / 320 | 26.147 / 1.150 |
+
+The 10,251-record real-client integration uses 41 full 250-record pages and one final record.
+Each committed page advances a deterministic clock by 0.1 seconds under a 0.2-second trusted
+cursor lifetime; maximum cursor hold is therefore 0.1 seconds, it makes 42 search requests, and
+the true-end transaction runs exactly once. Run alone under macOS `/usr/bin/time -l`, that pytest
+case reported 241,795,072 bytes maximum RSS (including Python, pytest and imported dependencies).
+The standalone 10,000-record page benchmark reported 115,851,264 bytes process-wide peak RSS;
+the live record buffer is independently capped at 250. These are development-machine evidence,
+not service-level latency promises.
 
 Only after enumeration stops does a sequence-paged journal reader feed bounded acquisition
 workers. Once every item has coverage, `commit_acquisition_watermark` atomically checks the

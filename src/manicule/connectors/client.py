@@ -27,6 +27,8 @@ page", which is a successful response no downstream stage can tell from a docume
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -70,6 +72,43 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 type Params = Sequence[tuple[str, str]]
 type Json = Mapping[str, object]
+
+
+class _CursorHistory:
+    """Disk-backed, bounded-memory fingerprints of requests already followed.
+
+    A digest collision can only refuse a safe request; it cannot let a pagination cycle pass.
+    The unnamed SQLite database is a temporary file deleted when this object closes, and its
+    page cache is explicitly bounded independently of the number of source pages.
+    """
+
+    def __init__(self) -> None:
+        try:
+            self._db = sqlite3.connect("")
+            self._db.execute("PRAGMA cache_size = -256")
+            self._db.execute("CREATE TABLE followed (fingerprint BLOB PRIMARY KEY) WITHOUT ROWID")
+        except sqlite3.Error as exc:
+            database = getattr(self, "_db", None)
+            if database is not None:
+                database.close()
+            raise ConnectorError("cannot create the bounded pagination history") from exc
+
+    def add(self, url: str, params: Sequence[tuple[str, str]]) -> bool:
+        digest = hashlib.sha256()
+        for part in (url, *(part for pair in params for part in pair)):
+            encoded = part.encode()
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        try:
+            self._db.execute("INSERT INTO followed VALUES (?)", (digest.digest(),))
+        except sqlite3.IntegrityError:
+            return False
+        except sqlite3.Error as exc:
+            raise ConnectorError("cannot record pagination history safely") from exc
+        return True
+
+    def close(self) -> None:
+        self._db.close()
 
 
 class Downloaded:
@@ -228,44 +267,49 @@ class ConfluenceClient:
         """
         current_url = url
         current_params: Params = params
-        followed: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        followed = _CursorHistory()
+        try:
+            while True:
+                payload = await self.get_json(current_url, current_params)
+                received = self._clock()
+                yield payload
 
-        while True:
-            payload = await self.get_json(current_url, current_params)
-            received = self._clock()
-            yield payload
+                following = next_page(payload, base_url=self._config.base_url)
+                if following is None:
+                    return
 
-            following = next_page(payload, base_url=self._config.base_url)
-            if following is None:
-                return
+                # The history insertion is disk-backed on purpose. Include that I/O in the
+                # cursor's held time: checking before it would leave an unguarded stall between
+                # the check and the next request, which is precisely where an expired cursor
+                # must never be followed.
+                is_new = followed.add(following.url, following.params)
+                held = self._clock() - received
+                if held > self._config.cursor_lifetime_seconds:
+                    msg = (
+                        f"a search cursor was held for {held:.0f}s, longer than the "
+                        f"{self._config.cursor_lifetime_seconds:.0f}s this connector will trust "
+                        f"one for. Confluence expires search cursors, and an expired cursor can be "
+                        f"answered with a fresh first page rather than an error — which would "
+                        f"enumerate the start of this space twice and its end never. Re-run the "
+                        f"sync: the watermark was not advanced, so nothing is lost but the "
+                        f"re-enumeration. If this recurs, the consumer is slower than the source's "
+                        f"cursor lifetime and cursor_lifetime_seconds is not the setting to raise."
+                    )
+                    raise CursorExpiredError(msg)
 
-            held = self._clock() - received
-            if held > self._config.cursor_lifetime_seconds:
-                msg = (
-                    f"a search cursor was held for {held:.0f}s, longer than the "
-                    f"{self._config.cursor_lifetime_seconds:.0f}s this connector will trust "
-                    f"one for. Confluence expires search cursors, and an expired cursor can be "
-                    f"answered with a fresh first page rather than an error — which would "
-                    f"enumerate the start of this space twice and its end never. Re-run the "
-                    f"sync: the watermark was not advanced, so nothing is lost but the "
-                    f"re-enumeration. If this recurs, the consumer is slower than the source's "
-                    f"cursor lifetime and cursor_lifetime_seconds is not the setting to raise."
-                )
-                raise CursorExpiredError(msg)
-
-            request = (following.url, following.params)
-            if request in followed:
-                msg = (
-                    f"pagination was sent back to a page it has already followed "
-                    f"(cursor {following.cursor[:24]!r}). Continuing would enumerate the same "
-                    f"results forever while looking like an unusually large space. The whole "
-                    f"request is compared rather than the cursor alone, so a link that repeats "
-                    f"without one is caught too."
-                )
-                raise ConnectorError(msg)
-            followed.add(request)
-            current_url = following.url
-            current_params = following.params
+                if not is_new:
+                    msg = (
+                        f"pagination was sent back to a page it has already followed "
+                        f"(cursor {following.cursor[:24]!r}). Continuing would enumerate the same "
+                        f"results forever while looking like an unusually large space. The whole "
+                        f"request is compared rather than the cursor alone, so a link that repeats "
+                        f"without one is caught too."
+                    )
+                    raise ConnectorError(msg)
+                current_url = following.url
+                current_params = following.params
+        finally:
+            followed.close()
 
     async def download(self, url: str, *, max_bytes: int) -> Downloaded:
         """Stream a file, refusing one larger than ``max_bytes`` and one that is a sign-in page.

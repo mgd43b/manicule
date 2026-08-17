@@ -74,6 +74,7 @@ _DIAGNOSTIC = TypeAdapter(AcquisitionDiagnostic)
 _OMISSION_REASONS = TypeAdapter(dict[AcquisitionFailureCode, int])
 
 _SQLITE_BUSY_RETRY_DELAYS = (0.0, 0.01, 0.05)
+_ACQUISITION_BATCH_LIMIT = 250
 
 
 def _empty_abandoned_leases() -> set[tuple[str, str, str, int]]:
@@ -1688,6 +1689,202 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 run.metadata_bytes -= encoded_bytes
                 run.updated_at = utcnow()
             return _record(row)
+
+    @translate_storage_capacity_errors
+    async def append_acquisition_records(  # noqa: PLR0912, PLR0915 - one atomic admission fence
+        self,
+        run_id: str,
+        sequence: int,
+        sources: Sequence[AcquisitionSource],
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> Sequence[AcquisitionRecord]:
+        """Atomically commit one bounded source-native response.
+
+        Existing identities are validated and reused inside the same writer transaction.  New
+        identities receive contiguous sequence numbers and reserve their aggregate global record
+        and metadata capacity in one guarded update.  The transaction therefore acknowledges all
+        of a source page or none of it, while a replay of an already committed prefix is a read.
+        """
+        if sequence < 0:
+            msg = "sequence must not be negative"
+            raise ValueError(msg)
+        if len(sources) > _ACQUISITION_BATCH_LIMIT:
+            msg = f"acquisition discovery batches are limited to {_ACQUISITION_BATCH_LIMIT} records"
+            raise ValueError(msg)
+        if not sources:
+            return ()
+        prepared = [
+            (
+                source,
+                source.model_dump(mode="json"),
+            )
+            for source in sources
+        ]
+        source_ids = list(dict.fromkeys(source.source_id for source, _ in prepared))
+        async with self._sessions() as session:
+            run = await self._required_run_row(session, run_id)
+            self._require_live_lease(run, lease_owner, lease_generation, now)
+            replay_rows = (
+                await session.execute(
+                    select(models.AcquisitionRecord).where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                        models.AcquisitionRecord.source_id.in_(source_ids),
+                    )
+                )
+            ).scalars()
+            replay = {row.source_id: row for row in replay_rows}
+        if len(replay) == len(source_ids):
+            return tuple(
+                cast(
+                    "AcquisitionRecord",
+                    _matching_record(replay.get(source.source_id), source_json),
+                )
+                for source, source_json in prepared
+            )
+        async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
+            run = await self._required_run_row(session, run_id)
+            self._require_live_lease(run, lease_owner, lease_generation, now)
+            existing_rows = (
+                await session.execute(
+                    select(models.AcquisitionRecord).where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                        models.AcquisitionRecord.source_id.in_(source_ids),
+                    )
+                )
+            ).scalars()
+            existing = {row.source_id: row for row in existing_rows}
+            source_json_by_id: dict[str, dict[str, Any]] = {}
+            novel: list[tuple[AcquisitionSource, dict[str, Any]]] = []
+            for source, source_json in prepared:
+                prior_json = source_json_by_id.setdefault(source.source_id, source_json)
+                if prior_json != source_json:
+                    raise AcquisitionConflictError(
+                        "source identity was rediscovered with different data"
+                    )
+                matched = _matching_record(existing.get(source.source_id), source_json)
+                if matched is None and all(item[0].source_id != source.source_id for item in novel):
+                    novel.append((source, source_json))
+
+            encoded_bytes = sum(
+                len(json.dumps(source_json, sort_keys=True, separators=(",", ":")).encode())
+                for _, source_json in novel
+            )
+            record_count = len(novel)
+            if record_count:
+                self._require_disk_headroom(requested_bytes=encoded_bytes)
+            unsettled_records = (
+                select(func.coalesce(func.sum(models.AcquisitionRun.discovered_count), 0))
+                .where(models.AcquisitionRun.state != AcquisitionRunState.SETTLED)
+                .scalar_subquery()
+            )
+            unsettled_metadata = (
+                select(func.coalesce(func.sum(models.AcquisitionRun.metadata_bytes), 0))
+                .where(models.AcquisitionRun.state != AcquisitionRunState.SETTLED)
+                .scalar_subquery()
+            )
+            reserved_count = 1
+            if record_count:
+                reserved = cast(
+                    "CursorResult[Any]",
+                    await session.execute(
+                        update(models.AcquisitionRun)
+                        .where(
+                            models.AcquisitionRun.id == run_id,
+                            models.AcquisitionRun.workspace_id == self._workspace_id,
+                            models.AcquisitionRun.state == AcquisitionRunState.ENUMERATING,
+                            models.AcquisitionRun.enumeration_completed_at.is_(None),
+                            models.AcquisitionRun.lease_owner == lease_owner,
+                            models.AcquisitionRun.lease_generation == lease_generation,
+                            models.AcquisitionRun.lease_expires_at > now,
+                            unsettled_records + record_count <= self._max_journal_records,
+                            unsettled_metadata + encoded_bytes <= self._max_journal_metadata_bytes,
+                        )
+                        .values(
+                            discovered_count=models.AcquisitionRun.discovered_count + record_count,
+                            metadata_bytes=models.AcquisitionRun.metadata_bytes + encoded_bytes,
+                            updated_at=utcnow(),
+                        )
+                    ),
+                )
+                reserved_count = reserved.rowcount
+            if reserved_count != 1:
+                run = await self._required_run_row(session, run_id)
+                self._require_live_lease(run, lease_owner, lease_generation, now)
+                if (
+                    run.state is not AcquisitionRunState.ENUMERATING
+                    or run.enumeration_completed_at is not None
+                ):
+                    msg = "acquisition run is no longer accepting discovery records"
+                    raise AcquisitionConflictError(msg)
+                record_total = int((await session.execute(select(unsettled_records))).scalar_one())
+                metadata_total = int(
+                    (await session.execute(select(unsettled_metadata))).scalar_one()
+                )
+                if record_total + record_count > self._max_journal_records:
+                    raise CapacityRefusedError(
+                        CapacityDiagnostic(
+                            resource=CapacityResource.JOURNAL_RECORDS,
+                            limit=self._max_journal_records,
+                            used=record_total,
+                            requested=record_count,
+                        )
+                    )
+                if metadata_total + encoded_bytes > self._max_journal_metadata_bytes:
+                    raise CapacityRefusedError(
+                        CapacityDiagnostic(
+                            resource=CapacityResource.JOURNAL_METADATA_BYTES,
+                            limit=self._max_journal_metadata_bytes,
+                            used=metadata_total,
+                            requested=encoded_bytes,
+                        )
+                    )
+                msg = "acquisition journal reservation changed concurrently"
+                raise AcquisitionConflictError(msg)
+            if novel:
+                timestamp = utcnow()
+                await session.execute(
+                    sqlite_insert(models.AcquisitionRecord).values(
+                        [
+                            {
+                                "id": _record_id(run_id, source.source_id),
+                                "run_id": run.id,
+                                "workspace_id": run.workspace_id,
+                                "connector_id": run.connector_id,
+                                "sequence": sequence + offset,
+                                "source_id": source.source_id,
+                                "marker_name": acquisition_marker_id(run_id, source.source_id),
+                                "source_record": source_json,
+                                "state": AcquisitionRecordState.DISCOVERED,
+                                "created_at": timestamp,
+                                "updated_at": timestamp,
+                            }
+                            for offset, (source, source_json) in enumerate(novel)
+                        ]
+                    )
+                )
+                rows = (
+                    await session.execute(
+                        select(models.AcquisitionRecord).where(
+                            models.AcquisitionRecord.run_id == run_id,
+                            models.AcquisitionRecord.workspace_id == self._workspace_id,
+                            models.AcquisitionRecord.source_id.in_(source_ids),
+                        )
+                    )
+                ).scalars()
+                existing = {row.source_id: row for row in rows}
+            return tuple(
+                cast(
+                    "AcquisitionRecord",
+                    _matching_record(existing.get(source.source_id), source_json),
+                )
+                for source, source_json in prepared
+            )
 
     @translate_storage_capacity_errors
     async def complete_acquisition_enumeration(

@@ -375,6 +375,19 @@ class ConfluenceConnector:
         space allowlist stops the run rather than producing a smaller subtree than the one that
         was configured.
         """
+        async for batch in self.discover_batches(watermark):
+            for found in batch:
+                yield found
+
+    async def discover_batches(
+        self, watermark: Watermark | None
+    ) -> AsyncIterator[Sequence[DiscoveredDoc]]:
+        """Yield one bounded source response at a time for atomic durable admission.
+
+        Empty transformed pages are intentionally preserved: filters may reject every result,
+        but the page boundary still decides when it is safe to follow the response's next
+        cursor.  The compatibility :meth:`discover` surface flattens these batches.
+        """
         carried = self._resume_from(watermark)
         self._observed = {}
         self._carried = dict(carried)
@@ -383,17 +396,23 @@ class ConfluenceConnector:
         spaces = await self._spaces()
         scope = await self._scope(spaces)
 
-        for space in spaces if scope is None else scope.spaces():
-            newest: datetime | None = None
-            async for found, when in self._changed_in(space, scope, self._since(carried, space)):
-                newest = cql.latest([newest, when])
-                yield found
-            # Only after the space's enumeration has run to completion: a watermark advanced
-            # from a partial walk skips whatever the rest of the walk would have returned, and
-            # nothing ever looks for it again.
-            if newest is not None:
-                self._observed[space] = newest
-        self._enumerated = True
+        try:
+            for space in spaces if scope is None else scope.spaces():
+                newest: datetime | None = None
+                async for batch in self._changed_in_batches(
+                    space, scope, self._since(carried, space)
+                ):
+                    newest = cql.latest([newest, *(when for _, when in batch)])
+                    yield tuple(found for found, _ in batch)
+                # Only after the space's enumeration has run to completion: a watermark advanced
+                # from a partial walk skips whatever the rest of the walk would have returned, and
+                # nothing ever looks for it again.
+                if newest is not None:
+                    self._observed[space] = newest
+            self._enumerated = True
+        finally:
+            if scope is not None:
+                scope.close()
 
     async def _changed_in(
         self, space: str, scope: Subtree | None, since: str | None
@@ -412,24 +431,37 @@ class ConfluenceConnector:
           them — which is the authoritative answer in any case, and the one §6 of the
           documentation says to use.
         """
+        async for batch in self._changed_in_batches(space, scope, since):
+            for found in batch:
+                yield found
+
+    async def _changed_in_batches(
+        self, space: str, scope: Subtree | None, since: str | None
+    ) -> AsyncIterator[Sequence[tuple[DiscoveredDoc, datetime | None]]]:
+        """Transform each search response without erasing its pagination boundary."""
         if scope is None:
             types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
             query = self._content_query(space, types=types, since=since)
-            async for result, base in self._search(query, expand=_SEARCH_EXPAND):
-                found = self._discovered(result, space=space, base=base)
-                if found is not None:
-                    yield found, cql.parse_when(_version_when(result))
+            async for page in self._search_batches(query, expand=_SEARCH_EXPAND):
+                yield tuple(
+                    (found, cql.parse_when(_version_when(result)))
+                    for result, base in page
+                    if (found := self._discovered(result, space=space, base=base)) is not None
+                )
             return
 
         pages = self._content_query(space, types=(PAGE,), since=since, subtree=scope.clause(space))
-        async for result, base in self._search(pages, expand=_SEARCH_EXPAND):
-            page_id = _str(result.get("id"))
-            roots = scope.covering_roots(space, page_id, subtree.ancestor_ids(result))
-            if not roots:
-                raise ConnectorError(scope.out_of_scope(space, page_id))
-            found = self._discovered(result, space=space, base=base, roots=roots)
-            if found is not None:
-                yield found, cql.parse_when(_version_when(result))
+        async for page in self._search_batches(pages, expand=_SEARCH_EXPAND):
+            changed: list[tuple[DiscoveredDoc, datetime | None]] = []
+            for result, base in page:
+                page_id = _str(result.get("id"))
+                roots = scope.covering_roots(space, page_id, subtree.ancestor_ids(result))
+                if not roots:
+                    raise ConnectorError(scope.out_of_scope(space, page_id))
+                found = self._discovered(result, space=space, base=base, roots=roots)
+                if found is not None:
+                    changed.append((found, cql.parse_when(_version_when(result))))
+            yield tuple(changed)
 
         if not self._config.include_attachments:
             return
@@ -439,14 +471,17 @@ class ConfluenceConnector:
         # and its container would then be a page this run has never seen.
         members = await scope.members(space)
         attachments = self._content_query(space, types=(ATTACHMENT,), since=since)
-        async for result, base in self._search(attachments, expand=_SEARCH_EXPAND):
-            container = _str(_obj(result.get("container")).get("id"))
-            roots = members.get(container, ())
-            if not roots:
-                continue
-            found = self._discovered(result, space=space, base=base, roots=roots)
-            if found is not None:
-                yield found, cql.parse_when(_version_when(result))
+        async for page in self._search_batches(attachments, expand=_SEARCH_EXPAND):
+            changed = []
+            for result, base in page:
+                container = _str(_obj(result.get("container")).get("id"))
+                roots = members.get(container, ())
+                if not roots:
+                    continue
+                found = self._discovered(result, space=space, base=base, roots=roots)
+                if found is not None:
+                    changed.append((found, cql.parse_when(_version_when(result))))
+            yield tuple(changed)
 
     def _content_query(
         self,
@@ -482,13 +517,20 @@ class ConfluenceConnector:
         self, query: str, *, expand: str = ""
     ) -> AsyncIterator[tuple[Mapping[str, object], str]]:
         """Every result of one CQL query, with the link base the page it arrived on declared."""
+        async for page in self._search_batches(query, expand=expand):
+            for result in page:
+                yield result
+
+    async def _search_batches(
+        self, query: str, *, expand: str = ""
+    ) -> AsyncIterator[Sequence[tuple[Mapping[str, object], str]]]:
+        """Each CQL response as one bounded batch, including an empty results page."""
         params = [("cql", query), ("limit", str(self._config.page_size))]
         if expand:
             params.append(("expand", expand))
         async for payload in self._client.paginate(self._client.url(SEARCH_PATH), params):
             base = _link_base(payload, self._config.base_url)
-            for result in _results(payload):
-                yield result, base
+            yield tuple((result, base) for result in _results(payload))
 
     async def _scope(self, spaces: Sequence[str]) -> Subtree | None:
         """The configured page trees, validated, or ``None`` for whole-space syncing.
@@ -711,33 +753,43 @@ class ConfluenceConnector:
         one place the two differ in cost, and it buys the check that a page the source returned
         is really in the tree that was asked for.
         """
+        async for batch in self.reconcile_batches():
+            for source_id in batch:
+                yield source_id
+
+    async def reconcile_batches(self) -> AsyncIterator[Sequence[SourceId]]:
+        """Yield reconciliation identities without erasing active search-page boundaries."""
         spaces = await self._spaces()
         scope = await self._scope(spaces)
         if scope is None:
             types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
             for space in spaces:
                 query = self._content_query(space, types=types, ordered=False)
-                async for result, _ in self._search(query):
-                    source_id = _str(result.get("id"))
-                    if source_id:
-                        yield source_id
+                async for page in self._search_batches(query):
+                    yield tuple(
+                        source_id for result, _ in page if (source_id := _str(result.get("id")))
+                    )
             return
 
-        for space in scope.spaces():
-            # The page enumeration and the scope are one thing: `members` is the live query,
-            # already checked page by page against the configured roots and already guarded
-            # against a subtree that only looks empty.
-            members = await scope.members(space)
-            for page_id in members:
-                yield page_id
-            if not self._config.include_attachments:
-                continue
-            query = self._content_query(space, types=(ATTACHMENT,), ordered=False)
-            async for result, _ in self._search(query, expand="container"):
-                container = _str(_obj(result.get("container")).get("id"))
-                source_id = _str(result.get("id"))
-                if source_id and container in members:
-                    yield source_id
+        try:
+            for space in scope.spaces():
+                # The page enumeration and the scope are one thing: each native search page is
+                # yielded for durable reconciliation before its next cursor is requested.
+                async for page in scope.member_batches(space):
+                    yield page
+                if not self._config.include_attachments:
+                    continue
+                members = await scope.members(space)
+                query = self._content_query(space, types=(ATTACHMENT,), ordered=False)
+                async for page in self._search_batches(query, expand="container"):
+                    yield tuple(
+                        source_id
+                        for result, _ in page
+                        if (source_id := _str(result.get("id")))
+                        and _str(_obj(result.get("container")).get("id")) in members
+                    )
+        finally:
+            scope.close()
 
     # --- fetch ---------------------------------------------------------------------------
 

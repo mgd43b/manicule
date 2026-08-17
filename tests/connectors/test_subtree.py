@@ -15,10 +15,12 @@ assertion below that looks over-careful is guarding the quiet direction.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import pytest
 
+import manicule.connectors.subtree as subtree_module
 from manicule.connectors import ConnectorError
 from manicule.connectors.config import ConfluenceConfig
 from manicule.connectors.confluence import ANCESTOR_IDS, ROOT_PAGE_IDS, SCOPE
@@ -853,6 +855,48 @@ async def test_discovery_and_reconciliation_report_the_same_scope() -> None:
         await connector.teardown()
 
     assert discovered == reconciled
+
+
+async def test_scoped_reconciliation_preserves_native_search_page_boundaries() -> None:
+    """Page two is not requested until page one has been handed to durable reconciliation."""
+    instance = _instance(page_size=2)
+    connector = await connected(instance, _scoped(instance, page_size=2))
+    try:
+        async with closing(connector.reconcile_batches()) as batches:
+            first = await anext(batches)
+            assert len(first) == 2
+            assert len(instance.queries()) == 1
+
+            second = await anext(batches)
+            assert len(second) == 2
+            assert len(instance.queries()) == 2
+    finally:
+        await connector.teardown()
+
+
+async def test_attachment_reconciliation_reuses_the_built_membership_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Looking up attachment containers must not rescan the completed subtree index."""
+    iterations = 0
+    original = subtree_module._MembershipIndex.__iter__  # pyright: ignore[reportPrivateUsage]
+
+    def observed(
+        members: subtree_module._MembershipIndex,  # pyright: ignore[reportPrivateUsage]
+    ) -> Iterator[str]:
+        nonlocal iterations
+        iterations += 1
+        return original(members)
+
+    monkeypatch.setattr("manicule.connectors.subtree._MembershipIndex.__iter__", observed)
+    instance = _with_attachments()
+    connector = await connected(instance, _scoped(instance, include_attachments=True))
+    try:
+        await drain(connector.reconcile())
+    finally:
+        await connector.teardown()
+
+    assert iterations == 1, "cached membership was re-enumerated before attachment lookup"
 
 
 async def test_a_failure_part_way_through_a_scoped_reconciliation_raises() -> None:

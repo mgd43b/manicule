@@ -80,6 +80,43 @@ class _FailsAfterOne:
         raise self._failure
 
 
+class _BatchedInventory:
+    name = _CONNECTOR
+
+    async def reconcile(self) -> AsyncIterator[str]:
+        raise AssertionError("durable reconciliation erased the source page seam")
+        yield "unreachable"  # pragma: no cover
+
+    async def reconcile_batches(self) -> AsyncIterator[Sequence[str]]:
+        yield ("page-0", "page-1")
+        yield ()
+        yield ("page-2",)
+
+
+async def test_durable_reconciliation_commits_each_source_page_before_requesting_the_next(
+    store: SqliteDocStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _documents(store, 3)
+    observed_pages: list[tuple[str, ...]] = []
+    original = store.append_reconciliation_inventory_page
+
+    async def observed(run_id: str, connector: str, scope: str, source_ids: Sequence[str]) -> int:
+        observed_pages.append(tuple(source_ids))
+        return await original(run_id, connector, scope, source_ids)
+
+    monkeypatch.setattr(store, "append_reconciliation_inventory_page", observed)
+    result = await reconcile(
+        _BatchedInventory(),  # type: ignore[arg-type] - optional page-capability spy
+        store,
+        scope=_SCOPE,
+        now=_NOW,
+    )
+
+    assert result.clean
+    assert result.seen == 3
+    assert observed_pages == [("page-0", "page-1"), ("page-2",)]
+
+
 async def test_a_crash_after_completion_resumes_without_reenumerating(
     store: SqliteDocStore,
 ) -> None:
