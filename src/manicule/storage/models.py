@@ -460,6 +460,7 @@ class AcquisitionRecord(Base):
         UniqueConstraint("run_id", "source_id"),
         UniqueConstraint("run_id", "sequence"),
         Index("ix_acquisition_records_run_state_sequence", "run_id", "state", "sequence"),
+        Index("ix_acquisition_records_run_blob_state", "run_id", "blob_ref", "state"),
         Index("ix_acquisition_records_marker_name", "marker_name", unique=True),
         Index(
             "ix_acquisition_records_run_source_version",
@@ -481,6 +482,41 @@ class AcquisitionRecord(Base):
         CheckConstraint(
             "snapshot_diagnostic IS NULL OR json_valid(snapshot_diagnostic)",
             name="snapshot_diagnostic_is_valid_json",
+        ),
+    )
+
+
+class AcquisitionBlobBacklog(Base):
+    """One content-addressed blob currently pinned by unfinished acquisition records."""
+
+    __tablename__ = "acquisition_blob_backlog"
+
+    blob_ref: Mapped[str] = mapped_column(
+        ForeignKey("blobs.hash", ondelete="RESTRICT"), primary_key=True
+    )
+    reference_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    stored_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("reference_count > 0", name="acquisition_blob_backlog_has_references"),
+        CheckConstraint(
+            "stored_bytes >= 0", name="acquisition_blob_backlog_bytes_are_not_negative"
+        ),
+    )
+
+
+class AcquisitionBacklogCapacity(Base):
+    """The O(1) exact total for content-addressed acquisition backlog admission."""
+
+    __tablename__ = "acquisition_backlog_capacity"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    acquired_blob_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("id = 1", name="acquisition_backlog_capacity_is_singleton"),
+        CheckConstraint(
+            "acquired_blob_bytes >= 0", name="acquisition_backlog_capacity_is_not_negative"
         ),
     )
 

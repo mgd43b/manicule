@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -29,7 +30,7 @@ from manicule.core.acquisition import (
     SnapshotPromotionPolicy,
 )
 from manicule.core.content import Metadata, RawDocument
-from manicule.core.errors import UnknownEntityError
+from manicule.core.errors import StorageBusyError, UnknownEntityError
 from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityRefusedError, CapacityResource
@@ -2653,6 +2654,150 @@ async def test_concurrent_blob_reservations_preserve_backlog_and_publications(
     resumed = await recovered.get_acquisition_run(lease.id)
     assert resumed is not None
     assert resumed.acquired_blob_bytes == 10, "settled bytes no longer consume backlog capacity"
+
+
+async def test_eight_reuse_workers_serialize_before_read_and_keep_exact_deduped_counters(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All workers reach writer admission together; none performs a deferred lock upgrade."""
+    store = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=100)
+    await store.ensure_workspace()
+    blob = await BlobStore(engine, data_dir, min_disk_headroom_bytes=1).put(b"same", "text/plain")
+    assert isinstance(blob, StoredBlob)
+    lease = await _claimed_run(store)
+    for sequence in range(8):
+        source_id = f"page-{sequence}"
+        await store.append_acquisition_record(
+            lease.id,
+            sequence,
+            _source(source_id),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+        await store.transition_acquisition_record(
+            lease.id,
+            source_id,
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+
+    original = store._begin_capacity_guard  # pyright: ignore[reportPrivateUsage]
+    arrived = 0
+    release = asyncio.Event()
+
+    async def simultaneous_admission(session: AsyncSession) -> None:
+        nonlocal arrived
+        arrived += 1
+        if arrived == 8:
+            release.set()
+        await release.wait()
+        await original(session)
+
+    monkeypatch.setattr(store, "_begin_capacity_guard", simultaneous_admission)
+    outcomes = await asyncio.gather(
+        *(
+            store.transition_acquisition_record(
+                lease.id,
+                f"page-{sequence}",
+                AcquisitionRecordState.ACQUIRING,
+                AcquisitionRecordState.ACQUIRED,
+                lease_owner="worker",
+                lease_generation=lease.lease_generation,
+                now=_NOW,
+                blob_ref=blob.hash,
+                acquired_source=_acquired(b"same", f"page-{sequence}"),
+                snapshot_outcome=SnapshotItemOutcome.REUSED,
+            )
+            for sequence in range(8)
+        )
+    )
+
+    assert len(outcomes) == 8
+    run = await store.get_acquisition_run(lease.id)
+    assert run is not None
+    assert (run.acquired_count, run.reused_count, run.retry_count) == (8, 8, 0)
+    assert run.acquired_blob_bytes == blob.stored_bytes
+    async with store.sessions() as session:
+        total = (
+            await session.execute(
+                text("SELECT acquired_blob_bytes FROM acquisition_backlog_capacity WHERE id = 1")
+            )
+        ).scalar_one()
+        references = (
+            await session.execute(
+                text("SELECT reference_count FROM acquisition_blob_backlog WHERE blob_ref = :ref"),
+                {"ref": blob.hash},
+            )
+        ).scalar_one()
+    assert total == blob.stored_bytes
+    assert references == 8
+
+
+async def test_busy_writer_retry_closes_each_attempt_and_returns_a_safe_typed_exhaustion(
+    store: SqliteDocStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = await _claimed_run(store)
+    for sequence in range(2):
+        await store.append_acquisition_record(
+            lease.id,
+            sequence,
+            _source(f"page-{sequence}"),
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+    original = store._begin_capacity_guard  # pyright: ignore[reportPrivateUsage]
+    attempts = 0
+
+    async def twice_busy(session: AsyncSession) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = sqlite3.OperationalError("private SQL and path must not survive")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+        await original(session)
+
+    monkeypatch.setattr(store, "_begin_capacity_guard", twice_busy)
+    acquired = await store.transition_acquisition_record(
+        lease.id,
+        "page-0",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="worker",
+        lease_generation=lease.lease_generation,
+        now=_NOW,
+    )
+    assert acquired.state is AcquisitionRecordState.ACQUIRING
+    assert attempts == 3
+
+    async def always_busy(_session: AsyncSession) -> None:
+        error = sqlite3.OperationalError("SELECT private FROM /machine/path")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise error
+
+    monkeypatch.setattr(store, "_begin_capacity_guard", always_busy)
+    with pytest.raises(StorageBusyError) as exhausted:
+        await store.transition_acquisition_record(
+            lease.id,
+            "page-1",
+            AcquisitionRecordState.DISCOVERED,
+            AcquisitionRecordState.ACQUIRING,
+            lease_owner="worker",
+            lease_generation=lease.lease_generation,
+            now=_NOW,
+        )
+    assert "SELECT" not in str(exhausted.value)
+    monkeypatch.setattr(store, "_begin_capacity_guard", original)
+    async with store.sessions.begin() as session:
+        await session.execute(text("BEGIN IMMEDIATE"))
 
 
 async def test_shared_blob_is_charged_once_and_remains_pinned_until_every_record_settles(

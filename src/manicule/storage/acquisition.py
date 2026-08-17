@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import shutil
+import sqlite3
+from functools import wraps
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import and_, case, delete, exists, func, literal, or_, select, text, update
+from sqlalchemy import and_, case, delete, exists, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import aliased
 
@@ -32,7 +35,12 @@ from manicule.core.acquisition import (
     UnsetValue,
 )
 from manicule.core.content import JsonValue
-from manicule.core.errors import AcquisitionLeaseLostError, ManiculeError, UnknownEntityError
+from manicule.core.errors import (
+    AcquisitionLeaseLostError,
+    ManiculeError,
+    StorageBusyError,
+    UnknownEntityError,
+)
 from manicule.core.ids import acquisition_marker_id
 from manicule.core.sources import Watermark
 from manicule.ingest.capacity import (
@@ -40,14 +48,16 @@ from manicule.ingest.capacity import (
     CapacityRefusedError,
     CapacityResource,
     require_disk_headroom,
-    translate_storage_capacity_errors,
+)
+from manicule.ingest.capacity import (
+    translate_storage_capacity_errors as _translate_storage_capacity_errors,
 )
 from manicule.storage import models
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import next_observation, utcnow
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
     from datetime import datetime
 
     from sqlalchemy import CursorResult
@@ -59,6 +69,59 @@ _SOURCE = TypeAdapter(AcquisitionSource)
 _ACQUIRED_SOURCE = TypeAdapter(AcquiredSource)
 _DIAGNOSTIC = TypeAdapter(AcquisitionDiagnostic)
 _OMISSION_REASONS = TypeAdapter(dict[AcquisitionFailureCode, int])
+
+_SQLITE_BUSY_RETRY_DELAYS = (0.0, 0.01, 0.05)
+
+
+def _sqlite_busy(error: BaseException) -> bool:
+    """Recognize SQLITE_BUSY through SQLAlchemy without retaining its SQL-shaped wrapper."""
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        code = getattr(current, "sqlite_errorcode", None)
+        if isinstance(code, int) and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return True
+        for related in (getattr(current, "orig", None), current.__cause__, current.__context__):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    return False
+
+
+def translate_storage_capacity_errors[F: Callable[..., Coroutine[Any, Any, Any]]](
+    operation: F,
+) -> F:
+    """Retry a whole idempotent journal transaction, then emit a private-safe busy outcome.
+
+    Every decorated method either commits one fenced transaction or rolls it back. Retrying at
+    this boundary therefore never resumes a half-transaction, and it also guarantees that the
+    SQLAlchemy session which observed BUSY has closed before another attempt begins.
+    """
+    capacity_safe = _translate_storage_capacity_errors(operation)
+
+    @wraps(operation)
+    async def bounded(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        exhausted = False
+        for delay in _SQLITE_BUSY_RETRY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                return await capacity_safe(*args, **kwargs)
+            except Exception as error:
+                if not _sqlite_busy(error):
+                    raise
+                exhausted = True
+        if exhausted:
+            # Outside the handler: no SQL, path, bound value, or exception chain survives into
+            # the durable report or served control envelope.
+            raise StorageBusyError from None
+        raise AssertionError("SQLite retry policy has no attempts")  # pragma: no cover
+
+    return cast("F", bounded)
+
 
 _RUN_TRANSITIONS: dict[AcquisitionRunState, set[AcquisitionRunState]] = {
     AcquisitionRunState.ENUMERATING: set(),
@@ -130,6 +193,161 @@ class AcquisitionWatermarkConflictError(AcquisitionConflictError):
 def _record_id(run_id: str, source_id: str) -> str:
     payload = f"{len(run_id)}:{run_id}{source_id}".encode()
     return hashlib.blake2b(payload, digest_size=20).hexdigest()
+
+
+def _counter_membership(
+    state: AcquisitionRecordState,
+    snapshot_outcome: SnapshotItemOutcome | None,
+    blob_ref: str | None,
+) -> tuple[int, int, int, int, int]:
+    """The five run aggregates affected by one record, in stable column order."""
+    return (
+        int(
+            state
+            in {
+                AcquisitionRecordState.ACQUIRED,
+                AcquisitionRecordState.INDEXING,
+                AcquisitionRecordState.SETTLED,
+            }
+        ),
+        int(state is AcquisitionRecordState.SETTLED and blob_ref is not None),
+        int(state is AcquisitionRecordState.UNCHANGED),
+        int(snapshot_outcome is SnapshotItemOutcome.REUSED),
+        int(state is AcquisitionRecordState.RETRY),
+    )
+
+
+def _apply_counter_edge(
+    run: models.AcquisitionRun,
+    before: tuple[int, int, int, int, int],
+    *,
+    target: AcquisitionRecordState,
+    blob_ref: str | None,
+    snapshot_outcome: SnapshotItemOutcome | None,
+) -> None:
+    """Apply an O(1) exact state-edge delta instead of recounting the whole manifest."""
+    after = _counter_membership(target, snapshot_outcome, blob_ref)
+    for attribute, old, new in zip(
+        ("acquired_count", "indexed_count", "unchanged_count", "reused_count", "retry_count"),
+        before,
+        after,
+        strict=True,
+    ):
+        setattr(run, attribute, int(getattr(run, attribute)) + new - old)
+
+
+async def _record_blob_is_unique_to_run(
+    session: AsyncSession,
+    record: models.AcquisitionRecord,
+    blob_ref: str,
+) -> bool:
+    other = (
+        select(models.AcquisitionRecord.id)
+        .where(
+            models.AcquisitionRecord.run_id == record.run_id,
+            models.AcquisitionRecord.id != record.id,
+            models.AcquisitionRecord.blob_ref == blob_ref,
+            models.AcquisitionRecord.state.in_(_BLOB_BACKLOG_STATES),
+        )
+        .limit(1)
+    )
+    return (await session.execute(other)).scalar_one_or_none() is None
+
+
+async def _apply_blob_backlog_edge(  # noqa: PLR0912 - one atomic old/new pin edge
+    session: AsyncSession,
+    run: models.AcquisitionRun,
+    record: models.AcquisitionRecord,
+    *,
+    target: AcquisitionRecordState,
+    blob_ref: str | None,
+    limit: int,
+) -> None:
+    """Move one exact content hash through the O(1) global capacity ledger.
+
+    The caller already owns ``BEGIN IMMEDIATE``.  Thus the singleton total, refcount, record
+    update, and per-run aggregate commit atomically; cancellation rolls all four back together.
+    """
+    old_ref = record.blob_ref if record.state in _BLOB_BACKLOG_STATES else None
+    new_ref = blob_ref if target in _BLOB_BACKLOG_STATES else None
+    if old_ref == new_ref:
+        return
+    capacity = await session.get(models.AcquisitionBacklogCapacity, 1)
+    if capacity is None:  # pragma: no cover - migrated databases always carry the singleton
+        raise AcquisitionConflictError("acquisition backlog capacity ledger is unavailable")
+    if old_ref is not None:
+        old_pin = await session.get(models.AcquisitionBlobBacklog, old_ref)
+        if old_pin is None:
+            raise AcquisitionConflictError("acquisition backlog ledger is inconsistent")
+        if await _record_blob_is_unique_to_run(session, record, old_ref):
+            run.acquired_blob_bytes -= old_pin.stored_bytes
+        if old_pin.reference_count == 1:
+            capacity.acquired_blob_bytes -= old_pin.stored_bytes
+            await session.delete(old_pin)
+        else:
+            old_pin.reference_count -= 1
+    if new_ref is None:
+        return
+    new_pin = await session.get(models.AcquisitionBlobBacklog, new_ref)
+    if new_pin is None:
+        blob = await session.get(models.Blob, new_ref)
+        if blob is None:
+            raise UnknownEntityError("acquisition blob does not exist")
+        requested = int(blob.stored_bytes)
+        used = int(capacity.acquired_blob_bytes)
+        if used + requested > limit:
+            raise CapacityRefusedError(
+                CapacityDiagnostic(
+                    resource=CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES,
+                    limit=limit,
+                    used=used,
+                    requested=max(1, requested),
+                )
+            )
+        new_pin = models.AcquisitionBlobBacklog(
+            blob_ref=new_ref, reference_count=1, stored_bytes=requested
+        )
+        session.add(new_pin)
+        capacity.acquired_blob_bytes += requested
+    else:
+        new_pin.reference_count += 1
+    if await _record_blob_is_unique_to_run(session, record, new_ref):
+        run.acquired_blob_bytes += new_pin.stored_bytes
+
+
+async def _rebuild_blob_backlog(session: AsyncSession) -> None:
+    """Repair the exact ledger after a bounded bulk transition or migration-era takeover."""
+    await session.execute(delete(models.AcquisitionBlobBacklog))
+    await session.execute(
+        sqlite_insert(models.AcquisitionBlobBacklog).from_select(
+            ("blob_ref", "reference_count", "stored_bytes"),
+            select(
+                models.AcquisitionRecord.blob_ref,
+                func.count(),
+                models.Blob.stored_bytes,
+            )
+            .join(
+                models.AcquisitionRun, models.AcquisitionRun.id == models.AcquisitionRecord.run_id
+            )
+            .join(models.Blob, models.Blob.hash == models.AcquisitionRecord.blob_ref)
+            .where(
+                models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                models.AcquisitionRecord.blob_ref.is_not(None),
+                models.AcquisitionRecord.state.in_(_BLOB_BACKLOG_STATES),
+            )
+            .group_by(models.AcquisitionRecord.blob_ref, models.Blob.stored_bytes),
+        )
+    )
+    total = (
+        await session.execute(
+            select(func.coalesce(func.sum(models.AcquisitionBlobBacklog.stored_bytes), 0))
+        )
+    ).scalar_one()
+    await session.execute(
+        update(models.AcquisitionBacklogCapacity)
+        .where(models.AcquisitionBacklogCapacity.id == 1)
+        .values(acquired_blob_bytes=total)
+    )
 
 
 def _run(row: models.AcquisitionRun) -> AcquisitionRun:
@@ -620,6 +838,7 @@ async def settle_published_snapshot(
     run.state = AcquisitionRunState.SETTLED
     run.diagnostic = None
     run.updated_at = now
+    await _rebuild_blob_backlog(session)
     latest_promoted = (
         await session.execute(
             select(models.AcquisitionRun.id)
@@ -1585,6 +1804,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             msg = f"invalid acquisition run transition: {expected} -> {target}"
             raise InvalidAcquisitionTransitionError(msg)
         async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
             if target is AcquisitionRunState.SETTLED:
                 active = (
                     await session.execute(
@@ -1630,7 +1850,11 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if result.rowcount != 1:
                 msg = f"acquisition run {run_id!r} state or lease changed"
                 raise AcquisitionConflictError(msg)
-            return _run(await self._required_run_row(session, run_id))
+            run = await self._required_run_row(session, run_id)
+            if target is AcquisitionRunState.SETTLED:
+                run.acquired_blob_bytes = 0
+                await _rebuild_blob_backlog(session)
+            return _run(run)
 
     async def list_acquisition_records(
         self,
@@ -1723,6 +1947,9 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 msg = "the acquired source hash does not match its retained blob"
                 raise InvalidAcquisitionTransitionError(msg)
         async with self._sessions.begin() as session:
+            # Acquire the SQLite writer before any read. A deferred read followed by UPDATE is
+            # an un-waitable lock upgrade when eight reuse workers reach it together.
+            await self._begin_capacity_guard(session)
             run = await self._required_run_row(session, run_id)
             self._require_live_lease(run, lease_owner, lease_generation, now)
             if run.state is AcquisitionRunState.SETTLED:
@@ -1735,20 +1962,34 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ):
                 msg = "snapshot evidence is frozen after acquisition completion"
                 raise AcquisitionConflictError(msg)
-            if target is AcquisitionRecordState.INDEXING and blob_ref is None:
-                record = (
-                    await session.execute(
-                        select(models.AcquisitionRecord).where(
-                            models.AcquisitionRecord.run_id == run_id,
-                            models.AcquisitionRecord.workspace_id == self._workspace_id,
-                            models.AcquisitionRecord.source_id == source_id,
-                            models.AcquisitionRecord.state == expected,
-                        )
+            record = (
+                await session.execute(
+                    select(models.AcquisitionRecord).where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.state == expected,
                     )
-                ).scalar_one_or_none()
-                if record is not None and record.blob_ref is None:
-                    msg = "an indexing record requires a retained blob reference"
-                    raise InvalidAcquisitionTransitionError(msg)
+                )
+            ).scalar_one_or_none()
+            if record is None:
+                raise AcquisitionConflictError("acquisition record state changed")
+            before_membership = _counter_membership(
+                AcquisitionRecordState(record.state),
+                (
+                    None
+                    if record.snapshot_outcome is None
+                    else SnapshotItemOutcome(record.snapshot_outcome)
+                ),
+                record.blob_ref,
+            )
+            if (
+                target is AcquisitionRecordState.INDEXING
+                and blob_ref is None
+                and record.blob_ref is None
+            ):
+                msg = "an indexing record requires a retained blob reference"
+                raise InvalidAcquisitionTransitionError(msg)
             values: dict[str, object] = {
                 "state": target,
                 "diagnostic": None if diagnostic is None else diagnostic.model_dump(mode="json"),
@@ -1775,16 +2016,32 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 values["blob_ref"] = blob_ref
             if acquired_source is not None:
                 values["acquired_source"] = acquired_source.model_dump(mode="json")
+            next_outcome = (
+                None
+                if record.snapshot_outcome is None
+                else SnapshotItemOutcome(record.snapshot_outcome)
+            )
             if target is AcquisitionRecordState.ACQUIRED:
-                values["snapshot_outcome"] = (
+                next_outcome = (
                     SnapshotItemOutcome.RETAINED if snapshot_outcome is None else snapshot_outcome
                 )
+                values["snapshot_outcome"] = next_outcome
             elif target is AcquisitionRecordState.UNCHANGED:
-                values["snapshot_outcome"] = (
+                next_outcome = (
                     SnapshotItemOutcome.REUSED
                     if blob_ref is not None and acquired_source is not None
                     else SnapshotItemOutcome.OMITTED
                 )
+                values["snapshot_outcome"] = next_outcome
+            next_blob_ref = record.blob_ref if blob_ref is None else blob_ref
+            await _apply_blob_backlog_edge(
+                session,
+                run,
+                record,
+                target=target,
+                blob_ref=next_blob_ref,
+                limit=self._max_acquired_blob_backlog_bytes,
+            )
             live_run = select(models.AcquisitionRun.id).where(
                 models.AcquisitionRun.id == run_id,
                 models.AcquisitionRun.workspace_id == self._workspace_id,
@@ -1800,73 +2057,6 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 models.AcquisitionRecord.state == expected,
                 live_run.exists(),
             ]
-            unsettled_blob_bytes: ColumnElement[int] = literal(0)
-            projected_blob_bytes: ColumnElement[int] = literal(0)
-            if blob_ref is not None:
-                blob_bytes = (
-                    select(models.Blob.stored_bytes)
-                    .where(models.Blob.hash == blob_ref)
-                    .scalar_subquery()
-                )
-                live_blob_hashes = (
-                    select(models.AcquisitionRecord.blob_ref.label("hash"))
-                    .join(
-                        models.AcquisitionRun,
-                        models.AcquisitionRun.id == models.AcquisitionRecord.run_id,
-                    )
-                    .where(models.AcquisitionRun.state != AcquisitionRunState.SETTLED)
-                    .where(models.AcquisitionRecord.state.in_(_BLOB_BACKLOG_STATES))
-                    .where(models.AcquisitionRecord.blob_ref.is_not(None))
-                    .distinct()
-                    .subquery()
-                )
-                unsettled_blob_bytes = (
-                    select(func.coalesce(func.sum(models.Blob.stored_bytes), 0))
-                    .select_from(live_blob_hashes)
-                    .join(models.Blob, models.Blob.hash == live_blob_hashes.c.hash)
-                    .scalar_subquery()
-                )
-                other_blob_hashes = (
-                    select(models.AcquisitionRecord.blob_ref.label("hash"))
-                    .join(
-                        models.AcquisitionRun,
-                        models.AcquisitionRun.id == models.AcquisitionRecord.run_id,
-                    )
-                    .where(models.AcquisitionRun.state != AcquisitionRunState.SETTLED)
-                    .where(models.AcquisitionRecord.state.in_(_BLOB_BACKLOG_STATES))
-                    .where(models.AcquisitionRecord.blob_ref.is_not(None))
-                    .where(
-                        or_(
-                            models.AcquisitionRecord.run_id != run_id,
-                            models.AcquisitionRecord.source_id != source_id,
-                        )
-                    )
-                    .distinct()
-                    .subquery()
-                )
-                other_blob_bytes = (
-                    select(func.coalesce(func.sum(models.Blob.stored_bytes), 0))
-                    .select_from(other_blob_hashes)
-                    .join(models.Blob, models.Blob.hash == other_blob_hashes.c.hash)
-                    .scalar_subquery()
-                )
-                projected_blob_bytes = other_blob_bytes
-                if target in _BLOB_BACKLOG_STATES:
-                    already_live = (
-                        select(other_blob_hashes.c.hash)
-                        .where(other_blob_hashes.c.hash == blob_ref)
-                        .exists()
-                    )
-                    projected_blob_bytes += case(
-                        (~already_live, blob_bytes),
-                        else_=literal(0),
-                    )
-                conditions.append(
-                    or_(
-                        projected_blob_bytes <= unsettled_blob_bytes,
-                        projected_blob_bytes <= self._max_acquired_blob_backlog_bytes,
-                    )
-                )
             result = cast(
                 "CursorResult[Any]",
                 await session.execute(
@@ -1892,28 +2082,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     raise UnknownEntityError("acquisition record does not exist")
                 if row.state != expected:
                     raise AcquisitionConflictError("acquisition record state changed")
-                if blob_ref is not None:
-                    requested_row = await session.get(models.Blob, blob_ref)
-                    if requested_row is None:
-                        raise UnknownEntityError("acquisition blob does not exist")
-                    used = int((await session.execute(select(unsettled_blob_bytes))).scalar_one())
-                    projected = int(
-                        (await session.execute(select(projected_blob_bytes))).scalar_one()
-                    )
-                    requested = projected - used
-                    if requested > 0 and used + requested > self._max_acquired_blob_backlog_bytes:
-                        raise CapacityRefusedError(
-                            CapacityDiagnostic(
-                                resource=CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES,
-                                limit=self._max_acquired_blob_backlog_bytes,
-                                used=used,
-                                requested=requested,
-                            )
-                        )
                 msg = "acquisition record state or capacity changed"
                 raise AcquisitionConflictError(msg)
-            run = await self._required_run_row(session, run_id)
-            await self._refresh_counters(session, run)
+            _apply_counter_edge(
+                run,
+                before_membership,
+                target=target,
+                blob_ref=next_blob_ref,
+                snapshot_outcome=next_outcome,
+            )
             if (
                 target is AcquisitionRecordState.RETRY
                 and diagnostic is not None
@@ -1956,6 +2133,29 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         )
         async with self._sessions.begin() as session:
             await self._fence_acquisition_mutation(session, fence)
+            run = await self._required_run_row(session, run_id)
+            record = (
+                await session.execute(
+                    select(models.AcquisitionRecord).where(
+                        models.AcquisitionRecord.run_id == run_id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.state == AcquisitionRecordState.ACQUIRING,
+                    )
+                )
+            ).scalar_one_or_none()
+            if record is None:
+                msg = f"acquisition record {source_id!r} state changed"
+                raise AcquisitionConflictError(msg)
+            before_membership = _counter_membership(
+                AcquisitionRecordState(record.state),
+                (
+                    None
+                    if record.snapshot_outcome is None
+                    else SnapshotItemOutcome(record.snapshot_outcome)
+                ),
+                record.blob_ref,
+            )
             values: dict[str, object] = {
                 "state": AcquisitionRecordState.UNCHANGED,
                 "fetched_version_token": fetched_version_token,
@@ -1966,10 +2166,20 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 values["blob_ref"] = blob_ref
             if acquired_source is not None:
                 values["acquired_source"] = acquired_source.model_dump(mode="json")
-            values["snapshot_outcome"] = (
+            next_outcome = (
                 SnapshotItemOutcome.REUSED
                 if blob_ref is not None and acquired_source is not None
                 else SnapshotItemOutcome.OMITTED
+            )
+            values["snapshot_outcome"] = next_outcome
+            next_blob_ref = record.blob_ref if blob_ref is None else blob_ref
+            await _apply_blob_backlog_edge(
+                session,
+                run,
+                record,
+                target=AcquisitionRecordState.UNCHANGED,
+                blob_ref=next_blob_ref,
+                limit=self._max_acquired_blob_backlog_bytes,
             )
             transitioned = cast(
                 "CursorResult[Any]",
@@ -2000,8 +2210,13 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 msg = f"unchanged document {document_id!r} is no longer live"
                 raise AcquisitionConflictError(msg)
             document.last_seen_at = next_observation(document.last_seen_at, utcnow())
-            run = await self._required_run_row(session, run_id)
-            await self._refresh_counters(session, run)
+            _apply_counter_edge(
+                run,
+                before_membership,
+                target=AcquisitionRecordState.UNCHANGED,
+                blob_ref=next_blob_ref,
+                snapshot_outcome=next_outcome,
+            )
             row = (
                 await session.execute(
                     select(models.AcquisitionRecord).where(
@@ -2436,6 +2651,8 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     )
                 ),
             )
+            if result.rowcount:
+                await _rebuild_blob_backlog(session)
             return result.rowcount
 
     async def _fence_acquisition_mutation(
@@ -2591,6 +2808,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 .join(models.Blob, models.Blob.hash == live_blob_hashes.c.hash)
             )
         ).scalar_one()
+        await _rebuild_blob_backlog(session)
         run.updated_at = utcnow()
 
     @staticmethod

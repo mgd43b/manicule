@@ -533,22 +533,29 @@ async def test_connecting_to_nothing_is_a_refusal_a_caller_can_act_on(
         await control.connect(socket_for(), control.Invoke(op="doctor"), on_progress=lambda _: None)
 
 
-async def test_a_server_that_dies_mid_operation_is_reported_as_itself(
+async def test_an_unexpected_handler_failure_returns_one_private_safe_envelope(
     socket_for: Callable[[], Path],
 ) -> None:
-    """A stream that ends with no result is not an empty success.
-
-    The operation may well have half-happened, so the message says so and names what to run to
-    find out. Reporting ``ok`` here would be the worst available answer: a sync that stopped
-    halfway, reported as one that finished.
-    """
+    """A live accepted request never becomes EOF, and private exception text never crosses."""
     path = socket_for()
-    handler = Echo(fail=RuntimeError("the store went away"))
+    private = "SELECT secret FROM /private/source?credential=never-print"
+    handler = Echo(fail=RuntimeError(private))
     server = await serving(path, handler)
     try:
-        with pytest.raises(control.ProtocolError, match="closed the connection without answering"):
-            await control.connect(
-                path, control.Invoke(op="connector_sync"), on_progress=lambda _: None
-            )
+        envelope = await control.connect(
+            path, control.Invoke(op="connector_sync"), on_progress=lambda _: None
+        )
+        assert envelope["ok"] is False
+        assert envelope["error"] == {
+            "type": "ControlOperationError",
+            "message": "the served operation failed before producing its normal result",
+            "hint": "Inspect aggregate lifecycle status, then retry the same operation.",
+        }
+        assert private not in json.dumps(envelope)
+        handler.fail = None
+        following = await control.connect(
+            path, control.Invoke(op="connector_list"), on_progress=lambda _: None
+        )
+        assert following["ok"] is True
     finally:
         await server.aclose()

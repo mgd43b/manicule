@@ -1845,6 +1845,7 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     assert durable.discovered_count == 10
     assert durable.enumeration_completed_at is not None
     assert durable.candidate_watermark == connector.watermark
+    assert durable.lease_owner is None
     records = await store.list_acquisition_records(durable.id)
     assert len(records) == 10
     assert {record.state for record in records} == {AcquisitionRecordState.DISCOVERED}
@@ -1852,11 +1853,6 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     assert await store.get_watermark(connector.name) is None
 
     pages_before_resume = connector.pages_requested
-    with pytest.raises(RuntimeError, match="could not be claimed"):
-        await pipeline().run(connector)
-    assert connector.pages_requested == pages_before_resume
-
-    lease_clock.advance(301)
     resumed = await pipeline().run(connector)
 
     assert connector.pages_requested == pages_before_resume, "the source was rediscovered"

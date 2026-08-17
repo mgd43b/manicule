@@ -675,19 +675,34 @@ class ControlServer:
         costs nothing while a sync is quiet and delivers immediately when it is not.
         """
         work = asyncio.ensure_future(self._handler.handle(request, report))
+        waking: asyncio.Task[bool] | None = None
         try:
             while True:
                 waking = asyncio.ensure_future(reported.wait())
                 done, _ = await asyncio.wait((work, waking), return_when=asyncio.FIRST_COMPLETED)
                 reported.clear()
                 waking.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waking
+                waking = None
                 await self._flush(writer, pending)
                 if work in done:
                     # Flushed once more, because the handler may have reported between the last
                     # flush and returning — and that report is the last thing it said.
                     await self._flush(writer, pending)
-                    return await work
+                    try:
+                        return await work
+                    except Exception:  # noqa: BLE001 - exactly-once served failure boundary
+                        # Last-resort served boundary. Operational failures should already be
+                        # typed by dispatch, but a live accepted request must never become EOF.
+                        # Do not retain or render the exception: it may carry SQL, paths, source
+                        # identities, or credentials.
+                        return _application_failure(request)
         finally:
+            if waking is not None and not waking.done():
+                waking.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waking
             if not work.done():  # pragma: no cover - only on cancellation of the connection
                 work.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -752,6 +767,24 @@ def _protocol_failure(exc: ProtocolError) -> dict[str, JsonValue]:
         "workspace": "unknown",
         "data": None,
         "error": {"type": type(exc).__name__, "message": str(exc), "hint": ""},
+    }
+
+
+def _application_failure(request: Request) -> dict[str, JsonValue]:
+    """A fixed, private-safe envelope for an unexpected served-handler failure."""
+    from manicule.app.results import CONTRACT_VERSION  # noqa: PLC0415 - avoids app import cycle
+
+    return {
+        "version": CONTRACT_VERSION,
+        "op": request.op if isinstance(request, Invoke) else "control",
+        "ok": False,
+        "workspace": (request.workspace or "unknown") if isinstance(request, Invoke) else "unknown",
+        "data": None,
+        "error": {
+            "type": "ControlOperationError",
+            "message": "the served operation failed before producing its normal result",
+            "hint": "Inspect aggregate lifecycle status, then retry the same operation.",
+        },
     }
 
 
