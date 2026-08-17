@@ -2192,11 +2192,11 @@ It is **not** the PyMuPDF case — GPL is not AGPL, and no network obligation fo
 copyleft dependency in `manicule` itself is refused regardless, because MIT that requires a
 footnote is not MIT.
 
-So **`extract-msg` is the route**, and [#21](https://github.com/mgd43b/manicule/issues/21) is
-a dependency plus a mapping rather than the hand-written property reader below.
+So [#21](https://github.com/mgd43b/manicule/issues/21) is **either a permissively licensed
+reader or the hand-written property reader below**, and not a one-line dependency either way.
 
-The permissive routes are kept on record, because they are what to reach for if `extract-msg`
-turns out to be unmaintained or wrong, not because the license forbids it. **`msg_parser` is
+The permissive routes below are therefore the plan rather than a fallback, and the license is
+exactly why. **`msg_parser` is
 BSD-2-Clause** and is a higher-level reader. Failing that, a `.msg` file is a compound-file
 (OLE/CFBF) container readable with **`olefile` (BSD-2-Clause)** — the same layer
 `extract-msg` itself sits on — holding MAPI properties as named streams. The ones that
@@ -2285,11 +2285,13 @@ Parsing is where this project's licenses get decided, because the best library f
 is repeatedly the one that cannot be used. Recorded together so the next person choosing a
 parser has the precedents rather than re-deriving them.
 
-**manicule is MIT** (`LICENSE`). It was GPL-3.0-or-later for a period — driven by the embedding
-runtime, see
-[`embeddings.md`](embeddings.md) §1.1 — changes two of the entries below and not the rest.
-The old reasoning is corrected here rather than left standing, because "rejected on license
-grounds" is exactly the kind of conclusion that outlives its premise.
+**manicule is MIT** (`LICENSE`). It was GPL-3.0-or-later for a period, driven by the embedding
+runtime — see [`embeddings.md`](embeddings.md) §1.1 — and is permissive again now that the
+runtime ships as its own distribution. **None of the entries below ends up anywhere different
+from where it started**, but one of them moved and came back, and the reasoning is recorded
+here rather than quietly restored: "rejected on license grounds" is exactly the kind of
+conclusion that outlives its premise, and a table that hides having been wrong once teaches
+nobody when to re-check it.
 
 | Dependency | License | Note |
 |---|---|---|
@@ -2298,20 +2300,31 @@ grounds" is exactly the kind of conclusion that outlives its premise.
 | **python-calamine**, **python-pptx**, **ruamel.yaml**, **markdown-it-py**, **olefile** | MIT / BSD-2-Clause | no obligations beyond attribution |
 | **selectolax** | wheel bundles **two** engines: lexbor (Apache-2.0) and Modest (**LGPL-2.1**) | import the lexbor backend only; see below |
 | **extract-msg** | GPL-3.0 | **rejected**, as it was originally — see below |
-| **PyMuPDF** | **AGPL-3.0**, dual-licensed with an Artifex commercial license | **still rejected**, and the reason changed — see below |
+| **PyMuPDF** | **AGPL-3.0**, dual-licensed with an Artifex commercial license | **rejected**, and for a reason that outlived two relicenses — see below |
 
-### `extract-msg` is unblocked, and #21 gets much simpler
+### `extract-msg` is rejected, and the round trip is the interesting part
 
-It was rejected for being GPL-3.0 in an MIT project, briefly admitted while this project was
-GPL-3.0-or-later, and is rejected again now that it is MIT. §10's hand-written MAPI property
-reader is therefore back on the table, and
-[#21](https://github.com/mgd43b/manicule/issues/21) is updated to say so rather than left
-carrying stale reasoning.
+It was rejected for being GPL-3.0 in an MIT project, admitted while this project was itself
+GPL-3.0-or-later, and is rejected again now that it is MIT. The dependency never changed. What
+changed twice was the license underneath it, and the answer followed each time — which is the
+whole reason this section exists.
 
-### PyMuPDF is *not* unblocked, and the PDF decision does not change
+That is worth recording rather than tidying away, because it is the argument for the package
+split in miniature. The version of this project that admitted `extract-msg` had bought one
+`.msg` parser at the price of making every distributed plugin a derivative work. Splitting the
+one dependency that actually needed copyleft — the MLX backend — costs a second `uv pip install`
+and buys the permissive license back for everything else.
 
-This is the correction that matters most, because the obvious inference from "we are GPL now"
-is wrong. **PyMuPDF is AGPL-3.0, not GPL-3.0.**
+So §10's permissive routes are the plan, and
+[#21](https://github.com/mgd43b/manicule/issues/21) is a BSD-licensed reader or a hand-written
+MAPI property reader.
+
+### PyMuPDF is refused under every license this project has carried
+
+**PyMuPDF is AGPL-3.0, not GPL-3.0**, and that distinction is why this decision never moved
+while everything around it did. Under MIT it is refused for the plain reason every copyleft
+dependency now is. But it was refused during the GPL period too, when `extract-msg` was not —
+and the reason it survived that window is the one worth keeping.
 
 GPLv3 §13 does permit combining a GPL-3.0 work with AGPL-3.0 code. But it says what the
 combination becomes: the AGPL portion keeps §13's network clause, so **anyone who runs the
@@ -2331,17 +2344,28 @@ operator an obligation they did not choose. **`pypdfium2` stays.**
 Both engines ship as separate compiled objects in the same wheel, so importing only the
 permissive backend still means an LGPL-2.1 binary is present on disk. That is not a problem
 for manicule as distributed — the wheel is resolved from PyPI by the user's installer,
-unmodified, and dynamic use of an LGPL library is exactly what LGPL permits, more comfortably
-now than under MIT. It would become an obligation if manicule ever shipped a bundled or
+unmodified, and dynamic use of an LGPL library is exactly what LGPL permits. That was true under
+MIT, true under GPL-3.0-or-later, and is true under MIT again: this one never depended on the
+project's own license. It would become an obligation if manicule ever shipped a bundled or
 frozen distribution containing that binary, and that is the moment to revisit.
 
 ### The rule, restated
 
-The old rule was "a copyleft dependency is rejected at selection time". That was right for an
-MIT project and is too blunt for this one. What survives is the part that was doing the work:
-**a license obligation is decided at selection time, not worked around later — and an
-obligation that falls on the operator rather than on us is the one to refuse.** That is why
-GPL is now ordinary, and AGPL still is not.
+"A copyleft dependency is rejected at selection time" is the rule again, and this section is
+the record of it being relaxed and then re-tightened rather than a claim it was never in doubt.
+
+Two things survive both moves, and they are what actually decide the cases above:
+
+**A license obligation is decided at selection time, not worked around later.** Every entry in
+the table was settled before the library was written against, which is why none of the three
+license changes required unpicking any code.
+
+**An obligation that falls on the operator rather than on us is refused outright.** That is the
+AGPL rule, and it is stricter than the copyleft rule rather than a special case of it: PyMuPDF
+would be refused even if manicule were GPL-3.0-or-later, and it was.
+
+What the split adds is a third: **a dependency that genuinely needs copyleft gets its own
+distribution, not a relicense of this one.** `packages/manicule-mlx` is the worked example.
 
 ---
 

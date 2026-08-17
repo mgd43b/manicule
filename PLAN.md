@@ -128,20 +128,21 @@ re-ingest against a pinned corpus a first-class operation rather than a re-crawl
 
 The project is MIT (`LICENSE`). It was GPL-3.0-or-later for a period, to accommodate the MLX
 embedding runtime; that runtime now ships as its own GPL-3.0-or-later distribution
-(`packages/manicule-mlx`) and core is permissive again, so copyleft dependencies are excluded
-from `manicule` itself. Two parsing decisions were made on license grounds and they move in
-directions:
+(`packages/manicule-mlx`), and core is permissive again — so a copyleft dependency in
+`manicule` itself is refused. **Neither parsing decision changes**, and the two are refused for
+different reasons:
 
-- **`extract-msg` (GPL-3.0) stays blocked.** A copyleft dependency in an MIT project carries
-  no additional obligation. [#21](https://github.com/mgd43b/manicule/issues/21) gets much
-  simpler: it becomes a dependency, not a hand-written MAPI property reader.
-- **PyMuPDF (AGPL-3.0) would be rejected under either license, and the PDF decision does not
-  change.**
-  GPLv3 §13 permits combining with AGPLv3 code, but the combination then carries AGPL §13:
-  anyone who *runs* it as a network service owes source to its users. manicule ships an HTTP
-  API and a web UI, so that is a live obligation in team mode rather than a formality.
-  `pypdfium2` is permissively licensed and already delivers page and bbox provenance, so
-  taking on a network-copyleft obligation to swap it out buys nothing.
+- **`extract-msg` (GPL-3.0) is refused because manicule is MIT.** It was briefly admissible
+  during the copyleft period and is not now.
+  [#21](https://github.com/mgd43b/manicule/issues/21) is therefore a permissively licensed
+  reader or a hand-written MAPI property reader, not a one-line dependency.
+- **PyMuPDF (AGPL-3.0) is refused under any license this project might carry**, which is the
+  stricter rule and the more durable one. GPLv3 §13 permits combining with AGPLv3 code, but
+  the combination then carries AGPL §13: anyone who *runs* it as a network service owes source
+  to its users. manicule ships an HTTP API and a web UI, so that is a live obligation in team
+  mode rather than a formality — one falling on operators rather than on us. `pypdfium2` is
+  permissively licensed and already delivers page and bbox provenance, so taking on a
+  network-copyleft obligation to swap it out buys nothing.
 
 ### OCR — out of scope for v1
 
