@@ -181,7 +181,7 @@ def test_the_mlx_package_declares_the_license_it_carries() -> None:
     """It is GPL-3.0-or-later, and that is not an accident to be tidied away.
 
     Asserted because the failure mode is somebody "fixing" the inconsistency in the direction
-    that makes the repository look uniform: relabelling this package MIT while it still links
+    that makes the repository look uniform: relabeling this package MIT while it still links
     `mlx-embeddings` would be the only genuinely wrong answer available.
     """
     blob = _declared_license("manicule-mlx")
