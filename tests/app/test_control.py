@@ -533,22 +533,78 @@ async def test_connecting_to_nothing_is_a_refusal_a_caller_can_act_on(
         await control.connect(socket_for(), control.Invoke(op="doctor"), on_progress=lambda _: None)
 
 
-async def test_a_server_that_dies_mid_operation_is_reported_as_itself(
+async def test_an_unexpected_handler_failure_returns_one_private_safe_envelope(
     socket_for: Callable[[], Path],
 ) -> None:
-    """A stream that ends with no result is not an empty success.
-
-    The operation may well have half-happened, so the message says so and names what to run to
-    find out. Reporting ``ok`` here would be the worst available answer: a sync that stopped
-    halfway, reported as one that finished.
-    """
+    """A live accepted request never becomes EOF, and private exception text never crosses."""
     path = socket_for()
-    handler = Echo(fail=RuntimeError("the store went away"))
+    private = "SELECT secret FROM /private/source?credential=never-print"
+    handler = Echo(fail=RuntimeError(private))
     server = await serving(path, handler)
     try:
-        with pytest.raises(control.ProtocolError, match="closed the connection without answering"):
-            await control.connect(
-                path, control.Invoke(op="connector_sync"), on_progress=lambda _: None
-            )
+        envelope = await control.connect(
+            path, control.Invoke(op="connector_sync"), on_progress=lambda _: None
+        )
+        assert envelope["ok"] is False
+        assert envelope["error"] == {
+            "type": "ControlOperationError",
+            "message": "the served operation failed before producing its normal result",
+            "hint": "Inspect aggregate lifecycle status, then retry the same operation.",
+        }
+        assert private not in json.dumps(envelope)
+        handler.fail = None
+        following = await control.connect(
+            path, control.Invoke(op="connector_list"), on_progress=lambda _: None
+        )
+        assert following["ok"] is True
     finally:
+        await server.aclose()
+
+
+async def test_client_disconnect_does_not_cancel_work_or_poison_the_next_request(
+    socket_for: Callable[[], Path],
+) -> None:
+    """The server owns accepted work even when the client stops waiting for its envelope."""
+
+    class Completing(Echo):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hold = True
+            self.entered = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        @override
+        async def handle(
+            self, request: control.Request, report: Callable[[str], None]
+        ) -> dict[str, JsonValue]:
+            try:
+                self.entered.set()
+                return await super().handle(request, report)
+            finally:
+                self.finished.set()
+
+    path = socket_for()
+    handler = Completing()
+    server = await serving(path, handler)
+    reader, writer = await asyncio.open_unix_connection(path)
+    del reader
+    try:
+        writer.write(control.Invoke(op="connector_sync").to_line())
+        await writer.drain()
+        await asyncio.wait_for(handler.entered.wait(), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+
+        handler.released.set()
+        await asyncio.wait_for(handler.finished.wait(), timeout=5)
+        following = await control.connect(
+            path, control.Invoke(op="connector_list"), on_progress=lambda _: None
+        )
+        assert following["ok"] is True
+        assert [getattr(request, "op", "") for request in handler.seen] == [
+            "connector_sync",
+            "connector_list",
+        ]
+    finally:
+        handler.released.set()
         await server.aclose()

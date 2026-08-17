@@ -2049,6 +2049,14 @@ mutation and every publication boundary is fenced by that generation. A source c
 `acquiring` becomes retry work at takeover, while `indexing` remains the exact checkpoint needed
 to replay partially expanded containers from retained bytes without source access.
 
+SQLite writer admission is taken before a journal transaction reads mutable state. Concurrent
+acquisition workers therefore queue at one bounded boundary instead of opening deferred readers
+and racing an un-waitable read-to-write upgrade. A short code-aware retry covers a genuinely
+external `SQLITE_BUSY`/`SQLITE_LOCKED`; exhaustion returns the private-safe `StorageBusyError`,
+closes the failed session, releases the logical lease after workers join, and leaves the committed
+prefix immediately resumable. The public envelope contains no SQL, bound values, source identity,
+or machine path.
+
 An unchanged-token result is one fenced transaction too: it moves the journal record to
 `unchanged` and refreshes the indexed document's `last_seen_at` under the same writer lock. A
 takeover cannot land between durable coverage and presence bookkeeping. The public `last_run`

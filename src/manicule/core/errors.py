@@ -95,6 +95,20 @@ class AcquisitionLeaseLostError(ManiculeError):
     """An attempt-owned mutation no longer holds its persisted fencing generation."""
 
 
+class StorageBusyError(ManiculeError):
+    """SQLite writer ownership stayed unavailable beyond the bounded retry policy.
+
+    The type deliberately retains no database exception.  SQLite and SQLAlchemy error text can
+    contain SQL, bound values, and local paths; none of those belong in a durable ingest report or
+    control envelope.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "durable storage is temporarily busy; the committed acquisition prefix is safe"
+        )
+
+
 class NameInUseError(ManiculeError):
     """A workspace already has a collection or a tag under the name that was asked for.
 
@@ -308,6 +322,7 @@ __all__ = [
     "ProviderTimeoutError",
     "ReconciliationRefusedError",
     "RedactionError",
+    "StorageBusyError",
     "TokenStateError",
     "UnknownComponentError",
     "UnknownEntityError",
