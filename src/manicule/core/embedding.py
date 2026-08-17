@@ -566,9 +566,10 @@ def require_within_context(
     damaged.
 
     Args:
-        chunks: What is about to be embedded. ``token_count`` is trusted, which is only
-            sound if it was measured with the embedder's tokenizer — hence the next
-            argument.
+        chunks: What is about to be embedded. This boundary evaluates the supplied
+            ``token_count``; callers whose embedder exposes exact counting remeasure
+            ``embed_text`` immediately before calling it, while also preserving the
+            conservative stored-count model-context check.
         fingerprint: The embedder about to receive them.
         chunk_fingerprint: The chunker that produced them, when it is known. Supplying it
             adds a tokenizer check, because a token count taken under a different
@@ -592,6 +593,18 @@ def require_within_context(
             f"this model's limit; re-chunk with the matching tokenizer."
         )
         raise ContextOverflowError(msg)
+
+    if chunk_fingerprint is not None:
+        budget = chunk_fingerprint.max_tokens
+        outside_budget = [chunk.token_count for chunk in chunks if chunk.token_count > budget]
+        if outside_budget:
+            msg = (
+                f"{len(outside_budget)} chunk(s) exceed their fingerprinted {budget}-token "
+                f"final embed_text budget; the maximum is {max(outside_budget)} tokens. "
+                f"A larger model context does not change the chunk policy. Rechunk from "
+                f"retained source bytes into a replacement generation."
+            )
+            raise ContextOverflowError(msg)
 
     limit = fingerprint.max_sequence_length
     oversized = sorted(

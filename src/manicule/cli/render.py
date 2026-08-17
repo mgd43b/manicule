@@ -1019,6 +1019,20 @@ def render_rebuild_plan(out: Console, payload: r.RebuildPlanReport) -> None:
         f"{payload.estimated_peak_memory_bytes} bytes; temporary disk "
         f"{payload.estimated_temporary_bytes} bytes"
     )
+    out.print(
+        f"estimated embedding work: {payload.estimated_embedding_chunks} chunks; "
+        f"missing retained inputs: {payload.missing_count}; "
+        f"network required: {'yes' if payload.network_required else 'no'}"
+    )
+    out.print(
+        f"current chunk identity: {escape(payload.current_chunk_fingerprint or 'unrecorded')}"
+    )
+    out.print(f"target chunk identity: {escape(payload.target_chunk_fingerprint)}")
+    if payload.over_budget_chunks:
+        out.print(
+            f"stored budget diagnostic: {payload.over_budget_chunks} chunk(s) over the "
+            f"recorded budget; maximum stored token count {payload.max_stored_chunk_tokens}"
+        )
 
 
 def render_rebuild_run(out: Console, payload: r.RebuildRunReport) -> None:

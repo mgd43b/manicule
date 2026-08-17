@@ -1382,6 +1382,10 @@ def looks_secret(key: str) -> bool:
     One rule, used both to mask configuration for display and to omit it when writing.
     """
     normalized = key.replace("-", "").replace("_", "").lower()
+    if normalized in {"maxtokens", "overlaptokens"} or "tokenizer" in normalized:
+        # Counts and tokenizer identities are public policy, not bearer tokens. Treating the
+        # substring alone as a credential made ``max_tokens`` impossible to inspect or set.
+        return False
     return any(marker.replace("_", "") in normalized for marker in _SECRET_KEYS)
 
 

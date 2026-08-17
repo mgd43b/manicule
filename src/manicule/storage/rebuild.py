@@ -10,17 +10,19 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, literal, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import (
     AcquiredSource,
+    AcquisitionRun,
     AcquisitionSource,
     SnapshotCompleteness,
     SnapshotItemOutcome,
     SnapshotPromotionPolicy,
 )
 from manicule.core.errors import ManiculeError
+from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import document_id, glossary_entry_id
 from manicule.core.rebuild import (
     DerivedReplacement,
@@ -316,58 +318,100 @@ class SqliteRebuildStore(WorkspaceScoped):
         missing_limit: int,
         persist: bool = True,
     ) -> RebuildEstimate:
-        run = await self._acquisition.get_acquisition_run(snapshot_run_id)
-        if run is None or run.promoted_at is None or not run.membership_hash:
+        anchor = await self._acquisition.get_acquisition_run(snapshot_run_id)
+        if anchor is None or anchor.promoted_at is None or not anchor.membership_hash:
             return self._refused_estimate(
                 snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_NOT_PROMOTED
             )
-        if not await self._acquisition.verify_snapshot_manifest(snapshot_run_id):
+        async with self._sessions() as session:
+            latest_rows = await self._latest_promoted_runs(session)
+        if snapshot_run_id not in {row.id for row in latest_rows}:
             return self._refused_estimate(
                 snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
             )
-        missing: list[MissingSnapshotInput] = []
-        missing_count = 0
-        documents = 0
-        manifest_items = 0
-        known_bytes = 0
-        largest_input = 0
-        async for record in self._acquisition.iter_acquisition_records(snapshot_run_id):
-            if record.sequence != manifest_items:
+        runs: list[AcquisitionRun] = []
+        for row in latest_rows:
+            candidate = await self._acquisition.get_acquisition_run(row.id)
+            if (
+                candidate is None
+                or candidate.promoted_at is None
+                or not candidate.membership_hash
+                or not await self._acquisition.verify_snapshot_manifest(row.id)
+            ):
                 return self._refused_estimate(
                     snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
                 )
-            manifest_items += 1
-            if (
-                record.blob_ref is None
-                or record.acquired_source is None
-                or not await self._blobs.contains(record.blob_ref)
-            ):
+            runs.append(candidate)
+        missing: list[MissingSnapshotInput] = []
+        missing_count = 0
+        documents = 0
+        known_bytes = 0
+        largest_input = 0
+        snapshot_bindings: list[tuple[AcquisitionRun, int]] = []
+        global_sequence = 0
+        for run in runs:
+            manifest_items = 0
+            retained_items = 0
+            async for record in self._acquisition.iter_acquisition_records(run.id):
+                if record.sequence != manifest_items:
+                    return self._refused_estimate(
+                        snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
+                    )
+                manifest_items += 1
                 if (
-                    run.promotion_policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS
-                    and record.snapshot_outcome is SnapshotItemOutcome.OMITTED
-                    and record.blob_ref is None
-                    and record.acquired_source is None
+                    record.blob_ref is None
+                    or record.acquired_source is None
+                    or not await self._blobs.contains(record.blob_ref)
                 ):
-                    continue
-                missing_count += 1
-                if len(missing) < missing_limit:
-                    missing.append(MissingSnapshotInput(sequence=record.sequence))
-            else:
-                documents += 1
-                known_bytes += record.acquired_source.byte_length
-                largest_input = max(largest_input, record.acquired_source.byte_length)
-        if manifest_items != run.discovered_count:
-            return self._refused_estimate(
-                snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
+                    if (
+                        run.promotion_policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS
+                        and record.snapshot_outcome is SnapshotItemOutcome.OMITTED
+                        and record.blob_ref is None
+                        and record.acquired_source is None
+                    ):
+                        continue
+                    missing_count += 1
+                    if len(missing) < missing_limit:
+                        missing.append(MissingSnapshotInput(sequence=global_sequence))
+                else:
+                    retained_items += 1
+                    documents += 1
+                    known_bytes += record.acquired_source.byte_length
+                    largest_input = max(largest_input, record.acquired_source.byte_length)
+                global_sequence += 1
+            if manifest_items != run.discovered_count:
+                return self._refused_estimate(
+                    snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
+                )
+            snapshot_bindings.append((run, retained_items))
+
+        combined_membership = hashlib.sha256(
+            _canonical(
+                [[run.id, run.membership_hash, retained] for run, retained in snapshot_bindings]
             )
+        ).hexdigest()
+        run_ids = tuple(run.id for run, _ in snapshot_bindings)
+        canonical_run_id = run_ids[0]
 
         target_json = target.model_dump(mode="json")
         target_digest = hashlib.sha256(_canonical(target_json)).hexdigest()
+        try:
+            target_max_tokens = ChunkFingerprint.model_validate_json(
+                target.chunk_fingerprint
+            ).max_tokens
+        except ValueError:
+            # Third-party and legacy chunkers may use opaque canonical identities. Keep their
+            # estimate conservative and retain the historical default without claiming that
+            # the opaque value encodes a structural policy.
+            target_max_tokens = 512
+        current_chunk_fingerprint: str | None = None
+        over_budget_chunks = 0
+        max_stored_chunk_tokens = 0
 
         def estimate(generation_id: str) -> RebuildEstimate:
             # Conservative estimates are deterministic functions of retained byte counts. They
             # do not sample bodies, so a dry run cannot leak content or exceed its own bound.
-            estimated_chunks = (known_bytes + 511) // 512
+            estimated_chunks = (known_bytes + target_max_tokens - 1) // target_max_tokens
             peak = largest_input * 6 + (4096 if documents else 0)
             temporary = known_bytes * 6 + estimated_chunks * 4096
             return RebuildEstimate(
@@ -384,17 +428,27 @@ class SqliteRebuildStore(WorkspaceScoped):
                 missing=tuple(missing),
                 missing_truncated=missing_count > len(missing),
                 refusal=(RebuildRefusalCode.MISSING_LOCAL_INPUT if missing_count else None),
+                current_chunk_fingerprint=current_chunk_fingerprint,
+                target_chunk_fingerprint=target.chunk_fingerprint,
+                over_budget_chunks=over_budget_chunks,
+                max_stored_chunk_tokens=max_stored_chunk_tokens,
+                estimated_embedding_chunks=estimated_chunks,
+                network_required=False,
             )
 
         if not persist:
             async with self._sessions() as session:
-                if not await self._is_only_promoted_scope(
-                    session, run.connector, run.scope_fingerprint
-                ):
+                if not await self._snapshot_set_is_current(session, run_ids):
                     return self._refused_estimate(
                         snapshot_run_id, target, RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
                     )
                 index_state = await session.get(models.IndexState, 1)
+                current_chunk_fingerprint = (
+                    None if index_state is None else index_state.chunk_fingerprint
+                )
+                over_budget_chunks, max_stored_chunk_tokens = await self._chunk_budget_diagnostic(
+                    session, current_chunk_fingerprint
+                )
                 expected_vector_table = None if index_state is None else index_state.vector_table
                 expected_vector_inventory_digest = (
                     None if index_state is None else index_state.vector_inventory_digest
@@ -409,13 +463,14 @@ class SqliteRebuildStore(WorkspaceScoped):
                 ).hexdigest()
                 generation_id = _generation_id(
                     self._workspace_id,
-                    snapshot_run_id,
+                    f"{canonical_run_id}:{combined_membership}",
                     target_digest,
                     publication_identity_digest,
                 )
                 published = await self._published_replay(
                     session,
-                    snapshot_run_id=snapshot_run_id,
+                    snapshot_run_id=canonical_run_id,
+                    snapshot_membership_hash=combined_membership,
                     target_digest=target_digest,
                     vector_table=expected_vector_table,
                     vector_inventory_digest=expected_vector_inventory_digest,
@@ -439,13 +494,17 @@ class SqliteRebuildStore(WorkspaceScoped):
             )
             if locked.rowcount != 1:
                 raise RuntimeError("rebuild workspace disappeared during planning")
-            if not await self._is_only_promoted_scope(
-                session, run.connector, run.scope_fingerprint
-            ):
+            if not await self._snapshot_set_is_current(session, run_ids):
                 return self._refused_estimate(
                     snapshot_run_id, target, RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
                 )
             index_state = await session.get(models.IndexState, 1)
+            current_chunk_fingerprint = (
+                None if index_state is None else index_state.chunk_fingerprint
+            )
+            over_budget_chunks, max_stored_chunk_tokens = await self._chunk_budget_diagnostic(
+                session, current_chunk_fingerprint
+            )
             expected_vector_table = None if index_state is None else index_state.vector_table
             expected_vector_inventory_digest = (
                 None if index_state is None else index_state.vector_inventory_digest
@@ -460,7 +519,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             ).hexdigest()
             generation_id = _generation_id(
                 self._workspace_id,
-                snapshot_run_id,
+                f"{canonical_run_id}:{combined_membership}",
                 target_digest,
                 publication_identity_digest,
             )
@@ -469,7 +528,8 @@ class SqliteRebuildStore(WorkspaceScoped):
             # same dry-run or run is idempotent instead of conflicting with its own result.
             published = await self._published_replay(
                 session,
-                snapshot_run_id=snapshot_run_id,
+                snapshot_run_id=canonical_run_id,
+                snapshot_membership_hash=combined_membership,
                 target_digest=target_digest,
                 vector_table=expected_vector_table,
                 vector_inventory_digest=expected_vector_inventory_digest,
@@ -482,11 +542,11 @@ class SqliteRebuildStore(WorkspaceScoped):
                     .values(
                         id=generation_id,
                         workspace_id=self._workspace_id,
-                        snapshot_run_id=snapshot_run_id,
+                        snapshot_run_id=canonical_run_id,
                         target_digest=target_digest,
                         publication_identity_digest=publication_identity_digest,
                         target=target_json,
-                        snapshot_membership_hash=run.membership_hash,
+                        snapshot_membership_hash=combined_membership,
                         expected_item_count=documents,
                         state=RebuildState.PLANNED,
                         next_sequence=0,
@@ -506,15 +566,59 @@ class SqliteRebuildStore(WorkspaceScoped):
                         index_elements=[
                             models.DerivedGeneration.workspace_id,
                             models.DerivedGeneration.snapshot_run_id,
+                            models.DerivedGeneration.snapshot_membership_hash,
                             models.DerivedGeneration.target_digest,
                             models.DerivedGeneration.publication_identity_digest,
                         ]
                     )
                 )
+                for ordinal, (bound_run, retained) in enumerate(snapshot_bindings):
+                    await session.execute(
+                        sqlite_insert(models.DerivedGenerationSnapshot)
+                        .values(
+                            generation_id=generation_id,
+                            ordinal=ordinal,
+                            run_id=bound_run.id,
+                            connector_name=bound_run.connector,
+                            scope_fingerprint=bound_run.scope_fingerprint,
+                            membership_hash=bound_run.membership_hash,
+                            expected_item_count=retained,
+                        )
+                        .on_conflict_do_nothing(
+                            index_elements=[
+                                models.DerivedGenerationSnapshot.generation_id,
+                                models.DerivedGenerationSnapshot.ordinal,
+                            ]
+                        )
+                    )
             generation = await self._required_generation(session, generation_id)
+            persisted_bindings = await self._generation_snapshot_rows(session, generation_id)
+            expected_bindings = [
+                (
+                    ordinal,
+                    bound_run.id,
+                    bound_run.connector,
+                    bound_run.scope_fingerprint,
+                    bound_run.membership_hash,
+                    retained,
+                )
+                for ordinal, (bound_run, retained) in enumerate(snapshot_bindings)
+            ]
             if (
-                generation.snapshot_membership_hash != run.membership_hash
+                generation.snapshot_membership_hash != combined_membership
                 or generation.expected_item_count != documents
+                or [
+                    (
+                        binding.ordinal,
+                        binding.run_id,
+                        binding.connector_name,
+                        binding.scope_fingerprint,
+                        binding.membership_hash,
+                        binding.expected_item_count,
+                    )
+                    for binding in persisted_bindings
+                ]
+                != expected_bindings
                 or (
                     generation.state is not RebuildState.PUBLISHED
                     and (
@@ -529,11 +633,35 @@ class SqliteRebuildStore(WorkspaceScoped):
 
         return estimate(generation_id)
 
+    async def _chunk_budget_diagnostic(
+        self, session: AsyncSession, canonical: str | None
+    ) -> tuple[int, int]:
+        """Aggregate-safe live stored-count audit; no chunk or source identity is selected."""
+        budget: int | None = None
+        if canonical is not None:
+            try:
+                budget = ChunkFingerprint.model_validate_json(canonical).max_tokens
+            except ValueError:
+                budget = None
+        over = func.count().filter(models.Chunk.token_count > budget) if budget else literal(0)
+        statement = (
+            select(over, func.coalesce(func.max(models.Chunk.token_count), 0))
+            .select_from(models.Chunk)
+            .join(models.Document, models.Document.id == models.Chunk.document_id)
+            .where(
+                models.Document.workspace_id == self._workspace_id,
+                models.Document.deleted_at.is_(None),
+            )
+        )
+        found, maximum = (await session.execute(statement)).one()
+        return int(found), int(maximum)
+
     async def _published_replay(
         self,
         session: AsyncSession,
         *,
         snapshot_run_id: str,
+        snapshot_membership_hash: str,
         target_digest: str,
         vector_table: str | None,
         vector_inventory_digest: str | None,
@@ -544,6 +672,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 .where(
                     models.DerivedGeneration.workspace_id == self._workspace_id,
                     models.DerivedGeneration.snapshot_run_id == snapshot_run_id,
+                    models.DerivedGeneration.snapshot_membership_hash == snapshot_membership_hash,
                     models.DerivedGeneration.target_digest == target_digest,
                     models.DerivedGeneration.state == RebuildState.PUBLISHED,
                     models.DerivedGeneration.expected_vector_table == vector_table,
@@ -574,6 +703,8 @@ class SqliteRebuildStore(WorkspaceScoped):
             estimated_temporary_bytes=0,
             missing_count=0,
             refusal=code,
+            target_chunk_fingerprint=target.chunk_fingerprint,
+            network_required=False,
         )
 
     async def checkpoint(self, generation_id: str) -> RebuildCheckpoint:
@@ -690,9 +821,9 @@ class SqliteRebuildStore(WorkspaceScoped):
             self._require_lease(generation, owner, lease_generation, now)
             if generation.state not in {RebuildState.BUILDING, RebuildState.VALIDATING}:
                 raise RebuildLeaseConflictError("generation is not accepting fenced work")
-            run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
-            if run is None or not await self._is_only_promoted_scope(
-                session, run.connector_name, run.scope_fingerprint
+            snapshots = await self._generation_snapshot_rows(session, generation.id)
+            if not snapshots or not await self._snapshot_set_is_current(
+                session, tuple(row.run_id for row in snapshots)
             ):
                 raise RebuildPublicationConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED)
             await self._require_live_vector_binding(session, generation)
@@ -794,69 +925,65 @@ class SqliteRebuildStore(WorkspaceScoped):
         if limit <= 0:
             raise ValueError("limit must be positive")
         async with self._sessions() as session:
-            generation = await self._required_generation(session, generation_id)
-            run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
-            if run is None or run.workspace_id != self._workspace_id or run.promoted_at is None:
+            await self._required_generation(session, generation_id)
+            snapshots = await self._generation_snapshot_rows(session, generation_id)
+            if not snapshots or not await self._snapshot_set_is_current(
+                session, tuple(row.run_id for row in snapshots)
+            ):
                 raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
-            snapshot_run_id = generation.snapshot_run_id
-        async with self._sessions() as session:
-            snapshot_after = -1
-            if after_sequence >= 0:
-                previous = await session.get(
-                    models.DerivedGenerationItem, (generation_id, after_sequence)
-                )
-                if previous is None:
-                    raise RebuildPublicationValidationError
-                try:
-                    previous_source_id = _REPLACEMENT.validate_python(
-                        previous.payload
-                    ).document.source_id
-                except ValueError as exc:
-                    raise RebuildPublicationValidationError from exc
-                prior_snapshot_sequence = await session.scalar(
-                    select(models.AcquisitionRecord.sequence).where(
-                        models.AcquisitionRecord.run_id == snapshot_run_id,
+            skip = after_sequence + 1
+            result: list[SnapshotRebuildInput] = []
+            for snapshot in snapshots:
+                if skip >= snapshot.expected_item_count:
+                    skip -= snapshot.expected_item_count
+                    continue
+                ranked = (
+                    select(
+                        models.AcquisitionRecord.id.label("record_id"),
+                        func.row_number()
+                        .over(order_by=models.AcquisitionRecord.sequence)
+                        .label("retained_ordinal"),
+                    )
+                    .where(
+                        models.AcquisitionRecord.run_id == snapshot.run_id,
                         models.AcquisitionRecord.workspace_id == self._workspace_id,
-                        models.AcquisitionRecord.source_id == previous_source_id,
                         models.AcquisitionRecord.blob_ref.is_not(None),
                         models.AcquisitionRecord.acquired_source.is_not(None),
                     )
+                    .subquery()
                 )
-                if prior_snapshot_sequence is None:
-                    raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
-                snapshot_after = prior_snapshot_sequence
-            records = list(
-                (
-                    await session.execute(
-                        select(models.AcquisitionRecord)
-                        .where(
-                            models.AcquisitionRecord.run_id == snapshot_run_id,
-                            models.AcquisitionRecord.workspace_id == self._workspace_id,
-                            models.AcquisitionRecord.blob_ref.is_not(None),
-                            models.AcquisitionRecord.acquired_source.is_not(None),
-                            models.AcquisitionRecord.sequence > snapshot_after,
+                records = list(
+                    (
+                        await session.execute(
+                            select(models.AcquisitionRecord)
+                            .join(ranked, ranked.c.record_id == models.AcquisitionRecord.id)
+                            .where(
+                                ranked.c.retained_ordinal > skip,
+                            )
+                            .order_by(ranked.c.retained_ordinal)
+                            .limit(limit - len(result))
                         )
-                        .order_by(models.AcquisitionRecord.sequence)
-                        .limit(limit)
-                    )
-                ).scalars()
-            )
-        result: list[SnapshotRebuildInput] = []
-        for offset, record in enumerate(records, start=after_sequence + 1):
-            if record.blob_ref is None or record.acquired_source is None:
-                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
-            acquired = AcquiredSource.model_validate(record.acquired_source)
-            source = AcquisitionSource.model_validate(record.source_record)
-            result.append(
-                SnapshotRebuildInput(
-                    sequence=offset,
-                    blob_ref=record.blob_ref,
-                    source=acquired,
-                    title=source.title,
-                    version_token=(record.fetched_version_token or source.version_token),
+                    ).scalars()
                 )
-            )
-        return result
+                skip = 0
+                for record in records:
+                    if record.blob_ref is None or record.acquired_source is None:
+                        raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+                    acquired = AcquiredSource.model_validate(record.acquired_source)
+                    source = AcquisitionSource.model_validate(record.source_record)
+                    result.append(
+                        SnapshotRebuildInput(
+                            sequence=after_sequence + 1 + len(result),
+                            connector=snapshot.connector_name,
+                            blob_ref=record.blob_ref,
+                            source=acquired,
+                            title=source.title,
+                            version_token=(record.fetched_version_token or source.version_token),
+                        )
+                    )
+                if len(result) == limit:
+                    break
+            return result
 
     async def check_capacity(
         self, generation_id: str, replacements: Sequence[DerivedReplacement]
@@ -1035,29 +1162,9 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation = await self._required_generation(session, generation_id)
             if generation.state is RebuildState.PUBLISHED:
                 return
-            run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
-            if run is None or run.workspace_id != self._workspace_id or run.promoted_at is None:
-                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
-            newer = (
-                await session.execute(
-                    select(models.AcquisitionRun.id)
-                    .where(
-                        models.AcquisitionRun.workspace_id == self._workspace_id,
-                        models.AcquisitionRun.connector_name == run.connector_name,
-                        models.AcquisitionRun.scope_fingerprint == run.scope_fingerprint,
-                        models.AcquisitionRun.promoted_at.is_not(None),
-                    )
-                    .order_by(
-                        models.AcquisitionRun.promoted_at.desc(),
-                        models.AcquisitionRun.id.desc(),
-                    )
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if newer != run.id:
-                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
-            if not await self._is_only_promoted_scope(
-                session, run.connector_name, run.scope_fingerprint
+            snapshots = await self._generation_snapshot_rows(session, generation.id)
+            if not snapshots or not await self._snapshot_set_is_current(
+                session, tuple(row.run_id for row in snapshots)
             ):
                 raise RebuildPublicationConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED)
 
@@ -1099,41 +1206,30 @@ class SqliteRebuildStore(WorkspaceScoped):
             self._require_lease(generation, owner, lease_generation, now)
             if generation.state is not RebuildState.VALIDATING:
                 raise RebuildPublicationValidationError
-            run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
-            if run is None or run.workspace_id != self._workspace_id or run.promoted_at is None:
-                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
-            newer = (
-                await session.execute(
-                    select(models.AcquisitionRun.id)
-                    .where(
-                        models.AcquisitionRun.workspace_id == self._workspace_id,
-                        models.AcquisitionRun.connector_name == run.connector_name,
-                        models.AcquisitionRun.scope_fingerprint == run.scope_fingerprint,
-                        models.AcquisitionRun.promoted_at.is_not(None),
-                    )
-                    .order_by(
-                        models.AcquisitionRun.promoted_at.desc(),
-                        models.AcquisitionRun.id.desc(),
-                    )
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if newer != run.id:
-                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
-            if not await self._is_only_promoted_scope(
-                session, run.connector_name, run.scope_fingerprint
+            snapshots = await self._generation_snapshot_rows(session, generation.id)
+            if not snapshots or not await self._snapshot_set_is_current(
+                session, tuple(row.run_id for row in snapshots)
             ):
                 raise RebuildPublicationConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED)
+            snapshot_runs = {
+                run.id: run
+                for run in (
+                    await session.execute(
+                        select(models.AcquisitionRun).where(
+                            models.AcquisitionRun.id.in_(
+                                tuple(snapshot.run_id for snapshot in snapshots)
+                            )
+                        )
+                    )
+                ).scalars()
+            }
+            if len(snapshot_runs) != len(snapshots):
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
             await self._require_live_vector_binding(session, generation)
 
             highest_fence = (
                 await session.execute(
-                    select(func.max(models.DerivedGeneration.fence_generation))
-                    .join(
-                        models.AcquisitionRun,
-                        models.AcquisitionRun.id == models.DerivedGeneration.snapshot_run_id,
-                    )
-                    .where(
+                    select(func.max(models.DerivedGeneration.fence_generation)).where(
                         models.DerivedGeneration.workspace_id == self._workspace_id,
                         models.DerivedGeneration.state.in_(
                             (
@@ -1142,8 +1238,6 @@ class SqliteRebuildStore(WorkspaceScoped):
                                 RebuildState.PUBLISHED,
                             )
                         ),
-                        models.AcquisitionRun.connector_name == run.connector_name,
-                        models.AcquisitionRun.scope_fingerprint == run.scope_fingerprint,
                     )
                 )
             ).scalar_one_or_none()
@@ -1180,7 +1274,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                         replacement=replacement,
                         generation_id=generation_id,
                         vector_publication=physical_publication,
-                        connector_name=run.connector_name,
+                        connector_name=replacement.document.source,
                         target=target,
                         snapshot=snapshot,
                     )
@@ -1188,12 +1282,26 @@ class SqliteRebuildStore(WorkspaceScoped):
             if await self._publication_row_count(physical_publication) != expected_vectors:
                 raise RebuildPublicationValidationError
 
-            if run.completeness is SnapshotCompleteness.COMPLETE:
+            connectors = {snapshot.connector_name for snapshot in snapshots}
+            complete_connectors = {
+                connector
+                for connector in connectors
+                if all(
+                    snapshot.connector_name != connector
+                    or (
+                        snapshot_runs[snapshot.run_id].completeness is not None
+                        and SnapshotCompleteness(snapshot_runs[snapshot.run_id].completeness)
+                        is SnapshotCompleteness.COMPLETE
+                    )
+                    for snapshot in snapshots
+                )
+            }
+            for connector in complete_connectors:
                 await session.execute(
                     update(models.Document)
                     .where(
                         models.Document.workspace_id == self._workspace_id,
-                        models.Document.source == run.connector_name,
+                        models.Document.source == connector,
                         models.Document.deleted_at.is_(None),
                         models.Document.publication_id != physical_publication,
                     )
@@ -1273,18 +1381,20 @@ class SqliteRebuildStore(WorkspaceScoped):
     ) -> None:
         """Join the live-generation flip to its exact source-work settlement."""
         await self._verify_complete_header(session, generation)
-        try:
-            await settle_published_snapshot(
-                session,
-                workspace_id=self._workspace_id,
-                run_id=generation.snapshot_run_id,
-                expected_membership_hash=generation.snapshot_membership_hash,
-                expected_item_count=generation.expected_item_count,
-                derived_generation_identity=generation.id,
-                now=now,
-            )
-        except AcquisitionConflictError as exc:
-            raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED) from exc
+        snapshots = await self._generation_snapshot_rows(session, generation.id)
+        for snapshot in snapshots:
+            try:
+                await settle_published_snapshot(
+                    session,
+                    workspace_id=self._workspace_id,
+                    run_id=snapshot.run_id,
+                    expected_membership_hash=snapshot.membership_hash,
+                    expected_item_count=snapshot.expected_item_count,
+                    derived_generation_identity=generation.id,
+                    now=now,
+                )
+            except AcquisitionConflictError as exc:
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED) from exc
 
     async def _require_live_vector_binding(
         self, session: AsyncSession, generation: models.DerivedGeneration
@@ -1298,41 +1408,71 @@ class SqliteRebuildStore(WorkspaceScoped):
         ):
             raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
 
-    async def _is_only_promoted_scope(
-        self, session: AsyncSession, connector_name: str, scope_fingerprint: str
-    ) -> bool:
-        """The explicit safe boundary until one generation can cover several manifests."""
-        scopes = (
-            await session.execute(
-                select(
-                    models.AcquisitionRun.connector_name,
-                    models.AcquisitionRun.scope_fingerprint,
+    async def _latest_promoted_runs(self, session: AsyncSession) -> list[models.AcquisitionRun]:
+        ranked = (
+            select(
+                models.AcquisitionRun.id.label("run_id"),
+                func.row_number()
+                .over(
+                    partition_by=models.AcquisitionRun.connector_name,
+                    order_by=(
+                        models.AcquisitionRun.promoted_at.desc(),
+                        models.AcquisitionRun.created_at.desc(),
+                        models.AcquisitionRun.id.desc(),
+                    ),
                 )
-                .where(
-                    models.AcquisitionRun.workspace_id == self._workspace_id,
-                    models.AcquisitionRun.promoted_at.is_not(None),
-                )
-                .group_by(
-                    models.AcquisitionRun.connector_name,
-                    models.AcquisitionRun.scope_fingerprint,
-                )
-                .limit(2)
+                .label("scope_rank"),
             )
-        ).all()
-        if [tuple(row) for row in scopes] != [(connector_name, scope_fingerprint)]:
+            .join(
+                models.Connector,
+                (models.Connector.id == models.AcquisitionRun.connector_id)
+                & (models.Connector.workspace_id == models.AcquisitionRun.workspace_id),
+            )
+            .where(
+                models.AcquisitionRun.workspace_id == self._workspace_id,
+                models.AcquisitionRun.promoted_at.is_not(None),
+                models.AcquisitionRun.superseded_at.is_(None),
+                models.Connector.deleted_at.is_(None),
+            )
+            .subquery()
+        )
+        return list(
+            (
+                await session.execute(
+                    select(models.AcquisitionRun)
+                    .join(ranked, ranked.c.run_id == models.AcquisitionRun.id)
+                    .where(ranked.c.scope_rank == 1)
+                    .order_by(models.AcquisitionRun.connector_name)
+                )
+            ).scalars()
+        )
+
+    async def _generation_snapshot_rows(
+        self, session: AsyncSession, generation_id: str
+    ) -> list[models.DerivedGenerationSnapshot]:
+        return list(
+            (
+                await session.execute(
+                    select(models.DerivedGenerationSnapshot)
+                    .where(models.DerivedGenerationSnapshot.generation_id == generation_id)
+                    .order_by(models.DerivedGenerationSnapshot.ordinal)
+                )
+            ).scalars()
+        )
+
+    async def _snapshot_set_is_current(self, session: AsyncSession, run_ids: Sequence[str]) -> bool:
+        latest = await self._latest_promoted_runs(session)
+        if tuple(row.id for row in latest) != tuple(run_ids):
             return False
-        foreign_live_document = (
-            await session.execute(
-                select(models.Document.id)
-                .where(
-                    models.Document.deleted_at.is_(None),
-                    (models.Document.workspace_id != self._workspace_id)
-                    | (models.Document.source != connector_name),
-                )
-                .limit(1)
+        connectors = {row.connector_name for row in latest}
+        foreign_live = await session.scalar(
+            select(func.count(models.Document.id)).where(
+                models.Document.workspace_id == self._workspace_id,
+                models.Document.deleted_at.is_(None),
+                models.Document.source.not_in(connectors),
             )
-        ).scalar_one_or_none()
-        return foreign_live_document is None
+        )
+        return not foreign_live
 
     async def _live_chunk_inventory_digest(self, session: AsyncSession) -> str:
         """Recompute #187's exact active-corpus vector inventory after relational mutation."""
@@ -1492,7 +1632,6 @@ class SqliteRebuildStore(WorkspaceScoped):
         """Stream the ordered evidence inventory without populating the ORM identity map."""
         rows = await session.stream(
             select(
-                models.AcquisitionRecord.sequence,
                 models.AcquisitionRecord.source_id,
                 models.AcquisitionRecord.blob_ref,
                 models.AcquisitionRecord.acquired_source,
@@ -1502,17 +1641,24 @@ class SqliteRebuildStore(WorkspaceScoped):
                 models.Blob.compression,
             )
             .join(models.Blob, models.Blob.hash == models.AcquisitionRecord.blob_ref)
+            .join(
+                models.DerivedGenerationSnapshot,
+                models.DerivedGenerationSnapshot.run_id == models.AcquisitionRecord.run_id,
+            )
             .where(
-                models.AcquisitionRecord.run_id == generation.snapshot_run_id,
+                models.DerivedGenerationSnapshot.generation_id == generation.id,
                 models.AcquisitionRecord.workspace_id == self._workspace_id,
                 models.AcquisitionRecord.blob_ref.is_not(None),
                 models.AcquisitionRecord.acquired_source.is_not(None),
             )
-            .order_by(models.AcquisitionRecord.sequence)
+            .order_by(
+                models.DerivedGenerationSnapshot.ordinal,
+                models.AcquisitionRecord.sequence,
+            )
             .execution_options(yield_per=_INVENTORY_PAGE)
         )
+        sequence = 0
         async for (
-            sequence,
             source_id,
             blob_ref,
             acquired_source,
@@ -1542,6 +1688,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 stored_bytes=stored,
                 compression=compression,
             )
+            sequence += 1
 
     async def _evidence_representations(
         self,
@@ -1558,8 +1705,12 @@ class SqliteRebuildStore(WorkspaceScoped):
                 models.Blob.compression,
             )
             .join(models.Blob, models.Blob.hash == models.AcquisitionRecord.blob_ref)
+            .join(
+                models.DerivedGenerationSnapshot,
+                models.DerivedGenerationSnapshot.run_id == models.AcquisitionRecord.run_id,
+            )
             .where(
-                models.AcquisitionRecord.run_id == generation.snapshot_run_id,
+                models.DerivedGenerationSnapshot.generation_id == generation.id,
                 models.AcquisitionRecord.workspace_id == self._workspace_id,
                 models.AcquisitionRecord.blob_ref.is_not(None),
                 models.AcquisitionRecord.acquired_source.is_not(None),
@@ -1590,13 +1741,14 @@ class SqliteRebuildStore(WorkspaceScoped):
     ) -> str:
         """Incrementally bind exact ordered membership with constant resident state."""
         hasher = hashlib.sha256()
+        snapshots = await self._generation_snapshot_rows(session, generation.id)
         self._digest_part(
             hasher,
             {
                 "version": 2,
                 "workspace_id": self._workspace_id,
                 "generation_id": generation.id,
-                "snapshot_run_id": generation.snapshot_run_id,
+                "snapshot_run_ids": [row.run_id for row in snapshots],
                 "snapshot_membership_hash": generation.snapshot_membership_hash,
                 "expected_item_count": generation.expected_item_count,
             },
@@ -1787,17 +1939,79 @@ class SqliteRebuildStore(WorkspaceScoped):
         session: AsyncSession,
         generation: models.DerivedGeneration,
     ) -> None:
-        run = await session.get(models.AcquisitionRun, generation.snapshot_run_id)
-        if (
-            run is None
-            or run.workspace_id != self._workspace_id
-            or run.promoted_at is None
-            or run.membership_hash != generation.snapshot_membership_hash
-            or not await snapshot_manifest_matches(
-                session, run.id, generation.snapshot_membership_hash
-            )
-        ):
+        snapshots = await self._generation_snapshot_rows(session, generation.id)
+        if not snapshots:
             raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+        combined = hashlib.sha256(
+            _canonical(
+                [[row.run_id, row.membership_hash, row.expected_item_count] for row in snapshots]
+            )
+        ).hexdigest()
+        legacy_single = (
+            len(snapshots) == 1
+            and snapshots[0].membership_hash == generation.snapshot_membership_hash
+        )
+        if combined != generation.snapshot_membership_hash and not legacy_single:
+            raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+        snapshot_count = 0
+        evidence_count = 0
+        for snapshot in snapshots:
+            run = await session.get(models.AcquisitionRun, snapshot.run_id)
+            if (
+                run is None
+                or run.workspace_id != self._workspace_id
+                or run.promoted_at is None
+                or run.membership_hash != snapshot.membership_hash
+                or run.connector_name != snapshot.connector_name
+                or run.scope_fingerprint != snapshot.scope_fingerprint
+                or not await snapshot_manifest_matches(session, run.id, snapshot.membership_hash)
+            ):
+                raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
+            counts = (
+                await session.execute(
+                    select(
+                        func.count(models.AcquisitionRecord.sequence),
+                        func.count(models.AcquisitionRecord.sequence).filter(
+                            models.AcquisitionRecord.blob_ref.is_not(None),
+                            models.AcquisitionRecord.acquired_source.is_not(None),
+                        ),
+                        func.count(models.AcquisitionRecord.sequence).filter(
+                            models.AcquisitionRecord.snapshot_outcome
+                            == SnapshotItemOutcome.OMITTED,
+                            models.AcquisitionRecord.blob_ref.is_(None),
+                            models.AcquisitionRecord.acquired_source.is_(None),
+                        ),
+                    ).where(
+                        models.AcquisitionRecord.run_id == snapshot.run_id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                    )
+                )
+            ).one()
+            total, retained, omitted = (int(value) for value in counts)
+            completeness = (
+                None if run.completeness is None else SnapshotCompleteness(run.completeness)
+            )
+            partial_is_honest = (
+                completeness is SnapshotCompleteness.PARTIAL
+                and SnapshotPromotionPolicy(run.promotion_policy)
+                is SnapshotPromotionPolicy.ALLOW_OMISSIONS
+                and omitted == run.omission_count
+                and total == retained + omitted
+            )
+            complete_is_honest = (
+                completeness is SnapshotCompleteness.COMPLETE
+                and run.omission_count == 0
+                and omitted == 0
+                and total == retained
+            )
+            if (
+                total != run.discovered_count
+                or retained != snapshot.expected_item_count
+                or not (partial_is_honest or complete_is_honest)
+            ):
+                raise RebuildPublicationValidationError
+            snapshot_count += total
+            evidence_count += retained
         if (
             generation.next_sequence != generation.expected_item_count
             or generation.documents_built != generation.expected_item_count
@@ -1816,6 +2030,10 @@ class SqliteRebuildStore(WorkspaceScoped):
                     func.count(
                         func.distinct(
                             func.json_extract(
+                                models.DerivedGenerationItem.payload, "$.document.source"
+                            )
+                            + "\0"
+                            + func.json_extract(
                                 models.DerivedGenerationItem.payload, "$.document.source_id"
                             )
                         )
@@ -1823,55 +2041,11 @@ class SqliteRebuildStore(WorkspaceScoped):
                 ).where(models.DerivedGenerationItem.generation_id == generation.id)
             )
         ).scalar_one()
-        snapshot_count = (
-            await session.execute(
-                select(func.count(models.AcquisitionRecord.sequence)).where(
-                    models.AcquisitionRecord.run_id == generation.snapshot_run_id,
-                    models.AcquisitionRecord.workspace_id == self._workspace_id,
-                )
-            )
-        ).scalar_one()
-        evidence_count = (
-            await session.execute(
-                select(func.count(models.AcquisitionRecord.sequence)).where(
-                    models.AcquisitionRecord.run_id == generation.snapshot_run_id,
-                    models.AcquisitionRecord.workspace_id == self._workspace_id,
-                    models.AcquisitionRecord.blob_ref.is_not(None),
-                    models.AcquisitionRecord.acquired_source.is_not(None),
-                )
-            )
-        ).scalar_one()
-        omitted_count = (
-            await session.execute(
-                select(func.count(models.AcquisitionRecord.sequence)).where(
-                    models.AcquisitionRecord.run_id == generation.snapshot_run_id,
-                    models.AcquisitionRecord.workspace_id == self._workspace_id,
-                    models.AcquisitionRecord.snapshot_outcome == SnapshotItemOutcome.OMITTED,
-                    models.AcquisitionRecord.blob_ref.is_(None),
-                    models.AcquisitionRecord.acquired_source.is_(None),
-                )
-            )
-        ).scalar_one()
-        completeness = None if run.completeness is None else SnapshotCompleteness(run.completeness)
-        partial_is_honest = (
-            completeness is SnapshotCompleteness.PARTIAL
-            and SnapshotPromotionPolicy(run.promotion_policy)
-            is SnapshotPromotionPolicy.ALLOW_OMISSIONS
-            and omitted_count == run.omission_count
-            and snapshot_count == evidence_count + omitted_count
-        )
-        complete_is_honest = (
-            completeness is SnapshotCompleteness.COMPLETE
-            and run.omission_count == 0
-            and omitted_count == 0
-            and snapshot_count == evidence_count
-        )
         if (
             item_count != generation.expected_item_count
             or distinct_item_sources != item_count
             or evidence_count != item_count
-            or snapshot_count != run.discovered_count
-            or not (partial_is_honest or complete_is_honest)
+            or snapshot_count < evidence_count
         ):
             raise RebuildPublicationValidationError
 
@@ -1898,15 +2072,21 @@ class SqliteRebuildStore(WorkspaceScoped):
         snapshots: list[models.AcquisitionRecord] = []
         for item in items:
             try:
-                source_id = _REPLACEMENT.validate_python(item.payload).document.source_id
+                document = _REPLACEMENT.validate_python(item.payload).document
             except ValueError as exc:
                 raise RebuildPublicationValidationError from exc
             snapshot = (
                 await session.execute(
-                    select(models.AcquisitionRecord).where(
-                        models.AcquisitionRecord.run_id == generation.snapshot_run_id,
+                    select(models.AcquisitionRecord)
+                    .join(
+                        models.DerivedGenerationSnapshot,
+                        models.DerivedGenerationSnapshot.run_id == models.AcquisitionRecord.run_id,
+                    )
+                    .where(
+                        models.DerivedGenerationSnapshot.generation_id == generation.id,
+                        models.DerivedGenerationSnapshot.connector_name == document.source,
                         models.AcquisitionRecord.workspace_id == self._workspace_id,
-                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.source_id == document.source_id,
                         models.AcquisitionRecord.blob_ref.is_not(None),
                         models.AcquisitionRecord.acquired_source.is_not(None),
                     )

@@ -15,6 +15,7 @@ from manicule.chunking.chunker import (
     MIN_TOKENS,
     OVERLAP_TOKENS,
     StructuralChunker,
+    finalize_chunks,
 )
 from manicule.chunking.tokens import PROVISIONAL_SAFETY_FACTOR, SupportsTokenCount, TokenCounter
 
@@ -29,4 +30,5 @@ __all__ = [
     "StructuralChunker",
     "SupportsTokenCount",
     "TokenCounter",
+    "finalize_chunks",
 ]

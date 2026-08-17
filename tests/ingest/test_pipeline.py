@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, override
 
 import pytest
 
+from manicule.chunking import StructuralChunker, TokenCounter
 from manicule.core.content import Commit, DocumentStatus, PipelineStage, RawDocument, Retention
 from manicule.core.errors import PolicyError
 from manicule.core.fingerprints import ParseFingerprint
@@ -123,6 +124,46 @@ async def test_a_document_goes_from_bytes_to_indexed_with_chunks_and_vectors() -
         fakes.BlockChunker.fingerprint.canonical(),
         HashEmbedder().fingerprint.canonical(),
     ), "per-document lineage is what makes a later invalidation a query rather than a rebuild"
+
+
+async def test_post_chunk_middleware_growth_is_recounted_and_refused_before_embedding() -> None:
+    class OversizedEmbedText(fakes.PassThrough):
+        name = "oversized-embed-text"
+        mutates_embedded_text = True
+
+        @override
+        async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
+            del document
+            return [
+                item.model_copy(
+                    update={
+                        "embed_text": item.embed_text + (" synthetic" * 200),
+                        "token_count": 1,
+                    }
+                )
+                for item in chunks
+            ]
+
+    chunker = StructuralChunker(
+        TokenCounter("whitespace", lambda text: len(text.split()), provisional=False),
+        max_tokens=96,
+        overlap_tokens=16,
+        breadcrumb_tokens=16,
+        min_tokens=1,
+    )
+    pipeline, store, vectors = build(
+        chunker=chunker,
+        middleware=(OversizedEmbedText(),),
+    )
+
+    await pipeline.run(fakes.DictConnector({"a": "small synthetic input"}))
+
+    failed = await store.find_document("memory", "a")
+    assert failed is not None
+    assert failed.status is DocumentStatus.FAILED
+    assert failed.failed_stage is PipelineStage.MIDDLEWARE
+    assert not store.chunks.get(failed.id)
+    assert not vectors.rows
 
 
 async def test_the_write_order_marks_a_document_indexed_last() -> None:

@@ -40,8 +40,9 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from manicule.parsers.expansion import MAX_DEPTH
 from manicule.parsers.grammars import DECLARED_LANGUAGES
@@ -64,6 +65,7 @@ __all__ = [
     "SLIDES_MEDIA_TYPES",
     "SOURCE_CODE_MEDIA_TYPES",
     "SPREADSHEET_MEDIA_TYPES",
+    "STRUCTURAL_BREADCRUMB_TOKENS",
     "STRUCTURED_MEDIA_TYPES",
     "WEB_MEDIA_TYPES",
     "WORD_MEDIA_TYPE",
@@ -80,11 +82,30 @@ __all__ = [
     "SlidesConfig",
     "SourceCodeConfig",
     "SpreadsheetConfig",
+    "StructuralChunkerConfig",
     "StructuredConfig",
     "WebConfig",
     "WordConfig",
     "html_text_version",
 ]
+
+STRUCTURAL_BREADCRUMB_TOKENS = 64
+
+
+class StructuralChunkerConfig(BaseModel):
+    """Fingerprint-affecting policy for the built-in structural chunker."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_tokens: int = Field(default=512, gt=STRUCTURAL_BREADCRUMB_TOKENS)
+    overlap_tokens: int = Field(default=64, ge=0)
+
+    @model_validator(mode="after")
+    def _overlap_fits(self) -> Self:
+        if self.overlap_tokens >= self.max_tokens:
+            raise ValueError("overlap_tokens must be lower than max_tokens")
+        return self
+
 
 # --- media types -------------------------------------------------------------------------
 #

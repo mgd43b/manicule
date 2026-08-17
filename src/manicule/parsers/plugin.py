@@ -219,6 +219,14 @@ def _build_chunker(context: BuildContext) -> StructuralChunker:
     from manicule.chunking import StructuralChunker, TokenCounter  # noqa: PLC0415 - see docstring
     from manicule.chunking.tokens import SupportsTokenCount  # noqa: PLC0415
 
+    policy = context.config
+    if not isinstance(policy, parser_config.StructuralChunkerConfig):
+        msg = (
+            f"structural chunker was built with {type(policy).__name__} where it declares "
+            f"{parser_config.StructuralChunkerConfig.__name__}"
+        )
+        raise ConfigError(msg)
+
     embedder: SupportsTokenCount | None = None
     try:
         candidate = context.components.get(keys.EMBEDDER)
@@ -233,6 +241,8 @@ def _build_chunker(context: BuildContext) -> StructuralChunker:
     return StructuralChunker(
         counter,
         embedder=embedder,
+        max_tokens=policy.max_tokens,
+        overlap_tokens=policy.overlap_tokens,
         grammars=_grammar_versions(context.settings),
         version_components=_pinned_versions(),
     )
@@ -283,24 +293,23 @@ def _chunker_metadata(context: MetadataContext) -> ChunkFingerprint:
     from manicule.chunking.chunker import (  # noqa: PLC0415
         CHUNKER_NAME as FINGERPRINT_NAME,
     )
-    from manicule.chunking.chunker import (  # noqa: PLC0415
-        CHUNKER_VERSION,
-        MAX_TOKENS,
-        OVERLAP_TOKENS,
-    )
+    from manicule.chunking.chunker import CHUNKER_VERSION  # noqa: PLC0415
     from manicule.core.embedding import EmbedFingerprint  # noqa: PLC0415
     from manicule.core.fingerprints import ChunkFingerprint  # noqa: PLC0415
 
     embedding = context.components.get(keys.EMBEDDER)
     if not isinstance(embedding, EmbedFingerprint):
         raise ConfigError("embedder metadata did not declare an embedding fingerprint")
+    policy = context.config
+    if not isinstance(policy, parser_config.StructuralChunkerConfig):
+        raise ConfigError("structural chunker metadata received invalid component configuration")
     components = _pinned_versions()
     suffix = "".join(f";{name}={value}" for name, value in sorted(components.items()))
     return ChunkFingerprint(
         chunker=FINGERPRINT_NAME,
         version=f"{CHUNKER_VERSION}{suffix}",
-        max_tokens=MAX_TOKENS,
-        overlap_tokens=OVERLAP_TOKENS,
+        max_tokens=policy.max_tokens,
+        overlap_tokens=policy.overlap_tokens,
         tokenizer_id=embedding.tokenizer_id,
         grammars=_grammar_versions(context.settings),
     )
@@ -328,8 +337,9 @@ class ParsingPlugin:
         registry.add(
             keys.CHUNKER.named(CHUNKER_NAME),
             _build_chunker,
+            config_model=parser_config.StructuralChunkerConfig,
             metadata_factory=_chunker_metadata,
-            summary="512 tokens on embed_text, 64 overlap, boundaries from block structure.",
+            summary="Configurable final embed_text budget and overlap; structural boundaries.",
         )
 
 

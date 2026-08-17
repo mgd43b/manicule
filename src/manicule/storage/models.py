@@ -1434,6 +1434,7 @@ class DerivedGeneration(Base):
         UniqueConstraint(
             "workspace_id",
             "snapshot_run_id",
+            "snapshot_membership_hash",
             "target_digest",
             "publication_identity_digest",
             name="uq_derived_generation_plan",
@@ -1456,6 +1457,32 @@ class DerivedGeneration(Base):
         CheckConstraint(
             "(state = 'published') = (published_at IS NOT NULL)",
             name="derived_generation_publication_timestamp_matches_state",
+        ),
+    )
+
+
+class DerivedGenerationSnapshot(Base):
+    """One promoted source scope bound into a workspace replacement generation."""
+
+    __tablename__ = "derived_generation_snapshots"
+
+    generation_id: Mapped[str] = mapped_column(
+        ForeignKey("derived_generations.id", ondelete="CASCADE"), primary_key=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("acquisition_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    connector_name: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    membership_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("generation_id", "run_id", name="uq_generation_snapshot_run"),
+        CheckConstraint(
+            "ordinal >= 0 AND expected_item_count >= 0",
+            name="derived_generation_snapshot_counts_are_not_negative",
         ),
     )
 
@@ -1535,6 +1562,7 @@ __all__ = [
     "CorpusRevision",
     "DerivedGeneration",
     "DerivedGenerationItem",
+    "DerivedGenerationSnapshot",
     "Document",
     "DocumentTag",
     "DocumentVersion",

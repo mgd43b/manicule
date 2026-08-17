@@ -330,6 +330,10 @@ class SourceLifecycleMixin(WorkspaceScoped):
         dependent = await session.scalar(
             select(exists().where(models.DerivedGeneration.snapshot_run_id == run.id))
         )
+        if not dependent:
+            dependent = await session.scalar(
+                select(exists().where(models.DerivedGenerationSnapshot.run_id == run.id))
+            )
         if dependent:
             raise LifecycleRefusalError(
                 "snapshot still anchors a derived generation; clean obsolete generations first"

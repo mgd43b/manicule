@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from itertools import pairwise
+from typing import cast
 
 import pytest
 
@@ -20,7 +21,7 @@ from manicule.chunking.tokens import tiktoken_tokenizer_id
 from manicule.core.anchors import CellAnchor, LineAnchor, PageAnchor
 from manicule.core.content import BlockKind, Document, DocumentStatus, Metadata, ParsedBlock
 from manicule.core.embedding import EmbedFingerprint, Pooling, Vector
-from manicule.core.errors import ConfigError, ContextOverflowError
+from manicule.core.errors import ChunkingError, ConfigError, ContextOverflowError
 from manicule.core.fingerprints import PROVISIONAL_TOKENIZER_PREFIX
 from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
 from manicule.testing import assert_chunker_contract
@@ -294,6 +295,67 @@ def test_an_oversized_table_splits_by_rows_and_repeats_the_header() -> None:
         "a part whose header is repeated into its text must address the header rows too, or "
         "the citation resolves to fewer rows than it quotes"
     )
+
+
+@pytest.mark.parametrize("with_header", [True, False])
+def test_one_oversized_table_row_is_lossless_and_every_fragment_is_bounded(
+    with_header: bool,
+) -> None:
+    header = "Header | Value"
+    row = f"Item | {'x' * 350}"
+    rows = [header, row] if with_header else [row]
+    refs = ["A1:B1", "A2:B2"] if with_header else ["A1:B1"]
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=128, overlap_tokens=0, breadcrumb_tokens=16, min_tokens=1
+    )
+    metadata = cast(
+        "Metadata",
+        {"rows": rows, "header_rows": 1 if with_header else 0, "row_refs": refs},
+    )
+    table = ParsedBlock(
+        kind=BlockKind.TABLE,
+        text="\n".join(rows),
+        anchor=CellAnchor(sheet="Synthetic", ref="A1:B2" if with_header else "A1:B1"),
+        metadata=metadata,
+    )
+
+    chunks = chunker.chunk(document(title="Synthetic table"), [table])
+
+    assert len(chunks) > 1
+    assert all(chunk.token_count <= 128 for chunk in chunks)
+    assert all(chunk.metadata.get("hard_split_at") == "row" for chunk in chunks)
+    if with_header:
+        prefix = f"{header}\n"
+        assert all(chunk.text.startswith(prefix) for chunk in chunks)
+        assert "".join(chunk.text.removeprefix(prefix) for chunk in chunks) == row
+    else:
+        assert "".join(chunk.text for chunk in chunks) == row
+
+
+def test_an_oversized_header_and_row_fall_back_to_a_lossless_bounded_split() -> None:
+    header = "H" * 150
+    row = "R" * 200
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=128, overlap_tokens=0, breadcrumb_tokens=16, min_tokens=1
+    )
+    metadata: Metadata = {
+        "rows": [header, row],
+        "header_rows": 1,
+        "row_refs": ["A1", "A2"],
+    }
+    table = ParsedBlock(
+        kind=BlockKind.TABLE,
+        text=f"{header}\n{row}",
+        anchor=CellAnchor(sheet="Synthetic", ref="A1:A2"),
+        metadata=metadata,
+    )
+
+    chunks = chunker.chunk(document(title="Synthetic table"), [table])
+
+    assert chunks
+    assert "".join(chunk.text for chunk in chunks) == table.text
+    assert all(chunk.token_count <= 128 for chunk in chunks)
+    assert all(chunk.metadata.get("hard_split_at") == "row" for chunk in chunks)
 
 
 # A header row wide enough that the table alone exceeds the 448-token text budget, which is
@@ -672,6 +734,159 @@ def test_an_over_long_breadcrumb_is_elided_from_the_middle() -> None:
     assert rendered.startswith("ENG")
     assert rendered.endswith("Configuration")
     assert "…" in rendered
+
+
+def test_a_single_identifier_breadcrumb_is_still_bounded() -> None:
+    rendered = render(["synthetic_identifier_" * 40], len, 32)
+    assert len(rendered) <= 32
+    assert rendered.endswith("…")
+
+
+# --- final rendered budget ---------------------------------------------------------------
+
+
+def byte_counter() -> TokenCounter:
+    """Deterministic exact synthetic tokenizer; every UTF-8 byte is one content token."""
+    return TokenCounter("test/utf8-bytes-v1", lambda text: len(text.encode()), provisional=False)
+
+
+@pytest.mark.parametrize(("maximum", "overlap"), [(512, 64), (768, 96)])
+def test_every_supported_block_kind_obeys_the_final_exact_budget(
+    maximum: int, overlap: int
+) -> None:
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=maximum, overlap_tokens=overlap, breadcrumb_tokens=64
+    )
+    blocks = [
+        ParsedBlock(
+            kind=kind,
+            text=("synthetic café 数据 payload. " * 80),
+            anchor=LineAnchor(start=index + 1, end=index + 1),
+            metadata=(
+                {"rows": ["synthetic café 数据 payload. " * 80], "header_rows": 0}
+                if kind is BlockKind.TABLE
+                else {}
+            ),
+        )
+        for index, kind in enumerate(
+            (BlockKind.PROSE, BlockKind.LIST, BlockKind.TABLE, BlockKind.PANEL, BlockKind.MEDIA)
+        )
+    ]
+    blocks.append(
+        ParsedBlock(
+            kind=BlockKind.CODE,
+            text="synthetic_identifier_" * 180,
+            anchor=LineAnchor(start=20, end=20),
+        )
+    )
+
+    chunks = chunker.chunk(document(title="Synthetic budget"), blocks)
+
+    assert chunks
+    assert all(chunk.token_count == len(chunk.embed_text.encode()) for chunk in chunks)
+    assert all(chunk.token_count <= maximum for chunk in chunks)
+    assert any(chunk.metadata.get("hard_split") for chunk in chunks)
+
+
+def test_overlap_is_shrunk_against_the_complete_rendered_input() -> None:
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=128, overlap_tokens=32, breadcrumb_tokens=24, min_tokens=1
+    )
+    shared = LineAnchor(start=1, end=1)
+    blocks = [
+        ParsedBlock(
+            kind=BlockKind.PROSE,
+            text=" ".join(f"Prior {index:02d}." for index in range(9)),
+            anchor=shared,
+            heading_path=("Config",),
+        ),
+        ParsedBlock(
+            kind=BlockKind.PROSE,
+            text=" ".join(f"Current {index:02d}." for index in range(8)),
+            anchor=shared,
+            heading_path=("Config",),
+        ),
+    ]
+
+    chunks = chunker.chunk(document(title="Synthetic service"), blocks)
+
+    assert len(chunks) == 2
+    assert max(chunk.token_count for chunk in chunks) <= 128
+    assert all(chunk.token_count == len(chunk.embed_text.encode()) for chunk in chunks)
+    assert chunks[1].text.startswith("Prior 08.\n\nCurrent 00.")
+    crumb = chunks[1].embed_text.split("\n\n", maxsplit=1)[0]
+    next_overlap = f"{crumb}\n\nPrior 07. {chunks[1].text}"
+    assert len(next_overlap.encode()) > 128
+
+
+def test_one_oversized_code_line_is_losslessly_split_with_narrow_provenance() -> None:
+    source = "const syntheticIdentifier = '数据-café-';" * 120
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=512, overlap_tokens=64, breadcrumb_tokens=64
+    )
+    block = ParsedBlock(
+        kind=BlockKind.CODE,
+        text=source,
+        anchor=LineAnchor(start=37, end=37, symbol="syntheticIdentifier"),
+        lang="typescript",
+    )
+
+    chunks = chunker.chunk(document(title="Synthetic module"), [block])
+
+    assert len(chunks) > 1
+    assert "".join(chunk.text for chunk in chunks) == source
+    assert all(chunk.token_count <= 512 for chunk in chunks)
+    assert all(chunk.metadata.get("hard_split_at") == "line" for chunk in chunks)
+    assert all(
+        chunk.anchor == LineAnchor(start=37, end=37, symbol="syntheticIdentifier")
+        for chunk in chunks
+    )
+
+
+def test_mixed_code_lines_reconstruct_and_each_anchor_covers_only_its_payload() -> None:
+    source = "short line\n" + ("x" * 260) + "\ntail line"
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=96, overlap_tokens=0, breadcrumb_tokens=16, min_tokens=1
+    )
+    block = ParsedBlock(
+        kind=BlockKind.CODE,
+        text=source,
+        anchor=LineAnchor(start=10, end=12, symbol="synthetic"),
+        lang="text",
+    )
+
+    chunks = chunker.chunk(document(title="Synthetic module"), [block])
+
+    assert "".join(chunk.text for chunk in chunks) == source
+    for chunk in chunks:
+        represented: set[int] = set()
+        if "short line" in chunk.text:
+            represented.add(10)
+        if "x" in chunk.text:
+            represented.add(11)
+        if "tail line" in chunk.text:
+            represented.add(12)
+        assert represented
+        assert chunk.anchor == LineAnchor(
+            start=min(represented), end=max(represented), symbol="synthetic"
+        )
+
+
+def test_post_middleware_finalization_recounts_and_refuses_growth() -> None:
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=96, overlap_tokens=0, breadcrumb_tokens=16
+    )
+    [chunk] = chunker.chunk(document(title="Synthetic"), [prose("bounded payload")])
+    grown = chunk.model_copy(
+        update={"embed_text": chunk.embed_text + " middleware", "token_count": 1}
+    )
+
+    [final] = chunker.finalize([grown])
+    assert final.token_count == len(final.embed_text.encode())
+
+    oversized = grown.model_copy(update={"embed_text": grown.embed_text + ("x" * 200)})
+    with pytest.raises(ChunkingError, match="above the configured 96-token chunk budget"):
+        chunker.finalize([oversized])
 
 
 # --- minimum size ----------------------------------------------------------------------------

@@ -187,7 +187,14 @@ class PooledEmbedder(Lifecycle, ABC):
         limit would be dropped in silence, and each stored vector would describe an opening
         fragment while its chunk still claimed all of its text.
         """
-        require_within_context(chunks, self.fingerprint, chunk_fingerprint)
+        measured = [
+            chunk.model_copy(update={"token_count": self.count_tokens(chunk.embed_text)})
+            for chunk in chunks
+        ]
+        # Preserve the conservative stored-count context guard while exact measurement closes
+        # the opposite (stale-low) direction for the fingerprint budget below.
+        require_within_context(chunks, self.fingerprint)
+        require_within_context(measured, self.fingerprint, chunk_fingerprint)
         return await self.embed([chunk.embed_text for chunk in chunks])
 
     def count_tokens(self, text: str) -> int:

@@ -20,7 +20,7 @@ Two numbers are expensive to change once a corpus is indexed, and both are in
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import cast
 
@@ -32,10 +32,11 @@ from manicule.core.content import BlockKind, Chunk, Document, Metadata, ParsedBl
 from manicule.core.errors import ChunkingError, ContextOverflowError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import chunk_id
+from manicule.parsers.config import STRUCTURAL_BREADCRUMB_TOKENS
 
 CHUNKER_NAME = "structural"
 
-CHUNKER_VERSION = "2"
+CHUNKER_VERSION = "3"
 """This chunker's own version, and what moving it costs.
 
 1 -> 2: an oversized table with no non-header row is split at its rows with no header
@@ -73,12 +74,20 @@ can price it:
 No parser ``rules`` version moves with it. What the parsers extract is unchanged: this is a
 change to what the chunker does with identical blocks, which is the division
 ``PARSERS["html"]``'s 2 -> 3 comment draws from the other side.
+
+2 -> 3: ``max_tokens`` became a post-render invariant. Version 2 packed content against the
+breadcrumb-adjusted text budget and added overlap afterwards, so a near-full prose or list
+group could exceed the fingerprint it claimed. Its code-line fallback also preserved one
+oversized line whole. Version 3 repacks against each chunk's exact rendered breadcrumb,
+admits only the overlap that still fits, and hard-splits every remaining oversized unit.
+Those changes move boundaries, so retained-source offline rebuild is required; relabeling
+the existing generation would leave its stored chunks and vectors falsely current.
 """
 
 MAX_TOKENS = 512
 OVERLAP_TOKENS = 64
 MIN_TOKENS = 64
-BREADCRUMB_TOKENS = 64
+BREADCRUMB_TOKENS = STRUCTURAL_BREADCRUMB_TOKENS
 
 BLOCK_SEPARATOR = "\n\n"
 
@@ -119,6 +128,10 @@ class _Unit:
 
     metadata: Metadata = field(default_factory=Metadata)
     starts_section: bool = False
+    source_ordinal: int = -1
+    source_contiguous: bool = False
+    repeated_prefix: str = ""
+    """Structural context that must begin every hard-split fragment, such as a table header."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,8 +231,8 @@ class StructuralChunker:
                 f"{self._embedder.fingerprint.describe()} attends to {limit}. Text past the "
                 f"limit is dropped with no error raised, so every oversized chunk would be "
                 f"indexed as its opening tokens while still claiming all of its text. "
-                f"Set rag.chunk.maxTokens to {limit} or lower, or choose a model with a "
-                f"longer sequence length."
+                f'Set plugins.config."chunker.structural".max_tokens to {limit} or lower, '
+                f"or choose a model with a longer sequence length."
             )
             raise ContextOverflowError(msg)
 
@@ -233,14 +246,48 @@ class StructuralChunker:
         block_list = _promote_headings_when_that_is_all_there_is(block_list)
 
         units: list[_Unit] = []
-        for block in block_list:
-            units.extend(self._to_units(block))
+        for source_ordinal, block in enumerate(block_list):
+            units.extend(
+                replace(unit, source_ordinal=source_ordinal) for unit in self._to_units(block)
+            )
         if not units:
             return []
 
         groups = self._accumulate(units)
         groups = self._merge_short_tail(groups)
+        groups = self._fit_final_bases(document, groups)
         return self._render(document, groups)
+
+    def finalize(self, chunks: Sequence[Chunk]) -> list[Chunk]:
+        """Measure middleware's final embedding inputs and enforce this fingerprint's budget.
+
+        ``after_chunk`` may legitimately rewrite ``embed_text``. It may not make a chunk cease
+        to satisfy the chunk fingerprint that records its limit, and its inherited
+        ``token_count`` is no longer true after any rewrite. The ingest stage calls this after
+        the complete middleware chain, immediately before glossary detection and embedding.
+
+        This guard cannot split middleware output: splitting ``embed_text`` alone would make
+        it cease to correspond to the immutable, cited ``text``. A growing middleware must
+        reserve space or emit a bounded representation instead.
+        """
+        measured: list[Chunk] = []
+        over_budget = 0
+        maximum = 0
+        for chunk in chunks:
+            tokens = self._counter(chunk.embed_text)
+            maximum = max(maximum, tokens)
+            if tokens > self._max_tokens:
+                over_budget += 1
+            measured.append(chunk.model_copy(update={"token_count": tokens}))
+        if over_budget:
+            msg = (
+                f"middleware produced {over_budget} chunk(s) above the configured "
+                f"{self._max_tokens}-token chunk budget; the maximum final embedding input "
+                f"was {maximum} tokens. Reduce the middleware's added context or its input "
+                f"before rebuilding."
+            )
+            raise ChunkingError(msg)
+        return measured
 
     # --- step 1: blocks to units ---------------------------------------------------------
 
@@ -360,7 +407,8 @@ class StructuralChunker:
 
         units: list[_Unit] = []
         for part_index, indices in enumerate(parts, start=1):
-            text = "\n".join([*header, *(rows[i] for i in indices)])
+            prefix = f"{header_text}\n" if header else ""
+            text = f"{prefix}{'\n'.join(rows[i] for i in indices)}"
             unit = self._unit(
                 block,
                 text,
@@ -368,7 +416,7 @@ class StructuralChunker:
                 rows=[indices[0] + 1, indices[-1] + 1],
             )
             anchor = _narrow_cell_anchor(block.anchor, refs, header_rows, indices)
-            units.append(replace(unit, anchor=anchor))
+            units.append(replace(unit, anchor=anchor, repeated_prefix=prefix))
         if any(unit.tokens > self._text_budget for unit in units):
             # A single row does not fit. Splitting it further is a cell-level operation the
             # parser's rendering does not expose, so the row is treated as prose: it is
@@ -379,10 +427,42 @@ class StructuralChunker:
                 for split in (
                     [unit]
                     if unit.tokens <= self._text_budget
-                    else self._split_text(unit.text, unit, hard_split_kind="row")
+                    else (
+                        self._hard_split_repeating_prefix(unit, "row")
+                        if unit.repeated_prefix
+                        else self._split_text(unit.text, unit, hard_split_kind="row")
+                    )
                 )
             ]
         return units
+
+    def _hard_split_repeating_prefix(self, unit: _Unit, kind: str) -> list[_Unit]:
+        """Split a table row while retaining its parser-declared header on every fragment."""
+        prefix = unit.repeated_prefix
+        if not prefix or not unit.text.startswith(prefix):  # pragma: no cover - internal invariant
+            return self._hard_split(unit, kind)
+        remaining = unit.text[len(prefix) :]
+        pieces: list[_Unit] = []
+        while remaining:
+            cut = self._longest_prefix_satisfying(
+                remaining,
+                lambda candidate: self._counter(f"{prefix}{candidate}") <= self._text_budget,
+            )
+            if cut == 0:
+                # Repeating a header wider than the budget is physically impossible. Keep the
+                # complete table losslessly indexable and mark the structural hard split,
+                # instead of turning an oversized header into a document-level refusal.
+                fallback = replace(unit, repeated_prefix="")
+                return self._split_text(fallback.text, fallback, hard_split_kind=kind)
+            head, remaining = remaining[:cut], remaining[cut:]
+            text = f"{prefix}{head}"
+            metadata: Metadata = {
+                **unit.metadata,
+                "hard_split": True,
+                "hard_split_at": kind,
+            }
+            pieces.append(replace(unit, text=text, tokens=self._counter(text), metadata=metadata))
+        return pieces
 
     def _split_lines(self, block: ParsedBlock) -> list[_Unit]:
         """Last-resort split for a code block the parser could not divide further.
@@ -392,13 +472,42 @@ class StructuralChunker:
         still exceeds the budget. It cuts at blank-line runs and then at line ends, never
         mid-token, mid-string or mid-comment, and lines mean the same thing on every machine.
         """
-        blocks = [part for part in block.text.split("\n\n") if part.strip()]
         units: list[_Unit] = []
-        for part in blocks:
-            if self._counter(part) <= self._text_budget:
-                units.append(self._unit(block, part))
-                continue
-            units.extend(self._pack(part.split("\n"), "\n", block))
+        current: list[tuple[int, str]] = []
+        source_lines = block.text.splitlines(keepends=True) or [block.text]
+        exact_line_mapping = isinstance(
+            block.anchor, LineAnchor
+        ) and block.anchor.end - block.anchor.start + 1 == len(source_lines)
+
+        def materialize(selected: Sequence[tuple[int, str]]) -> _Unit:
+            text = "".join(value for _, value in selected)
+            unit = replace(self._unit(block, text), source_contiguous=True)
+            if exact_line_mapping and isinstance(block.anchor, LineAnchor):
+                first = block.anchor.start + selected[0][0]
+                last = block.anchor.start + selected[-1][0]
+                unit = replace(
+                    unit,
+                    anchor=LineAnchor(start=first, end=last, symbol=block.anchor.symbol),
+                )
+            return unit
+
+        def flush() -> None:
+            if current:
+                units.append(materialize(current))
+                current.clear()
+
+        # Keep line endings on their source lines. Joining with a synthetic separator would
+        # lose blank lines and make the non-overlap payload impossible to reconstruct exactly.
+        for offset, line in enumerate(source_lines):
+            candidate = "".join(value for _, value in (*current, (offset, line)))
+            if current and self._counter(candidate) > self._text_budget:
+                flush()
+            current.append((offset, line))
+            if self._counter(line) > self._text_budget:
+                oversized = materialize(current)
+                current.clear()
+                units.extend(self._hard_split(oversized, "line"))
+        flush()
         return units or [self._unit(block, block.text)]
 
     def _split_prose(self, block: ParsedBlock) -> list[_Unit]:
@@ -486,6 +595,98 @@ class StructuralChunker:
                 high = middle - 1
         return best
 
+    def _fit_final_bases(
+        self, document: Document, groups: Sequence[Sequence[_Unit]]
+    ) -> list[list[_Unit]]:
+        """Repack groups against the exact breadcrumb-plus-current-text rendering.
+
+        The earlier text budget is still useful: it preserves structural boundaries cheaply
+        and keeps most documents on the fast path. This pass is authoritative. It accounts
+        for separators and tokenizer behavior at string boundaries rather than assuming token
+        counts add.
+        """
+        hierarchy = _source_hierarchy(document)
+        fitted: list[list[_Unit]] = []
+        for group in groups:
+            heading_path = group[0].heading_path
+
+            def fits_text(value: str, path: Sequence[str] = heading_path) -> bool:
+                crumb = self._breadcrumb(document, hierarchy, path, content=value)
+                return self._rendered_count(crumb, value) <= self._max_tokens
+
+            current: list[_Unit] = []
+            for original in group:
+                for unit in self._fit_final_unit(original, fits_text):
+                    candidate = [*current, unit]
+                    candidate_text = _join_units(candidate)
+                    if current and not fits_text(candidate_text):
+                        fitted.append(current)
+                        current = []
+                    if not fits_text(unit.text):  # pragma: no cover - guarded below
+                        raise ChunkingError("an indivisible unit cannot fit the final chunk budget")
+                    current.append(unit)
+            if current:
+                fitted.append(current)
+        return fitted
+
+    def _fit_final_unit(self, unit: _Unit, fits_text: Callable[[str], bool]) -> list[_Unit]:
+        if fits_text(unit.text):
+            return [unit]
+
+        pieces: list[_Unit] = []
+        repeated_prefix = unit.repeated_prefix
+        if repeated_prefix and (
+            not unit.text.startswith(repeated_prefix) or not fits_text(repeated_prefix)
+        ):
+            repeated_prefix = ""
+        remaining = unit.text[len(repeated_prefix) :] if repeated_prefix else unit.text
+        while remaining:
+
+            def fits_prefix(candidate: str) -> bool:
+                return fits_text(f"{repeated_prefix}{candidate}")
+
+            cut = self._longest_prefix_satisfying(remaining, fits_prefix)
+            if cut == 0:
+                msg = (
+                    "the rendered breadcrumb and repeated table header leave no room for "
+                    "even one content character"
+                )
+                raise ChunkingError(msg)
+            head, remaining = remaining[:cut], remaining[cut:]
+            metadata: Metadata = {
+                **unit.metadata,
+                "hard_split": True,
+                "hard_split_at": "row" if unit.repeated_prefix else "final_budget",
+            }
+            text = f"{repeated_prefix}{head}"
+            pieces.append(
+                replace(
+                    unit,
+                    text=text,
+                    tokens=self._counter(text),
+                    metadata=metadata,
+                    repeated_prefix=repeated_prefix,
+                )
+            )
+        return pieces
+
+    def _rendered_count(self, crumb: str, text: str) -> int:
+        embed_text = f"{crumb}{BLOCK_SEPARATOR}{text}" if crumb else text
+        return self._counter(embed_text)
+
+    @staticmethod
+    def _longest_prefix_satisfying(text: str, fits: Callable[[str], bool]) -> int:
+        low, high = 1, len(text)
+        best = 0
+        while low <= high:
+            middle = (low + high) // 2
+            if fits(text[:middle]):
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
     # --- step 2: units to groups ---------------------------------------------------------
 
     def _accumulate(self, units: Sequence[_Unit]) -> list[list[_Unit]]:
@@ -559,13 +760,26 @@ class StructuralChunker:
         # hundred chunks paid for two hundred identical validations of one JSON blob.
         hierarchy = _source_hierarchy(document)
         for position, group in enumerate(groups):
-            text = BLOCK_SEPARATOR.join(unit.text for unit in group)
-            overlap = self._overlap_from(previous, group)
+            current_text = _join_units(group)
+            heading_path = group[0].heading_path
+            crumb = self._breadcrumb(document, hierarchy, heading_path, content=current_text)
+
+            def overlap_fits(
+                value: str,
+                current: str = current_text,
+                breadcrumb_text: str = crumb,
+            ) -> bool:
+                text = f"{value}{BLOCK_SEPARATOR}{current}" if value else current
+                return self._rendered_count(breadcrumb_text, text) <= self._max_tokens
+
+            overlap = self._overlap_from(previous, group, fits=overlap_fits)
+            text = current_text
             if overlap.text:
                 text = f"{overlap.text}{BLOCK_SEPARATOR}{text}"
-            heading_path = group[0].heading_path
-            crumb = self._breadcrumb(document, hierarchy, heading_path)
             embed_text = f"{crumb}{BLOCK_SEPARATOR}{text}" if crumb else text
+            measured = self._counter(embed_text)
+            if measured > self._max_tokens:  # pragma: no cover - direct postcondition above
+                raise ChunkingError("the final rendered chunk exceeds its configured token budget")
             # The overlap window extends the anchor with it (docs/parsing.md §4.3). A chunk
             # that opens with the previous chunk's last sentences and names only its own lines
             # quotes from outside the place it cites — and it reads correctly while doing so,
@@ -581,14 +795,20 @@ class StructuralChunker:
                     heading_path=heading_path,
                     kind=_dominant_kind(group),
                     position=position,
-                    token_count=self._counter(embed_text),
+                    token_count=measured,
                     metadata=_group_metadata(group, provisional=self._counter.provisional),
                 )
             )
             previous = group
         return chunks
 
-    def _overlap_from(self, previous: Sequence[_Unit] | None, group: Sequence[_Unit]) -> _Overlap:
+    def _overlap_from(
+        self,
+        previous: Sequence[_Unit] | None,
+        group: Sequence[_Unit],
+        *,
+        fits: Callable[[str], bool] | None = None,
+    ) -> _Overlap:
         """Whole trailing sentences of the previous chunk, and the units they came from.
 
         Taken in whole sentences, never mid-sentence: a window that cuts mid-sentence produces
@@ -614,12 +834,11 @@ class StructuralChunker:
             # The overlap would be text the next chunk's anchor does not cover, which is a
             # citation quoting from outside the place it names.
             return _Overlap()
-        source = BLOCK_SEPARATOR.join(unit.text for unit in previous)
+        source = _join_units(previous)
         cap = min(self._overlap_tokens, max(1, self._counter(source) // 2))
 
         taken: list[str] = []
         used: list[_Unit] = []
-        running = 0
         for unit in reversed(previous):
             # A unit the next chunk's anchor already covers may be cut into: taking part of it
             # widens nothing, because the anchor is the same one either way. That is the case
@@ -630,22 +849,24 @@ class StructuralChunker:
             free = unit.anchor == group[0].anchor
             unit_sentences = list(reversed(sentences(unit.text) or [unit.text]))
             if not free:
-                unit_tokens = sum(self._counter(sentence) for sentence in unit_sentences)
-                if running + unit_tokens > cap:
+                candidate = [*reversed(unit_sentences), *taken]
+                candidate_text = " ".join(candidate)
+                candidate_tokens = self._counter(candidate_text)
+                if candidate_tokens > cap or (fits is not None and not fits(candidate_text)):
                     break
-                taken[0:0] = list(reversed(unit_sentences))
+                taken = candidate
                 used.insert(0, unit)
-                running += unit_tokens
                 continue
             stopped = False
             contributed = False
             for sentence in unit_sentences:
-                tokens = self._counter(sentence)
-                if running + tokens > cap:
+                candidate = [sentence, *taken]
+                candidate_text = " ".join(candidate)
+                candidate_tokens = self._counter(candidate_text)
+                if candidate_tokens > cap or (fits is not None and not fits(candidate_text)):
                     stopped = True
                     break
-                taken.insert(0, sentence)
-                running += tokens
+                taken = candidate
                 contributed = True
             if contributed:
                 used.insert(0, unit)
@@ -654,7 +875,12 @@ class StructuralChunker:
         return _Overlap(" ".join(taken), tuple(used))
 
     def _breadcrumb(
-        self, document: Document, hierarchy: Sequence[str], heading_path: Sequence[str]
+        self,
+        document: Document,
+        hierarchy: Sequence[str],
+        heading_path: Sequence[str],
+        *,
+        content: str | None = None,
     ) -> str:
         """One chunk's breadcrumb. ``hierarchy`` is the document's, resolved by the caller once."""
         parts = breadcrumb.elements(
@@ -663,7 +889,32 @@ class StructuralChunker:
             (document.title,),
             heading_path,
         )
-        return breadcrumb.render(parts, self._counter, self._breadcrumb_tokens)
+        if content is None:
+            return breadcrumb.render(parts, self._counter, self._breadcrumb_tokens)
+        # The reserve is an upper bound, not a promise to spend all of it. Separators and
+        # tokenizer merges at the breadcrumb/content boundary are part of the final budget.
+        for budget in range(self._breadcrumb_tokens, -1, -1):
+            rendered = breadcrumb.render(parts, self._counter, budget)
+            if self._rendered_count(rendered, content) <= self._max_tokens:
+                return rendered
+        return ""  # pragma: no cover - content fitting handles the empty-breadcrumb case
+
+
+def _join_units(units: Sequence[_Unit]) -> str:
+    """Render units without inventing separators inside one losslessly split source block."""
+    if not units:
+        return ""
+    rendered = units[0].text
+    previous = units[0]
+    for unit in units[1:]:
+        contiguous = (
+            previous.source_contiguous
+            and unit.source_contiguous
+            and previous.source_ordinal == unit.source_ordinal
+        )
+        rendered += ("" if contiguous else BLOCK_SEPARATOR) + unit.text
+        previous = unit
+    return rendered
 
 
 def _source_hierarchy(document: Document) -> tuple[str, ...]:
@@ -889,6 +1140,19 @@ def _non_negative_int(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+def finalize_chunks(chunker: object, chunks: Sequence[Chunk]) -> list[Chunk]:
+    """Apply a chunker's optional post-middleware finalizer.
+
+    Third-party chunkers keep their existing protocol. The structural chunker supplies this
+    hook because its exact bound counter is the authority for its fingerprinted final budget.
+    """
+    finalizer = getattr(chunker, "finalize", None)
+    if not callable(finalizer):
+        return list(chunks)
+    typed = cast("Callable[[Sequence[Chunk]], list[Chunk]]", finalizer)
+    return typed(chunks)
+
+
 __all__ = [
     "ATOMIC_KINDS",
     "BREADCRUMB_TOKENS",
@@ -899,4 +1163,5 @@ __all__ = [
     "OVERLAPPING_KINDS",
     "OVERLAP_TOKENS",
     "StructuralChunker",
+    "finalize_chunks",
 ]

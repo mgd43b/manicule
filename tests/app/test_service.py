@@ -985,6 +985,40 @@ async def test_a_setting_is_written_and_reads_back(
     assert written.count("precise") == 1
 
 
+async def test_structural_component_policy_uses_the_real_cli_key(
+    service: ApplicationService, config_home: Path
+) -> None:
+    await service.config_set("plugins.config.chunker.structural.max_tokens", "768")
+    await service.config_set('plugins.config."chunker.structural".overlap_tokens', "96")
+
+    written = await asyncio.to_thread(config_home.read_text, "utf-8")
+    assert '[plugins.config."chunker.structural"]' in written
+    assert "max_tokens = 768" in written
+    assert "overlap_tokens = 96" in written
+
+
+async def test_structural_component_policy_reads_through_the_real_cli_key(
+    backend: FakeBackend,
+) -> None:
+    backend.settings = Settings(
+        plugins={  # pyright: ignore[reportArgumentType]
+            "config": {"chunker.structural": {"max_tokens": 768, "overlap_tokens": 96}}
+        }
+    )
+    service = ApplicationService(backend)
+
+    value = await service.config_get("plugins.config.chunker.structural.max_tokens")
+    assert value.value == 768
+
+
+async def test_invalid_structural_component_policy_is_not_written(
+    service: ApplicationService, config_home: Path
+) -> None:
+    with pytest.raises(ConfigError, match=r"chunker\.structural"):
+        await service.config_set("plugins.config.chunker.structural.max_tokens", "64")
+    assert not await asyncio.to_thread(config_home.exists)
+
+
 async def test_a_value_that_parses_as_json_is_stored_as_json(
     service: ApplicationService, config_home: Path
 ) -> None:

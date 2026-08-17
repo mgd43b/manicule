@@ -825,7 +825,7 @@ class ReembedCleanupReport(Payload):
 
 
 class RebuildPlanReport(Payload):
-    """Aggregate-only dry run for one promoted retained snapshot."""
+    """Aggregate-only dry run for the workspace set containing a promoted snapshot."""
 
     generation_id: str
     snapshot_id: str
@@ -838,6 +838,12 @@ class RebuildPlanReport(Payload):
     missing_count: int = Field(ge=0)
     refusal_code: str | None = None
     runnable: bool
+    current_chunk_fingerprint: str | None = None
+    target_chunk_fingerprint: str
+    over_budget_chunks: int = Field(ge=0)
+    max_stored_chunk_tokens: int = Field(ge=0)
+    estimated_embedding_chunks: int = Field(ge=0)
+    network_required: bool = False
     lifecycle: LifecycleProgress
 
 

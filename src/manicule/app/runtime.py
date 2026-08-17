@@ -1020,7 +1020,10 @@ class _Ingestion:
             )
         if chunk.max_tokens > embed.max_sequence_length:
             raise ManiculeError(
-                "configured chunker metadata exceeds the embedder's declared context window"
+                f'plugins.config."chunker.structural".max_tokens is {chunk.max_tokens}, '
+                f"but the configured embedder reads at most {embed.max_sequence_length} "
+                "tokens. Lower that setting or choose a model with a longer context window; "
+                "silently clamping it would make the derived fingerprint false."
             )
         middleware: list[MiddlewareMetadata] = []
         for name in self._runtime.settings.plugins.middleware:

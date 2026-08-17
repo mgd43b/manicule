@@ -12,6 +12,8 @@ import pytest
 
 from manicule.core.content import Chunk, Document
 from manicule.core.embedding import EmbedFingerprint, Vector
+from manicule.core.errors import ContextOverflowError
+from manicule.core.fingerprints import ChunkFingerprint
 from manicule.ingest.reembed import (
     ChunkKey,
     CorpusSnapshot,
@@ -45,6 +47,20 @@ class CountingEmbedder(HashEmbedder):
     async def embed(self, texts: Sequence[str]) -> list[Vector]:
         self.calls.append(tuple(texts))
         return await super().embed(texts)
+
+
+class ExactCountingEmbedder(CountingEmbedder):
+    def __init__(self, dimension: int = 5) -> None:
+        super().__init__(dimension=dimension)
+        self.fingerprint = self.fingerprint.model_copy(
+            update={
+                "tokenizer_id": "synthetic/characters-v1",
+                "max_sequence_length": 1024,
+            }
+        )
+
+    def count_tokens(self, text: str) -> int:
+        return len(text)
 
 
 class Authority:
@@ -339,8 +355,15 @@ class Corpus:
     ) -> None:
         self.authority = authority
         initial = {document.id: (document, tuple(chunks)) for document, chunks in documents}
+        chunk_fingerprint = ChunkFingerprint(
+            chunker="synthetic",
+            version="1",
+            max_tokens=512,
+            overlap_tokens=0,
+            tokenizer_id="whitespace",
+        ).canonical()
         lineage = {
-            document.id: ("chunk-fingerprint", "embed-fingerprint", "glossary-fingerprint")
+            document.id: (chunk_fingerprint, "embed-fingerprint", "glossary-fingerprint")
             for document, _ in documents
         }
         self.current_view = "view-1"
@@ -551,7 +574,7 @@ async def test_protocol_keyset_pages_huge_document_and_keeps_old_winner_until_sw
     assert completed.chunks_completed == 130
     assert corpus.max_chunk_page == 64
     assert authority.max_upsert_batch == 64
-    assert [len(call) for call in embedder.calls] == [64, 64, 2]
+    assert [len(call) for call in embedder.calls] == [32, 32, 32, 32, 2]
     assert set(authority.live_during_upsert) == {"live-old"}
     assert authority.live.generation_id == completed.shadow_generation_id
 
@@ -785,6 +808,36 @@ async def test_operational_embedder_change_omitted_from_canonical_identity_is_re
     with pytest.raises(ReembedError, match="context limit"):
         await execute(run, authority, corpus, changed)
     assert authority.generations == {}
+
+
+async def test_shadow_reembed_refuses_actual_text_beyond_the_stored_chunk_policy() -> None:
+    authority = Authority()
+    document = make_document()
+    chunk = make_chunks(document, count=1)[0].model_copy(
+        update={"embed_text": "x" * 513, "token_count": 1}
+    )
+    corpus = Corpus(authority, [(document, (chunk,))])
+    chunk_fingerprint = ChunkFingerprint(
+        chunker="structural",
+        version="3",
+        max_tokens=512,
+        overlap_tokens=64,
+        tokenizer_id="synthetic/characters-v1",
+    )
+    corpus.lineage_versions[corpus.current_view][document.id] = (
+        chunk_fingerprint.canonical(),
+        "embed-fingerprint",
+        "glossary-fingerprint",
+    )
+    embedder = ExactCountingEmbedder(dimension=4)
+    run = await prepare_run(authority, corpus, embedder, "chunk-policy-refusal")
+
+    with pytest.raises(ContextOverflowError, match="fingerprinted 512-token"):
+        await execute(run, authority, corpus, embedder)
+
+    assert embedder.calls == []
+    assert authority.upsert_attempts == 0
+    assert authority.live.generation_id == "live-old"
 
 
 @pytest.mark.parametrize(
