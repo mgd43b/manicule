@@ -68,6 +68,7 @@ type LifecyclePhase = Literal[
 type LifecycleOutcome = Literal[
     "running", "complete", "bounded", "deferred", "incomplete", "refused", "failed", "canceled"
 ]
+type InventoryRecovery = Literal["", "reenumeration_required", "reenumerating", "reconciled"]
 type LifecycleRefusalCode = Literal[
     "capacity",
     "snapshot_not_promoted",
@@ -146,6 +147,8 @@ class LifecycleProgress(Payload):
     estimated_remaining_items: int = Field(default=0, ge=0)
     estimated_remaining_seconds: float = Field(default=0, ge=0)
     refusal: LifecycleRefusal | None = None
+    inventory_recovery: InventoryRecovery = ""
+    reconciled_deleted_items: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def terminal_and_refusal_are_consistent(self) -> Self:
@@ -1471,6 +1474,8 @@ class IngestReport(Payload):
     snapshot_completeness: Literal["", "complete", "partial"] = ""
     snapshot_omissions: int = Field(default=0, ge=0)
     snapshot_omission_reasons: dict[str, int] = Field(default_factory=dict)
+    inventory_recovery: InventoryRecovery = ""
+    reconciled_deleted_items: int = Field(default=0, ge=0)
     retry_required: bool = False
     derivation_deferred: bool = False
     intentionally_bounded: bool = False

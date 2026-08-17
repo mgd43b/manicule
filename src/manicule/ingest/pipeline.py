@@ -67,6 +67,7 @@ from manicule.core.acquisition import (
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
     AcquisitionFence,
+    AcquisitionInventoryState,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRun,
@@ -74,6 +75,7 @@ from manicule.core.acquisition import (
     AcquisitionSource,
     AcquisitionStage,
     SnapshotCompleteness,
+    SnapshotItemOutcome,
     SnapshotPromotionPolicy,
 )
 from manicule.core.content import (
@@ -462,6 +464,8 @@ class RunReport:
     snapshot_completeness: Literal["", "complete", "partial"] = ""
     snapshot_omissions: int = 0
     snapshot_omission_reasons: dict[str, int] = field(default_factory=dict[str, int])
+    inventory_recovery: Literal["", "reenumeration_required", "reenumerating", "reconciled"] = ""
+    reconciled_deleted_items: int = 0
 
     @property
     def indexed(self) -> int:
@@ -586,6 +590,8 @@ class RunReport:
                 "snapshot_completeness": self.snapshot_completeness,
                 "snapshot_omissions": self.snapshot_omissions,
                 "snapshot_omission_reasons": dict(self.snapshot_omission_reasons),
+                "inventory_recovery": self.inventory_recovery,
+                "reconciled_deleted_items": self.reconciled_deleted_items,
                 "retry_required": self.retry_required,
                 "derivation_deferred": self.derivation_deferred,
                 "glossary_failures": list(self.glossary_failures),
@@ -684,6 +690,8 @@ class RunReport:
             "estimated_remaining_items": pending,
             "estimated_remaining_seconds": 0,
             "refusal": refusal,
+            "inventory_recovery": self.inventory_recovery,
+            "reconciled_deleted_items": self.reconciled_deleted_items,
         }
 
 
@@ -725,6 +733,8 @@ class _AcquisitionStart:
     omission_reasons: dict[AcquisitionFailureCode, int] = field(
         default_factory=dict[AcquisitionFailureCode, int]
     )
+    inventory_state: AcquisitionInventoryState = AcquisitionInventoryState.CURRENT
+    reconciled_deleted_count: int = 0
 
 
 @dataclass
@@ -762,6 +772,8 @@ class _Sync:
     snapshot_omission_reasons: dict[AcquisitionFailureCode, int] = field(
         default_factory=dict[AcquisitionFailureCode, int]
     )
+    inventory_state: AcquisitionInventoryState = AcquisitionInventoryState.CURRENT
+    reconciled_deleted_count: int = 0
     reusable_snapshot_checked: bool = False
     reusable_snapshot_run_id: str | None = None
     discovery_records_held: Gauge = field(default_factory=lambda: Gauge("discovery-records"))
@@ -1018,6 +1030,8 @@ class IngestPipeline:
             completeness=claimed.completeness,
             omission_count=claimed.omission_count,
             omission_reasons=dict(claimed.omission_reasons),
+            inventory_state=claimed.inventory_state,
+            reconciled_deleted_count=claimed.reconciled_deleted_count,
         )
 
     async def run(  # noqa: PLR0912, PLR0915 - orchestrates durable recovery stages
@@ -1142,6 +1156,8 @@ class IngestPipeline:
             snapshot_completeness=acquisition.completeness,
             snapshot_omission_count=acquisition.omission_count,
             snapshot_omission_reasons=dict(acquisition.omission_reasons),
+            inventory_state=acquisition.inventory_state,
+            reconciled_deleted_count=acquisition.reconciled_deleted_count,
             accepted=acquisition.accepted,
         )
         if run.snapshot_completeness is not None:
@@ -1150,6 +1166,12 @@ class IngestPipeline:
             run.report.snapshot_omission_reasons = {
                 code.value: count for code, count in run.snapshot_omission_reasons.items()
             }
+        run.report.inventory_recovery = (
+            ""
+            if run.inventory_state is AcquisitionInventoryState.CURRENT
+            else run.inventory_state.value
+        )
+        run.report.reconciled_deleted_items = run.reconciled_deleted_count
         if run.resume_completed:
             run.report.candidate_watermark_present = run.candidate_watermark is not None
         # Peaks only. The active counts belong to whoever is inside the stage right now, and a
@@ -1228,7 +1250,7 @@ class IngestPipeline:
         run.accepted = durable.discovered_count
         report.discovered = durable.discovered_count
         report.durable_acquired = durable.acquired_count
-        report.durable_reused = durable.unchanged_count
+        report.durable_reused = durable.reused_count
         report.durable_failed = durable.retry_count
         report.durable_pending = max(
             0, durable.acquired_count - durable.indexed_count - durable.unchanged_count
@@ -1242,6 +1264,12 @@ class IngestPipeline:
         )
         report.candidate_watermark_present = durable.candidate_watermark is not None
         report.watermark_advanced = durable.watermark_committed_at is not None
+        report.inventory_recovery = (
+            ""
+            if durable.inventory_state is AcquisitionInventoryState.CURRENT
+            else durable.inventory_state.value
+        )
+        report.reconciled_deleted_items = durable.reconciled_deleted_count
 
     async def _record_run_completion(self, run: _Sync, *, crashed: bool) -> None:
         """Publish diagnostics only while this invocation still owns their durable order."""
@@ -1339,7 +1367,12 @@ class IngestPipeline:
                 return
             if not acquired:
                 await self._report_snapshot_omissions(run)
-            if acquired or run.promotion_policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS:
+            inventory_valid = (
+                run.inventory_state is not AcquisitionInventoryState.REENUMERATION_REQUIRED
+            )
+            if inventory_valid and (
+                acquired or run.promotion_policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS
+            ):
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
                 await acquisitions.complete_snapshot_acquisition(
@@ -1759,6 +1792,10 @@ class IngestPipeline:
                     now=now,
                 )
 
+            if await self._reuse_superseded_body(run, record):
+                _report_progress(run)
+                continue
+
             existing = await self._store.find_document(run.connector.name, record.source.source_id)
             discovered = self._discovered(record)
             if self._unchanged_by_token(existing, discovered):
@@ -1811,6 +1848,7 @@ class IngestPipeline:
                 if isinstance(exc, CapacityRefusedError):
                     run.report.refuse_capacity(exc)
                 diagnostic = _acquisition_diagnostic(exc)
+                self._note_inventory_failure(run, diagnostic)
                 await self._keep_acquisition_lease_live(
                     run, acquisitions, self._acquisition_clock(), force=True
                 )
@@ -1884,6 +1922,61 @@ class IngestPipeline:
         except Exception:  # noqa: BLE001 - corrupt reuse falls back to fresh fetch
             return None
         return reusable
+
+    @staticmethod
+    def _note_inventory_failure(run: _Sync, diagnostic: AcquisitionDiagnostic) -> None:
+        if diagnostic.code is AcquisitionFailureCode.SOURCE_DELETED:
+            run.inventory_state = AcquisitionInventoryState.REENUMERATION_REQUIRED
+            run.report.inventory_recovery = "reenumeration_required"
+
+    async def _validated_superseded_reuse(
+        self, run: _Sync, record: AcquisitionRecord
+    ) -> AcquisitionRecord | None:
+        """Validate exact retained evidence from this replacement's fenced predecessor."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - called only by the journal path
+            return None
+        reusable = await acquisitions.reusable_record_from_superseded_run(
+            run.acquisition_run_id,
+            record.source.source_id,
+            record.source.version_token,
+        )
+        if reusable is None or reusable.acquired_source is None:
+            return None
+        try:
+            reused_data = await self._blobs.get(reusable.blob_ref or "")
+            if reused_data is None:
+                return None
+            reusable.acquired_source.raw(reused_data)
+        except Exception:  # noqa: BLE001 - corrupt reuse falls back to fresh fetch
+            return None
+        return reusable
+
+    async def _reuse_superseded_body(self, run: _Sync, record: AcquisitionRecord) -> bool:
+        """Adopt exact predecessor evidence under the replacement generation fence."""
+        acquisitions = run.acquisitions
+        if acquisitions is None:  # pragma: no cover - called only by the journal path
+            return False
+        reusable = await self._validated_superseded_reuse(run, record)
+        if reusable is None or reusable.acquired_source is None:
+            return False
+        await self._keep_acquisition_lease_live(
+            run, acquisitions, self._acquisition_clock(), force=True
+        )
+        await acquisitions.transition_acquisition_record(
+            run.acquisition_run_id,
+            record.source.source_id,
+            AcquisitionRecordState.ACQUIRING,
+            AcquisitionRecordState.ACQUIRED,
+            lease_owner=run.lease_owner,
+            lease_generation=run.lease_generation,
+            now=self._acquisition_clock(),
+            blob_ref=reusable.blob_ref,
+            acquired_source=reusable.acquired_source,
+            fetched_version_token=reusable.fetched_version_token,
+            snapshot_outcome=SnapshotItemOutcome.REUSED,
+        )
+        return True
 
     @staticmethod
     def _discovered(record: AcquisitionRecord) -> DiscoveredDoc:

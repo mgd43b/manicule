@@ -15,28 +15,82 @@ import json
 import resource
 import subprocess
 import sys
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, override
 
 from sqlalchemy import func, select, text
 
 from manicule.app.runtime import Runtime
 from manicule.app.service import ApplicationService
 from manicule.config.settings import Settings
+from manicule.connectors.config import FilesystemConfig
+from manicule.connectors.enriched import DEFAULT_PROFILE, EnrichedProfile
+from manicule.connectors.filesystem import FilesystemConnector
 from manicule.container import keys
-from manicule.core.acquisition import AcquisitionRecordState, AcquisitionRunState
+from manicule.core.acquisition import (
+    AcquisitionInventoryState,
+    AcquisitionRecordState,
+    AcquisitionRunState,
+)
 from manicule.core.embedding import EmbedFingerprint, Pooling
-from manicule.plugins.registry import discover
+from manicule.plugins.manifest import ComponentKind
+from manicule.plugins.registry import BuildContext, discover
 from manicule.storage import models
 from manicule.storage.docstore import SqliteDocStore
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
+    from manicule.core.content import RawDocument
     from manicule.core.embedding import Vector
+    from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 
 CONNECTOR = "settlement-smoke-files"
 DOCUMENTS = 3
+ORIGINAL_DOCUMENTS = DOCUMENTS + 1
+DELETED_DOCUMENT = "document-3.txt"
+
+
+class SmokeFilesystemConnector(FilesystemConnector):
+    """Inject one post-enumeration deletion, or prove recovery never calls the source body."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        mode: str,
+        name: str = "local",
+        include_hidden: bool = False,
+        max_bytes: int | None = None,
+        profiles: Sequence[EnrichedProfile] = (DEFAULT_PROFILE,),
+        configured: bool = False,
+    ) -> None:
+        super().__init__(
+            root,
+            name=name,
+            include_hidden=include_hidden,
+            max_bytes=max_bytes,
+            profiles=profiles,
+            configured=configured,
+        )
+        self.mode = mode
+        self.fetches = 0
+
+    @override
+    async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+        async for discovered in super().discover(watermark):
+            yield discovered
+        if self.mode == "delete":
+            (self.root / DELETED_DOCUMENT).unlink()
+
+    @override
+    async def fetch(self, ref: DocRef) -> RawDocument:
+        self.fetches += 1
+        if self.mode == "reuse":
+            raise AssertionError(
+                "recovery fetched a retained source body instead of reusing evidence"
+            )
+        return await super().fetch(ref)
 
 
 class SmokeEmbedder:
@@ -73,9 +127,29 @@ def _runtime(
     enabled: bool,
     identity: str,
     detect_glossary: bool,
+    source_mode: str = "normal",
 ) -> tuple[Runtime, SmokeEmbedder]:
     embedder = SmokeEmbedder(identity)
     found = discover()
+    filesystem = found.registry.record(keys.CONNECTOR.named("filesystem"))
+
+    def build_smoke_filesystem(context: BuildContext) -> SmokeFilesystemConnector:
+        config = context.config
+        if not isinstance(config, FilesystemConfig) or not config.root:
+            raise TypeError("smoke filesystem connector requires a configured root")
+        return SmokeFilesystemConnector(
+            Path(config.root),
+            mode=source_mode,
+            name=context.instance or "filesystem",
+            include_hidden=config.include_hidden,
+            max_bytes=config.max_bytes,
+            profiles=config.enriched_profiles,
+            configured=bool(context.instance),
+        )
+
+    found.registry._records[(ComponentKind.CONNECTOR, "filesystem")] = replace(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        filesystem, factory=build_smoke_filesystem
+    )
     found.registry.bind(f"settlement-smoke-{identity}").add(
         keys.EMBEDDER.named("local"),
         lambda _: embedder,
@@ -123,13 +197,15 @@ async def _phase(  # noqa: PLR0912, PLR0915 - explicit process smoke phases
 ) -> dict[str, Any]:
     data_dir = cast("Path", args.data_dir)
     source_dir = cast("Path", args.source_dir)
-    enabled = args.phase in {"acquire", "unchanged"}
+    enabled = args.phase in {"acquire", "recover", "unchanged"}
+    source_mode = {"acquire": "delete", "recover": "reuse"}.get(args.phase, "normal")
     runtime, embedder = _runtime(
         data_dir,
         source_dir,
         enabled=enabled,
         identity="first",
         detect_glossary=args.phase in {"second", "unchanged"},
+        source_mode=source_mode,
     )
     async with runtime:
         service = ApplicationService(runtime)
@@ -143,11 +219,39 @@ async def _phase(  # noqa: PLR0912, PLR0915 - explicit process smoke phases
             snapshot = await store.latest_unsettled_acquisition_run(CONNECTOR)
             if snapshot is None:
                 raise AssertionError("acquire-only did not leave a rebuildable snapshot")
-            if embedder.texts != 0 or report.discovered != DOCUMENTS:
+            if (
+                embedder.texts != 0
+                or report.discovered != ORIGINAL_DOCUMENTS
+                or snapshot.inventory_state is not AcquisitionInventoryState.REENUMERATION_REQUIRED
+            ):
                 raise AssertionError("acquire-only constructed derived work or lost inventory")
             payload: dict[str, Any] = {
                 "snapshot_id": snapshot.id,
                 "discovered": report.discovered,
+                "embed_texts": embedder.texts,
+                "inventory_recovery": report.inventory_recovery,
+            }
+        elif args.phase == "recover":
+            report = await service.connector_sync(CONNECTOR, acquire_only=True)
+            snapshot = await store.latest_unsettled_acquisition_run(CONNECTOR)
+            if snapshot is None or snapshot.supersedes_run_id != args.snapshot_id:
+                raise AssertionError("recovery did not create the expected fenced replacement")
+            if (
+                report.discovered != DOCUMENTS
+                or report.inventory_recovery != "reconciled"
+                or report.reconciled_deleted_items != 1
+                or report.lifecycle.reused_items != DOCUMENTS
+                or snapshot.reused_count != DOCUMENTS
+                or snapshot.reconciled_deleted_count != 1
+            ):
+                raise AssertionError("recovery did not reuse and reconcile the complete inventory")
+            payload = {
+                "snapshot_id": snapshot.id,
+                "supersedes_run_id": snapshot.supersedes_run_id,
+                "discovered": report.discovered,
+                "reused_items": report.lifecycle.reused_items,
+                "reconciled_deleted_items": report.reconciled_deleted_items,
+                "inventory_recovery": report.inventory_recovery,
                 "embed_texts": embedder.texts,
             }
         elif args.phase in {"publish", "second"}:
@@ -264,7 +368,7 @@ def _orchestrate(args: argparse.Namespace) -> dict[str, Any]:
     data_dir = Path(args.data_dir).resolve()
     source_dir = Path(args.source_dir).resolve()
     source_dir.mkdir(parents=True, exist_ok=True)
-    for index in range(DOCUMENTS):
+    for index in range(ORIGINAL_DOCUMENTS):
         (source_dir / f"document-{index}.txt").write_text(
             f"Synthetic settlement smoke document {index}.\n", encoding="utf-8"
         )
@@ -277,24 +381,26 @@ def _orchestrate(args: argparse.Namespace) -> dict[str, Any]:
         str(source_dir),
     ]
     acquire = _child([*base, "--phase", "acquire"])
-    publish = _child([*base, "--phase", "publish", "--snapshot-id", acquire["snapshot_id"]])
+    recover = _child([*base, "--phase", "recover", "--snapshot-id", acquire["snapshot_id"]])
+    publish = _child([*base, "--phase", "publish", "--snapshot-id", recover["snapshot_id"]])
     restart = _child(
         [
             *base,
             "--phase",
             "restart",
             "--snapshot-id",
-            acquire["snapshot_id"],
+            recover["snapshot_id"],
             "--generation-id",
             publish["generation_id"],
         ]
     )
-    second = _child([*base, "--phase", "second", "--snapshot-id", acquire["snapshot_id"]])
+    second = _child([*base, "--phase", "second", "--snapshot-id", recover["snapshot_id"]])
     if second["generation_id"] == publish["generation_id"]:
         raise AssertionError("second derived identity replayed the first generation")
     unchanged = _child([*base, "--phase", "unchanged"])
     phases = {
         "acquire": acquire,
+        "recover": recover,
         "publish": publish,
         "restart": restart,
         "second": second,
@@ -316,7 +422,9 @@ def main() -> None:
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--source-dir", required=True)
     parser.add_argument("--max-rss-bytes", type=int, default=1_073_741_824)
-    parser.add_argument("--phase", choices=("acquire", "publish", "restart", "second", "unchanged"))
+    parser.add_argument(
+        "--phase", choices=("acquire", "recover", "publish", "restart", "second", "unchanged")
+    )
     parser.add_argument("--snapshot-id", default="")
     parser.add_argument("--generation-id", default="")
     args = parser.parse_args()

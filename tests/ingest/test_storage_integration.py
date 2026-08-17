@@ -28,6 +28,7 @@ from manicule.core.acquisition import (
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
     AcquisitionFence,
+    AcquisitionInventoryState,
     AcquisitionRecord,
     AcquisitionRecordState,
     AcquisitionRunState,
@@ -3247,6 +3248,379 @@ async def test_typed_acquisition_failures_block_source_coverage_without_publicat
     assert envelope.error.hint is not None
     assert "source acquisition failure" in envelope.error.hint
     assert "without contacting the source" not in envelope.error.hint
+
+
+async def test_source_deleted_reenumerates_and_reuses_the_retained_prefix(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    class VersionedVanishingConnector(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__(
+                {f"synthetic-{index}": f"public body {index}" for index in range(10)},
+                name="versioned-vanishing-source",
+            )
+            self.phase = 0
+            self.seen_watermarks: list[Watermark | None] = []
+            self._watermark = Watermark(
+                value="candidate-1", observed_at=datetime(2026, 8, 16, tzinfo=UTC)
+            )
+
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return self._watermark
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.seen_watermarks.append(watermark)
+            async for discovered in super().discover(watermark):
+                yield discovered
+            self.phase += 1
+            if self.phase == 1:
+                del self.documents["synthetic-9"]
+                self._watermark = Watermark(
+                    value="candidate-2", observed_at=datetime(2026, 8, 16, 0, 0, 1, tzinfo=UTC)
+                )
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            if ref.source_id == "synthetic-9":
+                raise NotFoundError("synthetic source item is no longer available")
+            if self.phase > 1:
+                raise AssertionError("unchanged retained bodies must not be fetched again")
+            return await super().fetch(ref)
+
+    connector = VersionedVanishingConnector()
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    first = await pipeline().run(connector, acquire_only=True)
+    stale = await store.latest_unsettled_acquisition_run(connector.name)
+    assert stale is not None
+    stale_generation = stale.lease_generation
+    assert stale.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
+    assert first.inventory_recovery == "reenumeration_required"
+    assert first.snapshot_omission_reasons == {"source_deleted": 1}
+    assert first.watermark_advanced is False
+
+    second = await pipeline().run(connector, acquire_only=True)
+    replacement = await store.latest_unsettled_acquisition_run(connector.name)
+    assert replacement is not None
+    assert replacement.id != stale.id
+    assert replacement.supersedes_run_id == stale.id
+    assert replacement.inventory_state is AcquisitionInventoryState.RECONCILED
+    assert replacement.reconciled_deleted_count == 1
+    assert replacement.discovered_count == 9
+    assert replacement.unchanged_count == 0
+    assert replacement.reused_count == 9
+    assert replacement.acquired_count == 9
+    assert replacement.watermark_committed_at is not None
+    assert second.inventory_recovery == "reconciled"
+    assert second.reconciled_deleted_items == 1
+    assert second.durable_reused == 9
+    assert second.snapshot_completeness == "complete"
+    assert connector.seen_watermarks == [None, None]
+    assert len(connector.fetches) == 9
+    assert all(
+        record.snapshot_outcome is SnapshotItemOutcome.REUSED
+        for record in await store.list_acquisition_records(replacement.id)
+    )
+
+    fenced = await store.get_acquisition_run(stale.id)
+    assert fenced is not None
+    assert fenced.superseded_by == replacement.id
+    assert fenced.superseded_at is not None
+    assert fenced.lease_owner is None
+    assert fenced.lease_generation > stale_generation
+
+
+@pytest.mark.parametrize("replacement", ["same", "newer", "unavailable"])
+async def test_reenumerated_item_is_fetched_or_remains_an_honest_failure(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    replacement: str,
+) -> None:
+    class ReappearingConnector(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "synthetic-a": "public body a",
+                    "synthetic-b": "public body b",
+                    "synthetic-target": "public target v1",
+                },
+                name=f"reappearing-{replacement}",
+            )
+            self.tokens["synthetic-target"] = "v1"
+            self.phase = 0
+            self.attempts: list[str] = []
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            async for discovered in super().discover(watermark):
+                yield discovered
+            self.phase += 1
+            if self.phase == 1:
+                del self.documents["synthetic-target"]
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            self.attempts.append(ref.source_id)
+            if ref.source_id == "synthetic-target" and (
+                self.phase == 1 or replacement == "unavailable"
+            ):
+                raise NotFoundError("synthetic source item is no longer available")
+            if self.phase > 1 and ref.source_id != "synthetic-target":
+                raise AssertionError("unchanged retained bodies must not be fetched again")
+            return await super().fetch(ref)
+
+    connector = ReappearingConnector()
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    await pipeline().run(connector, acquire_only=True)
+    connector.documents["synthetic-target"] = (
+        "public target v2" if replacement == "newer" else "public target v1"
+    )
+    connector.tokens["synthetic-target"] = "v2" if replacement == "newer" else "v1"
+    second = await pipeline().run(connector, acquire_only=True)
+    active = await store.latest_unsettled_acquisition_run(connector.name)
+    assert active is not None
+    assert connector.attempts.count("synthetic-a") == 1
+    assert connector.attempts.count("synthetic-b") == 1
+    assert connector.attempts.count("synthetic-target") == 2
+
+    if replacement == "unavailable":
+        assert active.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
+        assert active.promoted_at is None
+        assert active.watermark_committed_at is None
+        assert second.inventory_recovery == "reenumeration_required"
+        assert second.snapshot_omission_reasons == {"source_deleted": 1}
+        return
+
+    assert active.inventory_state is AcquisitionInventoryState.RECONCILED
+    assert active.promoted_at is not None
+    assert active.reused_count == 2
+    assert second.durable_reused == 2
+    assert second.snapshot_completeness == "complete"
+    records = await store.list_acquisition_records(active.id)
+    assert sum(record.snapshot_outcome is SnapshotItemOutcome.REUSED for record in records) == 2
+    assert sum(record.snapshot_outcome is SnapshotItemOutcome.RETAINED for record in records) == 1
+
+
+@pytest.mark.parametrize("failure", ["authentication", "capacity"])
+async def test_non_inventory_failures_resume_the_completed_manifest(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    failure: str,
+) -> None:
+    class RetrySameInventoryConnector(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__({"synthetic-current": "public current body"}, name=f"resume-{failure}")
+            self.discovery_calls = 0
+            self.fetch_calls = 0
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.discovery_calls += 1
+            async for discovered in super().discover(watermark):
+                yield discovered
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            self.fetch_calls += 1
+            if self.fetch_calls == 1:
+                if failure == "authentication":
+                    raise SessionExpiredError("synthetic session expired")
+                raise CapacityRefusedError(
+                    CapacityDiagnostic(
+                        resource=CapacityResource.ACQUIRED_BLOB_BACKLOG_BYTES,
+                        limit=1,
+                        used=1,
+                        requested=1,
+                    )
+                )
+            return await super().fetch(ref)
+
+    connector = RetrySameInventoryConnector()
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    await pipeline().run(connector, acquire_only=True)
+    first = await store.latest_unsettled_acquisition_run(connector.name)
+    assert first is not None
+    assert first.inventory_state is AcquisitionInventoryState.CURRENT
+    second = await pipeline().run(connector, acquire_only=True)
+    resumed = await store.latest_unsettled_acquisition_run(connector.name)
+    assert resumed is not None
+    assert resumed.id == first.id
+    assert connector.discovery_calls == 1
+    assert connector.fetch_calls == 2
+    assert second.snapshot_completeness == "complete"
+    assert second.inventory_recovery == ""
+
+
+async def test_allow_omissions_cannot_publish_an_inventory_known_to_be_stale(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    class DeletedConnector(fakes.DictConnector):
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            del ref
+            raise NotFoundError("synthetic source item is no longer available")
+
+    connector = DeletedConnector({"synthetic-deleted": "public body"}, name="partial-stale")
+    chunker = fakes.BlockChunker()
+    report = await IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+        snapshot_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    ).run(connector, acquire_only=True)
+
+    run = await store.latest_unsettled_acquisition_run(connector.name)
+    assert run is not None
+    assert run.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
+    assert run.promoted_at is None
+    assert run.watermark_committed_at is None
+    assert report.snapshot_completeness == ""
+    assert report.inventory_recovery == "reenumeration_required"
+
+
+@pytest.mark.parametrize("interruption", ["cursor", "limit"])
+async def test_incomplete_replacement_inventory_never_reconciles_deletion(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    interruption: str,
+) -> None:
+    class InterruptedReplacementConnector(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "synthetic-a": "public body a",
+                    "synthetic-b": "public body b",
+                    "synthetic-deleted": "public deleted body",
+                },
+                name=f"interrupted-replacement-{interruption}",
+            )
+            self.discovery_calls = 0
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.discovery_calls += 1
+            emitted = 0
+            async for discovered in super().discover(watermark):
+                if self.discovery_calls == 2 and interruption == "cursor" and emitted == 1:
+                    raise CursorExpiredError("synthetic cursor expired")
+                emitted += 1
+                yield discovered
+            if self.discovery_calls == 1:
+                del self.documents["synthetic-deleted"]
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            if ref.source_id == "synthetic-deleted":
+                raise NotFoundError("synthetic source item is no longer available")
+            if self.discovery_calls > 1:
+                raise AssertionError("replacement must reuse unchanged retained bodies")
+            return await super().fetch(ref)
+
+    connector = InterruptedReplacementConnector()
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    await pipeline().run(connector, acquire_only=True)
+    interrupted = await pipeline().run(
+        connector,
+        acquire_only=True,
+        limit=1 if interruption == "limit" else None,
+    )
+    replacement = await store.latest_unsettled_acquisition_run(connector.name)
+    assert replacement is not None
+    assert replacement.inventory_state is AcquisitionInventoryState.REENUMERATING
+    assert replacement.enumeration_completed_at is None
+    assert replacement.reconciled_deleted_count == 0
+    assert replacement.promoted_at is None
+    assert interrupted.enumeration_completed is False
+    assert interrupted.reconciled_deleted_items == 0
+
+    completed = await pipeline().run(connector, acquire_only=True)
+    replacement = await store.latest_unsettled_acquisition_run(connector.name)
+    assert replacement is not None
+    assert replacement.inventory_state is AcquisitionInventoryState.RECONCILED
+    assert replacement.reconciled_deleted_count == 1
+    assert replacement.promoted_at is not None
+    assert completed.snapshot_completeness == "complete"
 
 
 async def test_strict_omission_with_an_existing_document_is_still_incomplete_and_retryable(

@@ -855,6 +855,32 @@ authentication loss afterwards cannot block parsing, embedding or publication be
 phases make no connector calls. Missing, stale and deleted source bodies likewise remain typed
 acquisition retries and cannot publish older bytes.
 
+**A confirmed post-enumeration deletion invalidates that inventory, not just one body.** The
+first `source_deleted` fetch remains a safe retry: the completed manifest is not promoted and its
+candidate watermark is not committed. The run records `reenumeration_required`. On the next
+ordinary sync, the connector claim transaction fences and supersedes that run, creates exactly one
+replacement from the last committed watermark, and reports `reenumerating`. Authentication,
+transport and capacity retries continue claiming their existing manifest because they do not prove
+that its identity inventory changed.
+
+Only true exhaustion of the replacement discovery stream changes recovery to `reconciled` and
+counts identities absent from the replacement. A limit, cancellation, expired cursor or discovery
+failure leaves the replacement unfinished and cannot serve as deletion evidence. During bounded
+acquisition, each replacement record may adopt retained bytes from its exact superseded run only
+when workspace, connector instance, scope, source identity, revision token, blob reference, hash,
+length and acquired-source envelope agree. The blob is reopened and validated before adoption;
+changed, absent or corrupt evidence is fetched normally. Shared content hashes remain one distinct
+backlog-capacity charge, and cleanup preserves the predecessor while an unfinished replacement
+still depends on it. If an item is enumerated again but still returns not-found, the replacement is
+marked for another fresh enumeration and remains unpromoted. Strict and allow-omissions policies
+both refuse promotion of an inventory known to be stale.
+
+The aggregate fields `inventory_recovery` and `reconciled_deleted_items` appear in ingest results,
+connector lifecycle status and snapshot status. They contain no source identity, title, URL, blob
+hash, credential or exception text. Existing databases are migrated by marking completed,
+unpromoted runs with a typed `source_deleted` retry as `reenumeration_required`; their retained
+prefix and candidate watermark are not rewritten.
+
 `connector sync --acquire-only` stops at that exact durable boundary. A complete or
 policy-accepted partial manifest is promoted and its candidate watermark is committed, the run
 remains in `INDEXING`, and the result says local derivation is pending and can continue offline.

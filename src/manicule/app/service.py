@@ -239,7 +239,7 @@ def _snapshot_status_report(
             outcome=outcome,
             enumerated_items=run.discovered_count,
             acquired_items=run.acquired_count,
-            reused_items=run.unchanged_count,
+            reused_items=run.reused_count,
             omitted_items=run.omission_count,
             failed_items=run.retry_count,
             pending_items=0 if terminal or corrupt else pending,
@@ -260,6 +260,10 @@ def _snapshot_status_report(
                 and omission_pending == 0
             ),
             estimated_remaining_items=0 if terminal or corrupt else pending,
+            inventory_recovery=(
+                "" if run.inventory_state.value == "current" else run.inventory_state.value
+            ),
+            reconciled_deleted_items=run.reconciled_deleted_count,
         ),
     )
 
@@ -5181,7 +5185,9 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
             type=report.error_type or "IncompleteIngestError",
             message=report.error_message
             or (
-                f"{report.snapshot_omissions} source snapshot member(s) require retry"
+                "a fresh source inventory is required before this snapshot can be promoted"
+                if report.inventory_recovery == "reenumeration_required"
+                else f"{report.snapshot_omissions} source snapshot member(s) require retry"
                 if report.snapshot_omissions
                 else f"{report.unrecorded} accepted document(s) left no durable record"
                 if report.unrecorded
@@ -5190,8 +5196,11 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
                 else report.error
             ),
             hint=(
-                "Resolve the source acquisition failure and run the same ingest operation again; "
-                "its snapshot and watermark were not published."
+                "Run the same ingest operation again; it will fence the stale inventory, "
+                "re-enumerate from the committed watermark, and reuse validated retained bodies."
+                if report.inventory_recovery == "reenumeration_required"
+                else "Resolve the source acquisition failure and run the same ingest operation "
+                "again; its snapshot and watermark were not published."
                 if report.snapshot_omissions
                 else "Run the same ingest operation again; retained source snapshots will be "
                 "retried without contacting the source."
@@ -5228,6 +5237,8 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         snapshot_completeness=report.snapshot_completeness,
         snapshot_omissions=report.snapshot_omissions,
         snapshot_omission_reasons=dict(report.snapshot_omission_reasons),
+        inventory_recovery=report.inventory_recovery,
+        reconciled_deleted_items=report.reconciled_deleted_items,
         retry_required=incomplete,
         derivation_deferred=report.derivation_deferred,
         intentionally_bounded=bounded,

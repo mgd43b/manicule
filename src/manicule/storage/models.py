@@ -38,6 +38,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from manicule.core.acquisition import (
+    AcquisitionInventoryState,
     AcquisitionRecordState,
     AcquisitionRunState,
     SnapshotCompleteness,
@@ -113,6 +114,10 @@ def _kind_enum() -> Enum:
 
 def _acquisition_run_state_enum() -> Enum:
     return _value_enum(AcquisitionRunState, "acquisition_run_state")
+
+
+def _acquisition_inventory_state_enum() -> Enum:
+    return _value_enum(AcquisitionInventoryState, "acquisition_inventory_state")
 
 
 def _acquisition_record_state_enum() -> Enum:
@@ -298,6 +303,13 @@ class AcquisitionRun(Base):
     watermark_committed_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     superseded_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     superseded_by: Mapped[str | None] = mapped_column(Text)
+    supersedes_run_id: Mapped[str | None] = mapped_column(Text)
+    inventory_state: Mapped[AcquisitionInventoryState] = mapped_column(
+        _acquisition_inventory_state_enum(),
+        nullable=False,
+        default=AcquisitionInventoryState.CURRENT,
+    )
+    reconciled_deleted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     membership_hash: Mapped[str | None] = mapped_column(Text)
     completeness: Mapped[SnapshotCompleteness | None] = mapped_column(Text)
     omission_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -309,6 +321,7 @@ class AcquisitionRun(Base):
     acquired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     indexed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     unchanged_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reused_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     metadata_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     acquired_blob_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -334,6 +347,14 @@ class AcquisitionRun(Base):
             "connector_id",
             "superseded_at",
             "state",
+            "created_at",
+        ),
+        Index(
+            "ix_acquisition_runs_inventory_recovery",
+            "workspace_id",
+            "connector_id",
+            "inventory_state",
+            "superseded_at",
             "created_at",
         ),
         Index(
@@ -372,6 +393,10 @@ class AcquisitionRun(Base):
             name="committed_watermark_has_complete_scope_inventory",
         ),
         CheckConstraint("omission_count >= 0", name="snapshot_omissions_are_not_negative"),
+        CheckConstraint(
+            "reconciled_deleted_count >= 0", name="reconciled_deletions_are_not_negative"
+        ),
+        CheckConstraint("reused_count >= 0", name="reused_acquisition_count_is_not_negative"),
         CheckConstraint(
             "promotion_policy IN ('require_complete', 'allow_omissions')",
             name="snapshot_promotion_policy_is_known",

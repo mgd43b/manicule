@@ -319,7 +319,8 @@ same envelope on CLI JSON, authenticated admin HTTP, stdio/control MCP, connecto
 scheduler records. Human CLI renders the enclosing operation while JSON consumers receive the
 same object unchanged. It contains aggregate counts, snapshot completeness and promotion facts,
 watermark presence, backlog and offline-continuation facts, phase/outcome/rate/remaining work,
-producer identities where they are safe, and a typed aggregate capacity or missing-input refusal.
+producer identities where they are safe, inventory recovery state and reconciled deletion count,
+and a typed aggregate capacity or missing-input refusal.
 
 An unavailable fact is null or empty, never an invented zero. The object cannot contain source
 ids, paths, URIs, titles, content or exception context. Re-embedding exposes fingerprints and a

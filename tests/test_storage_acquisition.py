@@ -18,6 +18,7 @@ from manicule.core.acquisition import (
     AcquiredSource,
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
+    AcquisitionInventoryState,
     AcquisitionRecordState,
     AcquisitionRun,
     AcquisitionRunState,
@@ -963,6 +964,87 @@ async def test_claim_or_create_serializes_repeated_sync_requests(
         await store.get_acquisition_run("second"),
     ]
     assert sum(run is not None for run in persisted) == 1
+
+
+async def test_source_deleted_claims_one_fenced_reenumeration_from_committed_position(
+    store: SqliteDocStore,
+) -> None:
+    await store.set_watermark("wiki", _watermark("committed-position"))
+    stale = await _claimed_run(store, "stale-inventory", "wiki", "stale-owner")
+    await store.append_acquisition_record(
+        stale.id,
+        0,
+        _source("deleted-after-discovery"),
+        lease_owner="stale-owner",
+        lease_generation=stale.lease_generation,
+        now=_NOW,
+    )
+    await store.complete_acquisition_enumeration(
+        stale.id,
+        _watermark("uncommitted-candidate"),
+        lease_owner="stale-owner",
+        lease_generation=stale.lease_generation,
+        now=_NOW,
+    )
+    await store.transition_acquisition_record(
+        stale.id,
+        "deleted-after-discovery",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="stale-owner",
+        lease_generation=stale.lease_generation,
+        now=_NOW,
+        diagnostic=AcquisitionDiagnostic(
+            stage=AcquisitionStage.ACQUISITION,
+            code=AcquisitionFailureCode.SOURCE_DELETED,
+        ),
+    )
+
+    marked = await store.get_acquisition_run(stale.id)
+    assert marked is not None
+    assert marked.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
+
+    first, second = await asyncio.gather(
+        store.claim_or_create_acquisition_run(
+            "wiki",
+            "replacement-a",
+            "replacement-owner-a",
+            now=_NOW,
+            expires_at=_NOW + timedelta(minutes=1),
+        ),
+        store.claim_or_create_acquisition_run(
+            "wiki",
+            "replacement-b",
+            "replacement-owner-b",
+            now=_NOW,
+            expires_at=_NOW + timedelta(minutes=1),
+        ),
+    )
+
+    winners = [run for run in (first, second) if run is not None]
+    assert len(winners) == 1
+    replacement = winners[0]
+    assert replacement.base_watermark == _watermark("committed-position")
+    assert replacement.candidate_watermark is None
+    assert replacement.supersedes_run_id == stale.id
+    assert replacement.inventory_state is AcquisitionInventoryState.REENUMERATING
+
+    fenced = await store.get_acquisition_run(stale.id)
+    assert fenced is not None
+    assert fenced.superseded_by == replacement.id
+    assert fenced.lease_generation == stale.lease_generation + 1
+    assert fenced.lease_owner is None
+    assert not await store.renew_acquisition_lease(
+        stale.id,
+        "stale-owner",
+        stale.lease_generation,
+        now=_NOW,
+        expires_at=_NOW + timedelta(minutes=2),
+    )
+
+    # Cleanup cannot discard retained recovery evidence while the replacement still needs it.
+    assert await store.cleanup_acquisition_history(datetime(2100, 1, 1, tzinfo=UTC), limit=10) == 0
+    assert await store.get_acquisition_run(stale.id) is not None
 
 
 async def test_current_omissions_exclude_active_records_until_they_need_retry(
