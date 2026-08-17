@@ -221,6 +221,8 @@ class Subtree:
             ConnectorError: The source returned a page outside the configured trees, or
                 returned no descendants for a root that demonstrably has children.
         """
+        if space in self._members:
+            return self._members[space]
         async for _ in self.member_batches(space):
             pass
         return self._members[space]

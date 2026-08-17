@@ -235,6 +235,50 @@ async def test_batch_append_is_atomic_contiguous_and_replay_safe(store: SqliteDo
     ] == [0, 1, 2, 3]
 
 
+async def test_batch_replay_mismatches_are_typed_before_any_novel_insert(
+    store: SqliteDocStore,
+) -> None:
+    """Both replay paths validate stored source data before returning or appending."""
+    run = await _claimed_run(store, "batch-mismatch")
+    existing = (_source("page-a"), _source("page-b"))
+    await store.append_acquisition_records(
+        run.id,
+        0,
+        existing,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+    changed = _source("page-a", uri="https://example.test/moved")
+
+    with pytest.raises(AcquisitionConflictError, match="different data"):
+        await store.append_acquisition_records(
+            run.id,
+            2,
+            (changed, existing[1]),
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+    with pytest.raises(AcquisitionConflictError, match="different data"):
+        await store.append_acquisition_records(
+            run.id,
+            2,
+            (changed, _source("page-c")),
+            lease_owner="worker",
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+
+    persisted = await store.get_acquisition_run(run.id)
+    assert persisted is not None
+    assert persisted.discovered_count == 2
+    assert [record.source.source_id for record in await store.list_acquisition_records(run.id)] == [
+        "page-a",
+        "page-b",
+    ]
+
+
 async def test_batch_conflict_and_capacity_refusal_acknowledge_no_partial_page(
     engine: AsyncEngine,
 ) -> None:
