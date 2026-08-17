@@ -174,9 +174,25 @@ manicule rebuild status GENERATION_ID
 ```
 
 There is no separate settlement command: successful publication atomically settles the exact
-acquisition manifest it consumed, and rebuild has no connector or source fallback. Until
-multi-snapshot coordination is built, planning deliberately refuses an installation that is not
-exactly one promoted connector scope with no live documents outside that workspace and source.
+acquisition manifests it consumed, and rebuild has no connector or source fallback. Planning
+binds the newest promoted snapshot for every connector scope in the workspace into one ordered
+shadow generation. An interrupted worker resumes its durable sequence checkpoint, and the old
+corpus remains queryable until the complete multi-source replacement validates and publishes in
+one transaction.
+
+The structural chunk policy is component configuration. Defaults remain 512 final
+`embed_text` tokens with up to 64 tokens of prose/list overlap:
+
+```toml
+[plugins.config."chunker.structural"]
+max_tokens = 768
+overlap_tokens = 96
+```
+
+These values are fingerprinted and must fit the configured embedding model's effective context
+window. Changing either value requires `rebuild plan` followed by `rebuild execute`; it rechunks
+and re-embeds retained originals alongside the live corpus. A larger budget is a retrieval-quality,
+index-size and embedding-cost tradeoff, not an automatic improvement.
 
 `connector snapshot` and `connector list` expose aggregate recovery state. Authentication,
 transport, capacity and temporary body failures retry the same valid manifest. A confirmed

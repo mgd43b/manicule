@@ -65,6 +65,7 @@ __all__ = [
     "SLIDES_MEDIA_TYPES",
     "SOURCE_CODE_MEDIA_TYPES",
     "SPREADSHEET_MEDIA_TYPES",
+    "STRUCTURAL_BREADCRUMB_TOKENS",
     "STRUCTURED_MEDIA_TYPES",
     "WEB_MEDIA_TYPES",
     "WORD_MEDIA_TYPE",
@@ -88,13 +89,15 @@ __all__ = [
     "html_text_version",
 ]
 
+STRUCTURAL_BREADCRUMB_TOKENS = 64
+
 
 class StructuralChunkerConfig(BaseModel):
     """Fingerprint-affecting policy for the built-in structural chunker."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    max_tokens: int = Field(default=512, gt=64)
+    max_tokens: int = Field(default=512, gt=STRUCTURAL_BREADCRUMB_TOKENS)
     overlap_tokens: int = Field(default=64, ge=0)
 
     @model_validator(mode="after")

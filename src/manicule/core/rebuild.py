@@ -84,6 +84,12 @@ class RebuildEstimate(BaseModel):
     missing: tuple[MissingSnapshotInput, ...] = ()
     missing_truncated: bool = False
     refusal: RebuildRefusalCode | None = None
+    current_chunk_fingerprint: str | None = None
+    target_chunk_fingerprint: str = ""
+    over_budget_chunks: int = Field(default=0, ge=0)
+    max_stored_chunk_tokens: int = Field(default=0, ge=0)
+    estimated_embedding_chunks: int = Field(default=0, ge=0)
+    network_required: bool = False
 
     @property
     def runnable(self) -> bool:
@@ -96,6 +102,7 @@ class SnapshotRebuildInput(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     sequence: int = Field(ge=0)
+    connector: str = ""
     blob_ref: str = Field(min_length=1)
     source: AcquiredSource
     title: str = ""

@@ -1616,28 +1616,32 @@ They are not interchangeable, and the price of each is the reason:
 
 ### 10.4 Offline derived-generation rebuilds
 
-A parser-routing, parser, chunker, tokenizer, size or overlap change that must replace a whole
-source scope uses `OfflineGenerationRebuilder`; it does not use the per-document repair loop.
+A parser-routing, parser, chunker, tokenizer, size or overlap change that must replace the
+workspace's derived corpus uses `OfflineGenerationRebuilder`; it does not use the per-document
+repair loop.
 The distinction is the publication boundary. A repair deliberately commits one document at a
 time, while a generation rebuild keeps its document, chunk, glossary, FTS and vector output
 beside the active corpus until the complete replacement validates.
 
-The only source input is a promoted acquisition manifest. The runner accepts a read-only blob
-source and has no connector dependency, fetch method or source-crawl fallback. Planning verifies
-the manifest once, pages it in bounded batches, stream-verifies each retained blob without
+The only source inputs are the newest promoted acquisition manifests for the workspace's
+connector scopes. The runner accepts a read-only blob source and has no connector dependency,
+fetch method or source-crawl fallback. Planning verifies every manifest once, pages them in a
+deterministic connector/scope order, stream-verifies each retained blob without
 allocating or fully decompressing it, and returns only
 aggregate counts plus bounded manifest sequence numbers for missing inputs. A missing or corrupt
 blob is a typed refusal; it is never permission to contact the source.
 
-`index_state` and its named vector directory are installation-wide, while an acquisition manifest
-names one connector scope. Until a coordinator can bind several promoted manifests into one
-generation, the explicit safe boundary is an installation with exactly one promoted connector
-scope and no live documents outside that workspace/source. Planning refuses broader installations
-with `workspace_scope_changed`, and lease checks plus the publication transaction repeat the gate;
-a second connector promoted after planning therefore cannot create mixed global fingerprints.
+`index_state` and its named vector directory are installation-wide, so the generation binds all
+those manifests into one canonical workspace snapshot set. `derived_generation_snapshots` records
+their ordered run, connector/scope, membership and retained-item commitments. Planning from any
+included snapshot produces the same generation identity. Lease checks and the publication
+transaction repeat the complete set comparison; a connector promotion after planning fences the
+old shadow work with `workspace_scope_changed` and a new plan includes the replacement snapshot.
+Live documents from a source outside the bound connector set also refuse publication rather than
+creating mixed global fingerprints.
 
-`derived_generations` records the immutable snapshot and target identities, its canonical
-membership hash and expected item count, resource bounds, forward-only state and checkpoint
+`derived_generations` records the immutable combined snapshot and target identities, canonical
+membership hash and aggregate expected item count, resource bounds, forward-only state and checkpoint
 counters. Its unique plan identity also includes the bound live vector table and inventory
 digest, so a #187 pointer swap leaves a pristine stale plan inert and a retry can create a new
 generation against the winner. Publication records the resulting inventory digest; while that
@@ -1648,9 +1652,9 @@ concurrent pointer swap cannot turn that replay decision into a mixed-time obser
 remains `PLANNED`; only a
 successful owner claim enters `BUILDING`, and dry
 run or missing-input refusal never claims a worker lease. Each claim has an expiry, renewable
-owner token, lease generation and monotonically allocated scope fence. An expired lease may be
+owner token, lease generation and monotonically allocated workspace fence. An expired lease may be
 taken over, but its former owner cannot checkpoint or publish; publication also refuses any
-generation fenced by a newer non-terminal rebuild for the same connector scope.
+generation fenced by a newer non-terminal workspace rebuild.
 
 `derived_generation_items` stores deterministic
 relational replacements keyed by `(generation_id, sequence)`. A retry must reproduce the same
@@ -1688,9 +1692,9 @@ completes retire/replacement plus permit restoration before propagating, includi
 cancellation during replacement.
 Execution repeats the exact cumulative capacity check before each durable stage.
 
-Publication is one SQLite transaction. It re-verifies the complete canonical manifest and exact
+Publication is one SQLite transaction. It re-verifies every complete canonical manifest and exact
 contiguous replacement coverage, verifies that the snapshot is still the newest promoted
-manifest for its connector scope, ties every replacement back to that manifest's blob
+manifest for its connector scope, ties every replacement back to its manifest's blob
 and acquired-source envelope, replaces documents, chunks and glossary rows, rebuilds FTS when
 its tokenizer changed, and runs the external-content FTS integrity check before advancing index
 identity and marking the generation published. Tokenizer syntax is probed before any live row is

@@ -347,6 +347,12 @@ def _rebuild_plan_report(estimate: RebuildEstimate) -> r.RebuildPlanReport:
         missing_count=estimate.missing_count,
         refusal_code=estimate.refusal.value if estimate.refusal else None,
         runnable=estimate.runnable,
+        current_chunk_fingerprint=estimate.current_chunk_fingerprint,
+        target_chunk_fingerprint=estimate.target_chunk_fingerprint,
+        over_budget_chunks=estimate.over_budget_chunks,
+        max_stored_chunk_tokens=estimate.max_stored_chunk_tokens,
+        estimated_embedding_chunks=estimate.estimated_embedding_chunks,
+        network_required=estimate.network_required,
         lifecycle=r.LifecycleProgress(
             phase="rebuilding",
             outcome="deferred" if estimate.runnable else "refused",

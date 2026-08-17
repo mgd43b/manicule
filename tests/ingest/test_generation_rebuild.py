@@ -346,8 +346,9 @@ class FakeDeriver:
         blob_ref: str,
         title: str,
         version_token: str | None,
+        connector: str | None = None,
     ) -> PreparedReplacement:
-        del blob_ref, title, version_token
+        del blob_ref, title, version_token, connector
         self.calls.append(raw.source_id)
         document = Document(
             id=f"document-{raw.source_id}",
@@ -622,8 +623,9 @@ class DerivationFailure(FakeDeriver):
         blob_ref: str,
         title: str,
         version_token: str | None,
+        connector: str | None = None,
     ) -> PreparedReplacement:
-        del raw, target, generation_id, blob_ref, title, version_token
+        del raw, target, generation_id, blob_ref, title, version_token, connector
         raise ParseError("secret body at /private/path from https://wiki.example.test")
 
 

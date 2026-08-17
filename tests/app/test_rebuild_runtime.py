@@ -26,6 +26,7 @@ from manicule.connectors.sessions import SessionVault
 from manicule.container import keys
 from manicule.core.acquisition import AcquisitionRecordState, AcquisitionRunState
 from manicule.core.errors import ManiculeError
+from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.rebuild import RebuildState
 from manicule.core.source_lifecycle import LifecycleRefusalError
 from manicule.ingest.glossary_lineage import glossary_fingerprint
@@ -162,7 +163,8 @@ def _planning_runtime(
                     "embedder.onnx": {
                         "weights": "acme/metadata-export",
                         "weights_revision": "2" * 40,
-                    }
+                    },
+                    "chunker.structural": {"max_tokens": 768, "overlap_tokens": 96},
                 }
             },  # pyright: ignore[reportArgumentType]
         ),
@@ -241,7 +243,11 @@ async def test_fresh_served_rebuild_plan_is_metadata_only_on_every_surface(
                 await server.aclose()
 
         assert payload["ok"] is True
-        assert cast("dict[str, Any]", payload["data"])["runnable"] is True
+        data = cast("dict[str, Any]", payload["data"])
+        assert data["runnable"] is True
+        target_chunk = ChunkFingerprint.model_validate_json(data["target_chunk_fingerprint"])
+        assert (target_chunk.max_tokens, target_chunk.overlap_tokens) == (768, 96)
+        assert data["network_required"] is False
         async with runtime.require_engine().connect() as connection:
             generations = await connection.scalar(select(func.count(models.DerivedGeneration.id)))
         assert generations == 0, "planning persisted a shadow generation"
@@ -283,6 +289,45 @@ async def test_rebuild_run_refuses_stale_component_metadata_before_persisting(
         async with runtime.require_engine().connect() as connection:
             generations = await connection.scalar(select(func.count(models.DerivedGeneration.id)))
         assert generations == 0
+
+
+async def test_configured_structural_budget_refuses_the_real_path_before_construction(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "structural-context-refusal"
+    snapshot_id = await _acquired_snapshot(data_dir)
+    declared = CountingEmbedder().fingerprint
+
+    def forbidden_embedder(_context: object) -> NoReturn:
+        raise AssertionError("context refusal constructed the embedder")
+
+    found = discover()
+    found.registry.bind("structural-context-refusal").add(
+        keys.EMBEDDER.named("local"),
+        forbidden_embedder,
+        metadata_factory=lambda _: declared,
+    )
+    runtime = Runtime(
+        Settings(
+            data_dir=data_dir,
+            embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
+            plugins={
+                "config": {
+                    "chunker.structural": {"max_tokens": 768, "overlap_tokens": 96}
+                }
+            },  # pyright: ignore[reportArgumentType]
+        ),
+        discovery=found,
+    )
+
+    async with runtime:
+        with pytest.raises(
+            ManiculeError,
+            match=r'plugins\.config\."chunker\.structural"\.max_tokens is 768',
+        ):
+            await (await runtime.ingestion()).rebuild_plan(snapshot_id)
+        assert "embedder" not in runtime._slots  # pyright: ignore[reportPrivateUsage]
+        assert "chunker" not in runtime._slots  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_metadata_only_plan_failure_does_not_expose_a_configured_model_path(

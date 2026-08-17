@@ -566,9 +566,10 @@ def require_within_context(
     damaged.
 
     Args:
-        chunks: What is about to be embedded. ``token_count`` is trusted, which is only
-            sound if it was measured with the embedder's tokenizer — hence the next
-            argument.
+        chunks: What is about to be embedded. This boundary evaluates the supplied
+            ``token_count``; callers whose embedder exposes exact counting remeasure
+            ``embed_text`` immediately before calling it, while also preserving the
+            conservative stored-count model-context check.
         fingerprint: The embedder about to receive them.
         chunk_fingerprint: The chunker that produced them, when it is known. Supplying it
             adds a tokenizer check, because a token count taken under a different

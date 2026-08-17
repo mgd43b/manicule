@@ -128,6 +128,22 @@ async def test_the_refusal_prices_the_repair() -> None:
     assert any("2 stored chunk" in note for note in caught.value.__notes__)
 
 
+async def test_a_chunk_policy_change_names_the_retained_source_rebuild() -> None:
+    store = fakes.MemoryIngestStore()
+    document = _stored(store)
+    await store.replace_chunks(document, _chunks())
+    await check_before_run(embed=embed(), chunk=chunk(max_tokens=256), store=store)
+
+    with pytest.raises(FingerprintMismatchError) as caught:
+        await check_before_run(embed=embed(), chunk=chunk(max_tokens=384), store=store)
+
+    notes = " ".join(caught.value.__notes__)
+    assert "2 stored chunk" in notes
+    assert "rebuild plan SNAPSHOT_ID" in notes
+    assert "rebuild execute SNAPSHOT_ID" in notes
+    assert "cannot change structural boundaries" in notes
+
+
 async def test_a_vector_directory_from_another_instance_is_detected() -> None:
     """Two places cannot see this; three can.
 

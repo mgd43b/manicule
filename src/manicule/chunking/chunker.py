@@ -32,6 +32,7 @@ from manicule.core.content import BlockKind, Chunk, Document, Metadata, ParsedBl
 from manicule.core.errors import ChunkingError, ContextOverflowError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import chunk_id
+from manicule.parsers.config import STRUCTURAL_BREADCRUMB_TOKENS
 
 CHUNKER_NAME = "structural"
 
@@ -86,7 +87,7 @@ the existing generation would leave its stored chunks and vectors falsely curren
 MAX_TOKENS = 512
 OVERLAP_TOKENS = 64
 MIN_TOKENS = 64
-BREADCRUMB_TOKENS = 64
+BREADCRUMB_TOKENS = STRUCTURAL_BREADCRUMB_TOKENS
 
 BLOCK_SEPARATOR = "\n\n"
 
@@ -127,6 +128,8 @@ class _Unit:
 
     metadata: Metadata = field(default_factory=Metadata)
     starts_section: bool = False
+    source_ordinal: int = -1
+    source_contiguous: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,8 +244,10 @@ class StructuralChunker:
         block_list = _promote_headings_when_that_is_all_there_is(block_list)
 
         units: list[_Unit] = []
-        for block in block_list:
-            units.extend(self._to_units(block))
+        for source_ordinal, block in enumerate(block_list):
+            units.extend(
+                replace(unit, source_ordinal=source_ordinal) for unit in self._to_units(block)
+            )
         if not units:
             return []
 
@@ -442,7 +447,7 @@ class StructuralChunker:
 
         def materialize(selected: Sequence[tuple[int, str]]) -> _Unit:
             text = "".join(value for _, value in selected)
-            unit = self._unit(block, text)
+            unit = replace(self._unit(block, text), source_contiguous=True)
             if exact_line_mapping and isinstance(block.anchor, LineAnchor):
                 first = block.anchor.start + selected[0][0]
                 last = block.anchor.start + selected[-1][0]
@@ -579,7 +584,7 @@ class StructuralChunker:
             for original in group:
                 for unit in self._fit_final_unit(original, fits_text):
                     candidate = [*current, unit]
-                    candidate_text = BLOCK_SEPARATOR.join(item.text for item in candidate)
+                    candidate_text = _join_units(candidate)
                     if current and not fits_text(candidate_text):
                         fitted.append(current)
                         current = []
@@ -706,7 +711,7 @@ class StructuralChunker:
         # hundred chunks paid for two hundred identical validations of one JSON blob.
         hierarchy = _source_hierarchy(document)
         for position, group in enumerate(groups):
-            current_text = BLOCK_SEPARATOR.join(unit.text for unit in group)
+            current_text = _join_units(group)
             heading_path = group[0].heading_path
             crumb = self._breadcrumb(document, hierarchy, heading_path, content=current_text)
 
@@ -780,7 +785,7 @@ class StructuralChunker:
             # The overlap would be text the next chunk's anchor does not cover, which is a
             # citation quoting from outside the place it names.
             return _Overlap()
-        source = BLOCK_SEPARATOR.join(unit.text for unit in previous)
+        source = _join_units(previous)
         cap = min(self._overlap_tokens, max(1, self._counter(source) // 2))
 
         taken: list[str] = []
@@ -844,6 +849,23 @@ class StructuralChunker:
             if self._rendered_count(rendered, content) <= self._max_tokens:
                 return rendered
         return ""  # pragma: no cover - content fitting handles the empty-breadcrumb case
+
+
+def _join_units(units: Sequence[_Unit]) -> str:
+    """Render units without inventing separators inside one losslessly split source block."""
+    if not units:
+        return ""
+    rendered = units[0].text
+    previous = units[0]
+    for unit in units[1:]:
+        contiguous = (
+            previous.source_contiguous
+            and unit.source_contiguous
+            and previous.source_ordinal == unit.source_ordinal
+        )
+        rendered += ("" if contiguous else BLOCK_SEPARATOR) + unit.text
+        previous = unit
+    return rendered
 
 
 def _source_hierarchy(document: Document) -> tuple[str, ...]:

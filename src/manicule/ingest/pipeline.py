@@ -3157,7 +3157,7 @@ class IngestPipeline:
             transformed = await self._middleware.after_chunk(document, chunks)
             return finalize_chunks(self._chunker, transformed)
         except ChunkingError as exc:
-            raise _StageError(PipelineStage.CHUNK, str(exc)) from exc
+            raise _StageError(PipelineStage.MIDDLEWARE, str(exc)) from exc
         except MiddlewareViolationError as exc:
             raise _StageError(PipelineStage.MIDDLEWARE, str(exc)) from exc
         except Exception as exc:

@@ -28,7 +28,7 @@ __all__ = [
     "OVERLAP_TOKENS",
     "PROVISIONAL_SAFETY_FACTOR",
     "StructuralChunker",
-    "finalize_chunks",
     "SupportsTokenCount",
     "TokenCounter",
+    "finalize_chunks",
 ]

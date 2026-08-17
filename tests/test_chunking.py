@@ -688,7 +688,7 @@ def byte_counter() -> TokenCounter:
     return TokenCounter("test/utf8-bytes-v1", lambda text: len(text.encode()), provisional=False)
 
 
-@pytest.mark.parametrize("maximum,overlap", [(512, 64), (768, 96)])
+@pytest.mark.parametrize(("maximum", "overlap"), [(512, 64), (768, 96)])
 def test_every_supported_block_kind_obeys_the_final_exact_budget(
     maximum: int, overlap: int
 ) -> None:
@@ -730,21 +730,31 @@ def test_overlap_is_shrunk_against_the_complete_rendered_input() -> None:
     chunker = StructuralChunker(
         byte_counter(), max_tokens=128, overlap_tokens=32, breadcrumb_tokens=24, min_tokens=1
     )
+    shared = LineAnchor(start=1, end=1)
     blocks = [
         ParsedBlock(
             kind=BlockKind.PROSE,
-            text=(f"Sentence {index:02d} has synthetic detail. " * 3).strip(),
-            anchor=LineAnchor(start=index + 1, end=index + 1),
-            heading_path=("Configuration",),
-        )
-        for index in range(8)
+            text=" ".join(f"Prior {index:02d}." for index in range(9)),
+            anchor=shared,
+            heading_path=("Config",),
+        ),
+        ParsedBlock(
+            kind=BlockKind.PROSE,
+            text=" ".join(f"Current {index:02d}." for index in range(8)),
+            anchor=shared,
+            heading_path=("Config",),
+        ),
     ]
 
     chunks = chunker.chunk(document(title="Synthetic service"), blocks)
 
-    assert len(chunks) > 1
+    assert len(chunks) == 2
     assert max(chunk.token_count for chunk in chunks) <= 128
     assert all(chunk.token_count == len(chunk.embed_text.encode()) for chunk in chunks)
+    assert chunks[1].text.startswith("Prior 08.\n\nCurrent 00.")
+    crumb = chunks[1].embed_text.split("\n\n", maxsplit=1)[0]
+    next_overlap = f"{crumb}\n\nPrior 07. {chunks[1].text}"
+    assert len(next_overlap.encode()) > 128
 
 
 def test_one_oversized_code_line_is_losslessly_split_with_narrow_provenance() -> None:
@@ -771,12 +781,43 @@ def test_one_oversized_code_line_is_losslessly_split_with_narrow_provenance() ->
     )
 
 
+def test_mixed_code_lines_reconstruct_and_each_anchor_covers_only_its_payload() -> None:
+    source = "short line\n" + ("x" * 260) + "\ntail line"
+    chunker = StructuralChunker(
+        byte_counter(), max_tokens=96, overlap_tokens=0, breadcrumb_tokens=16, min_tokens=1
+    )
+    block = ParsedBlock(
+        kind=BlockKind.CODE,
+        text=source,
+        anchor=LineAnchor(start=10, end=12, symbol="synthetic"),
+        lang="text",
+    )
+
+    chunks = chunker.chunk(document(title="Synthetic module"), [block])
+
+    assert "".join(chunk.text for chunk in chunks) == source
+    for chunk in chunks:
+        represented: set[int] = set()
+        if "short line" in chunk.text:
+            represented.add(10)
+        if "x" in chunk.text:
+            represented.add(11)
+        if "tail line" in chunk.text:
+            represented.add(12)
+        assert represented
+        assert chunk.anchor == LineAnchor(
+            start=min(represented), end=max(represented), symbol="synthetic"
+        )
+
+
 def test_post_middleware_finalization_recounts_and_refuses_growth() -> None:
     chunker = StructuralChunker(
         byte_counter(), max_tokens=96, overlap_tokens=0, breadcrumb_tokens=16
     )
     [chunk] = chunker.chunk(document(title="Synthetic"), [prose("bounded payload")])
-    grown = chunk.model_copy(update={"embed_text": chunk.embed_text + " middleware", "token_count": 1})
+    grown = chunk.model_copy(
+        update={"embed_text": chunk.embed_text + " middleware", "token_count": 1}
+    )
 
     [final] = chunker.finalize([grown])
     assert final.token_count == len(final.embed_text.encode())

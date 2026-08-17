@@ -18,13 +18,21 @@ by a fingerprint rather than a note:
 
 ---
 
-## 1. Chunk size — 512 tokens, 64 overlap
+## 1. Chunk size — configurable, 512 tokens and 64 overlap by default
 
-**Decided: a 512-token budget on `embed_text`, 64 tokens of overlap, one budget for every
-block kind.**
+**Default: a 512-token final budget on `embed_text`, with up to 64 tokens of overlap and one
+budget for every block kind.** Installations may select another policy through the structural
+chunker's validated component configuration:
 
-This is a runtime guardrail, not a tuning knob. The reasoning below is the whole of the
-argument; if it stops holding, §1.8 says so explicitly.
+```toml
+[plugins.config."chunker.structural"]
+max_tokens = 768
+overlap_tokens = 96
+```
+
+`max_tokens` must be larger than the fixed 64-token breadcrumb reserve, `overlap_tokens` must
+be non-negative and smaller than `max_tokens`, and unknown fields are refused. Both values are
+part of `ChunkFingerprint`; changing either is a corpus migration, not an in-place tuning change.
 
 ### 1.1 The binding constraint is the embedder's context window
 
@@ -152,9 +160,17 @@ refusal would then wave through exactly what it exists to stop.
 below). The embedder sees `embed_text`. Therefore the model limit applies to `embed_text`,
 and a budget measured on `text` overflows by exactly the breadcrumb length.
 
+The 64-token breadcrumb reserve participates in packing, but the enforceable invariant is
+stronger than subtracting two nominal budgets:
+
+```text
+exact_tokenizer(chunk.embed_text) == chunk.token_count <= max_tokens
 ```
-max_tokens (512)  =  breadcrumb budget (64)  +  text budget (448)
-```
+
+The final count includes the rendered breadcrumb, block separators and admitted overlap. The
+renderer shrinks optional breadcrumb scaffolding or overlap before splitting source content, and
+hard-splits any remaining oversized atomic unit without dropping text. The same exact count is
+repeated after `after_chunk` middleware and immediately before embedding.
 
 The breadcrumb budget is reserved unconditionally, whether or not a given chunk has a
 breadcrumb. Reserving it conditionally would make chunk boundaries depend on heading depth,
@@ -196,7 +212,8 @@ Two rules make it behave:
   `LineAnchor` duplicates another chunk's lines, which breaks the tightness assertion in
   §3.3.
 - **Overlap is taken in whole units, never mid-sentence.** Fill backwards with complete
-  sentences until the next one would exceed 64 tokens. A window that cuts mid-sentence
+  sentences until the next one would exceed the configured overlap or make the complete next
+  `embed_text` exceed `max_tokens`. A window that cuts mid-sentence
   produces a chunk starting on a fragment, which is what the overlap was meant to avoid.
   **Where even one sentence exceeds the window, no overlap is taken.** A sentence is already
   the smallest whole unit available, so there is nothing smaller to fall back to — an
@@ -274,7 +291,7 @@ PDF library has touched. `grammars` escapes this only because the declared langu
 configuration, fixed before the run. So parser versions get their own fingerprint, per
 document, in §3.0.
 
-### 1.8 What would have to be true to change it
+### 1.8 How to evaluate and migrate another policy
 
 Both of these, not either:
 
@@ -286,8 +303,13 @@ Both of these, not either:
    other retrieval feature: no change without a measured gain on a fixed query set. #15
    exists partly for this.
 
-Absent both, 512/64 stands. And the cost of changing it is a full re-embed of the corpus,
-which the fingerprint makes an explicit, priced operation rather than an accident.
+Absent both, keep the 512/64 default. A selected policy change bumps the canonical chunk
+fingerprint and requires a retained-source rechunk plus re-embed of the workspace. Use
+`manicule rebuild plan SNAPSHOT_ID` to compare current/target identity, affected retained items,
+estimated chunk and embedding work, temporary capacity and missing bytes, then
+`manicule rebuild execute SNAPSHOT_ID`. The replacement is resumable and remains shadow state
+until every promoted source scope validates and publishes atomically; no connector or network
+fallback is available. Section 10.4 records that workflow.
 
 ---
 
@@ -982,7 +1004,8 @@ The algorithm:
 
 1. **Start a new chunk at every `heading` block.** Headings are boundaries. A section is
    the natural retrieval unit and it is the unit the breadcrumb describes.
-2. **Accumulate consecutive blocks** while `embed_text` stays within budget. Blocks of
+2. **Accumulate consecutive blocks** while the exact final `embed_text` stays within budget,
+   including breadcrumb, separators and any overlap that can still fit. Blocks of
    different `kind` may share a chunk — a paragraph introducing a table belongs with it —
    but an atomic block (`table`, `code`) is never *partially* included.
 3. **Close the chunk** when the next block would exceed budget, or at the next `heading`,
@@ -1033,8 +1056,10 @@ header. If a **single cell** exceeds the budget, it is prose and splits as prose
 **Code — split at the highest AST boundary that fits.**
 
 Descend the tree-sitter parse tree: try top-level definitions first, then nested ones, then
-statement boundaries, then blank-line runs, then lines. Never split mid-token, mid-string
-or mid-comment.
+statement boundaries, then blank-line runs, then lines. If one newline-free line alone exceeds
+the final budget, the exact tokenizer deterministically hard-splits it at text boundaries. Every
+character is preserved, each part keeps the provable line span and symbol, and metadata records
+the hard split; syntax preservation is impossible for a minified line and is not falsely claimed.
 
 Splitting code costs nothing in provenance and gains something: each part gets its own real
 `LineAnchor`, with `symbol` set to the definition that part covers. A 900-line file becomes

@@ -229,7 +229,7 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **39 relational tables**. The 28 that predate durable
+The authoritative SQLAlchemy model has **40 relational tables**. The 28 that predate durable
 re-embedding are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
 `acquisition_markers`, `chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
 `conversations`, `document_tags`, `document_versions`, `documents`, `glossary_aliases`,
@@ -239,13 +239,15 @@ re-embedding are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_l
 durable without changing live reads until publication: `corpus_revision`,
 `reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
 `reembed_runs`, `reembed_shadow_generations` and `reembed_publication_receipts`.
-Two more stage an offline relational rebuild beside the live corpus: `derived_generations` and
-`derived_generation_items`.
+Three more stage an offline relational rebuild beside the live corpus: `derived_generations`,
+`derived_generation_snapshots` and `derived_generation_items`. The association binds one shadow
+generation to every promoted connector scope in deterministic order, so a workspace rechunk is
+resumable while publication remains one atomic corpus transition.
 Two content-addressed acquisition ledgers keep exact global backlog admission constant-time:
 `acquisition_blob_backlog` stores unfinished-record refcounts by hash, and
 `acquisition_backlog_capacity` stores their deduplicated byte total.
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 39.
+included in the 40.
 
 ### 4.1 The pre-#187 additions
 

@@ -92,6 +92,7 @@ async def embed_chunks(
     """
     measured = chunks
     if isinstance(embedder, SupportsTokenCount):
+        require_within_context(chunks, embedder.fingerprint)
         measured = [
             chunk.model_copy(update={"token_count": embedder.count_tokens(chunk.embed_text)})
             for chunk in chunks
