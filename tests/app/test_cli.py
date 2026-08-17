@@ -2143,6 +2143,7 @@ MINIMAL: dict[str, list[str]] = {
     "collection_rename": ["collection", "rename", "col-1", "runbooks"],
     "collection_update": ["collection", "update", "col-1", "for on call"],
     "config_set": ["config", "set", "rag.profile", "fast"],
+    "connector_list": ["connector", "list"],
     "connector_sidecar": ["connector", "sidecar", "."],
     "connector_sync": ["connector", "sync", "handbook"],
     "document_delete": ["document", "delete", "doc-1"],
@@ -2168,6 +2169,7 @@ MINIMAL: dict[str, list[str]] = {
     "reembed_start": ["reembed", "start", "run-1"],
     "reset_index": ["reset-index", "--yes"],
     "restore": ["backup", "--restore", "backup.tar.gz"],
+    "snapshot_status": ["connector", "snapshot", "handbook"],
     "upgrade": ["upgrade"],
     "workspace_switch": ["workspace", "switch", "other"],
 }
