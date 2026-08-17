@@ -535,12 +535,11 @@ class AcquisitionStore(Protocol):
     async def reusable_record_from_verified_snapshot(
         self,
         run_id: str,
-        source_id: str,
-        version_token: str | None,
+        source: AcquisitionSource,
     ) -> AcquisitionRecord | None: ...
 
     async def reusable_record_from_superseded_run(
-        self, run_id: str, source_id: str, version_token: str | None
+        self, run_id: str, source: AcquisitionSource
     ) -> AcquisitionRecord | None: ...
 
     async def get_acquisition_watermark(

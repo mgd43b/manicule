@@ -1252,9 +1252,7 @@ class IngestPipeline:
         report.durable_acquired = durable.acquired_count
         report.durable_reused = durable.reused_count
         report.durable_failed = durable.retry_count
-        report.durable_pending = max(
-            0, durable.acquired_count - durable.indexed_count - durable.unchanged_count
-        )
+        report.durable_pending = max(0, durable.acquired_count - durable.indexed_count)
         report.snapshot_omissions = durable.omission_count
         report.snapshot_omission_reasons = {
             code.value: count for code, count in durable.omission_reasons.items()
@@ -1909,8 +1907,7 @@ class IngestPipeline:
             return None
         reusable = await acquisitions.reusable_record_from_verified_snapshot(
             run.reusable_snapshot_run_id,
-            record.source.source_id,
-            record.source.version_token,
+            record.source,
         )
         if reusable is None or reusable.acquired_source is None:
             return None
@@ -1938,8 +1935,7 @@ class IngestPipeline:
             return None
         reusable = await acquisitions.reusable_record_from_superseded_run(
             run.acquisition_run_id,
-            record.source.source_id,
-            record.source.version_token,
+            record.source,
         )
         if reusable is None or reusable.acquired_source is None:
             return None

@@ -588,10 +588,12 @@ def test_process_smoke_restarts_and_settles_without_duplicate_work(tmp_path: Pat
 
     assert payload["ok"] is True
     assert payload["peak_rss_bytes"] <= payload["rss_bound_bytes"]
+    assert payload["peak_data_dir_bytes"] <= payload["data_dir_bound_bytes"]
     assert payload["phases"]["acquire"]["embed_texts"] == 0
     assert payload["phases"]["acquire"]["inventory_recovery"] == "reenumeration_required"
     assert payload["phases"]["recover"] == {
         "counts": {"blobs": 3, "chunks": 0, "documents": 0, "generations": 0},
+        "data_dir_bytes": payload["phases"]["recover"]["data_dir_bytes"],
         "discovered": 3,
         "embed_texts": 0,
         "inventory_recovery": "reconciled",
@@ -613,6 +615,7 @@ def test_process_smoke_restarts_and_settles_without_duplicate_work(tmp_path: Pat
     assert payload["phases"]["unchanged"] == {
         "counts": {"blobs": 3, "chunks": 3, "documents": 3, "generations": 2},
         "counts_unchanged": True,
+        "data_dir_bytes": payload["phases"]["unchanged"]["data_dir_bytes"],
         "embed_texts": 0,
         "ingested": 0,
         "max_rss_bytes": payload["phases"]["unchanged"]["max_rss_bytes"],

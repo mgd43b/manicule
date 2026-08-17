@@ -194,7 +194,7 @@ def _snapshot_status_report(
     """Project a private manifest onto the aggregate surface contract."""
     from manicule.core.acquisition import AcquisitionRunState  # noqa: PLC0415
 
-    derivation_pending = max(0, run.acquired_count - run.indexed_count - run.unchanged_count)
+    derivation_pending = max(0, run.acquired_count - run.indexed_count)
     omission_pending = (
         run.omission_count
         if run.completeness is not None and run.completeness.value == "partial"

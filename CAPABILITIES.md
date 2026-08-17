@@ -12,8 +12,8 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 
 | Area | Items | Ticket |
 |---|---:|---|
-| CLI | 48 | #8 — **built** |
-| MCP tools | 38 | #8 — **built** |
+| CLI capability items | 48 | #8 — **built** |
+| MCP capability items | 38 | #8 — **built** |
 | HTTP endpoints | 60 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
@@ -21,11 +21,10 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 
 ## CLI — 48
 
-Ticket: #8 — **built.** Twenty commands: `ask` `search` `index` `document` `collection`
-`connector` `workspace` `auth` `plugin` `config` `backup` `export` `import` `reset-index`
-`doctor` `init` `start` `stop` `upgrade` `completion`. Several of the bare verbs below are subcommands of one
-of those, so the mapping is noted where it is not obvious. The output shape is a contract:
-[`docs/surfaces.md`](docs/surfaces.md).
+Ticket: #8 — **built.** The 48 rows below are upstream capability items, not the current command
+count. Manicule exposes 27 top-level commands; `manicule --help` and the asserted inventory in
+[`docs/surfaces.md`](docs/surfaces.md) are authoritative. Several bare verbs below are subcommands,
+so the mapping is noted where it is not obvious. The output shape is also a contract there.
 
 - [x] `add <name>` → `plugin add`
 - [ ] `add <type>` — adding a connector. Sources are declared in configuration, where the
@@ -101,6 +100,9 @@ of those, so the mapping is noted where it is not obvious. The output shape is a
 - `reset-derived`, `cleanup-derived-generations`, `release-source-history`, and
   `snapshot-delete` — distinct lifecycle boundaries; the last requires a token from its
   aggregate dry run before it releases authoritative snapshot ownership.
+- `connector sync --acquire-only`, `connector snapshot`, `connector verify`, and `rebuild
+  plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
+  connector-free derived publication with no separate settlement command.
 
 ## MCP tools — 38
 
@@ -155,10 +157,11 @@ than assume it.
   a tool no client can describe, and the description is how an assistant knows when to call it.
 
 **Deliberately not tools.** `reset-index`, `backup`, `restore`, `import`, `upgrade`, `start`,
-`stop`, `collection orphans` and the `auth` verbs are command-line only. Each destroys data,
-mints a credential or changes what the installation is, and a surface called unattended should
-not be able to do any of that. `collection orphans` moves every document outside every
-collection into the trash, which in a corpus where collections are optional is most of it.
+`stop`, `collection orphans`, rebuild execution/resume and the `auth` verbs are command-line only.
+Each destroys data, mints a credential, changes what the installation is or starts wide derived
+publication work, and a surface called unattended should not be able to do any of that.
+`collection orphans` moves every document outside every collection into the trash, which in a
+corpus where collections are optional is most of it.
 
 ## HTTP endpoints — 60
 

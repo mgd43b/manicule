@@ -245,6 +245,27 @@ def _record(row: models.AcquisitionRecord) -> AcquisitionRecord:
     )
 
 
+def _source_evidence_is_reusable(current: AcquisitionSource, reusable: AcquisitionRecord) -> bool:
+    """Require one authoritative revision and the exact discovery/envelope identity."""
+    envelope = reusable.acquired_source
+    proven_version = (
+        reusable.fetched_version_token
+        if reusable.fetched_version_token is not None
+        else reusable.source.version_token
+    )
+    return (
+        current.version_token is not None
+        and reusable.source == current
+        and envelope is not None
+        and proven_version == current.version_token
+        and reusable.blob_ref == envelope.content_hash
+        and envelope.source_id == current.source_id
+        and envelope.uri == current.ref.uri
+        and (current.media_type is None or envelope.media_type == current.media_type)
+        and (current.size_bytes is None or envelope.byte_length == current.size_bytes)
+    )
+
+
 def _safe_snapshot_diagnostic(raw: object) -> AcquisitionDiagnostic | None:
     """Read frozen evidence without ever rendering corrupt legacy or substituted input."""
     if raw is None:
@@ -836,6 +857,8 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         version_token: str | None,
     ) -> AcquisitionRecord | None:
         """Find validated retained bytes for an unchanged revision in the same exact scope."""
+        if version_token is None:
+            return None
         async with self._sessions() as session:
             run = (
                 await session.execute(
@@ -884,10 +907,11 @@ class AcquisitionJournalMixin(WorkspaceScoped):
     async def reusable_record_from_verified_snapshot(
         self,
         run_id: str,
-        source_id: str,
-        version_token: str | None,
+        source: AcquisitionSource,
     ) -> AcquisitionRecord | None:
         """Look up retained evidence after this operation verified ``run_id`` once."""
+        if source.version_token is None:
+            return None
         async with self._sessions() as session:
             run = await self._run_row(session, run_id)
             if (
@@ -902,34 +926,37 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     select(models.AcquisitionRecord)
                     .where(
                         models.AcquisitionRecord.run_id == run.id,
-                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.source_id == source.source_id,
                         models.AcquisitionRecord.blob_ref.is_not(None),
                         models.AcquisitionRecord.acquired_source.is_not(None),
                         or_(
-                            models.AcquisitionRecord.fetched_version_token == version_token,
+                            models.AcquisitionRecord.fetched_version_token == source.version_token,
                             models.AcquisitionRecord.source_record["version_token"].as_string()
-                            == version_token,
+                            == source.version_token,
                         ),
                     )
                     .limit(1)
                 )
             ).scalar_one_or_none()
-            return None if row is None else _record(row)
+            if row is None:
+                return None
+            reusable = _record(row)
+            return reusable if _source_evidence_is_reusable(source, reusable) else None
 
     async def reusable_record_from_superseded_run(
         self,
         run_id: str,
-        source_id: str,
-        version_token: str | None,
+        source: AcquisitionSource,
     ) -> AcquisitionRecord | None:
         """Return exact retained evidence owned by this replacement's fenced predecessor."""
+        if source.version_token is None:
+            return None
         async with self._sessions() as session:
             replacement = await self._run_row(session, run_id)
             if (
                 replacement is None
                 or replacement.workspace_id != self._workspace_id
                 or replacement.supersedes_run_id is None
-                or replacement.enumeration_completed_at is None
                 or replacement.inventory_state
                 not in {
                     AcquisitionInventoryState.RECONCILED,
@@ -943,6 +970,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 predecessor is None
                 or predecessor.workspace_id != replacement.workspace_id
                 or predecessor.connector_id != replacement.connector_id
+                or predecessor.source_scope != replacement.source_scope
                 or predecessor.scope_fingerprint != replacement.scope_fingerprint
                 or predecessor.superseded_by != replacement.id
                 or predecessor.superseded_at is None
@@ -954,7 +982,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     .where(
                         models.AcquisitionRecord.run_id == predecessor.id,
                         models.AcquisitionRecord.workspace_id == self._workspace_id,
-                        models.AcquisitionRecord.source_id == source_id,
+                        models.AcquisitionRecord.source_id == source.source_id,
                         models.AcquisitionRecord.blob_ref.is_not(None),
                         models.AcquisitionRecord.acquired_source.is_not(None),
                     )
@@ -964,20 +992,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if row is None:
                 return None
             reusable = _record(row)
-            envelope = reusable.acquired_source
-            proven_version = (
-                reusable.fetched_version_token
-                if reusable.fetched_version_token is not None
-                else reusable.source.version_token
-            )
-            if (
-                envelope is None
-                or reusable.blob_ref != envelope.content_hash
-                or envelope.source_id != source_id
-                or proven_version != version_token
-            ):
-                return None
-            return reusable
+            return reusable if _source_evidence_is_reusable(source, reusable) else None
 
     async def verify_snapshot_manifest(self, run_id: str) -> bool:
         """Verify the canonical evidence digest without loading an unbounded manifest."""

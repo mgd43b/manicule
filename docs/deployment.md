@@ -398,8 +398,8 @@ Unix domain socket. `manicule start` is the same command under its older name; b
 
 | | With a server running | With none |
 |---|---|---|
-| `search`, `ask`, `doctor`, `document list` | work | work |
-| `connector sync`, `index`, `document reindex`, the repair verbs | run **in the server** | refused, naming `manicule serve` |
+| `search`, `ask`, `doctor`, `document list`, `connector snapshot/verify`, `rebuild plan/status` | work | work |
+| `connector sync`, `index`, `document reindex`, `rebuild execute`, the repair verbs | run **in the server** | refused, naming `manicule serve` |
 | `connector login` | captures here, hands the session to the server | refused before it opens a browser |
 | A Confluence sync | uses the session the server holds | there is no session to use |
 

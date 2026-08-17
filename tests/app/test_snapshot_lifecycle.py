@@ -89,6 +89,20 @@ def test_http_and_mcp_return_the_same_aggregate_snapshot_status() -> None:
     assert lifecycle["can_continue_offline"] is True
 
 
+async def test_unchanged_members_do_not_hide_pending_acquired_derivation() -> None:
+    backend = _backend()
+    snapshot = backend.ingestion_.snapshot
+    assert snapshot is not None
+    backend.ingestion_.snapshot = snapshot.model_copy(
+        update={"discovered_count": 1_200, "unchanged_count": 200, "reused_count": 200}
+    )
+
+    status = await ApplicationService(backend).snapshot_status("synthetic-wiki")
+
+    assert status.lifecycle.reused_items == 200
+    assert status.lifecycle.pending_items == 750
+
+
 async def test_settled_partial_snapshot_keeps_source_retry_pending() -> None:
     backend = _backend()
     snapshot = backend.ingestion_.snapshot

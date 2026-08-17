@@ -49,6 +49,7 @@ CONNECTOR = "settlement-smoke-files"
 DOCUMENTS = 3
 ORIGINAL_DOCUMENTS = DOCUMENTS + 1
 DELETED_DOCUMENT = "document-3.txt"
+SMOKE_DISK_BOUND_BYTES = 256 * 1024 * 1024
 
 
 class SmokeFilesystemConnector(FilesystemConnector):
@@ -178,6 +179,13 @@ def _runtime(
 def _rss_bytes() -> int:
     observed = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return int(observed if sys.platform == "darwin" else observed * 1024)
+
+
+def _tree_bytes(root: Path) -> int:
+    """Count the bounded synthetic installation without following external symlinks."""
+    return sum(
+        path.stat().st_size for path in root.rglob("*") if not path.is_symlink() and path.is_file()
+    )
 
 
 async def _counts(runtime: Runtime) -> dict[str, int]:
@@ -350,6 +358,7 @@ async def _phase(  # noqa: PLR0912, PLR0915 - explicit process smoke phases
             raise AssertionError(args.phase)
         payload["counts"] = await _counts(runtime)
     payload["max_rss_bytes"] = _rss_bytes()
+    payload["data_dir_bytes"] = _tree_bytes(data_dir)
     return payload
 
 
@@ -409,10 +418,17 @@ def _orchestrate(args: argparse.Namespace) -> dict[str, Any]:
     peak = max(int(phase["max_rss_bytes"]) for phase in phases.values())
     if peak > args.max_rss_bytes:
         raise AssertionError(f"smoke peak RSS {peak} exceeds bound {args.max_rss_bytes}")
+    peak_disk = max(int(phase["data_dir_bytes"]) for phase in phases.values())
+    if peak_disk > args.max_disk_bytes:
+        raise AssertionError(
+            f"smoke data directory {peak_disk} exceeds bound {args.max_disk_bytes}"
+        )
     return {
         "ok": True,
         "peak_rss_bytes": peak,
         "rss_bound_bytes": args.max_rss_bytes,
+        "peak_data_dir_bytes": peak_disk,
+        "data_dir_bound_bytes": args.max_disk_bytes,
         "phases": phases,
     }
 
@@ -422,6 +438,7 @@ def main() -> None:
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--source-dir", required=True)
     parser.add_argument("--max-rss-bytes", type=int, default=1_073_741_824)
+    parser.add_argument("--max-disk-bytes", type=int, default=SMOKE_DISK_BOUND_BYTES)
     parser.add_argument(
         "--phase", choices=("acquire", "recover", "publish", "restart", "second", "unchanged")
     )

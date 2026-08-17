@@ -3350,6 +3350,118 @@ async def test_source_deleted_reenumerates_and_reuses_the_retained_prefix(
     assert fenced.lease_generation > stale_generation
 
 
+@pytest.mark.parametrize(
+    "changed_identity",
+    ["tokenless", "uri", "media_type", "size", "metadata", "provenance", "scope"],
+)
+async def test_reenumeration_fetches_when_exact_reuse_identity_is_unproven(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    changed_identity: str,
+) -> None:
+    from manicule.core.provenance import PROVENANCE_KEY  # noqa: PLC0415
+
+    class IdentityChangingConnector(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__(
+                {"synthetic-current": "public body v1", "synthetic-deleted": "gone"},
+                name=f"exact-reuse-{changed_identity}",
+            )
+            self.tokens["synthetic-current"] = "v1"
+            self.discovery_calls = 0
+            self.scope = "synthetic-scope-v1"
+
+        @property
+        def source_scope(self) -> str:
+            return self.scope
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.discovery_calls += 1
+            async for discovered in super().discover(watermark):
+                emitted = discovered
+                if discovered.source_id == "synthetic-current":
+                    if changed_identity == "tokenless":
+                        emitted = emitted.model_copy(update={"version_token": None})
+                    if self.discovery_calls == 2:
+                        if changed_identity == "uri":
+                            emitted = emitted.model_copy(
+                                update={
+                                    "ref": emitted.ref.model_copy(
+                                        update={"uri": "memory://synthetic-current-moved"}
+                                    )
+                                }
+                            )
+                        elif changed_identity == "media_type":
+                            emitted = emitted.model_copy(update={"media_type": "text/x-fake-moved"})
+                        elif changed_identity == "size":
+                            emitted = emitted.model_copy(
+                                update={"size_bytes": len(self.documents[emitted.source_id])}
+                            )
+                        elif changed_identity == "metadata":
+                            emitted = emitted.model_copy(
+                                update={"metadata": {"synthetic-route": "moved"}}
+                            )
+                        elif changed_identity == "provenance":
+                            emitted = emitted.model_copy(
+                                update={"metadata": {PROVENANCE_KEY: {"synthetic-origin": "moved"}}}
+                            )
+                yield emitted
+            if self.discovery_calls == 1:
+                del self.documents["synthetic-deleted"]
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            if ref.source_id == "synthetic-deleted":
+                raise NotFoundError("synthetic source item is no longer available")
+            return await super().fetch(ref)
+
+    connector = IdentityChangingConnector()
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    await pipeline().run(connector, acquire_only=True)
+    if changed_identity in {"tokenless", "size"}:
+        connector.documents["synthetic-current"] = "public body v2"
+    if changed_identity == "media_type":
+        connector.media_types["synthetic-current"] = "text/x-fake-moved"
+    if changed_identity == "scope":
+        connector.scope = "synthetic-scope-v2"
+
+    await pipeline().run(connector, acquire_only=True)
+    active = await store.latest_unsettled_acquisition_run(connector.name)
+    assert active is not None
+    assert connector.fetches.count("synthetic-current") == 2
+    assert active.reused_count == 0
+    current = (await store.list_acquisition_records(active.id))[0]
+    assert current.source.source_id == "synthetic-current"
+    assert current.snapshot_outcome is SnapshotItemOutcome.RETAINED
+    assert current.acquired_source is not None
+    if changed_identity in {"tokenless", "size"}:
+        assert current.acquired_source.content_hash == content_hash(b"public body v2")
+    if changed_identity == "scope":
+        assert active.supersedes_run_id is None
+        assert active.inventory_state is AcquisitionInventoryState.CURRENT
+    else:
+        assert active.supersedes_run_id is not None
+        assert active.inventory_state is AcquisitionInventoryState.RECONCILED
+
+
 @pytest.mark.parametrize("replacement", ["same", "newer", "unavailable"])
 async def test_reenumerated_item_is_fetched_or_remains_an_honest_failure(
     store: SqliteDocStore,
@@ -3610,8 +3722,10 @@ async def test_incomplete_replacement_inventory_never_reconciles_deletion(
     assert replacement.inventory_state is AcquisitionInventoryState.REENUMERATING
     assert replacement.enumeration_completed_at is None
     assert replacement.reconciled_deleted_count == 0
+    assert replacement.reused_count == 1
     assert replacement.promoted_at is None
     assert interrupted.enumeration_completed is False
+    assert interrupted.durable_reused == 1
     assert interrupted.reconciled_deleted_items == 0
 
     completed = await pipeline().run(connector, acquire_only=True)

@@ -255,7 +255,7 @@ could not do.
 | `blobs` | Content-addressed retained source bytes with media type, size and compression, plus a target for `documents.original_ref` to reference. §7. |
 | `index_state` | One row recording the fingerprints and the derived-index names this data directory was built with. §6.3. |
 | `vector_tombstones` | Chunk IDs deleted from SQLite whose vectors have not yet been swept from LanceDB. §8.2. |
-| `acquisition_runs` | Durable connector-run lifecycle, base and candidate watermarks, generation-fenced lease, completion markers and bounded aggregate counters, including unchanged source coverage separately from indexed work. It separates discovering source coverage from publishing derived content. |
+| `acquisition_runs` | Durable connector-run lifecycle, base and candidate watermarks, generation-fenced lease, completion markers, predecessor/successor fence lineage, typed inventory recovery, and bounded acquired/reused/reconciled-deletion counters. It separates discovering source coverage from publishing derived content. |
 | `acquisition_records` | One idempotent source identity per run, with the validated fetched envelope, acquisition/indexing state and retained-blob reference. Acquired and indexing states require the blob; the acquired transition also stores the fetched URI, media type, encoding, metadata, byte length and content hash atomically. Unchanged remains a distinct terminal provenance state. A discovery record is acknowledged only after this row commits. |
 | `acquisition_markers` | Indexed inventory of filesystem recovery markers. It blocks history cleanup until marker ownership is reconciled and contributes blob hashes to GC without a directory-wide scan. |
 | `reconciliation_runs` | Durable full-inventory lifecycle and scope binding for explicit deletion reconciliation, separate from ordinary incremental acquisition. |
@@ -1909,7 +1909,11 @@ even when discovery, acquisition, retry or derivation state remains: its generat
 that obsolete work permanently ineligible to resume. The cleanup query rejects live record
 states only for settled, non-superseded history. Age alone can therefore never erase the
 authoritative run's incomplete enumeration, retry, acquired, or indexing work, while a fenced
-overlap cannot pin blob references forever. Cascading record deletion merely releases
+overlap cannot pin blob references forever. A source-inventory replacement is the exception while
+its acquisition is unfinished: cleanup preserves the explicitly named predecessor so exact
+retained-body evidence remains reusable. After replacement acquisition completes, its own record
+references independently pin every adopted blob and the predecessor returns to ordinary bounded
+history retention. Cascading record deletion merely releases
 acquisition references. Publications and retained bytes remain governed by their own tables,
 and blob mark-and-sweep includes marker references through the indexed
 `acquisition_markers` table. A marker root commits before either physical blob or envelope is
@@ -1925,9 +1929,14 @@ harbor before expiring. This ordering prevents either crash window from pinning 
 without turning cleanup into an implicit deletion of resumable backlog. `alembic check`
 continues to enforce model/migration parity.
 
-#187 then adds the seven durable re-embedding tables listed in §4.1.1, bringing the modeled
-total to 35. Their migration follows the complete durable-acquisition and reconciliation chain, so an offline
-snapshot remains reconstructable before any shadow vector generation is planned or published.
+#187 then adds the seven durable re-embedding tables listed in §4.1.1, bringing the modeled total
+to 35; the two offline derived-generation tables bring it to the authoritative 37 listed in §4.
+A later additive acquisition migration persists source-inventory recovery state, supersession
+lineage, reused-body counts and reconciled-deletion counts without adding a table. It marks only
+completed, unpromoted runs with typed `source_deleted` retries as requiring re-enumeration and
+preserves their candidate watermark and retained evidence. These migrations follow the complete
+durable-acquisition and reconciliation chain, so an offline snapshot remains reconstructable
+before any shadow vector generation is planned or published.
 
 ---
 
@@ -1938,7 +1947,7 @@ one.
 
 | Decision | Rationale in |
 |---|---|
-| The pre-#187 schema has 28 modeled tables; seven durable re-embedding tables bring the authoritative total to 35 | §4.1 |
+| The pre-#187 schema has 28 modeled tables; seven durable re-embedding and two offline derived-generation tables bring the authoritative total to 37 | §4.1 |
 | `chunks.id` is content-derived; `position` is part of the digest, and the trade is stated | §3.2 |
 | Identity is `(workspace_id, source, source_id)`; the workspace is part of the derived id, settled before any corpus exists | §4.2 |
 | `documents.connector_id` is `NOT NULL`; filesystem and upload are connectors | §4.2 |
