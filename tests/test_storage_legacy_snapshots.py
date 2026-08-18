@@ -694,8 +694,14 @@ async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
     # It patches every call rather than matching one path. Path matching is what rotted the
     # first time, and it was fragile even before #219: `get` resolves through
     # `_authoritative_path`, which returns an evidence pin when one exists and the sharded path
-    # otherwise, so `path_for` was only ever one of two right answers. Exactly one read happens
-    # here, verified below, so "every call" and "the validation read" are the same set.
+    # otherwise, so `path_for` was only ever one of two right answers.
+    #
+    # This migration makes exactly one blob read today — measured, not assumed — so "every call"
+    # is no broader than "the validation read". A second read appearing later would be slowed
+    # too, which costs runtime and changes nothing this test asserts. So the guard below checks
+    # that a read was intercepted *at all*, which is the property the test depends on, rather
+    # than pinning a count that would fail on an unrelated change and prove nothing here.
+    #
     # The ratios carry the meaning; the absolute scale only has to survive a loaded CI runner.
     # Validation outlasts one whole lease, and the heartbeat renews at LEASE_DURATION/3, so a
     # correct implementation renews twice during the read and a broken one loses the lease.
