@@ -1,27 +1,22 @@
+<div align="center">
+
 # manicule
+
+**Self-hosted retrieval infrastructure for AI assistants.**
+
+An agent searches a private corpus or asks a grounded question, and gets evidence that resolves
+to a real location in a real document — a page, a heading, a line, a cell.
 
 [![CI](https://github.com/mgd43b/manicule/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mgd43b/manicule/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
+[![packaged with uv](https://img.shields.io/badge/packaged%20with-uv-de5fe9.svg)](https://docs.astral.sh/uv/)
 
-Self-hosted retrieval infrastructure for AI assistants. **MCP is the primary interface**: an
-agent searches a private corpus or asks a grounded question, and gets evidence that resolves to
-a real location in a real document — a page, a heading, a line, a cell. The core value is the
-accuracy of the embedding and retrieval pipeline, plus evidence a caller can inspect at its
-source. The command line and HTTP expose the same service; the browser is a functional operator
-and retrieval-inspection console, not the primary knowledge-work interface.
+[Install](#install) · [First run](#first-run) · [The four surfaces](#the-four-surfaces) ·
+[As a server](#running-it-as-a-server) · [In a container](#in-a-container) ·
+[Design](#the-idea-it-is-organized-around) · [Layout](#layout) · [Extending](#extending-it)
 
-Re-indexing is copy-on-write at the document boundary: vectors are staged under a publication
-id, then the document, chunks, glossary and lineage become active in one relational transaction.
-A failed or interrupted refresh keeps the previous indexed revision searchable; unpublished
-vectors are filtered during hydration and reclaimed by the normal sweep. The same atomic flip
-applies when parsing, middleware or chunking concludes that a document has no chunks.
-
-> **Early, and runnable.** All four surfaces work today: point it at a directory, search it, ask
-> it questions, read it in a browser, hand the same operations to an assistant over MCP, or serve
-> them over HTTP. There is no release on PyPI yet, so it is installed from a checkout —
-> [below](#install). See [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is
-> being built in.
+</div>
 
 ```bash
 manicule init                     # pick a backend, write a config, seed what no wheel ships
@@ -31,22 +26,44 @@ manicule ask "how do retries work?"
 manicule doctor                   # what is wrong, and what to do about it
 ```
 
-**Two sources exist today**: a local directory tree, and Confluence. Seven more — GitHub,
-Notion, Drive, S3/GCS, Swagger, a crawler and web search — are designed in
-[`PLAN.md`](PLAN.md) and tracked in [#16](https://github.com/mgd43b/manicule/issues/16). None
-of them is built, and nothing below describes them.
+> [!NOTE]
+> **Early, and runnable.** All four surfaces work today: point it at a directory, search it, ask
+> it questions, read it in a browser, hand the same operations to an assistant over MCP, or serve
+> them over HTTP. There is no release on PyPI yet, so it is installed from a checkout —
+> [below](#install). See [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is
+> being built in.
+
+## What it is
+
+**MCP is the primary interface.** The core value is the accuracy of the embedding and retrieval
+pipeline, plus evidence a caller can inspect at its source. The command line and HTTP expose the
+same service; the browser is a functional operator and retrieval-inspection console, not the
+primary knowledge-work interface.
+
+**Re-indexing is copy-on-write at the document boundary.** Vectors are staged under a publication
+id, then the document, chunks, glossary and lineage become active in one relational transaction.
+A failed or interrupted refresh keeps the previous indexed revision searchable; unpublished
+vectors are filtered during hydration and reclaimed by the normal sweep. The same atomic flip
+applies when parsing, middleware or chunking concludes that a document has no chunks.
+
+> [!IMPORTANT]
+> **Two sources exist today**: a local directory tree, and Confluence. Seven more — GitHub,
+> Notion, Drive, S3/GCS, Swagger, a crawler and web search — are designed in
+> [`PLAN.md`](PLAN.md) and tracked in [#16](https://github.com/mgd43b/manicule/issues/16). None
+> of them is built, and nothing below describes them.
 
 Every command that emits data takes `--json`, on either side of the command name — `manicule
 --json search …` and `manicule search … --json` are the same invocation, and `--workspace`/`-w`
-works the same way — and most of them are
-also MCP tools, so an assistant reaches the same operations through `manicule start --mcp-only`,
-and `manicule start --transport http` serves them over HTTP with an OpenAPI document at
-`/api/docs`. All three emit the same envelope, and the shape is a contract written down in
-[`docs/surfaces.md`](docs/surfaces.md).
+works the same way.
+
+Most of them are also MCP tools, so an assistant reaches the same operations through `manicule
+start --mcp-only`, and `manicule start --transport http` serves them over HTTP with an OpenAPI
+document at `/api/docs`. All three emit the same envelope, and the shape is a contract written
+down in [`docs/surfaces.md`](docs/surfaces.md).
 
 ## Install
 
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.12 or newer.
+> Requires [uv](https://docs.astral.sh/uv/) and Python 3.12 or newer.
 
 ```bash
 git clone https://github.com/mgd43b/manicule && cd manicule
@@ -62,12 +79,13 @@ comes with torch.
 Everything below writes `manicule`; from a checkout that is `uv run manicule`, or
 `.venv/bin/manicule` if you would rather not type `uv run` each time.
 
-**Two embedding backends, and one of them is chosen for you.** `manicule init` probes the
-machine — it prints `embedding backend 'mlx' chosen for arm64 on Darwin` — and picks `mlx` on
-Apple silicon, which runs the embedder on Metal in-process, or `onnx` everywhere else. Which one
-you get changes how long an ingest takes and **never what comes out of it**: the `backend parity
-(macOS)` job in CI exists to hold that line, comparing vectors from both backends on a runner
-that can build both. If it ever goes red the fix is to the code, not to the tolerance.
+> [!TIP]
+> **Two embedding backends, and one of them is chosen for you.** `manicule init` probes the
+> machine — it prints `embedding backend 'mlx' chosen for arm64 on Darwin` — and picks `mlx` on
+> Apple silicon, which runs the embedder on Metal in-process, or `onnx` everywhere else. Which
+> one you get changes how long an ingest takes and **never what comes out of it**: the `backend
+> parity (macOS)` job in CI exists to hold that line, comparing vectors from both backends on a
+> runner that can build both. If it ever goes red the fix is to the code, not to the tolerance.
 
 ## First run
 
@@ -79,18 +97,21 @@ manicule index docs                       # this repository's own design documen
 manicule search "how are citations verified"
 ```
 
-**`manicule init` first, and it does more than write a file.** It picks the embedding backend
-this machine can run, then pre-seeds the two things no Python wheel ships: the 24 tree-sitter
-grammars the code parser needs, and the two BPE vocabularies every search measures a context
-with. Both are small, and both are the kind of thing manicule refuses to download in the middle
-of a question. Skip `init` and the first `search` refuses rather than fetching — `doctor` calls a
-missing vocabulary `failing`, in as many words, because no corpus can be searched without one.
+### `init` first — it does more than write a file
 
-**The model weights are the one thing `init` does not fetch, and the first `index` does.** They
-are the big artifact: about **1.1 GB** for `BAAI/bge-m3` on Apple silicon (the MLX conversion,
-fp16) and about **2.3 GB** elsewhere (the ONNX export). `init` says so on its way past, and
-`manicule doctor` says so too, because the download itself is quiet — a Hugging Face progress
-bar, and a stretch with no manicule output at all.
+It picks the embedding backend this machine can run, then pre-seeds the two things no Python
+wheel ships: the 24 tree-sitter grammars the code parser needs, and the two BPE vocabularies
+every search measures a context with. Both are small, and both are the kind of thing manicule
+refuses to download in the middle of a question. Skip `init` and the first `search` refuses
+rather than fetching — `doctor` calls a missing vocabulary `failing`, in as many words, because
+no corpus can be searched without one.
+
+### The model weights are the one thing `init` does not fetch
+
+The first `index` does. They are the big artifact: about **1.1 GB** for `BAAI/bge-m3` on Apple
+silicon (the MLX conversion, fp16) and about **2.3 GB** elsewhere (the ONNX export). `init` says
+so on its way past, and `manicule doctor` says so too, because the download itself is quiet — a
+Hugging Face progress bar, and a stretch with no manicule output at all.
 
 To take that wait deliberately, before you have a corpus to be impatient about:
 
@@ -98,17 +119,25 @@ To take that wait deliberately, before you have a corpus to be impatient about:
 uv run tools/prefetch_embedding_models.py --backend mlx    # or --backend onnx
 ```
 
+<details>
+<summary><b>How weights are pinned to vector identity</b></summary>
+
 Weights are pinned as part of vector identity, not merely downloaded by model name. The exact
 executed hub commit (or a digest for local weights) is recorded with the index. Only the
 built-in ONNX/MLX artifact pairs covered by the parity suite are portable across backends;
 custom remote weights must set an immutable `weights_revision`, and changing any artifact
 requires `reindex --re-embed` rather than reusing incomparable vectors.
-Local model card/tokenizer inputs are content-addressed too, including when weights are separate;
-local `embedding.revision` claims are rejected.
-The MCP `index_status` result exposes the exact `weights_ref` and its compatibility identity.
 
-**`ask` additionally needs a generator**, where `search` needs only the embedder. The default
-configuration expects [Ollama](https://ollama.com) on `localhost:11434` serving `qwen2.5:14b`:
+Local model card/tokenizer inputs are content-addressed too, including when weights are
+separate; local `embedding.revision` claims are rejected. The MCP `index_status` result exposes
+the exact `weights_ref` and its compatibility identity.
+
+</details>
+
+### `ask` additionally needs a generator
+
+`search` needs only the embedder. The default configuration expects
+[Ollama](https://ollama.com) on `localhost:11434` serving `qwen2.5:14b`:
 
 ```bash
 ollama pull qwen2.5:14b
@@ -131,23 +160,26 @@ The executable must be on the `PATH` of the process running manicule. Restart a 
 after changing these settings. The CLI owns its own login, but its destination is treated as
 remote for data-policy purposes because manicule cannot inspect where the command sends a prompt.
 
-`manicule doctor` reports what is wrong and what to do about it, and it is the first thing to run
-when something does not work. `manicule doctor --fix` repairs what it can: the grammars and the
-vocabularies, from an offline bundle when one is installed and from upstream otherwise. It is the
-only part of that command that writes to the machine or uses the network, which is why it is a
-flag — and it does **not** fetch the model weights, which is why the line above exists.
+### When something does not work
 
-**A query never fetches a vocabulary or a grammar.** Those are seeded by a step you can watch
-fail, and a query that finds one missing refuses rather than reaching for the network: `search`
-exits non-zero with `VocabularyUnavailableError` and names the cache it looked in. The model
-weights are the one artifact fetched on demand rather than refused — which is why `init` and
-`doctor` both announce them while they are still to come, and why the prefetch line above
-exists.
+`manicule doctor` reports what is wrong and what to do about it, and it is the first thing to run.
+`manicule doctor --fix` repairs what it can: the grammars and the vocabularies, from an offline
+bundle when one is installed and from upstream otherwise. It is the only part of that command
+that writes to the machine or uses the network, which is why it is a flag — and it does **not**
+fetch the model weights, which is why the line above exists.
+
+> [!WARNING]
+> **A query never fetches a vocabulary or a grammar.** Those are seeded by a step you can watch
+> fail, and a query that finds one missing refuses rather than reaching for the network: `search`
+> exits non-zero with `VocabularyUnavailableError` and names the cache it looked in. The model
+> weights are the one artifact fetched on demand rather than refused — which is why `init` and
+> `doctor` both announce them while they are still to come, and why the prefetch line above
+> exists.
 
 ### What it costs to wait
 
 | Step | Measured here |
-|---|---|
+|:---|---:|
 | `manicule init`, with every cache cold | 9 s |
 | first `index` of `docs/`, model still to download | 1 m 21 s and 2 m 04 s, on two runs |
 | the same `index` with the model already present | 38 s |
@@ -158,7 +190,7 @@ They are here to set expectations about orders of magnitude. They are not benchm
 busier machine moves them: the 38-second run above took 54 seconds with a container build
 alongside it.
 
-### Durable connector hand-off and offline rebuild
+## Durable connector hand-off and offline rebuild
 
 A configured connector can stop after it has promoted a complete, locally retained source
 snapshot. The snapshot can then be verified and rebuilt without constructing the connector or
@@ -180,8 +212,8 @@ shadow generation. An interrupted worker resumes its durable sequence checkpoint
 corpus remains queryable until the complete multi-source replacement validates and publishes in
 one transaction.
 
-The structural chunk policy is component configuration. Defaults remain 512 final
-`embed_text` tokens with up to 64 tokens of prose/list overlap:
+The structural chunk policy is component configuration. Defaults remain 512 final `embed_text`
+tokens with up to 64 tokens of prose/list overlap:
 
 ```toml
 [plugins.config."chunker.structural"]
@@ -191,8 +223,11 @@ overlap_tokens = 96
 
 These values are fingerprinted and must fit the configured embedding model's effective context
 window. Changing either value requires `rebuild plan` followed by `rebuild execute`; it rechunks
-and re-embeds retained originals alongside the live corpus. A larger budget is a retrieval-quality,
-index-size and embedding-cost tradeoff, not an automatic improvement.
+and re-embeds retained originals alongside the live corpus. A larger budget is a
+retrieval-quality, index-size and embedding-cost tradeoff, not an automatic improvement.
+
+<details>
+<summary><b>Recovery state, deletion reconciliation and Confluence pagination internals</b></summary>
 
 `connector snapshot` and `connector list` expose aggregate recovery state. Authentication,
 transport, capacity and temporary body failures retry the same valid manifest. A confirmed
@@ -226,15 +261,18 @@ Strict policy never promotes while a current member lacks validated evidence. An
 green. Once a promoted snapshot publishes, source acquisition and derived publication settle in
 the same transaction; a complete snapshot reaches zero backlog while its retained source bytes
 remain available for later connector-free rebuilds. Status exposes counts and typed states, never
-source ids, paths, URLs, bodies, blob hashes, credentials or copied source exceptions. The full
-contract and recovery details are in
+source ids, paths, URLs, bodies, blob hashes, credentials or copied source exceptions.
+
+</details>
+
+The full contract and recovery details are in
 [`docs/ingest.md`](docs/ingest.md#831-durable-discovery-then-bounded-hand-offs) and the
 shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifecycle-status).
 
 ## The four surfaces
 
 | Surface | Started by | Shape |
-|---|---|---|
+|:---|:---|:---|
 | **MCP** | `manicule start --mcp-only` | 37 tools over stdio, which opens no socket; 22 read-only tools at `/mcp/` when served over a port |
 | **Command line** | `manicule <command>` | 27 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
@@ -245,10 +283,15 @@ them to it: for the same operation and the same arguments the CLI under `--json`
 and the HTTP route return **byte-identical** envelopes, and the browser page is asserted to
 show what that envelope said rather than anything it worked out for itself.
 
-**The command line** is twenty-seven commands; `manicule --help` lists them. Under `--json` the
-result envelope is the whole of stdout — no prose, no progress, nothing else — and a failure is
-that same envelope with `"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads
-well-formed JSON whether the command succeeded or not.
+### The command line
+
+Twenty-seven commands; `manicule --help` lists them. Under `--json` the result envelope is the
+whole of stdout — no prose, no progress, nothing else — and a failure is that same envelope with
+`"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads well-formed JSON whether
+the command succeeded or not.
+
+<details>
+<summary><b>How a connector sync reports its outcome</b></summary>
 
 Connector syncs additionally report `data.outcome` as `complete`, `bounded`, or `incomplete`.
 An incomplete sync exits non-zero and keeps its partial counters in `data`; a requested
@@ -258,14 +301,18 @@ If an external SQLite writer remains present beyond the bounded retry policy, th
 `StorageBusyError`; retrying resumes the committed acquisition prefix without advancing the
 watermark or exposing SQL and local paths in the envelope.
 
-**The HTTP API** is twelve route groups over the same service — health, documents, chat with SSE
-streaming, conversations and shareable links, collections, tags, admin, plugins, auth, a
-workbench, a websocket channel and an MCP endpoint — plus an embeddable chat widget at
-`/widget`. `manicule start --transport http` serves them on `127.0.0.1:8765`, and only there
-unless three separate things say otherwise. It prints where it is listening, and every path on
-it that you might want next:
+</details>
 
-```
+### The HTTP API
+
+Twelve route groups over the same service — health, documents, chat with SSE streaming,
+conversations and shareable links, collections, tags, admin, plugins, auth, a workbench, a
+websocket channel and an MCP endpoint — plus an embeddable chat widget at `/widget`. `manicule
+start --transport http` serves them on `127.0.0.1:8765`, and only there unless three separate
+things say otherwise. It prints where it is listening, and every path on it that you might want
+next:
+
+```console
 HTTP API on http://127.0.0.1:8765 (this machine only)
 browser surface    http://127.0.0.1:8765/ui
 MCP endpoint       http://127.0.0.1:8765/mcp/
@@ -284,14 +331,16 @@ talks to one process down a pipe, the whole surface is offered. `docs/surfaces.m
 `/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
 same envelope the CLI prints under `--json`.
 
-**The browser surface** is the functional operator and inspection console, not the primary
-knowledge-work interface. It is server-rendered HTML at `/ui`, on the same socket, with eleven
-areas in its navigation: a dashboard; chat with streaming citations, confidence and feedback;
-documents, their chunks, the trash and restore; collections and tags; connectors; plugins;
-workspaces; health; an admin dashboard; your own API keys; and settings. Command palette on
-`Ctrl`/`Cmd`+`K`, keyboard navigation, dark mode. `manicule start --no-web` prints `browser
-surface    off (--no-web)`, keeps the API, and answers 404 for every `/ui` path — and `/` lists
-the surfaces that are still there rather than redirecting to one that is not.
+### The browser surface
+
+The functional operator and inspection console, not the primary knowledge-work interface. It is
+server-rendered HTML at `/ui`, on the same socket, with eleven areas in its navigation: a
+dashboard; chat with streaming citations, confidence and feedback; documents, their chunks, the
+trash and restore; collections and tags; connectors; plugins; workspaces; health; an admin
+dashboard; your own API keys; and settings. Command palette on `Ctrl`/`Cmd`+`K`, keyboard
+navigation, dark mode. `manicule start --no-web` prints `browser surface    off (--no-web)`,
+keeps the API, and answers 404 for every `/ui` path — and `/` lists the surfaces that are still
+there rather than redirecting to one that is not.
 
 ![The manicule browser surface: a search for "how are citations verified" over this repository's own docs, showing ten ranked passages, the confidence band with the sentence explaining it, and each hit labeled with the document and the heading path the passage came from](docs/images/browser-search.png)
 
@@ -301,8 +350,10 @@ of Node. It also adds **no operation** — every page reads through a service me
 has a route, so there is no upload and no configuration write here either.
 [`docs/web.md`](docs/web.md) has the reasoning, including what that costs.
 
-**The MCP server** is the primary interface: thirty-seven tools over the same service, speaking
-stdio by default, which opens no socket at all. To let Claude Code use your index:
+### The MCP server
+
+The primary interface: thirty-seven tools over the same service, speaking stdio by default,
+which opens no socket at all. To let Claude Code use your index:
 
 ```bash
 claude mcp add manicule -s project -- "$(pwd)/.venv/bin/manicule" start --mcp-only
@@ -390,18 +441,19 @@ repository's `docs/` took 5 minutes 4 seconds in the container against 38 second
 MLX. `manicule ask` needs a generator; the compose file points at an Ollama on the host, which is
 one line to change.
 
-**MCP is better run natively.** Handing a container's stdio to an assistant means the client
-spawning `docker compose run`, and the failure modes of that — a stale container, a build that
-has not happened, a volume that is not there — surface to the assistant as a tool that will not
-start. The container is for the CLI and for batch ingest; the two are the same index if they
-share a data directory.
+> [!WARNING]
+> **MCP is better run natively.** Handing a container's stdio to an assistant means the client
+> spawning `docker compose run`, and the failure modes of that — a stale container, a build that
+> has not happened, a volume that is not there — surface to the assistant as a tool that will not
+> start. The container is for the CLI and for batch ingest; the two are the same index if they
+> share a data directory.
 
 [`docs/deployment.md`](docs/deployment.md) covers what the data directory holds, the permissions
 it needs, and what publishing a port will require when there is one.
 
 ## The idea it is organized around
 
-**A citation carries a correct location, or none at all.**
+> **A citation carries a correct location, or none at all.**
 
 That sounds like a small thing. It decides most of the architecture:
 
@@ -426,7 +478,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 ## Layout
 
 | Package | What is in it |
-|---|---|
+|:---|:---|
 | `src/manicule/core` | The types and protocols everything is written against. No implementation dependencies |
 | `src/manicule/config` | One declarative layer over the config file, the environment and plugin manifests |
 | `src/manicule/plugins` | Manifests, compatibility checking, entry-point discovery |
@@ -467,16 +519,17 @@ interface that nothing depends on rots without anyone noticing.
 Importing manicule gives you the contracts and nothing heavier: no vector database, no model
 runtime, no web framework. That boundary is enforced by a test, not by good intentions.
 
-**Plugins run in-process with full privileges** — the network, the filesystem, the environment.
-There is no sandbox and no `permissions` declaration, because manicule cannot enforce one and an
-unenforced guarantee is worse than an absent one. Install plugins you would run as yourself.
+> [!CAUTION]
+> **Plugins run in-process with full privileges** — the network, the filesystem, the environment.
+> There is no sandbox and no `permissions` declaration, because manicule cannot enforce one and an
+> unenforced guarantee is worse than an absent one. Install plugins you would run as yourself.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the plugin-authoring rules and the definition of
 done.
 
 ## Development
 
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.12+.
+> Requires [uv](https://docs.astral.sh/uv/) and Python 3.12+.
 
 ```bash
 uv sync --all-groups
@@ -499,13 +552,13 @@ GPL-3.0-or-later itself until the backend moved out of it.
 
 What that means:
 
-- `uv pip install manicule` — an MIT program, with `onnx` as the embedding backend. Runs
-  everywhere.
-- `uv pip install manicule manicule-mlx` — faster on Apple silicon, and the combination on your
-  machine is GPL-3.0. Running it obliges you to nothing; the GPL's obligations attach to
-  *distribution*.
-- A plugin that imports `manicule_mlx` is very likely a derivative work of it. A plugin that
-  does not, is not.
+| You install | You get | License of the combination |
+|:---|:---|:---|
+| `uv pip install manicule` | An MIT program, with `onnx` as the embedding backend. Runs everywhere | MIT |
+| `uv pip install manicule manicule-mlx` | Faster on Apple silicon | GPL-3.0 on your machine |
+
+Running it obliges you to nothing; the GPL's obligations attach to *distribution*. A plugin that
+imports `manicule_mlx` is very likely a derivative work of it. A plugin that does not, is not.
 
 **Switching backends never re-embeds.** `backend` is excluded from the embedding fingerprint's
 identity, and the two agree to cosine 0.99999998 with identical retrieval ranking — asserted in
