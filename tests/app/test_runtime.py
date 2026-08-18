@@ -34,7 +34,7 @@ from manicule.app.service import ApplicationService, pre_upgrade_destination
 from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
-from manicule.core.errors import InsecureTargetError
+from manicule.core.errors import InsecureTargetError, ManiculeError
 from manicule.generation.config import GENERATOR_NAME
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
@@ -43,7 +43,7 @@ from manicule.plugins.registry import discover
 from manicule.storage.config import DOC_STORE_NAME, VECTOR_STORE_NAME
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator, AsyncIterator
 
 STALE_INSTALL = (
     "an entry point declared in pyproject.toml is missing from the installed distribution. "
@@ -365,6 +365,42 @@ async def test_resetting_an_empty_index_is_not_an_error(runtime: Runtime) -> Non
     reset = await ApplicationService(runtime).reset_index()
     assert reset.documents == 0
     assert reset.vectors_removed is False
+
+
+async def test_custom_vector_backend_reset_refuses_before_relational_retirement(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    from tests.ingest import fakes  # noqa: PLC0415
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    store = cast("Any", await runtime.documents())
+    document = make_document(source_id="custom-backend-preserved")
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "preserve me")])
+
+    class CustomBackendRuntime:
+        @asynccontextmanager
+        async def derived_mutation_guard(self) -> AsyncGenerator[None]:
+            yield
+
+        async def documents(self) -> object:
+            return store
+
+        async def vector_directory(self) -> Path:
+            return tmp_path / "custom-vectors"
+
+        async def vectors(self) -> object:
+            return fakes.MemoryVectors()
+
+    maintenance = _Maintenance(cast("Runtime", CustomBackendRuntime()))
+    with pytest.raises(ManiculeError, match="publication-aware vector backend"):
+        await maintenance.reset_index()
+
+    assert await store.get_document(document.id) is not None
+    assert await store.count_chunks() == 1
 
 
 async def test_a_backup_is_taken_and_names_what_it_contains(
@@ -992,6 +1028,26 @@ async def test_reset_old_identity_with_no_live_documents_and_orphaned_chunks_the
         fresh.media_types["fresh"] = "text/plain"
         assert (await (await opened.pipeline()).run(fresh)).indexed == 1
         assert (await store.index_fingerprints()).embed == embedder.fingerprint
+
+
+async def test_reset_derived_returns_the_full_cleanup_envelope(
+    manicule_environment: Path,
+) -> None:
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        source = DictConnector({"full-envelope": "derived cleanup envelope"}, name="envelope")
+        source.media_types["full-envelope"] = "text/plain"
+        assert (await (await opened.pipeline()).run(source)).indexed == 1
+
+        outcome = await (await opened.maintenance()).reset_derived()
+
+        assert outcome.documents_retired == 1
+        assert outcome.chunks_removed == 1
+        assert outcome.vector_rows_removed == 1
+        assert outcome.vector_store_removed
+        assert outcome.fingerprints_cleared
+        assert outcome.runtime_cache_invalidated
 
 
 async def test_pipeline_captured_before_reset_is_fenced_before_any_new_write(

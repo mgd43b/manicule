@@ -880,6 +880,15 @@ class LifecycleReport(Payload):
     released_bytes: int = Field(default=0, ge=0)
     confirmation: str | None = None
     source_contacted: bool = False
+    documents_retired: int = Field(default=0, ge=0)
+    chunks_removed: int = Field(default=0, ge=0)
+    memberships_removed: int = Field(default=0, ge=0)
+    vector_rows_removed: int = Field(default=0, ge=0)
+    publications_removed: int = Field(default=0, ge=0)
+    generations_terminalized: int = Field(default=0, ge=0)
+    vector_store_removed: bool = False
+    fingerprints_cleared: bool = False
+    runtime_cache_invalidated: bool = False
     lifecycle: LifecycleProgress = Field(
         default_factory=lambda: LifecycleProgress(phase="complete", outcome="complete")
     )

@@ -2076,6 +2076,15 @@ class _Maintenance:
             operation=LifecycleOperation.RESET_DERIVED,
             removed_items=outcome.chunks,
             snapshot_items=outcome.snapshots_retained,
+            documents_retired=outcome.documents,
+            chunks_removed=outcome.chunks,
+            memberships_removed=outcome.memberships,
+            vector_rows_removed=outcome.vector_rows,
+            publications_removed=outcome.publications,
+            generations_terminalized=outcome.generations_terminalized,
+            vector_store_removed=outcome.vector_store_removed,
+            fingerprints_cleared=outcome.fingerprints_cleared,
+            runtime_cache_invalidated=outcome.runtime_cache_invalidated,
         )
 
     async def plan_derived_generation_cleanup(self) -> LifecyclePlan:
@@ -2134,12 +2143,12 @@ class _Maintenance:
 
             directory = await self._runtime.vector_directory()
             async with generation_pin(directory, exclusive=True):
-                prepared = await lifecycle.prepare_reset_derived()
                 vectors = await self._runtime.vectors()
                 if not isinstance(vectors, PublishedLanceVectorStore):
                     raise ManiculeError(
                         "derived reset requires the built-in publication-aware vector backend"
                     )
+                prepared = await lifecycle.prepare_reset_derived()
                 vector_rows = 0
                 while tombstones := await lifecycle.reset_vector_tombstones():
                     grouped: dict[str | None, list[str]] = {}
