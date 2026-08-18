@@ -1833,7 +1833,20 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     task = asyncio.create_task(pipeline.run(connector))
     try:
         await connector.enumeration_completed.wait()
-        await embedder.gate.wait_for(1, patience_s=60)
+        # **Sixty seconds was a budget calibrated on the wrong machine.** This gate does not open
+        # until a document has crossed the whole pipeline, and on the durable path every one of
+        # the 1,000 documents is acquired before indexing starts — so the wait is behind 1,000
+        # fetches and their retention, not behind one. Measured from `enumeration_completed` to
+        # the first arrival: 14.2s on a 16-core developer machine. Against a 60s budget that is
+        # a 4x margin, and CI's two-core runners are more than 4x slower at exactly this shape
+        # of work. It failed there, reporting zero arrivals.
+        #
+        # `patience_s` is "how long the test is willing to be wrong for" rather than a timeout on
+        # anything under test, and it only elapses when the test is *already* failing — so a
+        # generous number costs nothing on a green run and buys back a false failure. What it
+        # costs is that a genuine deadlock takes this long to report, which is the right trade
+        # for a stage that is legitimately slow.
+        await embedder.gate.wait_for(1, patience_s=300)
 
         durable = await store.latest_unsettled_acquisition_run(connector.name)
         assert durable is not None
@@ -3870,8 +3883,35 @@ async def test_served_source_deletion_recovery_reuses_exact_evidence_and_keeps_s
         )
 
     first = await pipeline().run(connector, acquire_only=True)
+
+    # **Which half failed, when this run comes back with no deletion recorded.** This test has
+    # failed intermittently in CI — roughly one run in four, across both parametrizations, both
+    # Python versions and different shards — reporting `snapshot_omission_reasons == {}`. Empty,
+    # not wrong: no omission of any kind was recorded.
+    #
+    # That is reachable two ways, and the report alone cannot tell them apart.
+    # `_report_snapshot_omissions` runs only when `_acquire_journal` reports incomplete coverage,
+    # and that reports complete when no record is left in DISCOVERED/ACQUIRING/RETRY without a
+    # blob. A `NotFoundError` fetch parks the record in RETRY with no blob, so a run that reached
+    # the deleted document cannot report complete. Either the deleted document was never reached
+    # — enumeration or dispatch stopped short of the 8001st item — or it was reached and its
+    # outcome was lost afterwards. The remedies are in different subsystems.
+    #
+    # `attempts` is appended in `fetch` before the raise, so it answers exactly that question and
+    # costs nothing. It is asserted first so the failure names the half rather than leaving the
+    # next reader with the same fork this comment describes.
+    assert connector.missing in connector.attempts, (
+        f"the deleted document {connector.missing!r} was never fetched, so this run could not "
+        f"have observed the deletion at all — {len(connector.attempts)} of {documents} documents "
+        f"were attempted, over {connector.discovery_pass} discovery pass(es). The run stopped "
+        f"short rather than losing the outcome: look at enumeration and dispatch, not at how the "
+        f"omission was recorded."
+    )
     assert first.snapshot_omission_reasons == {"source_deleted": 1}, (
-        "the first run must reach its typed deletion outcome before inventory is inspected"
+        "the first run must reach its typed deletion outcome before inventory is inspected. "
+        f"The deleted document *was* fetched ({connector.missing!r} is in attempts), so the "
+        f"deletion was observed and then lost between the fetch and the report — look at the "
+        f"record's state transition and at _report_snapshot_omissions, not at enumeration."
     )
     predecessor = await store.latest_unsettled_acquisition_run(connector.name)
     assert predecessor is not None
