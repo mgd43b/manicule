@@ -77,7 +77,8 @@ async def _seed_live_generation(runtime: Runtime, data_dir: Path) -> None:
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=table_name(old),
                 embed_fingerprint=old.model_dump_json(),
                 vector_inventory_digest=None,

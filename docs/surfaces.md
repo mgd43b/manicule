@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Thirty-seven MCP tools and twenty-seven CLI commands. They are not a one-to-one mapping: some
+Forty MCP tools and twenty-seven CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -298,6 +298,9 @@ server and the built command tree.
 | `collection_list` | ✓ | `collection list` | every collection, and the rule each carries |
 | `collection_rename` | ✓ | `collection rename` | the collection, renamed |
 | `collection_update` | ✓ | `collection update` | the collection, described |
+| `collection_rule_show` | ✓ | `collection rule show` | the collection and its stored rule |
+| `collection_rule_set` | ✓ | `collection rule set` | the collection with its replacement rule |
+| `collection_rule_clear` | ✓ | `collection rule clear` | the collection with manual membership preserved |
 | `collection_delete` | ✓ | `collection delete` | what was deleted; the documents survive |
 | `collection_add` | ✓ | `collection add` | how many memberships changed |
 | `collection_remove` | ✓ | `collection remove` | the same, the other way |
@@ -308,7 +311,7 @@ server and the built command tree.
 | `backup` / `restore` | — | `backup` | where it went, what it holds |
 | `export` | — | `export` | a portable archive |
 | `import` | — | `import` | run counters |
-| `reset_index` | — | `reset-index --yes` | derived state removed and durable snapshot items retained |
+| `reset_index` | — | `reset-index --yes` | workspace-scoped document/chunk/membership/vector/publication/generation counts, physical/fingerprint/cache cleanup, and durable snapshot items retained |
 | `init` | — | `init` | what was written and decided |
 | `upgrade` | — | `upgrade` | current, target, and the command to run |
 | `start` / `stop` | — | `start` / `stop` | the address, and whether it is loopback |
@@ -345,7 +348,7 @@ the recovery active and the deletion count at zero.
 corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The thirty-seven tools read
+assistant can call unattended should not be able to do any of that. The forty tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
 surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
 `collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
@@ -373,7 +376,7 @@ secret as a parameter, and a session cookie in a tool call is a session cookie i
 ### 4.1 What each tool says it does, and why that is not permission
 
 Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
-`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-two of the thirty-seven say they only
+`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-three of the forty say they only
 read.
 
 **They are a description, and nothing in manicule reads them back.** No tool is gated on its own
@@ -814,8 +817,10 @@ sending a `POST` to `/mcp/` and getting a 307 it may not re-send a body for.
 **Every mutating tool is absent from it.** Not refused — absent. `manicule.mcp.server` is asked
 for the read-only surface, and it never calls `@mcp.tool` for a tool whose `readOnlyHint` is not
 true, so there is no handler behind `document_delete`, `connector_sync`, `config_set`,
-`plugin_add`, `index_path`, `ask` or the nine collection verbs on that server object. A call to
-one is an unknown tool.
+`plugin_add`, `index_path`, `ask` or the eight mutating collection verbs (`collection_create`,
+`collection_rename`, `collection_update`, `collection_rule_set`, `collection_rule_clear`,
+`collection_delete`, `collection_add`, and `collection_remove`) on that server object. A call to
+one is an unknown tool; the four read-only collection tools remain available.
 
 That is the same guarantee `tests/api/test_routes.py` keeps for the HTTP route table, kept the
 same way and asserted in the same file: `ABSENT` names the operations with no route, and
@@ -962,7 +967,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | documents | `GET /api/v1/documents`, `GET /api/v1/documents/{id}`, `DELETE /api/v1/documents/{id}`, `GET /api/v1/documents/trash`, `POST /api/v1/documents/{id}/restore`, `POST /api/v1/documents/{id}/reindex`, `GET /api/v1/search` |
 | chat | `POST /api/v1/chat`, `POST /api/v1/chat/stream`, `POST /api/v1/chat/feedback` |
 | conversations | `GET`/`POST /api/v1/conversations`, `GET /api/v1/conversations/{id}/messages`, `PATCH`/`DELETE /api/v1/conversations/{id}`, `POST`/`DELETE /api/v1/conversations/{id}/share`, `GET /shared/{token}` |
-| collections | `GET`/`POST /api/v1/collections`, `PATCH`/`DELETE /api/v1/collections/{id}`, `POST /api/v1/collections/{id}/name`, `GET /api/v1/collections/{id}/counts`, `GET /api/v1/collections/{id}/documents`, `POST`/`DELETE /api/v1/collections/{id}/documents/{docId}` |
+| collections | `GET`/`POST /api/v1/collections`, `PATCH`/`DELETE /api/v1/collections/{id}`, `POST /api/v1/collections/{id}/name`, `GET`/`PUT`/`DELETE /api/v1/collections/{id}/rule`, `GET /api/v1/collections/{id}/counts`, `GET /api/v1/collections/{id}/documents`, `POST`/`DELETE /api/v1/collections/{id}/documents/{docId}` |
 | tags | `GET`/`POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`, `POST`/`DELETE /api/v1/documents/{docId}/tags/{tagId}` |
 | admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
 | plugins | `GET /api/v1/plugins`, `GET /api/v1/plugins/search`, `POST`/`DELETE /api/v1/plugins/{name}` |

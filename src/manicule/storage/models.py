@@ -150,6 +150,10 @@ class Workspace(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     mode: Mapped[str] = mapped_column(Text, nullable=False, default="personal")
     settings: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=dict)
+    derived_reset_epoch: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    """Monotonic fence invalidating derived writers assembled before a confirmed reset."""
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
     __table_args__ = (CheckConstraint("mode IN ('personal', 'team')", name="mode_is_known"),)
@@ -285,6 +289,7 @@ class AcquisitionRun(Base):
     connector_name: Mapped[str] = mapped_column(Text, nullable=False)
     source_scope: Mapped[str] = mapped_column(Text, nullable=False, default="")
     scope_fingerprint: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    full_inventory_authority: Mapped[str] = mapped_column(Text, nullable=False, default="")
     scope_inventory_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     promotion_policy: Mapped[SnapshotPromotionPolicy] = mapped_column(
         Text,
@@ -460,6 +465,7 @@ class AcquisitionRecord(Base):
         UniqueConstraint("run_id", "source_id"),
         UniqueConstraint("run_id", "sequence"),
         Index("ix_acquisition_records_run_state_sequence", "run_id", "state", "sequence"),
+        Index("ix_acquisition_records_run_blob_state", "run_id", "blob_ref", "state"),
         Index("ix_acquisition_records_marker_name", "marker_name", unique=True),
         Index(
             "ix_acquisition_records_run_source_version",
@@ -481,6 +487,41 @@ class AcquisitionRecord(Base):
         CheckConstraint(
             "snapshot_diagnostic IS NULL OR json_valid(snapshot_diagnostic)",
             name="snapshot_diagnostic_is_valid_json",
+        ),
+    )
+
+
+class AcquisitionBlobBacklog(Base):
+    """One content-addressed blob currently pinned by unfinished acquisition records."""
+
+    __tablename__ = "acquisition_blob_backlog"
+
+    blob_ref: Mapped[str] = mapped_column(
+        ForeignKey("blobs.hash", ondelete="RESTRICT"), primary_key=True
+    )
+    reference_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    stored_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("reference_count > 0", name="acquisition_blob_backlog_has_references"),
+        CheckConstraint(
+            "stored_bytes >= 0", name="acquisition_blob_backlog_bytes_are_not_negative"
+        ),
+    )
+
+
+class AcquisitionBacklogCapacity(Base):
+    """The O(1) exact total for content-addressed acquisition backlog admission."""
+
+    __tablename__ = "acquisition_backlog_capacity"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    acquired_blob_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("id = 1", name="acquisition_backlog_capacity_is_singleton"),
+        CheckConstraint(
+            "acquired_blob_bytes >= 0", name="acquisition_backlog_capacity_is_not_negative"
         ),
     )
 
@@ -1180,7 +1221,7 @@ class Plugin(Base):
 
 
 class IndexState(Base):
-    """One row describing what the derived indexes were built with.
+    """One row per workspace describing what its derived indexes were built with.
 
     The fingerprints are canonical bytes in a ``TEXT`` column, not a JSON mapping. They are
     compared for byte equality, and a JSON column round-trips through a serializer that does
@@ -1190,7 +1231,19 @@ class IndexState(Base):
 
     __tablename__ = "index_state"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    vector_namespace: Mapped[str] = mapped_column(
+        Text, nullable=False, default="workspace", server_default="workspace"
+    )
+    """Physical layout selector.
+
+    ``legacy`` keeps an upgraded workspace on the historical shared ``vectors/`` root until
+    its first confirmed reset. ``workspace`` uses an opaque workspace-qualified child
+    directory. The compatibility marker lets an upgrade avoid a multi-gigabyte eager copy
+    while allowing reset and every fresh workspace to have independent fingerprints.
+    """
     vector_table: Mapped[str | None] = mapped_column(Text)
     """A pointer, not a constant. It names a legacy table or a generation directory; re-embed
     moves it in one transaction, so a crash mid-rebuild leaves the old index live."""
@@ -1204,21 +1257,25 @@ class IndexState(Base):
         UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow
     )
 
-    __table_args__ = (CheckConstraint("id = 1", name="is_a_singleton"),)
+    __table_args__ = (
+        CheckConstraint(
+            "vector_namespace IN ('legacy', 'workspace')",
+            name="vector_namespace_is_known",
+        ),
+    )
 
 
 class CorpusRevision(Base):
-    """Monotonic revision moved by triggers on every authoritative corpus mutation."""
+    """Workspace-local revision moved by triggers on authoritative corpus mutations."""
 
     __tablename__ = "corpus_revision"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    __table_args__ = (
-        CheckConstraint("id = 1", name="is_a_singleton"),
-        CheckConstraint("revision >= 0", name="revision_is_not_negative"),
-    )
+    __table_args__ = (CheckConstraint("revision >= 0", name="revision_is_not_negative"),)
 
 
 class ReembedRunRecord(Base):
@@ -1398,6 +1455,7 @@ class DerivedGeneration(Base):
         UniqueConstraint(
             "workspace_id",
             "snapshot_run_id",
+            "snapshot_membership_hash",
             "target_digest",
             "publication_identity_digest",
             name="uq_derived_generation_plan",
@@ -1420,6 +1478,32 @@ class DerivedGeneration(Base):
         CheckConstraint(
             "(state = 'published') = (published_at IS NOT NULL)",
             name="derived_generation_publication_timestamp_matches_state",
+        ),
+    )
+
+
+class DerivedGenerationSnapshot(Base):
+    """One promoted source scope bound into a workspace replacement generation."""
+
+    __tablename__ = "derived_generation_snapshots"
+
+    generation_id: Mapped[str] = mapped_column(
+        ForeignKey("derived_generations.id", ondelete="CASCADE"), primary_key=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("acquisition_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    connector_name: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    membership_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("generation_id", "run_id", name="uq_generation_snapshot_run"),
+        CheckConstraint(
+            "ordinal >= 0 AND expected_item_count >= 0",
+            name="derived_generation_snapshot_counts_are_not_negative",
         ),
     )
 
@@ -1466,9 +1550,16 @@ class VectorTombstone(Base):
     __tablename__ = "vector_tombstones"
 
     chunk_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str | None] = mapped_column(Text)
+    """Owner of this exact physical row, or ``NULL`` for an unattributable legacy tombstone."""
+    vector_namespace: Mapped[str | None] = mapped_column(Text)
+    vector_table: Mapped[str | None] = mapped_column(Text)
     deleted_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
-    __table_args__ = (WITHOUT_ROWID,)
+    __table_args__ = (
+        Index("ix_vector_tombstones_workspace_deleted", "workspace_id", "deleted_at"),
+        WITHOUT_ROWID,
+    )
 
 
 ALL_TABLES = tuple(Base.metadata.sorted_tables)
@@ -1499,6 +1590,7 @@ __all__ = [
     "CorpusRevision",
     "DerivedGeneration",
     "DerivedGenerationItem",
+    "DerivedGenerationSnapshot",
     "Document",
     "DocumentTag",
     "DocumentVersion",

@@ -27,6 +27,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from manicule.chunking.tokens import SupportsTokenCount
 from manicule.core.embedding import VectorState, require_within_context
 from manicule.core.lifecycle import SupportsMetrics
 
@@ -89,7 +90,14 @@ async def embed_chunks(
     Raises:
         ContextOverflowError: Any chunk exceeds what the model will read.
     """
-    require_within_context(chunks, embedder.fingerprint, chunk_fingerprint)
+    measured = chunks
+    if isinstance(embedder, SupportsTokenCount):
+        require_within_context(chunks, embedder.fingerprint)
+        measured = [
+            chunk.model_copy(update={"token_count": embedder.count_tokens(chunk.embed_text)})
+            for chunk in chunks
+        ]
+    require_within_context(measured, embedder.fingerprint, chunk_fingerprint)
     if not chunks:
         return []
 

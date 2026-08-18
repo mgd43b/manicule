@@ -30,7 +30,7 @@ from manicule.core.content import Chunk, Document, DocumentStatus, RawDocument
 from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.glossary import DefinitionForm, GlossaryEntry
-from manicule.core.ids import chunk_id, content_hash
+from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.core.rebuild import (
     DerivedReplacement,
     RebuildCheckpoint,
@@ -74,6 +74,7 @@ class ReplayBarrierRebuildStore(SqliteRebuildStore):
         session: AsyncSession,
         *,
         snapshot_run_id: str,
+        snapshot_membership_hash: str,
         target_digest: str,
         vector_table: str | None,
         vector_inventory_digest: str | None,
@@ -83,6 +84,7 @@ class ReplayBarrierRebuildStore(SqliteRebuildStore):
         return await super()._published_replay(
             session,
             snapshot_run_id=snapshot_run_id,
+            snapshot_membership_hash=snapshot_membership_hash,
             target_digest=target_digest,
             vector_table=vector_table,
             vector_inventory_digest=vector_inventory_digest,
@@ -282,6 +284,7 @@ async def promoted_snapshot(
     connector: str = "wiki",
     scope_fingerprint: str = "scope-v1",
     source_id: str = "page-1",
+    emits_watermark: bool = True,
 ) -> tuple[str, str, RawDocument]:
     raw = RawDocument(
         source_id=source_id,
@@ -317,7 +320,7 @@ async def promoted_snapshot(
     )
     await store.complete_acquisition_enumeration(
         run.id,
-        Watermark(value="v2", observed_at=NOW),
+        Watermark(value="v2", observed_at=NOW) if emits_watermark else None,
         lease_owner="worker",
         lease_generation=claimed.lease_generation,
         now=NOW,
@@ -845,7 +848,11 @@ async def test_glossary_publication_failure_rolls_back_every_relational_live_row
         assert (await connection.execute(select(models.GlossaryAlias.key))).scalars().all() == []
         assert (await connection.execute(text("PRAGMA foreign_key_check"))).all() == []
         assert (
-            await connection.execute(select(models.IndexState.id).where(models.IndexState.id == 1))
+            await connection.execute(
+                select(models.IndexState.workspace_id).where(
+                    models.IndexState.workspace_id == "default"
+                )
+            )
         ).scalar_one_or_none() is None
     assert (await rebuilds.checkpoint(claimed.generation_id)).state is RebuildState.VALIDATING
 
@@ -898,12 +905,39 @@ async def test_publication_and_acquisition_settlement_share_one_rollback_boundar
     assert [await store.get_document(document.id) for document in documents] == [None, None]
 
 
-async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omission_pending(
+async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omission_pending(  # noqa: PLR0915
     store: SqliteDocStore,
     engine: AsyncEngine,
     data_dir: Path,
 ) -> None:
+    old_complete_run, _, _ = await promoted_snapshot(
+        store,
+        engine,
+        data_dir,
+        run_id="old-complete-scope",
+        scope_fingerprint="old-complete-v1",
+        source_id="old-scope-page",
+    )
+    async with session_factory(engine).begin() as session:
+        await session.execute(
+            update(models.AcquisitionRecord)
+            .where(models.AcquisitionRecord.run_id == old_complete_run)
+            .values(state=AcquisitionRecordState.SETTLED)
+        )
+        await session.execute(
+            update(models.AcquisitionRun)
+            .where(models.AcquisitionRun.id == old_complete_run)
+            .values(state=AcquisitionRunState.SETTLED)
+        )
     run_id, raws, blob_refs = await promoted_partial_snapshot(store, engine, data_dir)
+    omitted_live = make_document(
+        source="wiki",
+        source_id="omitted-one",
+        body=b"live content retained while the current scope is partial",
+        uri="https://wiki.example.test/content/omitted-one",
+        media_type="text/plain",
+    )
+    await store.upsert_document(omitted_live)
     target, embed = rebuild_target()
     vectors = LanceVectorStore(data_dir / "vectors")
     await vectors.ensure_ready(embed)
@@ -1010,6 +1044,7 @@ async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omiss
     assert lifecycle["snapshot_completeness"] == "partial"
     assert lifecycle["reproducibility_policy"] == "allow_omissions"
     assert lifecycle["can_continue_offline"] is False
+    assert await store.get_document(omitted_live.id) is not None
     assert await store.verify_snapshot_manifest(run_id)
     assert await store.latest_unsettled_acquisition_run("wiki") is None
     rendered = json.dumps(metadata, sort_keys=True)
@@ -1733,11 +1768,11 @@ async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempote
     assert record_selects == 2, "one manifest verification and one bounded planning cursor"
     sessions = session_factory(engine)
     async with sessions.begin() as session:
-        state = await session.get(models.IndexState, 1)
+        state = await session.get(models.IndexState, "default")
         if state is None:
             session.add(
                 models.IndexState(
-                    id=1,
+                    workspace_id="default",
                     vector_table="reembed-winner",
                     vector_inventory_digest="winner-inventory",
                 )
@@ -1790,7 +1825,7 @@ async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempote
             swap_started.set()
             await session.execute(
                 update(models.IndexState)
-                .where(models.IndexState.id == 1)
+                .where(models.IndexState.workspace_id == "default")
                 .values(
                     vector_table="later-reembed-winner",
                     vector_inventory_digest="later-winner-inventory",
@@ -1809,7 +1844,7 @@ async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempote
     assert after_swap.generation_id not in {stale.generation_id, winner.generation_id}
 
 
-async def test_second_connector_promotion_fences_a_single_scope_rebuild(
+async def test_second_connector_promotion_replans_one_workspace_generation_and_fences_old(
     store: SqliteDocStore,
     engine: AsyncEngine,
     data_dir: Path,
@@ -1860,10 +1895,14 @@ async def test_second_connector_promotion_fences_a_single_scope_rebuild(
         scope_fingerprint="folder-v1",
         source_id="drive-page-1",
     )
-    refused_first = await rebuilds.plan_rebuild(first_run, target, missing_limit=10)
-    refused_second = await rebuilds.plan_rebuild(second_run, target, missing_limit=10)
-    assert refused_first.refusal is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
-    assert refused_second.refusal is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+    workspace_from_first = await rebuilds.plan_rebuild(first_run, target, missing_limit=10)
+    workspace_from_second = await rebuilds.plan_rebuild(second_run, target, missing_limit=10)
+    assert workspace_from_first.runnable
+    assert workspace_from_second.runnable
+    assert workspace_from_first.documents == 2
+    assert workspace_from_second.documents == 2
+    assert workspace_from_first.generation_id == workspace_from_second.generation_id
+    assert workspace_from_first.generation_id != first.generation_id
     with pytest.raises(RebuildLeaseConflictError, match="workspace_scope_changed"):
         await rebuilds.assert_generation_lease(
             first.generation_id,
@@ -1885,6 +1924,332 @@ async def test_second_connector_promotion_fences_a_single_scope_rebuild(
             now=NOW,
         )
     assert caught.value.code is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+
+
+async def test_multi_source_generation_resumes_and_publishes_once_atomically(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    wiki_run, wiki_blob, wiki_raw = await promoted_snapshot(store, engine, data_dir)
+    drive_run, drive_blob, drive_raw = await promoted_snapshot(
+        store,
+        engine,
+        data_dir,
+        run_id="drive-promoted-run",
+        connector="drive",
+        scope_fingerprint="folder-v1",
+        source_id="drive-page-1",
+    )
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    plan = await rebuilds.plan_rebuild(wiki_run, target, missing_limit=10)
+    assert plan.runnable
+    assert plan.documents == 2
+    assert (await rebuilds.plan_rebuild(drive_run, target, missing_limit=10)).generation_id == (
+        plan.generation_id
+    )
+    inputs = await rebuilds.snapshot_inputs(plan.generation_id, after_sequence=-1, limit=10)
+    assert [(item.sequence, item.connector) for item in inputs] == [(0, "drive"), (1, "wiki")]
+
+    retained = {
+        "drive": (drive_raw, drive_blob),
+        "wiki": (wiki_raw, wiki_blob),
+    }
+
+    def replacement(sequence: int) -> tuple[DerivedReplacement, Chunk]:
+        item = inputs[sequence]
+        raw, blob_ref = retained[item.connector]
+        document = Document(
+            id=document_id(store.workspace_id, item.connector, raw.source_id),
+            publication_id=plan.generation_id,
+            source=item.connector,
+            source_id=raw.source_id,
+            uri=raw.uri,
+            content_hash=content_hash(raw.as_bytes()),
+            original_ref=blob_ref,
+            media_type=raw.media_type,
+            version_token="v2",  # noqa: S106 - source revision, not a credential
+            status=DocumentStatus.INDEXED,
+        )
+        chunk = Chunk(
+            id=chunk_id(document.id, 0, raw.as_text()),
+            document_id=document.id,
+            text=raw.as_text(),
+            embed_text=raw.as_text(),
+            anchor=Unlocated(reason="plain text"),
+            position=0,
+            token_count=3,
+        )
+        return (
+            DerivedReplacement(
+                document=document,
+                chunks=(chunk,),
+                parse_fingerprint="plain@2",
+                vector_embedded=1,
+            ),
+            chunk,
+        )
+
+    first = await rebuilds.claim_generation(
+        plan.generation_id,
+        "first-worker",
+        now=NOW,
+        expires_at=NOW + timedelta(seconds=1),
+    )
+    first_replacement, first_chunk = replacement(0)
+    await vectors.upsert(
+        [first_chunk], [[1.0, 0.0, 0.0, 0.0]], publication_id=first.vector_publication_id
+    )
+    await rebuilds.stage_replacements(
+        plan.generation_id,
+        [(0, first_replacement)],
+        expected_next_sequence=0,
+        owner="first-worker",
+        lease_generation=first.lease_generation,
+        now=NOW,
+    )
+
+    resumed_at = NOW + timedelta(seconds=2)
+    resumed = await rebuilds.claim_generation(
+        plan.generation_id,
+        "resumed-worker",
+        now=resumed_at,
+        expires_at=resumed_at + timedelta(days=30),
+    )
+    assert resumed.next_sequence == 1
+    assert resumed.predecessor_vector_publication_id == first.vector_publication_id
+    await rebuilds.copy_checkpointed_vectors(
+        plan.generation_id,
+        first.vector_publication_id,
+        owner="resumed-worker",
+        lease_generation=resumed.lease_generation,
+        now=resumed_at,
+    )
+    second_replacement, second_chunk = replacement(1)
+    await vectors.upsert(
+        [second_chunk],
+        [[0.0, 1.0, 0.0, 0.0]],
+        publication_id=resumed.vector_publication_id,
+    )
+    await rebuilds.stage_replacements(
+        plan.generation_id,
+        [(1, second_replacement)],
+        expected_next_sequence=1,
+        owner="resumed-worker",
+        lease_generation=resumed.lease_generation,
+        now=resumed_at,
+    )
+
+    # Shadow staging remains invisible until one publication commits the full source set.
+    assert await store.get_document(first_replacement.document.id) is None
+    assert await store.get_document(second_replacement.document.id) is None
+    await rebuilds.begin_validation(
+        plan.generation_id,
+        owner="resumed-worker",
+        lease_generation=resumed.lease_generation,
+        now=resumed_at,
+    )
+    await rebuilds.validate_generation(plan.generation_id)
+    published = await rebuilds.publish_generation(
+        plan.generation_id,
+        owner="resumed-worker",
+        lease_generation=resumed.lease_generation,
+        now=resumed_at,
+    )
+    assert published.state is RebuildState.PUBLISHED
+    assert await store.get_document(first_replacement.document.id) is not None
+    assert await store.get_document(second_replacement.document.id) is not None
+
+
+async def test_current_promoted_scope_without_a_watermark_is_still_plannable(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    await promoted_snapshot(
+        store,
+        engine,
+        data_dir,
+        run_id="prior-watermarked-scope",
+        scope_fingerprint="watermarked-scope",
+        source_id="prior-watermarked-page",
+    )
+    run_id, _, raw = await promoted_snapshot(
+        store,
+        engine,
+        data_dir,
+        run_id="new-no-watermark-scope",
+        scope_fingerprint="no-watermark-scope",
+        source_id="new-no-watermark-page",
+        emits_watermark=False,
+    )
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    assert plan.runnable, plan
+    inputs = await rebuilds.snapshot_inputs(plan.generation_id, after_sequence=-1, limit=10)
+
+    assert plan.documents == 1
+    assert [item.source.source_id for item in inputs] == [raw.source_id]
+
+
+async def test_complete_snapshot_publication_removes_stale_same_source_documents(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, blob_ref, raw = await promoted_snapshot(store, engine, data_dir)
+    stale = make_document(
+        source="wiki",
+        source_id="stale-outside-manifest",
+        body=b"stale live content",
+        uri="https://wiki.example.test/content/stale-outside-manifest",
+        media_type="text/plain",
+    )
+    await store.upsert_document(stale)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    replacement = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=raw.as_bytes(),
+        uri=raw.uri,
+        media_type=raw.media_type,
+    )
+
+    published = await publish_one_replacement(
+        rebuilds,
+        vectors,
+        estimate_id=plan.generation_id,
+        target=target,
+        document=replacement,
+        raw=raw,
+        blob_ref=blob_ref,
+        owner="complete-cleanup-publisher",
+    )
+
+    assert published.state is RebuildState.PUBLISHED
+    assert await store.get_document(stale.id) is None
+
+
+async def test_generation_bound_snapshot_is_not_removed_by_history_cleanup(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, _, _ = await promoted_snapshot(store, engine, data_dir)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    sessions = session_factory(engine)
+    old = datetime(2020, 1, 1, tzinfo=UTC)
+    async with sessions.begin() as session:
+        await session.execute(
+            update(models.AcquisitionRecord)
+            .where(models.AcquisitionRecord.run_id == run_id)
+            .values(state=AcquisitionRecordState.SETTLED, updated_at=old)
+        )
+        await session.execute(
+            update(models.AcquisitionRun)
+            .where(models.AcquisitionRun.id == run_id)
+            .values(state=AcquisitionRunState.SETTLED, updated_at=old)
+        )
+
+    removed = await store.cleanup_acquisition_history(datetime(2100, 1, 1, tzinfo=UTC), limit=10)
+
+    assert removed == 0
+    assert await store.get_acquisition_run(run_id) is not None
+
+
+async def test_rebuild_plan_reports_aggregate_chunk_budget_diagnostics(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, _, raw = await promoted_snapshot(store, engine, data_dir)
+    current = ChunkFingerprint(
+        chunker="structural",
+        version="3",
+        max_tokens=512,
+        overlap_tokens=64,
+        tokenizer_id="test/tokenizer",
+    )
+    target_chunk = current.model_copy(update={"max_tokens": 768, "overlap_tokens": 96})
+    document = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=b"stored body",
+        uri=raw.uri,
+        media_type=raw.media_type,
+    )
+    await store.upsert_document(document)
+    await store.replace_chunks(
+        document.id,
+        [make_chunk(document, 0, "stored body").model_copy(update={"token_count": 513})],
+    )
+    sessions = session_factory(engine)
+    async with sessions.begin() as session:
+        state = await session.get(models.IndexState, "default")
+        if state is None:
+            session.add(
+                models.IndexState(workspace_id="default", chunk_fingerprint=current.canonical())
+            )
+        else:
+            state.chunk_fingerprint = current.canonical()
+
+    target, embed = rebuild_target()
+    target = target.model_copy(update={"chunk_fingerprint": target_chunk.canonical()})
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    estimate = await rebuilds.plan_rebuild(run_id, target, missing_limit=10, persist=False)
+
+    assert estimate.runnable
+    assert estimate.current_chunk_fingerprint == current.canonical()
+    assert estimate.target_chunk_fingerprint == target_chunk.canonical()
+    assert estimate.over_budget_chunks == 1
+    assert estimate.max_stored_chunk_tokens == 513
+    assert estimate.estimated_embedding_chunks == estimate.estimated_chunks
+    assert estimate.network_required is False
+    rendered = estimate.model_dump_json()
+    assert raw.source_id not in rendered
+    assert raw.uri not in rendered
 
 
 async def test_resume_refuses_a_snapshot_that_lost_promotion_with_a_bounded_conflict(
@@ -2072,14 +2437,14 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
     await rebuilds.validate_generation(estimate.generation_id)
     # A #187 pointer swap after staging must win the CAS without publishing relational rows.
     async with sessions.begin() as session:
-        index_state = await session.get(models.IndexState, 1)
+        index_state = await session.get(models.IndexState, "default")
         index_state_was_missing = index_state is None
         expected_vector_table = None if index_state is None else index_state.vector_table
         expected_inventory = None if index_state is None else index_state.vector_inventory_digest
         if index_state is None:
             session.add(
                 models.IndexState(
-                    id=1,
+                    workspace_id="default",
                     vector_table="reembed-interleaving-winner",
                     vector_inventory_digest="interleaving-inventory",
                 )
@@ -2096,7 +2461,7 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         )
     assert caught.value.code is RebuildRefusalCode.PUBLICATION_CONFLICT
     async with sessions.begin() as session:
-        index_state = await session.get(models.IndexState, 1)
+        index_state = await session.get(models.IndexState, "default")
         assert index_state is not None
         if index_state_was_missing:
             await session.delete(index_state)
@@ -2176,7 +2541,9 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         ).scalar_one()
         inventory = (
             await connection.execute(
-                select(models.IndexState.vector_inventory_digest).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_inventory_digest).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert "tokenize='unicode61'" in fts_sql

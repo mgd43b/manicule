@@ -120,10 +120,10 @@
   <h2>Connectors</h2>
   {% if panels.connectors.ok %}
   <table>
-    <thead><tr><th>Name</th><th>Type</th><th>Last sync</th><th>Outcome</th><th>Retry</th><th>Status</th></tr></thead>
+    <thead><tr><th>Name</th><th>Type</th><th>Full inventory</th><th>Last sync</th><th>Outcome</th><th>Retry</th><th>Status</th></tr></thead>
     <tbody>
       {% for item in panels.connectors.data.connectors %}
-      <tr><td>{{ item.name }}</td><td>{{ item.type }}</td><td>{{ item.last_synced_at or 'never' }}</td><td>{{ item.last_outcome or '—' }}</td><td>{{ 'yes' if item.retry_required else 'no' }}</td><td>{{ item.status or '—' }}</td></tr>
+      <tr><td>{{ item.name }}</td><td>{{ item.type }}</td><td>{{ item.full_inventory_authority or '—' }}</td><td>{{ item.last_synced_at or 'never' }}</td><td>{{ item.last_outcome or '—' }}</td><td>{{ 'yes' if item.retry_required else 'no' }}</td><td>{{ item.status or '—' }}</td></tr>
       {% endfor %}
     </tbody>
   </table>

@@ -45,14 +45,22 @@ from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_own
 from manicule.config.loader import load_settings
 from manicule.config.settings import (
     AuthMode,
+    ConnectorSettings,
     Role,
     Settings,
     config_file,
     looks_secret,
 )
 from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome
+from manicule.container import keys
 from manicule.core.content import PREVIOUS_IDENTITY, DocumentStatus
-from manicule.core.errors import ConfigError, ManiculeError, PolicyError, UnknownEntityError
+from manicule.core.errors import (
+    ConfigError,
+    ManiculeError,
+    PolicyError,
+    UnknownComponentError,
+    UnknownEntityError,
+)
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id
 from manicule.core.rebuild import (
@@ -83,7 +91,7 @@ if TYPE_CHECKING:
     from manicule.connectors.sessions import SessionStore
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.content import Chunk, Document
-    from manicule.core.organization import Collection, Tag
+    from manicule.core.organization import Collection, CollectionRule, Tag
     from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Confidence
     from manicule.embedding.artifacts import WeightsPlan
@@ -234,6 +242,7 @@ def _snapshot_status_report(
         state=run.state.value,
         verified=verified,
         verification_performed=verification_performed,
+        full_inventory_authority=_public_full_inventory_authority(run.full_inventory_authority),
         lifecycle=r.LifecycleProgress(
             phase=phase,
             outcome=outcome,
@@ -264,6 +273,7 @@ def _snapshot_status_report(
                 "" if run.inventory_state.value == "current" else run.inventory_state.value
             ),
             reconciled_deleted_items=run.reconciled_deleted_count,
+            full_inventory_authority=_public_full_inventory_authority(run.full_inventory_authority),
         ),
     )
 
@@ -318,6 +328,15 @@ def _lifecycle_outcome_report(outcome: LifecycleOutcome) -> r.LifecycleReport:
         released_bytes=outcome.released_bytes,
         snapshot_items=outcome.snapshot_items,
         source_contacted=outcome.source_contacted,
+        documents_retired=outcome.documents_retired,
+        chunks_removed=outcome.chunks_removed,
+        memberships_removed=outcome.memberships_removed,
+        vector_rows_removed=outcome.vector_rows_removed,
+        publications_removed=outcome.publications_removed,
+        generations_terminalized=outcome.generations_terminalized,
+        vector_store_removed=outcome.vector_store_removed,
+        fingerprints_cleared=outcome.fingerprints_cleared,
+        runtime_cache_invalidated=outcome.runtime_cache_invalidated,
         lifecycle=r.LifecycleProgress(
             phase=phase,
             outcome="complete",
@@ -347,6 +366,12 @@ def _rebuild_plan_report(estimate: RebuildEstimate) -> r.RebuildPlanReport:
         missing_count=estimate.missing_count,
         refusal_code=estimate.refusal.value if estimate.refusal else None,
         runnable=estimate.runnable,
+        current_chunk_fingerprint=estimate.current_chunk_fingerprint,
+        target_chunk_fingerprint=estimate.target_chunk_fingerprint,
+        over_budget_chunks=estimate.over_budget_chunks,
+        max_stored_chunk_tokens=estimate.max_stored_chunk_tokens,
+        estimated_embedding_chunks=estimate.estimated_embedding_chunks,
+        network_required=estimate.network_required,
         lifecycle=r.LifecycleProgress(
             phase="rebuilding",
             outcome="deferred" if estimate.runnable else "refused",
@@ -1244,6 +1269,7 @@ class ApplicationService:
                         raw_watermark_advanced if isinstance(raw_watermark_advanced, bool) else None
                     ),
                     last_lifecycle=last_lifecycle,
+                    full_inventory_authority=_configured_full_inventory_authority(configured),
                 )
             )
         return r.ConnectorList(count=len(summaries), connectors=tuple(summaries))
@@ -2681,6 +2707,17 @@ class ApplicationService:
             store = await self._backend.documents()
             fingerprints = await store.index_fingerprints()
             documents = await store.count_documents()
+            ingestion = await self._backend.ingestion()
+            inspect_physical = getattr(ingestion, "physical_index_fingerprint", None)
+            physical_embed = (
+                await inspect_physical()
+                if fingerprints.is_empty and inspect_physical is not None
+                else None
+            )
+            if fingerprints.is_empty and physical_embed is None:
+                configured_embed = configured_chunk = ""
+            else:
+                configured_embed, configured_chunk = await ingestion.configured_index_fingerprints()
         except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
             return r.Check(
                 name="index",
@@ -2689,6 +2726,22 @@ class ApplicationService:
                 facts={"error_type": type(exc).__name__},
             )
         if fingerprints.is_empty:
+            if documents == 0 and physical_embed is not None and physical_embed != configured_embed:
+                return r.Check(
+                    name="index",
+                    state="degraded",
+                    detail=(
+                        "the empty workspace retains physical vector fingerprint metadata "
+                        "without a matching relational index identity"
+                    ),
+                    facts={
+                        "documents": 0,
+                        "vector_table": None,
+                        "stale_empty_identity": True,
+                        "physical_fingerprint_mismatch": True,
+                    },
+                    remedy="manicule reset-index --yes",
+                )
             return r.Check(
                 name="index",
                 state="ok" if documents == 0 else "degraded",
@@ -2701,6 +2754,31 @@ class ApplicationService:
                 # how it was reached, and a `remedy` naming a command with a `<path>` in it is
                 # neither runnable by a script nor certain to be the right advice.
                 facts={"documents": documents, "vector_table": None},
+            )
+        embed_mismatch = bool(
+            fingerprints.embed is not None
+            and configured_embed
+            and fingerprints.embed.canonical() != configured_embed
+        )
+        chunk_mismatch = bool(
+            fingerprints.chunk is not None
+            and configured_chunk
+            and fingerprints.chunk.canonical() != configured_chunk
+        )
+        if documents == 0 and (embed_mismatch or chunk_mismatch):
+            return r.Check(
+                name="index",
+                state="degraded",
+                detail=(
+                    "the empty workspace retains an obsolete derived fingerprint that would "
+                    "reject the configured first ingest"
+                ),
+                facts={
+                    "documents": 0,
+                    "vector_table": fingerprints.vector_table or None,
+                    "stale_empty_identity": True,
+                },
+                remedy="manicule reset-index --yes",
             )
         return r.Check(
             name="index",
@@ -3129,6 +3207,22 @@ class ApplicationService:
         """
         return await asyncio.to_thread(self._inspect_models, provider=provider)
 
+    def _embedder_config_model(self, provider: str) -> type[BaseModel] | None:
+        """The configuration model the named embedder registered, or ``None``.
+
+        ``None`` means "nothing installed provides this embedder, or it declared no
+        configuration model" — both of which leave the caller with no settings to validate and
+        nothing to say about the artifact beyond the defaults.
+        """
+        discovery = self._backend.discovery
+        if discovery is None:
+            return None
+        try:
+            record = discovery.registry.record(keys.EMBEDDER.named(provider))
+        except UnknownComponentError:
+            return None
+        return record.config_model
+
     def _weights_plan(self, provider: str | None) -> WeightsPlan | None:
         """The artifact the configured backend will load, or ``None`` with no embedding extra."""
         from manicule.embedding.artifacts import (  # noqa: PLC0415 - an extra
@@ -3137,10 +3231,7 @@ class ApplicationService:
             planned_weights,
         )
         from manicule.embedding.cards import CARD_FILES  # noqa: PLC0415 - an extra
-        from manicule.embedding.config import (  # noqa: PLC0415 - an extra
-            EmbedderConfig,
-            MlxEmbedderConfig,
-        )
+        from manicule.embedding.config import EmbedderConfig  # noqa: PLC0415 - an extra
         from manicule.embedding.runtimes.hub import (  # noqa: PLC0415 - an extra
             cached_revision,
         )
@@ -3165,12 +3256,32 @@ class ApplicationService:
         weights = ""
         try:
             raw = settings.component_config("embedder", chosen)
-            if chosen == "mlx":
-                config = MlxEmbedderConfig.model_validate(raw)
-            elif chosen == "onnx":
-                config = EmbedderConfig.model_validate(raw)
+            # Validate against the model the backend **registered**, not against a name this
+            # function knows. Backends ship their own `EmbedderConfig` subclass from their own
+            # distribution — `manicule-mlx` adds a Metal cache bound — and `extra="forbid"`
+            # means validating one of those against the base model fails on its own setting. An
+            # earlier version branched on the literals "mlx" and "onnx", so it could only ever
+            # be right about the backends that happened to be in-tree the day it was written.
+            #
+            # When the registry cannot answer — no discovery, or an embedder nothing installed
+            # provides — fall back to the two fields this function actually reads rather than
+            # skipping validation. Those live on the base model, so a mutable `weights_revision`
+            # is still refused; what is given up is only the rejection of a *foreign* key, which
+            # is a different diagnostic's job. Skipping instead would make `doctor` quietly
+            # weaker exactly where it has least information.
+            model_for_config = self._embedder_config_model(chosen)
+            if model_for_config is None:
+                base = set(EmbedderConfig.model_fields)
+                config: EmbedderConfig = EmbedderConfig.model_validate(
+                    {key: value for key, value in raw.items() if key in base}
+                )
             else:
-                return planned_weights(chosen, model, model_revision=model_revision)
+                validated = model_for_config.model_validate(raw)
+                if not isinstance(validated, EmbedderConfig):
+                    # A registered model that is not an `EmbedderConfig` cannot carry
+                    # `weights`/`weights_revision`, so there is no plan to make from it.
+                    return planned_weights(chosen, model, model_revision=model_revision)
+                config = validated
             weights = config.weights
             revision = config.weights_revision
             if (
@@ -3233,7 +3344,7 @@ class ApplicationService:
         if not key:
             return r.ConfigValue(key="", value=redacted, source=str(config_file()))
         value: JsonValue = redacted
-        for part in key.split("."):
+        for part in _config_key_parts(key):
             if not isinstance(value, dict) or part not in value:
                 msg = f"no such setting: {key!r}"
                 raise UnknownEntityError(msg)
@@ -3257,7 +3368,7 @@ class ApplicationService:
         if not key:
             msg = "config set needs a dotted key, for example 'rag.profile'"
             raise ConfigError(msg)
-        parts = key.split(".")
+        parts = _config_key_parts(key)
         if looks_secret(parts[-1]):
             msg = (
                 f"{key!r} is a credential. Set it in the environment instead — the config "
@@ -3269,12 +3380,15 @@ class ApplicationService:
         previous = await self._current_value(parts)
 
         path = config_file()
+
         # The whole read-modify-validate-write runs in a worker thread. It is blocking file
         # I/O in an async method, and pydantic-settings re-reads the file and the environment
         # while validating, so this is more than the one write it looks like.
-        await asyncio.to_thread(
-            _update_config, path, lambda document: _assign(document, parts, parsed)
-        )
+        def mutate(document: dict[str, Any]) -> None:
+            _assign(document, parts, parsed)
+            _validate_structural_chunker_config(document, parts)
+
+        await asyncio.to_thread(_update_config, path, mutate)
         return r.ConfigChange(key=key, previous=previous, value=parsed, path=str(path))
 
     async def _current_value(self, parts: Sequence[str]) -> JsonValue:
@@ -3625,13 +3739,21 @@ class ApplicationService:
         ``--yes``. The MCP and HTTP forms expose only the aggregate dry run.
         """
         maintenance = await self._backend.maintenance()
-        documents, chunks, vectors = await maintenance.reset_index()
-        plan = await maintenance.plan_reset_derived()
+        outcome = await maintenance.reset_index()
         return r.ResetReport(
-            documents=documents,
-            chunks=chunks,
-            vectors_removed=vectors,
-            snapshots_retained=plan.snapshot_items,
+            documents=outcome.documents,
+            chunks=outcome.chunks,
+            vectors_removed=bool(
+                outcome.vector_rows or outcome.publications or outcome.vector_store_removed
+            ),
+            vector_rows_removed=outcome.vector_rows,
+            publications_removed=outcome.publications,
+            memberships_removed=outcome.memberships,
+            generations_terminalized=outcome.generations_terminalized,
+            vector_store_removed=outcome.vector_store_removed,
+            fingerprints_cleared=outcome.fingerprints_cleared,
+            runtime_cache_invalidated=outcome.runtime_cache_invalidated,
+            snapshots_retained=outcome.snapshots_retained,
         )
 
     async def lifecycle_reset_derived(self, *, dry_run: bool = False) -> r.LifecycleReport:
@@ -4007,7 +4129,11 @@ class ApplicationService:
     # --- collections ----------------------------------------------------------------------
 
     async def collection_create(
-        self, name: str, *, description: str | None = None
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        rule: CollectionRule | None = None,
     ) -> r.CollectionSummary:
         """Create a collection. A duplicate name is refused rather than merged.
 
@@ -4016,7 +4142,7 @@ class ApplicationService:
             NameInUseError: A collection of that name already exists here.
         """
         store = await self._backend.organization()
-        return _collection(await store.create_collection(name, description=description))
+        return _collection(await store.create_collection(name, description=description, rule=rule))
 
     async def collection_list(self) -> r.CollectionList:
         """Every collection in this workspace."""
@@ -4101,6 +4227,27 @@ class ApplicationService:
         """
         store = await self._backend.organization()
         return _collection(await store.describe_collection(collection_id, description or None))
+
+    async def collection_rule_show(self, collection_id: str) -> r.CollectionSummary:
+        """Return a collection and its current stored rule without evaluating membership."""
+        store = await self._backend.organization()
+        collection = await store.get_collection(collection_id)
+        if collection is None:
+            msg = f"no collection {collection_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        return _collection(collection)
+
+    async def collection_rule_set(
+        self, collection_id: str, rule: CollectionRule
+    ) -> r.CollectionSummary:
+        """Attach or replace a rule. Membership remains evaluated by the store on reads."""
+        store = await self._backend.organization()
+        return _collection(await store.set_collection_rule(collection_id, rule))
+
+    async def collection_rule_clear(self, collection_id: str) -> r.CollectionSummary:
+        """Remove a rule while preserving every manually added membership."""
+        store = await self._backend.organization()
+        return _collection(await store.set_collection_rule(collection_id, None))
 
     async def collection_counts(self, collection_id: str) -> r.CollectionCounts:
         """How many documents and chunks a collection holds, counted now.
@@ -5239,6 +5386,7 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         snapshot_omission_reasons=dict(report.snapshot_omission_reasons),
         inventory_recovery=report.inventory_recovery,
         reconciled_deleted_items=report.reconciled_deleted_items,
+        full_inventory_authority=_public_full_inventory_authority(report.full_inventory_authority),
         retry_required=incomplete,
         derivation_deferred=report.derivation_deferred,
         intentionally_bounded=bounded,
@@ -5247,6 +5395,30 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         elapsed_ms=elapsed_ms,
         lifecycle=lifecycle,
     )
+
+
+def _configured_full_inventory_authority(
+    configured: ConnectorSettings,
+) -> r.FullInventoryAuthority:
+    """Effective public authority without constructing a credentialed live connector."""
+    from manicule.connectors.config import (  # noqa: PLC0415
+        CONNECTOR_NAME,
+        ConfluenceConfig,
+    )
+
+    if configured.type != CONNECTOR_NAME:
+        return ""
+    config = ConfluenceConfig.model_validate(configured.options)
+    return cast("r.FullInventoryAuthority", config.effective_full_inventory_authority.value)
+
+
+def _public_full_inventory_authority(value: str) -> r.FullInventoryAuthority:
+    """Closed aggregate value; durable/plugin strings never become a public data channel."""
+    if value == "search":
+        return "search"
+    if value == "direct_current_content":
+        return "direct_current_content"
+    return ""
 
 
 def _weights_check(plan: WeightsPlan | None) -> r.Check:
@@ -5639,6 +5811,39 @@ def _assign(document: dict[str, Any], parts: Sequence[str], value: JsonValue) ->
             cursor[part] = existing
         cursor = cast("dict[str, Any]", existing)
     cursor[parts[-1]] = value
+
+
+def _config_key_parts(key: str) -> list[str]:
+    """Resolve a dotted CLI key, including component slots whose names contain one dot."""
+    raw = key.replace('"', "").split(".")
+    component_field_parts = 5
+    if len(raw) >= component_field_parts and raw[:2] == ["plugins", "config"]:
+        return [*raw[:2], f"{raw[2]}.{raw[3]}", *raw[4:]]
+    return raw
+
+
+def _validate_structural_chunker_config(
+    document: Mapping[str, object], parts: Sequence[str]
+) -> None:
+    """Reject an accepted-but-inert component edit before the config file is written."""
+    if list(parts[:3]) != ["plugins", "config", "chunker.structural"]:
+        return
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from manicule.parsers.config import StructuralChunkerConfig  # noqa: PLC0415
+
+    plugins = _as_mapping(document.get("plugins"))
+    configured = _as_mapping(plugins.get("config"))
+    raw = _as_mapping(configured.get("chunker.structural"))
+    try:
+        StructuralChunkerConfig.model_validate(raw)
+    except ValidationError as exc:
+        detail = "; ".join(
+            f"{'.'.join(str(item) for item in error['loc'])}: {error['msg']}"
+            for error in exc.errors()
+        )
+        msg = f'invalid plugins.config."chunker.structural": {detail}'
+        raise ConfigError(msg) from exc
 
 
 def _as_list(value: object) -> list[object]:

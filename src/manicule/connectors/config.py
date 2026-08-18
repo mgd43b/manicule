@@ -20,6 +20,7 @@ which spaces to point it at.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Mapping
 from enum import StrEnum
@@ -41,6 +42,7 @@ __all__ = [
     "Deployment",
     "EnrichedProfile",
     "FilesystemConfig",
+    "FullInventoryAuthority",
     "resolve_credentials",
 ]
 
@@ -146,6 +148,16 @@ class Deployment(StrEnum):
 
     SERVER = "server"
     """Server or Data Center. Bodies in storage format."""
+
+
+class FullInventoryAuthority(StrEnum):
+    """The source resource trusted for whole-space full membership."""
+
+    SEARCH = "search"
+    """CQL content search, retained as the compatibility default."""
+
+    DIRECT_CURRENT_CONTENT = "direct_current_content"
+    """Server/Data Center's direct ``status=current`` content inventory."""
 
 
 class AuthMethod(StrEnum):
@@ -287,6 +299,7 @@ class ConfluenceConfig(BaseModel):
         "spaces, which is the behavior every existing configuration has. Set it to index one "
         "documentation area rather than everything its space contains.",
     )
+
     """A **narrowing of** :attr:`spaces`, never a second way of widening it.
 
     The two settings answer one question between them: ``spaces`` says which spaces this source
@@ -321,6 +334,13 @@ class ConfluenceConfig(BaseModel):
     no root page to include or leave out, and a setting that silently does nothing reads as one
     that is in force.
     """
+
+    full_inventory_authority: FullInventoryAuthority = Field(
+        default=FullInventoryAuthority.SEARCH,
+        description="Membership authority for complete Server/Data Center whole-space walks. "
+        "The direct strategy uses /rest/api/content with status=current; incremental and "
+        "subtree discovery remain CQL-backed.",
+    )
 
     page_size: int = Field(
         default=100,
@@ -511,6 +531,25 @@ class ConfluenceConfig(BaseModel):
             return "whole-space"
         roots = ",".join(sorted(self.root_page_ids))
         return f"roots={roots} include_roots={str(self.include_root_pages).lower()}"
+
+    @property
+    def effective_full_inventory_authority(self) -> FullInventoryAuthority:
+        """Authority that actually changes behavior for this deployment and scope.
+
+        Cloud and subtree scopes retain CQL semantics even when configuration contains the
+        direct option.  Returning the effective value keeps those ignored settings out of
+        cursor identity and avoids a surprise complete re-enumeration.
+        """
+        if self.deployment is Deployment.SERVER and not self.root_page_ids:
+            return self.full_inventory_authority
+        return FullInventoryAuthority.SEARCH
+
+    def scope_fingerprint(self, source_scope: str) -> str:
+        """Cursor identity, preserving the historical digest for search-backed scopes."""
+        material = source_scope
+        if self.effective_full_inventory_authority is FullInventoryAuthority.DIRECT_CURRENT_CONTENT:
+            material = f"{material};full_inventory=direct_current_content"
+        return hashlib.blake2b(material.encode(), digest_size=20).hexdigest()
 
     @property
     def auth_method(self) -> AuthMethod:

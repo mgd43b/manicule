@@ -44,6 +44,15 @@ class LifecycleOutcome(BaseModel):
     released_bytes: int = Field(default=0, ge=0)
     snapshot_items: int = Field(default=0, ge=0)
     source_contacted: bool = False
+    documents_retired: int = Field(default=0, ge=0)
+    chunks_removed: int = Field(default=0, ge=0)
+    memberships_removed: int = Field(default=0, ge=0)
+    vector_rows_removed: int = Field(default=0, ge=0)
+    publications_removed: int = Field(default=0, ge=0)
+    generations_terminalized: int = Field(default=0, ge=0)
+    vector_store_removed: bool = False
+    fingerprints_cleared: bool = False
+    runtime_cache_invalidated: bool = False
 
 
 class LifecycleRefusalError(ManiculeError):

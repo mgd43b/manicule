@@ -761,7 +761,7 @@ unchanged or retained and associated with its complete fetched source envelope b
 candidate watermark can become the connector watermark.
 
 ```
-discover → acquisition journal             one task; commit before advancing
+discover → acquisition journal             one task; commit source page before next cursor
    │  bounded sequence-paged reader
    │  fetch hand-off      depth = queue_depth_factor × fetch_concurrency
    ▼
@@ -778,7 +778,7 @@ ingest × (parse_workers + 1)               parse in the pool, chunk, embed unde
 
 | Stage | Width | Where the bound comes from |
 |---|---|---|
-| discover → journal | 1 | One cursor; each identity commits before the next source record is requested |
+| discover → journal | 1 | One cursor; one source-native page (at most 250 Confluence records) commits atomically before its next cursor is requested |
 | journal reader | 1 | Waits for hand-off room, then reads one durable record |
 | fetch | `fetch_concurrency` (8) | One task per permitted in-flight fetch |
 | parse | at most `parse_workers + 1` attempts | The ingest workers are the only callers of the pool |
@@ -809,11 +809,43 @@ stages and costs only that one archive's serialization.
 
 ### 8.3.1 Durable discovery, then bounded hand-offs
 
-Discovery does not feed the fetch queue. It appends one validated source record to the
-acquisition journal, waits for that transaction to commit, and only then asks the connector for
-the next record. On true iterator exhaustion it atomically records the completion marker and
+Discovery does not feed the fetch queue. A connector with expiring page cursors exposes its
+source-native response boundary; the pipeline validates and admits that bounded page in one
+capacity-guarded transaction, then and only then asks the connector to follow `_links.next`.
+Connectors without that optional surface retain scalar admission. On true iterator exhaustion
+the pipeline atomically records the completion marker and
 the connector's candidate watermark. A limit, cancellation, cursor/source failure or journal
 admission failure leaves that marker absent.
+
+The page transaction preserves scalar identity semantics. Already-durable replay rows are
+validated and reused; only novel identities receive contiguous sequence numbers. Record and
+metadata capacity are reserved as one aggregate delta against all unsettled runs across every
+workspace under the same `BEGIN IMMEDIATE` as the inserts. A refusal, lease loss, cancellation,
+process death or SQLite rollback therefore leaves the preceding full-page prefix, never half a
+page or a counter ahead of its rows. An all-old replay page is answered by the read path without
+opening a writer transaction.
+
+The defect this replaces held one Confluence cursor while every result in its page independently
+performed the optimistic replay reads, `BEGIN IMMEDIATE`, global capacity sums, run-counter
+update, insert and row verification. At 250 results that was 250 serialized writer sections before
+the next cursor could be requested. The reproducible synthetic benchmark
+`python -m tests.benchmarks.acquisition_enumeration` measures the compatibility scalar path and
+the page path on migrated temporary SQLite storage:
+
+| Records | Source pages | Scalar writer tx / SQL statements | Page writer tx / SQL statements | Scalar / page seconds |
+|---:|---:|---:|---:|---:|
+| 250 | 1 | 250 / 2,250 | 1 / 8 | 0.649 / 0.028 |
+| 2,500 | 10 | 2,500 / 22,500 | 10 / 80 | 6.381 / 0.263 |
+| 10,000 | 40 | 10,000 / 90,000 | 40 / 320 | 26.147 / 1.150 |
+
+The 10,251-record real-client integration uses 41 full 250-record pages and one final record.
+Each committed page advances a deterministic clock by 0.1 seconds under a 0.2-second trusted
+cursor lifetime; maximum cursor hold is therefore 0.1 seconds, it makes 42 search requests, and
+the true-end transaction runs exactly once. Run alone under macOS `/usr/bin/time -l`, that pytest
+case reported 241,795,072 bytes maximum RSS (including Python, pytest and imported dependencies).
+The standalone 10,000-record page benchmark reported 115,851,264 bytes process-wide peak RSS;
+the live record buffer is independently capped at 250. These are development-machine evidence,
+not service-level latency promises.
 
 Only after enumeration stops does a sequence-paged journal reader feed bounded acquisition
 workers. Once every item has coverage, `commit_acquisition_watermark` atomically checks the
@@ -874,6 +906,24 @@ backlog-capacity charge, and cleanup preserves the predecessor while an unfinish
 still depends on it. If an item is enumerated again but still returns not-found, the replacement is
 marked for another fresh enumeration and remains unpromoted. Strict and allow-omissions policies
 both refuse promotion of an inventory known to be stale.
+
+An explicit Confluence full-inventory authority change is also a replacement boundary. Search is
+the compatibility default, preserving its historical scope fingerprint byte-for-byte. Data Center
+whole-space `direct_current_content` uses a distinct fingerprint, reconciliation scope and
+watermark marker; Cloud, incremental and subtree behavior remain unchanged. The replacement may
+reuse a verified promoted search snapshot or a fenced unfinished predecessor through the same
+exact-evidence checks above, but it never reuses that predecessor's watermark. Likewise, a
+same-authority `reenumerating` replacement keeps the last committed watermark as promotion CAS
+evidence while passing no watermark to discovery, forcing the complete authoritative walk needed
+to prove a deletion.
+
+The aggregate `full_inventory_authority` field accompanies the recovery counts in ingest,
+connector-list, last-run, lifecycle and snapshot status across CLI, HTTP, MCP, control and web
+surfaces. It is the closed effective value `search` or `direct_current_content`; private spaces,
+roots, source ids, URIs and durable scope material are not surfaced. Offline verification and
+rebuild consume the promoted retained manifest, so disabling or losing the connector after a
+successful direct walk does not change membership, require a source call, or leave acquisition
+backlog after publication.
 
 The aggregate fields `inventory_recovery`, `reused_items` and `reconciled_deleted_items` appear in
 ingest results, connector lifecycle status and snapshot status. They contain no source identity,
@@ -1584,28 +1634,32 @@ They are not interchangeable, and the price of each is the reason:
 
 ### 10.4 Offline derived-generation rebuilds
 
-A parser-routing, parser, chunker, tokenizer, size or overlap change that must replace a whole
-source scope uses `OfflineGenerationRebuilder`; it does not use the per-document repair loop.
+A parser-routing, parser, chunker, tokenizer, size or overlap change that must replace the
+workspace's derived corpus uses `OfflineGenerationRebuilder`; it does not use the per-document
+repair loop.
 The distinction is the publication boundary. A repair deliberately commits one document at a
 time, while a generation rebuild keeps its document, chunk, glossary, FTS and vector output
 beside the active corpus until the complete replacement validates.
 
-The only source input is a promoted acquisition manifest. The runner accepts a read-only blob
-source and has no connector dependency, fetch method or source-crawl fallback. Planning verifies
-the manifest once, pages it in bounded batches, stream-verifies each retained blob without
+The only source inputs are the newest promoted acquisition manifests for the workspace's
+connector scopes. The runner accepts a read-only blob source and has no connector dependency,
+fetch method or source-crawl fallback. Planning verifies every manifest once, pages them in a
+deterministic connector/scope order, stream-verifies each retained blob without
 allocating or fully decompressing it, and returns only
 aggregate counts plus bounded manifest sequence numbers for missing inputs. A missing or corrupt
 blob is a typed refusal; it is never permission to contact the source.
 
-`index_state` and its named vector directory are installation-wide, while an acquisition manifest
-names one connector scope. Until a coordinator can bind several promoted manifests into one
-generation, the explicit safe boundary is an installation with exactly one promoted connector
-scope and no live documents outside that workspace/source. Planning refuses broader installations
-with `workspace_scope_changed`, and lease checks plus the publication transaction repeat the gate;
-a second connector promoted after planning therefore cannot create mixed global fingerprints.
+`index_state` and its named vector directory are workspace-owned, so the generation binds that
+workspace's manifests into one canonical snapshot set. `derived_generation_snapshots` records
+their ordered run, connector/scope, membership and retained-item commitments. Planning from any
+included snapshot produces the same generation identity. Lease checks and the publication
+transaction repeat the complete set comparison; a connector promotion after planning fences the
+old shadow work with `workspace_scope_changed` and a new plan includes the replacement snapshot.
+Live documents from a source outside the bound connector set also refuse publication rather than
+creating mixed global fingerprints.
 
-`derived_generations` records the immutable snapshot and target identities, its canonical
-membership hash and expected item count, resource bounds, forward-only state and checkpoint
+`derived_generations` records the immutable combined snapshot and target identities, canonical
+membership hash and aggregate expected item count, resource bounds, forward-only state and checkpoint
 counters. Its unique plan identity also includes the bound live vector table and inventory
 digest, so a #187 pointer swap leaves a pristine stale plan inert and a retry can create a new
 generation against the winner. Publication records the resulting inventory digest; while that
@@ -1616,9 +1670,9 @@ concurrent pointer swap cannot turn that replay decision into a mixed-time obser
 remains `PLANNED`; only a
 successful owner claim enters `BUILDING`, and dry
 run or missing-input refusal never claims a worker lease. Each claim has an expiry, renewable
-owner token, lease generation and monotonically allocated scope fence. An expired lease may be
+owner token, lease generation and monotonically allocated workspace fence. An expired lease may be
 taken over, but its former owner cannot checkpoint or publish; publication also refuses any
-generation fenced by a newer non-terminal rebuild for the same connector scope.
+generation fenced by a newer non-terminal workspace rebuild.
 
 `derived_generation_items` stores deterministic
 relational replacements keyed by `(generation_id, sequence)`. A retry must reproduce the same
@@ -1656,9 +1710,9 @@ completes retire/replacement plus permit restoration before propagating, includi
 cancellation during replacement.
 Execution repeats the exact cumulative capacity check before each durable stage.
 
-Publication is one SQLite transaction. It re-verifies the complete canonical manifest and exact
+Publication is one SQLite transaction. It re-verifies every complete canonical manifest and exact
 contiguous replacement coverage, verifies that the snapshot is still the newest promoted
-manifest for its connector scope, ties every replacement back to that manifest's blob
+manifest for its connector scope, ties every replacement back to its manifest's blob
 and acquired-source envelope, replaces documents, chunks and glossary rows, rebuilds FTS when
 its tokenizer changed, and runs the external-content FTS integrity check before advancing index
 identity and marking the generation published. Tokenizer syntax is probed before any live row is
@@ -1713,11 +1767,26 @@ manicule snapshot-delete RUN_ID               # dry-run, prints a token
 manicule snapshot-delete RUN_ID --confirm TOKEN
 ```
 
-`reset-index` remains a compatibility operation, but now observes the same derived-only
-boundary: it deletes chunks, FTS, glossary and vectors, marks retained document rows pending,
-and leaves acquisition manifests, original blob references and document-version history intact.
-It never resolves a connector. A promoted snapshot can therefore be verified and used by the
-offline generation rebuild immediately after the reset.
+`reset-index` is the complete workspace-derived reset. It removes chunks, FTS/glossary visibility,
+collection/tag memberships and workspace-owned vector storage; soft-deletes the live document
+projection; terminalizes and generation-fences unfinished acquisition work; and cancels and fences
+unfinished rebuild and re-embedding work;
+and clears the workspace fingerprint only after physical cleanup succeeds. Retained acquisition
+manifests, original blob references and document-version history remain GC roots. It never resolves
+a connector. A promoted snapshot can therefore be verified and used by the offline generation
+rebuild immediately after the reset.
+
+Physical cleanup is driven by workspace- and vector-binding-qualified tombstones written before
+external vector mutation. A failed cleanup returns failure and keeps that ledger plus the old
+identity for retry; it never returns a boolean success for a half-reset. The runtime closes its
+worker pool and vector handles before evicting every derived cache, so a different configured
+fingerprint can ingest in the same serving process. A cross-process workspace pin, durable lease
+generation fences and a monotonic workspace reset epoch prevent an old writer from landing rows
+after reset. Every pipeline checks the epoch before its first acquisition or document mutation;
+vector handles recheck it after acquiring their physical generation pin; and the relational
+fingerprint/stage/publication transactions take an epoch CAS while holding SQLite's writer lock.
+The same-process mutation guard spans the complete external-vector-to-SQLite publication gap.
+Repeating a completed reset is a zero-change success.
 
 Generation cleanup selects only `failed`, `canceled`, or superseded `published` generations.
 The newest published generation, every publication still named by a live document, and every
@@ -1864,14 +1933,14 @@ generation pin and only removes failed or superseded, non-live storage, so an in
 cannot lose its directory. `abandon` makes an unfinished run terminal without moving the live
 pointer.
 
-Snapshots, runs, generations and receipts are keyed by workspace as well as their opaque id, and
-every journal, lease, publication and cleanup lookup repeats that ownership predicate. The vector
-pointer is installation-wide, however, so its immutable snapshot and replacement generation cover
-all workspaces; otherwise publishing Alpha would make Beta's vectors disappear. The public plan
-and progress projection counts only the owning workspace, while private build accounting and
-capacity checks cover the full installation. Legacy state is backfilled only when its stored
-document payloads identify exactly one owning workspace (or an empty legacy database has exactly
-one workspace); ambiguous state refuses migration rather than guessing ownership.
+Snapshots, runs, generations, receipts, index identities and new vector directories are keyed by
+workspace as well as their opaque id, and every journal, lease, publication and cleanup lookup
+repeats that ownership predicate. Publishing or resetting Alpha therefore cannot move or remove
+Beta's pointer, metadata or vectors. Upgraded installations retain an explicit `legacy` binding to
+the old shared root until each workspace is rebuilt/reset; exact tombstones isolate deletions while
+it is shared, and the last consumer removes the root. Fresh workspaces never acquire that legacy
+binding. The FTS5 table and tokenizer remain installation-global, so publication refuses a
+tokenizer change while another workspace identity depends on the current lexical table.
 
 The serving scheduler runs one restart-recovery job for ownerless nonterminal runs in its active
 workspace. It records aggregate recovered/failure counts, while the durable run remains the
@@ -2048,6 +2117,14 @@ loser. An expired or orderly-released lease increments the generation; every lat
 mutation and every publication boundary is fenced by that generation. A source call left in
 `acquiring` becomes retry work at takeover, while `indexing` remains the exact checkpoint needed
 to replay partially expanded containers from retained bytes without source access.
+
+SQLite writer admission is taken before a journal transaction reads mutable state. Concurrent
+acquisition workers therefore queue at one bounded boundary instead of opening deferred readers
+and racing an un-waitable read-to-write upgrade. A short code-aware retry covers a genuinely
+external `SQLITE_BUSY`/`SQLITE_LOCKED`; exhaustion returns the private-safe `StorageBusyError`,
+closes the failed session, releases the logical lease after workers join, and leaves the committed
+prefix immediately resumable. The public envelope contains no SQL, bound values, source identity,
+or machine path.
 
 An unchanged-token result is one fenced transaction too: it moves the journal record to
 `unchanged` and refreshes the indexed document's `last_seen_at` under the same writer lock. A

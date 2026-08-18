@@ -682,7 +682,7 @@ async def test_middleware_and_chunker_output_never_materializes_in_serving_paren
         )
     parent_after = resident_bytes(os.getpid())
 
-    assert result.reason is StageFailure.MEMORY_BOUND
+    assert result.reason is StageFailure.STAGE_FAILED
     assert result.value is None
     if parent_before is not None and parent_after is not None:
         assert parent_after - parent_before < 8 * MEGABYTE

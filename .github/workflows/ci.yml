@@ -259,12 +259,20 @@ jobs:
       # ordinary one: it measures glossary retrieval against BAAI/bge-m3, which this job does not
       # seed. Naming it keeps the switch *reaching* it, so the day bge-m3 is added to the line
       # above the measurement starts being enforced rather than silently continuing to skip.
+      #
+      # packages/manicule-mlx/tests/ is named because the MLX backend ships as its own
+      # distribution — it is GPL-3.0 and manicule is MIT — and the backend *parity* measurement
+      # went with it. That measurement is what licenses `backend` staying out of
+      # `EmbedFingerprint.IDENTITY_FIELDS`, which is manicule's claim rather than the plugin's,
+      # so it has to keep running here. On this runner MLX does not install and those cases
+      # skip with a reason; the arming is what makes them fail rather than skip on a machine
+      # that has Metal and has seeded the weights.
       - name: pytest (models required)
         env:
           REQUIRE_EMBEDDING_MODELS: BAAI/bge-small-en-v1.5
         run: >-
           uv run pytest tests/test_embedding_backends.py tests/test_embedding_models.py
-          tests/glossary/test_measured.py -q -rs
+          tests/glossary/test_measured.py packages/manicule-mlx/tests -q -rs
 
       # The grammar suites run here too, and macOS is not an arbitrary second platform for
       # them — it is the platform where this exact area has already produced a silent failure.

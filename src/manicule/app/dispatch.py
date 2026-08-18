@@ -32,6 +32,7 @@ from manicule.core.errors import (
     FingerprintMismatchError,
     ManiculeError,
     PolicyError,
+    StorageBusyError,
     UnknownComponentError,
     UnknownEntityError,
 )
@@ -82,6 +83,9 @@ _HINTS: dict[type[Exception], str] = {
     ),
     CapacityRefusedError: (
         "Free durable ingest capacity or raise the configured limit, then retry."
+    ),
+    StorageBusyError: (
+        "Retry the same operation; it resumes from the last committed durable prefix."
     ),
     RebuildRefusedError: (
         "Inspect `rebuild plan` for aggregate missing-input and capacity estimates, then retry."
@@ -209,6 +213,7 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         "rebuild_status",
         "stats",
         "collection_list",
+        "collection_rule_show",
         "collection_documents",
         "collection_counts",
         "collection_orphans",

@@ -61,24 +61,33 @@ The artifact that ran is recorded as an exact repository commit or local SHA-256
 `EmbedFingerprint.weights_ref` (§5), so a vector can be traced to its bytes. Its separate
 `weights_identity` participates in compatibility.
 
-### 1.1 The license gate moved, and it moved the whole section
+### 1.1 The license gate moved twice, and ended where it started
 
-An earlier draft of this design eliminated candidates on a **permissive-license** gate, and
-chose the runtime on the same grounds. manicule is now **GPL-3.0-or-later** (`LICENSE`), and
-that gate is gone in one direction and intact in the other:
+This section has had three versions, and the history is worth keeping because the *shape* of
+the answer changed rather than the constraint.
 
-- **GPL-3.0 dependencies are ordinary.** `mlx-embeddings` is GPL-3.0 — verified from the
-  installed distribution metadata, `Classifier: License :: OSI Approved :: GNU General Public
-  License v3 (GPLv3)` — and was the reason the relicense happened at all. It is usable.
-- **AGPL-3.0 dependencies are still refused**, because AGPL §13 puts a source obligation on
-  anyone *running* the result as a network service, and manicule ships an HTTP API and a web
-  UI. That obligation would fall on operators rather than on us. See
+An early draft eliminated candidates on a **permissive-license** gate and chose the runtime on
+the same grounds — which made onnxruntime primary and `mlx-embeddings` inadmissible. A later
+draft relicensed manicule to GPL-3.0-or-later so that `mlx-embeddings` became an ordinary
+dependency, and MLX became primary. **manicule is now MIT again, and MLX is still available** —
+because the backend that links `mlx-embeddings` was moved into its own GPL-3.0-or-later
+distribution, `manicule-mlx`, instead of the license being moved around it.
+
+So the gate as it now stands:
+
+- **`manicule` itself takes no copyleft dependency.** `mlx-embeddings` is GPL-3.0 — verified
+  from the installed distribution metadata, `Classifier: License :: OSI Approved :: GNU General
+  Public License v3 (GPLv3)` — and lives behind the package boundary, where a copyleft
+  dependency is ordinary because that package is copyleft.
+- **AGPL-3.0 dependencies are refused everywhere**, including in `manicule-mlx`. AGPL §13 puts
+  a source obligation on anyone *running* the result as a network service, and manicule ships
+  an HTTP API and a web UI. That obligation would fall on operators rather than on us. See
   [`parsing.md`](parsing.md) §12.
 - **Non-commercial and gated licenses remain eliminated outright**, which is what removed
   `jina-embeddings-v3` (CC-BY-NC-4.0) and `google/embeddinggemma-300m` (gated Gemma Terms).
 
 BGE-M3's weights are **MIT**, so none of this constrains the model itself. It constrains what
-may execute it, and the answer is now "either backend" (§3).
+may execute it, and the answer is "either backend" (§3) — the two just arrive as two installs.
 
 ### 1.2 Why this one
 
@@ -182,20 +191,29 @@ already on disk. No schema change is required to support plurality, and none is 
 ```toml
 [embedding]
 model = "BAAI/bge-m3"          # the default
-provider = "mlx"               # or "onnx"
+provider = "onnx"              # the default; "mlx" needs `manicule-mlx` installed
 
-[plugins.config."embedder.mlx"]
+[plugins.config."embedder.onnx"]
 weights = ""                   # the artifact to execute, when it is not the model's own repo
 weights_revision = ""          # required immutable commit for an explicit remote artifact
 pooling = ""                   # only for a model that declares none; contradicting one is refused
 max_sequence_length = 0        # only for a model that declares none, in usable content tokens
+
+[plugins.config."embedder.mlx"]  # only meaningful with `manicule-mlx` installed
+weights = ""                   # the four above are shared: every backend has them
+weights_revision = ""
+pooling = ""
+max_sequence_length = 0
 cache_limit_mb = 2048          # ceiling on MLX's retained Metal buffers (§3.5)
 ```
 
-`cache_limit_mb` is the only setting here that is one backend's alone, and it is on the MLX
-config model rather than the shared one so that writing it under
-`[plugins.config."embedder.onnx"]` is *refused*. onnxruntime has no such allocator, and quietly
-accepting the setting would leave an operator believing they had bounded something.
+`cache_limit_mb` is the only setting here that is one backend's alone, and it lives on a config
+model that backend declares — in its own distribution, since the MLX backend ships as
+`manicule-mlx` — rather than on the shared one. That is what makes writing it under
+`[plugins.config."embedder.onnx"]` *refused* rather than ignored: onnxruntime has no such
+allocator, and quietly accepting the setting would leave an operator believing they had bounded
+something. The mechanism is `extra="forbid"` on a per-backend model, and it is available to any
+out-of-tree backend for the same reason.
 
 A model outside the known-good set is accepted, and everything that decides vector-space
 compatibility is read from **its own repository** rather than from a table — which is stronger
@@ -222,14 +240,20 @@ configure and no way to configure it wrongly.
 
 ## 3. The runtime
 
-### 3.1 MLX is the primary backend, and the relicense is why
+### 3.1 onnxruntime is what manicule ships; MLX is the fast path, and installs separately
 
-An earlier draft of this design made **onnxruntime** primary, on the grounds that
-`mlx-embeddings` is GPL-3.0 and manicule was MIT. That premise is gone: the project is
-GPL-3.0-or-later, chosen deliberately so that this dependency is usable
-([`parsing.md`](parsing.md) §12).
+Both backends are supported and neither was dropped. What changed is *packaging*: manicule is
+MIT and `mlx-embeddings` is GPL-3.0, so the Metal backend lives in `manicule-mlx` and claims the
+`embedder.mlx` slot through the ordinary entry-point group ([`parsing.md`](parsing.md) §12).
 
-With the license objection removed, the Apple-hardware principle decides it:
+`onnx` is therefore the **default** — it is the one an `install manicule` has — and MLX is what
+an operator on Apple silicon adds. On that hardware it is worth adding: measured on an M4 Max
+with `bge-m3`, MLX runs 4.3–5.6× onnxruntime's throughput across every realistic chunk length,
+and the two produce the same vectors (§3.3). Where the gap nearly vanishes is a single short
+query at batch one — 1.23× — which is the one path a person waits on.
+
+With the license question answered by packaging rather than by choosing, the Apple-hardware
+principle decides which is *fast* rather than which is permitted:
 
 > Optimize execution for Apple hardware freely; **never let the platform change what ends up
 > in the index.**
@@ -284,7 +308,7 @@ Both backends are supported, and the second one has a job beyond portability.
 
 | | MLX | onnxruntime |
 |---|---|---|
-| License | GPL-3.0 | MIT |
+| License | GPL-3.0 (ships as `manicule-mlx`) | MIT (ships with manicule) |
 | In-process | yes | yes |
 | Apple Silicon | Metal-native | yes, CPU |
 | Off Apple Silicon | no | yes |

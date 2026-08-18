@@ -204,6 +204,7 @@ class OfflineDeriver(Protocol):
         blob_ref: str,
         title: str,
         version_token: str | None,
+        connector: str | None = None,
     ) -> PreparedReplacement: ...
 
     async def stage(self, prepared: PreparedReplacement, *, publication_id: str) -> None: ...
@@ -232,6 +233,7 @@ class RelationalDeriver(Protocol):
         blob_ref: str,
         title: str,
         version_token: str | None,
+        connector: str | None = None,
     ) -> DerivedReplacement: ...
 
 
@@ -347,7 +349,9 @@ class ParserChunkerRelationalDeriver:
         blob_ref: str,
         title: str,
         version_token: str | None,
+        connector: str | None = None,
     ) -> DerivedReplacement:
+        source = connector or self._source
         root, members = await self._derive_one(
             raw,
             target,
@@ -355,6 +359,7 @@ class ParserChunkerRelationalDeriver:
             blob_ref=blob_ref,
             title=title,
             version_token=version_token,
+            source=source,
             budget=target.max_memory_bytes,
         )
         nodes = [root]
@@ -376,6 +381,7 @@ class ParserChunkerRelationalDeriver:
                     title=member_title(member),
                     version_token=None,
                     budget=remaining,
+                    source=source,
                 )
             elif isinstance(member, MemberFailure):
                 diagnostic = ChainResult(
@@ -388,9 +394,9 @@ class ParserChunkerRelationalDeriver:
                 )
                 child = DerivedReplacement(
                     document=Document(
-                        id=document_id(self._workspace_id, self._source, member.source_id),
+                        id=document_id(self._workspace_id, source, member.source_id),
                         publication_id=generation_id,
-                        source=self._source,
+                        source=source,
                         source_id=member.source_id,
                         uri=member.uri,
                         title="",
@@ -429,6 +435,7 @@ class ParserChunkerRelationalDeriver:
         title: str,
         version_token: str | None,
         budget: int,
+        source: str,
     ) -> tuple[DerivedReplacement, tuple[object, ...]]:
         runner = self._parse_runner
         if runner is None:
@@ -444,6 +451,7 @@ class ParserChunkerRelationalDeriver:
                 version_token=version_token,
                 budget=budget,
                 session=session,
+                source=source,
             )
         finally:
             await session.aclose()
@@ -459,6 +467,7 @@ class ParserChunkerRelationalDeriver:
         version_token: str | None,
         budget: int,
         session: BoundedStageSession,
+        source: str,
     ) -> tuple[DerivedReplacement, tuple[object, ...]]:
         if target.parser_routing != self._routing_identity:
             raise ValueError("target parser-routing identity does not match the configured chain")
@@ -493,11 +502,11 @@ class ParserChunkerRelationalDeriver:
             members = ()
         if result.status is DocumentStatus.FAILED:
             raise ValueError(RebuildRefusalCode.DERIVATION_FAILED.value)
-        identifier = document_id(self._workspace_id, self._source, raw.source_id)
+        identifier = document_id(self._workspace_id, source, raw.source_id)
         document = Document(
             id=identifier,
             publication_id=generation_id,
-            source=self._source,
+            source=source,
             source_id=raw.source_id,
             uri=raw.uri,
             title=title,
@@ -621,6 +630,7 @@ class EmbeddingOfflineDeriver:
         blob_ref: str,
         title: str,
         version_token: str | None,
+        connector: str | None = None,
     ) -> PreparedReplacement:
         if target.embedding_fingerprint != self._embedder.fingerprint.canonical():
             raise ValueError("target embedding identity does not match the configured embedder")
@@ -633,6 +643,7 @@ class EmbeddingOfflineDeriver:
             blob_ref=blob_ref,
             title=title,
             version_token=version_token,
+            connector=connector,
         )
         if any(item.vector_reused or item.vector_embedded for item in replacement.flattened()):
             raise ValueError("relational derivation must not claim vector work")
@@ -697,7 +708,7 @@ class EmbeddingOfflineDeriver:
 
 
 class OfflineGenerationRebuilder:
-    """Bounded, resumable executor over one promoted source snapshot."""
+    """Bounded, resumable executor over one workspace set of promoted snapshots."""
 
     def __init__(
         self,
@@ -906,14 +917,27 @@ class OfflineGenerationRebuilder:
                     raise RebuildRefusedError(RebuildRefusalCode.MISSING_LOCAL_INPUT, refreshed)
                 try:
                     raw = item.source.raw(data)
-                    prepared = await self._deriver.prepare(
-                        raw,
-                        target,
-                        generation_id=checkpoint.generation_id,
-                        blob_ref=item.blob_ref,
-                        title=item.title,
-                        version_token=item.version_token,
-                    )
+                    if item.connector:
+                        prepared = await self._deriver.prepare(
+                            raw,
+                            target,
+                            generation_id=checkpoint.generation_id,
+                            blob_ref=item.blob_ref,
+                            title=item.title,
+                            version_token=item.version_token,
+                            connector=item.connector,
+                        )
+                    else:
+                        # Preserve the protocol's pre-workspace shape for callers that supply
+                        # synthetic or legacy single-snapshot inputs without a connector.
+                        prepared = await self._deriver.prepare(
+                            raw,
+                            target,
+                            generation_id=checkpoint.generation_id,
+                            blob_ref=item.blob_ref,
+                            title=item.title,
+                            version_token=item.version_token,
+                        )
                 except ValueError as exc:
                     try:
                         code = RebuildRefusalCode(str(exc))

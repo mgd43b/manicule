@@ -7,7 +7,7 @@ name = "manicule"
 version = "0.1.0"
 description = "Self-hosted document search and answers, with citations that resolve."
 readme = "README.md"
-license = "GPL-3.0-or-later"
+license = "MIT"
 requires-python = ">=3.12"
 authors = [{ name = "manicule contributors" }]
 keywords = ["rag", "search", "documents", "citations", "self-hosted"]
@@ -53,12 +53,14 @@ embeddings = [     # #3
   # the Rust implementation on its own, so this does not drag in a training framework.
   "tokenizers>=0.20",
   "huggingface-hub>=0.26",
-  # The parity backend, and the only one off Apple Silicon. MIT.
+  # The backend, and the only one in this distribution. MIT.
+  #
+  # `mlx-embeddings` is deliberately **not** here. It is GPL-3.0, and manicule is MIT, so the
+  # Metal backend that links it ships as its own GPL-3.0-or-later distribution —
+  # `manicule-mlx`, in packages/ — and claims the `embedder.mlx` slot through the public
+  # entry-point group. `uv pip install manicule manicule-mlx` on Apple Silicon; nothing in
+  # this file, and nothing under src/manicule, knows that package exists.
   "onnxruntime>=1.20",
-  # GPL-3.0, which is ordinary now that manicule is GPL-3.0-or-later (docs/embeddings.md §1.1),
-  # and Apple-only by construction. Marked rather than left to fail at install time on Linux,
-  # where CI runs.
-  "mlx-embeddings>=0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 ingest = [         # #5
   # Both are optional on purpose, and neither changes what gets indexed. `psutil` reads a
@@ -71,7 +73,7 @@ ingest = [         # #5
 parsers = [
   # Every one of these is permissively licensed; docs/parsing.md §12 records the rejections
   # (PyMuPDF, extract-msg) and why a copyleft dependency is refused at selection time.
-  "pypdfium2>=4.30",
+  "pypdfium2>=5.13.0",
   "tree-sitter>=0.23",
   "tree-sitter-language-pack>=0.7",
   "selectolax>=0.3.21",
@@ -131,9 +133,9 @@ browser-auth = [
   # who asked for the browser flow and silently got the manual one would conclude the flow does
   # not work, which is worse than being told what to install.
   #
-  # Apache-2.0, which is compatible with GPL-3.0-or-later. Licensing was never the objection to
-  # driving a browser — `connectors/sessions.py` records what the objection actually was, and
-  # what changed.
+  # Apache-2.0, which is compatible with MIT. Licensing was never the objection to driving a
+  # browser — `connectors/sessions.py` records what the objection actually was, and what
+  # changed.
   "playwright>=1.49",
 ]
 serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #12 — the browser UI.
@@ -234,7 +236,7 @@ dev = [
   # balance and cannot cost coverage. It has no configuration file of its own — every option is
   # a flag, and the ones CI passes are in `.github/workflows/ci.yml`.
   "pytest-split>=0.10",
-  "ruff>=0.8",
+  "ruff>=0.16.3",
   "pyright>=1.1.390",
   # Fixture generation (docs/parsing.md §3.5): fixtures are built by a checked-in script
   # wherever generation is possible, so their structure is reviewable as code rather than as
@@ -244,6 +246,13 @@ dev = [
   # Installed so that entry-point discovery is exercised against a real distribution rather
   # than a mock. See packages/manicule-plugin-example.
   "manicule-plugin-example",
+  # The Metal backend, which is a separate distribution because it is GPL-3.0-or-later and
+  # this project is MIT. In the dev group because CI has to run its suites: `test_parity.py`
+  # there is what licenses `backend` staying out of `EmbedFingerprint`'s identity fields, and
+  # that claim belongs to manicule even though the code proving it no longer lives here. On
+  # Linux the marker on `mlx-embeddings` resolves to nothing, the backend refuses at setup,
+  # and those tests skip with a reason — exactly as they did when the backend was in-tree.
+  "manicule-mlx",
   # Parsers that hang, allocate and crash on purpose, so that "one bad document never
   # aborts a batch" is demonstrated rather than asserted. Not published.
   "manicule-plugin-hostile",
@@ -307,6 +316,7 @@ members = ["packages/*"]
 
 [tool.uv.sources]
 manicule = { workspace = true }
+manicule-mlx = { workspace = true }
 manicule-plugin-example = { workspace = true }
 manicule-plugin-hostile = { workspace = true }
 
@@ -356,10 +366,16 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "PLR2004", "ANN401", "SLF001"]
-"packages/*/tests/**" = ["S101", "PLR2004", "SLF001"]
-# A generator script for CAPABILITIES.md. Printing is its output, and it is owned by the
-# docs it produces rather than by the application's lint policy.
-"tools/**" = ["T201", "PLW2901", "PLR2004"]
+# The same set the root suite gets. `ANN401` joined it when the MLX backend moved out: its
+# tests drive a fake runtime and an argparse namespace, both of which are legitimately `Any`,
+# and they were written under the root suite's rules before the move.
+"packages/*/tests/**" = ["S101", "PLR2004", "ANN401", "SLF001"]
+# Generator and qualification scripts. Printing is their output, and they are owned by the
+# docs and measurements they produce rather than by the application's lint policy. The glob is
+# `**/tools/**` rather than `tools/**` so that a workspace package's own harnesses — currently
+# `packages/manicule-mlx/tools/` — are covered by the same rule instead of silently falling
+# outside it.
+"**/tools/**" = ["T201", "PLW2901", "PLR2004"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "parents"
@@ -385,10 +401,15 @@ convention = "google"
 #   columns — a schema laid out so the types read down the page — and a formatter collapsing
 #   that alignment removes the thing the author put there on purpose. They are not code that
 #   runs, and no test imports them.
-exclude = ["tools/**", "**/*.md"]
+exclude = ["**/tools/**", "**/*.md"]
 
 [tool.pyright]
 include = ["src", "tests", "packages"]
+# Measurement and generator harnesses, which are not shipped and are not application code. The
+# repository's own `tools/` was already outside `include`; a workspace package's `tools/` is
+# inside `packages/` and would otherwise be checked under strict mode by accident rather than
+# by decision. They are still linted by `ruff check .`.
+exclude = ["packages/*/tools"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = "error"
@@ -414,21 +435,17 @@ reportUnknownMemberType = "none"
 reportUnknownVariableType = "none"
 reportUnknownArgumentType = "none"
 
-# Same relaxation, same reasoning, and deliberately narrower. Four embedding dependencies ship
-# no type information or only partial stubs — mlx-embeddings, onnxruntime, tokenizers,
-# huggingface-hub — and every call into them yields an Unknown that spreads. Only
-# `embedding/runtimes/` is relaxed, and it exists to be the one place they are touched: the
-# modules that decide what a vector *is* — embedding/pooling.py, embedding/cards.py,
-# embedding/base.py — reach these libraries through the small typed functions there and stay
-# fully checked themselves. That split matters more here than for parsers, because
-# mlx-embeddings is version 0.1.0 and binds one attribute to different meanings on different
-# architectures: a hand-written stub would be confidently wrong rather than merely absent.
-# `reportMissingImports` is off for the same directory and a different reason: MLX installs on
-# Apple Silicon and nowhere else, so on Linux — where CI type-checks — `import mlx.core` cannot
-# resolve at all. That is a narrow real loss, covered by running the code rather than checking
-# it: the plugin factory imports these modules and tests/test_embedding_backends.py builds and
-# runs both backends. `manicule.embedding.runtimes.mlx_core` exists so that this suppression can
-# stay inside this directory instead of following MLX into every caller.
+# Same relaxation, same reasoning, and deliberately narrower. Three embedding dependencies ship
+# no type information or only partial stubs — onnxruntime, tokenizers, huggingface-hub — and
+# every call into them yields an Unknown that spreads. Only `embedding/runtimes/` is relaxed,
+# and it exists to be the one place they are touched: the modules that decide what a vector
+# *is* — embedding/pooling.py, embedding/cards.py, embedding/base.py — reach these libraries
+# through the small typed functions there and stay fully checked themselves. Hand-written stubs
+# for three C extensions were the alternative, and a stub that drifts from its library is worse
+# than none, because it type-checks confidently against an API that no longer exists.
+#
+# MLX used to be the fourth and is no longer in this distribution at all; its environment is
+# the `packages/manicule-mlx` one below.
 # The same relaxation once more, for the one directory that touches a cross-encoder runtime.
 # `sentence-transformers` and torch ship partial type information at best, and the extra is
 # deliberately absent from the dev group — CI type-checks without it installed, so
@@ -446,6 +463,22 @@ reportUnknownArgumentType = "none"
 
 [[tool.pyright.executionEnvironments]]
 root = "src/manicule/embedding/runtimes"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+
+# The MLX backend, which is its own distribution because it is GPL-3.0-or-later while this
+# project is MIT. Declared here rather than in `packages/manicule-mlx/pyproject.toml` because
+# pyright reads one configuration for the whole checked tree and would ignore that one.
+#
+# `reportMissingImports` is off here and nowhere else, and the reason is platform rather than
+# typing: MLX installs on Apple Silicon only, so on the Linux runner where CI type-checks
+# `import mlx.core` cannot resolve at all. That is a narrow real loss — a misspelled import in
+# this package goes unreported — covered by running the code instead, which is what
+# `packages/manicule-mlx/tests/` does on a machine that has Metal.
+[[tool.pyright.executionEnvironments]]
+root = "packages/manicule-mlx/src/manicule_mlx"
 reportMissingImports = "none"
 reportMissingTypeStubs = "none"
 reportUnknownMemberType = "none"

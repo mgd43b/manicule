@@ -38,9 +38,12 @@ space-wide, because there is no descendant predicate for attachments worth relyi
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+import json
+import sqlite3
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import cast
+from itertools import islice
+from typing import cast, override
 
 from manicule.connectors import cql
 from manicule.connectors.client import ConfluenceClient
@@ -79,6 +82,66 @@ class RootPage:
     title: str
 
 
+class _MembershipIndex(Mapping[str, tuple[str, ...]]):
+    """Exact subtree membership in temporary storage with a fixed SQLite page cache."""
+
+    def __init__(self) -> None:
+        try:
+            self._db = sqlite3.connect("")
+            self._db.execute("PRAGMA cache_size = -256")
+            self._db.execute(
+                "CREATE TABLE members (page_id TEXT PRIMARY KEY, roots TEXT NOT NULL) WITHOUT ROWID"
+            )
+        except sqlite3.Error as exc:
+            database = getattr(self, "_db", None)
+            if database is not None:
+                database.close()
+            raise ConnectorError("cannot create the bounded subtree membership index") from exc
+
+    def add_page(self, members: Sequence[tuple[str, tuple[str, ...]]]) -> None:
+        try:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO members VALUES (?, ?)",
+                ((page_id, json.dumps(roots)) for page_id, roots in members),
+            )
+            self._db.commit()
+        except sqlite3.Error as exc:
+            raise ConnectorError("cannot record subtree membership safely") from exc
+
+    @override
+    def __getitem__(self, page_id: str) -> tuple[str, ...]:
+        try:
+            row = self._db.execute(
+                "SELECT roots FROM members WHERE page_id = ?", (page_id,)
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise ConnectorError("cannot read subtree membership safely") from exc
+        if row is None:
+            raise KeyError(page_id)
+        roots = json.loads(cast("str", row[0]))
+        return tuple(cast("list[str]", roots))
+
+    @override
+    def __iter__(self) -> Iterator[str]:
+        try:
+            cursor = self._db.execute("SELECT page_id FROM members ORDER BY page_id")
+            while row := cursor.fetchone():
+                yield cast("str", row[0])
+        except sqlite3.Error as exc:
+            raise ConnectorError("cannot enumerate subtree membership safely") from exc
+
+    @override
+    def __len__(self) -> int:
+        try:
+            row = self._db.execute("SELECT count(*) FROM members").fetchone()
+        except sqlite3.Error as exc:
+            raise ConnectorError("cannot count subtree membership safely") from exc
+        return cast("int", row[0]) if row is not None else 0
+
+    def close(self) -> None:
+        self._db.close()
+
+
 class Subtree:
     """The pages one run may see, and which configured root put each of them there.
 
@@ -102,7 +165,7 @@ class Subtree:
         for root in self._roots:
             by_space.setdefault(root.space, []).append(root)
         self._by_space = {space: tuple(found) for space, found in by_space.items()}
-        self._members: dict[str, Mapping[str, tuple[str, ...]]] = {}
+        self._members: dict[str, _MembershipIndex] = {}
 
     # --- what the queries need -----------------------------------------------------------
 
@@ -160,8 +223,20 @@ class Subtree:
         """
         if space in self._members:
             return self._members[space]
+        async for _ in self.member_batches(space):
+            pass
+        return self._members[space]
 
-        found: dict[str, tuple[str, ...]] = {}
+    async def member_batches(self, space: str) -> AsyncIterator[Sequence[str]]:
+        """Index and yield each native subtree-search response before following its cursor."""
+        if space in self._members:
+            members = iter(self._members[space])
+            while batch := tuple(islice(members, self._config.page_size)):
+                yield batch
+            return
+
+        found = _MembershipIndex()
+        self._members[space] = found
         params = [
             (
                 "cql",
@@ -179,19 +254,30 @@ class Subtree:
             ("limit", str(self._config.page_size)),
             ("expand", "ancestors"),
         ]
-        async for payload in self._client.paginate(self._client.url(SEARCH_PATH), params):
-            for result in _results(payload):
-                page_id = _str(result.get("id"))
-                if not page_id:
-                    continue
-                covering = self.covering_roots(space, page_id, ancestor_ids(result))
-                if not covering:
-                    raise ConnectorError(self.out_of_scope(space, page_id))
-                found[page_id] = covering
+        try:
+            async for payload in self._client.paginate(self._client.url(SEARCH_PATH), params):
+                page: list[tuple[str, tuple[str, ...]]] = []
+                for result in _results(payload):
+                    page_id = _str(result.get("id"))
+                    if not page_id:
+                        continue
+                    page.append((page_id, self._checked_roots(space, page_id, result)))
+                found.add_page(page)
+                yield tuple(page_id for page_id, _ in page)
 
-        await self._check_not_falsely_empty(space, found)
-        self._members[space] = found
-        return found
+            await self._check_not_falsely_empty(space, found)
+        except BaseException:
+            found.close()
+            self._members.pop(space, None)
+            raise
+
+    def _checked_roots(
+        self, space: str, page_id: str, result: Mapping[str, object]
+    ) -> tuple[str, ...]:
+        covering = self.covering_roots(space, page_id, ancestor_ids(result))
+        if not covering:
+            raise ConnectorError(self.out_of_scope(space, page_id))
+        return covering
 
     async def _check_not_falsely_empty(
         self, space: str, found: Mapping[str, tuple[str, ...]]
@@ -208,8 +294,8 @@ class Subtree:
         through a different endpoint. One extra request per root, on the one run where the
         answer decides whether an index is emptied.
         """
-        descendants = set(found) - {root.id for root in self._by_space.get(space, ())}
-        if descendants:
+        roots = {root.id for root in self._by_space.get(space, ())}
+        if any(page_id not in roots for page_id in found):
             return
         for root in self._by_space.get(space, ()):
             if not await self._has_child_page(root.id):
@@ -255,6 +341,12 @@ class Subtree:
             f"not apply the narrowing — and filtering the difference away here would index a "
             f"subtree while paying for, and claiming, the whole space."
         )
+
+    def close(self) -> None:
+        """Delete all temporary membership indexes owned by this one enumeration."""
+        for members in self._members.values():
+            members.close()
+        self._members.clear()
 
 
 async def resolve(

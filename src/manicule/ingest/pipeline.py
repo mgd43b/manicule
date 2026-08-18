@@ -56,6 +56,7 @@ from importlib.metadata import PackageNotFoundError
 from typing import TYPE_CHECKING, Literal, Protocol, cast, runtime_checkable
 from uuid import uuid4
 
+from manicule.chunking import finalize_chunks
 from manicule.connectors.errors import (
     BodyUnavailableError,
     NotFoundError,
@@ -92,16 +93,24 @@ from manicule.core.errors import (
     AcquisitionLeaseLostError,
     ChunkingError,
     ContextOverflowError,
+    DerivedResetFenceLostError,
     MiddlewareViolationError,
+    StorageBusyError,
 )
 from manicule.core.ids import content_hash, document_id
+from manicule.core.protocols import BatchedDiscoveryConnector
 from manicule.core.provenance import Provenance
 from manicule.core.sources import DiscoveredDoc
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError
 from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
-from manicule.ingest.ports import AcquisitionStore, FencedIngestStore, GlossaryWriter
+from manicule.ingest.ports import (
+    AcquisitionStore,
+    BatchedAcquisitionStore,
+    FencedIngestStore,
+    GlossaryWriter,
+)
 from manicule.ingest.refusals import require_measured
 from manicule.ingest.stages import Conveyor, CountedLock, Gauge, StageReport
 from manicule.ingest.workers import AttemptResult, default_worker_count
@@ -140,11 +149,26 @@ backpressure on the pipeline.
 """
 
 type _PublicationFence = Callable[[], Awaitable[AcquisitionFence]]
+type FullInventoryAuthority = Literal["", "search", "direct_current_content"]
+
+
+def _closed_full_inventory_authority(value: object) -> FullInventoryAuthority:
+    """Normalize connector/durable input to the private-safe aggregate vocabulary."""
+    if value == "search":
+        return "search"
+    if value == "direct_current_content":
+        return "direct_current_content"
+    return ""
 
 
 _publication_fence: ContextVar[_PublicationFence | None] = ContextVar(
     "acquisition_publication_fence", default=None
 )
+
+
+@asynccontextmanager
+async def _unlocked_derived_mutation() -> AsyncGenerator[None]:
+    yield
 
 
 class _StageError(Exception):
@@ -466,6 +490,7 @@ class RunReport:
     snapshot_omission_reasons: dict[str, int] = field(default_factory=dict[str, int])
     inventory_recovery: Literal["", "reenumeration_required", "reenumerating", "reconciled"] = ""
     reconciled_deleted_items: int = 0
+    full_inventory_authority: FullInventoryAuthority = ""
 
     @property
     def indexed(self) -> int:
@@ -545,6 +570,16 @@ class RunReport:
         self.error_message = str(error)
         self.error = f"{self.error_type}: {self.error_message}"
 
+    def refuse_storage_busy(self, error: StorageBusyError) -> None:
+        """Make exhausted writer retries an aggregate-only retry-required outcome."""
+        # A worker may have recorded glossary diagnostics before another worker exhausted its
+        # bounded writer retries. Those diagnostics contain document identities and arbitrary
+        # detector details, neither of which belongs in an orderly storage-busy report.
+        self.glossary_failures.clear()
+        self.error_type = type(error).__name__
+        self.error_message = str(error)
+        self.error = f"{self.error_type}: {self.error_message}"
+
     def settle(self) -> None:
         """Put the order-sensitive parts into an order that does not depend on who finished first.
 
@@ -592,6 +627,9 @@ class RunReport:
                 "snapshot_omission_reasons": dict(self.snapshot_omission_reasons),
                 "inventory_recovery": self.inventory_recovery,
                 "reconciled_deleted_items": self.reconciled_deleted_items,
+                "full_inventory_authority": _closed_full_inventory_authority(
+                    self.full_inventory_authority
+                ),
                 "retry_required": self.retry_required,
                 "derivation_deferred": self.derivation_deferred,
                 "glossary_failures": list(self.glossary_failures),
@@ -692,6 +730,9 @@ class RunReport:
             "refusal": refusal,
             "inventory_recovery": self.inventory_recovery,
             "reconciled_deleted_items": self.reconciled_deleted_items,
+            "full_inventory_authority": _closed_full_inventory_authority(
+                self.full_inventory_authority
+            ),
         }
 
 
@@ -727,6 +768,7 @@ class _AcquisitionStart:
     state: AcquisitionRunState | None = None
     source_scope: str = ""
     scope_fingerprint: str = ""
+    full_inventory_authority: FullInventoryAuthority = ""
     promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
     completeness: SnapshotCompleteness | None = None
     omission_count: int = 0
@@ -766,6 +808,7 @@ class _Sync:
     acquisition_state: AcquisitionRunState | None = None
     source_scope: str = ""
     scope_fingerprint: str = ""
+    full_inventory_authority: FullInventoryAuthority = ""
     promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
     snapshot_completeness: SnapshotCompleteness | None = None
     snapshot_omission_count: int = 0
@@ -831,6 +874,8 @@ class IngestPipeline:
         acquisition_history_s: float = 30 * 24 * 3600.0,
         acquisition_cleanup_batch: int = 100,
         snapshot_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
+        mutation_guard: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
+        expected_reset_epoch: int | None = None,
     ) -> None:
         derived = (chunker, embedder, vectors, runner, resolve_chain, middleware, chunk_fingerprint)
         if any(component is None for component in derived) and not all(
@@ -862,6 +907,8 @@ class IngestPipeline:
         self._acquisition_history_s = max(0.0, acquisition_history_s)
         self._acquisition_cleanup_batch = max(1, acquisition_cleanup_batch)
         self._snapshot_policy = snapshot_policy
+        self._mutation_guard = mutation_guard or _unlocked_derived_mutation
+        self._expected_reset_epoch = expected_reset_epoch
         # These casts preserve the narrow, non-optional types throughout the derived path. An
         # acquisition-only pipeline never enters that path, and ``run`` refuses any other use
         # before source work begins. Keeping ``None`` here is important: it proves this is not a
@@ -979,6 +1026,12 @@ class IngestPipeline:
         """
         return self._glossary_lineage
 
+    async def aclose(self) -> None:
+        """Release parse workers when a runtime invalidates this derived pipeline."""
+        teardown = getattr(self._runner, "teardown", None)
+        if teardown is not None:
+            await teardown()
+
     # --- a run: three stages, two bounded hand-offs -----------------------------------------
 
     async def _start_acquisition(
@@ -988,6 +1041,7 @@ class IngestPipeline:
         if acquisitions is None:
             return _AcquisitionStart(watermark=watermark)
         source_scope, scope_fingerprint = snapshot_scope(connector)
+        full_inventory_authority = snapshot_full_inventory_authority(connector)
         owner = f"pipeline:{uuid4().hex}"
         now = self._acquisition_clock()
         claimed = await acquisitions.claim_or_create_acquisition_run(
@@ -996,6 +1050,7 @@ class IngestPipeline:
             owner,
             source_scope=source_scope,
             scope_fingerprint=scope_fingerprint,
+            full_inventory_authority=full_inventory_authority,
             promotion_policy=self._snapshot_policy,
             now=now,
             expires_at=now + timedelta(seconds=self._acquisition_lease_s),
@@ -1020,12 +1075,16 @@ class IngestPipeline:
             accepted=claimed.discovered_count,
             watermark=(
                 claimed.base_watermark
-                if claimed.base_watermark_scope_fingerprint == claimed.scope_fingerprint
+                if claimed.inventory_state is not AcquisitionInventoryState.REENUMERATING
+                and claimed.base_watermark_scope_fingerprint == claimed.scope_fingerprint
                 else None
             ),
             state=claimed.state,
             source_scope=claimed.source_scope,
             scope_fingerprint=claimed.scope_fingerprint,
+            full_inventory_authority=_closed_full_inventory_authority(
+                claimed.full_inventory_authority
+            ),
             promotion_policy=claimed.promotion_policy,
             completeness=claimed.completeness,
             omission_count=claimed.omission_count,
@@ -1034,7 +1093,25 @@ class IngestPipeline:
             reconciled_deleted_count=claimed.reconciled_deleted_count,
         )
 
-    async def run(  # noqa: PLR0912, PLR0915 - orchestrates durable recovery stages
+    async def run(
+        self,
+        connector: Connector,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+        acquire_only: bool = False,
+    ) -> RunReport:
+        """Run one complete sync under the runtime-wide reset/publication barrier."""
+        async with self._mutation_guard():
+            await self._assert_current_reset_epoch()
+            return await self._run_guarded(
+                connector,
+                limit=limit,
+                watching=watching,
+                acquire_only=acquire_only,
+            )
+
+    async def _run_guarded(  # noqa: PLR0912, PLR0915 - orchestrates durable recovery stages
         self,
         connector: Connector,
         *,
@@ -1108,6 +1185,7 @@ class IngestPipeline:
                     limit=self._acquisition_cleanup_batch,
                 )
         report = RunReport(connector=connector.name)
+        report.full_inventory_authority = snapshot_full_inventory_authority(connector)
         if self._acquisitions is not None:
             _, scope_fingerprint = snapshot_scope(connector)
             watermark = await self._acquisitions.get_acquisition_watermark(
@@ -1152,6 +1230,7 @@ class IngestPipeline:
             acquisition_state=acquisition.state,
             source_scope=acquisition.source_scope,
             scope_fingerprint=acquisition.scope_fingerprint,
+            full_inventory_authority=acquisition.full_inventory_authority,
             promotion_policy=acquisition.promotion_policy,
             snapshot_completeness=acquisition.completeness,
             snapshot_omission_count=acquisition.omission_count,
@@ -1189,6 +1268,17 @@ class IngestPipeline:
             await asyncio.shield(stages)
         except asyncio.CancelledError:
             await self._stop_within_grace(run, stages)
+            if run.acquisitions is not None:
+                # The TaskGroup is fully joined first, so no worker can mutate after release.
+                # Cancellation leaves the committed prefix resumable immediately rather than
+                # retaining a logical generation lease until its wall-clock expiry.
+                with contextlib.suppress(Exception):
+                    await run.acquisitions.release_acquisition_lease(
+                        run.acquisition_run_id,
+                        run.lease_owner,
+                        run.lease_generation,
+                        now=self._acquisition_clock(),
+                    )
             raise
         except ExceptionGroup as failures:
             # A stage failed for a reason that is not a document's: the document store went
@@ -1200,15 +1290,21 @@ class IngestPipeline:
             capacity_failures = [
                 failure for failure in leaves if isinstance(failure, CapacityRefusedError)
             ]
+            busy_failures = [failure for failure in leaves if isinstance(failure, StorageBusyError)]
             non_capacity = [
-                failure for failure in leaves if not isinstance(failure, CapacityRefusedError)
+                failure
+                for failure in leaves
+                if not isinstance(failure, (CapacityRefusedError, StorageBusyError))
             ]
             if not non_capacity:
                 # A refusal is an orderly, retryable stop even when several workers observe the
                 # same exhausted resource together.  Releasing the lease here is what makes the
                 # retry immediate rather than delayed until the crash fence expires.
                 crashed = False
-                run.report.refuse_capacity(capacity_failures[0])
+                if capacity_failures:
+                    run.report.refuse_capacity(capacity_failures[0])
+                else:
+                    run.report.refuse_storage_busy(busy_failures[0])
             else:
                 crashed = True
                 first, detail = _failure_detail(non_capacity)
@@ -1289,9 +1385,12 @@ class IngestPipeline:
             )
         except Exception as exc:  # noqa: BLE001 - diagnostics must not hide the run outcome
             if not crashed:
-                run.report.error_type = type(exc).__name__
-                run.report.error_message = str(exc)
-                run.report.error = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, StorageBusyError):
+                    run.report.refuse_storage_busy(exc)
+                else:
+                    run.report.error_type = type(exc).__name__
+                    run.report.error_message = str(exc)
+                    run.report.error = f"{type(exc).__name__}: {exc}"
         if not recorded and not crashed:
             msg = "the acquisition generation changed before diagnostics and release"
             run.report.error_type = AcquisitionLeaseLostError.__name__
@@ -1591,8 +1690,35 @@ class IngestPipeline:
             # worker waits for an item that is never coming and the run never returns.
             refs.finish()
 
-    async def _enumerate_to_journal(self, run: _Sync) -> None:
-        """Commit each source record before asking discovery for the next one.
+    @staticmethod
+    async def _durable_discovery_batches(
+        run: _Sync,
+    ) -> AsyncGenerator[Sequence[DiscoveredDoc], None]:
+        """Normalize optional source pages while retaining cancellation-safe stream closure."""
+        connector = run.connector
+        if isinstance(connector, BatchedDiscoveryConnector):
+            source = connector.discover_batches(run.watermark)
+            try:
+                async for batch in source:
+                    yield batch
+            finally:
+                closer = getattr(source, "aclose", None)
+                if closer is not None:
+                    await closer()
+            return
+        source = connector.discover(run.watermark)
+        try:
+            async for discovered in source:
+                yield (discovered,)
+        finally:
+            closer = getattr(source, "aclose", None)
+            if closer is not None:
+                await closer()
+
+    async def _enumerate_to_journal(  # noqa: PLR0912, PLR0915 - every exit guards completion
+        self, run: _Sync
+    ) -> None:
+        """Commit each source response before asking discovery for the next one.
 
         There is intentionally no downstream hand-off in this loop. The connector can be
         delayed only by its own work, journal admission, or lease maintenance; parsing and
@@ -1606,28 +1732,69 @@ class IngestPipeline:
         if run.limit is not None and run.accepted >= run.limit:
             run.report.limited = True
             return
-        stream = run.connector.discover(run.watermark)
+        native_pages = isinstance(run.connector, BatchedDiscoveryConnector)
+        stream = self._durable_discovery_batches(run)
         try:
-            async for discovered in stream:
+            while not run.stop.is_set():
+                try:
+                    discovered_batch = await anext(stream)
+                except StopAsyncIteration:
+                    break
+                # Cancellation can arrive while the connector itself is suspended inside
+                # ``anext``. The pre-call check prevents a new request after a committed page;
+                # this post-call check prevents a response already in flight from being
+                # admitted after the stop.
                 if run.stop.is_set():
                     break
+                if not discovered_batch:
+                    if run.limit is not None and run.accepted >= run.limit:
+                        run.report.limited = True
+                        break
+                    continue
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now)
-                appended = await acquisitions.append_acquisition_record(
-                    run.acquisition_run_id,
-                    run.accepted,
-                    AcquisitionSource.from_discovered(discovered),
-                    lease_owner=run.lease_owner,
-                    lease_generation=run.lease_generation,
-                    now=now,
+                sources = tuple(
+                    AcquisitionSource.from_discovered(found) for found in discovered_batch
                 )
-                if appended.sequence != run.accepted:
-                    continue
-                run.accepted += 1
+                appended: Sequence[AcquisitionRecord]
+                if (
+                    native_pages
+                    and isinstance(acquisitions, BatchedAcquisitionStore)
+                    and run.limit is None
+                ):
+                    appended = await acquisitions.append_acquisition_records(
+                        run.acquisition_run_id,
+                        run.accepted,
+                        sources,
+                        lease_owner=run.lease_owner,
+                        lease_generation=run.lease_generation,
+                        now=now,
+                    )
+                else:
+                    scalar_appended: list[AcquisitionRecord] = []
+                    for source in sources:
+                        if run.limit is not None and run.accepted >= run.limit:
+                            break
+                        record = await acquisitions.append_acquisition_record(
+                            run.acquisition_run_id,
+                            run.accepted,
+                            source,
+                            lease_owner=run.lease_owner,
+                            lease_generation=run.lease_generation,
+                            now=now,
+                        )
+                        scalar_appended.append(record)
+                        if record.sequence == run.accepted:
+                            run.accepted += 1
+                    appended = scalar_appended
+                run.accepted = max(
+                    run.accepted,
+                    max((record.sequence for record in appended), default=run.accepted - 1) + 1,
+                )
                 if run.limit is not None and run.accepted >= run.limit:
                     run.report.limited = True
                     break
-            else:
+            if not run.stop.is_set() and not run.report.limited:
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now)
                 completed = await acquisitions.complete_acquisition_enumeration(
@@ -1800,7 +1967,7 @@ class IngestPipeline:
                 reusable = await self._validated_reusable_snapshot(run, record)
                 if reusable is not None:
                     await self._keep_acquisition_lease_live(
-                        run, acquisitions, self._acquisition_clock(), force=True
+                        run, acquisitions, self._acquisition_clock()
                     )
                     await acquisitions.settle_unchanged_acquisition_record(
                         run.acquisition_run_id,
@@ -1848,7 +2015,7 @@ class IngestPipeline:
                 diagnostic = _acquisition_diagnostic(exc)
                 self._note_inventory_failure(run, diagnostic)
                 await self._keep_acquisition_lease_live(
-                    run, acquisitions, self._acquisition_clock(), force=True
+                    run, acquisitions, self._acquisition_clock()
                 )
                 await acquisitions.transition_acquisition_record(
                     run.acquisition_run_id,
@@ -1873,9 +2040,7 @@ class IngestPipeline:
                 _report_progress(run)
                 continue
 
-            await self._keep_acquisition_lease_live(
-                run, acquisitions, self._acquisition_clock(), force=True
-            )
+            await self._keep_acquisition_lease_live(run, acquisitions, self._acquisition_clock())
             await acquisitions.transition_acquisition_record(
                 run.acquisition_run_id,
                 record.source.source_id,
@@ -1901,6 +2066,10 @@ class IngestPipeline:
             promoted = await acquisitions.latest_promoted_snapshot(
                 run.connector.name, run.scope_fingerprint
             )
+            if promoted is None:
+                promoted = await acquisitions.latest_promoted_snapshot_for_source_scope(
+                    run.connector.name, run.source_scope
+                )
             run.reusable_snapshot_run_id = None if promoted is None else promoted.id
             run.reusable_snapshot_checked = True
         if run.reusable_snapshot_run_id is None:
@@ -1956,9 +2125,7 @@ class IngestPipeline:
         reusable = await self._validated_superseded_reuse(run, record)
         if reusable is None or reusable.acquired_source is None:
             return False
-        await self._keep_acquisition_lease_live(
-            run, acquisitions, self._acquisition_clock(), force=True
-        )
+        await self._keep_acquisition_lease_live(run, acquisitions, self._acquisition_clock())
         await acquisitions.transition_acquisition_record(
             run.acquisition_run_id,
             record.source.source_id,
@@ -2512,6 +2679,14 @@ class IngestPipeline:
     async def ingest(
         self, connector: Connector, discovered: DiscoveredDoc
     ) -> list[DocumentOutcome]:
+        """Ingest one discovery under the runtime-wide reset/publication barrier."""
+        async with self._mutation_guard():
+            await self._assert_current_reset_epoch()
+            return await self._ingest_discovered_guarded(connector, discovered)
+
+    async def _ingest_discovered_guarded(
+        self, connector: Connector, discovered: DiscoveredDoc
+    ) -> list[DocumentOutcome]:
         """One discovered document, from the change check to the commit.
 
         The two stages a run pipelines, run back to back instead. **One implementation, so the
@@ -2577,6 +2752,42 @@ class IngestPipeline:
         return _Fetched(raw=raw, discovered=discovered, existing=existing)
 
     async def ingest_raw(
+        self,
+        raw: RawDocument,
+        *,
+        source: str,
+        version_token: str | None = None,
+        title: str = "",
+        existing: Document | None = None,
+        force: bool = False,
+        expected: DocumentRevision | None = None,
+        retention: Retention | None = None,
+        force_members: bool = False,
+    ) -> list[DocumentOutcome]:
+        """Publish fetched bytes under the runtime-wide reset/publication barrier."""
+        async with self._mutation_guard():
+            await self._assert_current_reset_epoch()
+            return await self._ingest_raw_guarded(
+                raw,
+                source=source,
+                version_token=version_token,
+                title=title,
+                existing=existing,
+                force=force,
+                expected=expected,
+                retention=retention,
+                force_members=force_members,
+            )
+
+    async def _assert_current_reset_epoch(self) -> None:
+        if self._expected_reset_epoch is None:
+            return
+        assert_epoch = getattr(self._store, "assert_derived_reset_epoch", None)
+        if assert_epoch is None:  # pragma: no cover - Runtime binds epochs only to SQLite
+            raise TypeError("the derived store cannot validate its durable reset epoch")
+        await assert_epoch(self._expected_reset_epoch)
+
+    async def _ingest_raw_guarded(
         self,
         raw: RawDocument,
         *,
@@ -3052,7 +3263,10 @@ class IngestPipeline:
             raise _StageError(PipelineStage.CHUNK, str(exc)) from exc
 
         try:
-            return await self._middleware.after_chunk(document, chunks)
+            transformed = await self._middleware.after_chunk(document, chunks)
+            return finalize_chunks(self._chunker, transformed)
+        except ChunkingError as exc:
+            raise _StageError(PipelineStage.MIDDLEWARE, str(exc)) from exc
         except MiddlewareViolationError as exc:
             raise _StageError(PipelineStage.MIDDLEWARE, str(exc)) from exc
         except Exception as exc:
@@ -3131,6 +3345,7 @@ class IngestPipeline:
                 glossary_entries=entries,
                 glossary_fp=glossary_fp,
                 original_omitted_reason=retention.omitted_reason,
+                expected_reset_epoch=self._expected_reset_epoch,
             )
         else:
             committed = await self._store.publish_document(
@@ -3143,6 +3358,7 @@ class IngestPipeline:
                 glossary_entries=entries,
                 glossary_fp=glossary_fp,
                 original_omitted_reason=retention.omitted_reason,
+                expected_reset_epoch=self._expected_reset_epoch,
             )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
@@ -3185,9 +3401,18 @@ class IngestPipeline:
             publisher = self._fenced_store if fence is not None else None
             if existing is None or existing.publication_id != publication:
                 if fence is not None and publisher is not None:
-                    await publisher.fenced_stage_vectors(fence, publication, chunks)
+                    await publisher.fenced_stage_vectors(
+                        fence,
+                        publication,
+                        chunks,
+                        expected_reset_epoch=self._expected_reset_epoch,
+                    )
                 else:
-                    await self._store.stage_vectors(publication, chunks)
+                    await self._store.stage_vectors(
+                        publication,
+                        chunks,
+                        expected_reset_epoch=self._expected_reset_epoch,
+                    )
             await self._check_publication_fence()
             await self._vectors.upsert(chunks, vectors, publication_id=publication)
             entries, glossary_fp, glossary_detail = self._derive_definitions(document, chunks)
@@ -3205,6 +3430,7 @@ class IngestPipeline:
                     glossary_entries=entries,
                     glossary_fp=glossary_fp,
                     original_omitted_reason=retention.omitted_reason,
+                    expected_reset_epoch=self._expected_reset_epoch,
                 )
             else:
                 committed = await self._store.publish_document(
@@ -3217,8 +3443,9 @@ class IngestPipeline:
                     glossary_entries=entries,
                     glossary_fp=glossary_fp,
                     original_omitted_reason=retention.omitted_reason,
+                    expected_reset_epoch=self._expected_reset_epoch,
                 )
-        except AcquisitionLeaseLostError:
+        except (AcquisitionLeaseLostError, DerivedResetFenceLostError):
             raise
         except Exception as exc:  # noqa: BLE001 - a store failure is this document's
             return await self._demote(
@@ -3646,12 +3873,14 @@ class IngestPipeline:
                 document,
                 expected=expected,
                 original_omitted_reason=retention.omitted_reason,
+                expected_reset_epoch=self._expected_reset_epoch,
             )
         else:
             committed = await self._store.publish_failure(
                 document,
                 expected=expected,
                 original_omitted_reason=retention.omitted_reason,
+                expected_reset_epoch=self._expected_reset_epoch,
             )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
@@ -3920,6 +4149,14 @@ def snapshot_scope(connector: Connector) -> tuple[str, str]:
         return source_scope, declared_fingerprint
     fingerprint = hashlib.blake2b(source_scope.encode(), digest_size=20).hexdigest()
     return source_scope, fingerprint
+
+
+def snapshot_full_inventory_authority(connector: Connector) -> FullInventoryAuthority:
+    """Aggregate-safe effective inventory authority, blank for connectors without one."""
+    declared = getattr(connector, "full_inventory_authority", "")
+    if callable(declared):
+        declared = declared()
+    return _closed_full_inventory_authority(declared)
 
 
 def _with_status(document: Document, result: ChainResult) -> Document:

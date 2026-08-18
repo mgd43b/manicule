@@ -228,7 +228,13 @@ class MemoryIngestStore:
             return Commit(committed=False, stored=current)
         return Commit(committed=True, stored=await self.upsert_document(document))
 
-    async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
+    async def stage_vectors(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        expected_reset_epoch: int | None = None,
+    ) -> None:
         self.staged_publications.append((publication_id, tuple(chunk.id for chunk in chunks)))
 
     async def publish_failure(
@@ -237,6 +243,7 @@ class MemoryIngestStore:
         *,
         expected: DocumentRevision | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         current = await self.get_document(document.id)
         if expected is not None and (current is None or current.revision != expected):
@@ -257,6 +264,7 @@ class MemoryIngestStore:
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         current = await self.get_document(document.id)
         if expected is not None and (current is None or current.revision != expected):
@@ -497,7 +505,9 @@ class MemoryIngestStore:
     async def index_fingerprints(self) -> IndexFingerprints:
         return self.state
 
-    async def record_index_fingerprints(self, state: IndexFingerprints) -> None:
+    async def record_index_fingerprints(
+        self, state: IndexFingerprints, *, expected_reset_epoch: int | None = None
+    ) -> None:
         self.state = state
 
     # the sweep
@@ -1143,6 +1153,22 @@ class ExpiringCursorConnector(ObservedConnector):
 
     @override
     async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+        async for page in self._pages(watermark):
+            for found in page:
+                self.yields += 1
+                self.yielded.release()
+                yield found
+
+    async def discover_batches(
+        self, watermark: Watermark | None
+    ) -> AsyncIterator[Sequence[DiscoveredDoc]]:
+        async for page in self._pages(watermark):
+            self.yields += len(page)
+            for _ in page:
+                self.yielded.release()
+            yield page
+
+    async def _pages(self, watermark: Watermark | None) -> AsyncIterator[Sequence[DiscoveredDoc]]:
         del watermark
         source_ids = sorted(self.documents)
         for start in range(0, len(source_ids), self.page_size):
@@ -1155,19 +1181,21 @@ class ExpiringCursorConnector(ObservedConnector):
                 self.cursors_issued += 1
                 self.cursor_issued.set()
 
+            discovered: list[DiscoveredDoc] = []
             for source_id in page:
-                self.yields += 1
-                self.yielded.release()
-                yield DiscoveredDoc(
-                    ref=DocRef(
-                        source_id=source_id,
-                        uri=f"https://wiki.example.test/documents/{source_id}",
-                    ),
-                    version_token=self.tokens.get(
-                        source_id, content_hash(self.documents[source_id])
-                    ),
-                    media_type=self.media_types.get(source_id, MEDIA_TYPE),
+                discovered.append(
+                    DiscoveredDoc(
+                        ref=DocRef(
+                            source_id=source_id,
+                            uri=f"https://wiki.example.test/documents/{source_id}",
+                        ),
+                        version_token=self.tokens.get(
+                            source_id, content_hash(self.documents[source_id])
+                        ),
+                        media_type=self.media_types.get(source_id, MEDIA_TYPE),
+                    )
                 )
+            yield tuple(discovered)
 
             if has_next:
                 held = self.clock() - received_at

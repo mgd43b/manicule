@@ -69,6 +69,7 @@ type LifecycleOutcome = Literal[
     "running", "complete", "bounded", "deferred", "incomplete", "refused", "failed", "canceled"
 ]
 type InventoryRecovery = Literal["", "reenumeration_required", "reenumerating", "reconciled"]
+type FullInventoryAuthority = Literal["", "search", "direct_current_content"]
 type LifecycleRefusalCode = Literal[
     "capacity",
     "snapshot_not_promoted",
@@ -149,6 +150,7 @@ class LifecycleProgress(Payload):
     refusal: LifecycleRefusal | None = None
     inventory_recovery: InventoryRecovery = ""
     reconciled_deleted_items: int = Field(default=0, ge=0)
+    full_inventory_authority: FullInventoryAuthority = ""
 
     @model_validator(mode="after")
     def terminal_and_refusal_are_consistent(self) -> Self:
@@ -825,7 +827,7 @@ class ReembedCleanupReport(Payload):
 
 
 class RebuildPlanReport(Payload):
-    """Aggregate-only dry run for one promoted retained snapshot."""
+    """Aggregate-only dry run for the workspace set containing a promoted snapshot."""
 
     generation_id: str
     snapshot_id: str
@@ -838,6 +840,12 @@ class RebuildPlanReport(Payload):
     missing_count: int = Field(ge=0)
     refusal_code: str | None = None
     runnable: bool
+    current_chunk_fingerprint: str | None = None
+    target_chunk_fingerprint: str
+    over_budget_chunks: int = Field(ge=0)
+    max_stored_chunk_tokens: int = Field(ge=0)
+    estimated_embedding_chunks: int = Field(ge=0)
+    network_required: bool = False
     lifecycle: LifecycleProgress
 
 
@@ -872,6 +880,15 @@ class LifecycleReport(Payload):
     released_bytes: int = Field(default=0, ge=0)
     confirmation: str | None = None
     source_contacted: bool = False
+    documents_retired: int = Field(default=0, ge=0)
+    chunks_removed: int = Field(default=0, ge=0)
+    memberships_removed: int = Field(default=0, ge=0)
+    vector_rows_removed: int = Field(default=0, ge=0)
+    publications_removed: int = Field(default=0, ge=0)
+    generations_terminalized: int = Field(default=0, ge=0)
+    vector_store_removed: bool = False
+    fingerprints_cleared: bool = False
+    runtime_cache_invalidated: bool = False
     lifecycle: LifecycleProgress = Field(
         default_factory=lambda: LifecycleProgress(phase="complete", outcome="complete")
     )
@@ -1476,6 +1493,7 @@ class IngestReport(Payload):
     snapshot_omission_reasons: dict[str, int] = Field(default_factory=dict)
     inventory_recovery: InventoryRecovery = ""
     reconciled_deleted_items: int = Field(default=0, ge=0)
+    full_inventory_authority: FullInventoryAuthority = ""
     retry_required: bool = False
     derivation_deferred: bool = False
     intentionally_bounded: bool = False
@@ -1621,6 +1639,7 @@ class ConnectorSummary(Payload):
     last_enumeration_completed: bool | None = None
     last_watermark_advanced: bool | None = None
     last_lifecycle: LifecycleProgress | None = None
+    full_inventory_authority: FullInventoryAuthority = ""
 
 
 class ConnectorList(Payload):
@@ -1638,6 +1657,7 @@ class SnapshotStatusReport(Payload):
     state: str
     verified: bool
     verification_performed: bool = False
+    full_inventory_authority: FullInventoryAuthority = ""
     lifecycle: LifecycleProgress
 
 
@@ -1880,6 +1900,13 @@ class ResetReport(Payload):
     documents: int = Field(default=0, ge=0)
     chunks: int = Field(default=0, ge=0)
     vectors_removed: bool = False
+    vector_rows_removed: int = Field(default=0, ge=0)
+    publications_removed: int = Field(default=0, ge=0)
+    memberships_removed: int = Field(default=0, ge=0)
+    generations_terminalized: int = Field(default=0, ge=0)
+    vector_store_removed: bool = False
+    fingerprints_cleared: bool = False
+    runtime_cache_invalidated: bool = False
     snapshots_retained: int = Field(default=0, ge=0)
 
 

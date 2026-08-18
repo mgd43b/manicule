@@ -250,23 +250,31 @@ to the `index-affecting-extraction` patterns; `tests/parsers/test_versions.py` f
 two disagree.
 
 **Nothing here checks licenses, and this project has rejected dependencies over them.**
-manicule is GPL-3.0-or-later. Dependabot reports versions; it says nothing about the terms
-a new version ships under, and a relicense lands in a routine-looking bump. So the license
-is checked by a person, at selection time, and again if a bump crosses a major version.
+`manicule` is MIT. Dependabot reports versions; it says nothing about the terms a new version
+ships under, and a relicense lands in a routine-looking bump. So the license is checked by a
+person, at selection time, and again if a bump crosses a major version.
 
-The two decisions on record show why it is not a lookup ([`docs/parsing.md`](docs/parsing.md)
-§12 has the full reasoning):
+**A copyleft dependency of `manicule` itself is refused.** Not as a preference — the whole
+point of the package split is that MIT means MIT, with nothing in the dependency closure that
+contradicts it. The decisions on record ([`docs/parsing.md`](docs/parsing.md) §12 has the full
+reasoning):
 
-- **`extract-msg` is GPL-3.0 and became admissible** when this project relicensed. GPL-3.0
-  inside a GPL-3.0 work carries no additional obligation.
-- **PyMuPDF is AGPL-3.0 and stayed rejected**, relicense or not. GPLv3 §13 permits the
-  combination, but the AGPL portion keeps its network clause — so the obligation lands on
-  anyone who *runs* manicule rather than on us. A condition we would be imposing on
-  operators is not ours to accept on their behalf, and `pypdfium2` is permissive and
-  already does the job.
+- **PyMuPDF is AGPL-3.0 and is rejected.** Its network clause would land on anyone who *runs*
+  manicule rather than on us, and a condition we would be imposing on operators is not ours to
+  accept on their behalf. `pypdfium2` is permissive and already does the job.
+- **`extract-msg` is GPL-3.0 and is rejected** — for the plain reason again. It was briefly
+  admissible during the period when manicule was itself GPL-3.0-or-later; that period ended
+  when the MLX backend moved to its own distribution, and `.msg` support goes back to being
+  either a permissively licensed reader or a hand-written MAPI property reader
+  ([#21](https://github.com/mgd43b/manicule/issues/21)).
+- **`selectolax` bundles an LGPL-2.1 engine** alongside a permissive one, and only the
+  permissive one is imported. Unchanged by any of the above; see §12.
 
-GPL is ordinary here. AGPL is not, and neither is a term that reaches past this repository
-to the people deploying it.
+**`packages/manicule-mlx` is the one exception, and it is a separate distribution precisely so
+that it is not an exception to anything.** It is GPL-3.0-or-later because `mlx-embeddings` is,
+and a copyleft dependency is ordinary *there*. Adding one to `manicule` is not. If you find
+yourself wanting a GPL library in core, the shape of the answer is another package, not another
+relicense.
 
 ## Commit and pull request conventions
 

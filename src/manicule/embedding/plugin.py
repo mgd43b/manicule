@@ -1,11 +1,19 @@
-"""The built-in embedding plugin: the MLX and onnxruntime backends.
+"""The built-in embedding plugin: the onnxruntime backend.
 
 Registered through the public ``manicule.plugins`` entry point, exactly as a third-party
 plugin is, so the extension mechanism is exercised by every installation.
 
+**The MLX backend is no longer here.** It links ``mlx-embeddings``, which is GPL-3.0, so it
+ships as its own GPL-3.0-or-later distribution — ``manicule-mlx`` — and claims the
+``embedder.mlx`` slot through this same entry-point group. manicule has no special knowledge
+that it exists; ``[embedding] provider = "mlx"`` resolves through discovery like any other
+component. :func:`read_embedder_card` and :func:`embedder_metadata_factory` are public because
+that package calls them: they are the shared half of building an embedder, and duplicating
+them there would let the two drift on how a model's declaration is read.
+
 **Nothing here imports a model runtime.** Registration needs only the configuration model, so
-an installation that never selects an embedder never imports MLX, onnxruntime or numpy. The
-runtime is imported inside the backend's own ``setup``.
+an installation that never selects an embedder never imports onnxruntime or numpy. The runtime
+is imported inside the backend's own ``setup``.
 """
 
 from __future__ import annotations
@@ -14,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from manicule.container import keys
 from manicule.core.errors import ConfigError
-from manicule.embedding.config import EmbedderConfig, MlxEmbedderConfig
+from manicule.embedding.config import EmbedderConfig
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
 
 if TYPE_CHECKING:
@@ -23,12 +31,14 @@ if TYPE_CHECKING:
     from manicule.embedding.cards import ModelCard
     from manicule.plugins.registry import MetadataContext, MetadataFactory
 
-MLX_NAME = "mlx"
 ONNX_NAME = "onnx"
 
 
-def _card(context: BuildContext) -> tuple[ModelCard, EmbedderConfig]:
+def read_embedder_card(context: BuildContext) -> tuple[ModelCard, EmbedderConfig]:
     """Read the model's declaration at construction time.
+
+    Public because an out-of-tree backend needs it — ``manicule-mlx`` is the first — and a
+    second copy of this logic would be a second answer to "what does this model declare".
 
     Deliberately at construction rather than at first use. The chunker takes the embedder as a
     construction dependency and refuses to start when its token budget exceeds this model's
@@ -66,38 +76,11 @@ def _card(context: BuildContext) -> tuple[ModelCard, EmbedderConfig]:
     return card, settings
 
 
-def _build_mlx(context: BuildContext) -> Embedder:
-    # Deferred: this is where MLX and Metal are loaded.
-    from manicule.embedding.runtimes.mlx_backend import MEGABYTE, MlxEmbedder  # noqa: PLC0415
-
-    if not isinstance(context.config, MlxEmbedderConfig):
-        # Checked before anything is read, because the registry validates against the model a
-        # component registered and so this is the factory being called from outside the
-        # container. Falling back to the shared model's defaults would silently drop the cache
-        # bound, which is the one setting here that stops a run from taking the machine down.
-        msg = (
-            f"the mlx embedder was built with {type(context.config).__name__} where it "
-            f"declares {MlxEmbedderConfig.__name__}. Its cache bound would not be applied."
-        )
-        raise ConfigError(msg)
-    config = context.config
-    card, _ = _card(context)
-    embedding = context.settings.embedding
-    return MlxEmbedder(
-        card,
-        weights=config.weights,
-        weights_revision=config.weights_revision,
-        batch_size=embedding.batch_size,
-        cache_entries=embedding.cache_entries,
-        cache_limit_bytes=config.cache_limit_mb * MEGABYTE,
-    )
-
-
 def _build_onnx(context: BuildContext) -> Embedder:
     # Deferred: this is where onnxruntime is loaded.
     from manicule.embedding.runtimes.onnx_backend import OnnxEmbedder  # noqa: PLC0415
 
-    card, config = _card(context)
+    card, config = read_embedder_card(context)
     embedding = context.settings.embedding
     return OnnxEmbedder(
         card,
@@ -108,8 +91,14 @@ def _build_onnx(context: BuildContext) -> Embedder:
     )
 
 
-def _metadata_for(provider: str) -> MetadataFactory:
-    """Declare the exact configured vector space from local metadata only."""
+def embedder_metadata_factory(provider: str) -> MetadataFactory:
+    """Declare the exact configured vector space from local metadata only.
+
+    Parameterized by ``provider`` and public for the same reason as :func:`read_embedder_card`:
+    an out-of-tree backend has to produce a fingerprint the same way this one does, or two
+    backends would describe the same vector space differently and an index would refuse a
+    runtime that agrees with it.
+    """
 
     def metadata(context: MetadataContext) -> EmbedFingerprint:
         from manicule.embedding.artifacts import (  # noqa: PLC0415
@@ -160,23 +149,16 @@ class EmbeddingPlugin:
         name="embedding",
         version="0.1.0",
         core_version=">=0.1,<0.2",
-        summary="MLX and onnxruntime embedders, pooling in manicule's own numpy.",
+        summary="The onnxruntime embedder, pooling in manicule's own numpy.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:
         registry.add(
-            keys.EMBEDDER.named(MLX_NAME),
-            _build_mlx,
-            config_model=MlxEmbedderConfig,
-            metadata_factory=_metadata_for(MLX_NAME),
-            summary="Metal-native, in-process, on Apple Silicon. Pools from token states.",
-        )
-        registry.add(
             keys.EMBEDDER.named(ONNX_NAME),
             _build_onnx,
             config_model=EmbedderConfig,
-            metadata_factory=_metadata_for(ONNX_NAME),
-            summary="Portable, in-process, and the reference the MLX backend is measured "
+            metadata_factory=embedder_metadata_factory(ONNX_NAME),
+            summary="Portable, in-process, and the reference every other backend is measured "
             "against. Pools from token states.",
         )
 
@@ -187,4 +169,10 @@ PLUGIN = EmbeddingPlugin()
 # the protocol every installation loads it through.
 _plugin: Plugin = PLUGIN
 
-__all__ = ["MLX_NAME", "ONNX_NAME", "PLUGIN", "EmbeddingPlugin"]
+__all__ = [
+    "ONNX_NAME",
+    "PLUGIN",
+    "EmbeddingPlugin",
+    "embedder_metadata_factory",
+    "read_embedder_card",
+]

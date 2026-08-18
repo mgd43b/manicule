@@ -18,13 +18,21 @@ by a fingerprint rather than a note:
 
 ---
 
-## 1. Chunk size — 512 tokens, 64 overlap
+## 1. Chunk size — configurable, 512 tokens and 64 overlap by default
 
-**Decided: a 512-token budget on `embed_text`, 64 tokens of overlap, one budget for every
-block kind.**
+**Default: a 512-token final budget on `embed_text`, with up to 64 tokens of overlap and one
+budget for every block kind.** Installations may select another policy through the structural
+chunker's validated component configuration:
 
-This is a runtime guardrail, not a tuning knob. The reasoning below is the whole of the
-argument; if it stops holding, §1.8 says so explicitly.
+```toml
+[plugins.config."chunker.structural"]
+max_tokens = 768
+overlap_tokens = 96
+```
+
+`max_tokens` must be larger than the fixed 64-token breadcrumb reserve, `overlap_tokens` must
+be non-negative and smaller than `max_tokens`, and unknown fields are refused. Both values are
+part of `ChunkFingerprint`; changing either is a corpus migration, not an in-place tuning change.
 
 ### 1.1 The binding constraint is the embedder's context window
 
@@ -152,9 +160,17 @@ refusal would then wave through exactly what it exists to stop.
 below). The embedder sees `embed_text`. Therefore the model limit applies to `embed_text`,
 and a budget measured on `text` overflows by exactly the breadcrumb length.
 
+The 64-token breadcrumb reserve participates in packing, but the enforceable invariant is
+stronger than subtracting two nominal budgets:
+
+```text
+exact_tokenizer(chunk.embed_text) == chunk.token_count <= max_tokens
 ```
-max_tokens (512)  =  breadcrumb budget (64)  +  text budget (448)
-```
+
+The final count includes the rendered breadcrumb, block separators and admitted overlap. The
+renderer shrinks optional breadcrumb scaffolding or overlap before splitting source content, and
+hard-splits any remaining oversized atomic unit without dropping text. The same exact count is
+repeated after `after_chunk` middleware and immediately before embedding.
 
 The breadcrumb budget is reserved unconditionally, whether or not a given chunk has a
 breadcrumb. Reserving it conditionally would make chunk boundaries depend on heading depth,
@@ -196,7 +212,8 @@ Two rules make it behave:
   `LineAnchor` duplicates another chunk's lines, which breaks the tightness assertion in
   §3.3.
 - **Overlap is taken in whole units, never mid-sentence.** Fill backwards with complete
-  sentences until the next one would exceed 64 tokens. A window that cuts mid-sentence
+  sentences until the next one would exceed the configured overlap or make the complete next
+  `embed_text` exceed `max_tokens`. A window that cuts mid-sentence
   produces a chunk starting on a fragment, which is what the overlap was meant to avoid.
   **Where even one sentence exceeds the window, no overlap is taken.** A sentence is already
   the smallest whole unit available, so there is nothing smaller to fall back to — an
@@ -274,7 +291,7 @@ PDF library has touched. `grammars` escapes this only because the declared langu
 configuration, fixed before the run. So parser versions get their own fingerprint, per
 document, in §3.0.
 
-### 1.8 What would have to be true to change it
+### 1.8 How to evaluate and migrate another policy
 
 Both of these, not either:
 
@@ -286,8 +303,13 @@ Both of these, not either:
    other retrieval feature: no change without a measured gain on a fixed query set. #15
    exists partly for this.
 
-Absent both, 512/64 stands. And the cost of changing it is a full re-embed of the corpus,
-which the fingerprint makes an explicit, priced operation rather than an accident.
+Absent both, keep the 512/64 default. A selected policy change bumps the canonical chunk
+fingerprint and requires a retained-source rechunk plus re-embed of the workspace. Use
+`manicule rebuild plan SNAPSHOT_ID` to compare current/target identity, affected retained items,
+estimated chunk and embedding work, temporary capacity and missing bytes, then
+`manicule rebuild execute SNAPSHOT_ID`. The replacement is resumable and remains shadow state
+until every promoted source scope validates and publishes atomically; no connector or network
+fallback is available. Section 10.4 records that workflow.
 
 ---
 
@@ -555,7 +577,7 @@ path is ambiguous the block is `Unlocated(reason="notebook predates cell ids")`.
 notebook is still indexed and still cited at document level. Upgrading the notebook file
 fixes it, which is worth saying in the diagnostic.
 
-**`.msg` needs a GPL-3.0 parser, which the relicense permits.** §10, §12.
+**`.msg` has no permissively licensed maintained parser.** §10, §12.
 
 ### 2.6 Content that precedes the first heading
 
@@ -982,7 +1004,8 @@ The algorithm:
 
 1. **Start a new chunk at every `heading` block.** Headings are boundaries. A section is
    the natural retrieval unit and it is the unit the breadcrumb describes.
-2. **Accumulate consecutive blocks** while `embed_text` stays within budget. Blocks of
+2. **Accumulate consecutive blocks** while the exact final `embed_text` stays within budget,
+   including breadcrumb, separators and any overlap that can still fit. Blocks of
    different `kind` may share a chunk — a paragraph introducing a table belongs with it —
    but an atomic block (`table`, `code`) is never *partially* included.
 3. **Close the chunk** when the next block would exceed budget, or at the next `heading`,
@@ -1033,8 +1056,10 @@ header. If a **single cell** exceeds the budget, it is prose and splits as prose
 **Code — split at the highest AST boundary that fits.**
 
 Descend the tree-sitter parse tree: try top-level definitions first, then nested ones, then
-statement boundaries, then blank-line runs, then lines. Never split mid-token, mid-string
-or mid-comment.
+statement boundaries, then blank-line runs, then lines. If one newline-free line alone exceeds
+the final budget, the exact tokenizer deterministically hard-splits it at text boundaries. Every
+character is preserved, each part keeps the provable line span and symbol, and metadata records
+the hard split; syntax preservation is impossible for a minified line and is not falsely claimed.
 
 Splitting code costs nothing in provenance and gains something: each part gets its own real
 `LineAnchor`, with `symbol` set to the definition that part covers. A 900-line file becomes
@@ -1657,8 +1682,9 @@ not fail an ingest run. It is a normal outcome, counted and reported.
 
 ## 7. PDF
 
-**`pypdfium2` is the fast path.** Licensing is the reason the obvious choice is wrong, and it
-survives the GPL-3.0 relicense: PyMuPDF is **AGPL-3.0**, so combining with it would put AGPL
+**`pypdfium2` is the fast path.** Licensing is the reason the obvious choice is wrong, and the
+reason survived both of this project's relicenses: PyMuPDF is **AGPL-3.0**, so combining with
+it would put AGPL
 §13's network-source obligation onto everyone running manicule as a service. See §12.
 pypdfium2 is `Apache-2.0 OR BSD-3-Clause` and the pdfium it bundles is BSD-3-Clause — both
 permissive, and it is not slower in any way that shows up here. Its binary wheels ship a
@@ -2185,16 +2211,17 @@ Confluence connector does with page attachments
 ([`confluence.md`](connectors/confluence.md) §6), so a PDF is a PDF wherever it arrived
 from.
 
-**`.msg` was the one format whose obvious library was license-incompatible, and that has
-changed.** The maintained Python `.msg` parser, `extract-msg`, is GPL-3.0 — which was
-disqualifying under MIT and is an ordinary dependency now that manicule is GPL-3.0-or-later
-(§12). It is **not** the PyMuPDF case: GPL is not AGPL, and no network obligation follows.
+**`.msg` is the one format whose obvious library is license-incompatible.** The maintained
+Python `.msg` parser, `extract-msg`, is GPL-3.0, which is disqualifying for an MIT project (§12).
+It is **not** the PyMuPDF case — GPL is not AGPL, and no network obligation follows — but a
+copyleft dependency in `manicule` itself is refused regardless, because MIT that requires a
+footnote is not MIT.
 
-So **`extract-msg` is the route**, and [#21](https://github.com/mgd43b/manicule/issues/21) is
-a dependency plus a mapping rather than the hand-written property reader below.
+So [#21](https://github.com/mgd43b/manicule/issues/21) is **either a permissively licensed
+reader or the hand-written property reader below**, and not a one-line dependency either way.
 
-The permissive routes are kept on record, because they are what to reach for if `extract-msg`
-turns out to be unmaintained or wrong, not because the license forbids it. **`msg_parser` is
+The permissive routes below are therefore the plan rather than a fallback, and the license is
+exactly why. **`msg_parser` is
 BSD-2-Clause** and is a higher-level reader. Failing that, a `.msg` file is a compound-file
 (OLE/CFBF) container readable with **`olefile` (BSD-2-Clause)** — the same layer
 `extract-msg` itself sits on — holding MAPI properties as named streams. The ones that
@@ -2283,11 +2310,13 @@ Parsing is where this project's licenses get decided, because the best library f
 is repeatedly the one that cannot be used. Recorded together so the next person choosing a
 parser has the precedents rather than re-deriving them.
 
-**manicule is GPL-3.0-or-later** (`LICENSE`). It was MIT when most of this section was
-written, and the relicense — driven by the embedding runtime, see
-[`embeddings.md`](embeddings.md) §1.1 — changes two of the entries below and not the rest.
-The old reasoning is corrected here rather than left standing, because "rejected on license
-grounds" is exactly the kind of conclusion that outlives its premise.
+**manicule is MIT** (`LICENSE`). It was GPL-3.0-or-later for a period, driven by the embedding
+runtime — see [`embeddings.md`](embeddings.md) §1.1 — and is permissive again now that the
+runtime ships as its own distribution. **None of the entries below ends up anywhere different
+from where it started**, but one of them moved and came back, and the reasoning is recorded
+here rather than quietly restored: "rejected on license grounds" is exactly the kind of
+conclusion that outlives its premise, and a table that hides having been wrong once teaches
+nobody when to re-check it.
 
 | Dependency | License | Note |
 |---|---|---|
@@ -2295,21 +2324,32 @@ grounds" is exactly the kind of conclusion that outlives its premise.
 | **tree-sitter-language-pack** | MIT; grammars uniformly permissive by stated upstream policy | policy asserted at build time, not trusted (§8.1) |
 | **python-calamine**, **python-pptx**, **ruamel.yaml**, **markdown-it-py**, **olefile** | MIT / BSD-2-Clause | no obligations beyond attribution |
 | **selectolax** | wheel bundles **two** engines: lexbor (Apache-2.0) and Modest (**LGPL-2.1**) | import the lexbor backend only; see below |
-| **extract-msg** | GPL-3.0 | **now available.** GPL-3.0 in a GPL-3.0 project carries no extra obligation — see below |
-| **PyMuPDF** | **AGPL-3.0**, dual-licensed with an Artifex commercial license | **still rejected**, and the reason changed — see below |
+| **extract-msg** | GPL-3.0 | **rejected**, as it was originally — see below |
+| **PyMuPDF** | **AGPL-3.0**, dual-licensed with an Artifex commercial license | **rejected**, and for a reason that outlived two relicenses — see below |
 
-### `extract-msg` is unblocked, and #21 gets much simpler
+### `extract-msg` is rejected, and the round trip is the interesting part
 
-It was rejected for being GPL-3.0 in an MIT project. That premise is gone: GPL-3.0 code in a
-GPL-3.0-or-later project is an ordinary dependency with no additional obligation. §10's
-hand-written MAPI property reader was work created entirely by the old license, and
-[#21](https://github.com/mgd43b/manicule/issues/21) is updated to say so rather than left
-carrying stale reasoning.
+It was rejected for being GPL-3.0 in an MIT project, admitted while this project was itself
+GPL-3.0-or-later, and is rejected again now that it is MIT. The dependency never changed. What
+changed twice was the license underneath it, and the answer followed each time — which is the
+whole reason this section exists.
 
-### PyMuPDF is *not* unblocked, and the PDF decision does not change
+That is worth recording rather than tidying away, because it is the argument for the package
+split in miniature. The version of this project that admitted `extract-msg` had bought one
+`.msg` parser at the price of making every distributed plugin a derivative work. Splitting the
+one dependency that actually needed copyleft — the MLX backend — costs a second `uv pip install`
+and buys the permissive license back for everything else.
 
-This is the correction that matters most, because the obvious inference from "we are GPL now"
-is wrong. **PyMuPDF is AGPL-3.0, not GPL-3.0.**
+So §10's permissive routes are the plan, and
+[#21](https://github.com/mgd43b/manicule/issues/21) is a BSD-licensed reader or a hand-written
+MAPI property reader.
+
+### PyMuPDF is refused under every license this project has carried
+
+**PyMuPDF is AGPL-3.0, not GPL-3.0**, and that distinction is why this decision never moved
+while everything around it did. Under MIT it is refused for the plain reason every copyleft
+dependency now is. But it was refused during the GPL period too, when `extract-msg` was not —
+and the reason it survived that window is the one worth keeping.
 
 GPLv3 §13 does permit combining a GPL-3.0 work with AGPL-3.0 code. But it says what the
 combination becomes: the AGPL portion keeps §13's network clause, so **anyone who runs the
@@ -2329,17 +2369,28 @@ operator an obligation they did not choose. **`pypdfium2` stays.**
 Both engines ship as separate compiled objects in the same wheel, so importing only the
 permissive backend still means an LGPL-2.1 binary is present on disk. That is not a problem
 for manicule as distributed — the wheel is resolved from PyPI by the user's installer,
-unmodified, and dynamic use of an LGPL library is exactly what LGPL permits, more comfortably
-now than under MIT. It would become an obligation if manicule ever shipped a bundled or
+unmodified, and dynamic use of an LGPL library is exactly what LGPL permits. That was true under
+MIT, true under GPL-3.0-or-later, and is true under MIT again: this one never depended on the
+project's own license. It would become an obligation if manicule ever shipped a bundled or
 frozen distribution containing that binary, and that is the moment to revisit.
 
 ### The rule, restated
 
-The old rule was "a copyleft dependency is rejected at selection time". That was right for an
-MIT project and is too blunt for this one. What survives is the part that was doing the work:
-**a license obligation is decided at selection time, not worked around later — and an
-obligation that falls on the operator rather than on us is the one to refuse.** That is why
-GPL is now ordinary, and AGPL still is not.
+"A copyleft dependency is rejected at selection time" is the rule again, and this section is
+the record of it being relaxed and then re-tightened rather than a claim it was never in doubt.
+
+Two things survive both moves, and they are what actually decide the cases above:
+
+**A license obligation is decided at selection time, not worked around later.** Every entry in
+the table was settled before the library was written against, which is why none of the three
+license changes required unpicking any code.
+
+**An obligation that falls on the operator rather than on us is refused outright.** That is the
+AGPL rule, and it is stricter than the copyleft rule rather than a special case of it: PyMuPDF
+would be refused even if manicule were GPL-3.0-or-later, and it was.
+
+What the split adds is a third: **a dependency that genuinely needs copyleft gets its own
+distribution, not a relicense of this one.** `packages/manicule-mlx` is the worked example.
 
 ---
 

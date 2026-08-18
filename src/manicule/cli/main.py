@@ -395,6 +395,11 @@ auth_app = typer.Typer(
 collection_app = typer.Typer(
     help="Named sets of documents.", no_args_is_help=True, cls=CommandsShareTheRootOptions
 )
+collection_rule_app = typer.Typer(
+    help="Show, replace, or clear evaluated collection membership rules.",
+    no_args_is_help=True,
+    cls=CommandsShareTheRootOptions,
+)
 reembed_app = typer.Typer(
     help="Offline, resumable whole-index embedding migration.",
     no_args_is_help=True,
@@ -407,6 +412,7 @@ rebuild_app = typer.Typer(
 )
 app.add_typer(document_app, name="document")
 app.add_typer(collection_app, name="collection")
+collection_app.add_typer(collection_rule_app, name="rule")
 app.add_typer(connector_app, name="connector")
 app.add_typer(workspace_app, name="workspace")
 app.add_typer(plugin_app, name="plugin")
@@ -645,6 +651,9 @@ PAYLOADS: dict[str, type[Payload]] = {
     "collection_list": r.CollectionList,
     "collection_rename": r.CollectionSummary,
     "collection_update": r.CollectionSummary,
+    "collection_rule_show": r.CollectionSummary,
+    "collection_rule_set": r.CollectionSummary,
+    "collection_rule_clear": r.CollectionSummary,
     "collection_delete": r.CollectionDeleted,
     "collection_add": r.CollectionMembership,
     "collection_remove": r.CollectionMembership,
@@ -1046,13 +1055,73 @@ def rebuild_status(
 # --- collection -------------------------------------------------------------------------------
 
 
+def _collection_rule_arguments(
+    *,
+    sources: list[str] | None,
+    media_types: list[str] | None,
+    tag_ids: list[str] | None,
+    updated_after: str | None,
+    updated_before: str | None,
+    optional: bool,
+) -> dict[str, JsonValue] | None:
+    """Serialize CLI syntax; the command binder applies the one canonical rule validation."""
+    rule: dict[str, JsonValue] = {}
+    if sources:
+        rule["sources"] = cast("JsonValue", sources)
+    if media_types:
+        rule["media_types"] = cast("JsonValue", media_types)
+    if tag_ids:
+        rule["tag_ids"] = cast("JsonValue", tag_ids)
+    if updated_after is not None:
+        rule["updated_after"] = updated_after
+    if updated_before is not None:
+        rule["updated_before"] = updated_before
+    return None if optional and not rule else rule
+
+
 @collection_app.command("create")
-def collection_create(
+def collection_create(  # noqa: PLR0917 - each selector is intentionally a first-class CLI option
     name: Annotated[str, typer.Argument(help="The collection's name.")],
     description: Annotated[str | None, typer.Option(help="What this collection is for.")] = None,
+    source: Annotated[
+        list[str] | None,
+        typer.Option("--source", help="Select documents from this source; repeatable."),
+    ] = None,
+    media_type: Annotated[
+        list[str] | None,
+        typer.Option("--media-type", help="Select this media type; repeatable."),
+    ] = None,
+    tag_id: Annotated[
+        list[str] | None,
+        typer.Option("--tag-id", help="Select documents carrying this tag; repeatable."),
+    ] = None,
+    updated_after: Annotated[
+        str | None,
+        typer.Option(help="Select documents updated after this timezone-aware ISO timestamp."),
+    ] = None,
+    updated_before: Annotated[
+        str | None,
+        typer.Option(help="Select documents updated before this timezone-aware ISO timestamp."),
+    ] = None,
 ) -> None:
     """Create a collection. A name already in use is refused rather than merged."""
-    submit(Command("collection_create", {"name": name, "description": description}))
+    submit(
+        Command(
+            "collection_create",
+            {
+                "name": name,
+                "description": description,
+                "rule": _collection_rule_arguments(
+                    sources=source,
+                    media_types=media_type,
+                    tag_ids=tag_id,
+                    updated_after=updated_after,
+                    updated_before=updated_before,
+                    optional=True,
+                ),
+            },
+        )
+    )
 
 
 @collection_app.command("list")
@@ -1086,6 +1155,56 @@ def collection_update(
     submit(
         Command("collection_update", {"collection_id": collection_id, "description": description})
     )
+
+
+@collection_rule_app.command("show")
+def collection_rule_show(
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+) -> None:
+    """Show the stored rule without evaluating or materializing its membership."""
+    emit("collection_rule_show", lambda service: service.collection_rule_show(collection_id))
+
+
+@collection_rule_app.command("set")
+def collection_rule_set(  # noqa: PLR0917 - each selector is intentionally a first-class CLI option
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+    source: Annotated[list[str] | None, typer.Option("--source", help="Repeatable source.")] = None,
+    media_type: Annotated[
+        list[str] | None, typer.Option("--media-type", help="Repeatable media type.")
+    ] = None,
+    tag_id: Annotated[list[str] | None, typer.Option("--tag-id", help="Repeatable tag id.")] = None,
+    updated_after: Annotated[
+        str | None, typer.Option(help="Timezone-aware ISO lower update bound.")
+    ] = None,
+    updated_before: Annotated[
+        str | None, typer.Option(help="Timezone-aware ISO upper update bound.")
+    ] = None,
+) -> None:
+    """Replace the rule completely; at least one restricting selector is required."""
+    submit(
+        Command(
+            "collection_rule_set",
+            {
+                "collection_id": collection_id,
+                "rule": _collection_rule_arguments(
+                    sources=source,
+                    media_types=media_type,
+                    tag_ids=tag_id,
+                    updated_after=updated_after,
+                    updated_before=updated_before,
+                    optional=False,
+                ),
+            },
+        )
+    )
+
+
+@collection_rule_app.command("clear")
+def collection_rule_clear(
+    collection_id: Annotated[str, typer.Argument(help="The collection id.")],
+) -> None:
+    """Clear the rule while preserving manually added documents."""
+    submit(Command("collection_rule_clear", {"collection_id": collection_id}))
 
 
 @collection_app.command("delete")

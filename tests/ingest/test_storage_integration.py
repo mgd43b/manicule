@@ -12,17 +12,23 @@ import asyncio
 import hashlib
 import json
 import resource
+import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
 from sqlalchemy import text
 
+from manicule.app import control
 from manicule.app.dispatch import run_op
+from manicule.app.served import ControlHandler
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpiredError
+from manicule.connectors.config import FullInventoryAuthority
+from manicule.connectors.confluence import ConfluenceConnector
+from manicule.connectors.sessions import SessionVault
 from manicule.core.acquisition import (
     AcquiredSource,
     AcquisitionDiagnostic,
@@ -31,6 +37,7 @@ from manicule.core.acquisition import (
     AcquisitionInventoryState,
     AcquisitionRecord,
     AcquisitionRecordState,
+    AcquisitionRun,
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
@@ -54,7 +61,7 @@ from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.middleware import MiddlewareRunner
-from manicule.ingest.pipeline import IngestPipeline
+from manicule.ingest.pipeline import IngestPipeline, RunReport, Watching
 from manicule.ingest.rebuild import build_offline_rebuilder
 from manicule.ingest.recovery import requeue_interrupted
 from manicule.ingest.reembed import ReembedState, resume_reembed, start_reembed
@@ -70,7 +77,10 @@ from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.models import FTS_TOKENIZER
 from manicule.storage.rebuild import SqliteRebuildStore
 from manicule.storage.vectors import LanceVectorStore
-from tests.app.fakes import FakeBackend
+from tests.app.fakes import FakeBackend, FakeIngestion
+from tests.connectors.fake_confluence import FakeConfluence, FakePage
+from tests.connectors.support import Clock as ConfluenceClock
+from tests.connectors.support import client_for, cloud_config, connected, server_config
 from tests.fakes import HashEmbedder
 from tests.ingest import fakes
 from tests.ingest.test_shadow_reembed import Authority, Corpus, CountingEmbedder
@@ -657,14 +667,22 @@ async def test_hard_delete_tombstones_the_active_physical_vectors(
         [[0.3] * HashEmbedder().fingerprint.dimension],
         publication_id=doomed_document.publication_id,
     )
-    physical.add(vector_id(doomed_document.publication_id, doomed_chunk.id))
+    doomed_physical = vector_id(doomed_document.publication_id, doomed_chunk.id)
     async with engine.begin() as connection:
         await connection.execute(text("DELETE FROM workspaces WHERE id = 'doomed'"))
 
     await store.delete_document(document.id)
     tombstones = set(await store.take_tombstones(20))
     assert physical <= tombstones
+    async with engine.connect() as connection:
+        all_tombstones = set(
+            (await connection.execute(text("SELECT chunk_id FROM vector_tombstones"))).scalars()
+        )
+    assert doomed_physical in all_tombstones
+    assert doomed_physical not in tombstones, "one workspace cannot claim another's cleanup"
     await sweep_vectors(store, vectors)
+    assert await vectors.count() == 1
+    await vectors.delete_chunks([doomed_physical])
     assert await vectors.count() == 0
     await vectors.teardown()
 
@@ -711,7 +729,18 @@ async def test_a_legacy_tombstone_survives_a_publication_to_publication_flip(
     assert second is not None
     assert second.publication_id != first.publication_id
     assert [chunk.id for chunk in await store.document_chunks(second.id)] == [legacy_id]
-    assert legacy_id in await store.take_tombstones(20)
+    assert legacy_id not in await store.take_tombstones(20)
+    async with engine.connect() as connection:
+        unowned = (
+            await connection.execute(
+                text(
+                    "SELECT count(*) FROM vector_tombstones "
+                    "WHERE chunk_id = :chunk_id AND workspace_id IS NULL"
+                ),
+                {"chunk_id": legacy_id},
+            )
+        ).scalar_one()
+    assert unowned == 1, "an unattributable legacy cleanup record must remain protected"
     await vectors.teardown()
 
 
@@ -1063,6 +1092,129 @@ async def test_capacity_only_exception_group_releases_lease_for_immediate_retry(
     pipeline.refusing = False
     resumed = await pipeline.run(connector)
     assert resumed.error == ""
+
+
+async def test_busy_terminal_release_is_fenced_for_immediate_pipeline_retry(
+    engine: AsyncEngine,
+    data_dir: Path,
+    tmp_path: Path,
+) -> None:
+    class BusyTerminalStore(SqliteDocStore):
+        fail_terminal = True
+        terminal_call = False
+
+        @override
+        async def _begin_capacity_guard(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, session: AsyncSession
+        ) -> None:
+            if self.terminal_call:
+                error = sqlite3.OperationalError("UPDATE private terminal metadata")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
+            await super()._begin_capacity_guard(session)
+
+        @override
+        async def record_acquisition_run_metadata(
+            self,
+            run_id: str,
+            owner: str,
+            generation: int,
+            *,
+            now: datetime,
+            updates: Mapping[str, Any],
+            release: bool,
+        ) -> bool:
+            self.terminal_call = self.fail_terminal and release
+            try:
+                return await super().record_acquisition_run_metadata(
+                    run_id,
+                    owner,
+                    generation,
+                    now=now,
+                    updates=updates,
+                    release=release,
+                )
+            finally:
+                if self.terminal_call:
+                    self.fail_terminal = False
+                self.terminal_call = False
+
+    store = BusyTerminalStore(engine)
+    await store.ensure_workspace()
+
+    class RetryPipeline(IngestPipeline):
+        seed_private_glossary = True
+
+        @override
+        async def _drive(self, run: Any) -> None:
+            if self.seed_private_glossary:
+                run.report.glossary_failures.append(
+                    "private-document-id from private-source-id: glossary detection failed for "
+                    "https://private.invalid/source?token=fake-secret-cinder"
+                )
+                return
+            await super()._drive(run)
+
+    chunker = fakes.BlockChunker()
+    pipeline = RetryPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir, min_disk_headroom_bytes=1),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner([]),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+    connector = fakes.DictConnector({"public-retry": "public body"})
+
+    first = await pipeline.run(connector)
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+
+    assert first.error_type == "StorageBusyError"
+    assert first.glossary_failures == []
+    assert durable is not None
+    assert durable.lease_owner is not None, "the injected external writer prevented persistence"
+
+    backend = FakeBackend()
+    backend.ingestion_.report = first
+    backend.settings.connectors[connector.name] = ConnectorSettings.model_validate(
+        {"type": "filesystem", "options": {"root": "."}}
+    )
+    service = ApplicationService(backend)
+    path = control.socket_path(tmp_path)
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+    await server.start()
+    try:
+        envelope = await control.connect(
+            path,
+            control.Invoke(op="connector_sync", arguments={"name": connector.name, "limit": None}),
+            on_progress=lambda _: None,
+        )
+    finally:
+        await server.aclose()
+
+    assert envelope["ok"] is False
+    assert cast("dict[str, Any]", envelope["error"])["type"] == "StorageBusyError"
+    assert cast("dict[str, Any]", envelope["data"])["retry_required"] is True
+    public = json.dumps(
+        {"report": first.as_metadata(), "envelope": envelope}, sort_keys=True
+    ).lower()
+    for private in (
+        "private-document-id",
+        "private-source-id",
+        "private.invalid",
+        "fake-secret-cinder",
+        "token=",
+    ):
+        assert private not in public
+
+    pipeline.seed_private_glossary = False
+    resumed = await pipeline.run(connector)
+    assert resumed.error == ""
     assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
@@ -1368,6 +1520,289 @@ async def test_bounded_acquire_only_prefix_is_not_reported_as_offline_derivation
     assert await store.count_documents() == 0
 
 
+async def test_real_confluence_pages_admit_10251_records_to_true_end(
+    engine: AsyncEngine,
+) -> None:
+    """The real HTTP/page adapter and SQLite journal cross forty exact 250 boundaries."""
+
+    class EnumerationObservedError(RuntimeError):
+        pass
+
+    clock = ConfluenceClock()
+
+    class MeasuredJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine, max_journal_records=20_000)
+            self.batch_sizes: list[int] = []
+            self.scalar_appends = 0
+            self.completions = 0
+
+        @override
+        async def append_acquisition_record(
+            self,
+            run_id: str,
+            sequence: int,
+            source: AcquisitionSource,
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> AcquisitionRecord:
+            self.scalar_appends += 1
+            return await super().append_acquisition_record(
+                run_id,
+                sequence,
+                source,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+
+        @override
+        async def append_acquisition_records(
+            self,
+            run_id: str,
+            sequence: int,
+            sources: Sequence[AcquisitionSource],
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> Sequence[AcquisitionRecord]:
+            admitted = await super().append_acquisition_records(
+                run_id,
+                sequence,
+                sources,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+            self.batch_sizes.append(len(sources))
+            clock.advance(0.1)
+            return admitted
+
+        @override
+        async def complete_acquisition_enumeration(
+            self,
+            run_id: str,
+            candidate_watermark: Watermark | None,
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> AcquisitionRun:
+            self.completions += 1
+            return await super().complete_acquisition_enumeration(
+                run_id,
+                candidate_watermark,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+
+    class EnumerationPipeline(IngestPipeline):
+        async def _acquire_journal(self, run: object) -> bool:  # type: ignore[override]
+            del run
+            raise EnumerationObservedError
+
+    total = 10_251
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id=f"synthetic-{number:05d}",
+                title=f"Public synthetic {number}",
+                space="ENG",
+            )
+            for number in range(total)
+        ],
+        page_size=250,
+    )
+    config = cloud_config(
+        base_url=instance.base_url,
+        spaces=["ENG"],
+        include_attachments=False,
+        page_size=250,
+        cursor_lifetime_seconds=0.2,
+    )
+    _, client = client_for(instance, config, clock=clock)
+    connector = ConfluenceConnector(config, client, name="synthetic-large-wiki")
+    store = MeasuredJournal()
+    await store.ensure_workspace()
+    await connector.setup()
+    try:
+        report = await EnumerationPipeline(store=store, acquisitions=store).run(
+            connector, acquire_only=True
+        )
+    finally:
+        await connector.teardown()
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert report.error_type == "EnumerationObservedError"
+    assert durable.discovered_count == total
+    assert durable.enumeration_completed_at is not None
+    connector_watermark = connector.watermark
+    assert connector_watermark is not None
+    assert durable.candidate_watermark is not None
+    assert durable.candidate_watermark.value == connector_watermark.value
+    assert durable.candidate_watermark.metadata == connector_watermark.metadata
+    assert store.completions == 1
+    assert store.scalar_appends == 0, "native Confluence pages must use atomic batch admission"
+    assert store.batch_sizes == [250] * 41 + [1]
+    assert max(store.batch_sizes) == 250
+    search_requests = [
+        request
+        for request in instance.requests
+        if request.url.path.endswith("/rest/api/content/search")
+    ]
+    assert len(search_requests) == 42
+    assert clock.now == pytest.approx(4.2)
+
+
+async def test_nonbatched_connector_uses_the_dedicated_scalar_admission(
+    engine: AsyncEngine,
+) -> None:
+    """A singleton compatibility wrapper is not a native source-page capability."""
+
+    class EnumerationObservedError(RuntimeError):
+        pass
+
+    class DispatchJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.scalar_appends = 0
+            self.batch_appends = 0
+
+        @override
+        async def append_acquisition_record(
+            self,
+            run_id: str,
+            sequence: int,
+            source: AcquisitionSource,
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> AcquisitionRecord:
+            self.scalar_appends += 1
+            return await super().append_acquisition_record(
+                run_id,
+                sequence,
+                source,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+
+        @override
+        async def append_acquisition_records(
+            self,
+            run_id: str,
+            sequence: int,
+            sources: Sequence[AcquisitionSource],
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> Sequence[AcquisitionRecord]:
+            self.batch_appends += 1
+            return await super().append_acquisition_records(
+                run_id,
+                sequence,
+                sources,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+
+    class EnumerationPipeline(IngestPipeline):
+        async def _acquire_journal(self, run: object) -> bool:  # type: ignore[override]
+            del run
+            raise EnumerationObservedError
+
+    journal = DispatchJournal()
+    await journal.ensure_workspace()
+    report = await EnumerationPipeline(store=journal, acquisitions=journal).run(
+        fakes.DictConnector({"one": "public one", "two": "public two"}),
+        acquire_only=True,
+    )
+
+    assert report.error_type == "EnumerationObservedError"
+    assert journal.scalar_appends == 2
+    assert journal.batch_appends == 0
+
+
+async def test_cancellation_after_page_commit_does_not_request_the_next_cursor(
+    engine: AsyncEngine,
+) -> None:
+    """The stop barrier is before ``anext`` rather than after a discarded response."""
+
+    class PausedJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.committed = asyncio.Event()
+            self.release = asyncio.Event()
+
+        @override
+        async def append_acquisition_records(
+            self,
+            run_id: str,
+            sequence: int,
+            sources: Sequence[AcquisitionSource],
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> Sequence[AcquisitionRecord]:
+            admitted = await super().append_acquisition_records(
+                run_id,
+                sequence,
+                sources,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+            self.committed.set()
+            await self.release.wait()
+            return admitted
+
+    class StopObservedPipeline(IngestPipeline):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.stopping = asyncio.Event()
+
+        @override
+        async def _stop_within_grace(self, run: Any, stages: asyncio.Task[None]) -> None:
+            run.stop.set()
+            self.stopping.set()
+            await super()._stop_within_grace(run, stages)
+
+    journal = PausedJournal()
+    await journal.ensure_workspace()
+    pipeline = StopObservedPipeline(store=journal, acquisitions=journal)
+    connector = fakes.ExpiringCursorConnector(
+        {f"synthetic-{number}": "public" for number in range(4)},
+        clock=fakes.ManualClock(),
+        page_size=2,
+        cursor_lifetime_seconds=60,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector, acquire_only=True))
+    await journal.committed.wait()
+    assert connector.pages_requested == 1
+    task.cancel()
+    await pipeline.stopping.wait()
+    journal.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert connector.pages_requested == 1
+    durable = await journal.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == 2
+    assert durable.enumeration_completed_at is None
+
+
 async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_cursor(  # noqa: PLR0915 - one end-to-end evidence record
     store: SqliteDocStore,
     engine: AsyncEngine,
@@ -1417,7 +1852,20 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     task = asyncio.create_task(pipeline.run(connector))
     try:
         await connector.enumeration_completed.wait()
-        await embedder.gate.wait_for(1, patience_s=60)
+        # **Sixty seconds was a budget calibrated on the wrong machine.** This gate does not open
+        # until a document has crossed the whole pipeline, and on the durable path every one of
+        # the 1,000 documents is acquired before indexing starts — so the wait is behind 1,000
+        # fetches and their retention, not behind one. Measured from `enumeration_completed` to
+        # the first arrival: 14.2s on a 16-core developer machine. Against a 60s budget that is
+        # a 4x margin, and CI's two-core runners are more than 4x slower at exactly this shape
+        # of work. It failed there, reporting zero arrivals.
+        #
+        # `patience_s` is "how long the test is willing to be wrong for" rather than a timeout on
+        # anything under test, and it only elapses when the test is *already* failing — so a
+        # generous number costs nothing on a green run and buys back a false failure. What it
+        # costs is that a genuine deadlock takes this long to report, which is the right trade
+        # for a stage that is legitimately slow.
+        await embedder.gate.wait_for(1, patience_s=300)
 
         durable = await store.latest_unsettled_acquisition_run(connector.name)
         assert durable is not None
@@ -1773,9 +2221,11 @@ async def test_crash_during_enumeration_keeps_only_the_committed_prefix(
     assert await store.get_watermark(connector.name) is None
 
 
+@pytest.mark.parametrize("release_busy", [False, True])
 async def test_crash_after_enumeration_preserves_the_marker_records_and_candidate(
     engine: AsyncEngine,
     data_dir: Path,
+    release_busy: bool,
 ) -> None:
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
 
@@ -1784,6 +2234,32 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
             super().__init__(engine)
             self.reader_arrived = asyncio.Event()
             self.release_reader = asyncio.Event()
+            self.releasing = False
+
+        @override
+        async def _begin_capacity_guard(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, session: AsyncSession
+        ) -> None:
+            if self.releasing:
+                error = sqlite3.OperationalError("UPDATE private cancellation cleanup")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
+            await super()._begin_capacity_guard(session)
+
+        @override
+        async def release_acquisition_lease(
+            self,
+            run_id: str,
+            owner: str,
+            generation: int,
+            *,
+            now: datetime,
+        ) -> bool:
+            self.releasing = release_busy
+            try:
+                return await super().release_acquisition_lease(run_id, owner, generation, now=now)
+            finally:
+                self.releasing = False
 
         @override
         async def list_acquisition_records(
@@ -1845,6 +2321,7 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     assert durable.discovered_count == 10
     assert durable.enumeration_completed_at is not None
     assert durable.candidate_watermark == connector.watermark
+    assert (durable.lease_owner is not None) is release_busy
     records = await store.list_acquisition_records(durable.id)
     assert len(records) == 10
     assert {record.state for record in records} == {AcquisitionRecordState.DISCOVERED}
@@ -1852,11 +2329,6 @@ async def test_crash_after_enumeration_preserves_the_marker_records_and_candidat
     assert await store.get_watermark(connector.name) is None
 
     pages_before_resume = connector.pages_requested
-    with pytest.raises(RuntimeError, match="could not be claimed"):
-        await pipeline().run(connector)
-    assert connector.pages_requested == pages_before_resume
-
-    lease_clock.advance(301)
     resumed = await pipeline().run(connector)
 
     assert connector.pages_requested == pages_before_resume, "the source was rediscovered"
@@ -2325,9 +2797,19 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
 
         @override
         async def fenced_stage_vectors(
-            self, fence: AcquisitionFence, publication_id: str, chunks: Sequence[Chunk]
+            self,
+            fence: AcquisitionFence,
+            publication_id: str,
+            chunks: Sequence[Chunk],
+            *,
+            expected_reset_epoch: int | None = None,
         ) -> None:
-            await super().fenced_stage_vectors(fence, publication_id, chunks)
+            await super().fenced_stage_vectors(
+                fence,
+                publication_id,
+                chunks,
+                expected_reset_epoch=expected_reset_epoch,
+            )
             self.staged.set()
             await self.release_stage.wait()
 
@@ -3351,6 +3833,252 @@ async def test_source_deleted_reenumerates_and_reuses_the_retained_prefix(
 
 
 @pytest.mark.parametrize(
+    ("documents", "remove_missing_identity", "poll_status"),
+    [
+        pytest.param(8_001, True, True, id="eight-thousand-reuses-with-polling"),
+        pytest.param(8_001, False, False, id="eight-thousand-still-missing-without-polling"),
+    ],
+)
+async def test_served_source_deletion_recovery_reuses_exact_evidence_and_keeps_server_healthy(  # noqa: PLR0915, PLR0917 - end-to-end acceptance matrix
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    documents: int,
+    remove_missing_identity: bool,
+    poll_status: bool,
+) -> None:
+    """The large recovery and its next connector cross the real control socket."""
+
+    class RecoveringConnector(fakes.DictConnector):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    f"synthetic-{index:05d}": "public shared retained body"
+                    for index in range(documents)
+                },
+                name=f"served-recovery-{documents}",
+            )
+            self.missing = f"synthetic-{documents - 1:05d}"
+            self.discovery_pass = 0
+            self.attempts: list[str] = []
+            self._watermark = Watermark(
+                value=f"served-candidate-{documents}",
+                observed_at=datetime(2026, 8, 17, tzinfo=UTC),
+            )
+
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return self._watermark
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.discovery_pass += 1
+            async for discovered in super().discover(watermark):
+                yield discovered
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            self.attempts.append(ref.source_id)
+            if ref.source_id == self.missing:
+                raise NotFoundError("synthetic source item is no longer available")
+            if self.discovery_pass > 1:
+                raise AssertionError("exact retained survivors must not be fetched again")
+            return await super().fetch(ref)
+
+    connector = RecoveringConnector()
+    next_connector = fakes.DictConnector(
+        {"public-next": "public next body"}, name=f"served-next-{documents}"
+    )
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir, min_disk_headroom_bytes=1),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            fetch_concurrency=8,
+            acquisition_lease_s=1_800,
+            detect_glossary=False,
+        )
+
+    first = await pipeline().run(connector, acquire_only=True)
+
+    # **Which half failed, when this run comes back with no deletion recorded.** This test has
+    # failed intermittently in CI — roughly one run in four, across both parametrizations, both
+    # Python versions and different shards — reporting `snapshot_omission_reasons == {}`. Empty,
+    # not wrong: no omission of any kind was recorded.
+    #
+    # That is reachable two ways, and the report alone cannot tell them apart.
+    # `_report_snapshot_omissions` runs only when `_acquire_journal` reports incomplete coverage,
+    # and that reports complete when no record is left in DISCOVERED/ACQUIRING/RETRY without a
+    # blob. A `NotFoundError` fetch parks the record in RETRY with no blob, so a run that reached
+    # the deleted document cannot report complete. Either the deleted document was never reached
+    # — enumeration or dispatch stopped short of the 8001st item — or it was reached and its
+    # outcome was lost afterwards. The remedies are in different subsystems.
+    #
+    # `attempts` is appended in `fetch` before the raise, so it answers exactly that question and
+    # costs nothing. It is asserted first so the failure names the half rather than leaving the
+    # next reader with the same fork this comment describes.
+    assert connector.missing in connector.attempts, (
+        f"the deleted document {connector.missing!r} was never fetched, so this run could not "
+        f"have observed the deletion at all — {len(connector.attempts)} of {documents} documents "
+        f"were attempted, over {connector.discovery_pass} discovery pass(es). The run stopped "
+        f"short rather than losing the outcome: look at enumeration and dispatch, not at how the "
+        f"omission was recorded."
+    )
+    assert first.snapshot_omission_reasons == {"source_deleted": 1}, (
+        "the first run must reach its typed deletion outcome before inventory is inspected. "
+        f"The deleted document *was* fetched ({connector.missing!r} is in attempts), so the "
+        f"deletion was observed and then lost between the fetch and the report — look at the "
+        f"record's state transition and at _report_snapshot_omissions, not at enumeration."
+    )
+    predecessor = await store.latest_unsettled_acquisition_run(connector.name)
+    assert predecessor is not None
+    assert predecessor.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
+    if remove_missing_identity:
+        del connector.documents[connector.missing]
+
+    reuse_arrived = asyncio.Event()
+    release_reuse = asyncio.Event()
+    gate_reuse = True
+    original_transition = store.transition_acquisition_record
+
+    async def gated_transition(
+        run_id: str,
+        source_id: str,
+        expected: AcquisitionRecordState,
+        target: AcquisitionRecordState,
+        **kwargs: Any,
+    ) -> AcquisitionRecord:
+        nonlocal gate_reuse
+        if (
+            gate_reuse
+            and expected is AcquisitionRecordState.ACQUIRING
+            and target is AcquisitionRecordState.ACQUIRED
+            and kwargs.get("snapshot_outcome") is SnapshotItemOutcome.REUSED
+        ):
+            reuse_arrived.set()
+            await release_reuse.wait()
+        return await original_transition(run_id, source_id, expected, target, **kwargs)
+
+    monkeypatch.setattr(store, "transition_acquisition_record", gated_transition)
+    recovery_connector = connector
+
+    class PipelineIngestion(FakeIngestion):
+        @override
+        async def sync(
+            self,
+            connector: str,
+            *,
+            limit: int | None = None,
+            watching: Watching | None = None,
+            acquire_only: bool = False,
+        ) -> RunReport:
+            del watching
+            selected = (
+                recovery_connector if connector == recovery_connector.name else next_connector
+            )
+            return await pipeline().run(selected, limit=limit, acquire_only=acquire_only)
+
+        @override
+        async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
+            active = await store.latest_unsettled_acquisition_run(connector)
+            return None if active is None else (active, False)
+
+    backend = FakeBackend()
+    backend.store = cast("Any", store)
+    backend.ingestion_ = PipelineIngestion()
+    for name in (connector.name, next_connector.name):
+        backend.settings.connectors[name] = ConnectorSettings.model_validate(
+            {"type": "filesystem", "options": {"root": "."}}
+        )
+    service = ApplicationService(backend)
+    path = control.socket_path(tmp_path)
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+    await server.start()
+    try:
+        recovery = asyncio.create_task(
+            control.connect(
+                path,
+                control.Invoke(
+                    op="connector_sync",
+                    arguments={"name": connector.name, "limit": None, "acquire_only": True},
+                ),
+                on_progress=lambda _: None,
+            )
+        )
+        await asyncio.wait_for(reuse_arrived.wait(), timeout=120)
+        if poll_status:
+            snapshot_envelope, listing_envelope = await asyncio.gather(
+                control.connect(
+                    path,
+                    control.Invoke(op="snapshot_status", arguments={"name": connector.name}),
+                    on_progress=lambda _: None,
+                ),
+                control.connect(
+                    path,
+                    control.Invoke(op="connector_list"),
+                    on_progress=lambda _: None,
+                ),
+            )
+            assert snapshot_envelope["ok"] is True
+            snapshot_data = cast("dict[str, Any]", snapshot_envelope["data"])
+            lifecycle = cast("dict[str, Any]", snapshot_data["lifecycle"])
+            assert cast("int", lifecycle["reused_items"]) < documents
+            assert listing_envelope["ok"] is True
+            listing_data = cast("dict[str, Any]", listing_envelope["data"])
+            connectors = cast("list[dict[str, Any]]", listing_data["connectors"])
+            assert {summary["name"] for summary in connectors} == {
+                connector.name,
+                next_connector.name,
+            }
+        gate_reuse = False
+        release_reuse.set()
+        envelope = await asyncio.wait_for(recovery, timeout=180)
+
+        replacement = await store.latest_unsettled_acquisition_run(connector.name)
+        assert replacement is not None
+        survivors = documents - 1
+        assert replacement.reused_count == survivors
+        assert connector.attempts.count(connector.missing) == (2 - int(remove_missing_identity))
+        assert len(connector.attempts) == documents + int(not remove_missing_identity)
+        if remove_missing_identity:
+            assert envelope["ok"] is True
+            assert replacement.inventory_state is AcquisitionInventoryState.RECONCILED
+            assert replacement.reconciled_deleted_count == 1
+            assert replacement.promoted_at is not None
+            assert replacement.watermark_committed_at is not None
+        else:
+            assert envelope["ok"] is False
+            assert replacement.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
+            assert replacement.promoted_at is None
+            assert replacement.watermark_committed_at is None
+
+        following = await control.connect(
+            path,
+            control.Invoke(
+                op="connector_sync",
+                arguments={"name": next_connector.name, "limit": None, "acquire_only": True},
+            ),
+            on_progress=lambda _: None,
+        )
+        assert following["ok"] is True
+    finally:
+        release_reuse.set()
+        await server.aclose()
+
+
+@pytest.mark.parametrize(
     "changed_identity",
     ["tokenless", "uri", "media_type", "size", "metadata", "provenance", "scope"],
 )
@@ -3879,6 +4607,433 @@ async def test_unchanged_revision_reuses_promoted_snapshot_without_body_download
         record.snapshot_outcome is SnapshotItemOutcome.REUSED
         for record in await store.list_acquisition_records(promoted.id)
     )
+
+
+async def test_direct_native_pages_restart_from_an_exact_durable_prefix(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = "https://wiki.example.test/confluence"
+    pages = [
+        FakePage(id=str(180100 + number), title=f"Current {number}", space="DOCS")
+        for number in range(7)
+    ]
+    instance = FakeConfluence(base_url=base, pages=pages, page_size=2)
+    config = server_config(
+        base,
+        spaces=("DOCS",),
+        include_attachments=False,
+        page_size=250,
+        full_inventory_authority=FullInventoryAuthority.DIRECT_CURRENT_CONTENT,
+    )
+    connector = await connected(instance, config)
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    original_append = store.append_acquisition_records
+    committed_pages = 0
+
+    async def interrupt_after_two_pages(*args: Any, **kwargs: Any):  # noqa: ANN202
+        nonlocal committed_pages
+        records = await original_append(*args, **kwargs)
+        committed_pages += 1
+        if committed_pages == 2:
+            raise CursorExpiredError("synthetic interruption after a committed native page")
+        return records
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "append_acquisition_records", interrupt_after_two_pages)
+            interrupted = await pipeline().run(connector, acquire_only=True)
+
+        first_requests = [
+            request
+            for request in instance.requests
+            if request.url.path.endswith("/rest/api/content")
+        ]
+        assert len(first_requests) == 2
+        assert interrupted.enumeration_completed is False
+        unfinished = await store.latest_unsettled_acquisition_run(connector.name)
+        assert unfinished is not None
+        assert unfinished.enumeration_completed_at is None
+        assert unfinished.promoted_at is None
+        assert unfinished.watermark_committed_at is None
+        prefix = await store.list_acquisition_records(unfinished.id)
+        assert [record.sequence for record in prefix] == [0, 1, 2, 3]
+        first_body_requests = [
+            request for request in instance.requests if "/rest/api/content/" in request.url.path
+        ]
+        assert len(first_body_requests) == 4
+
+        instance.requests.clear()
+        completed = await pipeline().run(connector, acquire_only=True)
+    finally:
+        await connector.teardown()
+
+    assert completed.enumeration_completed
+    assert completed.snapshot_completeness == "complete"
+    promoted = await store.latest_promoted_snapshot(connector.name, connector.scope_fingerprint)
+    assert promoted is not None
+    records = await store.list_acquisition_records(promoted.id)
+    assert [record.sequence for record in records] == list(range(7))
+    restarted = [
+        request for request in instance.requests if request.url.path.endswith("/rest/api/content")
+    ]
+    assert [request.url.params.get("start", "0") for request in restarted] == [
+        "0",
+        "2",
+        "4",
+        "6",
+    ]
+    body_requests = [
+        request for request in instance.requests if "/rest/api/content/" in request.url.path
+    ]
+    assert len(body_requests) == 3, "the exact four-record durable prefix was fetched twice"
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        SnapshotPromotionPolicy.REQUIRE_COMPLETE,
+        SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    ],
+)
+async def test_direct_member_deleted_after_true_end_never_promotes_stale_inventory(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    policy: SnapshotPromotionPolicy,
+) -> None:
+    page = FakePage(id="190100", title="Current", space="DOCS")
+    instance = FakeConfluence(
+        base_url="https://wiki.example.test/confluence",
+        pages=[page],
+    )
+    config = server_config(
+        instance.base_url,
+        spaces=("DOCS",),
+        include_attachments=False,
+        full_inventory_authority=FullInventoryAuthority.DIRECT_CURRENT_CONTENT,
+    )
+    settings, client = client_for(instance, config)
+
+    class DeleteAfterEnumeration(ConfluenceConnector):
+        @override
+        async def discover_batches(
+            self, watermark: Watermark | None
+        ) -> AsyncIterator[Sequence[DiscoveredDoc]]:
+            async for batch in super().discover_batches(watermark):
+                yield batch
+            instance.delete(page.id)
+
+    connector = DeleteAfterEnumeration(settings, client, name=f"direct-{policy.value}")
+    await connector.setup()
+    chunker = fakes.BlockChunker()
+    try:
+        report = await IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+            snapshot_policy=policy,
+        ).run(connector, acquire_only=True)
+    finally:
+        await connector.teardown()
+
+    assert report.inventory_recovery == "reenumeration_required"
+    assert report.snapshot_completeness == ""
+    run = await store.latest_unsettled_acquisition_run(connector.name)
+    assert run is not None
+    assert run.promoted_at is None
+    assert run.watermark_committed_at is None
+
+
+async def test_authority_change_fences_failed_inventory_and_reuses_exact_retained_bodies(  # noqa: PLR0915 - one end-to-end recovery/publication lifecycle
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    class AuthorityConnector(fakes.DictConnector):
+        source_scope = "synthetic-whole-space"
+
+        def __init__(
+            self,
+            documents: Mapping[str, str],
+            *,
+            fingerprint: str,
+            authority: str,
+            name: str = "synthetic-wiki",
+        ) -> None:
+            super().__init__(documents, name=name)
+            self.scope_fingerprint = fingerprint
+            self.full_inventory_authority = authority
+            self.deleted: set[str] = set()
+            self.forbidden_fetches: set[str] = set()
+            self.seen_watermarks: list[Watermark | None] = []
+            self.tokens = {source_id: f"version-{source_id}" for source_id in documents}
+
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return Watermark(
+                value=f"{self.full_inventory_authority}-authoritative-end",
+                observed_at=datetime(2026, 8, 17, tzinfo=UTC),
+            )
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.seen_watermarks.append(watermark)
+            for source_id in sorted(self.documents):
+                yield DiscoveredDoc(
+                    ref=DocRef(
+                        source_id=source_id,
+                        uri=f"https://wiki.example.test/pages/{source_id}",
+                    ),
+                    version_token=self.tokens[source_id],
+                    media_type="text/plain",
+                )
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            self.fetches.append(ref.source_id)
+            if ref.source_id in self.deleted:
+                raise NotFoundError("the synthetic current member is no longer available")
+            if ref.source_id in self.forbidden_fetches:
+                raise AssertionError("an unchanged retained body was fetched again")
+            return RawDocument(
+                source_id=ref.source_id,
+                uri=ref.uri,
+                media_type="text/plain",
+                content=self.documents[ref.source_id],
+                metadata={"version_token": self.tokens[ref.source_id]},
+            )
+
+    retained = {
+        f"page-{number:03d}": f"retained synthetic body {number:03d}" for number in range(99)
+    }
+    search = AuthorityConnector(
+        {**retained, "stale-page": "stale synthetic body"},
+        fingerprint="search-inventory-fingerprint",
+        authority="search",
+    )
+    search.deleted.add("stale-page")
+    chunker = fakes.BlockChunker()
+    blobs = BlobStore(engine, data_dir)
+    embedder = HashEmbedder()
+    vectors = LanceVectorStore(data_dir / "authority-vectors")
+    await vectors.ensure_ready(embedder.fingerprint)
+    parser = PlaintextParser(PlaintextConfig())
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=blobs,
+            chunker=chunker,
+            embedder=embedder,
+            vectors=vectors,
+            runner=InProcessRunner({"plaintext": parser}),
+            resolve_chain=lambda _: ["plaintext"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    incomplete = await pipeline().run(search)
+    assert incomplete.inventory_recovery == "reenumeration_required"
+    assert incomplete.snapshot_completeness == ""
+    assert not incomplete.watermark_advanced
+
+    direct = AuthorityConnector(
+        {
+            **retained,
+            "page-102": "new synthetic body 102",
+            "page-103": "new synthetic body 103",
+            "page-104": "new synthetic body 104",
+        },
+        fingerprint="direct-current-inventory-fingerprint",
+        authority="direct_current_content",
+    )
+    direct.forbidden_fetches.update(retained)
+    complete = await pipeline().run(direct)
+
+    assert complete.snapshot_completeness == "complete"
+    assert complete.inventory_recovery == "reconciled"
+    assert complete.discovered == 102
+    assert complete.durable_reused == 99
+    assert complete.reconciled_deleted_items == 1
+    assert complete.watermark_advanced
+    assert direct.seen_watermarks == [None]
+    assert set(direct.fetches) == {"page-102", "page-103", "page-104"}
+    promoted = await store.latest_promoted_snapshot(
+        direct.name, "direct-current-inventory-fingerprint"
+    )
+    assert promoted is not None
+    assert promoted.supersedes_run_id is not None
+    assert promoted.full_inventory_authority == "direct_current_content"
+    assert promoted.discovered_count == 102
+    assert promoted.reconciled_deleted_count == 1
+    assert promoted.watermark_committed_at is not None
+    predecessor = await store.get_acquisition_run(promoted.supersedes_run_id)
+    assert predecessor is not None
+    assert predecessor.superseded_by == promoted.id
+    assert predecessor.superseded_at is not None
+    assert predecessor.lease_owner is None
+    assert predecessor.lease_generation > 1
+
+    direct.tokens["page-102"] = "version-page-102-replaced"
+    direct.deleted.add("page-102")
+    invalidated = await pipeline().run(direct)
+    assert invalidated.inventory_recovery == "reenumeration_required"
+    assert not invalidated.watermark_advanced
+    assert direct.seen_watermarks[-1] == direct.watermark
+
+    direct.deleted.remove("page-102")
+    direct.documents.pop("page-102")
+    direct.tokens.pop("page-102")
+    reconciled = await pipeline().run(direct)
+
+    assert reconciled.inventory_recovery == "reconciled"
+    assert reconciled.snapshot_completeness == "complete"
+    assert reconciled.discovered == 101
+    assert reconciled.reconciled_deleted_items == 1
+    assert reconciled.watermark_advanced
+    assert direct.seen_watermarks[-1] is None, (
+        "same-authority recovery must keep its durable base watermark for promotion CAS "
+        "without turning the replacement discovery into an incremental walk"
+    )
+
+    final_snapshot = await store.latest_promoted_snapshot(
+        direct.name, "direct-current-inventory-fingerprint"
+    )
+    assert final_snapshot is not None
+    source_calls = len(direct.fetches)
+    direct.forbidden_fetches.update(direct.documents)
+    await store.reset_derived()
+    assert await store.count_chunks() == 0
+
+    installed_parse = parse_fingerprint("plaintext")
+    assert installed_parse is not None
+    target = RebuildTarget(
+        parser_routing="synthetic-authority-routing-v1",
+        parser_set=(installed_parse.canonical(),),
+        chunk_fingerprint=chunker.fingerprint.canonical(),
+        embedding_fingerprint=embedder.fingerprint.canonical(),
+        embedding_config=embedder.fingerprint.model_dump_json(),
+        glossary_fingerprint=glossary_fingerprint(enabled=False, middleware=()).canonical(),
+        fts_tokenizer=FTS_TOKENIZER,
+        batch_documents=7,
+        max_memory_bytes=64 * 1024 * 1024,
+        max_temporary_bytes=64 * 1024 * 1024,
+    )
+    rebuild_store = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=blobs,
+        vectors=vectors,
+    )
+    rebuilder = build_offline_rebuilder(
+        store=rebuild_store,
+        blobs=blobs,
+        workspace_id=store.workspace_id,
+        source=direct.name,
+        parser_chain=ParserChain(
+            parsers={"plaintext": parser}, chains={"text/plain": ("plaintext",)}
+        ),
+        routing_identity=target.parser_routing,
+        chunker=chunker,
+        embedder=embedder,
+        vectors=vectors,
+        chunk_fingerprint=chunker.fingerprint,
+        middleware=MiddlewareRunner(()),
+        parse_runner=InProcessRunner(
+            {"plaintext": parser}, middleware=MiddlewareRunner(()), chunker=chunker
+        ),
+        detect_glossary=False,
+        clock=fakes.ManualLeaseClock(),
+    )
+    plan = await rebuilder.dry_run(final_snapshot.id, target)
+    rebuilt = await rebuilder.run(final_snapshot.id, target, owner="synthetic-offline-rebuild")
+
+    assert plan.runnable
+    assert plan.documents == 101
+    assert rebuilt.state is RebuildState.PUBLISHED
+    assert rebuilt.documents_built == 101
+    assert len(direct.fetches) == source_calls
+    assert await store.count_documents() == 101
+    settled = await store.get_acquisition_run(final_snapshot.id)
+    assert settled is not None
+    assert settled.state is AcquisitionRunState.SETTLED
+    assert settled.acquired_count == settled.indexed_count == 101
+
+    promoted_search = AuthorityConnector(
+        {
+            "fallback-a": "retained fallback a",
+            "fallback-b": "retained fallback b",
+            "fallback-c": "retained fallback c",
+        },
+        fingerprint="promoted-search-fingerprint",
+        authority="search",
+        name="promoted-search-wiki",
+    )
+    promoted_report = await pipeline().run(promoted_search)
+    assert promoted_report.snapshot_completeness == "complete"
+    older_promoted = await store.latest_promoted_snapshot(
+        promoted_search.name, "promoted-search-fingerprint"
+    )
+    assert older_promoted is not None
+    await pipeline().run(promoted_search)
+    newest_promoted = await store.latest_promoted_snapshot(
+        promoted_search.name, "promoted-search-fingerprint"
+    )
+    assert newest_promoted is not None
+    assert newest_promoted.id != older_promoted.id
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE acquisition_runs SET membership_hash = 'corrupted' WHERE id = :run_id"),
+            {"run_id": newest_promoted.id},
+        )
+
+    promoted_direct = AuthorityConnector(
+        {
+            "fallback-a": "retained fallback a",
+            "fallback-b": "changed fallback b",
+            "fallback-c": "retained fallback c",
+        },
+        fingerprint="promoted-direct-fingerprint",
+        authority="direct_current_content",
+        name="promoted-search-wiki",
+    )
+    promoted_direct.tokens["fallback-b"] = "version-fallback-b-changed"
+    promoted_direct.forbidden_fetches.update({"fallback-a", "fallback-c"})
+    fallback = await pipeline().run(promoted_direct)
+
+    assert fallback.snapshot_completeness == "complete"
+    assert fallback.durable_reused == 2
+    assert promoted_direct.fetches == ["fallback-b"]
 
 
 async def test_scope_change_resets_discovery_cursor_and_cas_binds_the_new_scope(

@@ -24,6 +24,7 @@ from manicule.app.ports import (
     Keys,
     Maintenance,
     Organizing,
+    ResetOutcome,
     Retrieving,
     Telemetry,
 )
@@ -345,6 +346,14 @@ class FakeOrganization:
         described = existing.model_copy(update={"description": description})
         self.collections[collection_id] = described
         return described
+
+    async def set_collection_rule(
+        self, collection_id: str, rule: CollectionRule | None
+    ) -> DocumentCollection:
+        existing = self._require_collection(collection_id)
+        changed = existing.model_copy(update={"rule": rule})
+        self.collections[collection_id] = changed
+        return changed
 
     async def collections_for(self, document_id: str) -> Sequence[DocumentCollection]:
         """Manual membership only.
@@ -1042,6 +1051,12 @@ class FakeIngestion:
 
         return glossary_fingerprint()
 
+    async def configured_index_fingerprints(self) -> tuple[str, str]:
+        return "", ""
+
+    async def physical_index_fingerprint(self) -> str | None:
+        return None
+
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
         self.glossary_sweeps.append((batch, dry_run))
         if dry_run:
@@ -1062,7 +1077,7 @@ class FakeMaintenance:
     workspace_rows: list[tuple[str, str, str]] = field(
         default_factory=lambda: [("default", "default", "personal")]
     )
-    reset: tuple[int, int, bool] = (0, 0, False)
+    reset: ResetOutcome = field(default_factory=ResetOutcome)
     resets: int = 0
     """How many times the index was actually emptied.
 
@@ -1101,7 +1116,7 @@ class FakeMaintenance:
         del force
         return {"files": [], "path": str(source)}
 
-    async def reset_index(self) -> tuple[int, int, bool]:
+    async def reset_index(self) -> ResetOutcome:
         self.resets += 1
         return self.reset
 

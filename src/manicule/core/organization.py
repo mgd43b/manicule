@@ -26,7 +26,14 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from manicule.core.content import Chunk, Document, Metadata
 
@@ -71,6 +78,19 @@ class CollectionRule(_Organization):
 
     updated_after: datetime | None = None
     updated_before: datetime | None = None
+
+    @field_validator("sources", "media_types", "tag_ids")
+    @classmethod
+    def _selectors_are_not_empty(cls, values: frozenset[str]) -> frozenset[str]:
+        if any(not value.strip() for value in values):
+            msg = "collection rule selectors must be non-empty strings"
+            raise ValueError(msg)
+        return values
+
+    @field_serializer("sources", "media_types", "tag_ids", when_used="json")
+    def _sorted_selectors(self, values: frozenset[str]) -> list[str]:
+        """Give every public surface one deterministic representation of set-valued fields."""
+        return sorted(values)
 
     @model_validator(mode="after")
     def _restricts_something(self) -> Self:

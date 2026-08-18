@@ -378,12 +378,24 @@ instead of whichever revision a GitHub repository is serving today.
 
 ### 5.2 Redistributing an image
 
-manicule is **GPL-3.0-or-later**, and that reaches an image built from it. Publishing an image
-to a registry others can pull is distribution: the corresponding source has to be available on
-the same terms, including any changes made to it, and the license text has to travel with it.
-Building an image for your own machines is not distribution and none of this applies. See
-[`LICENSE`](../LICENSE), and take advice before publishing an image containing modifications
-you intend to keep private.
+manicule is **MIT**, so publishing an image built from it obliges you to little: keep the
+copyright notice and the license text with it. Modifications need not be published. The
+`Dockerfile` here builds an MIT image — it installs the `onnx` embedding backend, and nothing in
+its dependency closure is copyleft.
+
+**Two things in an image can still carry terms of their own, and neither is manicule.**
+
+- **`manicule-mlx`, if you add it.** The Metal backend is GPL-3.0-or-later, and it is Apple
+  silicon only — so it has no place in a Linux image and the shipped `Dockerfile` does not
+  install it. An image that did would be a GPL-3.0 distribution: corresponding source on the
+  same terms, including modifications.
+- **Bundled third-party binaries.** `pypdfium2`'s wheels ship a `BUILD_LICENSES/` directory
+  that must be carried through, and `selectolax`'s wheel contains an LGPL-2.1 engine alongside
+  the permissive one manicule imports. Both are ordinary redistribution conditions and both
+  predate any of this.
+
+See [`LICENSE`](../LICENSE), and take advice if you are packaging manicule together with
+anything copyleft.
 
 ---
 

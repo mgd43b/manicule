@@ -285,6 +285,34 @@ type in (page, attachment) AND space = "ENG" order by lastmodified asc
 Sent to `GET /wiki/rest/api/content/search` with
 `&expand=version,ancestors,space,container&limit=100`.
 
+**Data Center can use the direct current-content inventory for complete membership.** The
+compatibility default remains:
+
+```toml
+[connectors.handbook.options]
+full_inventory_authority = "search"
+```
+
+For a Server or Data Center connector whose scope is one or more whole spaces, setting
+`full_inventory_authority = "direct_current_content"` makes full discovery and reconciliation
+enumerate `page` and `attachment` separately through `GET /rest/api/content`, explicitly pinned
+to the canonical space and `status=current`. Incremental discovery remains the CQL query below.
+Cloud and `root_page_ids` scopes remain entirely CQL-backed; the option does not alter their
+cursor identity or cause a replacement walk.
+
+This is an explicit source-authority choice, not a fallback after search looks suspicious. Every
+direct member must carry its source id, exact type, current status, canonical space, positive
+revision, offset-aware modification time, and required page or attachment metadata. Missing or
+mismatched evidence fails the aggregate enumeration; it is never converted to an empty result or
+filled from the request. Under strict policy that run cannot promote. `allow_omissions` may still
+represent typed body-fetch omissions, but it cannot promote an inventory known to be incomplete.
+
+Data Center native `next` links commonly contain only `start` and `limit`. The connector follows
+that native coordinate while re-pinning space, type, status, expansion, and configured page size
+on every request. An explicit conflict, extra narrowing parameter, malformed coordinate,
+cross-origin link, or loop fails closed. A response page is committed before its next link is
+requested, and only a direct walk's true end authorizes reconciliation.
+
 **Incremental** — a per-space watermark of the last successful sync, which adds one clause to
 whichever of those two the deployment uses:
 
@@ -390,10 +418,16 @@ requests carrying two. It scales with the configuration instead of with the acco
   twice and its end never. A cursor held longer than `cursor_lifetime_seconds` (default 300)
   is refused **before the request is sent**, so the run fails legibly and is re-run against an
   unadvanced watermark. A `next` link addressing a cursor already followed is refused for the
-  same reason: a loop over a paginated search reads as a very large space.
+  same reason: a loop over a paginated search reads as a very large space. Followed-request
+  fingerprints live in a temporary disk-backed exact-membership ledger with a capped SQLite page
+  cache, so exact long-cycle detection does not grow process memory with the number of pages. A
+  digest collision refuses the request and therefore fails closed. The cursor-age check runs
+  after that disk write, immediately before the next request, so a stalled ledger cannot create
+  an unchecked expiry window of its own.
 
   **The durable pipeline's side is a journal boundary, not downstream backpressure.** When that
-  path is wired, every discovered identity commits before the connector is advanced, and local
+  path is wired, each bounded source response commits atomically before the connector follows its
+  next cursor, and local
   fetch/parse/embed work starts from the journal after enumeration. A slow embedder therefore
   cannot hold a live cursor at all (`ingest.md` §8.3.1); source and journal delays still can,
   which is why the typed expiry guard remains. The explicitly supported nonjournal fallback
@@ -525,11 +559,23 @@ query is sent at all and the run costs the page tree only. With it on, a scoped 
 resolves the whole subtree's page ids once (ids and ancestor ids, bounded by the subtree rather
 than by the space) so that an attachment added to a page that has *not* changed since the
 watermark can still be placed. That is an ids-only enumeration of the subtree per run, and it is
-what makes the incremental attachment case correct rather than approximately correct.
+what makes the incremental attachment case correct rather than approximately correct. The
+membership index is an exact temporary SQLite table with a fixed page cache, deleted when the
+enumeration closes; only the current response page is retained in process memory.
 
 ### Changing the roots
 
 A watermark is a position **within a scope**, and the two are meaningless apart.
+
+The effective full-inventory authority is part of that position too. Historical and default
+search-backed scopes retain their exact existing fingerprint and watermark representation.
+Choosing direct current-content authority for a Data Center whole-space scope creates a distinct
+cursor identity, so an old CQL watermark can never turn the first direct walk into an incremental
+query. The stable corpus scope remains separate: after the replacement inventory reaches each
+member, retained bytes may be adopted from the fenced search-backed predecessor only when the
+connector, source identity, revision, URI, media type, byte length, hash, blob, and acquired-source
+envelope all agree. This avoids redownloading an unchanged corpus without treating the old
+watermark as compatible.
 `Watermark.metadata` therefore records the scope its positions were reached in, and when the configured
 roots or `include_root_pages` change, every stored position is discarded and the run enumerates
 the new scope in full. Anything less loses documents: every page in a newly configured tree that
@@ -699,6 +745,14 @@ yet reached as deleted: one transient error, and the corpus is soft-deleted
 ([`ingest.md`](../ingest.md) §11.1 carries the pipeline's half of this — clean completion
 only, a deletion ceiling, and soft delete only). The connector's half is to fail loudly, so
 that "everything is gone" and "nothing answered" never look alike.
+
+Reconciliation uses the same response-page hand-off as discovery. The durable inventory commits
+each nonempty ids-only source page before another cursor is requested; an empty page after scope
+filtering has nothing to write and is acknowledged at the same boundary without inventing a
+transaction. It does not infer a boundary from a local item count, so a configured 250-result
+page cannot be split by the pipeline's unrelated inventory write size. Subtree reconciliation
+builds its bounded membership index as it yields those native search pages; it never drains the
+tree and re-slices the completed result locally.
 
 ## 4. Fetching content
 

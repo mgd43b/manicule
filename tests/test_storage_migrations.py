@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -104,6 +105,98 @@ async def test_marker_name_index_upgrades_from_already_applied_inventory_revisio
 
 
 @pytest.mark.contract
+async def test_workspace_snapshot_downgrade_refuses_single_new_format_generation(
+    data_dir: Path,
+) -> None:
+    import hashlib  # noqa: PLC0415
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from manicule.core.rebuild import RebuildState  # noqa: PLC0415
+    from manicule.core.sources import Watermark  # noqa: PLC0415
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine)
+        store = SqliteDocStore(engine)
+        await store.ensure_workspace()
+        now = datetime(2026, 8, 17, tzinfo=UTC)
+        created = await store.create_acquisition_run(
+            "single-new-format-snapshot",
+            "wiki",
+            scope_fingerprint="scope-v1",
+        )
+        claimed = await store.claim_acquisition_run(
+            created.id,
+            "worker",
+            now=now,
+            expires_at=now + timedelta(minutes=1),
+        )
+        assert claimed is not None
+        await store.complete_acquisition_enumeration(
+            claimed.id,
+            Watermark(value="v1", observed_at=now),
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=now,
+        )
+        await store.complete_snapshot_acquisition(
+            claimed.id,
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=now,
+        )
+        promoted = await store.promote_snapshot_and_commit_watermark(
+            claimed.id,
+            expected_scope_fingerprint="scope-v1",
+            lease_owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=now,
+        )
+        assert promoted.membership_hash is not None
+        combined = hashlib.sha256(
+            json.dumps(
+                [[promoted.id, promoted.membership_hash, 0]],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        async with session_factory(engine).begin() as session:
+            session.add(
+                models.DerivedGeneration(
+                    id="single-new-format-generation",
+                    workspace_id=store.workspace_id,
+                    snapshot_run_id=promoted.id,
+                    snapshot_membership_hash=combined,
+                    expected_item_count=0,
+                    target_digest="target",
+                    publication_identity_digest="publication",
+                    target={},
+                    state=RebuildState.PLANNED,
+                )
+            )
+            session.add(
+                models.DerivedGenerationSnapshot(
+                    generation_id="single-new-format-generation",
+                    ordinal=0,
+                    run_id=promoted.id,
+                    connector_name="wiki",
+                    scope_fingerprint="scope-v1",
+                    membership_hash=promoted.membership_hash,
+                    expected_item_count=0,
+                )
+            )
+
+        with pytest.raises(RuntimeError, match=r"single-source|new-format"):
+            await downgrade(engine, "b9e14c72a6f0")
+        assert await current(engine) == head_revision()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
 async def test_every_revision_downgrades_and_upgrades_back_to_the_same_schema(
     data_dir: Path,
 ) -> None:
@@ -132,6 +225,76 @@ async def test_every_revision_downgrades_and_upgrades_back_to_the_same_schema(
         assert await _schema_snapshot(engine) == before, (
             "the schema after a downgrade/upgrade round trip differs from the schema before it"
         )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_workspace_index_migration_backfills_legacy_identity_and_owned_tombstones(
+    data_dir: Path,
+) -> None:
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="e6a2c91f04bd")
+        store = SqliteDocStore(engine)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces(id, name, mode, settings, created_at) "
+                    "VALUES ('default', 'default', 'personal', '{}', :created_at)"
+                ),
+                {"created_at": datetime.now(UTC).isoformat()},
+            )
+        document = make_document()
+        stored_chunk = make_chunk(document, 0, "migration-bound vector")
+        await store.upsert_document(document)
+        await store.replace_chunks(document.id, [stored_chunk])
+        async with engine.begin() as connection:
+            vector_id = (
+                await connection.execute(
+                    text("SELECT vector_id FROM chunks WHERE id = :id"),
+                    {"id": stored_chunk.id},
+                )
+            ).scalar_one()
+            await connection.execute(
+                text(
+                    "INSERT INTO index_state "
+                    "(id, vector_table, embed_fingerprint, chunk_fingerprint, fts_tokenizer, "
+                    "created_at, updated_at) VALUES "
+                    "(1, 'chunks__legacy', 'old-embed', 'old-chunk', :tokenizer, "
+                    "'2026-08-18T00:00:00+00:00', '2026-08-18T00:00:00+00:00')"
+                ),
+                {"tokenizer": "porter unicode61 remove_diacritics 2"},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO vector_tombstones (chunk_id, deleted_at) VALUES "
+                    "(:vector_id, '2026-08-18T00:00:00+00:00')"
+                ),
+                {"vector_id": vector_id},
+            )
+
+        await upgrade(engine)
+
+        async with engine.connect() as connection:
+            identity = (
+                await connection.execute(
+                    text("SELECT workspace_id, vector_namespace, vector_table FROM index_state")
+                )
+            ).one()
+            tombstone = (
+                await connection.execute(
+                    text(
+                        "SELECT workspace_id, vector_namespace, vector_table "
+                        "FROM vector_tombstones WHERE chunk_id = :vector_id"
+                    ),
+                    {"vector_id": vector_id},
+                )
+            ).one()
+        assert tuple(identity) == ("default", "legacy", "chunks__legacy")
+        assert tuple(tombstone) == ("default", "legacy", "chunks__legacy")
     finally:
         await engine.dispose()
 

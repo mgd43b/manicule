@@ -23,6 +23,20 @@ from manicule.testing.contracts import (
     assert_version_store_contract,
     closing,
 )
+from manicule.testing.models import (
+    FULL_MODEL,
+    PARITY_MODEL,
+    REQUIRE_MODELS_ENV,
+    REQUIRED_MODELS,
+    VOCABULARY,
+    is_required,
+    mlx_weights_available,
+    model_available,
+    onnx_weights_available,
+    require_model,
+    write_model,
+    write_tokenizer,
+)
 from manicule.testing.normalize import NORMALIZER_VERSION, contains_claimed_text, normalize
 from manicule.testing.roundtrip import (
     ParserProfile,
@@ -32,7 +46,12 @@ from manicule.testing.roundtrip import (
 )
 
 __all__ = [
+    "FULL_MODEL",
     "NORMALIZER_VERSION",
+    "PARITY_MODEL",
+    "REQUIRED_MODELS",
+    "REQUIRE_MODELS_ENV",
+    "VOCABULARY",
     "ParserProfile",
     "RoundTripReport",
     "assert_chunk_relation_store_contract",
@@ -57,5 +76,12 @@ __all__ = [
     "assert_version_store_contract",
     "closing",
     "contains_claimed_text",
+    "is_required",
+    "mlx_weights_available",
+    "model_available",
     "normalize",
+    "onnx_weights_available",
+    "require_model",
+    "write_model",
+    "write_tokenizer",
 ]

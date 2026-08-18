@@ -69,6 +69,8 @@ MUTATIONS: tuple[str, ...] = (
     "collection_create",
     "collection_rename",
     "collection_update",
+    "collection_rule_set",
+    "collection_rule_clear",
     "collection_delete",
     "collection_add",
     "collection_remove",
@@ -291,6 +293,7 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
         "collection_list": {},
         "collection_documents": {"collection_id": collection_id},
         "collection_counts": {"collection_id": collection_id},
+        "collection_rule_show": {"collection_id": collection_id},
     }
 
     async with Client(build_server(service)) as client:
@@ -372,6 +375,77 @@ async def test_nothing_on_this_server_is_gated_on_its_own_annotation(
         ).structured_content or {}
     assert created["ok"] is True
     assert created["op"] == "collection_create"
+
+
+async def test_writable_mcp_round_trips_the_canonical_collection_rule(
+    service: ApplicationService,
+) -> None:
+    async with Client(build_server(service)) as client:
+        created = (
+            await client.call_tool(
+                "collection_create",
+                {"name": "Team A", "rule": {"sources": ["wiki-team-a"]}},
+            )
+        ).structured_content or {}
+        collection_id = created["data"]["id"]
+        assert created["data"]["rule"]["sources"] == ["wiki-team-a"]
+
+        changed = (
+            await client.call_tool(
+                "collection_rule_set",
+                {
+                    "collection_id": collection_id,
+                    "rule": {"sources": ["wiki-team-a-archive", "wiki-team-a"]},
+                },
+            )
+        ).structured_content or {}
+        assert changed["data"]["rule"]["sources"] == [
+            "wiki-team-a",
+            "wiki-team-a-archive",
+        ]
+        shown = (
+            await client.call_tool("collection_rule_show", {"collection_id": collection_id})
+        ).structured_content or {}
+        assert shown["data"] == changed["data"]
+        cleared = (
+            await client.call_tool("collection_rule_clear", {"collection_id": collection_id})
+        ).structured_content or {}
+        assert cleared["data"]["rule"] is None
+
+
+async def test_rule_mutations_are_absent_from_read_only_mcp(
+    service: ApplicationService,
+) -> None:
+    async with Client(build_server(service, read_only=True)) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+    assert "collection_rule_show" in tools
+    assert "collection_rule_set" not in tools
+    assert "collection_rule_clear" not in tools
+
+
+async def test_collection_rule_mcp_schema_is_canonical_and_annotations_are_exact(
+    service: ApplicationService,
+) -> None:
+    tools = {tool.name: tool for tool in await _tools(service)}
+    setting = tools["collection_rule_set"]
+    rule_schema = setting.inputSchema["properties"]["rule"]
+    assert set(rule_schema["properties"]) == {
+        "sources",
+        "media_types",
+        "tag_ids",
+        "updated_after",
+        "updated_before",
+    }
+    assert rule_schema["additionalProperties"] is False
+    assert "rule" in setting.inputSchema.get("required", [])
+
+    for name in ("collection_rule_set", "collection_rule_clear"):
+        annotations = tools[name].annotations
+        assert annotations is not None
+        assert annotations.readOnlyHint is False
+        assert annotations.destructiveHint is True
+        assert annotations.idempotentHint is True
+        assert annotations.openWorldHint is False
 
 
 def test_the_server_ships_no_blanket_approval_setting() -> None:

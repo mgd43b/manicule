@@ -58,7 +58,7 @@ def render(parts: Sequence[str], count_tokens: Callable[[str], int], budget: int
         and inventing one would put a fabricated signal into the vector.
     """
     kept = list(parts)
-    if not kept:
+    if not kept or budget <= 0:
         return ""
 
     joined = SEPARATOR.join(kept)
@@ -108,7 +108,21 @@ def _truncate_last(kept: Sequence[str], count_tokens: Callable[[str], int], budg
         candidate = " ".join(outer) + ELLIPSIS
         if count_tokens(candidate) <= budget:
             return candidate
-    return first
+    # A single identifier-heavy element may have no word boundary at all. Returning it whole
+    # would make ``budget`` advisory precisely on the fallback path. Cut by character against
+    # the exact counter; the ellipsis makes the loss explicit, and an empty result is safer
+    # than scaffolding that leaves no room for citable content.
+    low, high = 1, len(first)
+    best = ""
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = first[:middle] + ELLIPSIS
+        if count_tokens(candidate) <= budget:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
 
 
 __all__ = ["ELLIPSIS", "SEPARATOR", "elements", "render"]

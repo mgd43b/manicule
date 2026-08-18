@@ -13,11 +13,11 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | Area | Items | Ticket |
 |---|---:|---|
 | CLI capability items | 48 | #8 — **built** |
-| MCP capability items | 38 | #8 — **built** |
+| MCP capability items | 41 | #8 — **built** |
 | HTTP endpoints | 60 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **204** | |
+| **Total** | **207** | |
 
 ## CLI — 48
 
@@ -104,13 +104,16 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
   connector-free derived publication with no separate settlement command.
 
-## MCP tools — 38
+## MCP tools — 41
 
-Ticket: #8 — **built.** Thirty-seven tools over the same application service the command
+Ticket: #8 — **built.** Forty implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
-**All thirty-seven over stdio; the twenty-two read-only ones over a socket.** MCP is also served
+The checklist below has forty-one capability items because it also records the deliberately
+declined catch-all `run-command` surface; that item is not a registered MCP tool.
+
+**All forty over stdio; the twenty-three read-only ones over a socket.** MCP is also served
 at `/mcp/` on the HTTP port, and every mutating tool is *absent* from that surface rather than
 refused on it — see [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are
 unreachable from a network by construction, and a socket has to replace that property rather
@@ -126,6 +129,9 @@ than assume it.
 - [x] `collection_remove`
 - [x] `collection_rename`
 - [x] `collection_update`
+- [x] `collection_rule_show`
+- [x] `collection_rule_set`
+- [x] `collection_rule_clear`
 - [x] `config_get`
 - [x] `config_set`
 - [x] `connector_list`

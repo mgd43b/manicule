@@ -59,8 +59,6 @@ _INSPECTION = TypeAdapter(ShadowInspection)
 _SNAPSHOT_DOCUMENT = TypeAdapter(SnapshotDocument)
 _SNAPSHOT_CHUNK = TypeAdapter(SnapshotChunk)
 _LIVE = TypeAdapter(LivePublication)
-_INDEX_STATE_ID: Final = 1
-_CORPUS_REVISION_ID: Final = 1
 GENERATIONS_DIRNAME: Final = "generations"
 SNAPSHOT_PAGE: Final = 256
 
@@ -113,7 +111,7 @@ class SqliteReembedCorpus:
                 (
                     await connection.execute(
                         select(models.CorpusRevision.revision).where(
-                            models.CorpusRevision.id == _CORPUS_REVISION_ID
+                            models.CorpusRevision.workspace_id == self.workspace_id
                         )
                     )
                 ).scalar_one()
@@ -122,7 +120,7 @@ class SqliteReembedCorpus:
                 (
                     await connection.execute(
                         select(models.IndexState.__table__).where(
-                            models.IndexState.id == _INDEX_STATE_ID
+                            models.IndexState.workspace_id == self.workspace_id
                         )
                     )
                 )
@@ -158,7 +156,7 @@ class SqliteReembedCorpus:
             live = LivePublication(state.vector_table, fingerprint, chunk_inventory)
             await connection.execute(
                 update(models.IndexState)
-                .where(models.IndexState.id == _INDEX_STATE_ID)
+                .where(models.IndexState.workspace_id == self.workspace_id)
                 .values(vector_inventory_digest=chunk_inventory, updated_at=utcnow())
             )
             await connection.execute(
@@ -276,10 +274,10 @@ class SqliteReembedCorpus:
         )
         chunk_digest = SnapshotChunkDigester()
         while True:
-            # The live vector pointer is installation-wide, so its replacement must cover the
-            # full installation too. ``workspace_id`` owns/access-controls the private snapshot;
-            # it is not a filter on the physical generation being atomically replaced.
-            statement = select(models.Document).where(models.Document.deleted_at.is_(None))
+            statement = select(models.Document).where(
+                models.Document.workspace_id == self.workspace_id,
+                models.Document.deleted_at.is_(None),
+            )
             if document_after is not None:
                 statement = statement.where(models.Document.id > document_after)
             page = (
@@ -552,7 +550,7 @@ class SqliteReembedStore:
             return (
                 await connection.execute(
                     select(models.IndexState.vector_table).where(
-                        models.IndexState.id == _INDEX_STATE_ID
+                        models.IndexState.workspace_id == self.workspace_id
                     )
                 )
             ).scalar_one_or_none()
@@ -576,15 +574,33 @@ class SqliteReembedStore:
             if run.state not in {ReembedState.FAILED, ReembedState.SUPERSEDED}:
                 raise ReembedError("only failed or superseded shadow generations may be cleaned")
             generation_id = run.shadow_generation_id or _generation_id(self.workspace_id, run_id)
-            live = (
+            identity = (
                 await connection.execute(
-                    select(models.IndexState.vector_table).where(
-                        models.IndexState.id == _INDEX_STATE_ID
-                    )
+                    select(
+                        models.IndexState.vector_namespace,
+                        models.IndexState.vector_table,
+                    ).where(models.IndexState.workspace_id == self.workspace_id)
                 )
-            ).scalar_one_or_none()
+            ).one_or_none()
+            live = None if identity is None else identity.vector_table
             if live == generation_id:
                 raise ReembedError("the live shadow generation cannot be cleaned")
+            if identity is not None and identity.vector_namespace == "legacy":
+                foreign_live = (
+                    await connection.execute(
+                        select(models.IndexState.workspace_id)
+                        .where(
+                            models.IndexState.workspace_id != self.workspace_id,
+                            models.IndexState.vector_namespace == "legacy",
+                            models.IndexState.vector_table == generation_id,
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if foreign_live is not None:
+                    raise ReembedError(
+                        "a foreign workspace still publishes this shared legacy generation"
+                    )
             yield connection, generation_id
 
     async def acquire(self, run_id: str, owner_token: str, *, ttl_seconds: float) -> ReembedLease:
@@ -727,7 +743,7 @@ class SqliteReembedStore:
                 (
                     await connection.execute(
                         select(models.CorpusRevision.revision).where(
-                            models.CorpusRevision.id == _CORPUS_REVISION_ID
+                            models.CorpusRevision.workspace_id == self.workspace_id
                         )
                     )
                 ).scalar_one()
@@ -773,7 +789,7 @@ class SqliteReembedStore:
                 result = await connection.execute(
                     update(models.IndexState)
                     .where(
-                        models.IndexState.id == _INDEX_STATE_ID,
+                        models.IndexState.workspace_id == self.workspace_id,
                         models.IndexState.vector_table == expected.generation_id,
                         models.IndexState.vector_inventory_digest == expected.inventory_digest,
                     )
@@ -899,14 +915,12 @@ class SqliteReembedStore:
                     & (models.ReembedShadowGeneration.run_id == models.ReembedRunRecord.id),
                 )
                 .where(
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     or_(
                         models.ReembedRunRecord.state == ReembedState.PUBLISHED.value,
                         models.ReembedShadowGeneration.state == "published",
                     ),
-                    or_(
-                        models.ReembedRunRecord.workspace_id != self.workspace_id,
-                        models.ReembedRunRecord.id != current_run_id,
-                    ),
+                    models.ReembedRunRecord.id != current_run_id,
                 )
             )
         ).all()
@@ -918,7 +932,7 @@ class SqliteReembedStore:
             await connection.execute(
                 update(models.ReembedRunRecord)
                 .where(
-                    models.ReembedRunRecord.workspace_id == row.workspace_id,
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     models.ReembedRunRecord.id == row.id,
                     models.ReembedRunRecord.revision == row.revision,
                 )
@@ -932,7 +946,7 @@ class SqliteReembedStore:
             await connection.execute(
                 update(models.ReembedShadowGeneration)
                 .where(
-                    models.ReembedShadowGeneration.workspace_id == row.workspace_id,
+                    models.ReembedShadowGeneration.workspace_id == self.workspace_id,
                     models.ReembedShadowGeneration.run_id == row.id,
                 )
                 .values(state="superseded")
@@ -943,7 +957,7 @@ class SqliteReembedStore:
             (
                 await connection.execute(
                     select(models.IndexState.__table__).where(
-                        models.IndexState.id == _INDEX_STATE_ID
+                        models.IndexState.workspace_id == self.workspace_id
                     )
                 )
             )
@@ -1070,6 +1084,22 @@ class LanceShadowGenerations:
         inventory_digest: str,
         lease: ReembedLease,
     ) -> ShadowGeneration:
+        async with generation_pin(self._root.parent):
+            return await self._open_or_create_pinned(
+                run_id,
+                fingerprint=fingerprint,
+                inventory_digest=inventory_digest,
+                lease=lease,
+            )
+
+    async def _open_or_create_pinned(
+        self,
+        run_id: str,
+        *,
+        fingerprint: EmbedFingerprint,
+        inventory_digest: str,
+        lease: ReembedLease,
+    ) -> ShadowGeneration:
         offered = ShadowGeneration(
             _generation_id(self._authority.workspace_id, run_id),
             run_id,
@@ -1130,6 +1160,17 @@ class LanceShadowGenerations:
         *,
         lease: ReembedLease,
     ) -> None:
+        async with generation_pin(self._root.parent):
+            await self._upsert_pinned(generation, chunks, vectors, lease=lease)
+
+    async def _upsert_pinned(
+        self,
+        generation: ShadowGeneration,
+        chunks: Sequence[SnapshotChunk],
+        vectors: Sequence[Vector],
+        *,
+        lease: ReembedLease,
+    ) -> None:
         async with self._authority.fenced(generation.run_id, lease) as connection:
             store = self._store(generation.id)
             await store.ensure_ready(
@@ -1146,6 +1187,12 @@ class LanceShadowGenerations:
                 raise
 
     async def inspect(
+        self, generation: ShadowGeneration, *, lease: ReembedLease
+    ) -> ShadowInspection:
+        async with generation_pin(self._root.parent):
+            return await self._inspect_pinned(generation, lease=lease)
+
+    async def _inspect_pinned(
         self, generation: ShadowGeneration, *, lease: ReembedLease
     ) -> ShadowInspection:
         async with self._authority.fenced(generation.run_id, lease) as connection:
@@ -1227,6 +1274,16 @@ class LanceShadowGenerations:
         *,
         lease: ReembedLease,
     ) -> None:
+        async with generation_pin(self._root.parent):
+            await self._seal_pinned(generation, inspection, lease=lease)
+
+    async def _seal_pinned(
+        self,
+        generation: ShadowGeneration,
+        inspection: ShadowInspection,
+        *,
+        lease: ReembedLease,
+    ) -> None:
         async with self._authority.fenced(generation.run_id, lease) as connection:
             fingerprint = await self._fingerprint(connection, generation)
             commitment_json = (
@@ -1286,6 +1343,10 @@ class LanceShadowGenerations:
 
     async def cleanup_terminal(self, run_id: str) -> bool:
         """Delete a failed or superseded generation; published/live generations are refused."""
+        async with generation_pin(self._root.parent):
+            return await self._cleanup_terminal_pinned(run_id)
+
+    async def _cleanup_terminal_pinned(self, run_id: str) -> bool:
         async with self._authority.cleanup_guard(run_id) as (connection, generation_id):
             path = self.directory(generation_id)
             async with generation_pin(path, exclusive=True):

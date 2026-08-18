@@ -12,12 +12,13 @@
 {% if panels.connectors.ok %}
 {% if panels.connectors.data.connectors %}
 <table>
-  <thead><tr><th>Name</th><th>Type</th><th>Enabled</th><th>Installed</th><th>Last sync</th><th>Outcome</th><th>Retry</th><th>Status</th><th>Documents</th><th></th></tr></thead>
+  <thead><tr><th>Name</th><th>Type</th><th>Full inventory</th><th>Enabled</th><th>Installed</th><th>Last sync</th><th>Outcome</th><th>Retry</th><th>Status</th><th>Documents</th><th></th></tr></thead>
   <tbody>
     {% for item in panels.connectors.data.connectors %}
     <tr>
       <td>{{ item.name }}</td>
       <td>{{ item.type }}</td>
+      <td>{{ item.full_inventory_authority or '—' }}</td>
       <td>{{ 'yes' if item.enabled else 'no' }}</td>
       <td>{{ 'yes' if item.installed else 'no — the plugin is not installed' }}</td>
       <td>{{ item.last_synced_at or 'never' }}</td>

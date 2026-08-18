@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from manicule.core.organization import CollectionRule
+
 
 class Body(BaseModel):
     """Base for every request body: closed, so a typo is a 422 rather than a silence."""
@@ -78,6 +80,13 @@ class CollectionBody(Body):
 
     name: str = Field(min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=2000)
+    rule: CollectionRule | None = None
+
+
+class CollectionRuleBody(Body):
+    """An explicit rule replacement; omission cannot be mistaken for clearing."""
+
+    rule: CollectionRule
 
 
 class CollectionUpdateBody(Body):

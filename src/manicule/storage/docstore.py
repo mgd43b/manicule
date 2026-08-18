@@ -24,6 +24,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.content import Commit, Document, DocumentRevision, DocumentStatus
 from manicule.core.embedding import EmbedFingerprint, IndexFingerprints
+from manicule.core.errors import DerivedResetFenceLostError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import vector_id
 from manicule.core.retrieval import Candidate, Filter
@@ -58,9 +59,6 @@ if TYPE_CHECKING:
     from manicule.core.glossary import GlossaryEntry
 
 _WATERMARK: TypeAdapter[Watermark] = TypeAdapter(Watermark)
-
-_INDEX_STATE_ID = 1
-"""``index_state`` holds one row, because a data directory holds one index."""
 
 
 def _cross_workspace(document_id: str, holder: str, asked: str) -> str:
@@ -255,32 +253,90 @@ class SqliteDocStore(
             stored = await self._write_document(session, document)
             return Commit(committed=True, stored=stored)
 
-    async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
+    async def _fence_derived_reset(
+        self, session: AsyncSession, expected_reset_epoch: int | None
+    ) -> None:
+        """Take SQLite's write lock while proving this publisher predates no reset."""
+        if expected_reset_epoch is None:
+            return
+        result = cast(
+            "CursorResult[Any]",
+            await session.execute(
+                update(models.Workspace)
+                .where(
+                    models.Workspace.id == self._workspace_id,
+                    models.Workspace.derived_reset_epoch == expected_reset_epoch,
+                )
+                .values(derived_reset_epoch=models.Workspace.derived_reset_epoch)
+            ),
+        )
+        if not result.rowcount:
+            raise DerivedResetFenceLostError(
+                "the workspace was reset after this derived writer was assembled; "
+                "discard the stale writer and retry with a fresh runtime handle"
+            )
+
+    async def assert_derived_reset_epoch(self, expected_reset_epoch: int) -> None:
+        """Refuse a stale pipeline before it can perform its first source or document write."""
+        async with self._sessions() as session:
+            actual = await session.scalar(
+                select(models.Workspace.derived_reset_epoch).where(
+                    models.Workspace.id == self._workspace_id
+                )
+            )
+        if actual != expected_reset_epoch:
+            raise DerivedResetFenceLostError(
+                "the workspace was reset after this derived writer was assembled; "
+                "discard the stale writer and retry with a fresh runtime handle"
+            )
+
+    async def stage_vectors(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        expected_reset_epoch: int | None = None,
+    ) -> None:
         """Write cleanup records before a publication's vectors can exist."""
         if not chunks:
             return
         async with self._sessions.begin() as session:
+            await self._fence_derived_reset(session, expected_reset_epoch)
             await self._stage_vectors_in(session, publication_id, chunks)
 
     async def fenced_stage_vectors(
-        self, fence: AcquisitionFence, publication_id: str, chunks: Sequence[Chunk]
+        self,
+        fence: AcquisitionFence,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        expected_reset_epoch: int | None = None,
     ) -> None:
         """Stage cleanup evidence in the same transaction that validates ownership."""
         async with self._sessions.begin() as session:
+            await self._fence_derived_reset(session, expected_reset_epoch)
             await self._fence_acquisition_mutation(session, fence)
             await self._stage_vectors_in(session, publication_id, chunks)
 
-    @staticmethod
     async def _stage_vectors_in(
-        session: AsyncSession, publication_id: str, chunks: Sequence[Chunk]
+        self, session: AsyncSession, publication_id: str, chunks: Sequence[Chunk]
     ) -> None:
         if not chunks:
             return
+        state = await session.get(models.IndexState, self._workspace_id)
+        namespace = "workspace" if state is None else state.vector_namespace
+        vector_table = None if state is None else state.vector_table
         await session.execute(
             sqlite_insert(models.VectorTombstone)
             .values(
                 [
-                    {"chunk_id": vector_id(publication_id, chunk.id), "deleted_at": utcnow()}
+                    {
+                        "chunk_id": vector_id(publication_id, chunk.id),
+                        "workspace_id": self._workspace_id,
+                        "vector_namespace": namespace,
+                        "vector_table": vector_table,
+                        "deleted_at": utcnow(),
+                    }
                     for chunk in chunks
                 ]
             )
@@ -299,9 +355,11 @@ class SqliteDocStore(
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         """Flip the active publication and every relational derivative in one transaction."""
         async with self._sessions.begin() as session:
+            await self._fence_derived_reset(session, expected_reset_epoch)
             return await self._publish_document_in(
                 session,
                 document,
@@ -328,8 +386,10 @@ class SqliteDocStore(
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         async with self._sessions.begin() as session:
+            await self._fence_derived_reset(session, expected_reset_epoch)
             await self._fence_acquisition_mutation(session, fence)
             return await self._publish_document_in(
                 session,
@@ -375,9 +435,10 @@ class SqliteDocStore(
         if chunks:
             await session.execute(
                 delete(models.VectorTombstone).where(
+                    models.VectorTombstone.workspace_id == self._workspace_id,
                     models.VectorTombstone.chunk_id.in_(
                         [vector_id(document.publication_id, chunk.id) for chunk in chunks]
-                    )
+                    ),
                 )
             )
         if glossary_entries is not None:
@@ -396,9 +457,11 @@ class SqliteDocStore(
         *,
         expected: DocumentRevision | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         """Publish a failed row and retention outcome as one guarded transaction."""
         async with self._sessions.begin() as session:
+            await self._fence_derived_reset(session, expected_reset_epoch)
             return await self._publish_failure_in(
                 session,
                 document,
@@ -413,8 +476,10 @@ class SqliteDocStore(
         *,
         expected: DocumentRevision | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         async with self._sessions.begin() as session:
+            await self._fence_derived_reset(session, expected_reset_epoch)
             await self._fence_acquisition_mutation(session, fence)
             return await self._publish_failure_in(
                 session,
@@ -910,7 +975,7 @@ class SqliteDocStore(
     async def index_fingerprints(self) -> IndexFingerprints:
         """What this index says it was built with, or an empty answer if it has said nothing."""
         async with self._sessions() as session:
-            row = await session.get(models.IndexState, _INDEX_STATE_ID)
+            row = await session.get(models.IndexState, self._workspace_id)
             if row is None:
                 return IndexFingerprints()
             return IndexFingerprints(
@@ -927,12 +992,17 @@ class SqliteDocStore(
                 vector_table=row.vector_table,
             )
 
-    async def record_index_fingerprints(self, state: IndexFingerprints) -> None:
+    async def record_index_fingerprints(
+        self, state: IndexFingerprints, *, expected_reset_epoch: int | None = None
+    ) -> None:
         """Commit the index to a shape. One row, because there is one index."""
         async with self._sessions.begin() as session:
-            row = await session.get(models.IndexState, _INDEX_STATE_ID)
+            await self._fence_derived_reset(session, expected_reset_epoch)
+            row = await session.get(models.IndexState, self._workspace_id)
             if row is None:
-                row = models.IndexState(id=_INDEX_STATE_ID)
+                row = models.IndexState(
+                    workspace_id=self._workspace_id, vector_namespace="workspace"
+                )
                 session.add(row)
             row.embed_fingerprint = state.embed.model_dump_json() if state.embed else None
             row.chunk_fingerprint = state.chunk.model_dump_json() if state.chunk else None
@@ -953,6 +1023,7 @@ class SqliteDocStore(
                 (
                     await session.execute(
                         select(models.VectorTombstone.chunk_id)
+                        .where(models.VectorTombstone.workspace_id == self._workspace_id)
                         .order_by(
                             models.VectorTombstone.deleted_at, models.VectorTombstone.chunk_id
                         )
@@ -971,7 +1042,8 @@ class SqliteDocStore(
         async with self._sessions.begin() as session:
             await session.execute(
                 delete(models.VectorTombstone).where(
-                    models.VectorTombstone.chunk_id.in_(list(chunk_ids))
+                    models.VectorTombstone.workspace_id == self._workspace_id,
+                    models.VectorTombstone.chunk_id.in_(list(chunk_ids)),
                 )
             )
 
@@ -1079,7 +1151,12 @@ class SqliteDocStore(
             return [to_chunk(row) for row in rows]
 
     async def count_chunks(self, document_id: str | None = None) -> int:
-        statement = select(func.count()).select_from(models.Chunk)
+        statement = (
+            select(func.count())
+            .select_from(models.Chunk)
+            .join(models.Document, models.Document.id == models.Chunk.document_id)
+            .where(models.Document.workspace_id == self._workspace_id)
+        )
         if document_id is not None:
             statement = statement.where(models.Chunk.document_id == document_id)
         async with self._sessions() as session:
@@ -1092,9 +1169,8 @@ class SqliteDocStore(
         vector table holds a row per chunk with no column for tenancy, liveness or status, so
         the fraction of its rows that survive the hydrating join is what says how far past
         ``k`` the leg has to reach. Deliberately narrower than :meth:`count_chunks`, which
-        counts every chunk in the database including other tenants' and soft-deleted ones —
-        using that as the numerator would report a diluted index as a clean one and under-fetch
-        on exactly the deployments that need it most.
+        includes soft-deleted rows in this workspace — using that as the numerator would report
+        a diluted index as clean and under-fetch on exactly the deployments that need it most.
 
         One aggregate over an indexed join, computed once per generation rather than per query.
         """

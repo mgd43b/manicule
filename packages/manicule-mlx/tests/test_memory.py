@@ -10,10 +10,10 @@ footprint rose 2.45 -> 25.0 GiB while RSS *fell*.
 
 **What is checked here is the lifecycle, not the number.** Whether the bound actually holds
 physical memory down is a claim about Metal, and no fake can answer it — that is
-``tools/qualify_mlx_memory.py``, which runs the real weights and measures a real child process
-from outside. What a fake can answer, on every platform and in milliseconds, is whether the
-calls that establish the bound happen at all and in the right order. Those are the assertions
-that fail the moment somebody removes them.
+``tools/qualify_memory.py`` in this package, which runs the real weights and measures a real
+child process from outside. What a fake can answer, on every platform and in milliseconds, is
+whether the calls that establish the bound happen at all and in the right order. Those are the
+assertions that fail the moment somebody removes them.
 
 The MLX runtime is replaced wholesale, so these run on Linux CI with no MLX installed, and on
 Apple Silicon without loading Metal or fetching a gigabyte of weights.
@@ -26,24 +26,30 @@ Apple Silicon without loading Metal or fetching a gigabyte of weights.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
-
-from manicule.core.errors import ConfigError
-from manicule.embedding.cards import read_card
-from manicule.embedding.config import EmbedderConfig, MlxEmbedderConfig
-from manicule.embedding.runtimes.mlx_backend import (
+from manicule_mlx.backend import (
     DEFAULT_CACHE_LIMIT_BYTES,
     MEGABYTE,
     MlxEmbedder,
 )
-from tests.embedding_support import write_model
+from manicule_mlx.config import MlxEmbedderConfig
+
+from manicule.core.errors import ConfigError
+from manicule.embedding.cards import read_card
+from manicule.embedding.config import EmbedderConfig
+from manicule.testing import write_model
 
 pytestmark = pytest.mark.anyio
+
+_HARNESS_NAME = "manicule_mlx_qualify_memory"
+"""What the qualification harness is registered as in ``sys.modules``. See :func:`_harness`."""
 
 
 class FakeMlxCore:
@@ -238,14 +244,14 @@ def test_the_mlx_factory_refuses_configuration_that_would_drop_the_bound() -> No
     through configuration — which is exactly why it is worth a refusal rather than a fallback
     to defaults that look like they came from somewhere.
     """
-    from manicule.embedding.plugin import _build_mlx  # noqa: PLC0415 - a private factory
+    from manicule_mlx import build_mlx  # noqa: PLC0415 - this package's own factory
 
     class Context:
         config = EmbedderConfig()
         settings = None
 
     with pytest.raises(ConfigError, match="cache bound would not be applied"):
-        _build_mlx(Context())  # pyright: ignore[reportArgumentType] - the point
+        build_mlx(Context())  # pyright: ignore[reportArgumentType] - the point
 
 
 # --- the qualification harness's verdict, on injected measurements -------------------------
@@ -254,6 +260,29 @@ def test_the_mlx_factory_refuses_configuration_that_would_drop_the_bound() -> No
 # against curves whose shape is known rather than only against a real run. Fakes are the right
 # instrument here for the same reason they are wrong for the bound itself: this is arithmetic,
 # not Metal.
+
+
+def _harness() -> ModuleType:
+    """``tools/qualify_memory.py``, imported by path under an unambiguous name.
+
+    By path because the harness is a measurement script that is not shipped in the wheel, so it
+    is not on any import path. Under an explicit name because two shorter routes both collide:
+    ``tools`` is ambiguous between this package's harness directory and the repository's own,
+    and loading it from ``conftest`` is worse — every package's conftest is importable as plain
+    ``conftest``, so ``from conftest import ...`` resolves to whichever pytest loaded first,
+    which on a full run is a different package's.
+    """
+    if (loaded := sys.modules.get(_HARNESS_NAME)) is not None:
+        return loaded
+    path = Path(__file__).resolve().parent.parent / "tools" / "qualify_memory.py"
+    spec = importlib.util.spec_from_file_location(_HARNESS_NAME, path)
+    if spec is None or spec.loader is None:
+        msg = f"the qualification harness is not where the suite expects it: {path}"
+        raise RuntimeError(msg)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_HARNESS_NAME] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _namespace(**overrides: object) -> Any:
@@ -284,9 +313,7 @@ def _samples(footprints: list[int]) -> list[dict[str, Any]]:
 
 
 def _judge(footprints: list[int], **overrides: object) -> dict[str, Any]:
-    from tools.qualify_mlx_memory import _report  # noqa: PLC0415 - a CI script, not runtime
-
-    return _report(
+    return _harness()._report(
         _namespace(**overrides),
         _samples(footprints),
         baseline=1,

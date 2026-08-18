@@ -1019,6 +1019,28 @@ class Connector(Protocol):
         ...
 
 
+@runtime_checkable
+class BatchedDiscoveryConnector(Protocol):
+    """Optionally exposes source-native discovery boundaries to durable consumers.
+
+    A batch is one bounded source response, not an arbitrary process-sized buffer.  Durable
+    ingest can therefore commit every record in that response in one transaction before asking
+    the connector to follow its next cursor.  ``Connector.discover`` remains the mandatory
+    compatibility surface; connectors without expiring page cursors need not implement this.
+    """
+
+    def discover_batches(
+        self, watermark: Watermark | None
+    ) -> AsyncIterator[Sequence[DiscoveredDoc]]: ...
+
+
+@runtime_checkable
+class BatchedReconciliationConnector(Protocol):
+    """Optionally preserves source-native cursor pages during deletion enumeration."""
+
+    def reconcile_batches(self) -> AsyncIterator[Sequence[SourceId]]: ...
+
+
 # --- middleware --------------------------------------------------------------------------
 
 

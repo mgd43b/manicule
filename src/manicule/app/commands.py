@@ -31,10 +31,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, NoReturn, cast
+
+from pydantic import ValidationError
 
 from manicule.app import control
 from manicule.app.dispatch import writes as writes_by_name
+from manicule.core.organization import CollectionRule
 from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
 
 if TYPE_CHECKING:
@@ -139,6 +142,24 @@ class Arguments:
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             self._refuse(name, "a list of strings", value)
         return tuple(str(item) for item in value)
+
+    def collection_rule(self, name: str, *, optional: bool = False) -> CollectionRule | None:
+        """Read the canonical rule model from a JSON object without echoing its values."""
+        value = self.values.get(name)
+        if value is None and optional:
+            return None
+        if not isinstance(value, dict):
+            self._refuse(name, "a collection rule object", value)
+        try:
+            return CollectionRule.model_validate(cast("dict[str, JsonValue]", value))
+        except ValidationError as exc:
+            first = exc.errors(include_input=False)[0]
+            location = ".".join(str(item) for item in first["loc"])
+            detail = str(first["msg"])
+            raise ValueError(
+                f"{self.op} requires {name} to be a valid collection rule"
+                f"{f' ({location}: {detail})' if location else f' ({detail})'}"
+            ) from exc
 
     def _refuse(self, name: str, expected: str, value: JsonValue) -> NoReturn:
         """Refuse an argument, naming the type it was and never quoting the value.
@@ -246,7 +267,9 @@ BINDERS: Mapping[str, Binder] = {
         args.text("collection_id"), args.texts("document_ids")
     ),
     "collection_create": lambda service, args, report: service.collection_create(
-        args.text("name"), description=args.optional_text("description")
+        args.text("name"),
+        description=args.optional_text("description"),
+        rule=args.collection_rule("rule", optional=True),
     ),
     "collection_delete": lambda service, args, report: service.collection_delete(
         args.text("collection_id")
@@ -263,9 +286,17 @@ BINDERS: Mapping[str, Binder] = {
     "collection_update": lambda service, args, report: service.collection_update(
         args.text("collection_id"), description=args.text("description")
     ),
+    "collection_rule_set": lambda service, args, report: service.collection_rule_set(
+        args.text("collection_id"),
+        cast("CollectionRule", args.collection_rule("rule")),
+    ),
+    "collection_rule_clear": lambda service, args, report: service.collection_rule_clear(
+        args.text("collection_id")
+    ),
     "config_set": lambda service, args, report: service.config_set(
         args.text("key"), args.text("value")
     ),
+    "connector_list": lambda service, args, report: service.connector_list(),
     "connector_sidecar": lambda service, args, report: service.connector_sidecar(
         args.optional_path("root"), source=args.text("source"), force=args.flag("force")
     ),
@@ -328,6 +359,7 @@ BINDERS: Mapping[str, Binder] = {
     "restore": lambda service, args, report: service.restore(
         args.path("source"), force=args.flag("force")
     ),
+    "snapshot_status": lambda service, args, report: service.snapshot_status(args.text("name")),
     "upgrade": lambda service, args, report: service.upgrade(
         version=args.optional_text("version"), skip_backup=args.flag("skip_backup")
     ),

@@ -15,7 +15,9 @@ from manicule_plugin_example import MEDIA_TYPE
 from manicule.config.settings import Settings
 from manicule.container import build_container, keys
 from manicule.core.content import Document, DocumentStatus, RawDocument
+from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.core.errors import ConfigError, PolicyError, UnknownComponentError
+from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import content_hash, document_id
 from manicule.core.protocols import Chunker, Parser
 from manicule.plugins import (
@@ -41,6 +43,25 @@ download a model, which is not something a test suite should do.
 policy reads: anything outside ``KEYLESS_PROVIDERS`` is required to carry an API key, and a
 stand-in that tripped that check would be testing the wrong thing.
 """
+
+
+class _WideSyntheticEmbedder(HashEmbedder):
+    """Exact deterministic counter with room for configurable chunk-policy tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fingerprint = EmbedFingerprint(
+            model_id="synthetic/wide",
+            dimension=5,
+            pooling=Pooling.MEAN,
+            normalized=True,
+            tokenizer_id="synthetic/utf8-bytes-v1",
+            max_sequence_length=8192,
+            backend="fake",
+        )
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.encode())
 
 
 def _install_the_rest(registry: ComponentRegistry) -> None:
@@ -189,6 +210,69 @@ async def test_a_document_parses_and_chunks_through_the_container(
     assert chunks, "a document with two sections produced no chunks"
     assert [chunk.position for chunk in chunks] == list(range(len(chunks)))
     assert any("scheduler" in chunk.text for chunk in chunks)
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [({}, (512, 64)), ({"max_tokens": 768, "overlap_tokens": 96}, (768, 96))],
+)
+async def test_structural_policy_matches_executable_and_metadata_identity(
+    manicule_environment: Path,
+    configured: dict[str, int],
+    expected: tuple[int, int],
+) -> None:
+    del manicule_environment
+    found = discover()
+    found.registry.bind("synthetic").add(
+        keys.EMBEDDER.named(EMBEDDER_NAME),
+        lambda _: _WideSyntheticEmbedder(),
+        metadata_factory=lambda _: _WideSyntheticEmbedder().fingerprint,
+    )
+    settings = Settings(
+        embedding={"provider": EMBEDDER_NAME},  # pyright: ignore[reportArgumentType]
+        plugins={"config": {"chunker.structural": configured}},  # pyright: ignore[reportArgumentType]
+    )
+    container = build_container(settings, discovery=found)
+
+    declared = container.metadata(keys.CHUNKER)
+    assert isinstance(declared, ChunkFingerprint)
+    async with container:
+        executable = await container.aget(keys.CHUNKER)
+
+    assert (declared.max_tokens, declared.overlap_tokens) == expected
+    assert executable.fingerprint.canonical() == declared.canonical()
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        {"unknown": 1},
+        {"max_tokens": 64},
+        {"max_tokens": -1},
+        {"overlap_tokens": -1},
+        {"max_tokens": 96, "overlap_tokens": 96},
+    ],
+)
+def test_invalid_structural_policy_is_rejected_at_its_component_path(
+    manicule_environment: Path, configured: dict[str, int]
+) -> None:
+    del manicule_environment
+    found = discover()
+    found.registry.bind("synthetic").add(
+        keys.EMBEDDER.named(EMBEDDER_NAME),
+        lambda _: _WideSyntheticEmbedder(),
+        metadata_factory=lambda _: _WideSyntheticEmbedder().fingerprint,
+    )
+    container = build_container(
+        Settings(
+            embedding={"provider": EMBEDDER_NAME},  # pyright: ignore[reportArgumentType]
+            plugins={"config": {"chunker.structural": configured}},  # pyright: ignore[reportArgumentType]
+        ),
+        discovery=found,
+    )
+
+    with pytest.raises(ConfigError, match=r"plugins\.config\['chunker\.structural'\]"):
+        container.metadata(keys.CHUNKER)
 
 
 async def test_an_anchor_from_the_container_still_resolves_to_its_own_text(

@@ -266,6 +266,8 @@ WRITERS: frozenset[str] = frozenset(
         "collection_remove",
         "collection_rename",
         "collection_update",
+        "collection_rule_set",
+        "collection_rule_clear",
         "config_set",
         "connector_sidecar",
         "connector_sync",
@@ -591,6 +593,10 @@ def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exc
         "snapshot-delete",
         "connector-snapshot",
         "connector-verify",
+        # Nested under `collection rule`; the AST walk records the inner command name.
+        "rule-show",
+        "rule-set",
+        "rule-clear",
     }
     exceptions = {_normalized(name) for name in NO_RUNTIME_COMMANDS}
     unaccounted = commands - classified - exceptions - aliases

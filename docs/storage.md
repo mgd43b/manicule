@@ -55,8 +55,10 @@ for anything except genuinely new content — which is what `original_ref` in
   manicule.db-wal
   manicule.db-shm
   vectors/                 LanceDB — derived
-    chunks__<fp8>.lance/   vector table, name carries the fingerprint hash
-    _manicule_meta.lance/  one row: the fingerprints this directory was built with
+    workspaces/<sha256>/   opaque, stable workspace namespace
+      chunks__<fp8>.lance/ vector table, name carries the fingerprint hash
+      _manicule_meta.lance/ one row: the workspace fingerprint
+      generations/         workspace-owned replacement generations
   blobs/                   immutable, content-addressed
     sha256/ab/cd/abcd…     retained original bytes
 ```
@@ -229,7 +231,7 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **37 relational tables**. The 28 that predate durable
+The authoritative SQLAlchemy model has **40 relational tables**. The 28 that predate durable
 re-embedding are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
 `acquisition_markers`, `chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
 `conversations`, `document_tags`, `document_versions`, `documents`, `glossary_aliases`,
@@ -239,10 +241,15 @@ re-embedding are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_l
 durable without changing live reads until publication: `corpus_revision`,
 `reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
 `reembed_runs`, `reembed_shadow_generations` and `reembed_publication_receipts`.
-Two more stage an offline relational rebuild beside the live corpus: `derived_generations` and
-`derived_generation_items`.
+Three more stage an offline relational rebuild beside the live corpus: `derived_generations`,
+`derived_generation_snapshots` and `derived_generation_items`. The association binds one shadow
+generation to every promoted connector scope in deterministic order, so a workspace rechunk is
+resumable while publication remains one atomic corpus transition.
+Two content-addressed acquisition ledgers keep exact global backlog admission constant-time:
+`acquisition_blob_backlog` stores unfinished-record refcounts by hash, and
+`acquisition_backlog_capacity` stores their deduplicated byte total.
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 37.
+included in the 40.
 
 ### 4.1 The pre-#187 additions
 
@@ -253,8 +260,8 @@ could not do.
 |---|---|
 | `chunks` | Chunks carry an `Anchor`, and anchors are the type `docs/contracts.md` §1 calls the most important in the system and locks once ingest runs. Storing them only inside a columnar vector store's JSON blob puts the system's most valuable data in its most disposable store. A real table also gives `chunk_relations` something to point a foreign key at, and gives rung 2 of the ladder somewhere to read `embed_text` from. |
 | `blobs` | Content-addressed retained source bytes with media type, size and compression, plus a target for `documents.original_ref` to reference. §7. |
-| `index_state` | One row recording the fingerprints and the derived-index names this data directory was built with. §6.3. |
-| `vector_tombstones` | Chunk IDs deleted from SQLite whose vectors have not yet been swept from LanceDB. §8.2. |
+| `index_state` | One row per workspace recording its fingerprints, vector namespace and live derived-index name. §6.3. |
+| `vector_tombstones` | Workspace- and physical-binding-qualified chunk IDs deleted from SQLite whose vectors have not yet been swept from LanceDB. §8.2. |
 | `acquisition_runs` | Durable connector-run lifecycle, base and candidate watermarks, generation-fenced lease, completion markers, predecessor/successor fence lineage, typed inventory recovery, and bounded acquired/reused/reconciled-deletion counters. It separates discovering source coverage from publishing derived content. |
 | `acquisition_records` | One idempotent source identity per run, with the validated fetched envelope, acquisition/indexing state and retained-blob reference. Acquired and indexing states require the blob; the acquired transition also stores the fetched URI, media type, encoding, metadata, byte length and content hash atomically. Unchanged remains a distinct terminal provenance state. A discovery record is acknowledged only after this row commits. |
 | `acquisition_markers` | Indexed inventory of filesystem recovery markers. It blocks history cleanup until marker ownership is reconciled and contributes blob hashes to GC without a directory-wide scan. |
@@ -590,10 +597,11 @@ questions and `doctor` reports both.
 
 ### 4.6 `index_state`
 
-A singleton. One row, enforced.
+One row per workspace, enforced by the primary key.
 
 ```python
-id:                Mapped[int] = mapped_column(primary_key=True)  # CHECK (id = 1)
+workspace_id:      Mapped[str] = mapped_column(primary_key=True)
+vector_namespace:  Mapped[str]                # "workspace" or upgraded "legacy"
 vector_table:      Mapped[str]                # e.g. "chunks__7f3a91c2"
 embed_fingerprint: Mapped[str] = mapped_column(Text)   # canonical bytes, verbatim
 chunk_fingerprint: Mapped[str] = mapped_column(Text)
@@ -1098,7 +1106,7 @@ it is per-document lineage or nothing.
 |---|---|
 | Config | what the operator has asked for **now** |
 | `index_state` (SQLite) | what ingest last committed to |
-| `_manicule_meta` (a one-row Lance table in `vectors/`) | what these vector files were actually built with |
+| `_manicule_meta` (a one-row Lance table in the workspace vector directory) | what these vector files were actually built with |
 
 Three, because two cannot detect the interesting failure: swapping the `vectors/` directory
 for another instance's, or restoring half a backup. Writing the fingerprint into the vector
@@ -1143,7 +1151,7 @@ touches neither the network nor a parser. Rung 2, not rung 4.
 
 ### 6.4 Per-document lineage
 
-`index_state` records what the store as a whole was built with. `documents.chunk_fp` and
+`index_state` records what one workspace was built with. `documents.chunk_fp` and
 `documents.embed_fp` record, per document, the short hash of the fingerprints *that document*
 was last built with.
 
@@ -1156,8 +1164,8 @@ SELECT id FROM documents
 WHERE chunk_fp <> :current AND media_type IN (:code_types)
 ```
 
-Without it, the only expressible repair is "everything". The global refusal in §6.3 still
-stands — one vector table cannot hold two spaces — but after adopting a new fingerprint, the
+Without it, the only expressible repair is "everything". The workspace refusal in §6.3 still
+stands — one workspace vector table cannot hold two spaces — but after adopting a new fingerprint, the
 repair is targeted instead of total.
 
 **`documents.parse_fp` is the third, and the only one with no row in `index_state`.** It
@@ -1244,15 +1252,16 @@ Introducing a media type is exactly the operation that needs it.
 
 ### 6.5 Creating and replacing the vector table
 
-**First ingest** creates `chunks__<fp8>` where `<fp8>` is the first eight hex characters of
-the canonical fingerprint hash, writes `_manicule_meta`, and sets `index_state.vector_table`
-in the same SQLite transaction that records the fingerprint.
+**First ingest** creates a private `vectors/workspaces/<sha256>/` namespace, then
+`chunks__<fp8>` where `<fp8>` is the first eight hex characters of the canonical fingerprint
+hash. It writes `_manicule_meta` in that directory and sets the workspace's
+`index_state.vector_table` in the same SQLite transaction that records the fingerprint.
 
 **`reindex --re-embed`** never mutates the live table:
 
 1. Create `chunks__<newfp8>` alongside the existing one.
 2. Embed from `chunks.embed_text` into it, in batches, resumable.
-3. In one SQLite transaction: update `index_state.vector_table`,
+3. In one SQLite transaction: update the workspace's `index_state.vector_table`,
    `index_state.embed_fingerprint`, and every `documents.embed_fp`.
 4. Drop the old table.
 
@@ -1744,6 +1753,13 @@ handle reads the collection; if it could name a workspace, a saved query would b
 its own scope past the handle running it. The evaluating store supplies the scope, always. The
 rule is also refused if it restricts nothing — an empty rule selects the whole workspace, and
 "no rule" already has a spelling.
+
+The rule is public collection metadata, so its set-valued selectors serialize in sorted order.
+Operators can supply it at collection creation and can show, replace, or clear it through the
+CLI, HTTP API, control socket, and writable MCP surface. These operations only write the stored
+rule JSON. They do not enumerate the corpus, materialize membership rows, contact a source, or
+reach parsing, chunking, embedding, and vector publication. Clearing the rule removes only its
+evaluated half; manually added membership survives.
 
 There is **one** expression of a rule, `rule_clause`, used by all three readers: listing a
 collection, reporting which collections hold a document, and resolving a filter. A second,

@@ -12,6 +12,7 @@ import json
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import huggingface_hub
 import pytest
@@ -20,6 +21,7 @@ from pydantic import ValidationError
 from manicule import vocabularies
 from manicule.app import results as r
 from manicule.app import service as service_module
+from manicule.app.ports import ResetOutcome
 from manicule.app.results import CheckState
 from manicule.app.service import (
     _IDENTITY_SAMPLE,  # pyright: ignore[reportPrivateUsage]
@@ -29,16 +31,24 @@ from manicule.app.service import (
 from manicule.config.settings import Settings, config_file
 from manicule.connectors.enriched import AdapterOutcome
 from manicule.connectors.filesystem import ENRICHED_KEY
-from manicule.core.content import Document, DocumentStatus
+from manicule.core.content import Chunk, Document, DocumentStatus
 from manicule.core.errors import ConfigError, UnknownEntityError
 from manicule.core.ids import document_id
+from manicule.core.organization import CollectionRule
 from manicule.core.provenance import Provenance
-from manicule.core.retrieval import Candidate, RetrievalProfile
+from manicule.core.retrieval import Candidate, Filter, RetrievalProfile
 from manicule.embedding.runtimes import hub
 from manicule.embedding.runtimes.hub import OFFLINE_ENV
 from manicule.ingest.pipeline import RunReport
 from manicule.plugins.registry import discover
+from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
+from manicule.storage.organization import resolve_filter
 from tests.app.fakes import FakeBackend, make_chunk, make_document
+from tests.storage_helpers import make_chunk as make_stored_chunk
+from tests.storage_helpers import make_document as make_stored_document
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
 
 @pytest.fixture
@@ -985,6 +995,40 @@ async def test_a_setting_is_written_and_reads_back(
     assert written.count("precise") == 1
 
 
+async def test_structural_component_policy_uses_the_real_cli_key(
+    service: ApplicationService, config_home: Path
+) -> None:
+    await service.config_set("plugins.config.chunker.structural.max_tokens", "768")
+    await service.config_set('plugins.config."chunker.structural".overlap_tokens', "96")
+
+    written = await asyncio.to_thread(config_home.read_text, "utf-8")
+    assert '[plugins.config."chunker.structural"]' in written
+    assert "max_tokens = 768" in written
+    assert "overlap_tokens = 96" in written
+
+
+async def test_structural_component_policy_reads_through_the_real_cli_key(
+    backend: FakeBackend,
+) -> None:
+    backend.settings = Settings(
+        plugins={  # pyright: ignore[reportArgumentType]
+            "config": {"chunker.structural": {"max_tokens": 768, "overlap_tokens": 96}}
+        }
+    )
+    service = ApplicationService(backend)
+
+    value = await service.config_get("plugins.config.chunker.structural.max_tokens")
+    assert value.value == 768
+
+
+async def test_invalid_structural_component_policy_is_not_written(
+    service: ApplicationService, config_home: Path
+) -> None:
+    with pytest.raises(ConfigError, match=r"chunker\.structural"):
+        await service.config_set("plugins.config.chunker.structural.max_tokens", "64")
+    assert not await asyncio.to_thread(config_home.exists)
+
+
 async def test_a_value_that_parses_as_json_is_stored_as_json(
     service: ApplicationService, config_home: Path
 ) -> None:
@@ -1225,8 +1269,15 @@ async def test_upgrade_names_a_destination_without_creating_one(tmp_path: Path) 
 
 
 @pytest.fixture
-def weights_on_disk(monkeypatch: pytest.MonkeyPatch) -> Callable[[bool], None]:
+def weights_on_disk(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> Callable[[bool], None]:
     """Decide what the model cache holds, without one being on the machine running the test.
+
+    Also selects the MLX backend, which these cases are about. It used to be the default and is
+    now a separate distribution, so a test that says nothing gets `onnx` — and would assert
+    about a different artifact while looking unchanged. `doctor` plans weights for whichever
+    backend is *configured*, which is the behavior under test either way.
 
     The probe is a real cache lookup, so on a developer's laptop it answers "present" and on a
     fresh CI runner it answers "absent" — which would make every assertion below true or false
@@ -1235,6 +1286,10 @@ def weights_on_disk(monkeypatch: pytest.MonkeyPatch) -> Callable[[bool], None]:
     """
 
     def decide(present: bool) -> None:
+        backend.settings = Settings(
+            embedding={"provider": "mlx"}  # pyright: ignore[reportArgumentType] - validated
+        )
+
         def cached(*_args: object, **_kwargs: object) -> bool:
             return present
 
@@ -1303,7 +1358,10 @@ async def test_doctor_recognizes_a_fully_local_model_without_a_download(
     directory = write_model(tmp_path / "local-model")
     (directory / "model.safetensors").write_bytes(b"weights")
     backend.settings = Settings(
-        embedding={"model": str(directory)}  # pyright: ignore[reportArgumentType]
+        # `mlx` named rather than defaulted: safetensors is the artifact *that* backend reads,
+        # and the default is now `onnx`, which would look for `onnx/model.onnx` and correctly
+        # report this local directory as holding nothing it can run.
+        embedding={"model": str(directory), "provider": "mlx"}  # pyright: ignore[reportArgumentType]
     )
 
     diagnosis = await ApplicationService(backend).doctor()
@@ -1317,6 +1375,7 @@ async def test_doctor_recognizes_a_fully_local_model_without_a_download(
 
 async def test_doctor_refuses_a_mutable_remote_weights_revision(backend: FakeBackend) -> None:
     backend.settings = Settings(
+        embedding={"provider": "mlx"},  # pyright: ignore[reportArgumentType] - validated
         plugins={  # pyright: ignore[reportArgumentType] - validated settings fixture
             "config": {
                 "embedder.mlx": {
@@ -1324,7 +1383,7 @@ async def test_doctor_refuses_a_mutable_remote_weights_revision(backend: FakeBac
                     "weights_revision": "main",
                 }
             }
-        }
+        },
     )
 
     diagnosis = await ApplicationService(backend).doctor()
@@ -1338,9 +1397,10 @@ async def test_doctor_refuses_a_mutable_remote_weights_revision(backend: FakeBac
 
 async def test_doctor_refuses_a_non_string_weights_revision(backend: FakeBackend) -> None:
     backend.settings = Settings(
+        embedding={"provider": "mlx"},  # pyright: ignore[reportArgumentType] - validated
         plugins={  # pyright: ignore[reportArgumentType] - malformed raw plugin config is the case
             "config": {"embedder.mlx": {"weights_revision": 123}}
-        }
+        },
     )
 
     diagnosis = await ApplicationService(backend).doctor()
@@ -1417,6 +1477,7 @@ async def test_doctor_refuses_a_revision_claim_for_local_weights(
     backend: FakeBackend, tmp_path: Path
 ) -> None:
     backend.settings = Settings(
+        embedding={"provider": "mlx"},  # pyright: ignore[reportArgumentType] - validated
         plugins={  # pyright: ignore[reportArgumentType] - validated settings fixture
             "config": {
                 "embedder.mlx": {
@@ -1424,7 +1485,7 @@ async def test_doctor_refuses_a_revision_claim_for_local_weights(
                     "weights_revision": "1" * 40,
                 }
             }
-        }
+        },
     )
 
     diagnosis = await ApplicationService(backend).doctor()
@@ -1882,6 +1943,99 @@ async def test_updating_a_description_cannot_erase_one_by_omission(
         "an empty string neither cleared the description nor was rejected; 'no description' "
         "now has two spellings on the wire"
     )
+
+
+async def test_collection_rules_are_created_shown_replaced_and_cleared_explicitly(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    first = CollectionRule(sources=frozenset({"wiki-team-a", "wiki-team-a-archive"}))
+    made = await service.collection_create("Team A", rule=first)
+    assert made.rule == {
+        "sources": ["wiki-team-a", "wiki-team-a-archive"],
+        "media_types": [],
+        "tag_ids": [],
+        "updated_after": None,
+        "updated_before": None,
+    }
+
+    shown = await service.collection_rule_show(made.id)
+    assert shown == made
+
+    replacement = CollectionRule(media_types=frozenset({"text/markdown"}))
+    changed = await service.collection_rule_set(made.id, replacement)
+    assert changed.rule is not None
+    assert changed.rule["media_types"] == ["text/markdown"]
+
+    cleared = await service.collection_rule_clear(made.id)
+    assert cleared.rule is None
+    stored = await backend.organization_.get_collection(made.id)
+    assert stored is not None
+    assert stored.rule is None
+
+
+async def test_collection_rule_show_refuses_a_foreign_or_missing_id(
+    service: ApplicationService,
+) -> None:
+    with pytest.raises(UnknownEntityError):
+        await service.collection_rule_show("somebody-elses-collection")
+
+
+async def test_supported_rule_management_selects_live_members_without_corpus_work(
+    engine: AsyncEngine,
+) -> None:
+    """Bounded end-to-end proof over the real rule evaluator and the supported service."""
+    organization = SqliteDocStore(engine)
+    await organization.ensure_workspace()
+    backend = FakeBackend()
+    backend.organization_ = cast("Any", organization)
+    service = ApplicationService(backend)
+
+    async def seed(source: str, source_id: str) -> tuple[Document, Chunk]:
+        document = await organization.upsert_document(
+            make_stored_document(source=source, source_id=source_id)
+        )
+        chunk = make_stored_chunk(document, 0, f"synthetic body for {source_id}")
+        await organization.replace_chunks(document.id, [chunk])
+        backend.store.add(document, chunk)
+        return document, chunk
+
+    current, _ = await seed("wiki-team-a", "current.md")
+    excluded, _ = await seed("wiki-team-b", "excluded.md")
+
+    async def corpus_facts() -> tuple[int, int, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        return (
+            await organization.count_documents(),
+            await organization.live_chunk_count(),
+            tuple(str(path) for path in backend.ingestion_.paths),
+            tuple(backend.ingestion_.synced),
+            tuple(backend.ingestion_.asked),
+        )
+
+    before_create = await corpus_facts()
+    made = await service.collection_create(
+        "Team A", rule=CollectionRule(sources=frozenset({"wiki-team-a"}))
+    )
+    assert await corpus_facts() == before_create
+    first_counts = await service.collection_counts(made.id)
+    assert (first_counts.documents, first_counts.chunks) == (1, 1)
+
+    later, later_chunk = await seed("wiki-team-a", "later.md")
+    later_counts = await service.collection_counts(made.id)
+    assert (later_counts.documents, later_counts.chunks) == (2, 2)
+    scope = Filter(
+        workspace_ids=frozenset({DEFAULT_WORKSPACE}),
+        collection_ids=frozenset({made.id}),
+    )
+    resolved = await resolve_filter(scope, collections=organization, tags=organization)
+    assert resolved is not None
+    assert resolved.document_ids == frozenset({current.id, later.id})
+    assert excluded.id not in resolved.document_ids
+    assert later_chunk.document_id == later.id
+
+    before_mutations = await corpus_facts()
+    await service.collection_rule_set(made.id, CollectionRule(sources=frozenset({"wiki-team-b"})))
+    await service.collection_rule_clear(made.id)
+    assert await corpus_facts() == before_mutations
 
 
 # --- the connector-identity check, and the two settings around it --------------------------------
@@ -2640,6 +2794,115 @@ async def test_status_and_mcp_payload_do_not_expose_a_local_weights_path(
     assert status.weights_ref.startswith("local:sha256:")
     assert str(directory) not in payload
     assert "private-name" not in payload
+
+
+async def test_doctor_identifies_stale_empty_index_identity_with_reset_remedy(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    stale = HashEmbedder(model_id="fake/stale-empty").fingerprint
+    configured = HashEmbedder(model_id="fake/configured").fingerprint
+    backend.store.documents.clear()
+    backend.store.chunks.clear()
+
+    async def fingerprints() -> IndexFingerprints:
+        return IndexFingerprints(embed=stale, vector_table="chunks__stale")
+
+    async def configured_fingerprints() -> tuple[str, str]:
+        return configured.canonical(), ""
+
+    monkeypatch.setattr(backend.store, "index_fingerprints", fingerprints)
+    monkeypatch.setattr(
+        backend.ingestion_, "configured_index_fingerprints", configured_fingerprints
+    )
+
+    check = _check(await ApplicationService(backend).doctor(), "index")
+
+    assert check.state == "degraded"
+    assert check.facts["documents"] == 0
+    assert check.facts["stale_empty_identity"] is True
+    assert check.remedy == "manicule reset-index --yes"
+
+
+async def test_doctor_detects_orphaned_physical_fingerprint_without_sql_identity(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    stale = HashEmbedder(model_id="fake/orphaned-lance-meta").fingerprint
+    configured = HashEmbedder(model_id="fake/configured").fingerprint
+    backend.store.documents.clear()
+    backend.store.chunks.clear()
+
+    async def empty_identity() -> IndexFingerprints:
+        return IndexFingerprints()
+
+    async def configured_fingerprints() -> tuple[str, str]:
+        return configured.canonical(), ""
+
+    async def physical_fingerprint() -> str:
+        return stale.canonical()
+
+    monkeypatch.setattr(backend.store, "index_fingerprints", empty_identity)
+    monkeypatch.setattr(
+        backend.ingestion_, "configured_index_fingerprints", configured_fingerprints
+    )
+    monkeypatch.setattr(backend.ingestion_, "physical_index_fingerprint", physical_fingerprint)
+
+    check = _check(await ApplicationService(backend).doctor(), "index")
+
+    assert check.state == "degraded"
+    assert check.facts["stale_empty_identity"] is True
+    assert check.facts["physical_fingerprint_mismatch"] is True
+    assert check.remedy == "manicule reset-index --yes"
+
+
+async def test_doctor_allows_matching_physical_metadata_without_sql_identity(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    configured = HashEmbedder(model_id="fake/matching-lance-meta").fingerprint
+    backend.store.documents.clear()
+    backend.store.chunks.clear()
+
+    async def empty_identity() -> IndexFingerprints:
+        return IndexFingerprints()
+
+    async def configured_fingerprints() -> tuple[str, str]:
+        return configured.canonical(), ""
+
+    async def physical_fingerprint() -> str:
+        return configured.canonical()
+
+    monkeypatch.setattr(backend.store, "index_fingerprints", empty_identity)
+    monkeypatch.setattr(
+        backend.ingestion_, "configured_index_fingerprints", configured_fingerprints
+    )
+    monkeypatch.setattr(backend.ingestion_, "physical_index_fingerprint", physical_fingerprint)
+
+    check = _check(await ApplicationService(backend).doctor(), "index")
+
+    assert check.state == "ok"
+    assert check.detail == "empty index, ready for a first ingest"
+    assert check.remedy == ""
+
+
+async def test_reset_reports_publication_backed_vector_cleanup(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    backend.maintenance_.reset = ResetOutcome(publications=1)
+
+    report = await service.reset_index()
+
+    assert report.publications_removed == 1
+    assert report.vector_rows_removed == 0
+    assert not report.vector_store_removed
+    assert report.vectors_removed
 
 
 async def test_the_glossary_sweep_reaches_the_port_with_what_the_caller_asked_for(

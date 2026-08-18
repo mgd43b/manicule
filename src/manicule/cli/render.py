@@ -442,6 +442,8 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     table.add_row("enumeration completed", "yes" if payload.enumeration_completed else "no")
     table.add_row("watermark advanced", "yes" if payload.watermark_advanced else "no")
     table.add_row("retry required", "yes" if payload.retry_required else "no")
+    if payload.full_inventory_authority:
+        table.add_row("full inventory authority", escape(payload.full_inventory_authority))
     if payload.inventory_recovery:
         table.add_row("inventory recovery", escape(payload.inventory_recovery))
     if payload.reconciled_deleted_items:
@@ -556,6 +558,7 @@ def render_connectors(out: Console, payload: r.ConnectorList) -> None:
         "last outcome",
         "retry",
         "inventory recovery",
+        "full inventory authority",
         box=None,
         pad_edge=False,
     )
@@ -574,6 +577,7 @@ def render_connectors(out: Console, payload: r.ConnectorList) -> None:
                 and connector.last_lifecycle.inventory_recovery
                 else "—"
             ),
+            connector.full_inventory_authority or "—",
         )
     out.print(table)
     if not payload.connectors:
@@ -906,6 +910,8 @@ def render_snapshot_status(out: Console, payload: r.SnapshotStatusReport) -> Non
         f"promoted: {'yes' if progress.snapshot_promoted else 'no'}; "
         f"offline continuation: {'yes' if progress.can_continue_offline else 'no'}"
     )
+    if payload.full_inventory_authority:
+        out.print(f"full inventory authority: {escape(payload.full_inventory_authority)}")
     if progress.inventory_recovery:
         out.print(
             f"inventory recovery: {escape(progress.inventory_recovery)}; "
@@ -1019,6 +1025,20 @@ def render_rebuild_plan(out: Console, payload: r.RebuildPlanReport) -> None:
         f"{payload.estimated_peak_memory_bytes} bytes; temporary disk "
         f"{payload.estimated_temporary_bytes} bytes"
     )
+    out.print(
+        f"estimated embedding work: {payload.estimated_embedding_chunks} chunks; "
+        f"missing retained inputs: {payload.missing_count}; "
+        f"network required: {'yes' if payload.network_required else 'no'}"
+    )
+    out.print(
+        f"current chunk identity: {escape(payload.current_chunk_fingerprint or 'unrecorded')}"
+    )
+    out.print(f"target chunk identity: {escape(payload.target_chunk_fingerprint)}")
+    if payload.over_budget_chunks:
+        out.print(
+            f"stored budget diagnostic: {payload.over_budget_chunks} chunk(s) over the "
+            f"recorded budget; maximum stored token count {payload.max_stored_chunk_tokens}"
+        )
 
 
 def render_rebuild_run(out: Console, payload: r.RebuildRunReport) -> None:

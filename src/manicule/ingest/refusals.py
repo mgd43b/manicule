@@ -53,6 +53,7 @@ async def check_before_run(
     chunk: ChunkFingerprint,
     store: IngestStore,
     vectors: VectorStore | None = None,
+    expected_reset_epoch: int | None = None,
 ) -> IndexFingerprints:
     """Refuse to start unless this configuration can write to this index.
 
@@ -81,7 +82,7 @@ async def check_before_run(
     if stored.embed is not None:
         await _refuse_embed_mismatch(stored.embed, embed, store)
     if stored.chunk is not None:
-        stored.chunk.require_match(chunk)
+        await _refuse_chunk_mismatch(stored.chunk, chunk, store)
 
     if vectors is not None:
         held = await vectors.fingerprint()
@@ -92,7 +93,12 @@ async def check_before_run(
         embed=embed, chunk=chunk, vector_table=_vector_table(embed, vectors)
     )
     if stored != committed:
-        await store.record_index_fingerprints(committed)
+        if expected_reset_epoch is None:
+            await store.record_index_fingerprints(committed)
+        else:
+            await store.record_index_fingerprints(
+                committed, expected_reset_epoch=expected_reset_epoch
+            )
     return committed
 
 
@@ -198,8 +204,39 @@ async def _refuse_embed_mismatch(
         stored.require_match(offered)
     except FingerprintMismatchError as exc:
         note = (
-            f"{chunks} stored chunk(s) would need re-embedding. `reindex --re-embed` reads "
-            f"chunks.embed_text and touches neither the network nor a parser."
+            "This workspace has no stored chunks. Run `manicule reset-index --yes` to clear "
+            "its obsolete derived identity, then retry the ingest."
+            if chunks == 0
+            else (
+                f"{chunks} stored chunk(s) would need re-embedding. `reindex --re-embed` reads "
+                "chunks.embed_text and touches neither the network nor a parser."
+            )
+        )
+        exc.add_note(note)
+        raise
+
+
+async def _refuse_chunk_mismatch(
+    stored: ChunkFingerprint, offered: ChunkFingerprint, store: IngestStore
+) -> None:
+    """Compare chunk structure and name the retained-source replacement workflow."""
+    if stored.matches(offered):
+        return
+    chunks = await store.count_chunks()
+    try:
+        stored.require_match(offered)
+    except FingerprintMismatchError as exc:
+        note = (
+            "This workspace has no stored chunks. Run `manicule reset-index --yes` to clear "
+            "its obsolete derived identity, then retry the ingest."
+            if chunks == 0
+            else (
+                f"{chunks} stored chunk(s) must be rechunked from retained source snapshots; "
+                "re-embedding stored embed_text cannot change structural boundaries. Run "
+                "`manicule rebuild plan SNAPSHOT_ID` for an aggregate cost/capacity estimate, "
+                "then `manicule rebuild execute SNAPSHOT_ID` to publish one resumable atomic "
+                "workspace generation without reacquiring source data."
+            )
         )
         exc.add_note(note)
         raise

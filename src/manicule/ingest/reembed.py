@@ -31,6 +31,7 @@ from typing import Protocol
 from manicule.core.content import Chunk, Document
 from manicule.core.embedding import EmbedFingerprint, Vector
 from manicule.core.errors import ManiculeError, PolicyError
+from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.protocols import Embedder
 from manicule.ingest.embedding import batch_size, embed_chunks
 
@@ -716,6 +717,14 @@ async def _build(
         document = await corpus.document(run.commitment.snapshot, active_document_id)
         if document is None:
             raise ReembedError("the immutable snapshot lost a document during resume")
+        chunk_fingerprint = None
+        if document.chunk_fingerprint is not None:
+            try:
+                chunk_fingerprint = ChunkFingerprint.model_validate_json(document.chunk_fingerprint)
+            except ValueError as exc:
+                raise ReembedError(
+                    "the immutable snapshot has an invalid chunk fingerprint"
+                ) from exc
         stored_chunks = await corpus.chunks(
             run.commitment.snapshot,
             document.document.id,
@@ -729,6 +738,7 @@ async def _build(
             vectors = await embed_chunks(
                 embedder,
                 chunks,
+                chunk_fingerprint=chunk_fingerprint,
                 target_batch_tokens=target_batch_tokens,
             )
             lease = await journal.renew(run.id, lease, ttl_seconds=lease_ttl_seconds)

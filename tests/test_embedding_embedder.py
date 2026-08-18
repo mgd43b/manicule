@@ -20,6 +20,7 @@ from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.lifecycle import HealthState
 from manicule.core.protocols import Embedder, TokenStateEmbedder
 from manicule.embedding.cards import ModelCard, read_card
+from manicule.ingest.embedding import embed_chunks as embed_chunk_batch
 from manicule.testing import (
     assert_embedder_contract,
     assert_protocol_signatures,
@@ -208,6 +209,48 @@ async def test_a_chunk_counted_with_another_vocabulary_is_refused(embedder: Stub
 
     with pytest.raises(ContextOverflowError, match="tokenizes with"):
         await embedder.embed_chunks([chunk("alpha", token_count=1)], counted_elsewhere)
+
+
+async def test_base_embedder_remeasures_stale_counts_against_the_chunk_budget(
+    embedder: StubEmbedder,
+) -> None:
+    text = " ".join(["alpha"] * 12)
+    measured = embedder.count_tokens(text)
+    assert 8 < measured <= embedder.fingerprint.max_sequence_length
+    produced = ChunkFingerprint(
+        chunker="structural",
+        version="3",
+        max_tokens=8,
+        overlap_tokens=0,
+        tokenizer_id=embedder.fingerprint.tokenizer_id,
+    )
+
+    with pytest.raises(ContextOverflowError, match="fingerprinted 8-token final embed_text"):
+        await embedder.embed_chunks([chunk(text, token_count=1)], produced)
+
+    assert embedder.forward_calls == 0
+
+
+async def test_shared_embedding_utility_remeasures_stale_counts_against_the_chunk_budget(
+    embedder: StubEmbedder,
+) -> None:
+    text = " ".join(["beta"] * 12)
+    produced = ChunkFingerprint(
+        chunker="structural",
+        version="3",
+        max_tokens=8,
+        overlap_tokens=0,
+        tokenizer_id=embedder.fingerprint.tokenizer_id,
+    )
+
+    with pytest.raises(ContextOverflowError, match="fingerprinted 8-token final embed_text"):
+        await embed_chunk_batch(
+            embedder,
+            [chunk(text, token_count=1)],
+            chunk_fingerprint=produced,
+        )
+
+    assert embedder.forward_calls == 0
 
 
 async def test_chunks_embed_in_the_order_they_were_given(embedder: StubEmbedder) -> None:

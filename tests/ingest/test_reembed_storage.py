@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import shutil
+from collections.abc import AsyncGenerator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, override
 
 import lancedb
 import pytest
 from pydantic import TypeAdapter
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 
 from manicule.core.content import Chunk
-from manicule.core.embedding import Vector
+from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.ingest.reembed import (
     CorpusSnapshot,
     PublishOutcome,
@@ -42,6 +44,7 @@ from manicule.storage.vectors import (
     PublishedLanceVectorStore,
     VectorStoreReprepareRequiredError,
     VectorStoreStateError,
+    generation_pin,
     quote,
     table_name,
 )
@@ -162,11 +165,17 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
-                vector_table=table_name(old),
-                embed_fingerprint=old.model_dump_json(),
-                created_at=utcnow(),
-                updated_at=utcnow(),
+                [
+                    {
+                        "workspace_id": workspace,
+                        "vector_namespace": "legacy",
+                        "vector_table": table_name(old),
+                        "embed_fingerprint": old.model_dump_json(),
+                        "created_at": utcnow(),
+                        "updated_at": utcnow(),
+                    }
+                    for workspace in ("alpha", "beta")
+                ]
             )
         )
 
@@ -177,10 +186,10 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
     beta_commitment = await plan_reembed_commitment(beta_corpus, target)
     assert alpha_commitment.plan.documents == alpha_commitment.plan.chunks == 1
     assert beta_commitment.plan.documents == beta_commitment.plan.chunks == 1
-    assert alpha_commitment.execution_plan.documents == 2
-    assert alpha_commitment.execution_plan.chunks == 2
-    assert beta_commitment.execution_plan.documents == 2
-    assert beta_commitment.execution_plan.chunks == 2
+    assert alpha_commitment.execution_plan.documents == 1
+    assert alpha_commitment.execution_plan.chunks == 1
+    assert beta_commitment.execution_plan.documents == 1
+    assert beta_commitment.execution_plan.chunks == 1
     assert alpha_commitment.snapshot.workspace_id == "alpha"
     assert beta_commitment.snapshot.workspace_id == "beta"
 
@@ -207,21 +216,88 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
         counts = {str(row[0]): int(row[1]) for row in rows}
     assert counts == {"alpha": 1, "beta": 2}
 
-    shadows = LanceShadowGenerations(data_dir / VECTORS_DIRNAME, alpha_store)
-    published = await resume_reembed(
+    beta_shadows = LanceShadowGenerations(data_dir / VECTORS_DIRNAME, beta_store)
+    beta_published = await resume_reembed(
+        beta_run.id,
+        owner_token="beta-owner",  # noqa: S106
+        corpus=beta_corpus,
+        embedder=HashEmbedder(dimension=4),
+        journal=beta_store,
+        shadow=beta_shadows,
+        publisher=beta_store,
+    )
+    assert beta_published.state is ReembedState.PUBLISHED
+    beta_document = await beta.get_document(stored_chunks[1].document_id)
+    assert beta_document is not None
+    await beta.upsert_document(beta_document.model_copy(update={"title": "beta changed"}))
+    async with engine.connect() as connection:
+        revision_rows = (
+            await connection.execute(
+                select(
+                    models.CorpusRevision.workspace_id,
+                    models.CorpusRevision.revision,
+                )
+            )
+        ).all()
+        revisions = {str(row.workspace_id): int(row.revision) for row in revision_rows}
+    assert str(revisions["alpha"]) == alpha_commitment.snapshot.revision
+    assert str(revisions["beta"]) != beta_commitment.snapshot.revision
+
+    alpha_shadows = LanceShadowGenerations(data_dir / VECTORS_DIRNAME, alpha_store)
+    alpha_published = await resume_reembed(
         alpha_run.id,
         owner_token="alpha-owner",  # noqa: S106
         corpus=alpha_corpus,
         embedder=HashEmbedder(dimension=4),
         journal=alpha_store,
-        shadow=shadows,
+        shadow=alpha_shadows,
         publisher=alpha_store,
     )
-    assert published.state is ReembedState.PUBLISHED
-    assert (await beta_store.get(beta_run.id)).state is ReembedState.PLANNED  # type: ignore[union-attr]
-    live = PublishedLanceVectorStore(data_dir / VECTORS_DIRNAME, engine)
+    assert alpha_published.state is ReembedState.PUBLISHED
+    assert (await beta_store.get(beta_run.id)).state is ReembedState.PUBLISHED  # type: ignore[union-attr]
+    async with engine.connect() as connection:
+        beta_shadow_state = (
+            await connection.execute(
+                select(models.ReembedShadowGeneration.state).where(
+                    models.ReembedShadowGeneration.workspace_id == "beta",
+                    models.ReembedShadowGeneration.run_id == beta_run.id,
+                )
+            )
+        ).scalar_one()
+    assert beta_shadow_state == "published"
+
+    stale_alpha = await start_reembed(
+        "alpha-mutated-after-snapshot",
+        owner_token="alpha-stale-owner",  # noqa: S106
+        corpus=alpha_corpus,
+        target=target,
+        journal=alpha_store,
+    )
+    alpha_document = await alpha.get_document(stored_chunks[0].document_id)
+    assert alpha_document is not None
+    await alpha.upsert_document(alpha_document.model_copy(update={"title": "alpha changed"}))
+    stale_result = await resume_reembed(
+        stale_alpha.id,
+        owner_token="alpha-stale-owner",  # noqa: S106
+        corpus=alpha_corpus,
+        embedder=HashEmbedder(dimension=4),
+        journal=alpha_store,
+        shadow=alpha_shadows,
+        publisher=alpha_store,
+    )
+    assert stale_result.state is ReembedState.SUPERSEDED
+
+    live = PublishedLanceVectorStore(
+        data_dir / VECTORS_DIRNAME,
+        engine,
+        workspace_id="alpha",
+        identity_namespace="legacy",
+    )
     await live.ensure_ready(HashEmbedder(dimension=4).fingerprint)
-    assert await live.count() == 2
+    assert await live.count() == 1
+    assert [row.chunk.document_id for row in await live.search([1.0, 0.0, 0.0, 0.0], 10)] == [
+        stored_chunks[0].document_id
+    ]
     assert await alpha.get_document(stored_chunks[0].document_id) is not None
     assert await beta.get_document(stored_chunks[1].document_id) is not None
     await live.teardown()
@@ -258,7 +334,8 @@ async def seeded_run(
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=table_name(old_fingerprint),
                 embed_fingerprint=old_fingerprint.model_dump_json(),
                 vector_inventory_digest=None,
@@ -303,7 +380,8 @@ async def test_failed_or_canceled_plan_removes_every_private_snapshot_row(
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=table_name(old),
                 embed_fingerprint=old.model_dump_json(),
                 vector_inventory_digest=None,
@@ -341,7 +419,8 @@ async def test_start_cleans_its_self_created_snapshot_when_run_creation_does_not
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=table_name(old),
                 embed_fingerprint=old.model_dump_json(),
                 created_at=utcnow(),
@@ -455,7 +534,9 @@ async def test_on_disk_shadow_validates_publishes_and_runtime_follows_pointer(
     async with engine.connect() as connection:
         revision = (
             await connection.execute(
-                select(models.CorpusRevision.revision).where(models.CorpusRevision.id == 1)
+                select(models.CorpusRevision.revision).where(
+                    models.CorpusRevision.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert str(revision) == run.commitment.snapshot.revision
@@ -598,7 +679,7 @@ async def test_inventory_cas_records_superseded_without_changing_live_rows(
     async with engine.begin() as connection:
         await connection.execute(
             update(models.IndexState)
-            .where(models.IndexState.id == 1)
+            .where(models.IndexState.workspace_id == "default")
             .values(vector_inventory_digest=competing_inventory)
         )
 
@@ -675,7 +756,7 @@ async def test_publish_receipt_is_atomic_and_cannot_be_downgraded_or_replayed(
     async with engine.begin() as connection:
         await connection.execute(
             update(models.IndexState)
-            .where(models.IndexState.id == 1)
+            .where(models.IndexState.workspace_id == "default")
             .values(vector_table="reembed-competing-winner")
         )
     reopened = SqliteReembedStore(engine, clock=clock)
@@ -690,7 +771,9 @@ async def test_publish_receipt_is_atomic_and_cannot_be_downgraded_or_replayed(
     async with engine.connect() as connection:
         assert (
             await connection.execute(
-                select(models.IndexState.vector_table).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_table).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one() == "reembed-competing-winner"
 
@@ -711,6 +794,46 @@ async def test_explicit_abandonment_makes_an_unfinished_generation_cleanup_eligi
 
     assert abandoned.state is ReembedState.FAILED
     assert abandoned.failure == "abandoned by operator"
+    assert await shadows.cleanup_terminal(run.id)
+    assert not shadows.directory(generation.id).exists()
+
+
+async def test_shared_legacy_generation_cleanup_refuses_a_foreign_live_pointer(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    clock = Clock()
+    authority, shadows, run, lease, generation, source, vector, _ = await seeded_run(
+        engine, store, data_dir, clock, run_id="shared-legacy-cleanup"
+    )
+    await shadows.upsert(generation, [source], [vector], lease=lease)
+    abandoned = await authority.abandon(run.id, lease=lease)
+    assert abandoned.state is ReembedState.FAILED
+
+    beta = SqliteDocStore(engine, workspace_id="beta")
+    await beta.ensure_workspace()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(models.IndexState).values(
+                workspace_id="beta",
+                vector_namespace="legacy",
+                vector_table=generation.id,
+                embed_fingerprint=HashEmbedder(dimension=4).fingerprint.model_dump_json(),
+                vector_inventory_digest=generation.inventory_digest,
+                created_at=utcnow(),
+                updated_at=utcnow(),
+            )
+        )
+
+    with pytest.raises(ReembedError, match=r"foreign workspace.*shared legacy generation"):
+        await shadows.cleanup_terminal(run.id)
+    assert shadows.directory(generation.id).exists()
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(models.IndexState)
+            .where(models.IndexState.workspace_id == "beta")
+            .values(vector_table=None, vector_inventory_digest=None)
+        )
     assert await shadows.cleanup_terminal(run.id)
     assert not shadows.directory(generation.id).exists()
 
@@ -763,7 +886,9 @@ async def test_ordinary_corpus_mutation_invalidates_then_snapshot_bootstraps_inv
     async with engine.connect() as connection:
         before = (
             await connection.execute(
-                select(models.IndexState.vector_inventory_digest).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_inventory_digest).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert before == run.commitment.snapshot.live.inventory_digest
@@ -772,7 +897,9 @@ async def test_ordinary_corpus_mutation_invalidates_then_snapshot_bootstraps_inv
     async with engine.connect() as connection:
         invalidated = (
             await connection.execute(
-                select(models.IndexState.vector_inventory_digest).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_inventory_digest).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert invalidated is None
@@ -781,7 +908,9 @@ async def test_ordinary_corpus_mutation_invalidates_then_snapshot_bootstraps_inv
     async with engine.connect() as connection:
         bootstrapped = (
             await connection.execute(
-                select(models.IndexState.vector_inventory_digest).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_inventory_digest).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert bootstrapped == rebuilt.live.inventory_digest
@@ -795,7 +924,8 @@ async def test_missing_published_generation_is_fatal_and_is_not_recreated(
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=missing,
                 embed_fingerprint=HashEmbedder(dimension=4).fingerprint.model_dump_json(),
                 vector_inventory_digest="synthetic-inventory",
@@ -846,7 +976,8 @@ async def test_invalid_published_generation_pointer_never_becomes_a_path(
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=pointer,
                 embed_fingerprint=HashEmbedder(dimension=4).fingerprint.model_dump_json(),
                 vector_inventory_digest="synthetic-inventory",
@@ -1108,4 +1239,227 @@ async def test_cleanup_waits_for_an_in_flight_search_pinned_to_the_old_generatio
     assert [row.chunk.id for row in rows] == [source.chunk.id]
     assert await asyncio.wait_for(cleanup, timeout=2.0)
     assert not shadows.directory(first.shadow_generation_id).exists()
+    await live.teardown()
+
+
+async def test_writer_queued_behind_reset_revalidates_durable_workspace_identity(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    """A pre-reset handle cannot recreate its old Lance store after reset releases the pin."""
+    embed = fingerprint(dimension=4)
+    await store.record_index_fingerprints(IndexFingerprints(embed=embed))
+    directory = data_dir / VECTORS_DIRNAME
+    live = PublishedLanceVectorStore(
+        directory,
+        engine,
+        identity_namespace="workspace",
+    )
+    await live.ensure_ready(embed)
+    source = make_document()
+    stored = make_chunk(source, 0, "queued stale write")
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_reset_pin() -> None:
+        async with generation_pin(directory, exclusive=True):
+            held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_reset_pin())
+    await asyncio.wait_for(held.wait(), timeout=2.0)
+    writing = asyncio.create_task(live.upsert([stored], [[0.1, 0.2, 0.3, 0.4]]))
+    await asyncio.sleep(0.05)
+    assert not writing.done(), "the stale writer did not wait for reset's exclusive pin"
+    async with engine.begin() as connection:
+        await connection.execute(
+            delete(models.IndexState).where(models.IndexState.workspace_id == "default")
+        )
+    release.set()
+    await asyncio.wait_for(holder, timeout=2.0)
+
+    with pytest.raises(VectorStoreReprepareRequiredError, match="identity was reset"):
+        await asyncio.wait_for(writing, timeout=2.0)
+    physical = LanceVectorStore(directory)
+    await physical.open_existing(embed)
+    assert await physical.count() == 0
+    await physical.teardown()
+    await live.teardown()
+
+
+async def test_generation_writer_contends_on_the_workspace_reset_pin(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    """A generation-backed operation uses the workspace root lock held by reset."""
+    embed = fingerprint(dimension=4)
+    await store.record_index_fingerprints(IndexFingerprints(embed=embed))
+    directory = data_dir / VECTORS_DIRNAME
+    generation_id = "reembed-reset-contender"
+    generation_directory = directory / "generations" / generation_id
+    generation = LanceVectorStore(generation_directory)
+    await generation.ensure_ready(embed)
+    await generation.teardown()
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(models.IndexState)
+            .where(models.IndexState.workspace_id == "default")
+            .values(vector_table=generation_id)
+        )
+
+    live = PublishedLanceVectorStore(
+        directory,
+        engine,
+        identity_namespace="workspace",
+        expected_reset_epoch=0,
+    )
+    await live.ensure_ready(embed)
+    source = make_document()
+    stored = make_chunk(source, 0, "generation write queued behind reset")
+    held = asyncio.Event()
+    perform_reset = asyncio.Event()
+
+    async def hold_reset_pin() -> None:
+        async with generation_pin(directory, exclusive=True):
+            held.set()
+            await perform_reset.wait()
+            async with engine.begin() as connection:
+                await connection.execute(
+                    delete(models.IndexState).where(models.IndexState.workspace_id == "default")
+                )
+                await connection.execute(
+                    update(models.Workspace)
+                    .where(models.Workspace.id == "default")
+                    .values(derived_reset_epoch=models.Workspace.derived_reset_epoch + 1)
+                )
+            await live.teardown()
+            shutil.rmtree(directory)
+
+    holder = asyncio.create_task(hold_reset_pin())
+    await asyncio.wait_for(held.wait(), timeout=2.0)
+    writing = asyncio.create_task(live.upsert([stored], [[0.1, 0.2, 0.3, 0.4]]))
+    await asyncio.sleep(0.05)
+    assert not writing.done(), "the generation writer bypassed reset's workspace root pin"
+
+    perform_reset.set()
+    await asyncio.wait_for(holder, timeout=2.0)
+    with pytest.raises(VectorStoreReprepareRequiredError, match="reset epoch changed"):
+        await asyncio.wait_for(writing, timeout=2.0)
+    assert not directory.exists(), "the stale generation writer recreated reset storage"
+    await live.teardown()
+
+
+async def test_bound_cleanup_queued_behind_reset_does_not_recreate_storage(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """A stale bound cleanup returns zero after reset removes its physical generation."""
+    embed = fingerprint(dimension=4)
+    directory = data_dir / VECTORS_DIRNAME
+    generation_id = "reembed-reset-cleanup"
+    generation_directory = directory / "generations" / generation_id
+    generation = LanceVectorStore(generation_directory)
+    await generation.ensure_ready(embed)
+    source = make_document()
+    stored = make_chunk(source, 0, "bound cleanup queued behind reset")
+    await generation.upsert(
+        [stored],
+        [[0.1, 0.2, 0.3, 0.4]],
+        publication_id="stale-publication",
+    )
+    await generation.teardown()
+    live = PublishedLanceVectorStore(directory, engine)
+    held = asyncio.Event()
+    perform_reset = asyncio.Event()
+
+    async def hold_reset_pin() -> None:
+        async with generation_pin(directory, exclusive=True):
+            held.set()
+            await perform_reset.wait()
+            shutil.rmtree(directory)
+
+    holder = asyncio.create_task(hold_reset_pin())
+    await asyncio.wait_for(held.wait(), timeout=2.0)
+    cleanup = asyncio.create_task(live.delete_bound_publication(generation_id, "stale-publication"))
+    await asyncio.sleep(0.05)
+    assert not cleanup.done(), "bound cleanup bypassed reset's workspace root pin"
+
+    perform_reset.set()
+    await asyncio.wait_for(holder, timeout=2.0)
+    assert await asyncio.wait_for(cleanup, timeout=2.0) == 0
+    assert not directory.exists(), "bound cleanup recreated reset storage"
+    await live.teardown()
+
+
+async def test_live_operation_retries_when_publication_changes_while_waiting_for_old_child(
+    engine: AsyncEngine,
+    store: SqliteDocStore,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A removed old generation is retried after its durable pointer moves."""
+    embed = fingerprint(dimension=4)
+    await store.record_index_fingerprints(IndexFingerprints(embed=embed))
+    directory = data_dir / VECTORS_DIRNAME
+    old_id = "reembed-pointer-old"
+    new_id = "reembed-pointer-new"
+    old_directory = directory / "generations" / old_id
+    new_directory = directory / "generations" / new_id
+    old_chunk = make_chunk(make_document(source_id="old-pointer"), 0, "old publication")
+    new_chunk = make_chunk(make_document(source_id="new-pointer"), 0, "new publication")
+    old_store = LanceVectorStore(old_directory)
+    new_store = LanceVectorStore(new_directory)
+    await old_store.ensure_ready(embed)
+    await new_store.ensure_ready(embed)
+    await old_store.upsert([old_chunk], [[1.0, 0.0, 0.0, 0.0]])
+    await new_store.upsert([new_chunk], [[0.0, 1.0, 0.0, 0.0]])
+    await old_store.teardown()
+    await new_store.teardown()
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(models.IndexState)
+            .where(models.IndexState.workspace_id == "default")
+            .values(vector_table=old_id)
+        )
+
+    live = PublishedLanceVectorStore(directory, engine)
+    await live.ensure_ready(embed)
+    held = asyncio.Event()
+    publish = asyncio.Event()
+    child_pin_attempted = asyncio.Event()
+    original_generation_pin = generation_pin
+
+    @asynccontextmanager
+    async def observed_generation_pin(
+        target: Path, *, exclusive: bool = False
+    ) -> AsyncGenerator[None]:
+        if target == old_directory and not exclusive:
+            child_pin_attempted.set()
+        async with original_generation_pin(target, exclusive=exclusive):
+            yield
+
+    monkeypatch.setattr("manicule.storage.vectors.generation_pin", observed_generation_pin)
+
+    async def publish_new_generation() -> None:
+        async with (
+            original_generation_pin(directory),
+            original_generation_pin(old_directory, exclusive=True),
+        ):
+            held.set()
+            await publish.wait()
+            async with engine.begin() as connection:
+                await connection.execute(
+                    update(models.IndexState)
+                    .where(models.IndexState.workspace_id == "default")
+                    .values(vector_table=new_id)
+                )
+            shutil.rmtree(old_directory)
+
+    publisher = asyncio.create_task(publish_new_generation())
+    await asyncio.wait_for(held.wait(), timeout=2.0)
+    searching = asyncio.create_task(live.search([0.0, 1.0, 0.0, 0.0], 1))
+    await asyncio.wait_for(child_pin_attempted.wait(), timeout=2.0)
+
+    publish.set()
+    await asyncio.wait_for(publisher, timeout=2.0)
+    rows = await asyncio.wait_for(searching, timeout=2.0)
+    assert [row.chunk.id for row in rows] == [new_chunk.id]
+    assert not old_directory.exists()
     await live.teardown()

@@ -32,13 +32,18 @@ from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from pydantic import JsonValue
 
 from manicule.connectors import cql, subtree
 from manicule.connectors.client import ConfluenceClient
-from manicule.connectors.config import CONNECTOR_NAME, ConfluenceConfig, Deployment
+from manicule.connectors.config import (
+    CONNECTOR_NAME,
+    ConfluenceConfig,
+    Deployment,
+    FullInventoryAuthority,
+)
 from manicule.connectors.errors import BodyUnavailableError, ConnectorError, NotFoundError
 from manicule.connectors.macros import (
     IncludedPage,
@@ -51,6 +56,7 @@ from manicule.connectors.macros import (
     resolve_storage,
     unresolved_because,
 )
+from manicule.connectors.pagination import origin_of
 from manicule.connectors.subtree import CONTENT_PATH, SEARCH_PATH, Subtree
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.lifecycle import HealthReport, Metric
@@ -112,6 +118,7 @@ _SPACE_PATH = "/rest/api/space"
 _V2_PAGE_PATH = "/api/v2/pages"
 
 _SEARCH_EXPAND = "version,ancestors,space,container"
+_DIRECT_EXPAND = _SEARCH_EXPAND
 _STORAGE_EXPAND = "body.storage,version,ancestors,space"
 
 PAGE = "page"
@@ -183,6 +190,9 @@ Not ``""`` and not ``None``: those would make "no scope recorded" a third state 
 comparison would have to handle, when in fact there is only one scope such a watermark can have
 had. Written out so that the backward-compatible reading is a value rather than an omission."""
 
+_FULL_INVENTORY_AUTHORITY = "full_inventory_authority"
+_EMPTY_DIRECT_POSITION = "direct-current:true-end-empty"
+
 
 @dataclass(frozen=True, slots=True)
 class _Body:
@@ -236,7 +246,7 @@ class ConfluenceConnector:
         self.name = name
         self._config = config
         self._client = client
-        self._observed: dict[str, datetime] = {}
+        self._observed: dict[str, str] = {}
         self._carried: dict[str, str] = {}
         self._enumerated = False
 
@@ -245,6 +255,23 @@ class ConfluenceConnector:
         """Stable non-credential identity of the configured spaces and subtree boundary."""
         spaces = ",".join(sorted(self._config.spaces))
         return f"spaces={spaces};{self._config.scope_identity}"
+
+    @property
+    def scope_fingerprint(self) -> str:
+        """Cursor identity: stable for search, distinct for direct full authority."""
+        return self._config.scope_fingerprint(self.source_scope)
+
+    @property
+    def full_inventory_authority(self) -> str:
+        """Aggregate-safe effective authority for durable status projections."""
+        return self._config.effective_full_inventory_authority.value
+
+    @property
+    def reconciliation_scope(self) -> str:
+        """Fence a completed deletion inventory to this exact effective authority."""
+        if not self._direct_full_inventory:
+            return f"whole-connector:{self.name}"
+        return f"confluence:{self.scope_fingerprint}"
 
     # --- lifecycle -----------------------------------------------------------------------
 
@@ -301,16 +328,21 @@ class ConfluenceConnector:
             return None
         spaces = dict(self._carried)
         for space, observed in self._observed.items():
-            spaces[space] = observed.isoformat()
+            spaces[space] = observed
         if not spaces:
             return None
+        metadata: Metadata = {
+            "spaces": cast("Metadata", dict(spaces)),
+            SCOPE: self._config.scope_identity,
+        }
+        if self._direct_full_inventory:
+            metadata[_FULL_INVENTORY_AUTHORITY] = (
+                FullInventoryAuthority.DIRECT_CURRENT_CONTENT.value
+            )
         return Watermark(
             value=_newest(spaces.values()),
             observed_at=datetime.now(tz=UTC),
-            metadata={
-                "spaces": cast("Metadata", dict(spaces)),
-                SCOPE: self._config.scope_identity,
-            },
+            metadata=metadata,
         )
 
     def _resume_from(self, watermark: Watermark | None) -> Mapping[str, str]:
@@ -337,8 +369,37 @@ class ConfluenceConnector:
         stored = watermark.metadata.get(SCOPE)
         recorded = stored if isinstance(stored, str) and stored else WHOLE_SPACE
         current = self._config.scope_identity
+        stored_authority = watermark.metadata.get(_FULL_INVENTORY_AUTHORITY)
+        recorded_authority = (
+            stored_authority
+            if isinstance(stored_authority, str) and stored_authority
+            else FullInventoryAuthority.SEARCH.value
+        )
+        current_authority = self._config.effective_full_inventory_authority.value
+        if recorded == current and recorded_authority == current_authority:
+            carried = _space_watermarks(watermark)
+            if current_authority == FullInventoryAuthority.DIRECT_CURRENT_CONTENT.value:
+                valid = {
+                    space: position
+                    for space, position in carried.items()
+                    if position == _EMPTY_DIRECT_POSITION or cql.parse_when(position) is not None
+                }
+                if len(valid) != len(carried):
+                    _log.warning(
+                        "source %r: malformed Data Center authoritative resume positions were "
+                        "discarded; affected spaces will be enumerated directly from the start",
+                        self.name,
+                    )
+                return valid
+            return carried
         if recorded == current:
-            return _space_watermarks(watermark)
+            _log.warning(
+                "source %r: the effective Confluence full-inventory authority changed. Stored "
+                "per-space positions have been discarded and this run performs one complete "
+                "enumeration from committed evidence.",
+                self.name,
+            )
+            return {}
         _log.warning(
             "source %r: the configured Confluence scope changed from [%s] to [%s]. Every "
             "stored per-space position has been discarded and this run enumerates the new "
@@ -375,6 +436,19 @@ class ConfluenceConnector:
         space allowlist stops the run rather than producing a smaller subtree than the one that
         was configured.
         """
+        async for batch in self.discover_batches(watermark):
+            for found in batch:
+                yield found
+
+    async def discover_batches(
+        self, watermark: Watermark | None
+    ) -> AsyncIterator[Sequence[DiscoveredDoc]]:
+        """Yield one bounded source response at a time for atomic durable admission.
+
+        Empty transformed pages are intentionally preserved: filters may reject every result,
+        but the page boundary still decides when it is safe to follow the response's next
+        cursor.  The compatibility :meth:`discover` surface flattens these batches.
+        """
         carried = self._resume_from(watermark)
         self._observed = {}
         self._carried = dict(carried)
@@ -383,17 +457,36 @@ class ConfluenceConnector:
         spaces = await self._spaces()
         scope = await self._scope(spaces)
 
-        for space in spaces if scope is None else scope.spaces():
-            newest: datetime | None = None
-            async for found, when in self._changed_in(space, scope, self._since(carried, space)):
-                newest = cql.latest([newest, when])
-                yield found
-            # Only after the space's enumeration has run to completion: a watermark advanced
-            # from a partial walk skips whatever the rest of the walk would have returned, and
-            # nothing ever looks for it again.
-            if newest is not None:
-                self._observed[space] = newest
-        self._enumerated = True
+        try:
+            for space in spaces if scope is None else scope.spaces():
+                since = self._since(carried, space)
+                direct_full = (
+                    scope is None
+                    and self._direct_full_inventory
+                    and since is None
+                    and space not in carried
+                )
+                newest: datetime | None = None
+                async for batch in self._changed_in_batches(
+                    space, scope, since, direct_full=direct_full
+                ):
+                    newest = cql.latest([newest, *(when for _, when in batch)])
+                    yield tuple(found for found, _ in batch)
+                # Only after the space's enumeration has run to completion: a watermark advanced
+                # from a partial walk skips whatever the rest of the walk would have returned, and
+                # nothing ever looks for it again.
+                if newest is not None:
+                    self._observed[space] = newest.isoformat()
+                elif direct_full:
+                    # Empty is still a completed authoritative inventory. This explicit
+                    # non-time marker commits the new cursor identity without forging a source
+                    # timestamp. Its next run takes an unbounded CQL path, so clock skew cannot
+                    # hide a member created around this walk.
+                    self._observed[space] = _EMPTY_DIRECT_POSITION
+            self._enumerated = True
+        finally:
+            if scope is not None:
+                scope.close()
 
     async def _changed_in(
         self, space: str, scope: Subtree | None, since: str | None
@@ -412,24 +505,57 @@ class ConfluenceConnector:
           them — which is the authoritative answer in any case, and the one §6 of the
           documentation says to use.
         """
+        async for batch in self._changed_in_batches(space, scope, since):
+            for found in batch:
+                yield found
+
+    async def _changed_in_batches(  # noqa: PLR0912 - explicit authority/scope boundaries
+        self,
+        space: str,
+        scope: Subtree | None,
+        since: str | None,
+        *,
+        direct_full: bool | None = None,
+    ) -> AsyncIterator[Sequence[tuple[DiscoveredDoc, datetime | None]]]:
+        """Transform each search response without erasing its pagination boundary."""
         if scope is None:
             types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
+            if direct_full is None:
+                direct_full = since is None and self._direct_full_inventory
+            if direct_full:
+                for kind in types:
+                    async for page in self._direct_batches(space, kind):
+                        yield tuple(
+                            (
+                                self._direct_discovered(
+                                    result, space=space, base=base, expected_type=kind
+                                ),
+                                cql.parse_when(_version_when(result)),
+                            )
+                            for result, base in page
+                        )
+                return
             query = self._content_query(space, types=types, since=since)
-            async for result, base in self._search(query, expand=_SEARCH_EXPAND):
-                found = self._discovered(result, space=space, base=base)
-                if found is not None:
-                    yield found, cql.parse_when(_version_when(result))
+            async for page in self._search_batches(query, expand=_SEARCH_EXPAND):
+                yield tuple(
+                    (found, cql.parse_when(_version_when(result)))
+                    for result, base in page
+                    if (found := self._discovered(result, space=space, base=base)) is not None
+                )
             return
 
         pages = self._content_query(space, types=(PAGE,), since=since, subtree=scope.clause(space))
-        async for result, base in self._search(pages, expand=_SEARCH_EXPAND):
-            page_id = _str(result.get("id"))
-            roots = scope.covering_roots(space, page_id, subtree.ancestor_ids(result))
-            if not roots:
-                raise ConnectorError(scope.out_of_scope(space, page_id))
-            found = self._discovered(result, space=space, base=base, roots=roots)
-            if found is not None:
-                yield found, cql.parse_when(_version_when(result))
+        async for page in self._search_batches(pages, expand=_SEARCH_EXPAND):
+            changed: list[tuple[DiscoveredDoc, datetime | None]] = []
+            for result, base in page:
+                page_id = _str(result.get("id"))
+                roots = scope.covering_roots(space, page_id, subtree.ancestor_ids(result))
+                if not roots:
+                    raise ConnectorError(scope.out_of_scope(space, page_id))
+                found = self._discovered(result, space=space, base=base, roots=roots)
+                if found is not None:
+                    changed.append((found, cql.parse_when(_version_when(result))))
+            yield tuple(changed)
 
         if not self._config.include_attachments:
             return
@@ -439,14 +565,17 @@ class ConfluenceConnector:
         # and its container would then be a page this run has never seen.
         members = await scope.members(space)
         attachments = self._content_query(space, types=(ATTACHMENT,), since=since)
-        async for result, base in self._search(attachments, expand=_SEARCH_EXPAND):
-            container = _str(_obj(result.get("container")).get("id"))
-            roots = members.get(container, ())
-            if not roots:
-                continue
-            found = self._discovered(result, space=space, base=base, roots=roots)
-            if found is not None:
-                yield found, cql.parse_when(_version_when(result))
+        async for page in self._search_batches(attachments, expand=_SEARCH_EXPAND):
+            changed = []
+            for result, base in page:
+                container = _str(_obj(result.get("container")).get("id"))
+                roots = members.get(container, ())
+                if not roots:
+                    continue
+                found = self._discovered(result, space=space, base=base, roots=roots)
+                if found is not None:
+                    changed.append((found, cql.parse_when(_version_when(result))))
+            yield tuple(changed)
 
     def _content_query(
         self,
@@ -482,13 +611,158 @@ class ConfluenceConnector:
         self, query: str, *, expand: str = ""
     ) -> AsyncIterator[tuple[Mapping[str, object], str]]:
         """Every result of one CQL query, with the link base the page it arrived on declared."""
+        async for page in self._search_batches(query, expand=expand):
+            for result in page:
+                yield result
+
+    async def _search_batches(
+        self, query: str, *, expand: str = ""
+    ) -> AsyncIterator[Sequence[tuple[Mapping[str, object], str]]]:
+        """Each CQL response as one bounded batch, including an empty results page."""
         params = [("cql", query), ("limit", str(self._config.page_size))]
         if expand:
             params.append(("expand", expand))
         async for payload in self._client.paginate(self._client.url(SEARCH_PATH), params):
             base = _link_base(payload, self._config.base_url)
-            for result in _results(payload):
-                yield result, base
+            yield tuple((result, base) for result in _results(payload))
+
+    @property
+    def _direct_full_inventory(self) -> bool:
+        return (
+            self._config.effective_full_inventory_authority
+            is FullInventoryAuthority.DIRECT_CURRENT_CONTENT
+        )
+
+    async def _direct_batches(
+        self, space: str, kind: str
+    ) -> AsyncIterator[Sequence[tuple[Mapping[str, object], str]]]:
+        """Yield exact native direct-resource pages, with immutable scope pinned on every link."""
+        params = [
+            ("spaceKey", space),
+            ("type", kind),
+            ("status", "current"),
+            ("expand", _DIRECT_EXPAND),
+            ("limit", str(self._config.page_size)),
+        ]
+
+        def validate_next(
+            url: str, following: Sequence[tuple[str, str]]
+        ) -> Sequence[tuple[str, str]]:
+            expected_path = urlsplit(self._client.url(CONTENT_PATH)).path
+            if urlsplit(url).path != expected_path:
+                raise ConnectorError(
+                    "authoritative current-content pagination changed its resource path"
+                )
+            for key, value in (
+                ("spaceKey", space),
+                ("type", kind),
+                ("status", "current"),
+                ("expand", _DIRECT_EXPAND),
+            ):
+                values = [found for name, found in following if name == key]
+                if any(found != value for found in values):
+                    raise ConnectorError(
+                        "authoritative current-content pagination changed its immutable scope"
+                    )
+            immutable = {"spaceKey", "type", "status", "expand", "limit"}
+            native = [(key, value) for key, value in following if key not in immutable]
+            if any(key not in {"start", "cursor"} for key, _ in native):
+                raise ConnectorError(
+                    "authoritative current-content pagination changed its immutable scope"
+                )
+            coordinates = {key for key, _ in native}
+            if len(coordinates) != 1:
+                raise ConnectorError(
+                    "authoritative current-content pagination supplied an invalid cursor"
+                )
+            for coordinate in coordinates:
+                values = [value for key, value in native if key == coordinate]
+                if (
+                    len(values) != 1
+                    or not values[0]
+                    or (coordinate == "start" and (not values[0].isdigit() or int(values[0]) < 0))
+                ):
+                    raise ConnectorError(
+                        "authoritative current-content pagination supplied an invalid cursor"
+                    )
+            return [*params, *native]
+
+        async for payload in self._client.paginate(
+            self._client.url(CONTENT_PATH), params, validate_next=validate_next
+        ):
+            base = _link_base(payload, self._config.base_url)
+            if origin_of(base) != self._config.origin:
+                raise ConnectorError(
+                    "authoritative current-content inventory declared an untrusted link base"
+                )
+            yield tuple((result, base) for result in _direct_results(payload))
+
+    def _direct_discovered(
+        self,
+        result: Mapping[str, object],
+        *,
+        space: str,
+        base: str,
+        expected_type: str,
+    ) -> DiscoveredDoc:
+        """Transform one authoritative row only after every membership fact is explicit."""
+        kind = _str(result.get("type"))
+        source_id = _str(result.get("id"))
+        status = _str(result.get("status"))
+        version = _int(_obj(result.get("version")).get("number"))
+        modified_at = cql.parse_when(_version_when(result))
+        source_space = _str(_obj(result.get("space")).get("key"))
+        title = _str(result.get("title"))
+        links = _obj(result.get("_links"))
+        webui = _str(links.get("webui"))
+        valid = (
+            kind == expected_type
+            and source_id
+            and status == "current"
+            and source_space == space
+            and version is not None
+            and version > 0
+            and modified_at is not None
+            and title
+            and webui
+            and origin_of(_join(base, webui)) == self._config.origin
+        )
+        if kind == PAGE:
+            ancestors = result.get("ancestors")
+            valid = (
+                valid
+                and isinstance(ancestors, list)
+                and all(
+                    _str(_obj(entry).get("id")) and _str(_obj(entry).get("title"))
+                    for entry in cast("Sequence[object]", ancestors or [])
+                )
+            )
+        elif kind == ATTACHMENT:
+            container = _obj(result.get("container"))
+            download = _str(links.get("download"))
+            parent_webui = _str(_obj(container.get("_links")).get("webui"))
+            media_type = _attachment_media_type(result)
+            size = _int(_obj(result.get("extensions")).get("fileSize"))
+            valid = valid and bool(
+                _str(container.get("id"))
+                and _str(container.get("title"))
+                and parent_webui
+                and download
+                and origin_of(_join(base, parent_webui)) == self._config.origin
+                and origin_of(_join(base, download)) == self._config.origin
+                and media_type
+                and size is not None
+                and size >= 0
+            )
+        if not valid:
+            raise ConnectorError(
+                "authoritative current-content inventory returned incomplete or out-of-scope "
+                "metadata"
+            )
+        found = self._discovered(result, space=space, base=base)
+        if found is None:  # pragma: no cover - validation above makes this unreachable
+            raise ConnectorError("authoritative current-content inventory row was unusable")
+        return found
 
     async def _scope(self, spaces: Sequence[str]) -> Subtree | None:
         """The configured page trees, validated, or ``None`` for whole-space syncing.
@@ -711,33 +985,53 @@ class ConfluenceConnector:
         one place the two differ in cost, and it buys the check that a page the source returned
         is really in the tree that was asked for.
         """
+        async for batch in self.reconcile_batches():
+            for source_id in batch:
+                yield source_id
+
+    async def reconcile_batches(self) -> AsyncIterator[Sequence[SourceId]]:
+        """Yield reconciliation identities without erasing active search-page boundaries."""
         spaces = await self._spaces()
         scope = await self._scope(spaces)
         if scope is None:
             types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
             for space in spaces:
+                if self._direct_full_inventory:
+                    for kind in types:
+                        async for page in self._direct_batches(space, kind):
+                            yield tuple(
+                                self._direct_discovered(
+                                    result, space=space, base=base, expected_type=kind
+                                ).source_id
+                                for result, base in page
+                            )
+                    continue
                 query = self._content_query(space, types=types, ordered=False)
-                async for result, _ in self._search(query):
-                    source_id = _str(result.get("id"))
-                    if source_id:
-                        yield source_id
+                async for page in self._search_batches(query):
+                    yield tuple(
+                        source_id for result, _ in page if (source_id := _str(result.get("id")))
+                    )
             return
 
-        for space in scope.spaces():
-            # The page enumeration and the scope are one thing: `members` is the live query,
-            # already checked page by page against the configured roots and already guarded
-            # against a subtree that only looks empty.
-            members = await scope.members(space)
-            for page_id in members:
-                yield page_id
-            if not self._config.include_attachments:
-                continue
-            query = self._content_query(space, types=(ATTACHMENT,), ordered=False)
-            async for result, _ in self._search(query, expand="container"):
-                container = _str(_obj(result.get("container")).get("id"))
-                source_id = _str(result.get("id"))
-                if source_id and container in members:
-                    yield source_id
+        try:
+            for space in scope.spaces():
+                # The page enumeration and the scope are one thing: each native search page is
+                # yielded for durable reconciliation before its next cursor is requested.
+                async for page in scope.member_batches(space):
+                    yield page
+                if not self._config.include_attachments:
+                    continue
+                members = await scope.members(space)
+                query = self._content_query(space, types=(ATTACHMENT,), ordered=False)
+                async for page in self._search_batches(query, expand="container"):
+                    yield tuple(
+                        source_id
+                        for result, _ in page
+                        if (source_id := _str(result.get("id")))
+                        and _str(_obj(result.get("container")).get("id")) in members
+                    )
+        finally:
+            scope.close()
 
     # --- fetch ---------------------------------------------------------------------------
 
@@ -1242,6 +1536,21 @@ def _results(payload: Mapping[str, object]) -> list[Mapping[str, object]]:
         return []
     entries = cast("Sequence[object]", results)
     return [cast("Mapping[str, object]", e) for e in entries if isinstance(e, dict)]
+
+
+def _direct_results(payload: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
+    """Authoritative rows: malformed containers or entries are failures, never omissions."""
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise ConnectorError(
+            "authoritative current-content inventory returned a malformed results page"
+        )
+    entries = cast("Sequence[object]", results)
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise ConnectorError(
+            "authoritative current-content inventory returned a malformed results page"
+        )
+    return tuple(cast("Mapping[str, object]", entry) for entry in entries)
 
 
 def _ancestor_titles(result: Mapping[str, object]) -> tuple[str, ...]:
