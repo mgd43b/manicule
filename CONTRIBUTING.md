@@ -18,6 +18,13 @@ A change is done when every one of these is true. Not most of them.
    marking, it is worth doing; if it is not worth doing, delete the comment.
 7. **The documents still describe the code.** A change that makes a document wrong fixes the
    document.
+8. **The pull request title is a Conventional Commit.** `fix: keep the previous revision
+   searchable after a failed refresh`, not `Fix the refresh bug`. This is not a style rule:
+   the repository squash-merges, so the title *is* the commit on `main`, and release-please
+   reads it to decide the next version and write the changelog. A title it cannot parse is a
+   change that ships without being mentioned anywhere. `feat` bumps the minor, `fix` the
+   patch, a trailing `!` marks a breaking change; `.github/workflows/pr-title.yml` checks it
+   and re-runs when you edit the title. See [`RELEASING.md`](RELEASING.md).
 
 Run the whole gate locally before pushing:
 

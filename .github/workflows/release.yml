@@ -1,0 +1,99 @@
+name: Release
+
+# release-please reads the Conventional Commits on `main` and keeps a release PR open that
+# bumps the version in pyproject.toml and writes CHANGELOG.md. Merging that PR creates the
+# `vX.Y.Z` tag and the GitHub Release; the publish job below then builds and pushes to PyPI.
+#
+# Nothing here is triggered by a tag. A tag push is how a release is *recorded*, and making it
+# the trigger would mean a hand-pushed tag could publish a version no release PR ever reviewed.
+on:
+  push:
+    branches: [main]
+
+# Denied at the top and granted per job. The publish job needs `id-token: write`, and a
+# workflow-wide grant would hand that to release-please as well.
+permissions: {}
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          token: ${{ github.token }}
+
+  publish:
+    name: publish to PyPI
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/manicule
+    permissions:
+      # Mandatory for OIDC trusted publishing. There is no API token in this repository's
+      # secrets and there should never be one: the credential is minted per run, scoped to this
+      # workflow in this repository, and expires. A leaked token cannot be replayed because
+      # there is nothing to leak.
+      id-token: write
+      # To attach the built distributions to the GitHub Release.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # Pinned rather than left to the runner's default, so the interpreter that builds a
+          # release is a decision rather than whatever ubuntu-latest moved to this month. The
+          # wheel is `py3-none-any`, so this does not restrict what it installs onto.
+          python-version: "3.12"
+
+      # `--package manicule` explicitly: this is a uv workspace, and `packages/*` holds two
+      # plugin distributions that exist to be test fixtures. Neither is published, and naming
+      # the package is what keeps a future workspace member from silently arriving in `dist/`
+      # and being pushed to PyPI by the step below.
+      - name: build sdist and wheel
+        run: uv build --package manicule --out-dir dist
+
+      - name: the built artifacts are the two expected ones
+        # A guard on the glob the publish step passes. `dist/*` is what gets uploaded, and an
+        # unexpected file in there is either a stale artifact or a workspace member that leaked
+        # past `--package` — both of which are better as a failed release than a published one.
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-please.outputs.tag_name }}"
+          version="${version#v}"
+          expected="manicule-${version}-py3-none-any.whl manicule-${version}.tar.gz"
+          actual=$(cd dist && ls | sort | tr '\n' ' ')
+          echo "expected: ${expected} "
+          echo "actual:   ${actual}"
+          test "${actual}" = "${expected} "
+
+      # The same check the `dist` job in ci.yml runs on every pull request, repeated here
+      # against the artifacts actually being published rather than against a rebuild of them.
+      - name: the wheel installs clean and the console script runs
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python "$(echo dist/*.whl)[all]"
+          /tmp/smoke/bin/manicule --version
+
+      - name: publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: attach the distributions to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release upload "${{ needs.release-please.outputs.tag_name }}"
+          dist/* --repo "${{ github.repository }}"
