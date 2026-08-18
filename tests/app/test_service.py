@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from manicule import vocabularies
 from manicule.app import results as r
 from manicule.app import service as service_module
+from manicule.app.ports import ResetOutcome
 from manicule.app.results import CheckState
 from manicule.app.service import (
     _IDENTITY_SAMPLE,  # pyright: ignore[reportPrivateUsage]
@@ -2787,6 +2788,19 @@ async def test_doctor_allows_matching_physical_metadata_without_sql_identity(
     assert check.state == "ok"
     assert check.detail == "empty index, ready for a first ingest"
     assert check.remedy == ""
+
+
+async def test_reset_reports_publication_backed_vector_cleanup(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    backend.maintenance_.reset = ResetOutcome(publications=1)
+
+    report = await service.reset_index()
+
+    assert report.publications_removed == 1
+    assert report.vector_rows_removed == 0
+    assert not report.vector_store_removed
+    assert report.vectors_removed
 
 
 async def test_the_glossary_sweep_reaches_the_port_with_what_the_caller_asked_for(
