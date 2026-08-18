@@ -2693,6 +2693,36 @@ async def test_status_and_mcp_payload_do_not_expose_a_local_weights_path(
     assert "private-name" not in payload
 
 
+async def test_doctor_identifies_stale_empty_index_identity_with_reset_remedy(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    stale = HashEmbedder(model_id="fake/stale-empty").fingerprint
+    configured = HashEmbedder(model_id="fake/configured").fingerprint
+    backend.store.documents.clear()
+    backend.store.chunks.clear()
+
+    async def fingerprints() -> IndexFingerprints:
+        return IndexFingerprints(embed=stale, vector_table="chunks__stale")
+
+    async def configured_fingerprints() -> tuple[str, str]:
+        return configured.canonical(), ""
+
+    monkeypatch.setattr(backend.store, "index_fingerprints", fingerprints)
+    monkeypatch.setattr(
+        backend.ingestion_, "configured_index_fingerprints", configured_fingerprints
+    )
+
+    check = _check(await ApplicationService(backend).doctor(), "index")
+
+    assert check.state == "degraded"
+    assert check.facts["documents"] == 0
+    assert check.facts["stale_empty_identity"] is True
+    assert check.remedy == "manicule reset-index --yes"
+
+
 async def test_the_glossary_sweep_reaches_the_port_with_what_the_caller_asked_for(
     service: ApplicationService, backend: FakeBackend
 ) -> None:

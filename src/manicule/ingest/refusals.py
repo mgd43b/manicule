@@ -198,8 +198,13 @@ async def _refuse_embed_mismatch(
         stored.require_match(offered)
     except FingerprintMismatchError as exc:
         note = (
-            f"{chunks} stored chunk(s) would need re-embedding. `reindex --re-embed` reads "
-            f"chunks.embed_text and touches neither the network nor a parser."
+            "This workspace has no stored chunks. Run `manicule reset-index --yes` to clear "
+            "its obsolete derived identity, then retry the ingest."
+            if chunks == 0
+            else (
+                f"{chunks} stored chunk(s) would need re-embedding. `reindex --re-embed` reads "
+                "chunks.embed_text and touches neither the network nor a parser."
+            )
         )
         exc.add_note(note)
         raise
@@ -216,11 +221,16 @@ async def _refuse_chunk_mismatch(
         stored.require_match(offered)
     except FingerprintMismatchError as exc:
         note = (
-            f"{chunks} stored chunk(s) must be rechunked from retained source snapshots; "
-            "re-embedding stored embed_text cannot change structural boundaries. Run "
-            "`manicule rebuild plan SNAPSHOT_ID` for an aggregate cost/capacity estimate, "
-            "then `manicule rebuild execute SNAPSHOT_ID` to publish one resumable atomic "
-            "workspace generation without reacquiring source data."
+            "This workspace has no stored chunks. Run `manicule reset-index --yes` to clear "
+            "its obsolete derived identity, then retry the ingest."
+            if chunks == 0
+            else (
+                f"{chunks} stored chunk(s) must be rechunked from retained source snapshots; "
+                "re-embedding stored embed_text cannot change structural boundaries. Run "
+                "`manicule rebuild plan SNAPSHOT_ID` for an aggregate cost/capacity estimate, "
+                "then `manicule rebuild execute SNAPSHOT_ID` to publish one resumable atomic "
+                "workspace generation without reacquiring source data."
+            )
         )
         exc.add_note(note)
         raise

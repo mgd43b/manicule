@@ -161,7 +161,7 @@ def _write_snapshot(
     target: Path,
     revision: str | None,
     counts: dict[str, int],
-    index_state: dict[str, str | None],
+    index_state: dict[str, Any],
     *,
     allow_insecure_target: bool,
 ) -> dict[str, Any]:
@@ -215,6 +215,8 @@ def _write_snapshot(
         "chunk_fingerprint": index_state.get("chunk_fingerprint"),
         "fts_tokenizer": index_state.get("fts_tokenizer"),
         "vector_table": index_state.get("vector_table"),
+        "workspace_indexes": index_state.get("workspace_indexes", 0),
+        "workspace_index_digest": index_state.get("workspace_index_digest"),
         "counts": counts,
         "files": [asdict(entry) for entry in _inventory(target)],
     }
@@ -355,18 +357,43 @@ async def _counts(engine: AsyncEngine) -> dict[str, int]:
         }
 
 
-async def _index_state(engine: AsyncEngine) -> dict[str, str | None]:
+async def _index_state(engine: AsyncEngine) -> dict[str, Any]:
     from manicule.storage.engine import session_factory  # noqa: PLC0415 - avoids a cycle
 
     async with session_factory(engine)() as session:
-        row = await session.get(models.IndexState, 1)
-    if row is None:
+        rows = (
+            (
+                await session.execute(
+                    select(models.IndexState).order_by(models.IndexState.workspace_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    if not rows:
         return {}
+    identities = [
+        {
+            "workspace_id": row.workspace_id,
+            "vector_namespace": row.vector_namespace,
+            "embed_fingerprint": row.embed_fingerprint,
+            "chunk_fingerprint": row.chunk_fingerprint,
+            "fts_tokenizer": row.fts_tokenizer,
+            "vector_table": row.vector_table,
+        }
+        for row in rows
+    ]
+    digest = hashlib.sha256(
+        json.dumps(identities, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    row = rows[0] if len(rows) == 1 else None
     return {
-        "embed_fingerprint": row.embed_fingerprint,
-        "chunk_fingerprint": row.chunk_fingerprint,
-        "fts_tokenizer": row.fts_tokenizer,
-        "vector_table": row.vector_table,
+        "embed_fingerprint": None if row is None else row.embed_fingerprint,
+        "chunk_fingerprint": None if row is None else row.chunk_fingerprint,
+        "fts_tokenizer": None if row is None else row.fts_tokenizer,
+        "vector_table": None if row is None else row.vector_table,
+        "workspace_indexes": len(rows),
+        "workspace_index_digest": digest,
     }
 
 

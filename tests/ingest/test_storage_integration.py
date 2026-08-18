@@ -667,14 +667,22 @@ async def test_hard_delete_tombstones_the_active_physical_vectors(
         [[0.3] * HashEmbedder().fingerprint.dimension],
         publication_id=doomed_document.publication_id,
     )
-    physical.add(vector_id(doomed_document.publication_id, doomed_chunk.id))
+    doomed_physical = vector_id(doomed_document.publication_id, doomed_chunk.id)
     async with engine.begin() as connection:
         await connection.execute(text("DELETE FROM workspaces WHERE id = 'doomed'"))
 
     await store.delete_document(document.id)
     tombstones = set(await store.take_tombstones(20))
     assert physical <= tombstones
+    async with engine.connect() as connection:
+        all_tombstones = set(
+            (await connection.execute(text("SELECT chunk_id FROM vector_tombstones"))).scalars()
+        )
+    assert doomed_physical in all_tombstones
+    assert doomed_physical not in tombstones, "one workspace cannot claim another's cleanup"
     await sweep_vectors(store, vectors)
+    assert await vectors.count() == 1
+    await vectors.delete_chunks([doomed_physical])
     assert await vectors.count() == 0
     await vectors.teardown()
 
@@ -721,7 +729,18 @@ async def test_a_legacy_tombstone_survives_a_publication_to_publication_flip(
     assert second is not None
     assert second.publication_id != first.publication_id
     assert [chunk.id for chunk in await store.document_chunks(second.id)] == [legacy_id]
-    assert legacy_id in await store.take_tombstones(20)
+    assert legacy_id not in await store.take_tombstones(20)
+    async with engine.connect() as connection:
+        unowned = (
+            await connection.execute(
+                text(
+                    "SELECT count(*) FROM vector_tombstones "
+                    "WHERE chunk_id = :chunk_id AND workspace_id IS NULL"
+                ),
+                {"chunk_id": legacy_id},
+            )
+        ).scalar_one()
+    assert unowned == 1, "an unattributable legacy cleanup record must remain protected"
     await vectors.teardown()
 
 

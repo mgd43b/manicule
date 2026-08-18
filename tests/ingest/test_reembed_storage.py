@@ -10,10 +10,10 @@ from typing import TYPE_CHECKING, override
 import lancedb
 import pytest
 from pydantic import TypeAdapter
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 
 from manicule.core.content import Chunk
-from manicule.core.embedding import Vector
+from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.ingest.reembed import (
     CorpusSnapshot,
     PublishOutcome,
@@ -42,6 +42,7 @@ from manicule.storage.vectors import (
     PublishedLanceVectorStore,
     VectorStoreReprepareRequiredError,
     VectorStoreStateError,
+    generation_pin,
     quote,
     table_name,
 )
@@ -162,11 +163,17 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
-                vector_table=table_name(old),
-                embed_fingerprint=old.model_dump_json(),
-                created_at=utcnow(),
-                updated_at=utcnow(),
+                [
+                    {
+                        "workspace_id": workspace,
+                        "vector_namespace": "legacy",
+                        "vector_table": table_name(old),
+                        "embed_fingerprint": old.model_dump_json(),
+                        "created_at": utcnow(),
+                        "updated_at": utcnow(),
+                    }
+                    for workspace in ("alpha", "beta")
+                ]
             )
         )
 
@@ -219,7 +226,12 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
     )
     assert published.state is ReembedState.PUBLISHED
     assert (await beta_store.get(beta_run.id)).state is ReembedState.PLANNED  # type: ignore[union-attr]
-    live = PublishedLanceVectorStore(data_dir / VECTORS_DIRNAME, engine)
+    live = PublishedLanceVectorStore(
+        data_dir / VECTORS_DIRNAME,
+        engine,
+        workspace_id="alpha",
+        identity_namespace="legacy",
+    )
     await live.ensure_ready(HashEmbedder(dimension=4).fingerprint)
     assert await live.count() == 2
     assert await alpha.get_document(stored_chunks[0].document_id) is not None
@@ -258,7 +270,8 @@ async def seeded_run(
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=table_name(old_fingerprint),
                 embed_fingerprint=old_fingerprint.model_dump_json(),
                 vector_inventory_digest=None,
@@ -303,7 +316,8 @@ async def test_failed_or_canceled_plan_removes_every_private_snapshot_row(
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=table_name(old),
                 embed_fingerprint=old.model_dump_json(),
                 vector_inventory_digest=None,
@@ -341,7 +355,8 @@ async def test_start_cleans_its_self_created_snapshot_when_run_creation_does_not
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=table_name(old),
                 embed_fingerprint=old.model_dump_json(),
                 created_at=utcnow(),
@@ -598,7 +613,7 @@ async def test_inventory_cas_records_superseded_without_changing_live_rows(
     async with engine.begin() as connection:
         await connection.execute(
             update(models.IndexState)
-            .where(models.IndexState.id == 1)
+            .where(models.IndexState.workspace_id == "default")
             .values(vector_inventory_digest=competing_inventory)
         )
 
@@ -675,7 +690,7 @@ async def test_publish_receipt_is_atomic_and_cannot_be_downgraded_or_replayed(
     async with engine.begin() as connection:
         await connection.execute(
             update(models.IndexState)
-            .where(models.IndexState.id == 1)
+            .where(models.IndexState.workspace_id == "default")
             .values(vector_table="reembed-competing-winner")
         )
     reopened = SqliteReembedStore(engine, clock=clock)
@@ -690,7 +705,9 @@ async def test_publish_receipt_is_atomic_and_cannot_be_downgraded_or_replayed(
     async with engine.connect() as connection:
         assert (
             await connection.execute(
-                select(models.IndexState.vector_table).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_table).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one() == "reembed-competing-winner"
 
@@ -763,7 +780,9 @@ async def test_ordinary_corpus_mutation_invalidates_then_snapshot_bootstraps_inv
     async with engine.connect() as connection:
         before = (
             await connection.execute(
-                select(models.IndexState.vector_inventory_digest).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_inventory_digest).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert before == run.commitment.snapshot.live.inventory_digest
@@ -772,7 +791,9 @@ async def test_ordinary_corpus_mutation_invalidates_then_snapshot_bootstraps_inv
     async with engine.connect() as connection:
         invalidated = (
             await connection.execute(
-                select(models.IndexState.vector_inventory_digest).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_inventory_digest).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert invalidated is None
@@ -781,7 +802,9 @@ async def test_ordinary_corpus_mutation_invalidates_then_snapshot_bootstraps_inv
     async with engine.connect() as connection:
         bootstrapped = (
             await connection.execute(
-                select(models.IndexState.vector_inventory_digest).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_inventory_digest).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert bootstrapped == rebuilt.live.inventory_digest
@@ -795,7 +818,8 @@ async def test_missing_published_generation_is_fatal_and_is_not_recreated(
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=missing,
                 embed_fingerprint=HashEmbedder(dimension=4).fingerprint.model_dump_json(),
                 vector_inventory_digest="synthetic-inventory",
@@ -846,7 +870,8 @@ async def test_invalid_published_generation_pointer_never_becomes_a_path(
     async with engine.begin() as connection:
         await connection.execute(
             insert(models.IndexState).values(
-                id=1,
+                workspace_id="default",
+                vector_namespace="legacy",
                 vector_table=pointer,
                 embed_fingerprint=HashEmbedder(dimension=4).fingerprint.model_dump_json(),
                 vector_inventory_digest="synthetic-inventory",
@@ -1108,4 +1133,48 @@ async def test_cleanup_waits_for_an_in_flight_search_pinned_to_the_old_generatio
     assert [row.chunk.id for row in rows] == [source.chunk.id]
     assert await asyncio.wait_for(cleanup, timeout=2.0)
     assert not shadows.directory(first.shadow_generation_id).exists()
+    await live.teardown()
+
+
+async def test_writer_queued_behind_reset_revalidates_durable_workspace_identity(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    """A pre-reset handle cannot recreate its old Lance store after reset releases the pin."""
+    embed = fingerprint(dimension=4)
+    await store.record_index_fingerprints(IndexFingerprints(embed=embed))
+    directory = data_dir / VECTORS_DIRNAME
+    live = PublishedLanceVectorStore(
+        directory,
+        engine,
+        identity_namespace="workspace",
+    )
+    await live.ensure_ready(embed)
+    source = make_document()
+    stored = make_chunk(source, 0, "queued stale write")
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_reset_pin() -> None:
+        async with generation_pin(directory, exclusive=True):
+            held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_reset_pin())
+    await asyncio.wait_for(held.wait(), timeout=2.0)
+    writing = asyncio.create_task(live.upsert([stored], [[0.1, 0.2, 0.3, 0.4]]))
+    await asyncio.sleep(0.05)
+    assert not writing.done(), "the stale writer did not wait for reset's exclusive pin"
+    async with engine.begin() as connection:
+        await connection.execute(
+            delete(models.IndexState).where(models.IndexState.workspace_id == "default")
+        )
+    release.set()
+    await asyncio.wait_for(holder, timeout=2.0)
+
+    with pytest.raises(VectorStoreReprepareRequiredError, match="identity was reset"):
+        await asyncio.wait_for(writing, timeout=2.0)
+    physical = LanceVectorStore(directory)
+    await physical.open_existing(embed)
+    assert await physical.count() == 0
+    await physical.teardown()
     await live.teardown()

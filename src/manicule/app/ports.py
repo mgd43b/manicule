@@ -17,6 +17,7 @@ implementations satisfy them structurally with no adapter in between.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 # Imported for real rather than under TYPE_CHECKING, because it is re-exported: `answering()`
@@ -244,6 +245,10 @@ class Ingesting(Protocol):
         """
         ...
 
+    async def configured_index_fingerprints(self) -> tuple[str, str]:
+        """Canonical configured embed/chunk identities, resolved from metadata without models."""
+        ...
+
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
         """Recompute the glossary of every document the installed detector did not produce.
 
@@ -274,6 +279,22 @@ class Ingesting(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class ResetOutcome:
+    """Truthful aggregate result of relational, physical, identity, and runtime cleanup."""
+
+    documents: int = 0
+    chunks: int = 0
+    memberships: int = 0
+    vector_rows: int = 0
+    publications: int = 0
+    generations: int = 0
+    snapshots_retained: int = 0
+    vector_store_removed: bool = False
+    fingerprints_cleared: bool = False
+    runtime_cache_invalidated: bool = False
+
+
 @runtime_checkable
 class Maintenance(Protocol):
     """Whole-installation operations: the ones that touch files rather than rows."""
@@ -294,8 +315,8 @@ class Maintenance(Protocol):
 
     async def restore(self, source: Path, *, force: bool = False) -> Mapping[str, object]: ...
 
-    async def reset_index(self) -> tuple[int, int, bool]:
-        """Reset derived state; return documents affected, chunks removed, vectors removed."""
+    async def reset_index(self) -> ResetOutcome:
+        """Reset one workspace's complete derived identity and return aggregate evidence."""
         ...
 
     async def plan_reset_derived(self) -> LifecyclePlan: ...

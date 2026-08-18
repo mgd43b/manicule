@@ -35,7 +35,6 @@ from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
 from manicule.core.errors import InsecureTargetError
-from manicule.core.source_lifecycle import LifecycleOperation, LifecycleOutcome
 from manicule.generation.config import GENERATOR_NAME
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
@@ -80,54 +79,45 @@ async def test_reembed_restart_recovery_deduplicates_failure_classes() -> None:
     assert outcome.failure_types == ("RuntimeError",)
 
 
-async def test_reset_commits_visibility_before_vectors_and_joins_cleanup_on_cancellation() -> None:
-    order: list[str] = []
+async def test_reset_commits_visibility_and_joins_cleanup_on_cancellation(
+    manicule_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
+    settled = asyncio.Event()
 
-    class Lifecycle:
-        async def legacy_vector_binding(self) -> tuple[str | None, bool]:
-            return "reembed-old", True
+    opened = Runtime.open(data_dir=manicule_environment / "data")
+    async with opened:
+        lifecycle = cast("Any", await opened.documents())
+        original_prepare = lifecycle.prepare_reset_derived
+        original_finish = lifecycle.finish_reset_identity
 
-        async def reset_derived(self) -> LifecycleOutcome:
-            order.append("relational")
-            return LifecycleOutcome(operation=LifecycleOperation.RESET_DERIVED)
-
-    class Vectors:
-        async def delete_bound_publication(
-            self, vector_table: str | None, publication_id: str
-        ) -> int:
-            assert vector_table == "reembed-old"
-            assert publication_id == "legacy"
-            order.append("vector")
-            entered.set()
+        async def prepare() -> object:
+            result = await original_prepare()
+            entered.set()  # the authoritative visibility transaction has committed
             await release.wait()
-            return 1
+            return result
 
-    class RuntimeStub:
-        async def vectors(self) -> Vectors:
-            return Vectors()
+        async def finish() -> bool:
+            result = await original_finish()
+            settled.set()
+            return result
 
-    maintenance = _Maintenance(cast("Runtime", RuntimeStub()))
-
-    async def cleanup() -> LifecycleOutcome:
-        order.append("finalize")
-        return LifecycleOutcome(
-            operation=LifecycleOperation.CLEANUP_DERIVED_GENERATIONS,
-            removed_items=1,
+        monkeypatch.setattr(lifecycle, "prepare_reset_derived", prepare)
+        monkeypatch.setattr(lifecycle, "finish_reset_identity", finish)
+        maintenance = _Maintenance(opened)
+        task = asyncio.create_task(
+            maintenance._reset_derived_joined(lifecycle)  # pyright: ignore[reportPrivateUsage]
         )
+        await entered.wait()
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    maintenance.cleanup_derived_generations = cleanup
-    task = asyncio.create_task(
-        maintenance._reset_derived_joined(cast("Any", Lifecycle()))  # pyright: ignore[reportPrivateUsage]
-    )
-    await entered.wait()
-    task.cancel()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert order == ["relational", "vector", "finalize"]
+        assert settled.is_set(), (
+            "cancellation escaped before owned cleanup reached a terminal state"
+        )
 
 
 async def test_reembed_restart_recovery_does_not_swallow_cancellation() -> None:
@@ -856,11 +846,162 @@ async def test_turning_detection_off_in_configuration_reaches_the_pipeline(
         )
 
 
+async def test_reset_reprepares_a_new_fingerprint_in_the_same_runtime(
+    manicule_environment: Path,
+) -> None:
+    from manicule.app import control  # noqa: PLC0415
+    from manicule.app.results import ResetReport  # noqa: PLC0415
+    from manicule.app.served import ControlHandler  # noqa: PLC0415
+    from manicule.connectors.sessions import SessionVault  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    embedder = HashEmbedder(model_id="fake/before-reset")
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, embedder=embedder
+    ) as opened:
+        first = await opened.pipeline()
+        before = DictConnector({"before": "old index body"}, name="before")
+        before.media_types["before"] = "text/plain"
+        initial = await first.run(before)
+        assert initial.indexed == 1
+        vector_directory = await opened.vector_directory()
+        assert vector_directory.exists()
+
+        socket = control.socket_path(manicule_environment / "data")
+        server = control.ControlServer(
+            socket, ControlHandler(ApplicationService(opened), SessionVault())
+        )
+        await server.start()
+        try:
+            response = cast(
+                "dict[str, Any]",
+                await control.connect(
+                    socket,
+                    control.Invoke(op="reset_index"),
+                    on_progress=lambda _message: None,
+                ),
+            )
+            assert response["ok"] is True
+            reset = ResetReport.model_validate(response["data"])
+        finally:
+            await server.aclose()
+
+        assert reset.documents == 1
+        assert reset.chunks == 1
+        assert reset.fingerprints_cleared
+        assert reset.runtime_cache_invalidated
+        assert reset.vector_store_removed
+        assert not vector_directory.exists()
+
+        embedder.fingerprint = HashEmbedder(dimension=7, model_id="fake/after-reset").fingerprint
+        second = await opened.pipeline()
+        assert second is not first
+        after = DictConnector({"after": "fresh index body"}, name="after")
+        after.media_types["after"] = "text/plain"
+        fresh = await second.run(after)
+        assert fresh.indexed == 1
+        fingerprints = await (await opened.documents()).index_fingerprints()
+        assert fingerprints.embed == embedder.fingerprint
+        assert await (await opened.prepared_vectors()).count() == 1
+
+
+async def test_reset_isolated_workspace_preserves_foreign_vectors_and_identity(
+    manicule_environment: Path,
+) -> None:
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    beta_embedder = HashEmbedder(dimension=6, model_id="fake/beta")
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, workspace="beta", embedder=beta_embedder
+    ) as beta:
+        beta_source = DictConnector({"beta-doc": "beta private body"}, name="beta-source")
+        beta_source.media_types["beta-doc"] = "text/plain"
+        report = await (await beta.pipeline()).run(beta_source)
+        assert report.indexed == 1
+        beta_directory = await beta.vector_directory()
+        beta_identity = await (await beta.documents()).index_fingerprints()
+        beta_vector = (await beta_embedder.embed(["beta private body"]))[0]
+        assert await (await beta.prepared_vectors()).count() == 1
+
+    alpha_embedder = HashEmbedder(dimension=4, model_id="fake/alpha")
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, workspace="alpha", embedder=alpha_embedder
+    ) as alpha:
+        alpha_source = DictConnector({"alpha-doc": "alpha private body"}, name="alpha-source")
+        alpha_source.media_types["alpha-doc"] = "text/plain"
+        report = await (await alpha.pipeline()).run(alpha_source)
+        assert report.indexed == 1
+        alpha_directory = await alpha.vector_directory()
+        assert alpha_directory != beta_directory
+        reset = await ApplicationService(alpha).reset_index()
+        assert reset.documents == 1
+        assert not alpha_directory.exists()
+        assert beta_directory.exists()
+
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, workspace="beta", embedder=beta_embedder
+    ) as beta:
+        assert await (await beta.documents()).index_fingerprints() == beta_identity
+        vectors = await beta.prepared_vectors()
+        assert await vectors.count() == 1
+        candidates = await vectors.search(beta_vector, 5)
+        assert len(candidates) == 1
+        assert candidates[0].chunk.text == "beta private body"
+
+
+async def test_reset_physical_failure_is_retryable_and_never_reports_success(
+    manicule_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    embedder = HashEmbedder(model_id="fake/retry-reset")
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, embedder=embedder
+    ) as opened:
+        source = DictConnector({"retry": "retryable vector body"}, name="retry-source")
+        source.media_types["retry"] = "text/plain"
+        assert (await (await opened.pipeline()).run(source)).indexed == 1
+        vectors = await opened.vectors()
+        assert isinstance(vectors, PublishedLanceVectorStore)
+        original_delete = vectors.delete_bound_chunks
+        attempts = 0
+
+        async def fail_once(vector_table: str | None, vector_ids: list[str]) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("synthetic physical cleanup failure")
+            await original_delete(vector_table, vector_ids)
+
+        monkeypatch.setattr(vectors, "delete_bound_chunks", fail_once)
+        with pytest.raises(OSError, match="physical cleanup failure"):
+            await ApplicationService(opened).reset_index()
+
+        # The relational retirement is committed, while both the identity and bound cleanup
+        # ledger remain durable so the same command can finish rather than falsely succeeding.
+        assert await (await opened.documents()).count_chunks() == 0
+        assert (await (await opened.documents()).index_fingerprints()).embed == embedder.fingerprint
+
+        retried = await ApplicationService(opened).reset_index()
+        assert retried.vector_rows_removed == 1
+        assert retried.fingerprints_cleared
+        again = await ApplicationService(opened).reset_index()
+        assert again.documents == 0
+        assert again.chunks == 0
+        assert again.vector_rows_removed == 0
+
+
 def _runtime_with_a_buildable_pipeline(
     environment: Path,
     *,
     detect_on_ingest: bool = True,
     retain_source_bytes: bool = True,
+    workspace: str = "default",
+    embedder: Any | None = None,
 ) -> Runtime:
     """A runtime whose ``pipeline()`` can actually be resolved.
 
@@ -877,10 +1018,12 @@ def _runtime_with_a_buildable_pipeline(
     bound = found.registry.bind("test")
     # Named ``local`` rather than something invented: provider names are what the credential
     # policy reads, and anything outside the keyless set is required to carry an API key.
-    bound.add(keys.EMBEDDER.named("local"), lambda _: HashEmbedder())
+    selected_embedder = HashEmbedder() if embedder is None else embedder
+    bound.add(keys.EMBEDDER.named("local"), lambda _: selected_embedder)
     bound.add(keys.CHUNKER.named("block"), lambda _: BlockChunker())
     settings = Settings(
         data_dir=environment / "data",
+        workspace=workspace,
         embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
         storage={"retain_source_bytes": retain_source_bytes},  # pyright: ignore[reportArgumentType]
         rag={  # pyright: ignore[reportArgumentType]

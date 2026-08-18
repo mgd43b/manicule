@@ -1016,6 +1016,12 @@ class IngestPipeline:
         """
         return self._glossary_lineage
 
+    async def aclose(self) -> None:
+        """Release parse workers when a runtime invalidates this derived pipeline."""
+        teardown = getattr(self._runner, "teardown", None)
+        if teardown is not None:
+            await teardown()
+
     # --- a run: three stages, two bounded hand-offs -----------------------------------------
 
     async def _start_acquisition(

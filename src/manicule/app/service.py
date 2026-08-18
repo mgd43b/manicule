@@ -2698,6 +2698,9 @@ class ApplicationService:
             store = await self._backend.documents()
             fingerprints = await store.index_fingerprints()
             documents = await store.count_documents()
+            configured_embed, configured_chunk = await (
+                await self._backend.ingestion()
+            ).configured_index_fingerprints()
         except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
             return r.Check(
                 name="index",
@@ -2718,6 +2721,31 @@ class ApplicationService:
                 # how it was reached, and a `remedy` naming a command with a `<path>` in it is
                 # neither runnable by a script nor certain to be the right advice.
                 facts={"documents": documents, "vector_table": None},
+            )
+        embed_mismatch = bool(
+            fingerprints.embed is not None
+            and configured_embed
+            and fingerprints.embed.canonical() != configured_embed
+        )
+        chunk_mismatch = bool(
+            fingerprints.chunk is not None
+            and configured_chunk
+            and fingerprints.chunk.canonical() != configured_chunk
+        )
+        if documents == 0 and (embed_mismatch or chunk_mismatch):
+            return r.Check(
+                name="index",
+                state="degraded",
+                detail=(
+                    "the empty workspace retains an obsolete derived fingerprint that would "
+                    "reject the configured first ingest"
+                ),
+                facts={
+                    "documents": 0,
+                    "vector_table": fingerprints.vector_table or None,
+                    "stale_empty_identity": True,
+                },
+                remedy="manicule reset-index --yes",
             )
         return r.Check(
             name="index",
@@ -3678,13 +3706,19 @@ class ApplicationService:
         ``--yes``. The MCP and HTTP forms expose only the aggregate dry run.
         """
         maintenance = await self._backend.maintenance()
-        documents, chunks, vectors = await maintenance.reset_index()
-        plan = await maintenance.plan_reset_derived()
+        outcome = await maintenance.reset_index()
         return r.ResetReport(
-            documents=documents,
-            chunks=chunks,
-            vectors_removed=vectors,
-            snapshots_retained=plan.snapshot_items,
+            documents=outcome.documents,
+            chunks=outcome.chunks,
+            vectors_removed=bool(outcome.vector_rows or outcome.vector_store_removed),
+            vector_rows_removed=outcome.vector_rows,
+            publications_removed=outcome.publications,
+            memberships_removed=outcome.memberships,
+            generations_canceled=outcome.generations,
+            vector_store_removed=outcome.vector_store_removed,
+            fingerprints_cleared=outcome.fingerprints_cleared,
+            runtime_cache_invalidated=outcome.runtime_cache_invalidated,
+            snapshots_retained=outcome.snapshots_retained,
         )
 
     async def lifecycle_reset_derived(self, *, dry_run: bool = False) -> r.LifecycleReport:

@@ -308,7 +308,7 @@ server and the built command tree.
 | `backup` / `restore` | — | `backup` | where it went, what it holds |
 | `export` | — | `export` | a portable archive |
 | `import` | — | `import` | run counters |
-| `reset_index` | — | `reset-index --yes` | derived state removed and durable snapshot items retained |
+| `reset_index` | — | `reset-index --yes` | workspace-scoped document/chunk/membership/vector/publication/generation counts, physical/fingerprint/cache cleanup, and durable snapshot items retained |
 | `init` | — | `init` | what was written and decided |
 | `upgrade` | — | `upgrade` | current, target, and the command to run |
 | `start` / `stop` | — | `start` / `stop` | the address, and whether it is loopback |

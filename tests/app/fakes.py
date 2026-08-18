@@ -24,6 +24,7 @@ from manicule.app.ports import (
     Keys,
     Maintenance,
     Organizing,
+    ResetOutcome,
     Retrieving,
     Telemetry,
 )
@@ -1042,6 +1043,9 @@ class FakeIngestion:
 
         return glossary_fingerprint()
 
+    async def configured_index_fingerprints(self) -> tuple[str, str]:
+        return "", ""
+
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
         self.glossary_sweeps.append((batch, dry_run))
         if dry_run:
@@ -1062,7 +1066,7 @@ class FakeMaintenance:
     workspace_rows: list[tuple[str, str, str]] = field(
         default_factory=lambda: [("default", "default", "personal")]
     )
-    reset: tuple[int, int, bool] = (0, 0, False)
+    reset: ResetOutcome = field(default_factory=ResetOutcome)
     resets: int = 0
     """How many times the index was actually emptied.
 
@@ -1101,7 +1105,7 @@ class FakeMaintenance:
         del force
         return {"files": [], "path": str(source)}
 
-    async def reset_index(self) -> tuple[int, int, bool]:
+    async def reset_index(self) -> ResetOutcome:
         self.resets += 1
         return self.reset
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, cast
 
@@ -17,7 +17,7 @@ from sqlalchemy import delete, exists, func, or_, select, union, update
 
 from manicule.core.acquisition import AcquisitionRunState
 from manicule.core.content import DocumentStatus
-from manicule.core.rebuild import RebuildState
+from manicule.core.rebuild import RebuildState, vector_publication_id
 from manicule.core.source_lifecycle import (
     LifecycleOperation,
     LifecycleOutcome,
@@ -49,6 +49,28 @@ class GenerationPublication:
     expected_vector_table: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ResetPreparation:
+    """Aggregate durable cleanup binding committed by a confirmed workspace reset."""
+
+    documents: int
+    chunks: int
+    memberships: int
+    generations: int
+    snapshots: int
+    vector_namespace: str
+    vector_table: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class BoundVectorTombstone:
+    """One exact retryable physical row deletion, scoped to its immutable layout."""
+
+    vector_id: str
+    vector_namespace: str
+    vector_table: str | None
+
+
 class SourceLifecycleMixin(WorkspaceScoped):
     """Workspace-scoped retention boundaries mixed into :class:`SqliteDocStore`."""
 
@@ -64,50 +86,242 @@ class SourceLifecycleMixin(WorkspaceScoped):
             # `eligible_bytes` is intentionally zero: source bytes are outside this operation.
         ).model_copy(update={"eligible_items": chunks})
 
-    async def legacy_vector_binding(self) -> tuple[str | None, bool]:
-        """The one legacy namespace reset must remove, without listing its documents."""
+    async def reset_binding(self) -> tuple[str, str | None]:
+        """The durable physical layout this workspace must finish cleaning."""
         async with self._sessions() as session:
-            vector_table = await session.scalar(
-                select(models.IndexState.vector_table).where(models.IndexState.id == 1)
-            )
-            has_legacy = bool(
-                await session.scalar(
+            state = (
+                await session.execute(
                     select(
-                        exists().where(
-                            models.Document.workspace_id == self._workspace_id,
-                            models.Document.publication_id == "legacy",
+                        models.IndexState.vector_namespace,
+                        models.IndexState.vector_table,
+                    ).where(models.IndexState.workspace_id == self._workspace_id)
+                )
+            ).one_or_none()
+        if state is None:
+            return "workspace", None
+        return str(state.vector_namespace), state.vector_table
+
+    async def reset_vector_tombstones(
+        self, *, limit: int = GENERATION_CLEANUP_PAGE
+    ) -> tuple[BoundVectorTombstone, ...]:
+        """Read one bounded workspace-owned cleanup page without exposing document identity."""
+        if limit < 1 or limit > GENERATION_CLEANUP_PAGE:
+            raise ValueError(f"reset tombstone page size must be 1..{GENERATION_CLEANUP_PAGE}")
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        models.VectorTombstone.chunk_id,
+                        models.VectorTombstone.vector_namespace,
+                        models.VectorTombstone.vector_table,
+                    )
+                    .where(models.VectorTombstone.workspace_id == self._workspace_id)
+                    .order_by(
+                        models.VectorTombstone.deleted_at,
+                        models.VectorTombstone.chunk_id,
+                    )
+                    .limit(limit)
+                )
+            ).all()
+        return tuple(
+            BoundVectorTombstone(str(row.chunk_id), str(row.vector_namespace), row.vector_table)
+            for row in rows
+        )
+
+    async def finish_reset_identity(self) -> bool:
+        """Clear only this workspace's identity after every physical cleanup has succeeded."""
+        async with self._sessions.begin() as session:
+            result = cast(
+                "CursorResult[object]",
+                await session.execute(
+                    delete(models.IndexState).where(
+                        models.IndexState.workspace_id == self._workspace_id
+                    )
+                ),
+            )
+        return bool(result.rowcount)
+
+    async def retire_reset_pointer(self) -> None:
+        """Make terminal shadow generations non-live while retaining retry identity metadata."""
+        async with self._sessions.begin() as session:
+            await session.execute(
+                update(models.IndexState)
+                .where(models.IndexState.workspace_id == self._workspace_id)
+                .values(vector_table=None, vector_inventory_digest=None, updated_at=utcnow())
+            )
+
+    async def other_legacy_vector_consumers(self) -> int:
+        """How many other workspaces still depend on the upgraded shared vector root."""
+        async with self._sessions() as session:
+            return int(
+                await session.scalar(
+                    select(func.count(models.IndexState.workspace_id)).where(
+                        models.IndexState.workspace_id != self._workspace_id,
+                        models.IndexState.vector_namespace == "legacy",
+                    )
+                )
+                or 0
+            )
+
+    async def clear_unowned_legacy_tombstones(self) -> int:
+        """Forget upgrade-era tombstones only after the last shared root is removed.
+
+        Rows that could not be attributed during migration deliberately remain unclaimable by
+        any workspace.  Deleting the shared legacy store is the first point at which their
+        cleanup is certain, and therefore the only safe point at which to retire the ledger.
+        """
+        async with self._sessions.begin() as session:
+            result = cast(
+                "CursorResult[object]",
+                await session.execute(
+                    delete(models.VectorTombstone).where(
+                        models.VectorTombstone.workspace_id.is_(None)
+                    )
+                ),
+            )
+        return int(result.rowcount or 0)
+
+    async def prepare_reset_derived(self) -> ResetPreparation:
+        """Retire all workspace derived visibility and fence every resumable generation."""
+        async with self._sessions.begin() as session:
+            document_ids = select(models.Document.id).where(
+                models.Document.workspace_id == self._workspace_id
+            )
+            documents = await self._workspace_document_count(session)
+            chunks = await self._workspace_chunk_count(session)
+            memberships = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(models.CollectionDocument)
+                    .where(models.CollectionDocument.document_id.in_(document_ids))
+                )
+                or 0
+            )
+            retired_at = utcnow()
+            acquisition_result = cast(
+                "CursorResult[object]",
+                await session.execute(
+                    update(models.AcquisitionRun)
+                    .where(
+                        models.AcquisitionRun.workspace_id == self._workspace_id,
+                        models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                    )
+                    .values(
+                        state=AcquisitionRunState.SETTLED,
+                        superseded_at=retired_at,
+                        lease_owner=None,
+                        lease_generation=models.AcquisitionRun.lease_generation + 1,
+                        lease_expires_at=None,
+                        updated_at=retired_at,
+                    )
+                ),
+            )
+            await session.execute(delete(models.Chunk).where(self._workspace_chunk()))
+            await session.execute(
+                delete(models.CollectionDocument).where(
+                    models.CollectionDocument.document_id.in_(document_ids)
+                )
+            )
+            await session.execute(
+                delete(models.DocumentTag).where(models.DocumentTag.document_id.in_(document_ids))
+            )
+            generations = (
+                (
+                    await session.execute(
+                        select(models.DerivedGeneration).where(
+                            models.DerivedGeneration.workspace_id == self._workspace_id,
+                            models.DerivedGeneration.state.notin_(
+                                {RebuildState.FAILED, RebuildState.CANCELED}
+                            ),
                         )
                     )
                 )
+                .scalars()
+                .all()
             )
-        return vector_table, has_legacy
+            for generation in generations:
+                if (
+                    generation.vector_publication_id is None
+                    and generation.lease_owner is not None
+                    and generation.lease_generation > 0
+                ):
+                    generation.vector_publication_id = vector_publication_id(
+                        generation.id,
+                        generation.lease_owner,
+                        generation.lease_generation,
+                    )
+                generation.state = RebuildState.CANCELED
+                generation.published_at = None
+                generation.diagnostic_code = None
+                generation.lease_owner = None
+                generation.lease_expires_at = None
+                generation.lease_generation += 1
+                generation.updated_at = utcnow()
+            from pydantic import TypeAdapter  # noqa: PLC0415
 
-    async def reset_derived(self) -> LifecycleOutcome:
-        """Retire derived visibility while retaining retryable physical cleanup metadata."""
-        async with self._sessions.begin() as session:
-            chunk_count = await self._workspace_chunk_count(session)
-            await session.execute(delete(models.Chunk).where(self._workspace_chunk()))
-            # Retire rather than delete: the row is the durable binding needed to remove its
-            # physical publication after this relational transaction commits. A crash between
-            # the two phases therefore leaves cleanup discoverable and retryable.
+            from manicule.ingest.reembed import ReembedRun, ReembedState  # noqa: PLC0415
+
+            adapter = TypeAdapter(ReembedRun)
+            reembed_runs = (
+                (
+                    await session.execute(
+                        select(models.ReembedRunRecord).where(
+                            models.ReembedRunRecord.workspace_id == self._workspace_id,
+                            models.ReembedRunRecord.state.in_(
+                                {
+                                    ReembedState.PLANNED.value,
+                                    ReembedState.BUILDING.value,
+                                    ReembedState.VALIDATING.value,
+                                    ReembedState.READY.value,
+                                    ReembedState.PUBLISHED.value,
+                                }
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in reembed_runs:
+                run = adapter.validate_json(row.checkpoint_json)
+                failed = replace(
+                    run,
+                    state=ReembedState.FAILED,
+                    revision=run.revision + 1,
+                    failure="workspace derived index reset",
+                )
+                row.state = ReembedState.FAILED.value
+                row.checkpoint_json = adapter.dump_json(failed).decode("utf-8")
+                row.revision = failed.revision
+                row.lease_owner = None
+                row.lease_generation += 1
+                row.lease_expires_at = None
+                row.updated_at = utcnow()
+            if reembed_runs:
+                await session.execute(
+                    delete(models.ReembedPublicationReceipt).where(
+                        models.ReembedPublicationReceipt.workspace_id == self._workspace_id,
+                        models.ReembedPublicationReceipt.run_id.in_(
+                            [row.id for row in reembed_runs]
+                        ),
+                    )
+                )
             await session.execute(
-                update(models.DerivedGeneration)
+                update(models.ReembedShadowGeneration)
                 .where(
-                    models.DerivedGeneration.workspace_id == self._workspace_id,
-                    models.DerivedGeneration.state == RebuildState.PUBLISHED,
+                    models.ReembedShadowGeneration.workspace_id == self._workspace_id,
+                    models.ReembedShadowGeneration.state.in_({"building", "sealed", "published"}),
                 )
-                .values(
-                    state=RebuildState.CANCELED,
-                    published_at=None,
-                    diagnostic_code=None,
-                    updated_at=utcnow(),
-                )
+                .values(state="superseded")
             )
             await session.execute(
                 update(models.Document)
-                .where(models.Document.workspace_id == self._workspace_id)
+                .where(
+                    models.Document.workspace_id == self._workspace_id,
+                    models.Document.deleted_at.is_(None),
+                )
                 .values(
-                    status=DocumentStatus.PENDING,
+                    status=DocumentStatus.DELETED,
                     status_detail="derived state reset; rebuild from retained snapshot",
                     failed_stage=None,
                     parse_fp=None,
@@ -116,13 +330,55 @@ class SourceLifecycleMixin(WorkspaceScoped):
                     glossary_fp=None,
                     indexed_at=None,
                     publication_id=RESET_PUBLICATION,
+                    deleted_at=utcnow(),
                     updated_at=utcnow(),
                 )
             )
+            state = await session.get(models.IndexState, self._workspace_id)
+            namespace = "workspace" if state is None else state.vector_namespace
+            vector_table = None if state is None else state.vector_table
+        return ResetPreparation(
+            documents=documents,
+            chunks=chunks,
+            memberships=memberships,
+            generations=int(acquisition_result.rowcount or 0)
+            + len(generations)
+            + len(reembed_runs),
+            snapshots=await self._snapshot_item_count(),
+            vector_namespace=namespace,
+            vector_table=vector_table,
+        )
+
+    async def reset_reembed_run_ids(self) -> tuple[str, ...]:
+        """Terminal re-embedding runs whose workspace-owned shadow directories can be removed."""
+        async with self._sessions() as session:
+            values = (
+                await session.execute(
+                    select(models.ReembedRunRecord.id)
+                    .join(
+                        models.ReembedShadowGeneration,
+                        (
+                            models.ReembedShadowGeneration.workspace_id
+                            == models.ReembedRunRecord.workspace_id
+                        )
+                        & (models.ReembedShadowGeneration.run_id == models.ReembedRunRecord.id),
+                    )
+                    .where(
+                        models.ReembedRunRecord.workspace_id == self._workspace_id,
+                        models.ReembedRunRecord.state.in_({"failed", "superseded"}),
+                    )
+                    .order_by(models.ReembedRunRecord.id)
+                )
+            ).scalars()
+        return tuple(str(value) for value in values)
+
+    async def reset_derived(self) -> LifecycleOutcome:
+        """Retire derived visibility while retaining retryable physical cleanup metadata."""
+        prepared = await self.prepare_reset_derived()
         return LifecycleOutcome(
             operation=LifecycleOperation.RESET_DERIVED,
-            removed_items=chunk_count,
-            snapshot_items=await self._snapshot_item_count(),
+            removed_items=prepared.chunks,
+            snapshot_items=prepared.snapshots,
         )
 
     async def plan_derived_generation_cleanup(self) -> LifecyclePlan:
@@ -543,7 +799,8 @@ class SourceLifecycleMixin(WorkspaceScoped):
         return int(
             await session.scalar(
                 select(func.count(models.Document.id)).where(
-                    models.Document.workspace_id == self._workspace_id
+                    models.Document.workspace_id == self._workspace_id,
+                    models.Document.deleted_at.is_(None),
                 )
             )
             or 0
