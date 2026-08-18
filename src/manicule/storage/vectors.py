@@ -1273,18 +1273,27 @@ class PublishedLanceVectorStore:
     async def physical_fingerprint(self) -> EmbedFingerprint | None:
         """Read existing Lance metadata without preparing or creating a physical store."""
         while True:
-            pointer, namespace, epoch = await self._binding()
+            binding = await self._binding()
+            pointer, _namespace, _epoch = binding
             key = _published_generation_key(pointer)
             directory = (
                 self._directory / "generations" / key if key != "legacy" else self._directory
             )
-            if not directory.exists():
-                return None
-            async with generation_pin(directory):
-                if await self._binding() != (pointer, namespace, epoch):
+            async with generation_pin(self._directory):
+                if await self._binding() != binding:
                     continue
-                store = self._stores.setdefault(key, LanceVectorStore(directory))
-                return await store.fingerprint()
+                if not await asyncio.to_thread(directory.exists):
+                    return None
+                if directory == self._directory:
+                    store = self._stores.setdefault(key, LanceVectorStore(directory))
+                    return await store.fingerprint()
+                async with generation_pin(directory):
+                    if await self._binding() != binding:
+                        continue
+                    if not await asyncio.to_thread(directory.exists):
+                        return None
+                    store = self._stores.setdefault(key, LanceVectorStore(directory))
+                    return await store.fingerprint()
 
     async def upsert(
         self,
@@ -1341,12 +1350,11 @@ class PublishedLanceVectorStore:
         key = _published_generation_key(vector_table)
         directory = self._directory / "generations" / key if key != "legacy" else self._directory
         store = self._stores.setdefault(key, LanceVectorStore(directory))
-        if key == "legacy":
-            return await store.delete_publication(publication_id)
-        if not directory.exists():
-            return 0
-        async with generation_pin(directory):
-            await store.open_existing()
+        async with self._existing_operation_pin(directory) as exists:
+            if not exists:
+                return 0
+            if key != "legacy":
+                await store.open_existing()
             return await store.delete_publication(publication_id)
 
     async def delete_bound_chunks(self, vector_table: str | None, vector_ids: Sequence[str]) -> int:
@@ -1355,13 +1363,12 @@ class PublishedLanceVectorStore:
             return 0
         key = _published_generation_key(vector_table)
         directory = self._directory / "generations" / key if key != "legacy" else self._directory
-        if not directory.exists():
-            return 0
         store = self._stores.setdefault(key, LanceVectorStore(directory))
-        if key == "legacy":
-            return await store.delete_chunks_counted(vector_ids)
-        async with generation_pin(directory):
-            await store.open_existing()
+        async with self._existing_operation_pin(directory) as exists:
+            if not exists:
+                return 0
+            if key != "legacy":
+                await store.open_existing()
             return await store.delete_chunks_counted(vector_ids)
 
     async def publication_page_is_complete(
@@ -1412,40 +1419,81 @@ class PublishedLanceVectorStore:
     async def _operation(self) -> AsyncGenerator[LanceVectorStore]:
         """Pin and revalidate one pointer before exposing its store to an operation."""
         while True:
-            pointer, namespace, epoch = await self._binding()
+            binding = await self._binding()
+            pointer, namespace, epoch = binding
             key = _published_generation_key(pointer)
             directory = (
                 self._directory / "generations" / key if key != "legacy" else self._directory
             )
-            async with generation_pin(directory):
-                current_pointer, current_namespace, current_epoch = await self._binding()
-                if (current_pointer, current_namespace, current_epoch) != (
-                    pointer,
-                    namespace,
-                    epoch,
-                ):
+            async with generation_pin(self._directory):
+                current_binding = await self._binding()
+                if current_binding != binding:
                     continue
-                if (
-                    self._expected_reset_epoch is not None
-                    and current_epoch != self._expected_reset_epoch
-                ):
-                    raise VectorStoreReprepareRequiredError(
-                        "the workspace derived-reset epoch changed while this vector handle "
-                        "was waiting; rebuild the runtime handle before writing"
-                    )
-                if self._identity_namespace is not None and (
-                    current_namespace is None or current_namespace != self._identity_namespace
-                ):
-                    raise VectorStoreReprepareRequiredError(
-                        "the workspace index identity was reset while this vector handle was "
-                        "waiting; rebuild the runtime handle before writing"
-                    )
-                self._publication_pointer = pointer
-                store = await self._prepared_store(key, directory)
-                if self._operation_hook is not None:
-                    await self._operation_hook()
-                yield store
+                self._require_current_handle(namespace, epoch)
+                async with self._selected_generation_pin(directory) as exists:
+                    current_binding = await self._binding()
+                    if current_binding != binding:
+                        continue
+                    if not exists:
+                        raise VectorStoreStateError(
+                            f"published vector generation {directory} does not exist"
+                        )
+                    self._require_current_handle(namespace, epoch)
+                    self._publication_pointer = pointer
+                    store = await self._prepared_store(key, directory)
+                    if self._operation_hook is not None:
+                        await self._operation_hook()
+                    yield store
+                    return
+
+    @asynccontextmanager
+    async def _selected_generation_pin(self, directory: Path) -> AsyncGenerator[bool]:
+        """Pin a child after root validation and report whether it still exists.
+
+        The caller re-reads the moving SQLite binding before interpreting ``False`` as
+        corruption.  A publisher may legitimately flip the pointer and remove the old child
+        while this operation waits for its pin; that case retries the new publication.
+        """
+        if directory == self._directory:
+            yield True
+            return
+        if not await asyncio.to_thread(directory.exists):
+            yield False
+            return
+        async with generation_pin(directory):
+            yield await asyncio.to_thread(directory.exists)
+
+    @asynccontextmanager
+    async def _existing_operation_pin(self, directory: Path) -> AsyncGenerator[bool]:
+        """Pin an existing bound directory without recreating it after reset.
+
+        The existence checks deliberately happen after the root pin and, for a child, after
+        its pin.  A cleanup queued behind reset must return zero rather than recreate the
+        deleted ``generations/.pins`` tree while trying to lock a path that no longer exists.
+        """
+        async with generation_pin(self._directory):
+            if not await asyncio.to_thread(directory.exists):
+                yield False
                 return
+            if directory == self._directory:
+                yield True
+                return
+            async with generation_pin(directory):
+                yield await asyncio.to_thread(directory.exists)
+
+    def _require_current_handle(self, namespace: str | None, epoch: int) -> None:
+        if self._expected_reset_epoch is not None and epoch != self._expected_reset_epoch:
+            raise VectorStoreReprepareRequiredError(
+                "the workspace derived-reset epoch changed while this vector handle was "
+                "waiting; rebuild the runtime handle before writing"
+            )
+        if self._identity_namespace is not None and (
+            namespace is None or namespace != self._identity_namespace
+        ):
+            raise VectorStoreReprepareRequiredError(
+                "the workspace index identity was reset while this vector handle was waiting; "
+                "rebuild the runtime handle before writing"
+            )
 
     async def _binding(self) -> tuple[str | None, str | None, int]:
         from sqlalchemy import select  # noqa: PLC0415 - storage remains lazy

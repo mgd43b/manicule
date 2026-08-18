@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import shutil
+from collections.abc import AsyncGenerator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, override
 
@@ -1281,4 +1283,183 @@ async def test_writer_queued_behind_reset_revalidates_durable_workspace_identity
     await physical.open_existing(embed)
     assert await physical.count() == 0
     await physical.teardown()
+    await live.teardown()
+
+
+async def test_generation_writer_contends_on_the_workspace_reset_pin(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    """A generation-backed operation uses the workspace root lock held by reset."""
+    embed = fingerprint(dimension=4)
+    await store.record_index_fingerprints(IndexFingerprints(embed=embed))
+    directory = data_dir / VECTORS_DIRNAME
+    generation_id = "reembed-reset-contender"
+    generation_directory = directory / "generations" / generation_id
+    generation = LanceVectorStore(generation_directory)
+    await generation.ensure_ready(embed)
+    await generation.teardown()
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(models.IndexState)
+            .where(models.IndexState.workspace_id == "default")
+            .values(vector_table=generation_id)
+        )
+
+    live = PublishedLanceVectorStore(
+        directory,
+        engine,
+        identity_namespace="workspace",
+        expected_reset_epoch=0,
+    )
+    await live.ensure_ready(embed)
+    source = make_document()
+    stored = make_chunk(source, 0, "generation write queued behind reset")
+    held = asyncio.Event()
+    perform_reset = asyncio.Event()
+
+    async def hold_reset_pin() -> None:
+        async with generation_pin(directory, exclusive=True):
+            held.set()
+            await perform_reset.wait()
+            async with engine.begin() as connection:
+                await connection.execute(
+                    delete(models.IndexState).where(models.IndexState.workspace_id == "default")
+                )
+                await connection.execute(
+                    update(models.Workspace)
+                    .where(models.Workspace.id == "default")
+                    .values(derived_reset_epoch=models.Workspace.derived_reset_epoch + 1)
+                )
+            await live.teardown()
+            shutil.rmtree(directory)
+
+    holder = asyncio.create_task(hold_reset_pin())
+    await asyncio.wait_for(held.wait(), timeout=2.0)
+    writing = asyncio.create_task(live.upsert([stored], [[0.1, 0.2, 0.3, 0.4]]))
+    await asyncio.sleep(0.05)
+    assert not writing.done(), "the generation writer bypassed reset's workspace root pin"
+
+    perform_reset.set()
+    await asyncio.wait_for(holder, timeout=2.0)
+    with pytest.raises(VectorStoreReprepareRequiredError, match="reset epoch changed"):
+        await asyncio.wait_for(writing, timeout=2.0)
+    assert not directory.exists(), "the stale generation writer recreated reset storage"
+    await live.teardown()
+
+
+async def test_bound_cleanup_queued_behind_reset_does_not_recreate_storage(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """A stale bound cleanup returns zero after reset removes its physical generation."""
+    embed = fingerprint(dimension=4)
+    directory = data_dir / VECTORS_DIRNAME
+    generation_id = "reembed-reset-cleanup"
+    generation_directory = directory / "generations" / generation_id
+    generation = LanceVectorStore(generation_directory)
+    await generation.ensure_ready(embed)
+    source = make_document()
+    stored = make_chunk(source, 0, "bound cleanup queued behind reset")
+    await generation.upsert(
+        [stored],
+        [[0.1, 0.2, 0.3, 0.4]],
+        publication_id="stale-publication",
+    )
+    await generation.teardown()
+    live = PublishedLanceVectorStore(directory, engine)
+    held = asyncio.Event()
+    perform_reset = asyncio.Event()
+
+    async def hold_reset_pin() -> None:
+        async with generation_pin(directory, exclusive=True):
+            held.set()
+            await perform_reset.wait()
+            shutil.rmtree(directory)
+
+    holder = asyncio.create_task(hold_reset_pin())
+    await asyncio.wait_for(held.wait(), timeout=2.0)
+    cleanup = asyncio.create_task(live.delete_bound_publication(generation_id, "stale-publication"))
+    await asyncio.sleep(0.05)
+    assert not cleanup.done(), "bound cleanup bypassed reset's workspace root pin"
+
+    perform_reset.set()
+    await asyncio.wait_for(holder, timeout=2.0)
+    assert await asyncio.wait_for(cleanup, timeout=2.0) == 0
+    assert not directory.exists(), "bound cleanup recreated reset storage"
+    await live.teardown()
+
+
+async def test_live_operation_retries_when_publication_changes_while_waiting_for_old_child(
+    engine: AsyncEngine,
+    store: SqliteDocStore,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A removed old generation is retried after its durable pointer moves."""
+    embed = fingerprint(dimension=4)
+    await store.record_index_fingerprints(IndexFingerprints(embed=embed))
+    directory = data_dir / VECTORS_DIRNAME
+    old_id = "reembed-pointer-old"
+    new_id = "reembed-pointer-new"
+    old_directory = directory / "generations" / old_id
+    new_directory = directory / "generations" / new_id
+    old_chunk = make_chunk(make_document(source_id="old-pointer"), 0, "old publication")
+    new_chunk = make_chunk(make_document(source_id="new-pointer"), 0, "new publication")
+    old_store = LanceVectorStore(old_directory)
+    new_store = LanceVectorStore(new_directory)
+    await old_store.ensure_ready(embed)
+    await new_store.ensure_ready(embed)
+    await old_store.upsert([old_chunk], [[1.0, 0.0, 0.0, 0.0]])
+    await new_store.upsert([new_chunk], [[0.0, 1.0, 0.0, 0.0]])
+    await old_store.teardown()
+    await new_store.teardown()
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(models.IndexState)
+            .where(models.IndexState.workspace_id == "default")
+            .values(vector_table=old_id)
+        )
+
+    live = PublishedLanceVectorStore(directory, engine)
+    await live.ensure_ready(embed)
+    held = asyncio.Event()
+    publish = asyncio.Event()
+    child_pin_attempted = asyncio.Event()
+    original_generation_pin = generation_pin
+
+    @asynccontextmanager
+    async def observed_generation_pin(
+        target: Path, *, exclusive: bool = False
+    ) -> AsyncGenerator[None]:
+        if target == old_directory and not exclusive:
+            child_pin_attempted.set()
+        async with original_generation_pin(target, exclusive=exclusive):
+            yield
+
+    monkeypatch.setattr("manicule.storage.vectors.generation_pin", observed_generation_pin)
+
+    async def publish_new_generation() -> None:
+        async with (
+            original_generation_pin(directory),
+            original_generation_pin(old_directory, exclusive=True),
+        ):
+            held.set()
+            await publish.wait()
+            async with engine.begin() as connection:
+                await connection.execute(
+                    update(models.IndexState)
+                    .where(models.IndexState.workspace_id == "default")
+                    .values(vector_table=new_id)
+                )
+            shutil.rmtree(old_directory)
+
+    publisher = asyncio.create_task(publish_new_generation())
+    await asyncio.wait_for(held.wait(), timeout=2.0)
+    searching = asyncio.create_task(live.search([0.0, 1.0, 0.0, 0.0], 1))
+    await asyncio.wait_for(child_pin_attempted.wait(), timeout=2.0)
+
+    publish.set()
+    await asyncio.wait_for(publisher, timeout=2.0)
+    rows = await asyncio.wait_for(searching, timeout=2.0)
+    assert [row.chunk.id for row in rows] == [new_chunk.id]
+    assert not old_directory.exists()
     await live.teardown()
