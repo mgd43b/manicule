@@ -106,9 +106,12 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 
 ## MCP tools — 41
 
-Ticket: #8 — **built.** Forty tools over the same application service the command
+Ticket: #8 — **built.** Forty implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
+
+The checklist below has forty-one capability items because it also records the deliberately
+declined catch-all `run-command` surface; that item is not a registered MCP tool.
 
 **All forty over stdio; the twenty-three read-only ones over a socket.** MCP is also served
 at `/mcp/` on the HTTP port, and every mutating tool is *absent* from that surface rather than
