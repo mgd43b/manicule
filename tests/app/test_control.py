@@ -279,6 +279,36 @@ async def test_an_invocation_crosses_whole_and_comes_back_as_an_envelope(
     assert envelope["data"] == {"echoed": "invoke"}
 
 
+async def test_a_collection_rule_crosses_the_control_socket_without_field_loss(
+    socket_for: Callable[[], Path],
+) -> None:
+    path = socket_for()
+    handler = Echo()
+    server = await serving(path, handler)
+    rule: dict[str, JsonValue] = {
+        "sources": ["wiki-team-a", "wiki-team-a-archive"],
+        "media_types": ["text/markdown"],
+        "tag_ids": ["tag-team-a"],
+        "updated_after": "2026-08-01T00:00:00+00:00",
+        "updated_before": "2026-08-18T00:00:00+00:00",
+    }
+    try:
+        await control.connect(
+            path,
+            control.Invoke(
+                op="collection_rule_set",
+                arguments={"collection_id": "collection-team-a", "rule": rule},
+                workspace="default",
+            ),
+            on_progress=lambda _: None,
+        )
+    finally:
+        await server.aclose()
+    (seen,) = handler.seen
+    assert isinstance(seen, control.Invoke)
+    assert seen.arguments == {"collection_id": "collection-team-a", "rule": rule}
+
+
 async def test_progress_arrives_before_the_result_rather_than_with_it(
     socket_for: Callable[[], Path],
 ) -> None:

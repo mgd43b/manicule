@@ -158,6 +158,131 @@ def test_a_human_readable_failure_goes_to_stderr(bound: ApplicationService) -> N
     assert result.stdout == ""
 
 
+def test_collection_create_accepts_one_or_multiple_sources_and_reports_the_rule_as_json(
+    bound: ApplicationService,
+) -> None:
+    del bound
+    one = run(["--json", "collection", "create", "Team A", "--source", "wiki-team-a"])
+    assert one.exit_code == 0, one.output
+    one_data = json.loads(one.stdout)["data"]
+    assert one_data["rule"]["sources"] == ["wiki-team-a"]
+
+    many = run(
+        [
+            "--json",
+            "collection",
+            "create",
+            "Team Archives",
+            "--source",
+            "wiki-team-a-archive",
+            "--source",
+            "wiki-team-a",
+        ]
+    )
+    assert many.exit_code == 0, many.output
+    assert json.loads(many.stdout)["data"]["rule"]["sources"] == [
+        "wiki-team-a",
+        "wiki-team-a-archive",
+    ]
+
+
+def test_collection_rule_show_set_and_clear_have_human_and_json_output(
+    bound: ApplicationService,
+) -> None:
+    del bound
+    made = run(["--json", "collection", "create", "Team A"])
+    collection_id = json.loads(made.stdout)["data"]["id"]
+
+    changed = run(
+        [
+            "--json",
+            "collection",
+            "rule",
+            "set",
+            collection_id,
+            "--source",
+            "wiki-team-a",
+        ]
+    )
+    assert changed.exit_code == 0, changed.output
+    assert json.loads(changed.stdout)["data"]["rule"]["sources"] == ["wiki-team-a"]
+
+    shown = run(["collection", "rule", "show", collection_id])
+    assert shown.exit_code == 0, shown.output
+    assert "wiki-team-a" in shown.output
+
+    cleared = run(["--json", "collection", "rule", "clear", collection_id])
+    assert cleared.exit_code == 0, cleared.output
+    assert json.loads(cleared.stdout)["data"]["rule"] is None
+
+
+def test_collection_rule_refuses_an_empty_or_blank_selector(bound: ApplicationService) -> None:
+    del bound
+    made = run(["--json", "collection", "create", "Team A"])
+    collection_id = json.loads(made.stdout)["data"]["id"]
+
+    empty = run(["--json", "collection", "rule", "set", collection_id])
+    assert empty.exit_code == 1
+    assert json.loads(empty.stdout)["error"]["type"] == "ValueError"
+
+    blank = run(["--json", "collection", "rule", "set", collection_id, "--source", "   "])
+    assert blank.exit_code == 1
+    body = json.loads(blank.stdout)
+    assert body["error"]["type"] == "ValueError"
+    assert "   " not in body["error"]["message"]
+
+
+def test_collection_rule_cli_accepts_aware_update_bounds_and_refuses_naive_ones(
+    bound: ApplicationService,
+) -> None:
+    del bound
+    created = run(
+        [
+            "--json",
+            "collection",
+            "create",
+            "Recent Team A",
+            "--source",
+            "wiki-team-a",
+            "--updated-after",
+            "2026-08-01T00:00:00Z",
+        ]
+    )
+    assert created.exit_code == 0, created.output
+    data = json.loads(created.stdout)["data"]
+    assert data["rule"]["updated_after"] == "2026-08-01T00:00:00Z"
+
+    changed = run(
+        [
+            "--json",
+            "collection",
+            "rule",
+            "set",
+            data["id"],
+            "--updated-before",
+            "2026-08-18T12:30:00+00:00",
+        ]
+    )
+    assert changed.exit_code == 0, changed.output
+    assert json.loads(changed.stdout)["data"]["rule"]["updated_before"] == ("2026-08-18T12:30:00Z")
+
+    naive = run(
+        [
+            "--json",
+            "collection",
+            "rule",
+            "set",
+            data["id"],
+            "--updated-after",
+            "2026-08-01T00:00:00",
+        ]
+    )
+    assert naive.exit_code == 1
+    body = json.loads(naive.stdout)
+    assert body["error"]["type"] == "ValueError"
+    assert "timezone-aware" in body["error"]["message"]
+
+
 # --- stdin -------------------------------------------------------------------------------------
 
 
@@ -2184,6 +2309,8 @@ MINIMAL: dict[str, list[str]] = {
     "collection_remove": ["collection", "remove", "col-1", "doc-1"],
     "collection_rename": ["collection", "rename", "col-1", "runbooks"],
     "collection_update": ["collection", "update", "col-1", "for on call"],
+    "collection_rule_set": ["collection", "rule", "set", "col-1", "--source", "handbook"],
+    "collection_rule_clear": ["collection", "rule", "clear", "col-1"],
     "config_set": ["config", "set", "rag.profile", "fast"],
     "connector_list": ["connector", "list"],
     "connector_sidecar": ["connector", "sidecar", "."],

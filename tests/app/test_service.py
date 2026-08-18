@@ -12,6 +12,7 @@ import json
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import huggingface_hub
 import pytest
@@ -30,16 +31,24 @@ from manicule.app.service import (
 from manicule.config.settings import Settings, config_file
 from manicule.connectors.enriched import AdapterOutcome
 from manicule.connectors.filesystem import ENRICHED_KEY
-from manicule.core.content import Document, DocumentStatus
+from manicule.core.content import Chunk, Document, DocumentStatus
 from manicule.core.errors import ConfigError, UnknownEntityError
 from manicule.core.ids import document_id
+from manicule.core.organization import CollectionRule
 from manicule.core.provenance import Provenance
-from manicule.core.retrieval import Candidate, RetrievalProfile
+from manicule.core.retrieval import Candidate, Filter, RetrievalProfile
 from manicule.embedding.runtimes import hub
 from manicule.embedding.runtimes.hub import OFFLINE_ENV
 from manicule.ingest.pipeline import RunReport
 from manicule.plugins.registry import discover
+from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
+from manicule.storage.organization import resolve_filter
 from tests.app.fakes import FakeBackend, make_chunk, make_document
+from tests.storage_helpers import make_chunk as make_stored_chunk
+from tests.storage_helpers import make_document as make_stored_document
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
 
 @pytest.fixture
@@ -1934,6 +1943,99 @@ async def test_updating_a_description_cannot_erase_one_by_omission(
         "an empty string neither cleared the description nor was rejected; 'no description' "
         "now has two spellings on the wire"
     )
+
+
+async def test_collection_rules_are_created_shown_replaced_and_cleared_explicitly(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    first = CollectionRule(sources=frozenset({"wiki-team-a", "wiki-team-a-archive"}))
+    made = await service.collection_create("Team A", rule=first)
+    assert made.rule == {
+        "sources": ["wiki-team-a", "wiki-team-a-archive"],
+        "media_types": [],
+        "tag_ids": [],
+        "updated_after": None,
+        "updated_before": None,
+    }
+
+    shown = await service.collection_rule_show(made.id)
+    assert shown == made
+
+    replacement = CollectionRule(media_types=frozenset({"text/markdown"}))
+    changed = await service.collection_rule_set(made.id, replacement)
+    assert changed.rule is not None
+    assert changed.rule["media_types"] == ["text/markdown"]
+
+    cleared = await service.collection_rule_clear(made.id)
+    assert cleared.rule is None
+    stored = await backend.organization_.get_collection(made.id)
+    assert stored is not None
+    assert stored.rule is None
+
+
+async def test_collection_rule_show_refuses_a_foreign_or_missing_id(
+    service: ApplicationService,
+) -> None:
+    with pytest.raises(UnknownEntityError):
+        await service.collection_rule_show("somebody-elses-collection")
+
+
+async def test_supported_rule_management_selects_live_members_without_corpus_work(
+    engine: AsyncEngine,
+) -> None:
+    """Bounded end-to-end proof over the real rule evaluator and the supported service."""
+    organization = SqliteDocStore(engine)
+    await organization.ensure_workspace()
+    backend = FakeBackend()
+    backend.organization_ = cast("Any", organization)
+    service = ApplicationService(backend)
+
+    async def seed(source: str, source_id: str) -> tuple[Document, Chunk]:
+        document = await organization.upsert_document(
+            make_stored_document(source=source, source_id=source_id)
+        )
+        chunk = make_stored_chunk(document, 0, f"synthetic body for {source_id}")
+        await organization.replace_chunks(document.id, [chunk])
+        backend.store.add(document, chunk)
+        return document, chunk
+
+    current, _ = await seed("wiki-team-a", "current.md")
+    excluded, _ = await seed("wiki-team-b", "excluded.md")
+
+    async def corpus_facts() -> tuple[int, int, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        return (
+            await organization.count_documents(),
+            await organization.live_chunk_count(),
+            tuple(str(path) for path in backend.ingestion_.paths),
+            tuple(backend.ingestion_.synced),
+            tuple(backend.ingestion_.asked),
+        )
+
+    before_create = await corpus_facts()
+    made = await service.collection_create(
+        "Team A", rule=CollectionRule(sources=frozenset({"wiki-team-a"}))
+    )
+    assert await corpus_facts() == before_create
+    first_counts = await service.collection_counts(made.id)
+    assert (first_counts.documents, first_counts.chunks) == (1, 1)
+
+    later, later_chunk = await seed("wiki-team-a", "later.md")
+    later_counts = await service.collection_counts(made.id)
+    assert (later_counts.documents, later_counts.chunks) == (2, 2)
+    scope = Filter(
+        workspace_ids=frozenset({DEFAULT_WORKSPACE}),
+        collection_ids=frozenset({made.id}),
+    )
+    resolved = await resolve_filter(scope, collections=organization, tags=organization)
+    assert resolved is not None
+    assert resolved.document_ids == frozenset({current.id, later.id})
+    assert excluded.id not in resolved.document_ids
+    assert later_chunk.document_id == later.id
+
+    before_mutations = await corpus_facts()
+    await service.collection_rule_set(made.id, CollectionRule(sources=frozenset({"wiki-team-b"})))
+    await service.collection_rule_clear(made.id)
+    assert await corpus_facts() == before_mutations
 
 
 # --- the connector-identity check, and the two settings around it --------------------------------
