@@ -61,8 +61,10 @@ import json
 import math
 import os
 import re
+import shutil
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Final
 
 import lancedb
@@ -177,9 +179,18 @@ class VectorStoreReprepareRequiredError(VectorStoreStateError):
     """The live publication moved to a vector space this handle has not prepared."""
 
 
+_EXCLUSIVE_PINS: ContextVar[frozenset[Path]] = ContextVar(
+    "manicule_exclusive_vector_pins", default=frozenset()
+)
+
+
 @asynccontextmanager
 async def generation_pin(directory: Path, *, exclusive: bool = False) -> AsyncGenerator[None]:
     """Cross-process pin preventing cleanup from deleting a generation during an operation."""
+    resolved = await asyncio.to_thread(directory.resolve)
+    if resolved in _EXCLUSIVE_PINS.get():
+        yield
+        return
     pins = directory.parent / ".pins"
     pins.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(pins / f"{directory.name}.lock", os.O_CREAT | os.O_RDWR, 0o600)
@@ -191,7 +202,14 @@ async def generation_pin(directory: Path, *, exclusive: bool = False) -> AsyncGe
                 break
             except BlockingIOError:
                 await asyncio.sleep(0.01)
-        yield
+        token = None
+        if exclusive:
+            token = _EXCLUSIVE_PINS.set(_EXCLUSIVE_PINS.get() | {resolved})
+        try:
+            yield
+        finally:
+            if token is not None:
+                _EXCLUSIVE_PINS.reset(token)
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
@@ -645,6 +663,18 @@ class LanceVectorStore:
             return
         listed = ", ".join(quote(chunk_id) for chunk_id in sorted(set(chunk_ids)))
         await table.delete(f"{ID_COLUMN} IN ({listed})")
+
+    async def delete_chunks_counted(self, chunk_ids: Sequence[str]) -> int:
+        """Delete exact physical ids and report rows that actually existed."""
+        if not chunk_ids:
+            return 0
+        table = await self._existing_table()
+        if table is None:
+            return 0
+        listed = ", ".join(quote(chunk_id) for chunk_id in sorted(set(chunk_ids)))
+        rows = await table.query().where(f"{ID_COLUMN} IN ({listed})").select([ID_COLUMN]).to_list()
+        await table.delete(f"{ID_COLUMN} IN ({listed})")
+        return len({str(row[ID_COLUMN]) for row in rows})
 
     # --- reading -------------------------------------------------------------------------
 
@@ -1198,10 +1228,20 @@ class PublishedLanceVectorStore:
         directory: Path,
         engine: AsyncEngine,
         *,
+        workspace_id: str = "default",
+        identity_namespace: str | None = None,
+        expected_reset_epoch: int | None = None,
         operation_hook: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._directory = directory
         self._engine = engine
+        self._workspace_id = workspace_id
+        # A handle built against an existing identity must never silently become the first
+        # writer of a new one.  Reset removes that identity only after fencing leases and
+        # cleaning its physical store; this durable expectation is the post-flock CAS that
+        # prevents a writer queued behind reset from recreating the stale store afterwards.
+        self._identity_namespace = identity_namespace
+        self._expected_reset_epoch = expected_reset_epoch
         self._stores: dict[str, LanceVectorStore] = {}
         self._middleware: tuple[str, ...] = ()
         self._configured: EmbedFingerprint | None = None
@@ -1229,6 +1269,31 @@ class PublishedLanceVectorStore:
     async def fingerprint(self) -> EmbedFingerprint | None:
         async with self._operation() as store:
             return await store.fingerprint()
+
+    async def physical_fingerprint(self) -> EmbedFingerprint | None:
+        """Read existing Lance metadata without preparing or creating a physical store."""
+        while True:
+            binding = await self._binding()
+            pointer, _namespace, _epoch = binding
+            key = _published_generation_key(pointer)
+            directory = (
+                self._directory / "generations" / key if key != "legacy" else self._directory
+            )
+            async with generation_pin(self._directory):
+                if await self._binding() != binding:
+                    continue
+                if not await asyncio.to_thread(directory.exists):
+                    return None
+                if directory == self._directory:
+                    store = self._stores.setdefault(key, LanceVectorStore(directory))
+                    return await store.fingerprint()
+                async with generation_pin(directory):
+                    if await self._binding() != binding:
+                        continue
+                    if not await asyncio.to_thread(directory.exists):
+                        return None
+                    store = self._stores.setdefault(key, LanceVectorStore(directory))
+                    return await store.fingerprint()
 
     async def upsert(
         self,
@@ -1285,13 +1350,26 @@ class PublishedLanceVectorStore:
         key = _published_generation_key(vector_table)
         directory = self._directory / "generations" / key if key != "legacy" else self._directory
         store = self._stores.setdefault(key, LanceVectorStore(directory))
-        if key == "legacy":
+        async with self._existing_operation_pin(directory) as exists:
+            if not exists:
+                return 0
+            if key != "legacy":
+                await store.open_existing()
             return await store.delete_publication(publication_id)
-        if not directory.exists():
+
+    async def delete_bound_chunks(self, vector_table: str | None, vector_ids: Sequence[str]) -> int:
+        """Delete exact staged/live rows from the physical generation recorded before reset."""
+        if not vector_ids:
             return 0
-        async with generation_pin(directory):
-            await store.open_existing()
-            return await store.delete_publication(publication_id)
+        key = _published_generation_key(vector_table)
+        directory = self._directory / "generations" / key if key != "legacy" else self._directory
+        store = self._stores.setdefault(key, LanceVectorStore(directory))
+        async with self._existing_operation_pin(directory) as exists:
+            if not exists:
+                return 0
+            if key != "legacy":
+                await store.open_existing()
+            return await store.delete_chunks_counted(vector_ids)
 
     async def publication_page_is_complete(
         self,
@@ -1341,40 +1419,114 @@ class PublishedLanceVectorStore:
     async def _operation(self) -> AsyncGenerator[LanceVectorStore]:
         """Pin and revalidate one pointer before exposing its store to an operation."""
         while True:
-            pointer = await self._pointer()
+            binding = await self._binding()
+            pointer, namespace, epoch = binding
             key = _published_generation_key(pointer)
             directory = (
                 self._directory / "generations" / key if key != "legacy" else self._directory
             )
-            if key == "legacy":
-                self._publication_pointer = pointer
-                store = await self._prepared_store(key, directory)
-                if self._operation_hook is not None:
-                    await self._operation_hook()
-                yield store
+            async with generation_pin(self._directory):
+                current_binding = await self._binding()
+                if current_binding != binding:
+                    continue
+                self._require_current_handle(namespace, epoch)
+                async with self._selected_generation_pin(directory) as exists:
+                    current_binding = await self._binding()
+                    if current_binding != binding:
+                        continue
+                    if not exists:
+                        raise VectorStoreStateError(
+                            f"published vector generation {directory} does not exist"
+                        )
+                    self._require_current_handle(namespace, epoch)
+                    self._publication_pointer = pointer
+                    store = await self._prepared_store(key, directory)
+                    if self._operation_hook is not None:
+                        await self._operation_hook()
+                    yield store
+                    return
+
+    @asynccontextmanager
+    async def _selected_generation_pin(self, directory: Path) -> AsyncGenerator[bool]:
+        """Pin a child after root validation and report whether it still exists.
+
+        The caller re-reads the moving SQLite binding before interpreting ``False`` as
+        corruption.  A publisher may legitimately flip the pointer and remove the old child
+        while this operation waits for its pin; that case retries the new publication.
+        """
+        if directory == self._directory:
+            yield True
+            return
+        if not await asyncio.to_thread(directory.exists):
+            yield False
+            return
+        async with generation_pin(directory):
+            yield await asyncio.to_thread(directory.exists)
+
+    @asynccontextmanager
+    async def _existing_operation_pin(self, directory: Path) -> AsyncGenerator[bool]:
+        """Pin an existing bound directory without recreating it after reset.
+
+        The existence checks deliberately happen after the root pin and, for a child, after
+        its pin.  A cleanup queued behind reset must return zero rather than recreate the
+        deleted ``generations/.pins`` tree while trying to lock a path that no longer exists.
+        """
+        async with generation_pin(self._directory):
+            if not await asyncio.to_thread(directory.exists):
+                yield False
+                return
+            if directory == self._directory:
+                yield True
                 return
             async with generation_pin(directory):
-                if await self._pointer() != pointer:
-                    continue
-                self._publication_pointer = pointer
-                store = await self._prepared_store(key, directory)
-                if self._operation_hook is not None:
-                    await self._operation_hook()
-                yield store
-                return
+                yield await asyncio.to_thread(directory.exists)
 
-    async def _pointer(self) -> str | None:
+    def _require_current_handle(self, namespace: str | None, epoch: int) -> None:
+        if self._expected_reset_epoch is not None and epoch != self._expected_reset_epoch:
+            raise VectorStoreReprepareRequiredError(
+                "the workspace derived-reset epoch changed while this vector handle was "
+                "waiting; rebuild the runtime handle before writing"
+            )
+        if self._identity_namespace is not None and (
+            namespace is None or namespace != self._identity_namespace
+        ):
+            raise VectorStoreReprepareRequiredError(
+                "the workspace index identity was reset while this vector handle was waiting; "
+                "rebuild the runtime handle before writing"
+            )
+
+    async def _binding(self) -> tuple[str | None, str | None, int]:
         from sqlalchemy import select  # noqa: PLC0415 - storage remains lazy
 
         from manicule.storage import models  # noqa: PLC0415 - avoids import cycle at startup
 
         async with self._engine.connect() as connection:
-            value = (
+            row = (
                 await connection.execute(
-                    select(models.IndexState.vector_table).where(models.IndexState.id == 1)
+                    select(
+                        models.IndexState.vector_table,
+                        models.IndexState.vector_namespace,
+                        models.Workspace.derived_reset_epoch,
+                    )
+                    .select_from(models.Workspace)
+                    .outerjoin(
+                        models.IndexState,
+                        models.IndexState.workspace_id == models.Workspace.id,
+                    )
+                    .where(models.Workspace.id == self._workspace_id)
                 )
-            ).scalar_one_or_none()
-        return None if value is None else str(value)
+            ).one_or_none()
+        if row is None:
+            return None, None, 0
+        return (
+            None if row.vector_table is None else str(row.vector_table),
+            None if row.vector_namespace is None else str(row.vector_namespace),
+            int(row.derived_reset_epoch),
+        )
+
+    async def _pointer(self) -> str | None:
+        pointer, _namespace, _epoch = await self._binding()
+        return pointer
 
     async def _prepared_store(self, key: str, directory: Path) -> LanceVectorStore:
         store = self._stores.setdefault(key, LanceVectorStore(directory))
@@ -1405,6 +1557,39 @@ def _published_generation_key(pointer: str | None) -> str:
     return pointer
 
 
+def workspace_vector_directory(root: Path, workspace_id: str) -> Path:
+    """Opaque, stable physical namespace for one workspace's independent vector identity."""
+    digest = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()
+    return root / "workspaces" / digest
+
+
+async def reset_vector_directory(directory: Path, *, legacy_root: bool) -> bool:
+    """Remove one workspace's physical identity after all exact row cleanup has settled.
+
+    The historical root may contain the new ``workspaces/`` children, so it is cleared through
+    Lance's table API and its legacy generation tree rather than recursively deleting the root.
+    """
+    if not await asyncio.to_thread(directory.exists):
+        return False
+    if not legacy_root:
+        await asyncio.to_thread(shutil.rmtree, directory)
+        return True
+    connection = await lancedb.connect_async(directory)
+    try:
+        listed = await connection.list_tables()
+        for name in listed.tables:
+            await connection.drop_table(str(name))
+    finally:
+        connection.close()
+    generations = directory / "generations"
+    if generations.exists():
+        await asyncio.to_thread(shutil.rmtree, generations)
+    workspace_root = directory / "workspaces"
+    if not workspace_root.exists():
+        await asyncio.to_thread(shutil.rmtree, directory)
+    return True
+
+
 __all__ = [
     "EXEMPT_FILTER_FIELDS",
     "FILTERABLE_COLUMNS",
@@ -1426,6 +1611,8 @@ __all__ = [
     "membership",
     "predicate_for",
     "quote",
+    "reset_vector_directory",
     "table_name",
     "unit",
+    "workspace_vector_directory",
 ]

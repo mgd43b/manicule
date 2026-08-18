@@ -34,8 +34,7 @@ from manicule.app.service import ApplicationService, pre_upgrade_destination
 from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
-from manicule.core.errors import InsecureTargetError
-from manicule.core.source_lifecycle import LifecycleOperation, LifecycleOutcome
+from manicule.core.errors import InsecureTargetError, ManiculeError
 from manicule.generation.config import GENERATOR_NAME
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
@@ -44,7 +43,7 @@ from manicule.plugins.registry import discover
 from manicule.storage.config import DOC_STORE_NAME, VECTOR_STORE_NAME
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator, AsyncIterator
 
 STALE_INSTALL = (
     "an entry point declared in pyproject.toml is missing from the installed distribution. "
@@ -80,54 +79,45 @@ async def test_reembed_restart_recovery_deduplicates_failure_classes() -> None:
     assert outcome.failure_types == ("RuntimeError",)
 
 
-async def test_reset_commits_visibility_before_vectors_and_joins_cleanup_on_cancellation() -> None:
-    order: list[str] = []
+async def test_reset_commits_visibility_and_joins_cleanup_on_cancellation(
+    manicule_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
+    settled = asyncio.Event()
 
-    class Lifecycle:
-        async def legacy_vector_binding(self) -> tuple[str | None, bool]:
-            return "reembed-old", True
+    opened = Runtime.open(data_dir=manicule_environment / "data")
+    async with opened:
+        lifecycle = cast("Any", await opened.documents())
+        original_prepare = lifecycle.prepare_reset_derived
+        original_finish = lifecycle.finish_reset_identity
 
-        async def reset_derived(self) -> LifecycleOutcome:
-            order.append("relational")
-            return LifecycleOutcome(operation=LifecycleOperation.RESET_DERIVED)
-
-    class Vectors:
-        async def delete_bound_publication(
-            self, vector_table: str | None, publication_id: str
-        ) -> int:
-            assert vector_table == "reembed-old"
-            assert publication_id == "legacy"
-            order.append("vector")
-            entered.set()
+        async def prepare() -> object:
+            result = await original_prepare()
+            entered.set()  # the authoritative visibility transaction has committed
             await release.wait()
-            return 1
+            return result
 
-    class RuntimeStub:
-        async def vectors(self) -> Vectors:
-            return Vectors()
+        async def finish() -> bool:
+            result = await original_finish()
+            settled.set()
+            return result
 
-    maintenance = _Maintenance(cast("Runtime", RuntimeStub()))
-
-    async def cleanup() -> LifecycleOutcome:
-        order.append("finalize")
-        return LifecycleOutcome(
-            operation=LifecycleOperation.CLEANUP_DERIVED_GENERATIONS,
-            removed_items=1,
+        monkeypatch.setattr(lifecycle, "prepare_reset_derived", prepare)
+        monkeypatch.setattr(lifecycle, "finish_reset_identity", finish)
+        maintenance = _Maintenance(opened)
+        task = asyncio.create_task(
+            maintenance._reset_derived_joined(lifecycle)  # pyright: ignore[reportPrivateUsage]
         )
+        await entered.wait()
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    maintenance.cleanup_derived_generations = cleanup
-    task = asyncio.create_task(
-        maintenance._reset_derived_joined(cast("Any", Lifecycle()))  # pyright: ignore[reportPrivateUsage]
-    )
-    await entered.wait()
-    task.cancel()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert order == ["relational", "vector", "finalize"]
+        assert settled.is_set(), (
+            "cancellation escaped before owned cleanup reached a terminal state"
+        )
 
 
 async def test_reembed_restart_recovery_does_not_swallow_cancellation() -> None:
@@ -201,6 +191,38 @@ async def test_doctor_is_healthy_on_a_fresh_installation(runtime: Runtime) -> No
     failing = [check for check in diagnosis.checks if check.state == "failing"]
     assert failing == [], failing
     assert diagnosis.state == "ok"
+
+
+async def test_doctor_reads_orphaned_lance_metadata_when_sql_identity_is_absent(
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    configured = HashEmbedder(model_id="fake/configured-doctor")
+    stale = HashEmbedder(model_id="fake/orphaned-doctor").fingerprint
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, embedder=configured
+    ) as opened:
+        await (await opened.vectors()).ensure_ready(stale)
+        assert (await (await opened.documents()).index_fingerprints()).is_empty
+
+        async def configured_fingerprints() -> tuple[str, str]:
+            return configured.fingerprint.canonical(), ""
+
+        monkeypatch.setattr(
+            await opened.ingestion(),
+            "configured_index_fingerprints",
+            configured_fingerprints,
+        )
+
+        diagnosis = await ApplicationService(opened).doctor()
+        index = next(check for check in diagnosis.checks if check.name == "index")
+
+        assert index.state == "degraded", index
+        assert index.facts["stale_empty_identity"] is True
+        assert index.facts["physical_fingerprint_mismatch"] is True
+        assert index.remedy == "manicule reset-index --yes"
 
 
 async def test_an_empty_index_reports_itself_as_empty_rather_than_broken(
@@ -343,6 +365,42 @@ async def test_resetting_an_empty_index_is_not_an_error(runtime: Runtime) -> Non
     reset = await ApplicationService(runtime).reset_index()
     assert reset.documents == 0
     assert reset.vectors_removed is False
+
+
+async def test_custom_vector_backend_reset_refuses_before_relational_retirement(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    from tests.ingest import fakes  # noqa: PLC0415
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    store = cast("Any", await runtime.documents())
+    document = make_document(source_id="custom-backend-preserved")
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "preserve me")])
+
+    class CustomBackendRuntime:
+        @asynccontextmanager
+        async def derived_mutation_guard(self) -> AsyncGenerator[None]:
+            yield
+
+        async def documents(self) -> object:
+            return store
+
+        async def vector_directory(self) -> Path:
+            return tmp_path / "custom-vectors"
+
+        async def vectors(self) -> object:
+            return fakes.MemoryVectors()
+
+    maintenance = _Maintenance(cast("Runtime", CustomBackendRuntime()))
+    with pytest.raises(ManiculeError, match="publication-aware vector backend"):
+        await maintenance.reset_index()
+
+    assert await store.get_document(document.id) is not None
+    assert await store.count_chunks() == 1
 
 
 async def test_a_backup_is_taken_and_names_what_it_contains(
@@ -856,11 +914,496 @@ async def test_turning_detection_off_in_configuration_reaches_the_pipeline(
         )
 
 
+async def test_reset_reprepares_a_new_fingerprint_in_the_same_runtime(  # noqa: PLR0915
+    manicule_environment: Path,
+) -> None:
+    from manicule.app import control  # noqa: PLC0415
+    from manicule.app.results import ResetReport  # noqa: PLC0415
+    from manicule.app.served import ControlHandler  # noqa: PLC0415
+    from manicule.connectors.sessions import SessionVault  # noqa: PLC0415
+    from manicule.storage.vectors import (  # noqa: PLC0415
+        LanceVectorStore,
+        VectorStoreStateError,
+    )
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    embedder = HashEmbedder(model_id="fake/before-reset")
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, embedder=embedder
+    ) as opened:
+        first = await opened.pipeline()
+        before = DictConnector({"before": "old index body"}, name="before")
+        before.media_types["before"] = "text/plain"
+        initial = await first.run(before)
+        assert initial.indexed == 1
+        vector_directory = await opened.vector_directory()
+        assert vector_directory.exists()
+        shadow_directory = vector_directory / "generations" / "non-live-shadow"
+        shadow = LanceVectorStore(shadow_directory)
+        await shadow.ensure_ready(embedder.fingerprint)
+        shadow_document = make_document(source_id="non-live-shadow")
+        shadow_chunk = make_chunk(shadow_document, 0, "non-live shadow vector")
+        await shadow.upsert([shadow_chunk], [[0.0] * embedder.fingerprint.dimension])
+        await shadow.teardown()
+        assert shadow_directory.exists()
+
+        socket = control.socket_path(manicule_environment / "data")
+        server = control.ControlServer(
+            socket, ControlHandler(ApplicationService(opened), SessionVault())
+        )
+        await server.start()
+        try:
+            response = cast(
+                "dict[str, Any]",
+                await control.connect(
+                    socket,
+                    control.Invoke(op="reset_index"),
+                    on_progress=lambda _message: None,
+                ),
+            )
+            assert response["ok"] is True
+            reset = ResetReport.model_validate(response["data"])
+        finally:
+            await server.aclose()
+
+        assert reset.documents == 1
+        assert reset.chunks == 1
+        assert reset.fingerprints_cleared
+        assert reset.runtime_cache_invalidated
+        assert reset.vector_store_removed
+        assert not vector_directory.exists()
+        assert not shadow_directory.exists()
+        with pytest.raises(VectorStoreStateError, match="does not exist"):
+            await LanceVectorStore(shadow_directory).open_existing()
+        status = await ApplicationService(opened).index_status()
+        assert status.documents == 0
+        assert status.chunks == 0
+
+        embedder.fingerprint = HashEmbedder(dimension=7, model_id="fake/after-reset").fingerprint
+        second = await opened.pipeline()
+        assert second is not first
+        after = DictConnector({"after": "fresh index body"}, name="after")
+        after.media_types["after"] = "text/plain"
+        fresh = await second.run(after)
+        assert fresh.indexed == 1
+        fingerprints = await (await opened.documents()).index_fingerprints()
+        assert fingerprints.embed == embedder.fingerprint
+        assert await (await opened.prepared_vectors()).count() == 1
+
+
+async def test_reset_old_identity_with_no_live_documents_and_orphaned_chunks_then_ingests(
+    manicule_environment: Path,
+) -> None:
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    embedder = HashEmbedder(model_id="fake/orphan-before-reset")
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, embedder=embedder
+    ) as opened:
+        source = DictConnector({"orphan": "old orphan chunk"}, name="orphan-source")
+        source.media_types["orphan"] = "text/plain"
+        assert (await (await opened.pipeline()).run(source)).indexed == 1
+        async with opened.require_engine().begin() as connection:
+            await connection.execute(
+                text("UPDATE documents SET deleted_at = datetime('now') WHERE source_id = 'orphan'")
+            )
+        store = cast("Any", await opened.documents())
+        assert await store.count_documents() == 0
+        assert await store.count_chunks() == 1
+
+        reset = await ApplicationService(opened).reset_index()
+        assert reset.documents == 0
+        assert reset.chunks == 1
+        assert reset.fingerprints_cleared
+
+        embedder.fingerprint = HashEmbedder(
+            dimension=7, model_id="fake/orphan-after-reset"
+        ).fingerprint
+        fresh = DictConnector({"fresh": "new derived index"}, name="fresh-source")
+        fresh.media_types["fresh"] = "text/plain"
+        assert (await (await opened.pipeline()).run(fresh)).indexed == 1
+        assert (await store.index_fingerprints()).embed == embedder.fingerprint
+
+
+async def test_reset_derived_returns_the_full_cleanup_envelope(
+    manicule_environment: Path,
+) -> None:
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        source = DictConnector({"full-envelope": "derived cleanup envelope"}, name="envelope")
+        source.media_types["full-envelope"] = "text/plain"
+        assert (await (await opened.pipeline()).run(source)).indexed == 1
+
+        outcome = await (await opened.maintenance()).reset_derived()
+
+        assert outcome.documents_retired == 1
+        assert outcome.chunks_removed == 1
+        assert outcome.vector_rows_removed == 1
+        assert outcome.vector_store_removed
+        assert outcome.fingerprints_cleared
+        assert outcome.runtime_cache_invalidated
+
+
+async def test_pipeline_captured_before_reset_is_fenced_before_any_new_write(
+    manicule_environment: Path,
+) -> None:
+    from manicule.core.content import RawDocument  # noqa: PLC0415
+    from manicule.core.errors import DerivedResetFenceLostError  # noqa: PLC0415
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        stale = await opened.pipeline()
+        reset = await ApplicationService(opened).reset_index()
+        assert reset.fingerprints_cleared
+
+        connector = DictConnector({"late": "must never publish"}, name="late-source")
+        connector.media_types["late"] = "text/plain"
+        with pytest.raises(DerivedResetFenceLostError, match="workspace was reset"):
+            await stale.run(connector)
+        with pytest.raises(DerivedResetFenceLostError, match="workspace was reset"):
+            await stale.ingest_raw(
+                RawDocument(
+                    source_id="late-direct",
+                    uri="memory://late-direct",
+                    media_type="text/plain",
+                    content=b"must never publish directly",
+                ),
+                source="late-direct-source",
+            )
+
+        store = cast("Any", await opened.documents())
+        assert await store.count_documents() == 0
+        assert await store.count_chunks() == 0
+        assert (await store.index_fingerprints()).embed is None
+
+
+async def test_identity_absent_vector_handle_queued_behind_reset_epoch_is_refused(
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manicule.storage import vectors as vector_storage  # noqa: PLC0415
+    from manicule.storage.vectors import VectorStoreReprepareRequiredError  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        stale = await opened.vectors()
+        store = cast("Any", await opened.documents())
+        assert (await store.index_fingerprints()).embed is None
+        entered_cleanup = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_reset_directory = vector_storage.reset_vector_directory
+
+        async def blocked_reset_directory(*args: Any, **kwargs: Any) -> bool:
+            entered_cleanup.set()
+            await release_cleanup.wait()
+            return await original_reset_directory(*args, **kwargs)
+
+        monkeypatch.setattr(vector_storage, "reset_vector_directory", blocked_reset_directory)
+        resetting = asyncio.create_task(ApplicationService(opened).reset_index())
+        await entered_cleanup.wait()
+        queued = asyncio.create_task(stale.ensure_ready(HashEmbedder().fingerprint))
+        await asyncio.sleep(0.05)
+        assert not queued.done(), "the stale handle did not queue behind reset's exclusive pin"
+        release_cleanup.set()
+        await resetting
+        with pytest.raises(VectorStoreReprepareRequiredError, match="reset epoch changed"):
+            await queued
+        assert (await store.index_fingerprints()).embed is None
+
+
+async def test_reset_waits_across_vector_upsert_and_relational_publication(
+    manicule_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reset cannot return inside the external-vector to SQLite publication gap."""
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        vectors = await opened.prepared_vectors()
+        pipeline = await opened.pipeline()
+        original_upsert = vectors.upsert
+        vector_written = asyncio.Event()
+        release_publication = asyncio.Event()
+
+        async def pause_after_vector(*args: Any, **kwargs: Any) -> None:
+            await original_upsert(*args, **kwargs)
+            vector_written.set()
+            await release_publication.wait()
+
+        monkeypatch.setattr(vectors, "upsert", pause_after_vector)
+        connector = DictConnector({"racing": "vector then relational"}, name="racing-source")
+        connector.media_types["racing"] = "text/plain"
+        ingesting = asyncio.create_task(pipeline.run(connector))
+        await vector_written.wait()
+
+        resetting = asyncio.create_task(ApplicationService(opened).reset_index())
+        await asyncio.sleep(0.05)
+        assert not resetting.done(), "reset returned while a derived publication was in flight"
+        release_publication.set()
+        report = await ingesting
+        assert report.indexed == 1
+        reset = await resetting
+        assert reset.documents == 1
+        assert reset.chunks == 1
+
+        store = cast("Any", await opened.documents())
+        assert await store.count_documents() == 0
+        assert await store.count_chunks() == 0
+        assert (await store.index_fingerprints()).embed is None
+
+
+async def test_reset_isolated_workspace_preserves_foreign_vectors_and_identity(
+    manicule_environment: Path,
+) -> None:
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    beta_embedder = HashEmbedder(dimension=6, model_id="fake/beta")
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, workspace="beta", embedder=beta_embedder
+    ) as beta:
+        beta_source = DictConnector({"beta-doc": "beta private body"}, name="beta-source")
+        beta_source.media_types["beta-doc"] = "text/plain"
+        report = await (await beta.pipeline()).run(beta_source)
+        assert report.indexed == 1
+        beta_directory = await beta.vector_directory()
+        beta_identity = await (await beta.documents()).index_fingerprints()
+        beta_vector = (await beta_embedder.embed(["beta private body"]))[0]
+        assert await (await beta.prepared_vectors()).count() == 1
+
+    alpha_embedder = HashEmbedder(dimension=4, model_id="fake/alpha")
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, workspace="alpha", embedder=alpha_embedder
+    ) as alpha:
+        alpha_source = DictConnector({"alpha-doc": "alpha private body"}, name="alpha-source")
+        alpha_source.media_types["alpha-doc"] = "text/plain"
+        report = await (await alpha.pipeline()).run(alpha_source)
+        assert report.indexed == 1
+        alpha_directory = await alpha.vector_directory()
+        assert alpha_directory != beta_directory
+        reset = await ApplicationService(alpha).reset_index()
+        assert reset.documents == 1
+        assert not alpha_directory.exists()
+        assert beta_directory.exists()
+
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, workspace="beta", embedder=beta_embedder
+    ) as beta:
+        assert await (await beta.documents()).index_fingerprints() == beta_identity
+        vectors = await beta.prepared_vectors()
+        assert await vectors.count() == 1
+        candidates = await vectors.search(beta_vector, 5)
+        assert len(candidates) == 1
+        assert candidates[0].chunk.text == "beta private body"
+
+
+async def test_simultaneous_workspaces_publish_different_vector_fingerprints(
+    manicule_environment: Path,
+) -> None:
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from manicule.storage.engine import VECTORS_DIRNAME, create_engine  # noqa: PLC0415
+    from manicule.storage.migrator import upgrade  # noqa: PLC0415
+    from manicule.storage.vectors import (  # noqa: PLC0415
+        PublishedLanceVectorStore,
+        workspace_vector_directory,
+    )
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    data_dir = manicule_environment / "data"
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine)
+        alpha_store = SqliteDocStore(engine, workspace_id="alpha")
+        beta_store = SqliteDocStore(engine, workspace_id="beta")
+        await alpha_store.ensure_workspace()
+        await beta_store.ensure_workspace()
+        root = data_dir / VECTORS_DIRNAME
+        alpha_vectors = PublishedLanceVectorStore(
+            workspace_vector_directory(root, "alpha"),
+            engine,
+            workspace_id="alpha",
+            expected_reset_epoch=0,
+        )
+        beta_vectors = PublishedLanceVectorStore(
+            workspace_vector_directory(root, "beta"),
+            engine,
+            workspace_id="beta",
+            expected_reset_epoch=0,
+        )
+        alpha_fp = HashEmbedder(dimension=4, model_id="fake/simultaneous-alpha").fingerprint
+        beta_fp = HashEmbedder(dimension=7, model_id="fake/simultaneous-beta").fingerprint
+        await asyncio.gather(
+            alpha_vectors.ensure_ready(alpha_fp), beta_vectors.ensure_ready(beta_fp)
+        )
+        await asyncio.gather(
+            alpha_store.record_index_fingerprints(
+                IndexFingerprints(embed=alpha_fp), expected_reset_epoch=0
+            ),
+            beta_store.record_index_fingerprints(
+                IndexFingerprints(embed=beta_fp), expected_reset_epoch=0
+            ),
+        )
+        alpha_chunk = make_chunk(make_document(source_id="sim-alpha"), 0, "alpha")
+        beta_chunk = make_chunk(make_document(source_id="sim-beta"), 0, "beta")
+        await asyncio.gather(
+            alpha_vectors.upsert([alpha_chunk], [[1.0] * alpha_fp.dimension]),
+            beta_vectors.upsert([beta_chunk], [[1.0] * beta_fp.dimension]),
+        )
+
+        assert await alpha_vectors.fingerprint() == alpha_fp
+        assert await beta_vectors.fingerprint() == beta_fp
+        assert await alpha_vectors.count() == 1
+        assert await beta_vectors.count() == 1
+        await alpha_vectors.teardown()
+        await beta_vectors.teardown()
+    finally:
+        await engine.dispose()
+
+
+async def test_upgraded_shared_legacy_reset_preserves_foreign_workspace_until_last_consumer(  # noqa: PLR0915
+    manicule_environment: Path,
+) -> None:
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+    from manicule.storage.engine import VECTORS_DIRNAME, create_engine  # noqa: PLC0415
+    from manicule.storage.migrator import upgrade  # noqa: PLC0415
+    from manicule.storage.vectors import LanceVectorStore, table_name  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    data_dir = manicule_environment / "data"
+    engine = create_engine(data_dir)
+    fingerprint = HashEmbedder(model_id="fake/upgraded-shared").fingerprint
+    alpha_document = make_document(source="alpha", source_id="alpha-legacy")
+    beta_document = make_document(source="beta", source_id="beta-legacy")
+    alpha_chunk = make_chunk(alpha_document, 0, "alpha shared legacy vector")
+    beta_chunk = make_chunk(beta_document, 0, "beta shared legacy vector")
+    try:
+        await upgrade(engine)
+        alpha = SqliteDocStore(engine, workspace_id="alpha")
+        beta = SqliteDocStore(engine, workspace_id="beta")
+        await alpha.ensure_workspace()
+        await beta.ensure_workspace()
+        await alpha.upsert_document(alpha_document)
+        await alpha.replace_chunks(alpha_document.id, [alpha_chunk])
+        await beta.upsert_document(beta_document)
+        await beta.replace_chunks(beta_document.id, [beta_chunk])
+        async with alpha.sessions.begin() as session:
+            for workspace in ("alpha", "beta"):
+                session.add(
+                    models.IndexState(
+                        workspace_id=workspace,
+                        vector_namespace="legacy",
+                        vector_table=table_name(fingerprint),
+                        embed_fingerprint=fingerprint.model_dump_json(),
+                    )
+                )
+        root = data_dir / VECTORS_DIRNAME
+        shared = LanceVectorStore(root)
+        await shared.ensure_ready(fingerprint)
+        await shared.upsert(
+            [alpha_chunk, beta_chunk],
+            [[1.0] * fingerprint.dimension, [2.0] * fingerprint.dimension],
+        )
+        await shared.teardown()
+    finally:
+        await engine.dispose()
+
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment,
+        workspace="alpha",
+        embedder=HashEmbedder(model_id="fake/upgraded-shared"),
+    ) as alpha_runtime:
+        reset = await ApplicationService(alpha_runtime).reset_index()
+        assert reset.documents == 1
+        assert root.exists(), "the shared root still has a foreign legacy consumer"
+
+    check_engine = create_engine(data_dir)
+    try:
+        beta = SqliteDocStore(check_engine, workspace_id="beta")
+        assert await beta.get_document(beta_document.id) is not None
+        assert await beta.count_chunks() == 1
+        async with beta.sessions() as session:
+            beta_identity = await session.get(models.IndexState, "beta")
+            assert beta_identity is not None
+            assert beta_identity.vector_namespace == "legacy"
+            assert beta_identity.embed_fingerprint == fingerprint.model_dump_json()
+        shared = LanceVectorStore(root)
+        assert await shared.count() == 1
+        await shared.teardown()
+    finally:
+        await check_engine.dispose()
+
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment,
+        workspace="beta",
+        embedder=HashEmbedder(model_id="fake/upgraded-shared"),
+    ) as beta_runtime:
+        reset = await ApplicationService(beta_runtime).reset_index()
+        assert reset.documents == 1
+        assert reset.vector_store_removed
+        assert not root.exists()
+
+
+async def test_reset_physical_failure_is_retryable_and_never_reports_success(
+    manicule_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    embedder = HashEmbedder(model_id="fake/retry-reset")
+    async with _runtime_with_a_buildable_pipeline(
+        manicule_environment, embedder=embedder
+    ) as opened:
+        source = DictConnector({"retry": "retryable vector body"}, name="retry-source")
+        source.media_types["retry"] = "text/plain"
+        assert (await (await opened.pipeline()).run(source)).indexed == 1
+        vectors = await opened.vectors()
+        assert isinstance(vectors, PublishedLanceVectorStore)
+        original_delete = vectors.delete_bound_chunks
+        attempts = 0
+
+        async def fail_once(vector_table: str | None, vector_ids: list[str]) -> int:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("synthetic physical cleanup failure")
+            return await original_delete(vector_table, vector_ids)
+
+        monkeypatch.setattr(vectors, "delete_bound_chunks", fail_once)
+        with pytest.raises(OSError, match="physical cleanup failure"):
+            await ApplicationService(opened).reset_index()
+
+        # The relational retirement is committed, while both the identity and bound cleanup
+        # ledger remain durable so the same command can finish rather than falsely succeeding.
+        assert await (await opened.documents()).count_chunks() == 0
+        assert (await (await opened.documents()).index_fingerprints()).embed == embedder.fingerprint
+
+        retried = await ApplicationService(opened).reset_index()
+        assert retried.vector_rows_removed == 1
+        assert retried.fingerprints_cleared
+        again = await ApplicationService(opened).reset_index()
+        assert again.documents == 0
+        assert again.chunks == 0
+        assert again.vector_rows_removed == 0
+
+
 def _runtime_with_a_buildable_pipeline(
     environment: Path,
     *,
     detect_on_ingest: bool = True,
     retain_source_bytes: bool = True,
+    workspace: str = "default",
+    embedder: Any | None = None,
 ) -> Runtime:
     """A runtime whose ``pipeline()`` can actually be resolved.
 
@@ -877,10 +1420,12 @@ def _runtime_with_a_buildable_pipeline(
     bound = found.registry.bind("test")
     # Named ``local`` rather than something invented: provider names are what the credential
     # policy reads, and anything outside the keyless set is required to carry an API key.
-    bound.add(keys.EMBEDDER.named("local"), lambda _: HashEmbedder())
+    selected_embedder = HashEmbedder() if embedder is None else embedder
+    bound.add(keys.EMBEDDER.named("local"), lambda _: selected_embedder)
     bound.add(keys.CHUNKER.named("block"), lambda _: BlockChunker())
     settings = Settings(
         data_dir=environment / "data",
+        workspace=workspace,
         embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
         storage={"retain_source_bytes": retain_source_bytes},  # pyright: ignore[reportArgumentType]
         rag={  # pyright: ignore[reportArgumentType]

@@ -237,16 +237,31 @@ async def test_failed_stage_is_required_exactly_when_the_status_is_failed(
             )
 
 
-async def test_index_state_holds_at_most_one_row(engine: AsyncEngine) -> None:
-    """Two rows describing what the index was built with is two answers to one question."""
+async def test_index_state_holds_at_most_one_row_per_workspace(engine: AsyncEngine) -> None:
+    """Two rows for one workspace would be two answers to one identity question."""
     from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
 
     async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, mode, settings, created_at) "
+                "VALUES ('index-workspace', 'index-workspace', 'personal', '{}', "
+                "'2026-01-01 00:00:00')"
+            )
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO index_state (workspace_id, created_at, updated_at) "
+                "VALUES ('index-workspace', '2026-01-01 00:00:00', "
+                "'2026-01-01 00:00:00')"
+            )
+        )
         with pytest.raises(IntegrityError):
             await connection.execute(
                 text(
-                    "INSERT INTO index_state (id, created_at, updated_at) "
-                    "VALUES (2, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                    "INSERT INTO index_state (workspace_id, created_at, updated_at) "
+                    "VALUES ('index-workspace', '2026-01-01 00:00:00', "
+                    "'2026-01-01 00:00:00')"
                 )
             )
 

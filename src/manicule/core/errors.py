@@ -95,6 +95,10 @@ class AcquisitionLeaseLostError(ManiculeError):
     """An attempt-owned mutation no longer holds its persisted fencing generation."""
 
 
+class DerivedResetFenceLostError(ManiculeError):
+    """A derived writer was assembled before a confirmed workspace reset completed."""
+
+
 class StorageBusyError(ManiculeError):
     """SQLite writer ownership stayed unavailable beyond the bounded retry policy.
 
@@ -301,6 +305,7 @@ __all__ = [
     "ContentFilteredError",
     "ContextOverflowError",
     "ContextWindowError",
+    "DerivedResetFenceLostError",
     "DuplicateComponentError",
     "FingerprintMismatchError",
     "GenerationError",

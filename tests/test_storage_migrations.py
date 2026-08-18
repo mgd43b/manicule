@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -224,6 +225,76 @@ async def test_every_revision_downgrades_and_upgrades_back_to_the_same_schema(
         assert await _schema_snapshot(engine) == before, (
             "the schema after a downgrade/upgrade round trip differs from the schema before it"
         )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_workspace_index_migration_backfills_legacy_identity_and_owned_tombstones(
+    data_dir: Path,
+) -> None:
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="e6a2c91f04bd")
+        store = SqliteDocStore(engine)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces(id, name, mode, settings, created_at) "
+                    "VALUES ('default', 'default', 'personal', '{}', :created_at)"
+                ),
+                {"created_at": datetime.now(UTC).isoformat()},
+            )
+        document = make_document()
+        stored_chunk = make_chunk(document, 0, "migration-bound vector")
+        await store.upsert_document(document)
+        await store.replace_chunks(document.id, [stored_chunk])
+        async with engine.begin() as connection:
+            vector_id = (
+                await connection.execute(
+                    text("SELECT vector_id FROM chunks WHERE id = :id"),
+                    {"id": stored_chunk.id},
+                )
+            ).scalar_one()
+            await connection.execute(
+                text(
+                    "INSERT INTO index_state "
+                    "(id, vector_table, embed_fingerprint, chunk_fingerprint, fts_tokenizer, "
+                    "created_at, updated_at) VALUES "
+                    "(1, 'chunks__legacy', 'old-embed', 'old-chunk', :tokenizer, "
+                    "'2026-08-18T00:00:00+00:00', '2026-08-18T00:00:00+00:00')"
+                ),
+                {"tokenizer": "porter unicode61 remove_diacritics 2"},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO vector_tombstones (chunk_id, deleted_at) VALUES "
+                    "(:vector_id, '2026-08-18T00:00:00+00:00')"
+                ),
+                {"vector_id": vector_id},
+            )
+
+        await upgrade(engine)
+
+        async with engine.connect() as connection:
+            identity = (
+                await connection.execute(
+                    text("SELECT workspace_id, vector_namespace, vector_table FROM index_state")
+                )
+            ).one()
+            tombstone = (
+                await connection.execute(
+                    text(
+                        "SELECT workspace_id, vector_namespace, vector_table "
+                        "FROM vector_tombstones WHERE chunk_id = :vector_id"
+                    ),
+                    {"vector_id": vector_id},
+                )
+            ).one()
+        assert tuple(identity) == ("default", "legacy", "chunks__legacy")
+        assert tuple(tombstone) == ("default", "legacy", "chunks__legacy")
     finally:
         await engine.dispose()
 

@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from manicule import vocabularies
 from manicule.app import results as r
 from manicule.app import service as service_module
+from manicule.app.ports import ResetOutcome
 from manicule.app.results import CheckState
 from manicule.app.service import (
     _IDENTITY_SAMPLE,  # pyright: ignore[reportPrivateUsage]
@@ -2691,6 +2692,115 @@ async def test_status_and_mcp_payload_do_not_expose_a_local_weights_path(
     assert status.weights_ref.startswith("local:sha256:")
     assert str(directory) not in payload
     assert "private-name" not in payload
+
+
+async def test_doctor_identifies_stale_empty_index_identity_with_reset_remedy(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    stale = HashEmbedder(model_id="fake/stale-empty").fingerprint
+    configured = HashEmbedder(model_id="fake/configured").fingerprint
+    backend.store.documents.clear()
+    backend.store.chunks.clear()
+
+    async def fingerprints() -> IndexFingerprints:
+        return IndexFingerprints(embed=stale, vector_table="chunks__stale")
+
+    async def configured_fingerprints() -> tuple[str, str]:
+        return configured.canonical(), ""
+
+    monkeypatch.setattr(backend.store, "index_fingerprints", fingerprints)
+    monkeypatch.setattr(
+        backend.ingestion_, "configured_index_fingerprints", configured_fingerprints
+    )
+
+    check = _check(await ApplicationService(backend).doctor(), "index")
+
+    assert check.state == "degraded"
+    assert check.facts["documents"] == 0
+    assert check.facts["stale_empty_identity"] is True
+    assert check.remedy == "manicule reset-index --yes"
+
+
+async def test_doctor_detects_orphaned_physical_fingerprint_without_sql_identity(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    stale = HashEmbedder(model_id="fake/orphaned-lance-meta").fingerprint
+    configured = HashEmbedder(model_id="fake/configured").fingerprint
+    backend.store.documents.clear()
+    backend.store.chunks.clear()
+
+    async def empty_identity() -> IndexFingerprints:
+        return IndexFingerprints()
+
+    async def configured_fingerprints() -> tuple[str, str]:
+        return configured.canonical(), ""
+
+    async def physical_fingerprint() -> str:
+        return stale.canonical()
+
+    monkeypatch.setattr(backend.store, "index_fingerprints", empty_identity)
+    monkeypatch.setattr(
+        backend.ingestion_, "configured_index_fingerprints", configured_fingerprints
+    )
+    monkeypatch.setattr(backend.ingestion_, "physical_index_fingerprint", physical_fingerprint)
+
+    check = _check(await ApplicationService(backend).doctor(), "index")
+
+    assert check.state == "degraded"
+    assert check.facts["stale_empty_identity"] is True
+    assert check.facts["physical_fingerprint_mismatch"] is True
+    assert check.remedy == "manicule reset-index --yes"
+
+
+async def test_doctor_allows_matching_physical_metadata_without_sql_identity(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    configured = HashEmbedder(model_id="fake/matching-lance-meta").fingerprint
+    backend.store.documents.clear()
+    backend.store.chunks.clear()
+
+    async def empty_identity() -> IndexFingerprints:
+        return IndexFingerprints()
+
+    async def configured_fingerprints() -> tuple[str, str]:
+        return configured.canonical(), ""
+
+    async def physical_fingerprint() -> str:
+        return configured.canonical()
+
+    monkeypatch.setattr(backend.store, "index_fingerprints", empty_identity)
+    monkeypatch.setattr(
+        backend.ingestion_, "configured_index_fingerprints", configured_fingerprints
+    )
+    monkeypatch.setattr(backend.ingestion_, "physical_index_fingerprint", physical_fingerprint)
+
+    check = _check(await ApplicationService(backend).doctor(), "index")
+
+    assert check.state == "ok"
+    assert check.detail == "empty index, ready for a first ingest"
+    assert check.remedy == ""
+
+
+async def test_reset_reports_publication_backed_vector_cleanup(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    backend.maintenance_.reset = ResetOutcome(publications=1)
+
+    report = await service.reset_index()
+
+    assert report.publications_removed == 1
+    assert report.vector_rows_removed == 0
+    assert not report.vector_store_removed
+    assert report.vectors_removed
 
 
 async def test_the_glossary_sweep_reaches_the_port_with_what_the_caller_asked_for(

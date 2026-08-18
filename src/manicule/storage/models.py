@@ -150,6 +150,10 @@ class Workspace(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     mode: Mapped[str] = mapped_column(Text, nullable=False, default="personal")
     settings: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=dict)
+    derived_reset_epoch: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    """Monotonic fence invalidating derived writers assembled before a confirmed reset."""
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
     __table_args__ = (CheckConstraint("mode IN ('personal', 'team')", name="mode_is_known"),)
@@ -1217,7 +1221,7 @@ class Plugin(Base):
 
 
 class IndexState(Base):
-    """One row describing what the derived indexes were built with.
+    """One row per workspace describing what its derived indexes were built with.
 
     The fingerprints are canonical bytes in a ``TEXT`` column, not a JSON mapping. They are
     compared for byte equality, and a JSON column round-trips through a serializer that does
@@ -1227,7 +1231,19 @@ class IndexState(Base):
 
     __tablename__ = "index_state"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    vector_namespace: Mapped[str] = mapped_column(
+        Text, nullable=False, default="workspace", server_default="workspace"
+    )
+    """Physical layout selector.
+
+    ``legacy`` keeps an upgraded workspace on the historical shared ``vectors/`` root until
+    its first confirmed reset. ``workspace`` uses an opaque workspace-qualified child
+    directory. The compatibility marker lets an upgrade avoid a multi-gigabyte eager copy
+    while allowing reset and every fresh workspace to have independent fingerprints.
+    """
     vector_table: Mapped[str | None] = mapped_column(Text)
     """A pointer, not a constant. It names a legacy table or a generation directory; re-embed
     moves it in one transaction, so a crash mid-rebuild leaves the old index live."""
@@ -1241,21 +1257,25 @@ class IndexState(Base):
         UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow
     )
 
-    __table_args__ = (CheckConstraint("id = 1", name="is_a_singleton"),)
+    __table_args__ = (
+        CheckConstraint(
+            "vector_namespace IN ('legacy', 'workspace')",
+            name="vector_namespace_is_known",
+        ),
+    )
 
 
 class CorpusRevision(Base):
-    """Monotonic revision moved by triggers on every authoritative corpus mutation."""
+    """Workspace-local revision moved by triggers on authoritative corpus mutations."""
 
     __tablename__ = "corpus_revision"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    __table_args__ = (
-        CheckConstraint("id = 1", name="is_a_singleton"),
-        CheckConstraint("revision >= 0", name="revision_is_not_negative"),
-    )
+    __table_args__ = (CheckConstraint("revision >= 0", name="revision_is_not_negative"),)
 
 
 class ReembedRunRecord(Base):
@@ -1530,9 +1550,16 @@ class VectorTombstone(Base):
     __tablename__ = "vector_tombstones"
 
     chunk_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str | None] = mapped_column(Text)
+    """Owner of this exact physical row, or ``NULL`` for an unattributable legacy tombstone."""
+    vector_namespace: Mapped[str | None] = mapped_column(Text)
+    vector_table: Mapped[str | None] = mapped_column(Text)
     deleted_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
-    __table_args__ = (WITHOUT_ROWID,)
+    __table_args__ = (
+        Index("ix_vector_tombstones_workspace_deleted", "workspace_id", "deleted_at"),
+        WITHOUT_ROWID,
+    )
 
 
 ALL_TABLES = tuple(Base.metadata.sorted_tables)

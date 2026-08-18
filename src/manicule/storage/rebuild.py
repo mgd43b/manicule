@@ -442,7 +442,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     return self._refused_estimate(
                         snapshot_run_id, target, RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
                     )
-                index_state = await session.get(models.IndexState, 1)
+                index_state = await session.get(models.IndexState, self._workspace_id)
                 current_chunk_fingerprint = (
                     None if index_state is None else index_state.chunk_fingerprint
                 )
@@ -498,7 +498,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 return self._refused_estimate(
                     snapshot_run_id, target, RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
                 )
-            index_state = await session.get(models.IndexState, 1)
+            index_state = await session.get(models.IndexState, self._workspace_id)
             current_chunk_fingerprint = (
                 None if index_state is None else index_state.chunk_fingerprint
             )
@@ -1308,12 +1308,41 @@ class SqliteRebuildStore(WorkspaceScoped):
                     .values(deleted_at=utcnow())
                 )
 
-            state = await session.get(models.IndexState, 1)
-            current_tokenizer = models.FTS_TOKENIZER if state is None else state.fts_tokenizer
+            state = await session.get(models.IndexState, self._workspace_id)
+            tokenizer_rows = (
+                (await session.execute(select(models.IndexState.fts_tokenizer).distinct()))
+                .scalars()
+                .all()
+            )
+            installed_tokenizers = {
+                models.FTS_TOKENIZER if value is None else str(value) for value in tokenizer_rows
+            }
+            if len(installed_tokenizers) > 1:
+                raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
+            current_tokenizer = (
+                next(iter(installed_tokenizers)) if installed_tokenizers else models.FTS_TOKENIZER
+            )
             if state is None:
-                state = models.IndexState(id=1)
+                state = models.IndexState(
+                    workspace_id=self._workspace_id, vector_namespace="workspace"
+                )
                 session.add(state)
             if current_tokenizer != target.fts_tokenizer:
+                foreign_identity = int(
+                    await session.scalar(
+                        select(func.count(models.IndexState.workspace_id)).where(
+                            models.IndexState.workspace_id != self._workspace_id
+                        )
+                    )
+                    or 0
+                )
+                if foreign_identity:
+                    # FTS5 is intentionally installation-global.  A workspace-private vector
+                    # identity does not authorize rebuilding that shared table underneath a
+                    # different workspace's published lexical index.
+                    raise RebuildPublicationConflictError(
+                        RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+                    )
                 for statement in DROP_TRIGGERS:
                     await session.execute(text(statement))
                 await session.execute(text(f"DROP TABLE IF EXISTS {FTS_TABLE}"))
@@ -1399,7 +1428,7 @@ class SqliteRebuildStore(WorkspaceScoped):
     async def _require_live_vector_binding(
         self, session: AsyncSession, generation: models.DerivedGeneration
     ) -> None:
-        state = await session.get(models.IndexState, 1)
+        state = await session.get(models.IndexState, self._workspace_id)
         observed_table = None if state is None else state.vector_table
         observed_inventory = None if state is None else state.vector_inventory_digest
         if (
@@ -1482,7 +1511,10 @@ class SqliteRebuildStore(WorkspaceScoped):
             statement = (
                 select(models.Chunk, models.Document.publication_id)
                 .join(models.Document, models.Document.id == models.Chunk.document_id)
-                .where(models.Document.deleted_at.is_(None))
+                .where(
+                    models.Document.workspace_id == self._workspace_id,
+                    models.Document.deleted_at.is_(None),
+                )
             )
             if after is not None:
                 document, position, chunk = after

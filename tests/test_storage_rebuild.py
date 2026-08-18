@@ -848,7 +848,11 @@ async def test_glossary_publication_failure_rolls_back_every_relational_live_row
         assert (await connection.execute(select(models.GlossaryAlias.key))).scalars().all() == []
         assert (await connection.execute(text("PRAGMA foreign_key_check"))).all() == []
         assert (
-            await connection.execute(select(models.IndexState.id).where(models.IndexState.id == 1))
+            await connection.execute(
+                select(models.IndexState.workspace_id).where(
+                    models.IndexState.workspace_id == "default"
+                )
+            )
         ).scalar_one_or_none() is None
     assert (await rebuilds.checkpoint(claimed.generation_id)).state is RebuildState.VALIDATING
 
@@ -1764,11 +1768,11 @@ async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempote
     assert record_selects == 2, "one manifest verification and one bounded planning cursor"
     sessions = session_factory(engine)
     async with sessions.begin() as session:
-        state = await session.get(models.IndexState, 1)
+        state = await session.get(models.IndexState, "default")
         if state is None:
             session.add(
                 models.IndexState(
-                    id=1,
+                    workspace_id="default",
                     vector_table="reembed-winner",
                     vector_inventory_digest="winner-inventory",
                 )
@@ -1821,7 +1825,7 @@ async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempote
             swap_started.set()
             await session.execute(
                 update(models.IndexState)
-                .where(models.IndexState.id == 1)
+                .where(models.IndexState.workspace_id == "default")
                 .values(
                     vector_table="later-reembed-winner",
                     vector_inventory_digest="later-winner-inventory",
@@ -2216,9 +2220,11 @@ async def test_rebuild_plan_reports_aggregate_chunk_budget_diagnostics(
     )
     sessions = session_factory(engine)
     async with sessions.begin() as session:
-        state = await session.get(models.IndexState, 1)
+        state = await session.get(models.IndexState, "default")
         if state is None:
-            session.add(models.IndexState(id=1, chunk_fingerprint=current.canonical()))
+            session.add(
+                models.IndexState(workspace_id="default", chunk_fingerprint=current.canonical())
+            )
         else:
             state.chunk_fingerprint = current.canonical()
 
@@ -2431,14 +2437,14 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
     await rebuilds.validate_generation(estimate.generation_id)
     # A #187 pointer swap after staging must win the CAS without publishing relational rows.
     async with sessions.begin() as session:
-        index_state = await session.get(models.IndexState, 1)
+        index_state = await session.get(models.IndexState, "default")
         index_state_was_missing = index_state is None
         expected_vector_table = None if index_state is None else index_state.vector_table
         expected_inventory = None if index_state is None else index_state.vector_inventory_digest
         if index_state is None:
             session.add(
                 models.IndexState(
-                    id=1,
+                    workspace_id="default",
                     vector_table="reembed-interleaving-winner",
                     vector_inventory_digest="interleaving-inventory",
                 )
@@ -2455,7 +2461,7 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         )
     assert caught.value.code is RebuildRefusalCode.PUBLICATION_CONFLICT
     async with sessions.begin() as session:
-        index_state = await session.get(models.IndexState, 1)
+        index_state = await session.get(models.IndexState, "default")
         assert index_state is not None
         if index_state_was_missing:
             await session.delete(index_state)
@@ -2535,7 +2541,9 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         ).scalar_one()
         inventory = (
             await connection.execute(
-                select(models.IndexState.vector_inventory_digest).where(models.IndexState.id == 1)
+                select(models.IndexState.vector_inventory_digest).where(
+                    models.IndexState.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert "tokenize='unicode61'" in fts_sql

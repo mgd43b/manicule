@@ -1649,8 +1649,8 @@ allocating or fully decompressing it, and returns only
 aggregate counts plus bounded manifest sequence numbers for missing inputs. A missing or corrupt
 blob is a typed refusal; it is never permission to contact the source.
 
-`index_state` and its named vector directory are installation-wide, so the generation binds all
-those manifests into one canonical workspace snapshot set. `derived_generation_snapshots` records
+`index_state` and its named vector directory are workspace-owned, so the generation binds that
+workspace's manifests into one canonical snapshot set. `derived_generation_snapshots` records
 their ordered run, connector/scope, membership and retained-item commitments. Planning from any
 included snapshot produces the same generation identity. Lease checks and the publication
 transaction repeat the complete set comparison; a connector promotion after planning fences the
@@ -1767,11 +1767,26 @@ manicule snapshot-delete RUN_ID               # dry-run, prints a token
 manicule snapshot-delete RUN_ID --confirm TOKEN
 ```
 
-`reset-index` remains a compatibility operation, but now observes the same derived-only
-boundary: it deletes chunks, FTS, glossary and vectors, marks retained document rows pending,
-and leaves acquisition manifests, original blob references and document-version history intact.
-It never resolves a connector. A promoted snapshot can therefore be verified and used by the
-offline generation rebuild immediately after the reset.
+`reset-index` is the complete workspace-derived reset. It removes chunks, FTS/glossary visibility,
+collection/tag memberships and workspace-owned vector storage; soft-deletes the live document
+projection; terminalizes and generation-fences unfinished acquisition work; and cancels and fences
+unfinished rebuild and re-embedding work;
+and clears the workspace fingerprint only after physical cleanup succeeds. Retained acquisition
+manifests, original blob references and document-version history remain GC roots. It never resolves
+a connector. A promoted snapshot can therefore be verified and used by the offline generation
+rebuild immediately after the reset.
+
+Physical cleanup is driven by workspace- and vector-binding-qualified tombstones written before
+external vector mutation. A failed cleanup returns failure and keeps that ledger plus the old
+identity for retry; it never returns a boolean success for a half-reset. The runtime closes its
+worker pool and vector handles before evicting every derived cache, so a different configured
+fingerprint can ingest in the same serving process. A cross-process workspace pin, durable lease
+generation fences and a monotonic workspace reset epoch prevent an old writer from landing rows
+after reset. Every pipeline checks the epoch before its first acquisition or document mutation;
+vector handles recheck it after acquiring their physical generation pin; and the relational
+fingerprint/stage/publication transactions take an epoch CAS while holding SQLite's writer lock.
+The same-process mutation guard spans the complete external-vector-to-SQLite publication gap.
+Repeating a completed reset is a zero-change success.
 
 Generation cleanup selects only `failed`, `canceled`, or superseded `published` generations.
 The newest published generation, every publication still named by a live document, and every
@@ -1918,14 +1933,14 @@ generation pin and only removes failed or superseded, non-live storage, so an in
 cannot lose its directory. `abandon` makes an unfinished run terminal without moving the live
 pointer.
 
-Snapshots, runs, generations and receipts are keyed by workspace as well as their opaque id, and
-every journal, lease, publication and cleanup lookup repeats that ownership predicate. The vector
-pointer is installation-wide, however, so its immutable snapshot and replacement generation cover
-all workspaces; otherwise publishing Alpha would make Beta's vectors disappear. The public plan
-and progress projection counts only the owning workspace, while private build accounting and
-capacity checks cover the full installation. Legacy state is backfilled only when its stored
-document payloads identify exactly one owning workspace (or an empty legacy database has exactly
-one workspace); ambiguous state refuses migration rather than guessing ownership.
+Snapshots, runs, generations, receipts, index identities and new vector directories are keyed by
+workspace as well as their opaque id, and every journal, lease, publication and cleanup lookup
+repeats that ownership predicate. Publishing or resetting Alpha therefore cannot move or remove
+Beta's pointer, metadata or vectors. Upgraded installations retain an explicit `legacy` binding to
+the old shared root until each workspace is rebuilt/reset; exact tombstones isolate deletions while
+it is shared, and the last consumer removes the root. Fresh workspaces never acquire that legacy
+binding. The FTS5 table and tokenizer remain installation-global, so publication refuses a
+tokenizer change while another workspace identity depends on the current lexical table.
 
 The serving scheduler runs one restart-recovery job for ownerless nonterminal runs in its active
 workspace. It records aggregate recovered/failure counts, while the durable run remains the

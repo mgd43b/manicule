@@ -328,6 +328,15 @@ def _lifecycle_outcome_report(outcome: LifecycleOutcome) -> r.LifecycleReport:
         released_bytes=outcome.released_bytes,
         snapshot_items=outcome.snapshot_items,
         source_contacted=outcome.source_contacted,
+        documents_retired=outcome.documents_retired,
+        chunks_removed=outcome.chunks_removed,
+        memberships_removed=outcome.memberships_removed,
+        vector_rows_removed=outcome.vector_rows_removed,
+        publications_removed=outcome.publications_removed,
+        generations_terminalized=outcome.generations_terminalized,
+        vector_store_removed=outcome.vector_store_removed,
+        fingerprints_cleared=outcome.fingerprints_cleared,
+        runtime_cache_invalidated=outcome.runtime_cache_invalidated,
         lifecycle=r.LifecycleProgress(
             phase=phase,
             outcome="complete",
@@ -2698,6 +2707,17 @@ class ApplicationService:
             store = await self._backend.documents()
             fingerprints = await store.index_fingerprints()
             documents = await store.count_documents()
+            ingestion = await self._backend.ingestion()
+            inspect_physical = getattr(ingestion, "physical_index_fingerprint", None)
+            physical_embed = (
+                await inspect_physical()
+                if fingerprints.is_empty and inspect_physical is not None
+                else None
+            )
+            if fingerprints.is_empty and physical_embed is None:
+                configured_embed = configured_chunk = ""
+            else:
+                configured_embed, configured_chunk = await ingestion.configured_index_fingerprints()
         except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
             return r.Check(
                 name="index",
@@ -2706,6 +2726,22 @@ class ApplicationService:
                 facts={"error_type": type(exc).__name__},
             )
         if fingerprints.is_empty:
+            if documents == 0 and physical_embed is not None and physical_embed != configured_embed:
+                return r.Check(
+                    name="index",
+                    state="degraded",
+                    detail=(
+                        "the empty workspace retains physical vector fingerprint metadata "
+                        "without a matching relational index identity"
+                    ),
+                    facts={
+                        "documents": 0,
+                        "vector_table": None,
+                        "stale_empty_identity": True,
+                        "physical_fingerprint_mismatch": True,
+                    },
+                    remedy="manicule reset-index --yes",
+                )
             return r.Check(
                 name="index",
                 state="ok" if documents == 0 else "degraded",
@@ -2718,6 +2754,31 @@ class ApplicationService:
                 # how it was reached, and a `remedy` naming a command with a `<path>` in it is
                 # neither runnable by a script nor certain to be the right advice.
                 facts={"documents": documents, "vector_table": None},
+            )
+        embed_mismatch = bool(
+            fingerprints.embed is not None
+            and configured_embed
+            and fingerprints.embed.canonical() != configured_embed
+        )
+        chunk_mismatch = bool(
+            fingerprints.chunk is not None
+            and configured_chunk
+            and fingerprints.chunk.canonical() != configured_chunk
+        )
+        if documents == 0 and (embed_mismatch or chunk_mismatch):
+            return r.Check(
+                name="index",
+                state="degraded",
+                detail=(
+                    "the empty workspace retains an obsolete derived fingerprint that would "
+                    "reject the configured first ingest"
+                ),
+                facts={
+                    "documents": 0,
+                    "vector_table": fingerprints.vector_table or None,
+                    "stale_empty_identity": True,
+                },
+                remedy="manicule reset-index --yes",
             )
         return r.Check(
             name="index",
@@ -3678,13 +3739,21 @@ class ApplicationService:
         ``--yes``. The MCP and HTTP forms expose only the aggregate dry run.
         """
         maintenance = await self._backend.maintenance()
-        documents, chunks, vectors = await maintenance.reset_index()
-        plan = await maintenance.plan_reset_derived()
+        outcome = await maintenance.reset_index()
         return r.ResetReport(
-            documents=documents,
-            chunks=chunks,
-            vectors_removed=vectors,
-            snapshots_retained=plan.snapshot_items,
+            documents=outcome.documents,
+            chunks=outcome.chunks,
+            vectors_removed=bool(
+                outcome.vector_rows or outcome.publications or outcome.vector_store_removed
+            ),
+            vector_rows_removed=outcome.vector_rows,
+            publications_removed=outcome.publications,
+            memberships_removed=outcome.memberships,
+            generations_terminalized=outcome.generations_terminalized,
+            vector_store_removed=outcome.vector_store_removed,
+            fingerprints_cleared=outcome.fingerprints_cleared,
+            runtime_cache_invalidated=outcome.runtime_cache_invalidated,
+            snapshots_retained=outcome.snapshots_retained,
         )
 
     async def lifecycle_reset_derived(self, *, dry_run: bool = False) -> r.LifecycleReport:

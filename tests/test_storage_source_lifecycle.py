@@ -129,6 +129,21 @@ async def test_derived_reset_preserves_snapshot_versions_and_blob_gc_roots(
             )
         )
         session.add(
+            models.Collection(
+                id="reset-collection",
+                workspace_id="default",
+                name="Reset collection",
+                description=None,
+                auto_rules={},
+            )
+        )
+        session.add(
+            models.CollectionDocument(
+                collection_id="reset-collection",
+                document_id=document.id,
+            )
+        )
+        session.add(
             models.DerivedGeneration(
                 id="published-before-reset",
                 workspace_id="default",
@@ -141,6 +156,20 @@ async def test_derived_reset_preserves_snapshot_versions_and_blob_gc_roots(
                 state=RebuildState.PUBLISHED,
                 vector_publication_id="published-before-reset",
                 published_at=NOW,
+            )
+        )
+        session.add(
+            models.AcquisitionRun(
+                id="unfinished-before-reset",
+                workspace_id="default",
+                connector_id="wiki",
+                connector_name="wiki",
+                source_scope="all",
+                scope_fingerprint="scope-unfinished",
+                state=AcquisitionRunState.INDEXING,
+                lease_owner="stale-worker",
+                lease_generation=3,
+                lease_expires_at=NOW + timedelta(minutes=5),
             )
         )
         session.add(
@@ -162,18 +191,37 @@ async def test_derived_reset_preserves_snapshot_versions_and_blob_gc_roots(
 
     assert plan.snapshot_items == 1
     assert outcome.removed_items == 1
-    retained = await store.get_document(document.id)
-    assert retained is not None
-    assert retained.original_ref == blob_ref
-    assert retained.status is DocumentStatus.PENDING
+    assert await store.get_document(document.id) is None, "reset documents are no longer live"
     assert await store.count_chunks() == 0
     async with sessions() as session:
+        retained = await session.get(models.Document, document.id)
+        assert retained is not None
+        assert retained.original_ref == blob_ref
+        assert retained.status is DocumentStatus.DELETED
+        assert retained.deleted_at is not None
         assert await session.get(models.DocumentVersion, "version-1") is not None
         assert await session.get(models.AcquisitionRun, "snapshot-reset") is not None
+        unfinished = await session.get(models.AcquisitionRun, "unfinished-before-reset")
+        assert unfinished is not None
+        assert unfinished.state is AcquisitionRunState.SETTLED
+        assert unfinished.superseded_at is not None
+        assert unfinished.lease_owner is None
+        assert unfinished.lease_generation == 4
         retired = await session.get(models.DerivedGeneration, "published-before-reset")
         assert retired is not None
         assert retired.state is RebuildState.CANCELED
-        assert await session.get(models.DerivedGeneration, "retry-after-reset") is not None
+        interrupted = await session.get(models.DerivedGeneration, "retry-after-reset")
+        assert interrupted is not None
+        assert interrupted.state is RebuildState.CANCELED
+        assert interrupted.lease_generation == 1
+        assert (
+            await session.get(
+                models.CollectionDocument,
+                {"collection_id": "reset-collection", "document_id": document.id},
+            )
+            is None
+        )
+        assert await session.get(models.Collection, "reset-collection") is not None
     assert await BlobStore(engine, data_dir).collect_garbage() == []
 
 
