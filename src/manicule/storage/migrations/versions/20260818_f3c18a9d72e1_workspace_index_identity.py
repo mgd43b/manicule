@@ -28,19 +28,33 @@ def _drop_revision_triggers() -> None:
 
 def _create_workspace_revision_triggers() -> None:
     for event, reference in (("INSERT", "new"), ("UPDATE", "new"), ("DELETE", "old")):
+        document_revision_scope = (
+            "workspace_id IN (old.workspace_id, new.workspace_id)"
+            if event == "UPDATE"
+            else f"workspace_id = {reference}.workspace_id"
+        )
+        chunk_revision_scope = (
+            "workspace_id IN (SELECT workspace_id FROM documents "
+            "WHERE id IN (old.document_id, new.document_id))"
+            if event == "UPDATE"
+            else "workspace_id = (SELECT workspace_id FROM documents "  # noqa: S608
+            f"WHERE id = {reference}.document_id)"
+        )
         op.execute(
             f"CREATE TRIGGER documents_reembed_revision_{event.lower()} "  # noqa: S608
             f"AFTER {event} ON documents BEGIN "
-            "UPDATE corpus_revision SET revision = revision + 1 WHERE id = 1; "
+            "UPDATE corpus_revision SET revision = revision + 1 WHERE "
+            f"{document_revision_scope}; "
             f"UPDATE index_state SET vector_inventory_digest = NULL "
-            f"WHERE workspace_id = {reference}.workspace_id; END"
+            f"WHERE {document_revision_scope}; END"
         )
         op.execute(
             f"CREATE TRIGGER chunks_reembed_revision_{event.lower()} "  # noqa: S608
             f"AFTER {event} ON chunks BEGIN "
-            "UPDATE corpus_revision SET revision = revision + 1 WHERE id = 1; "
-            f"UPDATE index_state SET vector_inventory_digest = NULL WHERE workspace_id = "
-            f"(SELECT workspace_id FROM documents WHERE id = {reference}.document_id); END"
+            "UPDATE corpus_revision SET revision = revision + 1 WHERE "
+            f"{chunk_revision_scope}; "
+            "UPDATE index_state SET vector_inventory_digest = NULL WHERE "
+            f"{chunk_revision_scope}; END"
         )
 
 
@@ -58,6 +72,36 @@ def _create_legacy_revision_triggers() -> None:
 def upgrade() -> None:
     """Copy the historical singleton identity to each workspace without moving vectors."""
     _drop_revision_triggers()
+    op.add_column(
+        "workspaces",
+        sa.Column("derived_reset_epoch", sa.Integer(), server_default="0", nullable=False),
+    )
+    op.create_table(
+        "workspace_corpus_revision",
+        sa.Column("workspace_id", sa.Text(), nullable=False),
+        sa.Column("revision", sa.Integer(), nullable=False),
+        sa.CheckConstraint(
+            "revision >= 0", name=op.f("ck_corpus_revision_revision_is_not_negative")
+        ),
+        sa.ForeignKeyConstraint(
+            ["workspace_id"],
+            ["workspaces.id"],
+            name=op.f("fk_corpus_revision_workspace_id_workspaces"),
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("workspace_id", name=op.f("pk_corpus_revision")),
+    )
+    op.execute(
+        "INSERT INTO workspace_corpus_revision (workspace_id, revision) "
+        "SELECT id, COALESCE((SELECT revision FROM corpus_revision WHERE id = 1), 0) "
+        "FROM workspaces"
+    )
+    op.drop_table("corpus_revision")
+    op.rename_table("workspace_corpus_revision", "corpus_revision")
+    op.execute(
+        "CREATE TRIGGER workspaces_corpus_revision_insert AFTER INSERT ON workspaces BEGIN "
+        "INSERT OR IGNORE INTO corpus_revision (workspace_id, revision) VALUES (new.id, 0); END"
+    )
     op.create_table(
         "workspace_index_state",
         sa.Column("workspace_id", sa.Text(), nullable=False),
@@ -182,7 +226,25 @@ def downgrade() -> None:
             "refusing to downgrade workspace index identity: workspaces have independent "
             "derived fingerprints or vector namespaces; reset them before retrying"
         )
+    op.drop_column("workspaces", "derived_reset_epoch")
     _drop_revision_triggers()
+    op.execute("DROP TRIGGER IF EXISTS workspaces_corpus_revision_insert")
+    op.create_table(
+        "legacy_corpus_revision",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("revision", sa.Integer(), nullable=False),
+        sa.CheckConstraint("id = 1", name=op.f("ck_corpus_revision_is_a_singleton")),
+        sa.CheckConstraint(
+            "revision >= 0", name=op.f("ck_corpus_revision_revision_is_not_negative")
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_corpus_revision")),
+    )
+    op.execute(
+        "INSERT INTO legacy_corpus_revision (id, revision) "
+        "SELECT 1, COALESCE(max(revision), 0) FROM corpus_revision"
+    )
+    op.drop_table("corpus_revision")
+    op.rename_table("legacy_corpus_revision", "corpus_revision")
     op.execute("DROP TRIGGER IF EXISTS documents_vector_tombstones_bd")
     op.execute("DROP TRIGGER IF EXISTS chunks_ad")
     op.drop_index("ix_vector_tombstones_workspace_deleted", table_name="vector_tombstones")

@@ -1046,6 +1046,9 @@ class FakeIngestion:
     async def configured_index_fingerprints(self) -> tuple[str, str]:
         return "", ""
 
+    async def physical_index_fingerprint(self) -> str | None:
+        return None
+
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
         self.glossary_sweeps.append((batch, dry_run))
         if dry_run:

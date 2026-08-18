@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -238,7 +239,14 @@ async def test_workspace_index_migration_backfills_legacy_identity_and_owned_tom
     try:
         await upgrade(engine, revision="e6a2c91f04bd")
         store = SqliteDocStore(engine)
-        await store.ensure_workspace()
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces(id, name, mode, settings, created_at) "
+                    "VALUES ('default', 'default', 'personal', '{}', :created_at)"
+                ),
+                {"created_at": datetime.now(UTC).isoformat()},
+            )
         document = make_document()
         stored_chunk = make_chunk(document, 0, "migration-bound vector")
         await store.upsert_document(document)

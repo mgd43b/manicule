@@ -94,7 +94,13 @@ class IngestStore(Protocol):
         """
         ...
 
-    async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
+    async def stage_vectors(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        expected_reset_epoch: int | None = None,
+    ) -> None:
         """Record physical vector ids before they are written, for crash cleanup."""
         ...
 
@@ -104,6 +110,7 @@ class IngestStore(Protocol):
         *,
         expected: DocumentRevision | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         """Atomically publish a failed row and its source-retention state."""
         ...
@@ -120,6 +127,7 @@ class IngestStore(Protocol):
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         """Atomically publish one document and all relational derived state."""
         ...
@@ -318,7 +326,9 @@ class IngestStore(Protocol):
 
     async def index_fingerprints(self) -> IndexFingerprints: ...
 
-    async def record_index_fingerprints(self, state: IndexFingerprints) -> None: ...
+    async def record_index_fingerprints(
+        self, state: IndexFingerprints, *, expected_reset_epoch: int | None = None
+    ) -> None: ...
 
     # --- the vector sweep --------------------------------------------------------------
 
@@ -636,6 +646,7 @@ class FencedIngestStore(Protocol):
         *,
         expected: DocumentRevision | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit: ...
 
     async def fenced_publish_document(
@@ -651,6 +662,7 @@ class FencedIngestStore(Protocol):
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit: ...
 
     async def fenced_publish_record(
@@ -662,7 +674,12 @@ class FencedIngestStore(Protocol):
     ) -> Commit: ...
 
     async def fenced_stage_vectors(
-        self, fence: AcquisitionFence, publication_id: str, chunks: Sequence[Chunk]
+        self,
+        fence: AcquisitionFence,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        expected_reset_epoch: int | None = None,
     ) -> None: ...
 
 

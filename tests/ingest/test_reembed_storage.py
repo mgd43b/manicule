@@ -184,10 +184,10 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
     beta_commitment = await plan_reembed_commitment(beta_corpus, target)
     assert alpha_commitment.plan.documents == alpha_commitment.plan.chunks == 1
     assert beta_commitment.plan.documents == beta_commitment.plan.chunks == 1
-    assert alpha_commitment.execution_plan.documents == 2
-    assert alpha_commitment.execution_plan.chunks == 2
-    assert beta_commitment.execution_plan.documents == 2
-    assert beta_commitment.execution_plan.chunks == 2
+    assert alpha_commitment.execution_plan.documents == 1
+    assert alpha_commitment.execution_plan.chunks == 1
+    assert beta_commitment.execution_plan.documents == 1
+    assert beta_commitment.execution_plan.chunks == 1
     assert alpha_commitment.snapshot.workspace_id == "alpha"
     assert beta_commitment.snapshot.workspace_id == "beta"
 
@@ -214,18 +214,77 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
         counts = {str(row[0]): int(row[1]) for row in rows}
     assert counts == {"alpha": 1, "beta": 2}
 
-    shadows = LanceShadowGenerations(data_dir / VECTORS_DIRNAME, alpha_store)
-    published = await resume_reembed(
+    beta_shadows = LanceShadowGenerations(data_dir / VECTORS_DIRNAME, beta_store)
+    beta_published = await resume_reembed(
+        beta_run.id,
+        owner_token="beta-owner",  # noqa: S106
+        corpus=beta_corpus,
+        embedder=HashEmbedder(dimension=4),
+        journal=beta_store,
+        shadow=beta_shadows,
+        publisher=beta_store,
+    )
+    assert beta_published.state is ReembedState.PUBLISHED
+    beta_document = await beta.get_document(stored_chunks[1].document_id)
+    assert beta_document is not None
+    await beta.upsert_document(beta_document.model_copy(update={"title": "beta changed"}))
+    async with engine.connect() as connection:
+        revision_rows = (
+            await connection.execute(
+                select(
+                    models.CorpusRevision.workspace_id,
+                    models.CorpusRevision.revision,
+                )
+            )
+        ).all()
+        revisions = {str(row.workspace_id): int(row.revision) for row in revision_rows}
+    assert str(revisions["alpha"]) == alpha_commitment.snapshot.revision
+    assert str(revisions["beta"]) != beta_commitment.snapshot.revision
+
+    alpha_shadows = LanceShadowGenerations(data_dir / VECTORS_DIRNAME, alpha_store)
+    alpha_published = await resume_reembed(
         alpha_run.id,
         owner_token="alpha-owner",  # noqa: S106
         corpus=alpha_corpus,
         embedder=HashEmbedder(dimension=4),
         journal=alpha_store,
-        shadow=shadows,
+        shadow=alpha_shadows,
         publisher=alpha_store,
     )
-    assert published.state is ReembedState.PUBLISHED
-    assert (await beta_store.get(beta_run.id)).state is ReembedState.PLANNED  # type: ignore[union-attr]
+    assert alpha_published.state is ReembedState.PUBLISHED
+    assert (await beta_store.get(beta_run.id)).state is ReembedState.PUBLISHED  # type: ignore[union-attr]
+    async with engine.connect() as connection:
+        beta_shadow_state = (
+            await connection.execute(
+                select(models.ReembedShadowGeneration.state).where(
+                    models.ReembedShadowGeneration.workspace_id == "beta",
+                    models.ReembedShadowGeneration.run_id == beta_run.id,
+                )
+            )
+        ).scalar_one()
+    assert beta_shadow_state == "published"
+
+    stale_alpha = await start_reembed(
+        "alpha-mutated-after-snapshot",
+        owner_token="alpha-stale-owner",  # noqa: S106
+        corpus=alpha_corpus,
+        target=target,
+        journal=alpha_store,
+    )
+    alpha_document = await alpha.get_document(stored_chunks[0].document_id)
+    assert alpha_document is not None
+    await alpha.upsert_document(alpha_document.model_copy(update={"title": "alpha changed"}))
+    stale_result = await resume_reembed(
+        stale_alpha.id,
+        owner_token="alpha-stale-owner",  # noqa: S106
+        corpus=alpha_corpus,
+        embedder=HashEmbedder(dimension=4),
+        journal=alpha_store,
+        shadow=alpha_shadows,
+        publisher=alpha_store,
+    )
+    assert stale_result.state is ReembedState.SUPERSEDED
+
     live = PublishedLanceVectorStore(
         data_dir / VECTORS_DIRNAME,
         engine,
@@ -233,7 +292,10 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
         identity_namespace="legacy",
     )
     await live.ensure_ready(HashEmbedder(dimension=4).fingerprint)
-    assert await live.count() == 2
+    assert await live.count() == 1
+    assert [row.chunk.document_id for row in await live.search([1.0, 0.0, 0.0, 0.0], 10)] == [
+        stored_chunks[0].document_id
+    ]
     assert await alpha.get_document(stored_chunks[0].document_id) is not None
     assert await beta.get_document(stored_chunks[1].document_id) is not None
     await live.teardown()
@@ -470,7 +532,9 @@ async def test_on_disk_shadow_validates_publishes_and_runtime_follows_pointer(
     async with engine.connect() as connection:
         revision = (
             await connection.execute(
-                select(models.CorpusRevision.revision).where(models.CorpusRevision.id == 1)
+                select(models.CorpusRevision.revision).where(
+                    models.CorpusRevision.workspace_id == "default"
+                )
             )
         ).scalar_one()
     assert str(revision) == run.commitment.snapshot.revision
@@ -728,6 +792,46 @@ async def test_explicit_abandonment_makes_an_unfinished_generation_cleanup_eligi
 
     assert abandoned.state is ReembedState.FAILED
     assert abandoned.failure == "abandoned by operator"
+    assert await shadows.cleanup_terminal(run.id)
+    assert not shadows.directory(generation.id).exists()
+
+
+async def test_shared_legacy_generation_cleanup_refuses_a_foreign_live_pointer(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    clock = Clock()
+    authority, shadows, run, lease, generation, source, vector, _ = await seeded_run(
+        engine, store, data_dir, clock, run_id="shared-legacy-cleanup"
+    )
+    await shadows.upsert(generation, [source], [vector], lease=lease)
+    abandoned = await authority.abandon(run.id, lease=lease)
+    assert abandoned.state is ReembedState.FAILED
+
+    beta = SqliteDocStore(engine, workspace_id="beta")
+    await beta.ensure_workspace()
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(models.IndexState).values(
+                workspace_id="beta",
+                vector_namespace="legacy",
+                vector_table=generation.id,
+                embed_fingerprint=HashEmbedder(dimension=4).fingerprint.model_dump_json(),
+                vector_inventory_digest=generation.inventory_digest,
+                created_at=utcnow(),
+                updated_at=utcnow(),
+            )
+        )
+
+    with pytest.raises(ReembedError, match=r"foreign workspace.*shared legacy generation"):
+        await shadows.cleanup_terminal(run.id)
+    assert shadows.directory(generation.id).exists()
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(models.IndexState)
+            .where(models.IndexState.workspace_id == "beta")
+            .values(vector_table=None, vector_inventory_digest=None)
+        )
     assert await shadows.cleanup_terminal(run.id)
     assert not shadows.directory(generation.id).exists()
 

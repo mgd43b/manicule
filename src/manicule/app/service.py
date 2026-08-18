@@ -2698,9 +2698,14 @@ class ApplicationService:
             store = await self._backend.documents()
             fingerprints = await store.index_fingerprints()
             documents = await store.count_documents()
-            configured_embed, configured_chunk = await (
-                await self._backend.ingestion()
-            ).configured_index_fingerprints()
+            ingestion = await self._backend.ingestion()
+            configured_embed, configured_chunk = await ingestion.configured_index_fingerprints()
+            inspect_physical = getattr(ingestion, "physical_index_fingerprint", None)
+            physical_embed = (
+                await inspect_physical()
+                if fingerprints.is_empty and inspect_physical is not None
+                else None
+            )
         except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
             return r.Check(
                 name="index",
@@ -2709,6 +2714,22 @@ class ApplicationService:
                 facts={"error_type": type(exc).__name__},
             )
         if fingerprints.is_empty:
+            if documents == 0 and physical_embed is not None and physical_embed != configured_embed:
+                return r.Check(
+                    name="index",
+                    state="degraded",
+                    detail=(
+                        "the empty workspace retains physical vector fingerprint metadata "
+                        "without a matching relational index identity"
+                    ),
+                    facts={
+                        "documents": 0,
+                        "vector_table": None,
+                        "stale_empty_identity": True,
+                        "physical_fingerprint_mismatch": True,
+                    },
+                    remedy="manicule reset-index --yes",
+                )
             return r.Check(
                 name="index",
                 state="ok" if documents == 0 else "degraded",
@@ -3714,7 +3735,7 @@ class ApplicationService:
             vector_rows_removed=outcome.vector_rows,
             publications_removed=outcome.publications,
             memberships_removed=outcome.memberships,
-            generations_canceled=outcome.generations,
+            generations_terminalized=outcome.generations_terminalized,
             vector_store_removed=outcome.vector_store_removed,
             fingerprints_cleared=outcome.fingerprints_cleared,
             runtime_cache_invalidated=outcome.runtime_cache_invalidated,

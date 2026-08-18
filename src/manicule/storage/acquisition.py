@@ -450,6 +450,11 @@ async def _rebuild_blob_backlog(session: AsyncSession) -> None:
             .group_by(models.AcquisitionRecord.blob_ref, models.Blob.stored_bytes),
         )
     )
+
+
+async def rebuild_acquisition_blob_backlog(session: AsyncSession) -> None:
+    """Reconcile the global acquired-blob capacity ledger after a bulk run transition."""
+    await _rebuild_blob_backlog(session)
     total = (
         await session.execute(
             select(func.coalesce(func.sum(models.AcquisitionBlobBacklog.stored_bytes), 0))

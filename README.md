@@ -149,7 +149,7 @@ is `manicule reset-index --yes`. It removes only that workspace's derived chunks
 FTS/vector visibility, publication checkpoints and cached runtime handles. Retained source
 snapshots, document-version history, connector configuration, credentials and other workspaces
 survive. The command is idempotent and its JSON result separates relational rows, vector rows,
-publications, canceled generations, retained snapshots, fingerprint cleanup and runtime-cache
+publications, terminalized generations, retained snapshots, fingerprint cleanup and runtime-cache
 invalidation. A non-empty fingerprint mismatch remains a refusal: use the rebuild or re-embed
 path instead of discarding a searchable corpus.
 

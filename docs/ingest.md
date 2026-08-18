@@ -1781,8 +1781,12 @@ external vector mutation. A failed cleanup returns failure and keeps that ledger
 identity for retry; it never returns a boolean success for a half-reset. The runtime closes its
 worker pool and vector handles before evicting every derived cache, so a different configured
 fingerprint can ingest in the same serving process. A cross-process workspace pin, durable lease
-generation fences and a post-pin SQLite identity check prevent an old writer from landing rows
-after reset. Repeating a completed reset is a zero-change success.
+generation fences and a monotonic workspace reset epoch prevent an old writer from landing rows
+after reset. Every pipeline checks the epoch before its first acquisition or document mutation;
+vector handles recheck it after acquiring their physical generation pin; and the relational
+fingerprint/stage/publication transactions take an epoch CAS while holding SQLite's writer lock.
+The same-process mutation guard spans the complete external-vector-to-SQLite publication gap.
+Repeating a completed reset is a zero-change success.
 
 Generation cleanup selects only `failed`, `canceled`, or superseded `published` generations.
 The newest published generation, every publication still named by a live document, and every

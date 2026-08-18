@@ -3148,6 +3148,95 @@ async def test_shared_blob_is_charged_once_and_remains_pinned_until_every_record
     )
 
 
+async def test_reset_releases_unfinished_acquisition_blob_capacity(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    limited = SqliteDocStore(engine, max_acquired_blob_backlog_bytes=10)
+    await limited.ensure_workspace()
+    blobs = BlobStore(engine, data_dir, min_disk_headroom_bytes=1)
+    before = await blobs.put(b"old-bytes!", "application/octet-stream")
+    after = await blobs.put(b"new-bytes!", "application/octet-stream")
+    assert isinstance(before, StoredBlob)
+    assert isinstance(after, StoredBlob)
+
+    stale = await _claimed_run(limited, "stale-before-reset")
+    await limited.append_acquisition_record(
+        stale.id,
+        0,
+        _source("old"),
+        lease_owner="worker",
+        lease_generation=stale.lease_generation,
+        now=_NOW,
+    )
+    await limited.transition_acquisition_record(
+        stale.id,
+        "old",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="worker",
+        lease_generation=stale.lease_generation,
+        now=_NOW,
+    )
+    await limited.transition_acquisition_record(
+        stale.id,
+        "old",
+        AcquisitionRecordState.ACQUIRING,
+        AcquisitionRecordState.ACQUIRED,
+        lease_owner="worker",
+        lease_generation=stale.lease_generation,
+        now=_NOW,
+        blob_ref=before.hash,
+        acquired_source=_acquired(b"old-bytes!", "old"),
+    )
+
+    await limited.reset_derived()
+
+    settled = await limited.get_acquisition_run(stale.id)
+    assert settled is not None
+    assert settled.state is AcquisitionRunState.SETTLED
+    assert settled.acquired_blob_bytes == 0
+    async with limited.sessions() as session:
+        assert await session.scalar(text("SELECT count(*) FROM acquisition_blob_backlog")) == 0
+        assert (
+            await session.scalar(
+                text("SELECT acquired_blob_bytes FROM acquisition_backlog_capacity WHERE id = 1")
+            )
+            == 0
+        )
+
+    successor = await _claimed_run(limited, "admitted-after-reset")
+    await limited.append_acquisition_record(
+        successor.id,
+        0,
+        _source("new"),
+        lease_owner="worker",
+        lease_generation=successor.lease_generation,
+        now=_NOW,
+    )
+    await limited.transition_acquisition_record(
+        successor.id,
+        "new",
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.ACQUIRING,
+        lease_owner="worker",
+        lease_generation=successor.lease_generation,
+        now=_NOW,
+    )
+    admitted = await limited.transition_acquisition_record(
+        successor.id,
+        "new",
+        AcquisitionRecordState.ACQUIRING,
+        AcquisitionRecordState.ACQUIRED,
+        lease_owner="worker",
+        lease_generation=successor.lease_generation,
+        now=_NOW,
+        blob_ref=after.hash,
+        acquired_source=_acquired(b"new-bytes!", "new"),
+    )
+    assert admitted.state is AcquisitionRecordState.ACQUIRED
+
+
 async def test_lowered_backlog_limit_never_blocks_capacity_releasing_transitions(
     engine: AsyncEngine,
     data_dir: Path,

@@ -59,7 +59,6 @@ _INSPECTION = TypeAdapter(ShadowInspection)
 _SNAPSHOT_DOCUMENT = TypeAdapter(SnapshotDocument)
 _SNAPSHOT_CHUNK = TypeAdapter(SnapshotChunk)
 _LIVE = TypeAdapter(LivePublication)
-_CORPUS_REVISION_ID: Final = 1
 GENERATIONS_DIRNAME: Final = "generations"
 SNAPSHOT_PAGE: Final = 256
 
@@ -112,7 +111,7 @@ class SqliteReembedCorpus:
                 (
                     await connection.execute(
                         select(models.CorpusRevision.revision).where(
-                            models.CorpusRevision.id == _CORPUS_REVISION_ID
+                            models.CorpusRevision.workspace_id == self.workspace_id
                         )
                     )
                 ).scalar_one()
@@ -275,10 +274,10 @@ class SqliteReembedCorpus:
         )
         chunk_digest = SnapshotChunkDigester()
         while True:
-            # The live vector pointer is installation-wide, so its replacement must cover the
-            # full installation too. ``workspace_id`` owns/access-controls the private snapshot;
-            # it is not a filter on the physical generation being atomically replaced.
-            statement = select(models.Document).where(models.Document.deleted_at.is_(None))
+            statement = select(models.Document).where(
+                models.Document.workspace_id == self.workspace_id,
+                models.Document.deleted_at.is_(None),
+            )
             if document_after is not None:
                 statement = statement.where(models.Document.id > document_after)
             page = (
@@ -575,15 +574,33 @@ class SqliteReembedStore:
             if run.state not in {ReembedState.FAILED, ReembedState.SUPERSEDED}:
                 raise ReembedError("only failed or superseded shadow generations may be cleaned")
             generation_id = run.shadow_generation_id or _generation_id(self.workspace_id, run_id)
-            live = (
+            identity = (
                 await connection.execute(
-                    select(models.IndexState.vector_table).where(
-                        models.IndexState.workspace_id == self.workspace_id
-                    )
+                    select(
+                        models.IndexState.vector_namespace,
+                        models.IndexState.vector_table,
+                    ).where(models.IndexState.workspace_id == self.workspace_id)
                 )
-            ).scalar_one_or_none()
+            ).one_or_none()
+            live = None if identity is None else identity.vector_table
             if live == generation_id:
                 raise ReembedError("the live shadow generation cannot be cleaned")
+            if identity is not None and identity.vector_namespace == "legacy":
+                foreign_live = (
+                    await connection.execute(
+                        select(models.IndexState.workspace_id)
+                        .where(
+                            models.IndexState.workspace_id != self.workspace_id,
+                            models.IndexState.vector_namespace == "legacy",
+                            models.IndexState.vector_table == generation_id,
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if foreign_live is not None:
+                    raise ReembedError(
+                        "a foreign workspace still publishes this shared legacy generation"
+                    )
             yield connection, generation_id
 
     async def acquire(self, run_id: str, owner_token: str, *, ttl_seconds: float) -> ReembedLease:
@@ -726,7 +743,7 @@ class SqliteReembedStore:
                 (
                     await connection.execute(
                         select(models.CorpusRevision.revision).where(
-                            models.CorpusRevision.id == _CORPUS_REVISION_ID
+                            models.CorpusRevision.workspace_id == self.workspace_id
                         )
                     )
                 ).scalar_one()
@@ -898,14 +915,12 @@ class SqliteReembedStore:
                     & (models.ReembedShadowGeneration.run_id == models.ReembedRunRecord.id),
                 )
                 .where(
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     or_(
                         models.ReembedRunRecord.state == ReembedState.PUBLISHED.value,
                         models.ReembedShadowGeneration.state == "published",
                     ),
-                    or_(
-                        models.ReembedRunRecord.workspace_id != self.workspace_id,
-                        models.ReembedRunRecord.id != current_run_id,
-                    ),
+                    models.ReembedRunRecord.id != current_run_id,
                 )
             )
         ).all()
@@ -917,7 +932,7 @@ class SqliteReembedStore:
             await connection.execute(
                 update(models.ReembedRunRecord)
                 .where(
-                    models.ReembedRunRecord.workspace_id == row.workspace_id,
+                    models.ReembedRunRecord.workspace_id == self.workspace_id,
                     models.ReembedRunRecord.id == row.id,
                     models.ReembedRunRecord.revision == row.revision,
                 )
@@ -931,7 +946,7 @@ class SqliteReembedStore:
             await connection.execute(
                 update(models.ReembedShadowGeneration)
                 .where(
-                    models.ReembedShadowGeneration.workspace_id == row.workspace_id,
+                    models.ReembedShadowGeneration.workspace_id == self.workspace_id,
                     models.ReembedShadowGeneration.run_id == row.id,
                 )
                 .values(state="superseded")

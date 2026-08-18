@@ -53,6 +53,7 @@ async def check_before_run(
     chunk: ChunkFingerprint,
     store: IngestStore,
     vectors: VectorStore | None = None,
+    expected_reset_epoch: int | None = None,
 ) -> IndexFingerprints:
     """Refuse to start unless this configuration can write to this index.
 
@@ -92,7 +93,12 @@ async def check_before_run(
         embed=embed, chunk=chunk, vector_table=_vector_table(embed, vectors)
     )
     if stored != committed:
-        await store.record_index_fingerprints(committed)
+        if expected_reset_epoch is None:
+            await store.record_index_fingerprints(committed)
+        else:
+            await store.record_index_fingerprints(
+                committed, expected_reset_epoch=expected_reset_epoch
+            )
     return committed
 
 

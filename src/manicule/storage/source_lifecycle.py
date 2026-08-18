@@ -56,7 +56,7 @@ class ResetPreparation:
     documents: int
     chunks: int
     memberships: int
-    generations: int
+    generations_terminalized: int
     snapshots: int
     vector_namespace: str
     vector_table: str | None
@@ -183,7 +183,21 @@ class SourceLifecycleMixin(WorkspaceScoped):
 
     async def prepare_reset_derived(self) -> ResetPreparation:
         """Retire all workspace derived visibility and fence every resumable generation."""
+        from manicule.storage.acquisition import (  # noqa: PLC0415
+            rebuild_acquisition_blob_backlog,
+        )
+
         async with self._sessions.begin() as session:
+            epoch_result = cast(
+                "CursorResult[object]",
+                await session.execute(
+                    update(models.Workspace)
+                    .where(models.Workspace.id == self._workspace_id)
+                    .values(derived_reset_epoch=models.Workspace.derived_reset_epoch + 1)
+                ),
+            )
+            if not epoch_result.rowcount:  # pragma: no cover - stores ensure their workspace
+                raise RuntimeError("reset workspace does not exist")
             document_ids = select(models.Document.id).where(
                 models.Document.workspace_id == self._workspace_id
             )
@@ -208,6 +222,7 @@ class SourceLifecycleMixin(WorkspaceScoped):
                     )
                     .values(
                         state=AcquisitionRunState.SETTLED,
+                        acquired_blob_bytes=0,
                         superseded_at=retired_at,
                         lease_owner=None,
                         lease_generation=models.AcquisitionRun.lease_generation + 1,
@@ -216,6 +231,7 @@ class SourceLifecycleMixin(WorkspaceScoped):
                     )
                 ),
             )
+            await rebuild_acquisition_blob_backlog(session)
             await session.execute(delete(models.Chunk).where(self._workspace_chunk()))
             await session.execute(
                 delete(models.CollectionDocument).where(
@@ -341,7 +357,7 @@ class SourceLifecycleMixin(WorkspaceScoped):
             documents=documents,
             chunks=chunks,
             memberships=memberships,
-            generations=int(acquisition_result.rowcount or 0)
+            generations_terminalized=int(acquisition_result.rowcount or 0)
             + len(generations)
             + len(reembed_runs),
             snapshots=await self._snapshot_item_count(),

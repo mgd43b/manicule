@@ -2797,9 +2797,19 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
 
         @override
         async def fenced_stage_vectors(
-            self, fence: AcquisitionFence, publication_id: str, chunks: Sequence[Chunk]
+            self,
+            fence: AcquisitionFence,
+            publication_id: str,
+            chunks: Sequence[Chunk],
+            *,
+            expected_reset_epoch: int | None = None,
         ) -> None:
-            await super().fenced_stage_vectors(fence, publication_id, chunks)
+            await super().fenced_stage_vectors(
+                fence,
+                publication_id,
+                chunks,
+                expected_reset_epoch=expected_reset_epoch,
+            )
             self.staged.set()
             await self.release_stage.wait()
 

@@ -249,6 +249,10 @@ class Ingesting(Protocol):
         """Canonical configured embed/chunk identities, resolved from metadata without models."""
         ...
 
+    async def physical_index_fingerprint(self) -> str | None:
+        """Existing vector metadata identity, read without loading a model or creating a table."""
+        ...
+
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
         """Recompute the glossary of every document the installed detector did not produce.
 
@@ -288,7 +292,7 @@ class ResetOutcome:
     memberships: int = 0
     vector_rows: int = 0
     publications: int = 0
-    generations: int = 0
+    generations_terminalized: int = 0
     snapshots_retained: int = 0
     vector_store_removed: bool = False
     fingerprints_cleared: bool = False

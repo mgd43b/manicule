@@ -20,6 +20,8 @@ import os
 import secrets
 import shutil
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -40,7 +42,7 @@ from manicule.ingest.recovery import InstanceLock
 from manicule.plugins.manifest import ComponentKind
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -79,6 +81,10 @@ ARCHIVE_MANIFEST = "manicule-export.json"
 
 ARCHIVE_VERSION = 1
 """Bumped when the archive layout changes in a way an older import cannot read."""
+
+_DERIVED_MUTATION_GUARDS: ContextVar[frozenset[int]] = ContextVar(
+    "manicule_derived_mutation_guards", default=frozenset()
+)
 
 
 async def _recover_reembed_runs(
@@ -310,6 +316,21 @@ class Runtime:
         """Process-local half of the filesystem-pinned derived mutation barrier."""
         return self._derived_mutation_lock
 
+    @asynccontextmanager
+    async def derived_mutation_guard(self) -> AsyncGenerator[None]:
+        """Serialize a whole derived publication lifecycle against reset, reentrantly."""
+        key = id(self._derived_mutation_lock)
+        held = _DERIVED_MUTATION_GUARDS.get()
+        if key in held:
+            yield
+            return
+        async with self._derived_mutation_lock:
+            token = _DERIVED_MUTATION_GUARDS.set(held | {key})
+            try:
+                yield
+            finally:
+                _DERIVED_MUTATION_GUARDS.reset(token)
+
     @property
     def discovery(self) -> Discovery | None:
         return self._container.discovery
@@ -353,6 +374,23 @@ class Runtime:
             ).scalar_one_or_none()
         return root if namespace == "legacy" else workspace_vector_directory(root, self.workspace)
 
+    async def derived_reset_epoch(self) -> int:
+        """Return the durable workspace fence captured by newly assembled derived writers."""
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        await self.documents()
+        async with self.require_engine().connect() as connection:
+            epoch = (
+                await connection.execute(
+                    select(models.Workspace.derived_reset_epoch).where(
+                        models.Workspace.id == self.workspace
+                    )
+                )
+            ).scalar_one()
+        return int(epoch)
+
     async def invalidate_derived_runtime(self) -> None:
         """Close and evict every cached object that can retain an old index identity."""
         pipeline = self._slots.get("pipeline")
@@ -382,7 +420,8 @@ class Runtime:
         It is also where a directory holding another model's vectors is refused, before a
         single vector is written into a space it does not belong to.
         """
-        return await self._once("prepared_vectors", self._build_prepared_vectors)
+        async with self.derived_mutation_guard():
+            return await self._once("prepared_vectors", self._build_prepared_vectors)
 
     async def retriever(self) -> Retrieving:
         """The whole of retrieval. Builds the embedder, so it is not built for a listing."""
@@ -574,13 +613,21 @@ class Runtime:
             from manicule.storage import models  # noqa: PLC0415
 
             async with self.require_engine().connect() as connection:
-                identity_namespace = (
+                row = (
                     await connection.execute(
-                        select(models.IndexState.vector_namespace).where(
-                            models.IndexState.workspace_id == self.workspace
+                        select(
+                            models.IndexState.vector_namespace,
+                            models.Workspace.derived_reset_epoch,
                         )
+                        .select_from(models.Workspace)
+                        .outerjoin(
+                            models.IndexState,
+                            models.IndexState.workspace_id == models.Workspace.id,
+                        )
+                        .where(models.Workspace.id == self.workspace)
                     )
-                ).scalar_one_or_none()
+                ).one()
+            identity_namespace = row.vector_namespace
             return PublishedLanceVectorStore(
                 await self.vector_directory(),
                 self.require_engine(),
@@ -588,6 +635,7 @@ class Runtime:
                 identity_namespace=(
                     None if identity_namespace is None else str(identity_namespace)
                 ),
+                expected_reset_epoch=int(row.derived_reset_epoch),
             )
         return store
 
@@ -704,7 +752,8 @@ class Runtime:
 
     async def pipeline(self) -> IngestPipeline:
         """The ingest pipeline, refused before construction if it cannot write to this index."""
-        return await self._once("pipeline", self._build_pipeline)
+        async with self.derived_mutation_guard():
+            return await self._once("pipeline", self._build_pipeline)
 
     async def acquisition_pipeline(self) -> IngestPipeline:
         """The source-only pipeline, assembled without requesting any derived component."""
@@ -736,6 +785,7 @@ class Runtime:
             shutdown_grace_s=settings.ingest.shutdown_grace_s,
             max_fetch_bytes=settings.ingest.max_fetch_bytes,
             snapshot_policy=settings.ingest.snapshot_promotion_policy,
+            mutation_guard=self.derived_mutation_guard,
         )
 
     async def _build_pipeline(self) -> IngestPipeline:
@@ -749,6 +799,11 @@ class Runtime:
 
         settings = self._settings
         store = await self.documents()
+        expected_reset_epoch = (
+            await self.derived_reset_epoch()
+            if getattr(store, "assert_derived_reset_epoch", None) is not None
+            else None
+        )
         acquisitions: AcquisitionSurface | None = None
         if settings.storage.retain_source_bytes:
             # Retention enables the durable journal path. Third-party document stores may
@@ -793,6 +848,7 @@ class Runtime:
             # `_build_documents` asserts the reads the surfaces need at construction time.
             store=cast("IngestStore", store),
             vectors=vectors,
+            expected_reset_epoch=expected_reset_epoch,
         )
         pool = WorkerPool(
             worker_config(settings, chunker=chunker, embedder=embedder),
@@ -826,6 +882,8 @@ class Runtime:
             target_batch_tokens=settings.ingest.target_batch_tokens,
             max_embed_batch=settings.ingest.max_embed_batch,
             snapshot_policy=settings.ingest.snapshot_promotion_policy,
+            mutation_guard=self.derived_mutation_guard,
+            expected_reset_epoch=expected_reset_epoch,
             # Passed rather than defaulted, which it had been since the setting shipped. The
             # field is documented as the switch an operator throws while investigating a
             # detector that is producing rubbish, and nothing outside `settings.py` read it: a
@@ -942,7 +1000,11 @@ class _Ingestion:
         connector = FilesystemConnector(path, name=name)
         pipeline = await self._runtime.pipeline()
         if force:
-            return await self._forced(connector, pipeline, limit=limit, watching=watching)
+            mutation_guard = getattr(self._runtime, "derived_mutation_guard", None)
+            if mutation_guard is None:  # protocol test doubles; Runtime always supplies it
+                return await self._forced(connector, pipeline, limit=limit, watching=watching)
+            async with mutation_guard():
+                return await self._forced(connector, pipeline, limit=limit, watching=watching)
         return await pipeline.run(connector, limit=limit, watching=watching)
 
     async def _forced(
@@ -1225,6 +1287,10 @@ class _Ingestion:
         )
 
     async def rebuild_run(self, snapshot_run_id: str, owner: str):  # noqa: ANN202
+        async with self._runtime.derived_mutation_guard():
+            return await self._rebuild_run_guarded(snapshot_run_id, owner)
+
+    async def _rebuild_run_guarded(self, snapshot_run_id: str, owner: str):  # noqa: ANN202
         _, rebuilder, target = await self._rebuild_components(snapshot_run_id)
         return await rebuilder.run(snapshot_run_id, target, owner=owner)
 
@@ -1245,6 +1311,10 @@ class _Ingestion:
             return None
 
     async def reembed_plan(self) -> tuple[ReembedPlan, str, int]:
+        async with self._runtime.derived_mutation_guard():
+            return await self._reembed_plan_guarded()
+
+    async def _reembed_plan_guarded(self) -> tuple[ReembedPlan, str, int]:
         """Price from a transient durable snapshot, with no embedding or source access."""
         from manicule.ingest.reembed import (  # noqa: PLC0415
             discard_reembed_snapshot,
@@ -1267,6 +1337,10 @@ class _Ingestion:
             await discard_reembed_snapshot(corpus, commitment.snapshot.id)
 
     async def reembed_start(self, run_id: str, owner_token: str) -> ReembedRun:
+        async with self._runtime.derived_mutation_guard():
+            return await self._reembed_start_guarded(run_id, owner_token)
+
+    async def _reembed_start_guarded(self, run_id: str, owner_token: str) -> ReembedRun:
         from manicule.ingest.reembed import (  # noqa: PLC0415
             ReembedCapacityError,
             discard_reembed_snapshot,
@@ -1313,6 +1387,10 @@ class _Ingestion:
             raise
 
     async def reembed_resume(self, run_id: str, owner_token: str) -> ReembedRun:
+        async with self._runtime.derived_mutation_guard():
+            return await self._reembed_resume_guarded(run_id, owner_token)
+
+    async def _reembed_resume_guarded(self, run_id: str, owner_token: str) -> ReembedRun:
         from manicule.storage.reembed import (  # noqa: PLC0415
             LanceShadowGenerations,
             SqliteReembedCorpus,
@@ -1349,6 +1427,10 @@ class _Ingestion:
         ).get(run_id)
 
     async def reembed_abandon(self, run_id: str, owner_token: str) -> ReembedRun:
+        async with self._runtime.derived_mutation_guard():
+            return await self._reembed_abandon_guarded(run_id, owner_token)
+
+    async def _reembed_abandon_guarded(self, run_id: str, owner_token: str) -> ReembedRun:
         from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
 
         await self._runtime.documents()
@@ -1359,6 +1441,10 @@ class _Ingestion:
         return await authority.abandon(run_id, lease=lease)
 
     async def reembed_cleanup(self, run_id: str) -> bool:
+        async with self._runtime.derived_mutation_guard():
+            return await self._reembed_cleanup_guarded(run_id)
+
+    async def _reembed_cleanup_guarded(self, run_id: str) -> bool:
         from manicule.storage.reembed import (  # noqa: PLC0415
             LanceShadowGenerations,
             SqliteReembedStore,
@@ -1373,6 +1459,11 @@ class _Ingestion:
 
     async def reembed_recover_pending(self) -> ReembedRecovery:
         """Resume ownerless runs after a serving-process restart, scoped to this workspace."""
+        async with self._runtime.derived_mutation_guard():
+            return await self._reembed_recover_pending_guarded()
+
+    async def _reembed_recover_pending_guarded(self) -> ReembedRecovery:
+        """Recover while reset cannot terminalize a run between listing and resumption."""
         import secrets  # noqa: PLC0415
 
         from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
@@ -1456,6 +1547,10 @@ class _Ingestion:
         return run
 
     async def reindex(self, document_id: str) -> ReindexReport:
+        async with self._runtime.derived_mutation_guard():
+            return await self._reindex_guarded(document_id)
+
+    async def _reindex_guarded(self, document_id: str) -> ReindexReport:
         from manicule.ingest.reindex import reindex_document  # noqa: PLC0415
 
         store = await self._runtime.documents()
@@ -1467,6 +1562,12 @@ class _Ingestion:
         )
 
     async def reparse_stale(self, *, batch: int, dry_run: bool = False) -> StaleSweep:
+        if dry_run:
+            return await self._reparse_stale_guarded(batch=batch, dry_run=True)
+        async with self._runtime.derived_mutation_guard():
+            return await self._reparse_stale_guarded(batch=batch, dry_run=False)
+
+    async def _reparse_stale_guarded(self, *, batch: int, dry_run: bool = False) -> StaleSweep:
         """Sweep the corpus for documents an installed parser has moved past.
 
         ``current_parse_fingerprints`` is read here, once per run, and it *raises* when a
@@ -1523,7 +1624,24 @@ class _Ingestion:
         target = self._rebuild_target()
         return target.embedding_fingerprint, target.chunk_fingerprint
 
+    async def physical_index_fingerprint(self) -> str | None:
+        """Inspect only existing vector metadata; never prepare a fresh table."""
+        vectors = await self._runtime.vectors()
+        inspect = getattr(vectors, "physical_fingerprint", None)
+        if inspect is None:
+            return None
+        fingerprint = await inspect()
+        return None if fingerprint is None else fingerprint.canonical()
+
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
+        if dry_run:
+            return await self._redetect_stale_glossary_guarded(batch=batch, dry_run=True)
+        async with self._runtime.derived_mutation_guard():
+            return await self._redetect_stale_glossary_guarded(batch=batch, dry_run=False)
+
+    async def _redetect_stale_glossary_guarded(
+        self, *, batch: int, dry_run: bool = False
+    ) -> GlossarySweep:
         """Bring every document's glossary up to the installed detector. Reads chunks only.
 
         **No pipeline is built on either path, and that is the cost boundary rather than a
@@ -1560,6 +1678,13 @@ class _Ingestion:
         )
 
     async def import_archive(self, path: Path, *, force: bool = False) -> RunReport:
+        mutation_guard = getattr(self._runtime, "derived_mutation_guard", None)
+        if mutation_guard is None:  # protocol test doubles; Runtime always supplies it
+            return await self._import_archive_guarded(path, force=force)
+        async with mutation_guard():
+            return await self._import_archive_guarded(path, force=force)
+
+    async def _import_archive_guarded(self, path: Path, *, force: bool = False) -> RunReport:
         """Ingest an exported archive through the ordinary pipeline.
 
         Chunks and vectors are produced **here**, by this installation's chunker and embedder.
@@ -1931,7 +2056,7 @@ class _Maintenance:
         the reset at a durable terminal or retryable boundary.
         """
 
-        async with self._runtime.derived_mutation_lock:
+        async with self._runtime.derived_mutation_guard():
             lifecycle = self._source_lifecycle(await self._runtime.documents())
             return await self._reset_derived_joined(lifecycle)
 
@@ -1945,7 +2070,7 @@ class _Maintenance:
         )
 
         lifecycle = self._source_lifecycle(await self._runtime.documents())
-        async with self._runtime.derived_mutation_lock:
+        async with self._runtime.derived_mutation_guard():
             outcome = await self._reset_derived_joined(lifecycle)
         return LifecycleOutcome(
             operation=LifecycleOperation.RESET_DERIVED,
@@ -1959,6 +2084,10 @@ class _Maintenance:
         ).plan_derived_generation_cleanup()
 
     async def cleanup_derived_generations(self) -> LifecycleOutcome:
+        async with self._runtime.derived_mutation_guard():
+            return await self._cleanup_derived_generations_guarded()
+
+    async def _cleanup_derived_generations_guarded(self) -> LifecycleOutcome:
         lifecycle = self._source_lifecycle(await self._runtime.documents())
         vectors = await self._runtime.vectors()
         remover = getattr(vectors, "delete_bound_publication", None)
@@ -2017,9 +2146,8 @@ class _Maintenance:
                     for tombstone in tombstones:
                         grouped.setdefault(tombstone.vector_table, []).append(tombstone.vector_id)
                     for vector_table, vector_ids in grouped.items():
-                        await vectors.delete_bound_chunks(vector_table, vector_ids)
+                        vector_rows += await vectors.delete_bound_chunks(vector_table, vector_ids)
                         await lifecycle.clear_tombstones(vector_ids)
-                        vector_rows += len(vector_ids)
                 cleanup = await self.cleanup_derived_generations()
                 await lifecycle.retire_reset_pointer()
                 from manicule.storage.reembed import (  # noqa: PLC0415
@@ -2051,7 +2179,7 @@ class _Maintenance:
                     memberships=prepared.memberships,
                     vector_rows=vector_rows,
                     publications=cleanup.removed_items,
-                    generations=prepared.generations,
+                    generations_terminalized=prepared.generations_terminalized,
                     snapshots_retained=prepared.snapshots,
                     vector_store_removed=physical_removed,
                     fingerprints_cleared=fingerprints,

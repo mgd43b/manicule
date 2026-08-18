@@ -150,6 +150,10 @@ class Workspace(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     mode: Mapped[str] = mapped_column(Text, nullable=False, default="personal")
     settings: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=dict)
+    derived_reset_epoch: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    """Monotonic fence invalidating derived writers assembled before a confirmed reset."""
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
 
     __table_args__ = (CheckConstraint("mode IN ('personal', 'team')", name="mode_is_known"),)
@@ -1262,17 +1266,16 @@ class IndexState(Base):
 
 
 class CorpusRevision(Base):
-    """Monotonic revision moved by triggers on every authoritative corpus mutation."""
+    """Workspace-local revision moved by triggers on authoritative corpus mutations."""
 
     __tablename__ = "corpus_revision"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    __table_args__ = (
-        CheckConstraint("id = 1", name="is_a_singleton"),
-        CheckConstraint("revision >= 0", name="revision_is_not_negative"),
-    )
+    __table_args__ = (CheckConstraint("revision >= 0", name="revision_is_not_negative"),)
 
 
 class ReembedRunRecord(Base):

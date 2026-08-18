@@ -93,6 +93,7 @@ from manicule.core.errors import (
     AcquisitionLeaseLostError,
     ChunkingError,
     ContextOverflowError,
+    DerivedResetFenceLostError,
     MiddlewareViolationError,
     StorageBusyError,
 )
@@ -163,6 +164,11 @@ def _closed_full_inventory_authority(value: object) -> FullInventoryAuthority:
 _publication_fence: ContextVar[_PublicationFence | None] = ContextVar(
     "acquisition_publication_fence", default=None
 )
+
+
+@asynccontextmanager
+async def _unlocked_derived_mutation() -> AsyncGenerator[None]:
+    yield
 
 
 class _StageError(Exception):
@@ -868,6 +874,8 @@ class IngestPipeline:
         acquisition_history_s: float = 30 * 24 * 3600.0,
         acquisition_cleanup_batch: int = 100,
         snapshot_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
+        mutation_guard: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
+        expected_reset_epoch: int | None = None,
     ) -> None:
         derived = (chunker, embedder, vectors, runner, resolve_chain, middleware, chunk_fingerprint)
         if any(component is None for component in derived) and not all(
@@ -899,6 +907,8 @@ class IngestPipeline:
         self._acquisition_history_s = max(0.0, acquisition_history_s)
         self._acquisition_cleanup_batch = max(1, acquisition_cleanup_batch)
         self._snapshot_policy = snapshot_policy
+        self._mutation_guard = mutation_guard or _unlocked_derived_mutation
+        self._expected_reset_epoch = expected_reset_epoch
         # These casts preserve the narrow, non-optional types throughout the derived path. An
         # acquisition-only pipeline never enters that path, and ``run`` refuses any other use
         # before source work begins. Keeping ``None`` here is important: it proves this is not a
@@ -1083,7 +1093,25 @@ class IngestPipeline:
             reconciled_deleted_count=claimed.reconciled_deleted_count,
         )
 
-    async def run(  # noqa: PLR0912, PLR0915 - orchestrates durable recovery stages
+    async def run(
+        self,
+        connector: Connector,
+        *,
+        limit: int | None = None,
+        watching: Watching | None = None,
+        acquire_only: bool = False,
+    ) -> RunReport:
+        """Run one complete sync under the runtime-wide reset/publication barrier."""
+        async with self._mutation_guard():
+            await self._assert_current_reset_epoch()
+            return await self._run_guarded(
+                connector,
+                limit=limit,
+                watching=watching,
+                acquire_only=acquire_only,
+            )
+
+    async def _run_guarded(  # noqa: PLR0912, PLR0915 - orchestrates durable recovery stages
         self,
         connector: Connector,
         *,
@@ -2651,6 +2679,14 @@ class IngestPipeline:
     async def ingest(
         self, connector: Connector, discovered: DiscoveredDoc
     ) -> list[DocumentOutcome]:
+        """Ingest one discovery under the runtime-wide reset/publication barrier."""
+        async with self._mutation_guard():
+            await self._assert_current_reset_epoch()
+            return await self._ingest_discovered_guarded(connector, discovered)
+
+    async def _ingest_discovered_guarded(
+        self, connector: Connector, discovered: DiscoveredDoc
+    ) -> list[DocumentOutcome]:
         """One discovered document, from the change check to the commit.
 
         The two stages a run pipelines, run back to back instead. **One implementation, so the
@@ -2716,6 +2752,42 @@ class IngestPipeline:
         return _Fetched(raw=raw, discovered=discovered, existing=existing)
 
     async def ingest_raw(
+        self,
+        raw: RawDocument,
+        *,
+        source: str,
+        version_token: str | None = None,
+        title: str = "",
+        existing: Document | None = None,
+        force: bool = False,
+        expected: DocumentRevision | None = None,
+        retention: Retention | None = None,
+        force_members: bool = False,
+    ) -> list[DocumentOutcome]:
+        """Publish fetched bytes under the runtime-wide reset/publication barrier."""
+        async with self._mutation_guard():
+            await self._assert_current_reset_epoch()
+            return await self._ingest_raw_guarded(
+                raw,
+                source=source,
+                version_token=version_token,
+                title=title,
+                existing=existing,
+                force=force,
+                expected=expected,
+                retention=retention,
+                force_members=force_members,
+            )
+
+    async def _assert_current_reset_epoch(self) -> None:
+        if self._expected_reset_epoch is None:
+            return
+        assert_epoch = getattr(self._store, "assert_derived_reset_epoch", None)
+        if assert_epoch is None:  # pragma: no cover - Runtime binds epochs only to SQLite
+            raise TypeError("the derived store cannot validate its durable reset epoch")
+        await assert_epoch(self._expected_reset_epoch)
+
+    async def _ingest_raw_guarded(
         self,
         raw: RawDocument,
         *,
@@ -3273,6 +3345,7 @@ class IngestPipeline:
                 glossary_entries=entries,
                 glossary_fp=glossary_fp,
                 original_omitted_reason=retention.omitted_reason,
+                expected_reset_epoch=self._expected_reset_epoch,
             )
         else:
             committed = await self._store.publish_document(
@@ -3285,6 +3358,7 @@ class IngestPipeline:
                 glossary_entries=entries,
                 glossary_fp=glossary_fp,
                 original_omitted_reason=retention.omitted_reason,
+                expected_reset_epoch=self._expected_reset_epoch,
             )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
@@ -3327,9 +3401,18 @@ class IngestPipeline:
             publisher = self._fenced_store if fence is not None else None
             if existing is None or existing.publication_id != publication:
                 if fence is not None and publisher is not None:
-                    await publisher.fenced_stage_vectors(fence, publication, chunks)
+                    await publisher.fenced_stage_vectors(
+                        fence,
+                        publication,
+                        chunks,
+                        expected_reset_epoch=self._expected_reset_epoch,
+                    )
                 else:
-                    await self._store.stage_vectors(publication, chunks)
+                    await self._store.stage_vectors(
+                        publication,
+                        chunks,
+                        expected_reset_epoch=self._expected_reset_epoch,
+                    )
             await self._check_publication_fence()
             await self._vectors.upsert(chunks, vectors, publication_id=publication)
             entries, glossary_fp, glossary_detail = self._derive_definitions(document, chunks)
@@ -3347,6 +3430,7 @@ class IngestPipeline:
                     glossary_entries=entries,
                     glossary_fp=glossary_fp,
                     original_omitted_reason=retention.omitted_reason,
+                    expected_reset_epoch=self._expected_reset_epoch,
                 )
             else:
                 committed = await self._store.publish_document(
@@ -3359,8 +3443,9 @@ class IngestPipeline:
                     glossary_entries=entries,
                     glossary_fp=glossary_fp,
                     original_omitted_reason=retention.omitted_reason,
+                    expected_reset_epoch=self._expected_reset_epoch,
                 )
-        except AcquisitionLeaseLostError:
+        except (AcquisitionLeaseLostError, DerivedResetFenceLostError):
             raise
         except Exception as exc:  # noqa: BLE001 - a store failure is this document's
             return await self._demote(
@@ -3788,12 +3873,14 @@ class IngestPipeline:
                 document,
                 expected=expected,
                 original_omitted_reason=retention.omitted_reason,
+                expected_reset_epoch=self._expected_reset_epoch,
             )
         else:
             committed = await self._store.publish_failure(
                 document,
                 expected=expected,
                 original_omitted_reason=retention.omitted_reason,
+                expected_reset_epoch=self._expected_reset_epoch,
             )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)

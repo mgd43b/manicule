@@ -228,7 +228,13 @@ class MemoryIngestStore:
             return Commit(committed=False, stored=current)
         return Commit(committed=True, stored=await self.upsert_document(document))
 
-    async def stage_vectors(self, publication_id: str, chunks: Sequence[Chunk]) -> None:
+    async def stage_vectors(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        expected_reset_epoch: int | None = None,
+    ) -> None:
         self.staged_publications.append((publication_id, tuple(chunk.id for chunk in chunks)))
 
     async def publish_failure(
@@ -237,6 +243,7 @@ class MemoryIngestStore:
         *,
         expected: DocumentRevision | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         current = await self.get_document(document.id)
         if expected is not None and (current is None or current.revision != expected):
@@ -257,6 +264,7 @@ class MemoryIngestStore:
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        expected_reset_epoch: int | None = None,
     ) -> Commit:
         current = await self.get_document(document.id)
         if expected is not None and (current is None or current.revision != expected):
@@ -497,7 +505,9 @@ class MemoryIngestStore:
     async def index_fingerprints(self) -> IndexFingerprints:
         return self.state
 
-    async def record_index_fingerprints(self, state: IndexFingerprints) -> None:
+    async def record_index_fingerprints(
+        self, state: IndexFingerprints, *, expected_reset_epoch: int | None = None
+    ) -> None:
         self.state = state
 
     # the sweep

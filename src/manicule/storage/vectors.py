@@ -664,6 +664,18 @@ class LanceVectorStore:
         listed = ", ".join(quote(chunk_id) for chunk_id in sorted(set(chunk_ids)))
         await table.delete(f"{ID_COLUMN} IN ({listed})")
 
+    async def delete_chunks_counted(self, chunk_ids: Sequence[str]) -> int:
+        """Delete exact physical ids and report rows that actually existed."""
+        if not chunk_ids:
+            return 0
+        table = await self._existing_table()
+        if table is None:
+            return 0
+        listed = ", ".join(quote(chunk_id) for chunk_id in sorted(set(chunk_ids)))
+        rows = await table.query().where(f"{ID_COLUMN} IN ({listed})").select([ID_COLUMN]).to_list()
+        await table.delete(f"{ID_COLUMN} IN ({listed})")
+        return len({str(row[ID_COLUMN]) for row in rows})
+
     # --- reading -------------------------------------------------------------------------
 
     async def search(
@@ -1218,6 +1230,7 @@ class PublishedLanceVectorStore:
         *,
         workspace_id: str = "default",
         identity_namespace: str | None = None,
+        expected_reset_epoch: int | None = None,
         operation_hook: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._directory = directory
@@ -1228,6 +1241,7 @@ class PublishedLanceVectorStore:
         # cleaning its physical store; this durable expectation is the post-flock CAS that
         # prevents a writer queued behind reset from recreating the stale store afterwards.
         self._identity_namespace = identity_namespace
+        self._expected_reset_epoch = expected_reset_epoch
         self._stores: dict[str, LanceVectorStore] = {}
         self._middleware: tuple[str, ...] = ()
         self._configured: EmbedFingerprint | None = None
@@ -1255,6 +1269,22 @@ class PublishedLanceVectorStore:
     async def fingerprint(self) -> EmbedFingerprint | None:
         async with self._operation() as store:
             return await store.fingerprint()
+
+    async def physical_fingerprint(self) -> EmbedFingerprint | None:
+        """Read existing Lance metadata without preparing or creating a physical store."""
+        while True:
+            pointer, namespace, epoch = await self._binding()
+            key = _published_generation_key(pointer)
+            directory = (
+                self._directory / "generations" / key if key != "legacy" else self._directory
+            )
+            if not directory.exists():
+                return None
+            async with generation_pin(directory):
+                if await self._binding() != (pointer, namespace, epoch):
+                    continue
+                store = self._stores.setdefault(key, LanceVectorStore(directory))
+                return await store.fingerprint()
 
     async def upsert(
         self,
@@ -1319,23 +1349,20 @@ class PublishedLanceVectorStore:
             await store.open_existing()
             return await store.delete_publication(publication_id)
 
-    async def delete_bound_chunks(
-        self, vector_table: str | None, vector_ids: Sequence[str]
-    ) -> None:
+    async def delete_bound_chunks(self, vector_table: str | None, vector_ids: Sequence[str]) -> int:
         """Delete exact staged/live rows from the physical generation recorded before reset."""
         if not vector_ids:
-            return
+            return 0
         key = _published_generation_key(vector_table)
         directory = self._directory / "generations" / key if key != "legacy" else self._directory
         if not directory.exists():
-            return
+            return 0
         store = self._stores.setdefault(key, LanceVectorStore(directory))
         if key == "legacy":
-            await store.delete_chunks(vector_ids)
-            return
+            return await store.delete_chunks_counted(vector_ids)
         async with generation_pin(directory):
             await store.open_existing()
-            await store.delete_chunks(vector_ids)
+            return await store.delete_chunks_counted(vector_ids)
 
     async def publication_page_is_complete(
         self,
@@ -1385,15 +1412,27 @@ class PublishedLanceVectorStore:
     async def _operation(self) -> AsyncGenerator[LanceVectorStore]:
         """Pin and revalidate one pointer before exposing its store to an operation."""
         while True:
-            pointer, namespace = await self._binding()
+            pointer, namespace, epoch = await self._binding()
             key = _published_generation_key(pointer)
             directory = (
                 self._directory / "generations" / key if key != "legacy" else self._directory
             )
             async with generation_pin(directory):
-                current_pointer, current_namespace = await self._binding()
-                if (current_pointer, current_namespace) != (pointer, namespace):
+                current_pointer, current_namespace, current_epoch = await self._binding()
+                if (current_pointer, current_namespace, current_epoch) != (
+                    pointer,
+                    namespace,
+                    epoch,
+                ):
                     continue
+                if (
+                    self._expected_reset_epoch is not None
+                    and current_epoch != self._expected_reset_epoch
+                ):
+                    raise VectorStoreReprepareRequiredError(
+                        "the workspace derived-reset epoch changed while this vector handle "
+                        "was waiting; rebuild the runtime handle before writing"
+                    )
                 if self._identity_namespace is not None and (
                     current_namespace is None or current_namespace != self._identity_namespace
                 ):
@@ -1408,7 +1447,7 @@ class PublishedLanceVectorStore:
                 yield store
                 return
 
-    async def _binding(self) -> tuple[str | None, str | None]:
+    async def _binding(self) -> tuple[str | None, str | None, int]:
         from sqlalchemy import select  # noqa: PLC0415 - storage remains lazy
 
         from manicule.storage import models  # noqa: PLC0415 - avoids import cycle at startup
@@ -1419,18 +1458,26 @@ class PublishedLanceVectorStore:
                     select(
                         models.IndexState.vector_table,
                         models.IndexState.vector_namespace,
-                    ).where(models.IndexState.workspace_id == self._workspace_id)
+                        models.Workspace.derived_reset_epoch,
+                    )
+                    .select_from(models.Workspace)
+                    .outerjoin(
+                        models.IndexState,
+                        models.IndexState.workspace_id == models.Workspace.id,
+                    )
+                    .where(models.Workspace.id == self._workspace_id)
                 )
             ).one_or_none()
         if row is None:
-            return None, None
+            return None, None, 0
         return (
             None if row.vector_table is None else str(row.vector_table),
-            str(row.vector_namespace),
+            None if row.vector_namespace is None else str(row.vector_namespace),
+            int(row.derived_reset_epoch),
         )
 
     async def _pointer(self) -> str | None:
-        pointer, _namespace = await self._binding()
+        pointer, _namespace, _epoch = await self._binding()
         return pointer
 
     async def _prepared_store(self, key: str, directory: Path) -> LanceVectorStore:
@@ -1489,6 +1536,9 @@ async def reset_vector_directory(directory: Path, *, legacy_root: bool) -> bool:
     generations = directory / "generations"
     if generations.exists():
         await asyncio.to_thread(shutil.rmtree, generations)
+    workspace_root = directory / "workspaces"
+    if not workspace_root.exists():
+        await asyncio.to_thread(shutil.rmtree, directory)
     return True
 
 

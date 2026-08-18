@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import event, select
+from sqlalchemy import event, select, text
 
 from manicule.core.errors import ManiculeError, UnknownEntityError
 from manicule.storage import models
@@ -162,10 +162,19 @@ class WorkspaceScoped:
     async def ensure_workspace(self) -> None:
         """Create this store's workspace row if it is absent. Idempotent."""
         async with self._sessions.begin() as session:
-            existing = await session.get(models.Workspace, self._workspace_id)
+            existing = await session.scalar(
+                select(models.Workspace.id).where(models.Workspace.id == self._workspace_id)
+            )
             if existing is None:
-                session.add(
-                    models.Workspace(id=self._workspace_id, name=self._workspace_id, settings={})
+                # Name only columns that have existed since the workspace table was introduced.
+                # Migration contract tests deliberately exercise this helper at older revisions;
+                # newer fence columns take their server defaults after the schema reaches head.
+                await session.execute(
+                    text(
+                        "INSERT INTO workspaces(id, name, mode, settings, created_at) "
+                        "VALUES (:workspace_id, :name, 'personal', '{}', datetime('now'))"
+                    ),
+                    {"workspace_id": self._workspace_id, "name": self._workspace_id},
                 )
 
     # --- tenancy guards ---------------------------------------------------------------------
