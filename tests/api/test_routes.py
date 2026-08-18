@@ -211,6 +211,54 @@ def test_a_duplicate_collection_name_is_a_409() -> None:
     assert envelope(again)["error"]["type"] == "NameInUseError"
 
 
+def test_collection_rule_create_show_replace_and_clear_round_trip() -> None:
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client:
+        created = envelope(
+            client.post(
+                "/api/v1/collections",
+                json={"name": "Team A", "rule": {"sources": ["wiki-team-a"]}},
+            )
+        )
+        collection_id = created["data"]["id"]
+        assert created["data"]["rule"]["sources"] == ["wiki-team-a"]
+
+        replaced = envelope(
+            client.put(
+                f"/api/v1/collections/{collection_id}/rule",
+                json={"rule": {"sources": ["wiki-team-a-archive", "wiki-team-a"]}},
+            )
+        )
+        assert replaced["data"]["rule"]["sources"] == [
+            "wiki-team-a",
+            "wiki-team-a-archive",
+        ]
+        shown = envelope(client.get(f"/api/v1/collections/{collection_id}/rule"))
+        assert shown["data"] == replaced["data"]
+
+        cleared = envelope(client.delete(f"/api/v1/collections/{collection_id}/rule"))
+        assert cleared["data"]["rule"] is None
+
+
+def test_collection_rule_http_body_refuses_empty_blank_and_workspace_scope() -> None:
+    backend, _ = backend_with_a_document()
+    with client_for(backend) as client:
+        made = envelope(client.post("/api/v1/collections", json={"name": "Team A"}))
+        path = f"/api/v1/collections/{made['data']['id']}/rule"
+        for rule in (
+            {},
+            {"sources": [""]},
+            {"sources": ["wiki"], "workspace": "other"},
+            {"sources": ["wiki"], "workspace_ids": ["other"]},
+        ):
+            response = client.put(path, json={"rule": rule})
+            assert response.status_code == UNPROCESSABLE
+
+        # Explicit DELETE is the sole clear spelling: omission and null cannot erase a rule.
+        assert client.put(path, json={}).status_code == UNPROCESSABLE
+        assert client.put(path, json={"rule": None}).status_code == UNPROCESSABLE
+
+
 def test_an_unknown_profile_is_a_400() -> None:
     """A caller error, and the message lists the profiles that exist."""
     backend, _ = backend_with_a_document()
@@ -523,6 +571,8 @@ ABSENT_TOOLS: tuple[tuple[str, str], ...] = (
     ("collection_create", "creating a grouping"),
     ("collection_rename", "renaming one"),
     ("collection_update", "overwriting a description the call does not carry"),
+    ("collection_rule_set", "overwriting a membership rule the call cannot restore"),
+    ("collection_rule_clear", "removing a membership rule the call cannot restore"),
     ("collection_delete", "deleting a grouping"),
     ("collection_add", "changing what a grouping holds"),
     ("collection_remove", "changing what a grouping holds"),

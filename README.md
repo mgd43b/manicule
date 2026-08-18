@@ -282,7 +282,7 @@ shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifec
 
 | Surface | Started by | Shape |
 |:---|:---|:---|
-| **MCP** | `manicule start --mcp-only` | 37 tools over stdio, which opens no socket; 22 read-only tools at `/mcp/` when served over a port |
+| **MCP** | `manicule start --mcp-only` | 40 tools over stdio, which opens no socket; 23 read-only tools at `/mcp/` when served over a port |
 | **Command line** | `manicule <command>` | 27 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 12 areas of server-rendered HTML, 11 in the navigation |
@@ -298,6 +298,21 @@ Twenty-seven commands; `manicule --help` lists them. Under `--json` the result e
 whole of stdout — no prose, no progress, nothing else — and a failure is that same envelope with
 `"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads well-formed JSON whether
 the command succeeded or not.
+
+Rule-driven collections select current and future documents without enumerating ids or
+rebuilding the index:
+
+```console
+manicule collection create "Team A" --source wiki-team-a --source wiki-team-a-archive
+manicule collection rule show COLLECTION_ID
+manicule collection rule set COLLECTION_ID --source wiki-team-a
+manicule collection rule clear COLLECTION_ID
+```
+
+Sources within a rule are alternatives; source, media-type, tag, and update-bound fields are
+combined. Manual members remain unioned with the rule. Creating, replacing, or clearing a rule
+changes only collection metadata: existing indexes adopt it immediately, with no source fetch,
+re-ingestion, chunking, or re-embedding.
 
 <details>
 <summary><b>How a connector sync reports its outcome</b></summary>
@@ -361,7 +376,7 @@ has a route, so there is no upload and no configuration write here either.
 
 ### The MCP server
 
-The primary interface: thirty-seven tools over the same service, speaking stdio by default,
+The primary interface: forty tools over the same service, speaking stdio by default,
 which opens no socket at all. To let Claude Code use your index:
 
 ```bash
@@ -495,7 +510,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
 | `src/manicule/cli` | Twenty-seven commands over that service, and nothing else |
-| `src/manicule/mcp` | Thirty-seven MCP tools over that service, and nothing else |
+| `src/manicule/mcp` | Forty MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |

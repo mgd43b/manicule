@@ -1754,6 +1754,13 @@ its own scope past the handle running it. The evaluating store supplies the scop
 rule is also refused if it restricts nothing — an empty rule selects the whole workspace, and
 "no rule" already has a spelling.
 
+The rule is public collection metadata, so its set-valued selectors serialize in sorted order.
+Operators can supply it at collection creation and can show, replace, or clear it through the
+CLI, HTTP API, control socket, and writable MCP surface. These operations only write the stored
+rule JSON. They do not enumerate the corpus, materialize membership rows, contact a source, or
+reach parsing, chunking, embedding, and vector publication. Clearing the rule removes only its
+evaluated half; manually added membership survives.
+
 There is **one** expression of a rule, `rule_clause`, used by all three readers: listing a
 collection, reporting which collections hold a document, and resolving a filter. A second,
 Python-side reading for the "does this one document match" case is how the same rule starts

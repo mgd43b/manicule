@@ -91,7 +91,7 @@ if TYPE_CHECKING:
     from manicule.connectors.sessions import SessionStore
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.content import Chunk, Document
-    from manicule.core.organization import Collection, Tag
+    from manicule.core.organization import Collection, CollectionRule, Tag
     from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Confidence
     from manicule.embedding.artifacts import WeightsPlan
@@ -4129,7 +4129,11 @@ class ApplicationService:
     # --- collections ----------------------------------------------------------------------
 
     async def collection_create(
-        self, name: str, *, description: str | None = None
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        rule: CollectionRule | None = None,
     ) -> r.CollectionSummary:
         """Create a collection. A duplicate name is refused rather than merged.
 
@@ -4138,7 +4142,7 @@ class ApplicationService:
             NameInUseError: A collection of that name already exists here.
         """
         store = await self._backend.organization()
-        return _collection(await store.create_collection(name, description=description))
+        return _collection(await store.create_collection(name, description=description, rule=rule))
 
     async def collection_list(self) -> r.CollectionList:
         """Every collection in this workspace."""
@@ -4223,6 +4227,27 @@ class ApplicationService:
         """
         store = await self._backend.organization()
         return _collection(await store.describe_collection(collection_id, description or None))
+
+    async def collection_rule_show(self, collection_id: str) -> r.CollectionSummary:
+        """Return a collection and its current stored rule without evaluating membership."""
+        store = await self._backend.organization()
+        collection = await store.get_collection(collection_id)
+        if collection is None:
+            msg = f"no collection {collection_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        return _collection(collection)
+
+    async def collection_rule_set(
+        self, collection_id: str, rule: CollectionRule
+    ) -> r.CollectionSummary:
+        """Attach or replace a rule. Membership remains evaluated by the store on reads."""
+        store = await self._backend.organization()
+        return _collection(await store.set_collection_rule(collection_id, rule))
+
+    async def collection_rule_clear(self, collection_id: str) -> r.CollectionSummary:
+        """Remove a rule while preserving every manually added membership."""
+        store = await self._backend.organization()
+        return _collection(await store.set_collection_rule(collection_id, None))
 
     async def collection_counts(self, collection_id: str) -> r.CollectionCounts:
         """How many documents and chunks a collection holds, counted now.

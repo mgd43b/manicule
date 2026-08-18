@@ -347,6 +347,14 @@ class FakeOrganization:
         self.collections[collection_id] = described
         return described
 
+    async def set_collection_rule(
+        self, collection_id: str, rule: CollectionRule | None
+    ) -> DocumentCollection:
+        existing = self._require_collection(collection_id)
+        changed = existing.model_copy(update={"rule": rule})
+        self.collections[collection_id] = changed
+        return changed
+
     async def collections_for(self, document_id: str) -> Sequence[DocumentCollection]:
         """Manual membership only.
 

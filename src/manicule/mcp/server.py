@@ -1,4 +1,4 @@
-"""The MCP server: thirty-seven tools, each a few lines over the application service.
+"""The MCP server: forty tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -49,6 +49,7 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from manicule.app.dispatch import run_op
+from manicule.core.organization import CollectionRule
 from manicule.core.version import CORE_VERSION
 
 if TYPE_CHECKING:
@@ -230,6 +231,9 @@ TOOL_NAMES: tuple[str, ...] = (
     "collection_list",
     "collection_rename",
     "collection_update",
+    "collection_rule_show",
+    "collection_rule_set",
+    "collection_rule_clear",
     "collection_delete",
     "collection_add",
     "collection_remove",
@@ -330,7 +334,7 @@ def _register_collections(
 ) -> tuple[Any, ...]:
     """Register the collection tools and hand back what was registered.
 
-    Split out of :func:`build_server` because nine more tools pushed one function past the
+    Split out of :func:`build_server` because twelve tools pushed one function past the
     point where a reader can hold it, not because collections are a different kind of thing.
     The registered functions are *returned* rather than dropped, so they reach the same
     surface-versus-``TOOL_NAMES`` comparison every other tool is held to — a group registered
@@ -338,7 +342,7 @@ def _register_collections(
 
     ``register`` is the :class:`_Registrar` rather than the server, so this group is filtered by
     the same rule as every other tool. Passing the ``FastMCP`` here and the registrar elsewhere
-    is precisely how nine tools would end up on a socket that carries none of the others.
+    is precisely how twelve tools would end up on a socket that carries none of the others.
 
     Note the one operation deliberately absent: there is no tool that deletes documents left
     in no collection. It destroys data, so it stays on the command line with the rest of that
@@ -346,7 +350,11 @@ def _register_collections(
     """
 
     @register.tool(hints(reads=False, removes=False, repeatable=False, reaches_out=False))
-    async def collection_create(name: str, description: str | None = None) -> dict[str, Any]:
+    async def collection_create(
+        name: str,
+        description: str | None = None,
+        rule: CollectionRule | None = None,
+    ) -> dict[str, Any]:
         """Create a named set of documents.
 
         A collection groups documents that are already indexed. It never copies them: a
@@ -355,9 +363,11 @@ def _register_collections(
         Args:
             name: What to call it. A name already in use is refused rather than merged.
             description: What the collection is for.
+            rule: Optional evaluated membership selectors. Omit for a manual collection.
         """
         return await dispatch(
-            "collection_create", lambda: service.collection_create(name, description=description)
+            "collection_create",
+            lambda: service.collection_create(name, description=description, rule=rule),
         )
 
     @register.tool(READS)
@@ -400,6 +410,40 @@ def _register_collections(
         return await dispatch(
             "collection_update",
             lambda: service.collection_update(collection_id, description=description),
+        )
+
+    @register.tool(READS)
+    async def collection_rule_show(collection_id: str) -> dict[str, Any]:
+        """Show the stored rule without evaluating its document membership.
+
+        Args:
+            collection_id: The collection to inspect.
+        """
+        return await dispatch(
+            "collection_rule_show", lambda: service.collection_rule_show(collection_id)
+        )
+
+    @register.tool(hints(reads=False, removes=True, repeatable=True, reaches_out=False))
+    async def collection_rule_set(collection_id: str, rule: CollectionRule) -> dict[str, Any]:
+        """Replace the collection's rule; nothing is acquired, chunked, or embedded.
+
+        Args:
+            collection_id: The collection whose rule is replaced.
+            rule: The complete replacement rule; it must restrict at least one field.
+        """
+        return await dispatch(
+            "collection_rule_set", lambda: service.collection_rule_set(collection_id, rule)
+        )
+
+    @register.tool(hints(reads=False, removes=True, repeatable=True, reaches_out=False))
+    async def collection_rule_clear(collection_id: str) -> dict[str, Any]:
+        """Clear the rule while preserving manually added membership.
+
+        Args:
+            collection_id: The collection whose rule is removed.
+        """
+        return await dispatch(
+            "collection_rule_clear", lambda: service.collection_rule_clear(collection_id)
         )
 
     @register.tool(hints(reads=False, removes=True, repeatable=False, reaches_out=False))
@@ -491,6 +535,9 @@ def _register_collections(
         collection_list,
         collection_rename,
         collection_update,
+        collection_rule_show,
+        collection_rule_set,
+        collection_rule_clear,
         collection_delete,
         collection_add,
         collection_remove,

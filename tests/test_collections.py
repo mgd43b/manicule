@@ -307,6 +307,51 @@ async def test_a_rule_selects_documents_that_arrived_after_it_was_written(
     assert ruled.id in {held.id for held in await store.collections_for(latecomer.id)}
 
 
+async def test_rule_fields_share_one_membership_answer_and_never_touch_chunks(
+    store: SqliteDocStore,
+) -> None:
+    """Sources are ORed, fields are ANDed, and manual membership is unioned with the rule."""
+    specifications = (
+        ("wiki-team-a", "a.md", "text/markdown"),
+        ("wiki-team-a-archive", "archive.md", "text/markdown"),
+        ("wiki-team-a", "diagram.pdf", "application/pdf"),
+        ("wiki-team-b", "manual.md", "text/markdown"),
+    )
+    documents: list[Document] = []
+    for source, source_id, media_type in specifications:
+        document = await store.upsert_document(
+            make_document(source=source, source_id=source_id, media_type=media_type)
+        )
+        await store.replace_chunks(document.id, [make_chunk(document, 0, f"body for {source_id}")])
+        documents.append(document)
+
+    before_chunks = {document.id: await _chunk_ids(store, document) for document in documents}
+    before_total = await store.live_chunk_count()
+    collection = await store.create_collection("Team A")
+    await store.add_to_collection(collection.id, [documents[3].id])
+    await store.set_collection_rule(
+        collection.id,
+        CollectionRule(
+            sources=frozenset({"wiki-team-a", "wiki-team-a-archive"}),
+            media_types=frozenset({"text/markdown"}),
+        ),
+    )
+
+    expected = {documents[0].id, documents[1].id, documents[3].id}
+    assert {item.id for item in await store.collection_documents(collection.id)} == expected
+    for document in documents:
+        holdings = {item.id for item in await store.collections_for(document.id)}
+        assert (collection.id in holdings) is (document.id in expected)
+
+    await store.set_collection_rule(collection.id, None)
+    assert {item.id for item in await store.collection_documents(collection.id)} == {
+        documents[3].id
+    }
+    assert await store.live_chunk_count() == before_total
+    for document in documents:
+        assert await _chunk_ids(store, document) == before_chunks[document.id]
+
+
 async def test_applying_the_same_rule_twice_changes_nothing(store: SqliteDocStore) -> None:
     """Idempotent, and therefore safe to re-run after a crash of any kind."""
     corpus = await _corpus(store)
@@ -403,6 +448,19 @@ async def test_an_empty_rule_is_refused_rather_than_matching_everything() -> Non
     """A rule that restricts nothing selects the whole workspace."""
     with pytest.raises(ValueError, match="must restrict something"):
         CollectionRule()
+
+
+async def test_rule_selectors_refuse_blanks_and_serialize_sets_deterministically() -> None:
+    for field in ("sources", "media_types", "tag_ids"):
+        with pytest.raises(ValueError, match="non-empty"):
+            CollectionRule.model_validate({field: ["   "]})
+
+    serialized = CollectionRule(
+        sources=frozenset({"wiki-z", "wiki-a"}),
+        media_types=frozenset({"text/plain", "text/markdown"}),
+    ).model_dump(mode="json")
+    assert serialized["sources"] == ["wiki-a", "wiki-z"]
+    assert serialized["media_types"] == ["text/markdown", "text/plain"]
 
 
 async def test_a_rule_selects_nothing_from_another_workspace(
@@ -517,6 +575,7 @@ async def test_no_membership_operation_can_reach_a_write_that_would_re_embed(
     await store.rename_collection(collection.id, "alpha handbook")
     await store.describe_collection(collection.id, "worked examples")
     await store.set_collection_rule(collection.id, CollectionRule(sources=frozenset({"fs"})))
+    await store.set_collection_rule(collection.id, None)
     await store.delete_collection(collection.id)
 
 

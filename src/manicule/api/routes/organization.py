@@ -21,6 +21,7 @@ from manicule.api.envelopes import respond
 from manicule.api.models import (
     CollectionBody,
     CollectionNameBody,
+    CollectionRuleBody,
     CollectionUpdateBody,
     TagBody,
 )
@@ -45,7 +46,54 @@ async def create_collection(
     return await respond(
         "collection_create",
         service,
-        lambda: service.collection_create(body.name, description=body.description),
+        lambda: service.collection_create(body.name, description=body.description, rule=body.rule),
+    )
+
+
+@router.get(
+    "/collections/{collection_id}/rule",
+    name="collection_rule_show",
+    summary="Show a collection's stored membership rule.",
+)
+async def show_collection_rule(
+    service: Service, caller: ViewerPrincipal, collection_id: str
+) -> Response:
+    del caller
+    return await respond(
+        "collection_rule_show", service, lambda: service.collection_rule_show(collection_id)
+    )
+
+
+@router.put(
+    "/collections/{collection_id}/rule",
+    name="collection_rule_set",
+    summary="Replace a collection's evaluated membership rule.",
+)
+async def set_collection_rule(
+    service: Service,
+    caller: MemberPrincipal,
+    collection_id: str,
+    body: CollectionRuleBody,
+) -> Response:
+    del caller
+    return await respond(
+        "collection_rule_set",
+        service,
+        lambda: service.collection_rule_set(collection_id, body.rule),
+    )
+
+
+@router.delete(
+    "/collections/{collection_id}/rule",
+    name="collection_rule_clear",
+    summary="Clear a collection's rule while preserving manual members.",
+)
+async def clear_collection_rule(
+    service: Service, caller: MemberPrincipal, collection_id: str
+) -> Response:
+    del caller
+    return await respond(
+        "collection_rule_clear", service, lambda: service.collection_rule_clear(collection_id)
     )
 
 
