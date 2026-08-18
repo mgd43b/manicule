@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from rich.console import Console
 from typer._click.exceptions import NoSuchOption, UsageError
 from typer.testing import CliRunner
 
@@ -1651,6 +1652,47 @@ def _ingest_output(capsys: pytest.CaptureFixture[str], *, ingested: int, error: 
         r.IngestReport(connector="local", discovered=13, ingested=ingested, error=error),
     )
     return " ".join(capsys.readouterr().out.split())
+
+
+def test_cli_aggregate_views_render_effective_full_inventory_authority(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_console = Console(width=240)
+    render.render_ingest(
+        output_console,
+        r.IngestReport(
+            connector="synthetic-wiki",
+            full_inventory_authority="direct_current_content",
+        ),
+    )
+    render.render_connectors(
+        output_console,
+        r.ConnectorList(
+            count=1,
+            connectors=(
+                r.ConnectorSummary(
+                    name="synthetic-wiki",
+                    type="confluence",
+                    full_inventory_authority="direct_current_content",
+                ),
+            ),
+        ),
+    )
+    render.render_snapshot_status(
+        output_console,
+        r.SnapshotStatusReport(
+            connector="synthetic-wiki",
+            snapshot_id="synthetic-snapshot",
+            state="settled",
+            verified=True,
+            full_inventory_authority="direct_current_content",
+            lifecycle=r.LifecycleProgress(phase="complete", outcome="complete"),
+        ),
+    )
+
+    output = " ".join(capsys.readouterr().out.split())
+    assert output.count("direct_current_content") == 3
+    assert "DOCS" not in output
 
 
 def test_the_longest_command_in_a_first_run_says_what_comes_after_it(

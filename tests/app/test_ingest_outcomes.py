@@ -577,6 +577,99 @@ def test_http_and_mcp_report_the_same_incomplete_outcome() -> None:
     )
 
 
+def test_http_and_mcp_share_effective_full_inventory_authority() -> None:
+    report = RunReport(
+        connector="synthetic-wiki",
+        discovered=102,
+        full_inventory_authority="direct_current_content",
+        snapshot_completeness="complete",
+        watermark_advanced=True,
+        durable_acquired=3,
+        durable_reused=99,
+        reconciled_deleted_items=1,
+    )
+    service, backend = _service(report)
+    backend.settings.connectors["synthetic-wiki"] = ConnectorSettings.model_validate(
+        {
+            "type": "confluence",
+            "options": {
+                "base_url": "https://wiki.example.test/confluence",
+                "deployment": "server",
+                "personal_access_token": "synthetic-token",
+                "spaces": ["DOCS"],
+                "full_inventory_authority": "direct_current_content",
+            },
+        }
+    )
+    mcp = build_server(service)
+    tool = asyncio.run(mcp.call_tool("connector_sync", {"name": "synthetic-wiki"}))
+    with client_for(backend) as client:
+        http = cast(
+            "dict[str, Any]",
+            client.post("/api/v1/admin/connectors/synthetic-wiki/sync", json={}).json(),
+        )
+        web = client.get("/ui/connectors")
+    mcp_result = cast("dict[str, Any]", tool.structured_content)
+    for envelope in (http, mcp_result):
+        data = cast("dict[str, Any]", envelope["data"])
+        lifecycle = cast("dict[str, Any]", data["lifecycle"])
+        assert data["full_inventory_authority"] == "direct_current_content"
+        assert lifecycle["full_inventory_authority"] == "direct_current_content"
+        rendered = json.dumps(envelope).lower()
+        for private in ("source_id", "page title", "blob_hash", "cookie", "username"):
+            assert private not in rendered
+    listed = asyncio.run(service.connector_list())
+    assert listed.connectors[0].full_inventory_authority == "direct_current_content"
+    assert web.status_code == 200
+    assert "direct_current_content" in web.text
+    assert "DOCS" not in web.text
+
+
+async def test_control_socket_preserves_aggregate_full_inventory_authority(
+    tmp_path: Path,
+) -> None:
+    report = RunReport(
+        connector="synthetic-wiki",
+        discovered=102,
+        full_inventory_authority="direct_current_content",
+        snapshot_completeness="complete",
+        watermark_advanced=True,
+    )
+    service, _ = _service(report)
+    path = control.socket_path(tmp_path)
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+    await server.start()
+    try:
+        envelope = await control.connect(
+            path,
+            control.Invoke(
+                op="connector_sync", arguments={"name": "synthetic-wiki", "limit": None}
+            ),
+            on_progress=lambda _: None,
+        )
+    finally:
+        await server.aclose()
+
+    data = cast("dict[str, Any]", envelope["data"])
+    lifecycle = cast("dict[str, Any]", data["lifecycle"])
+    assert data["full_inventory_authority"] == "direct_current_content"
+    assert lifecycle["full_inventory_authority"] == "direct_current_content"
+    rendered = json.dumps(envelope).lower()
+    for private in ("source_id", "page title", "blob_hash", "cookie", "username"):
+        assert private not in rendered
+
+
+def test_unknown_connector_authority_cannot_become_an_aggregate_data_channel() -> None:
+    report = RunReport(connector="synthetic-wiki")
+    cast("Any", report).full_inventory_authority = "private-space-DOCS"
+    service, _ = _service(report)
+    result = asyncio.run(service.connector_sync("synthetic-wiki"))
+
+    assert result.full_inventory_authority == ""
+    assert result.lifecycle.full_inventory_authority == ""
+    assert "private-space" not in result.model_dump_json()
+
+
 async def test_scheduler_counts_a_returned_incomplete_report_as_a_failure(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

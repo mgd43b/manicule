@@ -211,6 +211,16 @@ the final one-record page. Cursor-cycle history and subtree membership use tempo
 fixed-cache SQLite indexes, keeping pagination and subtree scope bookkeeping independent of
 corpus size in process memory.
 
+Server and Data Center whole-space connectors may set
+`full_inventory_authority = "direct_current_content"`. Complete discovery and reconciliation
+then use the direct current-content inventory, while incremental discovery remains CQL-backed.
+The compatibility default is `search`; Cloud and page-tree scopes keep their existing CQL
+behavior even when the direct option is present. The effective authority is included in durable
+cursor identity and aggregate connector/snapshot status, so switching authority performs one
+complete replacement without exposing configured spaces. Exact retained bodies are reused after
+their source revision and acquisition evidence are revalidated. Direct native pagination is
+scope-pinned on every request and only true exhaustion can authorize deletion reconciliation.
+
 Strict policy never promotes while a current member lacks validated evidence. An
 `allow_omissions` snapshot remains honestly partial, and it cannot turn a known-stale inventory
 green. Once a promoted snapshot publishes, source acquisition and derived publication settle in

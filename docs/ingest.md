@@ -907,6 +907,24 @@ still depends on it. If an item is enumerated again but still returns not-found,
 marked for another fresh enumeration and remains unpromoted. Strict and allow-omissions policies
 both refuse promotion of an inventory known to be stale.
 
+An explicit Confluence full-inventory authority change is also a replacement boundary. Search is
+the compatibility default, preserving its historical scope fingerprint byte-for-byte. Data Center
+whole-space `direct_current_content` uses a distinct fingerprint, reconciliation scope and
+watermark marker; Cloud, incremental and subtree behavior remain unchanged. The replacement may
+reuse a verified promoted search snapshot or a fenced unfinished predecessor through the same
+exact-evidence checks above, but it never reuses that predecessor's watermark. Likewise, a
+same-authority `reenumerating` replacement keeps the last committed watermark as promotion CAS
+evidence while passing no watermark to discovery, forcing the complete authoritative walk needed
+to prove a deletion.
+
+The aggregate `full_inventory_authority` field accompanies the recovery counts in ingest,
+connector-list, last-run, lifecycle and snapshot status across CLI, HTTP, MCP, control and web
+surfaces. It is the closed effective value `search` or `direct_current_content`; private spaces,
+roots, source ids, URIs and durable scope material are not surfaced. Offline verification and
+rebuild consume the promoted retained manifest, so disabling or losing the connector after a
+successful direct walk does not change membership, require a source call, or leave acquisition
+backlog after publication.
+
 The aggregate fields `inventory_recovery`, `reused_items` and `reconciled_deleted_items` appear in
 ingest results, connector lifecycle status and snapshot status. They contain no source identity,
 title, URL, blob hash, credential or exception text. Existing databases are migrated by marking

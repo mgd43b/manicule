@@ -285,6 +285,7 @@ class AcquisitionRun(Base):
     connector_name: Mapped[str] = mapped_column(Text, nullable=False)
     source_scope: Mapped[str] = mapped_column(Text, nullable=False, default="")
     scope_fingerprint: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    full_inventory_authority: Mapped[str] = mapped_column(Text, nullable=False, default="")
     scope_inventory_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     promotion_policy: Mapped[SnapshotPromotionPolicy] = mapped_column(
         Text,

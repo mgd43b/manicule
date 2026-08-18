@@ -470,6 +470,7 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         connector=row.connector_name,
         source_scope=row.source_scope,
         scope_fingerprint=row.scope_fingerprint,
+        full_inventory_authority=row.full_inventory_authority,
         scope_inventory_complete=row.scope_inventory_complete,
         promotion_policy=row.promotion_policy,
         state=row.state,
@@ -754,6 +755,7 @@ def _matching_run_identity(
     connector: str,
     source_scope: str,
     scope_fingerprint: str,
+    full_inventory_authority: str,
     scope_inventory_complete: bool,
     promotion_policy: SnapshotPromotionPolicy,
 ) -> bool:
@@ -767,6 +769,7 @@ def _matching_run_identity(
         and row.connector_name == connector
         and row.source_scope == source_scope
         and row.scope_fingerprint == scope_fingerprint
+        and row.full_inventory_authority == full_inventory_authority
         and row.scope_inventory_complete is scope_inventory_complete
         and stored_policy is promotion_policy
     )
@@ -1038,6 +1041,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         *,
         source_scope: str = "",
         scope_fingerprint: str = "",
+        full_inventory_authority: str = "",
         scope_inventory_complete: bool = True,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         _allow_connector_tombstone: bool = False,
@@ -1055,6 +1059,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 connector=connector,
                 source_scope=source_scope,
                 scope_fingerprint=scope_fingerprint,
+                full_inventory_authority=full_inventory_authority,
                 scope_inventory_complete=scope_inventory_complete,
                 promotion_policy=promotion_policy,
             ):
@@ -1072,6 +1077,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     connector=connector,
                     source_scope=source_scope,
                     scope_fingerprint=scope_fingerprint,
+                    full_inventory_authority=full_inventory_authority,
                     scope_inventory_complete=scope_inventory_complete,
                     promotion_policy=promotion_policy,
                 ):
@@ -1092,6 +1098,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     connector_name=connector,
                     source_scope=source_scope,
                     scope_fingerprint=scope_fingerprint,
+                    full_inventory_authority=full_inventory_authority,
                     scope_inventory_complete=scope_inventory_complete,
                     promotion_policy=promotion_policy,
                     state=AcquisitionRunState.ENUMERATING,
@@ -1113,6 +1120,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     connector=connector,
                     source_scope=source_scope,
                     scope_fingerprint=scope_fingerprint,
+                    full_inventory_authority=full_inventory_authority,
                     scope_inventory_complete=scope_inventory_complete,
                     promotion_policy=promotion_policy,
                 )
@@ -1179,6 +1187,55 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             ):
                 return None
             return _run(row)
+
+    async def latest_promoted_snapshot_for_source_scope(
+        self, connector: str, source_scope: str
+    ) -> AcquisitionRun | None:
+        """Newest verified manifest for one stable logical scope, regardless of cursor authority."""
+        async with self._sessions() as session:
+            page_size = 16
+            cursor: tuple[datetime, str] | None = None
+            while True:
+                statement = select(models.AcquisitionRun).where(
+                    models.AcquisitionRun.workspace_id == self._workspace_id,
+                    models.AcquisitionRun.connector_name == connector,
+                    models.AcquisitionRun.source_scope == source_scope,
+                    models.AcquisitionRun.promoted_at.is_not(None),
+                )
+                if cursor is not None:
+                    promoted_at, run_id = cursor
+                    statement = statement.where(
+                        or_(
+                            models.AcquisitionRun.promoted_at < promoted_at,
+                            and_(
+                                models.AcquisitionRun.promoted_at == promoted_at,
+                                models.AcquisitionRun.id < run_id,
+                            ),
+                        )
+                    )
+                rows = (
+                    (
+                        await session.execute(
+                            statement.order_by(
+                                models.AcquisitionRun.promoted_at.desc(),
+                                models.AcquisitionRun.id.desc(),
+                            ).limit(page_size)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for row in rows:
+                    if row.membership_hash and await _manifest_matches(
+                        session, row.id, row.membership_hash
+                    ):
+                        return _run(row)
+                if len(rows) < page_size:
+                    return None
+                last = rows[-1]
+                if last.promoted_at is None:  # pragma: no cover - query excludes it
+                    return None
+                cursor = (last.promoted_at, last.id)
 
     async def reusable_snapshot_record(
         self,
@@ -1302,7 +1359,6 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 or predecessor.workspace_id != replacement.workspace_id
                 or predecessor.connector_id != replacement.connector_id
                 or predecessor.source_scope != replacement.source_scope
-                or predecessor.scope_fingerprint != replacement.scope_fingerprint
                 or predecessor.superseded_by != replacement.id
                 or predecessor.superseded_at is None
             ):
@@ -1370,6 +1426,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         *,
         source_scope: str = "",
         scope_fingerprint: str = "",
+        full_inventory_authority: str = "",
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         now: datetime,
         expires_at: datetime,
@@ -1463,12 +1520,16 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             # API exists to reconcile on upgraded databases.
             row = safe[0] if safe else None
             superseded = [candidate for candidate in candidates if candidate is not row]
-            invalidated = next(
+            predecessor = next(
                 (
                     candidate
                     for candidate in superseded
-                    if candidate.inventory_state is AcquisitionInventoryState.REENUMERATION_REQUIRED
-                    and candidate.scope_fingerprint == scope_fingerprint
+                    if candidate.source_scope == source_scope
+                    and (
+                        candidate.scope_fingerprint != scope_fingerprint
+                        or candidate.inventory_state
+                        is AcquisitionInventoryState.REENUMERATION_REQUIRED
+                    )
                 ),
                 None,
             )
@@ -1486,14 +1547,15 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     connector_name=connector,
                     source_scope=source_scope,
                     scope_fingerprint=scope_fingerprint,
+                    full_inventory_authority=full_inventory_authority,
                     promotion_policy=promotion_policy,
                     state=AcquisitionRunState.ENUMERATING,
                     base_watermark=connector_row.watermark,
                     base_watermark_scope_fingerprint=connector_row.watermark_scope_fingerprint,
-                    supersedes_run_id=None if invalidated is None else invalidated.id,
+                    supersedes_run_id=None if predecessor is None else predecessor.id,
                     inventory_state=(
                         AcquisitionInventoryState.CURRENT
-                        if invalidated is None
+                        if predecessor is None
                         else AcquisitionInventoryState.REENUMERATING
                     ),
                     lease_owner=owner,

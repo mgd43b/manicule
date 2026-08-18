@@ -26,6 +26,7 @@ from manicule.app.served import ControlHandler
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors import CursorExpiredError, NotFoundError, SessionExpiredError
+from manicule.connectors.config import FullInventoryAuthority
 from manicule.connectors.confluence import ConfluenceConnector
 from manicule.connectors.sessions import SessionVault
 from manicule.core.acquisition import (
@@ -79,7 +80,7 @@ from manicule.storage.vectors import LanceVectorStore
 from tests.app.fakes import FakeBackend, FakeIngestion
 from tests.connectors.fake_confluence import FakeConfluence, FakePage
 from tests.connectors.support import Clock as ConfluenceClock
-from tests.connectors.support import client_for, cloud_config
+from tests.connectors.support import client_for, cloud_config, connected, server_config
 from tests.fakes import HashEmbedder
 from tests.ingest import fakes
 from tests.ingest.test_shadow_reembed import Authority, Corpus, CountingEmbedder
@@ -4537,6 +4538,433 @@ async def test_unchanged_revision_reuses_promoted_snapshot_without_body_download
         record.snapshot_outcome is SnapshotItemOutcome.REUSED
         for record in await store.list_acquisition_records(promoted.id)
     )
+
+
+async def test_direct_native_pages_restart_from_an_exact_durable_prefix(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = "https://wiki.example.test/confluence"
+    pages = [
+        FakePage(id=str(180100 + number), title=f"Current {number}", space="DOCS")
+        for number in range(7)
+    ]
+    instance = FakeConfluence(base_url=base, pages=pages, page_size=2)
+    config = server_config(
+        base,
+        spaces=("DOCS",),
+        include_attachments=False,
+        page_size=250,
+        full_inventory_authority=FullInventoryAuthority.DIRECT_CURRENT_CONTENT,
+    )
+    connector = await connected(instance, config)
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    original_append = store.append_acquisition_records
+    committed_pages = 0
+
+    async def interrupt_after_two_pages(*args: Any, **kwargs: Any):  # noqa: ANN202
+        nonlocal committed_pages
+        records = await original_append(*args, **kwargs)
+        committed_pages += 1
+        if committed_pages == 2:
+            raise CursorExpiredError("synthetic interruption after a committed native page")
+        return records
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "append_acquisition_records", interrupt_after_two_pages)
+            interrupted = await pipeline().run(connector, acquire_only=True)
+
+        first_requests = [
+            request
+            for request in instance.requests
+            if request.url.path.endswith("/rest/api/content")
+        ]
+        assert len(first_requests) == 2
+        assert interrupted.enumeration_completed is False
+        unfinished = await store.latest_unsettled_acquisition_run(connector.name)
+        assert unfinished is not None
+        assert unfinished.enumeration_completed_at is None
+        assert unfinished.promoted_at is None
+        assert unfinished.watermark_committed_at is None
+        prefix = await store.list_acquisition_records(unfinished.id)
+        assert [record.sequence for record in prefix] == [0, 1, 2, 3]
+        first_body_requests = [
+            request for request in instance.requests if "/rest/api/content/" in request.url.path
+        ]
+        assert len(first_body_requests) == 4
+
+        instance.requests.clear()
+        completed = await pipeline().run(connector, acquire_only=True)
+    finally:
+        await connector.teardown()
+
+    assert completed.enumeration_completed
+    assert completed.snapshot_completeness == "complete"
+    promoted = await store.latest_promoted_snapshot(connector.name, connector.scope_fingerprint)
+    assert promoted is not None
+    records = await store.list_acquisition_records(promoted.id)
+    assert [record.sequence for record in records] == list(range(7))
+    restarted = [
+        request for request in instance.requests if request.url.path.endswith("/rest/api/content")
+    ]
+    assert [request.url.params.get("start", "0") for request in restarted] == [
+        "0",
+        "2",
+        "4",
+        "6",
+    ]
+    body_requests = [
+        request for request in instance.requests if "/rest/api/content/" in request.url.path
+    ]
+    assert len(body_requests) == 3, "the exact four-record durable prefix was fetched twice"
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        SnapshotPromotionPolicy.REQUIRE_COMPLETE,
+        SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    ],
+)
+async def test_direct_member_deleted_after_true_end_never_promotes_stale_inventory(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    policy: SnapshotPromotionPolicy,
+) -> None:
+    page = FakePage(id="190100", title="Current", space="DOCS")
+    instance = FakeConfluence(
+        base_url="https://wiki.example.test/confluence",
+        pages=[page],
+    )
+    config = server_config(
+        instance.base_url,
+        spaces=("DOCS",),
+        include_attachments=False,
+        full_inventory_authority=FullInventoryAuthority.DIRECT_CURRENT_CONTENT,
+    )
+    settings, client = client_for(instance, config)
+
+    class DeleteAfterEnumeration(ConfluenceConnector):
+        @override
+        async def discover_batches(
+            self, watermark: Watermark | None
+        ) -> AsyncIterator[Sequence[DiscoveredDoc]]:
+            async for batch in super().discover_batches(watermark):
+                yield batch
+            instance.delete(page.id)
+
+    connector = DeleteAfterEnumeration(settings, client, name=f"direct-{policy.value}")
+    await connector.setup()
+    chunker = fakes.BlockChunker()
+    try:
+        report = await IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+            snapshot_policy=policy,
+        ).run(connector, acquire_only=True)
+    finally:
+        await connector.teardown()
+
+    assert report.inventory_recovery == "reenumeration_required"
+    assert report.snapshot_completeness == ""
+    run = await store.latest_unsettled_acquisition_run(connector.name)
+    assert run is not None
+    assert run.promoted_at is None
+    assert run.watermark_committed_at is None
+
+
+async def test_authority_change_fences_failed_inventory_and_reuses_exact_retained_bodies(  # noqa: PLR0915 - one end-to-end recovery/publication lifecycle
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    class AuthorityConnector(fakes.DictConnector):
+        source_scope = "synthetic-whole-space"
+
+        def __init__(
+            self,
+            documents: Mapping[str, str],
+            *,
+            fingerprint: str,
+            authority: str,
+            name: str = "synthetic-wiki",
+        ) -> None:
+            super().__init__(documents, name=name)
+            self.scope_fingerprint = fingerprint
+            self.full_inventory_authority = authority
+            self.deleted: set[str] = set()
+            self.forbidden_fetches: set[str] = set()
+            self.seen_watermarks: list[Watermark | None] = []
+            self.tokens = {source_id: f"version-{source_id}" for source_id in documents}
+
+        @property
+        @override
+        def watermark(self) -> Watermark:
+            return Watermark(
+                value=f"{self.full_inventory_authority}-authoritative-end",
+                observed_at=datetime(2026, 8, 17, tzinfo=UTC),
+            )
+
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            self.seen_watermarks.append(watermark)
+            for source_id in sorted(self.documents):
+                yield DiscoveredDoc(
+                    ref=DocRef(
+                        source_id=source_id,
+                        uri=f"https://wiki.example.test/pages/{source_id}",
+                    ),
+                    version_token=self.tokens[source_id],
+                    media_type="text/plain",
+                )
+
+        @override
+        async def fetch(self, ref: DocRef) -> RawDocument:
+            self.fetches.append(ref.source_id)
+            if ref.source_id in self.deleted:
+                raise NotFoundError("the synthetic current member is no longer available")
+            if ref.source_id in self.forbidden_fetches:
+                raise AssertionError("an unchanged retained body was fetched again")
+            return RawDocument(
+                source_id=ref.source_id,
+                uri=ref.uri,
+                media_type="text/plain",
+                content=self.documents[ref.source_id],
+                metadata={"version_token": self.tokens[ref.source_id]},
+            )
+
+    retained = {
+        f"page-{number:03d}": f"retained synthetic body {number:03d}" for number in range(99)
+    }
+    search = AuthorityConnector(
+        {**retained, "stale-page": "stale synthetic body"},
+        fingerprint="search-inventory-fingerprint",
+        authority="search",
+    )
+    search.deleted.add("stale-page")
+    chunker = fakes.BlockChunker()
+    blobs = BlobStore(engine, data_dir)
+    embedder = HashEmbedder()
+    vectors = LanceVectorStore(data_dir / "authority-vectors")
+    await vectors.ensure_ready(embedder.fingerprint)
+    parser = PlaintextParser(PlaintextConfig())
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=blobs,
+            chunker=chunker,
+            embedder=embedder,
+            vectors=vectors,
+            runner=InProcessRunner({"plaintext": parser}),
+            resolve_chain=lambda _: ["plaintext"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    incomplete = await pipeline().run(search)
+    assert incomplete.inventory_recovery == "reenumeration_required"
+    assert incomplete.snapshot_completeness == ""
+    assert not incomplete.watermark_advanced
+
+    direct = AuthorityConnector(
+        {
+            **retained,
+            "page-102": "new synthetic body 102",
+            "page-103": "new synthetic body 103",
+            "page-104": "new synthetic body 104",
+        },
+        fingerprint="direct-current-inventory-fingerprint",
+        authority="direct_current_content",
+    )
+    direct.forbidden_fetches.update(retained)
+    complete = await pipeline().run(direct)
+
+    assert complete.snapshot_completeness == "complete"
+    assert complete.inventory_recovery == "reconciled"
+    assert complete.discovered == 102
+    assert complete.durable_reused == 99
+    assert complete.reconciled_deleted_items == 1
+    assert complete.watermark_advanced
+    assert direct.seen_watermarks == [None]
+    assert set(direct.fetches) == {"page-102", "page-103", "page-104"}
+    promoted = await store.latest_promoted_snapshot(
+        direct.name, "direct-current-inventory-fingerprint"
+    )
+    assert promoted is not None
+    assert promoted.supersedes_run_id is not None
+    assert promoted.full_inventory_authority == "direct_current_content"
+    assert promoted.discovered_count == 102
+    assert promoted.reconciled_deleted_count == 1
+    assert promoted.watermark_committed_at is not None
+    predecessor = await store.get_acquisition_run(promoted.supersedes_run_id)
+    assert predecessor is not None
+    assert predecessor.superseded_by == promoted.id
+    assert predecessor.superseded_at is not None
+    assert predecessor.lease_owner is None
+    assert predecessor.lease_generation > 1
+
+    direct.tokens["page-102"] = "version-page-102-replaced"
+    direct.deleted.add("page-102")
+    invalidated = await pipeline().run(direct)
+    assert invalidated.inventory_recovery == "reenumeration_required"
+    assert not invalidated.watermark_advanced
+    assert direct.seen_watermarks[-1] == direct.watermark
+
+    direct.deleted.remove("page-102")
+    direct.documents.pop("page-102")
+    direct.tokens.pop("page-102")
+    reconciled = await pipeline().run(direct)
+
+    assert reconciled.inventory_recovery == "reconciled"
+    assert reconciled.snapshot_completeness == "complete"
+    assert reconciled.discovered == 101
+    assert reconciled.reconciled_deleted_items == 1
+    assert reconciled.watermark_advanced
+    assert direct.seen_watermarks[-1] is None, (
+        "same-authority recovery must keep its durable base watermark for promotion CAS "
+        "without turning the replacement discovery into an incremental walk"
+    )
+
+    final_snapshot = await store.latest_promoted_snapshot(
+        direct.name, "direct-current-inventory-fingerprint"
+    )
+    assert final_snapshot is not None
+    source_calls = len(direct.fetches)
+    direct.forbidden_fetches.update(direct.documents)
+    await store.reset_derived()
+    assert await store.count_chunks() == 0
+
+    installed_parse = parse_fingerprint("plaintext")
+    assert installed_parse is not None
+    target = RebuildTarget(
+        parser_routing="synthetic-authority-routing-v1",
+        parser_set=(installed_parse.canonical(),),
+        chunk_fingerprint=chunker.fingerprint.canonical(),
+        embedding_fingerprint=embedder.fingerprint.canonical(),
+        embedding_config=embedder.fingerprint.model_dump_json(),
+        glossary_fingerprint=glossary_fingerprint(enabled=False, middleware=()).canonical(),
+        fts_tokenizer=FTS_TOKENIZER,
+        batch_documents=7,
+        max_memory_bytes=64 * 1024 * 1024,
+        max_temporary_bytes=64 * 1024 * 1024,
+    )
+    rebuild_store = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=blobs,
+        vectors=vectors,
+    )
+    rebuilder = build_offline_rebuilder(
+        store=rebuild_store,
+        blobs=blobs,
+        workspace_id=store.workspace_id,
+        source=direct.name,
+        parser_chain=ParserChain(
+            parsers={"plaintext": parser}, chains={"text/plain": ("plaintext",)}
+        ),
+        routing_identity=target.parser_routing,
+        chunker=chunker,
+        embedder=embedder,
+        vectors=vectors,
+        chunk_fingerprint=chunker.fingerprint,
+        middleware=MiddlewareRunner(()),
+        parse_runner=InProcessRunner(
+            {"plaintext": parser}, middleware=MiddlewareRunner(()), chunker=chunker
+        ),
+        detect_glossary=False,
+        clock=fakes.ManualLeaseClock(),
+    )
+    plan = await rebuilder.dry_run(final_snapshot.id, target)
+    rebuilt = await rebuilder.run(final_snapshot.id, target, owner="synthetic-offline-rebuild")
+
+    assert plan.runnable
+    assert plan.documents == 101
+    assert rebuilt.state is RebuildState.PUBLISHED
+    assert rebuilt.documents_built == 101
+    assert len(direct.fetches) == source_calls
+    assert await store.count_documents() == 101
+    settled = await store.get_acquisition_run(final_snapshot.id)
+    assert settled is not None
+    assert settled.state is AcquisitionRunState.SETTLED
+    assert settled.acquired_count == settled.indexed_count == 101
+
+    promoted_search = AuthorityConnector(
+        {
+            "fallback-a": "retained fallback a",
+            "fallback-b": "retained fallback b",
+            "fallback-c": "retained fallback c",
+        },
+        fingerprint="promoted-search-fingerprint",
+        authority="search",
+        name="promoted-search-wiki",
+    )
+    promoted_report = await pipeline().run(promoted_search)
+    assert promoted_report.snapshot_completeness == "complete"
+    older_promoted = await store.latest_promoted_snapshot(
+        promoted_search.name, "promoted-search-fingerprint"
+    )
+    assert older_promoted is not None
+    await pipeline().run(promoted_search)
+    newest_promoted = await store.latest_promoted_snapshot(
+        promoted_search.name, "promoted-search-fingerprint"
+    )
+    assert newest_promoted is not None
+    assert newest_promoted.id != older_promoted.id
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE acquisition_runs SET membership_hash = 'corrupted' WHERE id = :run_id"),
+            {"run_id": newest_promoted.id},
+        )
+
+    promoted_direct = AuthorityConnector(
+        {
+            "fallback-a": "retained fallback a",
+            "fallback-b": "changed fallback b",
+            "fallback-c": "retained fallback c",
+        },
+        fingerprint="promoted-direct-fingerprint",
+        authority="direct_current_content",
+        name="promoted-search-wiki",
+    )
+    promoted_direct.tokens["fallback-b"] = "version-fallback-b-changed"
+    promoted_direct.forbidden_fetches.update({"fallback-a", "fallback-c"})
+    fallback = await pipeline().run(promoted_direct)
+
+    assert fallback.snapshot_completeness == "complete"
+    assert fallback.durable_reused == 2
+    assert promoted_direct.fetches == ["fallback-b"]
 
 
 async def test_scope_change_resets_discovery_cursor_and_cas_binds_the_new_scope(
