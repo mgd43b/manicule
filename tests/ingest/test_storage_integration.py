@@ -1832,7 +1832,20 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     task = asyncio.create_task(pipeline.run(connector))
     try:
         await connector.enumeration_completed.wait()
-        await embedder.gate.wait_for(1, patience_s=60)
+        # **Sixty seconds was a budget calibrated on the wrong machine.** This gate does not open
+        # until a document has crossed the whole pipeline, and on the durable path every one of
+        # the 1,000 documents is acquired before indexing starts — so the wait is behind 1,000
+        # fetches and their retention, not behind one. Measured from `enumeration_completed` to
+        # the first arrival: 14.2s on a 16-core developer machine. Against a 60s budget that is
+        # a 4x margin, and CI's two-core runners are more than 4x slower at exactly this shape
+        # of work. It failed there, reporting zero arrivals.
+        #
+        # `patience_s` is "how long the test is willing to be wrong for" rather than a timeout on
+        # anything under test, and it only elapses when the test is *already* failing — so a
+        # generous number costs nothing on a green run and buys back a false failure. What it
+        # costs is that a genuine deadlock takes this long to report, which is the right trade
+        # for a stage that is legitimately slow.
+        await embedder.gate.wait_for(1, patience_s=300)
 
         durable = await store.latest_unsettled_acquisition_run(connector.name)
         assert durable is not None
