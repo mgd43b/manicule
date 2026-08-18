@@ -2708,13 +2708,18 @@ class ApplicationService:
             fingerprints = await store.index_fingerprints()
             documents = await store.count_documents()
             ingestion = await self._backend.ingestion()
-            configured_embed, configured_chunk = await ingestion.configured_index_fingerprints()
             inspect_physical = getattr(ingestion, "physical_index_fingerprint", None)
             physical_embed = (
                 await inspect_physical()
                 if fingerprints.is_empty and inspect_physical is not None
                 else None
             )
+            if fingerprints.is_empty and physical_embed is None:
+                configured_embed = configured_chunk = ""
+            else:
+                configured_embed, configured_chunk = (
+                    await ingestion.configured_index_fingerprints()
+                )
         except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
             return r.Check(
                 name="index",
