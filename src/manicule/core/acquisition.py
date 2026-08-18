@@ -248,6 +248,7 @@ class AcquisitionRun(BaseModel):
     connector: str
     source_scope: str = ""
     scope_fingerprint: str = ""
+    full_inventory_authority: str = ""
     scope_inventory_complete: bool = True
     promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
     state: AcquisitionRunState

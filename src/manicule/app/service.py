@@ -45,6 +45,7 @@ from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_own
 from manicule.config.loader import load_settings
 from manicule.config.settings import (
     AuthMode,
+    ConnectorSettings,
     Role,
     Settings,
     config_file,
@@ -241,6 +242,7 @@ def _snapshot_status_report(
         state=run.state.value,
         verified=verified,
         verification_performed=verification_performed,
+        full_inventory_authority=_public_full_inventory_authority(run.full_inventory_authority),
         lifecycle=r.LifecycleProgress(
             phase=phase,
             outcome=outcome,
@@ -271,6 +273,7 @@ def _snapshot_status_report(
                 "" if run.inventory_state.value == "current" else run.inventory_state.value
             ),
             reconciled_deleted_items=run.reconciled_deleted_count,
+            full_inventory_authority=_public_full_inventory_authority(run.full_inventory_authority),
         ),
     )
 
@@ -1257,6 +1260,7 @@ class ApplicationService:
                         raw_watermark_advanced if isinstance(raw_watermark_advanced, bool) else None
                     ),
                     last_lifecycle=last_lifecycle,
+                    full_inventory_authority=_configured_full_inventory_authority(configured),
                 )
             )
         return r.ConnectorList(count=len(summaries), connectors=tuple(summaries))
@@ -5288,6 +5292,7 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         snapshot_omission_reasons=dict(report.snapshot_omission_reasons),
         inventory_recovery=report.inventory_recovery,
         reconciled_deleted_items=report.reconciled_deleted_items,
+        full_inventory_authority=_public_full_inventory_authority(report.full_inventory_authority),
         retry_required=incomplete,
         derivation_deferred=report.derivation_deferred,
         intentionally_bounded=bounded,
@@ -5296,6 +5301,30 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         elapsed_ms=elapsed_ms,
         lifecycle=lifecycle,
     )
+
+
+def _configured_full_inventory_authority(
+    configured: ConnectorSettings,
+) -> r.FullInventoryAuthority:
+    """Effective public authority without constructing a credentialed live connector."""
+    from manicule.connectors.config import (  # noqa: PLC0415
+        CONNECTOR_NAME,
+        ConfluenceConfig,
+    )
+
+    if configured.type != CONNECTOR_NAME:
+        return ""
+    config = ConfluenceConfig.model_validate(configured.options)
+    return cast("r.FullInventoryAuthority", config.effective_full_inventory_authority.value)
+
+
+def _public_full_inventory_authority(value: str) -> r.FullInventoryAuthority:
+    """Closed aggregate value; durable/plugin strings never become a public data channel."""
+    if value == "search":
+        return "search"
+    if value == "direct_current_content":
+        return "direct_current_content"
+    return ""
 
 
 def _weights_check(plan: WeightsPlan | None) -> r.Check:

@@ -251,7 +251,13 @@ class ConfluenceClient:
             raise ConnectorError(msg)
         return cast("Json", payload)
 
-    async def paginate(self, url: str, params: Params = ()) -> AsyncIterator[Json]:
+    async def paginate(
+        self,
+        url: str,
+        params: Params = (),
+        *,
+        validate_next: Callable[[str, Params], Params | None] | None = None,
+    ) -> AsyncIterator[Json]:
         """Yield each page of a cursor-paginated response, following ``_links.next``.
 
         Three failures are guarded here, and each is silent without a guard:
@@ -277,12 +283,15 @@ class ConfluenceClient:
                 following = next_page(payload, base_url=self._config.base_url)
                 if following is None:
                     return
+                next_params = following.params
+                if validate_next is not None:
+                    next_params = validate_next(following.url, following.params) or next_params
 
                 # The history insertion is disk-backed on purpose. Include that I/O in the
                 # cursor's held time: checking before it would leave an unguarded stall between
                 # the check and the next request, which is precisely where an expired cursor
                 # must never be followed.
-                is_new = followed.add(following.url, following.params)
+                is_new = followed.add(following.url, next_params)
                 held = self._clock() - received
                 if held > self._config.cursor_lifetime_seconds:
                     msg = (
@@ -307,7 +316,7 @@ class ConfluenceClient:
                     )
                     raise ConnectorError(msg)
                 current_url = following.url
-                current_params = following.params
+                current_params = next_params
         finally:
             followed.close()
 

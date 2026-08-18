@@ -40,6 +40,7 @@ def _backend() -> FakeBackend:
         connector="synthetic-wiki",
         source_scope="scope",
         scope_fingerprint="scope-fingerprint",
+        full_inventory_authority="direct_current_content",
         promotion_policy=SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         state=AcquisitionRunState.INDEXING,
         candidate_watermark=Watermark(value="cursor-1000", observed_at=_NOW),
@@ -87,6 +88,8 @@ def test_http_and_mcp_return_the_same_aggregate_snapshot_status() -> None:
     assert lifecycle["pending_items"] == 750
     assert lifecycle["backlog_bytes"] == 200_000
     assert lifecycle["can_continue_offline"] is True
+    assert data["full_inventory_authority"] == "direct_current_content"
+    assert lifecycle["full_inventory_authority"] == "direct_current_content"
 
 
 async def test_unchanged_members_do_not_hide_pending_acquired_derivation() -> None:

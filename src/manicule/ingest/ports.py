@@ -352,6 +352,7 @@ class AcquisitionStore(Protocol):
         *,
         source_scope: str = "",
         scope_fingerprint: str = "",
+        full_inventory_authority: str = "",
         scope_inventory_complete: bool = True,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
     ) -> AcquisitionRun: ...
@@ -370,6 +371,7 @@ class AcquisitionStore(Protocol):
         *,
         source_scope: str = "",
         scope_fingerprint: str = "",
+        full_inventory_authority: str = "",
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         now: datetime,
         expires_at: datetime,
@@ -522,6 +524,10 @@ class AcquisitionStore(Protocol):
 
     async def latest_promoted_snapshot(
         self, connector: str, scope_fingerprint: str | None
+    ) -> AcquisitionRun | None: ...
+
+    async def latest_promoted_snapshot_for_source_scope(
+        self, connector: str, source_scope: str
     ) -> AcquisitionRun | None: ...
 
     async def reusable_snapshot_record(

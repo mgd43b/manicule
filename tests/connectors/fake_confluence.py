@@ -240,6 +240,7 @@ class FakeConfluence:
         *,
         base_url: str = CLOUD_BASE,
         pages: Sequence[FakePage] = (),
+        search_pages: Sequence[FakePage] | None = None,
         attachments: Sequence[FakeAttachment] = (),
         spaces: Mapping[str, str] | None = None,
         page_size: int = 2,
@@ -248,6 +249,9 @@ class FakeConfluence:
         self.base_url = base_url.rstrip("/")
         self.context = httpx.URL(self.base_url).path.rstrip("/")
         self.pages = {page.id: page for page in pages}
+        self.search_pages = (
+            None if search_pages is None else {page.id: page for page in search_pages}
+        )
         self.attachments = {item.id: item for item in attachments}
         self.spaces = dict(spaces or {page.space: f"{page.space} space" for page in pages})
         self.page_size = page_size
@@ -411,6 +415,8 @@ class FakeConfluence:
             return httpx.Response(200, json={"type": "known", "username": self.user})
         if path == "/rest/api/content/search":
             return self._search(request)
+        if path == "/rest/api/content":
+            return self._direct_content(request)
         if path.startswith("/api/v2/pages/"):
             return self._v2_page(path)
         if path.endswith("/child/page") and path.startswith("/rest/api/content/"):
@@ -468,6 +474,44 @@ class FakeConfluence:
         rows = [self._result(item, expanded) for item in self._matching(query)]
         return self._paged(request, rows, "/rest/api/content/search")
 
+    def _direct_content(self, request: httpx.Request) -> httpx.Response:
+        """Authoritative current rows, independently of the synthetic search inventory."""
+        space = request.url.params.get("spaceKey", "")
+        kind = request.url.params.get("type", "")
+        status = request.url.params.get("status", "")
+        expanded = request.url.params.get("expand", "")
+        items: list[FakePage | FakeAttachment] = []
+        if status == "current" and kind == "page":
+            items.extend(
+                page
+                for page in self.pages.values()
+                if page.space == space and page.status == "current" and page.kind == "page"
+            )
+        if status == "current" and kind == "attachment":
+            items.extend(
+                item
+                for item in self.attachments.values()
+                if item.space == space and item.page_id in self.pages
+            )
+        rows = [self._result(item, expanded) for item in sorted(items, key=lambda item: item.id)]
+        limit = min(
+            int(request.url.params.get("limit", str(self.page_size)) or self.page_size),
+            self.page_size,
+        )
+        start = int(request.url.params.get("start", "0") or "0")
+        window = rows[start : start + limit]
+        payload: dict[str, Any] = {
+            "results": window,
+            "start": start,
+            "limit": limit,
+            "size": len(window),
+            "_links": {"base": self.base_url, "self": f"{self.base_url}/rest/api/content"},
+        }
+        following = start + limit
+        if following < len(rows):
+            payload["_links"]["next"] = f"/rest/api/content?limit={limit}&start={following}"
+        return httpx.Response(200, json=payload)
+
     def _matching(self, query: str) -> list[FakePage | FakeAttachment]:
         space = _unescape(_SPACE.search(query))
         title = _unescape(_TITLE.search(query))
@@ -476,9 +520,12 @@ class FakeConfluence:
 
         found: list[FakePage | FakeAttachment] = []
         if "page" in kinds:
+            source_pages = (
+                self.pages.values() if self.search_pages is None else self.search_pages.values()
+            )
             found.extend(
                 page
-                for page in self.pages.values()
+                for page in source_pages
                 if (not space or page.space == space)
                 and (not title or page.title == title)
                 and page.status == "current"

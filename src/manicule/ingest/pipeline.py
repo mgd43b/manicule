@@ -148,6 +148,16 @@ backpressure on the pipeline.
 """
 
 type _PublicationFence = Callable[[], Awaitable[AcquisitionFence]]
+type FullInventoryAuthority = Literal["", "search", "direct_current_content"]
+
+
+def _closed_full_inventory_authority(value: object) -> FullInventoryAuthority:
+    """Normalize connector/durable input to the private-safe aggregate vocabulary."""
+    if value == "search":
+        return "search"
+    if value == "direct_current_content":
+        return "direct_current_content"
+    return ""
 
 
 _publication_fence: ContextVar[_PublicationFence | None] = ContextVar(
@@ -474,6 +484,7 @@ class RunReport:
     snapshot_omission_reasons: dict[str, int] = field(default_factory=dict[str, int])
     inventory_recovery: Literal["", "reenumeration_required", "reenumerating", "reconciled"] = ""
     reconciled_deleted_items: int = 0
+    full_inventory_authority: FullInventoryAuthority = ""
 
     @property
     def indexed(self) -> int:
@@ -610,6 +621,9 @@ class RunReport:
                 "snapshot_omission_reasons": dict(self.snapshot_omission_reasons),
                 "inventory_recovery": self.inventory_recovery,
                 "reconciled_deleted_items": self.reconciled_deleted_items,
+                "full_inventory_authority": _closed_full_inventory_authority(
+                    self.full_inventory_authority
+                ),
                 "retry_required": self.retry_required,
                 "derivation_deferred": self.derivation_deferred,
                 "glossary_failures": list(self.glossary_failures),
@@ -710,6 +724,9 @@ class RunReport:
             "refusal": refusal,
             "inventory_recovery": self.inventory_recovery,
             "reconciled_deleted_items": self.reconciled_deleted_items,
+            "full_inventory_authority": _closed_full_inventory_authority(
+                self.full_inventory_authority
+            ),
         }
 
 
@@ -745,6 +762,7 @@ class _AcquisitionStart:
     state: AcquisitionRunState | None = None
     source_scope: str = ""
     scope_fingerprint: str = ""
+    full_inventory_authority: FullInventoryAuthority = ""
     promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
     completeness: SnapshotCompleteness | None = None
     omission_count: int = 0
@@ -784,6 +802,7 @@ class _Sync:
     acquisition_state: AcquisitionRunState | None = None
     source_scope: str = ""
     scope_fingerprint: str = ""
+    full_inventory_authority: FullInventoryAuthority = ""
     promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
     snapshot_completeness: SnapshotCompleteness | None = None
     snapshot_omission_count: int = 0
@@ -1006,6 +1025,7 @@ class IngestPipeline:
         if acquisitions is None:
             return _AcquisitionStart(watermark=watermark)
         source_scope, scope_fingerprint = snapshot_scope(connector)
+        full_inventory_authority = snapshot_full_inventory_authority(connector)
         owner = f"pipeline:{uuid4().hex}"
         now = self._acquisition_clock()
         claimed = await acquisitions.claim_or_create_acquisition_run(
@@ -1014,6 +1034,7 @@ class IngestPipeline:
             owner,
             source_scope=source_scope,
             scope_fingerprint=scope_fingerprint,
+            full_inventory_authority=full_inventory_authority,
             promotion_policy=self._snapshot_policy,
             now=now,
             expires_at=now + timedelta(seconds=self._acquisition_lease_s),
@@ -1038,12 +1059,16 @@ class IngestPipeline:
             accepted=claimed.discovered_count,
             watermark=(
                 claimed.base_watermark
-                if claimed.base_watermark_scope_fingerprint == claimed.scope_fingerprint
+                if claimed.inventory_state is not AcquisitionInventoryState.REENUMERATING
+                and claimed.base_watermark_scope_fingerprint == claimed.scope_fingerprint
                 else None
             ),
             state=claimed.state,
             source_scope=claimed.source_scope,
             scope_fingerprint=claimed.scope_fingerprint,
+            full_inventory_authority=_closed_full_inventory_authority(
+                claimed.full_inventory_authority
+            ),
             promotion_policy=claimed.promotion_policy,
             completeness=claimed.completeness,
             omission_count=claimed.omission_count,
@@ -1126,6 +1151,7 @@ class IngestPipeline:
                     limit=self._acquisition_cleanup_batch,
                 )
         report = RunReport(connector=connector.name)
+        report.full_inventory_authority = snapshot_full_inventory_authority(connector)
         if self._acquisitions is not None:
             _, scope_fingerprint = snapshot_scope(connector)
             watermark = await self._acquisitions.get_acquisition_watermark(
@@ -1170,6 +1196,7 @@ class IngestPipeline:
             acquisition_state=acquisition.state,
             source_scope=acquisition.source_scope,
             scope_fingerprint=acquisition.scope_fingerprint,
+            full_inventory_authority=acquisition.full_inventory_authority,
             promotion_policy=acquisition.promotion_policy,
             snapshot_completeness=acquisition.completeness,
             snapshot_omission_count=acquisition.omission_count,
@@ -2005,6 +2032,10 @@ class IngestPipeline:
             promoted = await acquisitions.latest_promoted_snapshot(
                 run.connector.name, run.scope_fingerprint
             )
+            if promoted is None:
+                promoted = await acquisitions.latest_promoted_snapshot_for_source_scope(
+                    run.connector.name, run.source_scope
+                )
             run.reusable_snapshot_run_id = None if promoted is None else promoted.id
             run.reusable_snapshot_checked = True
         if run.reusable_snapshot_run_id is None:
@@ -4025,6 +4056,14 @@ def snapshot_scope(connector: Connector) -> tuple[str, str]:
         return source_scope, declared_fingerprint
     fingerprint = hashlib.blake2b(source_scope.encode(), digest_size=20).hexdigest()
     return source_scope, fingerprint
+
+
+def snapshot_full_inventory_authority(connector: Connector) -> FullInventoryAuthority:
+    """Aggregate-safe effective inventory authority, blank for connectors without one."""
+    declared = getattr(connector, "full_inventory_authority", "")
+    if callable(declared):
+        declared = declared()
+    return _closed_full_inventory_authority(declared)
 
 
 def _with_status(document: Document, result: ChainResult) -> Document:

@@ -285,6 +285,34 @@ type in (page, attachment) AND space = "ENG" order by lastmodified asc
 Sent to `GET /wiki/rest/api/content/search` with
 `&expand=version,ancestors,space,container&limit=100`.
 
+**Data Center can use the direct current-content inventory for complete membership.** The
+compatibility default remains:
+
+```toml
+[connectors.handbook.options]
+full_inventory_authority = "search"
+```
+
+For a Server or Data Center connector whose scope is one or more whole spaces, setting
+`full_inventory_authority = "direct_current_content"` makes full discovery and reconciliation
+enumerate `page` and `attachment` separately through `GET /rest/api/content`, explicitly pinned
+to the canonical space and `status=current`. Incremental discovery remains the CQL query below.
+Cloud and `root_page_ids` scopes remain entirely CQL-backed; the option does not alter their
+cursor identity or cause a replacement walk.
+
+This is an explicit source-authority choice, not a fallback after search looks suspicious. Every
+direct member must carry its source id, exact type, current status, canonical space, positive
+revision, offset-aware modification time, and required page or attachment metadata. Missing or
+mismatched evidence fails the aggregate enumeration; it is never converted to an empty result or
+filled from the request. Under strict policy that run cannot promote. `allow_omissions` may still
+represent typed body-fetch omissions, but it cannot promote an inventory known to be incomplete.
+
+Data Center native `next` links commonly contain only `start` and `limit`. The connector follows
+that native coordinate while re-pinning space, type, status, expansion, and configured page size
+on every request. An explicit conflict, extra narrowing parameter, malformed coordinate,
+cross-origin link, or loop fails closed. A response page is committed before its next link is
+requested, and only a direct walk's true end authorizes reconciliation.
+
 **Incremental** — a per-space watermark of the last successful sync, which adds one clause to
 whichever of those two the deployment uses:
 
@@ -538,6 +566,16 @@ enumeration closes; only the current response page is retained in process memory
 ### Changing the roots
 
 A watermark is a position **within a scope**, and the two are meaningless apart.
+
+The effective full-inventory authority is part of that position too. Historical and default
+search-backed scopes retain their exact existing fingerprint and watermark representation.
+Choosing direct current-content authority for a Data Center whole-space scope creates a distinct
+cursor identity, so an old CQL watermark can never turn the first direct walk into an incremental
+query. The stable corpus scope remains separate: after the replacement inventory reaches each
+member, retained bytes may be adopted from the fenced search-backed predecessor only when the
+connector, source identity, revision, URI, media type, byte length, hash, blob, and acquired-source
+envelope all agree. This avoids redownloading an unchanged corpus without treating the old
+watermark as compatible.
 `Watermark.metadata` therefore records the scope its positions were reached in, and when the configured
 roots or `include_root_pages` change, every stored position is discarded and the run enumerates
 the new scope in full. Anything less loses documents: every page in a newly configured tree that
