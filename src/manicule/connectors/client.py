@@ -285,7 +285,9 @@ class ConfluenceClient:
                     return
                 next_params = following.params
                 if validate_next is not None:
-                    next_params = validate_next(following.url, following.params) or next_params
+                    validated = validate_next(following.url, following.params)
+                    if validated is not None:
+                        next_params = validated
 
                 # The history insertion is disk-backed on purpose. Include that I/O in the
                 # cursor's held time: checking before it would leave an unguarded stall between
