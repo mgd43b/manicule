@@ -817,8 +817,10 @@ sending a `POST` to `/mcp/` and getting a 307 it may not re-send a body for.
 **Every mutating tool is absent from it.** Not refused — absent. `manicule.mcp.server` is asked
 for the read-only surface, and it never calls `@mcp.tool` for a tool whose `readOnlyHint` is not
 true, so there is no handler behind `document_delete`, `connector_sync`, `config_set`,
-`plugin_add`, `index_path`, `ask` or the twelve collection verbs on that server object. A call to
-one is an unknown tool.
+`plugin_add`, `index_path`, `ask` or the eight mutating collection verbs (`collection_create`,
+`collection_rename`, `collection_update`, `collection_rule_set`, `collection_rule_clear`,
+`collection_delete`, `collection_add`, and `collection_remove`) on that server object. A call to
+one is an unknown tool; the four read-only collection tools remain available.
 
 That is the same guarantee `tests/api/test_routes.py` keeps for the HTTP route table, kept the
 same way and asserted in the same file: `ABSENT` names the operations with no route, and
