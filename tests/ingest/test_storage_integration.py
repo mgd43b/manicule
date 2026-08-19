@@ -4709,6 +4709,82 @@ async def test_unchanged_revision_reuses_promoted_snapshot_without_body_download
     )
 
 
+WORKERS = 8
+"""Acquisition workers the reusable-manifest test runs with, pinned rather than inherited.
+
+Enough of them, against three times as many records, that several are inside the lookup together
+on every run. Read from here rather than from ``IngestPipeline``'s default so that lowering that
+default changes what the pipeline does and not what this test proves."""
+
+
+async def test_the_reusable_manifest_is_verified_once_across_every_acquisition_worker(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claim above, made to fail on demand rather than on a bad day.
+
+    The test above states the same property with two documents, and two documents rarely put two
+    workers in the lookup at once — so it held for months and then failed one CI shard, which is
+    the worst way for a property to be checked. Three records per worker puts several of them in
+    the lookup together every time, and the lookup is held open across a few event-loop turns so
+    the window cannot close by luck on a fast machine.
+
+    Instrumenting the unguarded version showed exactly this: ``acquire-1`` enters while
+    ``acquire-0`` is still inside the query, reads the memo as ``False``, and issues it again.
+
+    :data:`WORKERS` is passed to the pipeline rather than inherited from it. Eight is the default
+    today, and a default lowered to one would leave this test green while it reproduced nothing —
+    a test that cannot fail for the reason it exists, which is the shape #233 found in the
+    lease-heartbeat test after a refactor moved the seam it patched.
+    """
+    connector = fakes.DictConnector(
+        {f"public-shared-{index}": f"retained body {index}" for index in range(3 * WORKERS)},
+        name="shared-manifest-source",
+    )
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+            fetch_concurrency=WORKERS,
+        )
+
+    first = await pipeline().run(connector)
+    fetches = list(connector.fetches)
+    calls = 0
+    latest_promoted_snapshot = store.latest_promoted_snapshot
+
+    async def held_open(connector_name: str, scope_fingerprint: str):  # noqa: ANN202
+        nonlocal calls
+        calls += 1
+        # Yields rather than sleeps: every other worker runs to its own check while this one is
+        # suspended, which is the window the memo has to survive, and it costs no wall clock.
+        for _ in range(8):
+            await asyncio.sleep(0)
+        return await latest_promoted_snapshot(connector_name, scope_fingerprint)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "latest_promoted_snapshot", held_open)
+        second = await pipeline().run(connector)
+
+    assert first.snapshot_completeness == "complete"
+    assert second.skipped_version == 3 * WORKERS
+    assert calls == 1, "every worker after the first reads the memo instead of repeating the query"
+    assert connector.fetches == fetches, "a verified manifest means no body is downloaded again"
+
+
 async def test_direct_native_pages_restart_from_an_exact_durable_prefix(
     store: SqliteDocStore,
     engine: AsyncEngine,
