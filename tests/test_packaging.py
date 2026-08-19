@@ -326,3 +326,45 @@ def test_main_translates_an_absent_dependency_and_propagates_everything_else(
         entry.main()
 
     assert propagated.value is incompatible
+
+
+def test_each_published_distribution_publishes_from_its_own_environment() -> None:
+    """No two publish jobs share a GitHub environment, and every published package has one.
+
+    This is a PyPI constraint wearing a GitHub Actions costume. A *pending* trusted publisher
+    must have a unique claim set, and the environment name is part of it — the OIDC `sub` reads
+    `repo:owner/repo:environment:<name>`. Two packages publishing from one environment therefore
+    cannot both be registered before their first release: PyPI refuses the second with "a pending
+    trusted publisher matching this configuration has already been registered for a different
+    project name", and the only ways out are ordering the first release by hand or coming back
+    here.
+
+    Found the hard way, on the first real release. Pinned so the next package added to
+    `PUBLISHED` cannot rediscover it.
+    """
+    import yaml  # noqa: PLC0415 - a test-only dependency, kept out of this module's import cost
+
+    workflow = cast(dict[str, Any], yaml.safe_load(RELEASE_WORKFLOW.read_text()))
+    jobs = cast(dict[str, dict[str, Any]], workflow["jobs"])
+
+    environments: dict[str, str] = {}
+    for name, job in jobs.items():
+        steps = cast(list[dict[str, Any]], job.get("steps") or [])
+        if not any("gh-action-pypi-publish" in str(step.get("uses", "")) for step in steps):
+            continue
+        environment = job.get("environment")
+        assert isinstance(environment, dict), (
+            f"job {name!r} uploads to PyPI without an `environment:`. The environment is half of "
+            "what the trusted publisher matches on; without it the OIDC claims cannot identify "
+            "which project is being published."
+        )
+        environments[name] = cast(str, environment["name"])
+
+    assert len(environments) == len(PUBLISHED), (
+        f"{len(PUBLISHED)} distributions are published but {len(environments)} jobs upload to "
+        f"PyPI: {environments}"
+    )
+    assert len(set(environments.values())) == len(environments), (
+        f"two publish jobs share an environment: {environments}. Each needs its own, or their "
+        "pending trusted publishers collide on PyPI and the second cannot be registered."
+    )

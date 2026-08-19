@@ -2,22 +2,32 @@ name: Release
 
 # release-please reads the Conventional Commits on `main` and keeps a release PR open that
 # bumps the version and writes CHANGELOG.md. Merging that PR creates the `vX.Y.Z` tag and the
-# GitHub Release; the publish job below then builds and pushes to PyPI.
+# GitHub Release; the jobs below then build and push both distributions to PyPI.
 #
-# Nothing here is triggered by a tag. A tag push is how a release is *recorded*, and making it
-# the trigger would mean a hand-pushed tag could publish a version no release PR ever reviewed.
+# A tag push is not a trigger. A tag is how a release is *recorded*, and triggering on one would
+# let a hand-pushed tag publish a version no release PR ever reviewed. `workflow_dispatch` is the
+# deliberate exception: it names an existing tag and republishes it, which is what recovers a
+# release whose upload failed after the tag already existed. It cannot invent a version — the
+# tag has to be there to check out.
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing tag to build and publish, e.g. v0.1.0"
+        required: true
+        type: string
 
-# Denied at the top and granted per job. The publish job needs `id-token: write`, and a
-# workflow-wide grant would hand that to release-please as well.
 permissions: {}
 
 jobs:
   release-please:
     name: release-please
     runs-on: ubuntu-latest
+    # Skipped on a manual republish: there is no new commit to read, and running it would only
+    # re-derive a release PR that already exists.
+    if: ${{ github.event_name == 'push' }}
     permissions:
       contents: write
       pull-requests: write
@@ -30,27 +40,26 @@ jobs:
         with:
           token: ${{ github.token }}
 
-  publish:
-    name: publish to PyPI
+  # One build, two publishes. The artifacts are built once and handed to the publish jobs,
+  # rather than each rebuilding, so that what reaches PyPI under both names is demonstrably the
+  # same set of files rather than two builds that ought to agree.
+  build:
+    name: build
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    # `always()` because `release-please` is skipped on a manual republish, and a skipped
+    # dependency would otherwise skip this too.
+    if: ${{ always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/manicule
-    permissions:
-      # Mandatory for OIDC trusted publishing. There is no API token in this repository's
-      # secrets and there should never be one: the credential is minted per run, scoped to this
-      # workflow in this repository, and expires. A leaked token cannot be replayed because
-      # there is nothing to leak. Both projects register the *same* publisher — this repository,
-      # `release.yml`, environment `pypi` — so one workflow can push both.
-      id-token: write
-      # To attach the built distributions to the GitHub Release.
-      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
     steps:
+      - name: which tag is being published
+        id: resolve
+        run: echo "tag=${{ inputs.tag || needs.release-please.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ steps.resolve.outputs.tag }}
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -59,16 +68,9 @@ jobs:
           # wheels are `py3-none-any`, so this does not restrict what they install onto.
           python-version: "3.12"
 
-      # **Two distributions, built and uploaded separately.** `manicule` is MIT; `manicule-mlx`
-      # is GPL-3.0-or-later, because it links `mlx-embeddings`, and that split is the entire
-      # reason the second package exists. They are versioned in lockstep — release-please bumps
-      # both from one release PR — because `manicule_mlx`'s plugin manifest pins a `core_version`
-      # range against manicule, and one version answering "which mlx goes with which manicule"
-      # is worth more than an independent cadence for a package that has no independent purpose.
-      #
-      # Each is named explicitly. `packages/` also holds two plugin distributions that exist to
-      # be test fixtures, and naming the packages is what keeps them off PyPI — a bare
-      # `uv build` in a workspace is the failure mode this avoids.
+      # Each package named explicitly. `packages/` also holds two plugin distributions that
+      # exist to be test fixtures, one of which hangs and allocates without bound on purpose,
+      # and naming the packages is what keeps them off PyPI.
       #
       # uv builds each wheel *from its own sdist* rather than from the tree, so this also
       # answers "does the sdist contain enough to build" — the failure where a local wheel works
@@ -79,12 +81,9 @@ jobs:
           uv build --package manicule-mlx --out-dir dist/manicule-mlx
 
       - name: the built artifacts are exactly the four expected ones
-        # A guard on the globs the publish steps pass. An unexpected file in either directory is
-        # either a stale artifact or a workspace member that leaked past `--package`, and both
-        # are better as a failed release than a published one.
         run: |
           set -euo pipefail
-          version="${{ needs.release-please.outputs.tag_name }}"
+          version="${{ steps.resolve.outputs.tag }}"
           version="${version#v}"
           for dist in manicule manicule-mlx; do
             underscored="${dist//-/_}"
@@ -94,11 +93,10 @@ jobs:
             test "${actual}" = "${expected} "
           done
 
-      # The same check the `dist` job in ci.yml runs on every pull request, repeated here against
-      # the artifacts actually being published rather than a rebuild of them. `manicule-mlx` is
-      # installed alongside, which is the combination the README tells an Apple silicon reader to
-      # install; on this Linux runner its `mlx-embeddings` marker is false, so what is proved
-      # here is that the distribution installs and its entry point resolves, not that Metal runs.
+      # The same check the `dist` job in ci.yml runs on every pull request, against the artifacts
+      # actually being published rather than a rebuild of them. On this Linux runner
+      # `manicule-mlx`'s `mlx-embeddings` marker is false, so what is proved is that the
+      # distribution installs and its entry point resolves, not that Metal runs.
       - name: the wheels install clean and the console script runs
         run: |
           set -euo pipefail
@@ -107,23 +105,77 @@ jobs:
             "$(echo dist/manicule/*.whl)[all]" "$(echo dist/manicule-mlx/*.whl)"
           /tmp/smoke/bin/manicule --version
 
-      # Two uploads rather than one over a merged directory, so a failure names the distribution
-      # that failed instead of reporting a rejected file. `manicule` goes first: `manicule-mlx`
-      # depends on it, and a resolver that finds the backend without the core it pins would be a
-      # worse partial state than the reverse.
-      - name: publish manicule to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/upload-artifact@v6
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  # **Two jobs, two environments, and the split is not cosmetic.** PyPI requires a *pending*
+  # trusted publisher to have a unique claim set, and the environment name is part of those
+  # claims — the `sub` reads `repo:owner/repo:environment:<name>`. With both packages publishing
+  # from one environment the second registration is refused outright, with "a pending trusted
+  # publisher matching this configuration has already been registered for a different project
+  # name". Separate environments give each package its own claim set, so both can be registered
+  # before either has ever been published.
+  #
+  # Each job also holds `id-token: write` alone rather than the whole workflow holding it.
+  publish-manicule:
+    name: publish manicule
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/manicule
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/manicule
+          # A republish of a tag whose other half failed must not fail on the half that
+          # succeeded. Only an *identical* filename is skipped; PyPI still refuses a changed
+          # artifact under a version it already has, so this cannot quietly ship a rebuild.
+          skip-existing: true
 
-      - name: publish manicule-mlx to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+  publish-manicule-mlx:
+    name: publish manicule-mlx
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-mlx
+      url: https://pypi.org/p/manicule-mlx
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/manicule-mlx
+          skip-existing: true
 
-      - name: attach the distributions to the release
-        env:
+  # Last, and only once both uploads succeeded: the assets on the GitHub Release should describe
+  # a release that actually reached PyPI.
+  attach:
+    name: attach to the release
+    needs: [build, publish-manicule, publish-manicule-mlx]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: distributions
+          path: dist
+      - env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release upload "${{ needs.release-please.outputs.tag_name }}"
-          dist/manicule/* dist/manicule-mlx/* --repo "${{ github.repository }}"
+          gh release upload "${{ needs.build.outputs.tag }}"
+          dist/manicule/* dist/manicule-mlx/* --repo "${{ github.repository }}" --clobber
