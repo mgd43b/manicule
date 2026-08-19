@@ -1722,6 +1722,25 @@ class SidecarReport(Payload):
     """
 
 
+class MessagingHostInstalled(Payload):
+    """Where the browser extension's native messaging host manifest was written.
+
+    Paths rather than a count, because the operator's next question when the extension cannot
+    reach manicule is *which browsers were set up* — and a browser they had not started before
+    running this is skipped rather than invented, so the answer is not always all of them.
+
+    Carries no credential and could not: installing the manifest grants no access to any site.
+    The extension asks Chrome for that itself, per origin, and Chrome's own dialog approves it.
+    """
+
+    installed: tuple[str, ...] = Field(
+        default=(), description="Host manifest paths written, one per browser."
+    )
+    extension_id: str = Field(
+        default="", description="The extension permitted to start the host. No other one can."
+    )
+
+
 class ConnectorSignedIn(Payload):
     """A browser session captured for a source, proved against it, and stored.
 

@@ -281,6 +281,86 @@ stay separate.
 
 `manicule doctor` reports which sources are covered, naming accounts and never cookies.
 
+### 1.1a1 Reusing the session in your own browser
+
+Everything above signs you in to a browser manicule opened. The extension does the opposite: it
+reads the session you *already have* in your ordinary Chrome, and hands it over without opening
+anything.
+
+```console
+$ manicule browser-auth install
+```
+
+Then load `extension/` at `chrome://extensions` with developer mode on, and set your Confluence
+URL in its popup. Chrome asks whether to grant access to that one site; nothing is read until you
+say yes.
+
+After that there is no login command at all. Sign in to your wiki the way you normally would —
+in your own browser, your own profile, your own device — and manicule follows within a couple of
+seconds. When the session expires, you sign in again as you would anyway, and manicule follows
+again.
+
+#### Why this needs an extension rather than a cleverer login
+
+A normal browser deliberately does not expose its live profile to another process. Chrome will
+not open a profile another Chrome owns, and a browser not started with remote debugging offers
+nothing to attach to. The remaining routes — copying the profile, decrypting the cookie database,
+opening a debugging port on your everyday browser — are all things manicule refuses to do.
+
+`chrome.cookies` is the supported way to ask, and an extension is the only thing that can call
+it. That is the whole reason this exists.
+
+#### What it can see, which is less than the browser login
+
+The manifest is nine lines and the absences are the point:
+
+- **No content scripts, and no permission that would allow one.** It never sees a page, a form, a
+  keystroke or a password. The driven-browser paths above can only promise they *do not* read the
+  page; this one **cannot**.
+- **No standing access to any site.** The host permission is requested at runtime for the one
+  origin you name, through Chrome's own dialog.
+- **No `webRequest`, no `debugger`, no `scripting`, no history.**
+
+It reads `chrome.cookies.getAll` for that origin — which includes `httpOnly` cookies, and is why
+this works at all, since a Confluence session cookie is unreachable from page script.
+
+#### How it reaches manicule
+
+Not over HTTP. A loopback port is reachable by every process on the machine, and a session
+credential does not belong behind one (`docs/surfaces.md` §4). The extension talks to a short-lived
+local process over Chrome's native messaging, which is a pipe rather than a socket:
+
+- Chrome starts that host only for the extension id named in the manifest `browser-auth install`
+  wrote, and for no other;
+- the extension only talks to a host it names.
+
+There is no port, no token and nothing to leak. The pairing is mutual and the operating system
+enforces it.
+
+#### What manicule does with what arrives
+
+The extension is an input, not an authority. Three checks, none of which trust it:
+
+- the URL must match a **configured, enabled** Confluence connector, so the extension cannot ask
+  manicule to hold a session for a site you never named;
+- the cookies are re-filtered to that authority by the same function the browser and state-file
+  paths use, so a jar containing an identity provider's cookies loses them here;
+- the result is proved against the instance before it is held, so a session that does not
+  authenticate is never stored and a working one is never replaced by it.
+
+Nothing is written to disk. The session crosses to the running server and lives in its memory, as
+every other login path's does.
+
+#### Removing it
+
+Delete the extension at `chrome://extensions`, and delete the host manifest:
+
+```console
+$ rm ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/com.manicule.session_handoff.json
+```
+
+With either gone the pairing is broken and nothing can start the host.
+
 ### 1.1b Importing a browser state file
 
 `--browser-state` reads a Playwright `storage_state` JSON document — the thing

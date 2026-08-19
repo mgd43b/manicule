@@ -181,7 +181,7 @@ def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
     }.isdisjoint(TOOL_NAMES)
 
 
-def test_the_command_line_offers_exactly_twenty_seven_commands() -> None:
+def test_the_command_line_offers_exactly_twenty_eight_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
@@ -189,6 +189,11 @@ def test_the_command_line_offers_exactly_twenty_seven_commands() -> None:
 
     ``serve`` and ``start`` are one function registered under two names, and the count includes
     both because that is what somebody typing ``manicule --help`` sees.
+
+    ``browser-auth`` is the newest and is a group of one: it installs the native messaging host
+    the browser extension reaches manicule through. It is a command rather than a documented
+    path to write a file by hand because the four locations differ by browser and by operating
+    system, which is exactly the instruction people get wrong.
     ``serve`` is the name the documentation uses and the one every refusal names, because it
     says what the process does; ``start`` is what scripts and habits already type, so it is kept
     rather than broken.
@@ -201,6 +206,7 @@ def test_the_command_line_offers_exactly_twenty_seven_commands() -> None:
         "ask",
         "auth",
         "backup",
+        "browser-auth",
         "cleanup-derived-generations",
         "collection",
         "completion",
@@ -226,7 +232,7 @@ def test_the_command_line_offers_exactly_twenty_seven_commands() -> None:
         "upgrade",
         "workspace",
     ]
-    assert len(names) == 27
+    assert len(names) == 28
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(

@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "manicule session handoff",
+  "version": "1.0.0",
+  "description": "Hands the Confluence session in this browser to a manicule server running on this machine.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqrFqh3VPANSeY3owC3bHKJ+ymPsbMai2/LgSC64EaXqWAlLb48KXyo0nkNof2uNT897sL7VkVTyAYAX74dY5N2YAcOHL8hi6kwAazw8qytTU4rsIJel7ENMhDj91s4s8zu8EpYh+CgkHjMHGYURyBjuOI00R7zNi5HKfjlpVDDNBeCApDne86Dx/DIAeYhfZ+ch89xSuh5eSqxEfzIlFRFLsxKFSx1qLP4OLvjT9popq8vEHXCC/5rvbCcc5Yxita0Ys5QOWZTcfx1BuvZixIgnVuTM5mBSX5/JBJC6GNdDriGGqzcgeukubEKFMVEpEPdIQTa0Ldc4RcZ6FVgkyxwIDAQAB",
+  "permissions": ["cookies", "nativeMessaging", "storage"],
+  "optional_host_permissions": ["https://*/*"],
+  "background": { "service_worker": "worker.js" },
+  "action": { "default_popup": "popup.html", "default_title": "manicule session handoff" }
+}
