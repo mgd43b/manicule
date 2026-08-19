@@ -8,10 +8,19 @@
 {% if panels.doctor.ok %}
 <p class="figure">{{ m.state(panels.doctor.data.state) }}</p>
 <table>
-  <thead><tr><th>Check</th><th>State</th><th>Detail</th></tr></thead>
+  <thead><tr><th>Check</th><th>State</th><th>Detail</th><th>What to run</th></tr></thead>
   <tbody>
     {% for check in panels.doctor.data.checks %}
-    <tr><td>{{ check.name }}</td><td>{{ m.state(check.state) }}</td><td>{{ check.detail }}</td></tr>
+    <tr>
+      <td>{{ check.name }}</td>
+      <td>{{ m.state(check.state) }}</td>
+      <td>{{ check.detail }}</td>
+      {# The command, shown rather than offered as a button. Capturing a session reads a secret
+         without echoing it and mints a credential, so it belongs to a terminal — `docs/surfaces.md`
+         §4. A button here would either do nothing or need an authenticated local helper that does
+         not exist yet, and both are worse than the sentence that tells you what to type. #}
+      <td>{% if check.remedy %}<code>{{ check.remedy }}</code>{% else %}—{% endif %}</td>
+    </tr>
     {% endfor %}
   </tbody>
 </table>

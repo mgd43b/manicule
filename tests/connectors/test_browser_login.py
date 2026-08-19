@@ -634,13 +634,16 @@ async def _waited(
         return False
 
     monkeypatch.setattr(sessions_module, "cookies_authenticate", not_yet)
-    provider = PlaywrightProvider(poll_seconds=0.0)
+    # The loop is a module function rather than a method, because the installed-browser
+    # provider drives the same one with a different liveness question — see `browser._wait`.
+    browser = FakeBrowser(connected=connected)
     with pytest.raises(ConfigError) as refusal:
-        await provider._wait(  # pyright: ignore[reportPrivateUsage]
+        await browser_module._wait(  # pyright: ignore[reportPrivateUsage]
             FakeContext(jar),  # type: ignore[arg-type]
-            FakeBrowser(connected=connected),  # type: ignore[arg-type]
+            alive=browser.is_connected,
             config=sso_config(BASE),
             deadline=asyncio.get_running_loop().time() - 1,
+            poll_seconds=0.0,
         )
     return str(refusal.value)
 

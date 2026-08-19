@@ -22,6 +22,7 @@ __all__ = [
     "ConnectorError",
     "CursorExpiredError",
     "NotFoundError",
+    "ProviderRefusedError",
     "RateLimitedError",
     "RemoteError",
     "SessionExpiredError",
@@ -123,6 +124,29 @@ class SessionExpiredError(ConnectorError):
     browser — and there is no interval a sync can usefully wait; the cursor it is holding
     would expire first (:class:`CursorExpiredError`). Stopping leaves the watermark
     unadvanced, so a re-run after a fresh sign-in resumes rather than starting over.
+    """
+
+
+class ProviderRefusedError(ConfigError):
+    """The selected browser-session provider could not run, and nothing else was tried.
+
+    **The class exists so that "it did not work" cannot quietly become "something else worked".**
+    A login that fell back from an installed browser to bundled Chromium would authenticate the
+    person against a browser their identity provider has never seen, and one that fell back to
+    the paste prompt would ask for a cookie header from somebody who had just asked not to be —
+    in both cases succeeding at something other than what was requested, which is the failure
+    mode hardest to notice afterwards. So a provider that cannot run raises, and the raise is
+    the end of the attempt.
+
+    Every message names the alternatives that *are* available on this machine, because a refusal
+    an operator cannot act on is a refusal that gets worked around. Naming them is not the same
+    as taking one: the choice stays with the person, which is the whole distinction between a
+    refusal and a fallback.
+
+    A :class:`~manicule.core.errors.ConfigError`, because it is nearly always the arrangement —
+    a browser that is not installed, a name that matches two of them, a profile directory that
+    cannot be made safely — rather than a fault at the instance. No message carries a cookie, a
+    profile's contents, or a path outside the configured private root.
     """
 
 
