@@ -246,6 +246,13 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         # it to, and `manicule connector login` refuses on its own when there is not one —
         # which is a different requirement from this lock and is stated where it applies.
         "connector_login",
+        # Installing the browser extension's messaging host. It writes two files — a shim and
+        # a manifest per browser — and neither is corpus state: the shim lands in a directory
+        # of its own beneath the data directory and the manifests land in the browsers'. There
+        # is no index to corrupt and nothing a concurrent sync could be reading, so taking the
+        # writer's exclusion would mean an operator could not set up their extension while a
+        # sync was running, which is exactly when they are most likely to discover they need to.
+        "browser_auth_install",
         # Copies *out*. Both read the data directory and write somewhere else, so neither
         # needs the writer's exclusion — and making them writers would mean no backup could be
         # taken while a server was up, which is when somebody most wants one. The cost is

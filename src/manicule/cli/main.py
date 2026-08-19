@@ -405,6 +405,11 @@ document_app = typer.Typer(
 connector_app = typer.Typer(
     help="Configured sources.", no_args_is_help=True, cls=CommandsShareTheRootOptions
 )
+browser_auth_app = typer.Typer(
+    help="The browser extension that hands this browser's session to manicule.",
+    no_args_is_help=True,
+    cls=CommandsShareTheRootOptions,
+)
 workspace_app = typer.Typer(
     help="Workspaces, and which one is active.",
     no_args_is_help=True,
@@ -441,6 +446,7 @@ app.add_typer(document_app, name="document")
 app.add_typer(collection_app, name="collection")
 collection_app.add_typer(collection_rule_app, name="rule")
 app.add_typer(connector_app, name="connector")
+app.add_typer(browser_auth_app, name="browser-auth")
 app.add_typer(workspace_app, name="workspace")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(config_app, name="config")
@@ -651,6 +657,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "connector_list": r.ConnectorList,
     "snapshot_status": r.SnapshotStatusReport,
     "snapshot_verify": r.SnapshotStatusReport,
+    "browser_auth_install": r.MessagingHostInstalled,
     "connector_login": r.ConnectorSignedIn,
     "connector_sidecar": r.SidecarReport,
     "connector_sync": r.IngestReport,
@@ -1566,6 +1573,42 @@ def connector_login(
             store=proxy.HandoverStore(served),
         ),
     )
+
+
+@browser_auth_app.command("install")
+def browser_auth_install() -> None:
+    """Let this browser's manicule extension reach this machine.
+
+    Writes the native messaging host manifest each installed Chromium-family browser looks for,
+    naming the extension that is allowed to start it. Chrome will start the host for that
+    extension and for nothing else — no port is opened and no token is stored, because the
+    pairing is the manifest plus the extension's id and the operating system enforces both.
+
+    Run it once, then load `extension/` from this repository at `chrome://extensions` with
+    developer mode on. The extension's id is pinned by a key in its manifest, so it does not
+    change when the directory moves.
+
+    Nothing here grants access to a site. The extension asks Chrome for that itself, for the one
+    origin you name in its popup, and Chrome's own dialog is what approves it.
+    """
+    from manicule.cli.extension import (  # noqa: PLC0415
+        EXTENSION_ID,
+        extension_dir,
+        install,
+    )
+
+    def run(service: ApplicationService) -> Awaitable[Payload]:
+        async def written() -> Payload:
+            paths = install(data_dir=service.settings.data_dir)
+            return r.MessagingHostInstalled(
+                installed=tuple(str(path) for path in paths),
+                extension_id=EXTENSION_ID,
+                extension_dir=str(extension_dir()),
+            )
+
+        return written()
+
+    emit("browser_auth_install", run)
 
 
 # --- workspace --------------------------------------------------------------------------------

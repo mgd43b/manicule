@@ -898,6 +898,22 @@ def render_connector_signed_in(out: Console, payload: r.ConnectorSignedIn) -> No
     out.print(f"  manicule will use it until {escape(payload.expires_at)}")
 
 
+def render_messaging_host_installed(out: Console, payload: r.MessagingHostInstalled) -> None:
+    """Which browsers were set up, and the one next step this cannot do for the operator."""
+    out.print(f"installed the messaging host for [bold]{len(payload.installed)}[/bold] browser(s)")
+    for path in payload.installed:
+        out.print(f"  {escape(path)}")
+    out.print(f"  only extension [bold]{escape(payload.extension_id)}[/bold] may start it")
+    out.print("")
+    out.print("")
+    out.print("Next, in Chrome:")
+    out.print("  1. open [bold]chrome://extensions[/bold]")
+    out.print("  2. turn on [bold]Developer mode[/bold] (top right)")
+    out.print("  3. click [bold]Load unpacked[/bold] and choose:")
+    out.print(f"       {escape(payload.extension_dir)}")
+    out.print("  4. open the extension's popup and enter your Confluence URL")
+
+
 def render_snapshot_status(out: Console, payload: r.SnapshotStatusReport) -> None:
     """Render only aggregate manifest facts; member identities never reach the payload."""
     progress = payload.lifecycle
@@ -1076,6 +1092,9 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),
     r.Diagnosis: lambda out, p: render_diagnosis(out, _as(r.Diagnosis, p)),
     r.ConnectorList: lambda out, p: render_connectors(out, _as(r.ConnectorList, p)),
+    r.MessagingHostInstalled: lambda out, p: render_messaging_host_installed(
+        out, _as(r.MessagingHostInstalled, p)
+    ),
     r.ConnectorSignedIn: lambda out, p: render_connector_signed_in(
         out, _as(r.ConnectorSignedIn, p)
     ),

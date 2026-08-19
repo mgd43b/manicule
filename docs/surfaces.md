@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Forty MCP tools and twenty-seven CLI commands. They are not a one-to-one mapping: some
+Forty MCP tools and twenty-eight CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.

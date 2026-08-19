@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>manicule</title>
+<style>
+  body { font: 13px/1.5 system-ui, sans-serif; width: 320px; margin: 0; padding: 12px; }
+  h1 { font-size: 13px; margin: 0 0 8px; }
+  input { width: 100%; box-sizing: border-box; margin: 4px 0 8px; padding: 4px; }
+  button { padding: 5px 10px; }
+  .muted { color: #666; font-size: 12px; }
+  .ok { color: #1a7f37; } .bad { color: #b3261e; }
+  p { margin: 8px 0 0; }
+</style>
+<h1>manicule session handoff</h1>
+<label for="site" class="muted">Your Confluence site, as configured in manicule</label>
+<input id="site" placeholder="https://wiki.example.test/confluence" autocomplete="off">
+<button id="save">Save &amp; grant access</button>
+<button id="send">Send now</button>
+<p id="status" class="muted" role="status" aria-live="polite"></p>
+<p class="muted">
+  Reads only this site's cookies. No page content is ever read — this extension has no
+  permission that would allow it.
+</p>
+<script src="popup.js"></script>
