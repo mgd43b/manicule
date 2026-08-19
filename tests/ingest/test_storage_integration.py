@@ -2548,22 +2548,9 @@ async def test_synchronous_document_preparation_does_not_block_lease_renewal(
                 self.renewed_enough.set()
             return result
 
-    class HeldChunker(fakes.BlockChunker):
-        """A chunker that blocks the way the real one does: synchronously, without awaiting."""
-
-        def __init__(self) -> None:
-            self.entered = threading.Event()
-            self.release = threading.Event()
-
-        @override
-        def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
-            self.entered.set()
-            self.release.wait(timeout=30)
-            return super().chunk(document, blocks)
-
     store = CountingJournal()
     await store.ensure_workspace()
-    chunker = HeldChunker()
+    chunker = _HeldChunker()
     connector = fakes.DictConnector(
         {"public-held-document": "public synthetic line"}, name="held-preparation-source"
     )
@@ -2598,6 +2585,97 @@ async def test_synchronous_document_preparation_does_not_block_lease_renewal(
     assert store.renewals >= renewals_wanted
     assert report.indexed == 1
     assert report.error_type == ""
+
+
+class _HeldChunker(fakes.BlockChunker):
+    """A chunker that blocks the way the real one does: synchronously, without awaiting.
+
+    The production chunker is compute-bound Python that never yields, which is what made it
+    able to hold the event loop. A `threading.Event` reproduces exactly that shape — and, now
+    that preparation runs on a worker thread, it parks that thread while leaving the loop free,
+    which is the state both tests below need to observe.
+    """
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    @override
+    def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+        self.entered.set()
+        self.release.wait(timeout=30)
+        return super().chunk(document, blocks)
+
+
+async def test_takeover_while_synchronous_preparation_is_held_fences_the_stale_worker(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """A run lost while preparing a document must not publish what it was preparing.
+
+    The sibling tests park at an embed, inside the publication transaction, at a fetch and
+    between vector staging and upsert. This one parks in synchronous preparation, which is a
+    seam the others could not reach: until preparation moved off the event loop it held the
+    loop outright, so there was no moment at which a successor could be admitted *while* it ran
+    — the takeover simply queued behind it. Moving it to a worker thread makes the overlap
+    real, and therefore makes it something to fence rather than something prevented by
+    accident.
+
+    The stale worker's chunks are derived from bytes it still holds and would be perfectly
+    valid; the reason it may not publish them is ownership, not correctness, which is why the
+    fence has to sit at publication rather than at derivation.
+    """
+    lease_clock = fakes.ManualLeaseClock()
+    chunker = _HeldChunker()
+    connector = fakes.DictConnector(
+        {"public-held-document": "public synthetic line"}, name="held-preparation-takeover"
+    )
+    vectors = fakes.MemoryVectors()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=vectors,
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=1,
+        acquisition_clock=lease_clock,
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await asyncio.wait_for(asyncio.to_thread(chunker.entered.wait, 10), timeout=15)
+
+    durable = await store.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    lease_clock.advance(2)
+    successor = await store.claim_acquisition_run(
+        durable.id,
+        "successor-attempt",
+        now=lease_clock(),
+        expires_at=lease_clock() + timedelta(seconds=60),
+    )
+    assert successor is not None, (
+        "the lease is past its expiry, so a successor has to be admitted — otherwise this "
+        "asserts fencing against a takeover that never happened"
+    )
+    assert successor.lease_generation > durable.lease_generation
+
+    chunker.release.set()
+    report = await asyncio.wait_for(task, timeout=30)
+
+    assert report.error_type == "AcquisitionLeaseLostError"
+    assert report.indexed == 0
+    assert report.retry_required, "a run that lost its lease has not finished its durable work"
+    assert await store.find_document(connector.name, "public-held-document") is None, (
+        "the stale worker published a document after its run was taken over"
+    )
+    assert vectors.rows == {}, "nor may it leave vectors behind for a successor to trip over"
 
 
 async def test_expired_worker_is_fenced_before_publication_after_takeover(
