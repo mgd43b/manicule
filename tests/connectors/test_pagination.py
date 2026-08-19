@@ -20,6 +20,8 @@ import httpx
 import pytest
 
 import manicule.connectors.client as client_module
+from manicule.connectors.config import ConfluenceConfig
+from manicule.connectors.pagination import origin_of
 from manicule.connectors import ConnectorError, CursorExpiredError, UntrustedLinkError
 from manicule.connectors.client import ConfluenceClient
 from manicule.connectors.confluence import ConfluenceConnector
@@ -372,3 +374,47 @@ async def test_a_request_off_the_configured_origin_is_refused_before_it_is_sent(
         await client.teardown()
 
     assert instance.requests == [], "the refusal must happen before anything is sent"
+
+# --- one reading of "the origin" ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://WIKI.example.test/confluence",
+        "https://Wiki.Example.Test/confluence",
+        "https://sync.user:secret@wiki.example.test/confluence",
+        "https://wiki.example.test:8443/confluence",
+        "https://wiki.example.test/confluence",
+    ],
+    ids=["upper-host", "mixed-host", "userinfo", "non-default-port", "already-canonical"],
+)
+def test_a_configured_origin_reads_the_same_way_the_link_check_reads_it(base_url: str) -> None:
+    """A regression, and the bug it is for was a hard failure against a healthy instance.
+
+    ``ConfluenceConfig.origin`` used to build its answer by splitting on ``://``, which neither
+    lowercased the host nor dropped userinfo. Every caller compares it against ``origin_of`` — a
+    link base a response declared, a ``webui`` path joined onto one — and ``origin_of`` does
+    both. So a ``base_url`` with a capital letter in the host made
+    ``origin_of(base) != config.origin`` true for a link that *was* same-origin, and the
+    connector refused its own instance with "declared an untrusted link base".
+
+    Parameterized over the shapes that used to disagree plus one that never did, because a test
+    of only the broken spellings would pass against an implementation that had stopped
+    normalizing altogether.
+    """
+    assert ConfluenceConfig(base_url=base_url).origin == origin_of(base_url)
+
+
+def test_a_configured_origin_still_separates_instances_that_are_genuinely_different() -> None:
+    """Agreeing with ``origin_of`` must not become agreeing with everything.
+
+    The fix removed a normalizer; it did not loosen one. Scheme, host and port still decide, so
+    a link that really is elsewhere is still elsewhere.
+    """
+    configured = ConfluenceConfig(base_url="https://wiki.example.test/confluence").origin
+
+    assert configured != origin_of("http://wiki.example.test/confluence")
+    assert configured != origin_of("https://wiki.example.test:8443/confluence")
+    assert configured != origin_of("https://wiki.example.test.evil.test/confluence")
+    assert configured != origin_of("https://evil.test/wiki.example.test")
