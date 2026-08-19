@@ -123,6 +123,15 @@ jobs:
   publish-manicule:
     name: publish manicule
     needs: build
+    # **`skipped` propagates transitively through `needs`.** On a manual republish
+    # `release-please` is skipped; `build` overrides that with `always()` and succeeds — and
+    # without this line the default `success()` still evaluates the *whole* upstream graph, sees
+    # the skip, and skips here. The run then reports green having published nothing, which is
+    # exactly what happened on the first attempt to republish v0.1.0.
+    #
+    # `needs['publish-…']` in bracket form wherever a job id is read below: a hyphen inside an
+    # expression is parsed as subtraction, so `needs.publish-manicule.result` is not a lookup.
+    if: ${{ always() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -145,6 +154,7 @@ jobs:
   publish-manicule-mlx:
     name: publish manicule-mlx
     needs: build
+    if: ${{ always() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi-mlx
@@ -166,10 +176,28 @@ jobs:
   attach:
     name: attach to the release
     needs: [build, publish-manicule, publish-manicule-mlx]
+    # Deliberately `always()` rather than inheriting, so that this job *runs* when a publish did
+    # not — and fails. A skipped publish is not an error to GitHub, so without a job that turns
+    # "nothing was uploaded" into a red run, a release that published nothing reports success.
+    if: ${{ always() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: both uploads must have succeeded
+        run: |
+          set -euo pipefail
+          manicule="${{ needs['publish-manicule'].result }}"
+          mlx="${{ needs['publish-manicule-mlx'].result }}"
+          echo "manicule: ${manicule}"
+          echo "manicule-mlx: ${mlx}"
+          if [ "${manicule}" != "success" ] || [ "${mlx}" != "success" ]; then
+            echo "a distribution did not publish; the release is incomplete." >&2
+            echo "Nothing is attached to the release, because the assets on a GitHub Release" >&2
+            echo "must describe a release that actually reached PyPI." >&2
+            exit 1
+          fi
+
       - uses: actions/download-artifact@v6
         with:
           name: distributions
