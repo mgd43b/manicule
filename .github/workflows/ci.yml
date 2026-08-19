@@ -654,6 +654,35 @@ jobs:
           print(f"{wheel.name}: {len(names)} files, {len(migrations)} migrations")
           PY
 
+      # README.md is the PyPI long description, and PyPI resolves a relative link against
+      # nothing. `hatch-fancy-pypi-readme` rewrites them at build time; this reads the result out
+      # of the artifact, because `tests/test_packaging.py` can only check that the *patterns*
+      # leave nothing behind — it cannot prove the build actually applied them. A build backend
+      # misconfigured so the hook never runs produces a wheel that installs perfectly and a
+      # project page full of 404s.
+      - name: the long description carries no relative links
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, sys, zipfile
+          from pathlib import Path
+
+          wheel = next(Path("dist").glob("*.whl"))
+          name = next(n for n in zipfile.ZipFile(wheel).namelist() if n.endswith(".dist-info/METADATA"))
+          body = zipfile.ZipFile(wheel).read(name).decode().split("\n\n", 1)[1]
+
+          links = re.findall(r"\[([^\]]+)\]\(([^)]+)\)", body)
+          relative = [t for _, t in links if not t.startswith(("http://", "https://", "#", "mailto:"))]
+          if relative:
+              sys.exit(f"{len(relative)} relative link(s) reached the long description: {relative}")
+
+          images = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", body)
+          blobs = [u for u in images if "/blob/" in u]
+          if blobs:
+              sys.exit(f"image(s) pointing at a GitHub HTML page rather than raw content: {blobs}")
+          print(f"{len(links)} links in the long description, none relative")
+          PY
+
       # A bare install, which is what `pip install manicule` gives. The console script must
       # print an install hint and exit 1 — not raise. `manicule.entry` exists for this and
       # nothing else.
