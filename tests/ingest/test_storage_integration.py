@@ -3932,6 +3932,28 @@ async def test_source_deleted_reenumerates_and_reuses_the_retained_prefix(
     assert fenced.lease_generation > stale_generation
 
 
+async def _journal_record_count(store: SqliteDocStore, connector_name: str) -> int:
+    """How many records enumeration actually wrote for the newest unsettled run.
+
+    The one number the deletion-recovery diagnostic still lacks. #233 installed `attempts` to
+    prove the run never reached the deleted document; it did, and the next question — whether the
+    records existed to be read — has no answer in the report. Counted through the paged reader
+    rather than a bare count so it costs one query per five hundred records and cannot itself
+    change what it observes.
+    """
+    run = await store.latest_unsettled_acquisition_run(connector_name)
+    if run is None:
+        return 0
+    total = 0
+    after: int | None = None
+    while True:
+        page = await store.list_acquisition_records(run.id, after_sequence=after, limit=500)
+        if not page:
+            return total
+        total += len(page)
+        after = page[-1].sequence
+
+
 @pytest.mark.parametrize(
     ("documents", "remove_missing_identity", "poll_status"),
     [
@@ -4029,12 +4051,17 @@ async def test_served_source_deletion_recovery_reuses_exact_evidence_and_keeps_s
     # `attempts` is appended in `fetch` before the raise, so it answers exactly that question and
     # costs nothing. It is asserted first so the failure names the half rather than leaving the
     # next reader with the same fork this comment describes.
+    enumerated = await _journal_record_count(store, connector.name)
     assert connector.missing in connector.attempts, (
         f"the deleted document {connector.missing!r} was never fetched, so this run could not "
         f"have observed the deletion at all — {len(connector.attempts)} of {documents} documents "
-        f"were attempted, over {connector.discovery_pass} discovery pass(es). The run stopped "
-        f"short rather than losing the outcome: look at enumeration and dispatch, not at how the "
-        f"omission was recorded."
+        f"were attempted, over {connector.discovery_pass} discovery pass(es), against "
+        f"{enumerated} journal record(s). The run stopped short rather than losing the outcome. "
+        f"Those two numbers split what is left: {enumerated} < {documents} means enumeration "
+        f"stopped short and the records were never written, while {enumerated} == {documents} "
+        f"means every record was written and dispatch stopped reading them — "
+        f"`_enumerate_to_journal` in the first case, `_acquisition_candidates_into` in the "
+        f"second, and they share no code."
     )
     assert first.snapshot_omission_reasons == {"source_deleted": 1}, (
         "the first run must reach its typed deletion outcome before inventory is inspected. "
