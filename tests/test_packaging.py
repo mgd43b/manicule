@@ -368,3 +368,88 @@ def test_each_published_distribution_publishes_from_its_own_environment() -> Non
         f"two publish jobs share an environment: {environments}. Each needs its own, or their "
         "pending trusted publishers collide on PyPI and the second cannot be registered."
     )
+
+
+# Anything that is already a destination rather than a repository path. `#` alone is an anchor
+# within the rendered page, which resolves on PyPI as well as on GitHub.
+_ABSOLUTE = ("http://", "https://", "#", "mailto:")
+
+
+def _markdown_links(text: str) -> list[str]:
+    return [target for _, target in re.findall(r"\[([^\]]+)\]\(([^)]+)\)", text)]
+
+
+def test_the_pypi_long_description_has_no_relative_links(pyproject: dict[str, Any]) -> None:
+    """Applying the configured rewrites to README.md leaves no relative link behind.
+
+    README.md *is* the PyPI long description, and PyPI resolves a relative link against nothing —
+    so `docs/surfaces.md` and the other fifteen rendered as 404s on the project page from the
+    moment 0.1.0 was published. `hatch-fancy-pypi-readme` rewrites them at build time, which
+    keeps the in-repo links relative so they follow the branch a contributor is reading.
+
+    The rewrite is a pair of regular expressions, and the failure mode is a link written in a
+    form they do not match: nothing errors, the build succeeds, and one more dead link appears on
+    a page nobody looks at until someone clicks it. So the patterns are read from pyproject.toml
+    and applied here to the real file — an unmatched link fails the build instead.
+    """
+    hooks = cast(dict[str, Any], pyproject["tool"]["hatch"]["metadata"]["hooks"])
+    config = cast(dict[str, Any], hooks["fancy-pypi-readme"])
+
+    fragments = cast(list[dict[str, str]], config["fragments"])
+    rendered = "".join((REPO_ROOT / fragment["path"]).read_text() for fragment in fragments)
+
+    for substitution in cast(list[dict[str, str]], config["substitutions"]):
+        rendered = re.sub(substitution["pattern"], substitution["replacement"], rendered)
+
+    survivors = [t for t in _markdown_links(rendered) if not t.startswith(_ABSOLUTE)]
+    assert not survivors, (
+        f"these links would reach PyPI unrewritten and 404 there: {survivors}. Either write them "
+        "in a form the substitutions in pyproject.toml match, or add a substitution for the form "
+        "you need."
+    )
+
+    # And the rewrite is doing real work rather than passing because the file has no relative
+    # links left. Without this, hard-coding absolute URLs in README.md would silently turn the
+    # substitutions into dead configuration and this test would still pass.
+    source_relative = [
+        t
+        for t in _markdown_links((REPO_ROOT / "README.md").read_text())
+        if not t.startswith(_ABSOLUTE)
+    ]
+    assert source_relative, (
+        "README.md has no relative links, so the fancy-pypi-readme substitutions rewrite "
+        "nothing. Either they are dead configuration and should be removed, or a link that "
+        "should be relative has been hard-coded to an absolute URL."
+    )
+
+
+def test_images_are_rewritten_to_raw_urls(pyproject: dict[str, Any]) -> None:
+    """A screenshot must become a `raw.` URL, not a `blob.` one.
+
+    `blob` serves GitHub's HTML page *for* the file. As a link that is right; as an `![image]`
+    source it is a page where an image should be, so the screenshot renders broken rather than
+    missing — which reads as a bug in the page rather than a bad link.
+    """
+    hooks = cast(dict[str, Any], pyproject["tool"]["hatch"]["metadata"]["hooks"])
+    config = cast(dict[str, Any], hooks["fancy-pypi-readme"])
+    rendered = (REPO_ROOT / "README.md").read_text()
+    for substitution in cast(list[dict[str, str]], config["substitutions"]):
+        rendered = re.sub(substitution["pattern"], substitution["replacement"], rendered)
+
+    images = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", rendered)
+
+    # Stated as "no image is a blob URL" rather than "every image is a raw URL", because the CI
+    # badge is a `github.com/.../badge.svg` endpoint that really does serve an SVG. What is
+    # always wrong is `/blob/`, which is the HTML page for a file.
+    blobs = [url for url in images if "/blob/" in url]
+    assert not blobs, (
+        f"{blobs} are images pointing at GitHub's HTML page for a file rather than at raw "
+        "content; they render broken on PyPI. The substitution ordering in pyproject.toml puts "
+        "the image rule first for this reason."
+    )
+
+    raw = [url for url in images if url.startswith("https://raw.githubusercontent.com/")]
+    assert raw, (
+        "no image was rewritten to a raw URL, so the image substitution matched nothing. Either "
+        "README.md no longer embeds a repository image, or the pattern has stopped matching it."
+    )

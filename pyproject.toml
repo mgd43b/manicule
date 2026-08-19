@@ -1,12 +1,16 @@
 [build-system]
-requires = ["hatchling"]
+# `hatch-fancy-pypi-readme` rewrites README.md's relative links as the long
+# description is built. See `[tool.hatch.metadata.hooks.fancy-pypi-readme]` below for why.
+requires = ["hatchling", "hatch-fancy-pypi-readme"]
 build-backend = "hatchling.build"
 
 [project]
 name = "manicule"
 version = "0.1.0"
 description = "Self-hosted document search and answers, with citations that resolve."
-readme = "README.md"
+# `readme` is dynamic because the long description is README.md with its relative links
+# rewritten. See `[tool.hatch.metadata.hooks.fancy-pypi-readme]`.
+dynamic = ["readme"]
 license = "MIT"
 requires-python = ">=3.12"
 authors = [{ name = "manicule contributors" }]
@@ -319,6 +323,37 @@ manicule = { workspace = true }
 manicule-mlx = { workspace = true }
 manicule-plugin-example = { workspace = true }
 manicule-plugin-hostile = { workspace = true }
+
+# **README.md is the PyPI long description, and PyPI resolves relative links against nothing.**
+# Sixteen of them — `docs/surfaces.md`, `PLAN.md`, `packages/manicule-mlx`, the browser
+# screenshot — rendered as 404s on the project page from the moment 0.1.0 was published.
+#
+# Rewritten here rather than in the file, so that in-repo links stay relative and keep following
+# the branch or fork they are read on: a contributor viewing a pull request should see that
+# branch's `docs/surfaces.md`, not main's. Hard-coding absolute URLs would fix PyPI by making
+# every link in the repository point somewhere the reader is not.
+#
+# `tests/test_packaging.py::test_the_pypi_long_description_has_no_relative_links` applies these
+# patterns to the real README and fails if any link survives them, so a link written in a form
+# these do not match is caught here rather than on the project page after a release.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+# Images first, and to `raw.` rather than `blob.`: a `blob` URL serves GitHub's HTML page for the
+# file, which is not an image, so the screenshot would render as a broken image rather than a
+# broken link. Ordering matters — the general rule below would otherwise claim these.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?!https?://|#|mailto:)([^)]+\.(?:png|jpg|jpeg|gif|svg))\)'
+replacement = '](https://raw.githubusercontent.com/mgd43b/manicule/main/\1)'
+
+# Everything else — files, directories and in-file anchors alike. `blob/main/<directory>`
+# redirects to the tree view, so directories need no rule of their own.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?!https?://|#|mailto:)([^)]+)\)'
+replacement = '](https://github.com/mgd43b/manicule/blob/main/\1)'
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/manicule"]
