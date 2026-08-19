@@ -31,6 +31,7 @@ is the one outcome that would make this whole file worthless.
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -56,9 +57,10 @@ from tests.fakes import MEDIA_TYPE, HashEmbedder
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Iterable, Iterator, Mapping
 
-    from manicule.core.protocols import Connector, Embedder, Middleware
+    from manicule.core.content import ParsedBlock
+    from manicule.core.protocols import Chunker, Connector, Embedder, Middleware
     from manicule.ingest.pipeline import RunReport, Watching
 
 
@@ -116,6 +118,7 @@ def served(
     middleware: tuple[Middleware, ...] = (),
     fetch_concurrency: int = 4,
     parse_workers: int = 3,
+    chunker: Chunker | None = None,
 ) -> tuple[ApplicationService, PipelineIngestion, fakes.MemoryIngestStore]:
     """A service whose syncs go through one real pipeline, with every stage bound stated.
 
@@ -124,7 +127,7 @@ def served(
     which is the one thing a bound must not depend on.
     """
     store = store or fakes.MemoryIngestStore()
-    chunker = fakes.BlockChunker()
+    chunker = chunker or fakes.BlockChunker()
     pipeline = IngestPipeline(
         store=store,
         chunker=chunker,
@@ -924,4 +927,210 @@ def _reader_was_running(reader: Reading) -> None:
     assert reader.answered > 1, (
         f"the reader answered {reader.answered} search(es), which is not enough to have been "
         f"running alongside the writes rather than only before them"
+    )
+
+
+# --- a client that goes away while one document is being prepared ------------------------------
+
+
+HELD_STAGE_TIMEOUT_S = 30.0
+"""How long a held stage waits to be released before it fails loudly rather than opening."""
+
+
+class HeldChunker(fakes.BlockChunker):
+    """A chunker that blocks synchronously, the way the production one does under a big block."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.exited = threading.Event()
+        self.timed_out = False
+
+    @override
+    def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+        self.entered.set()
+        try:
+            return self._held(document, blocks)
+        finally:
+            # Set on every path, because a run that loses its lease is torn down without
+            # waiting for this thread — so a test that read ``timed_out`` straight after the
+            # run returned would read it before this thread had finished deciding. Waiting on
+            # ``exited`` is what makes that flag worth asserting.
+            self.exited.set()
+
+    def _held(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+        if not self.release.wait(timeout=HELD_STAGE_TIMEOUT_S):
+            # A gate that was never opened means the interleaving under test did not happen.
+            # Proceeding anyway would let the test carry on and assert against a *different*
+            # ordering — passing or failing for reasons that have nothing to do with what it
+            # claims to check — so it is recorded and raised. Every test below reads
+            # ``timed_out`` before its own assertions, so the failure names this rather than
+            # the misleading consequence.
+            self.timed_out = True
+            msg = (
+                f"the held preparation stage was never released within "
+                f"{HELD_STAGE_TIMEOUT_S}s; the test did not reach the point where it opens "
+                f"the gate"
+            )
+            raise AssertionError(msg)
+        return super().chunk(document, blocks)
+
+
+async def test_a_client_that_disconnects_during_held_preparation_does_not_strand_the_sync(
+    socket_for: Callable[[], Path],
+) -> None:
+    """The disconnect case, taken through the stage that used to own the event loop.
+
+    ``tests/app/test_control.py`` already proves the socket keeps server-owned work after its
+    client goes, and it proves it against a handler parked on an ``asyncio.Event``. That is the
+    easy half: a coroutine parked on an event is one the loop can schedule around, so the
+    connection task notices the disconnect immediately and the two never interact.
+
+    Synchronous preparation is the half that could not be asked before. It held the loop
+    outright, so a close arriving on the socket was not read until the document finished — the
+    server appeared to survive the disconnect only because it had not yet noticed it. Now that
+    preparation runs on a worker thread the close is genuinely processed *while* the stage is
+    held, which is the interleaving to pin: the sync must still finish, settle the corpus, and
+    leave a socket that answers the next request.
+
+    Raw ``asyncio.open_unix_connection`` rather than ``control.connect`` for the reason the
+    control test gives — ``connect`` owns the whole exchange and cannot be abandoned partway.
+    """
+    path = socket_for()
+    held = HeldChunker()
+    documents = corpus(3, prefix="held")
+    service, ingestion, store = served(
+        {"proxied": fakes.ObservedConnector(documents, name="handbook")},
+        chunker=held,
+        fetch_concurrency=2,
+        parse_workers=1,
+    )
+
+    # An arrival rather than a wait: the run's own return is what says it survived the
+    # disconnect, and nothing else in the process announces it once the caller that asked for
+    # it has gone.
+    finished = asyncio.Event()
+    running = ingestion.sync
+
+    async def watched(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await running(*args, **kwargs)
+        finally:
+            finished.set()
+
+    ingestion.sync = watched
+
+    server = control.ControlServer(path, ControlHandler(service, SessionVault()))
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(path)
+        del reader
+        writer.write(
+            control.Invoke(
+                op="connector_sync", arguments={"name": "proxied", "limit": None}
+            ).to_line()
+        )
+        await writer.drain()
+        entered = await asyncio.wait_for(
+            asyncio.to_thread(held.entered.wait, HELD_STAGE_TIMEOUT_S / 3),
+            timeout=HELD_STAGE_TIMEOUT_S,
+        )
+        assert entered, "preparation was never reached, so the close had nothing to race"
+
+        writer.close()
+        await writer.wait_closed()
+        assert not finished.is_set(), (
+            "the sync finished before the client was closed, so this asserted nothing about a "
+            "disconnect arriving while preparation was held"
+        )
+
+        held.release.set()
+        await asyncio.wait_for(finished.wait(), timeout=30)
+
+        await asyncio.wait_for(
+            asyncio.to_thread(held.exited.wait, HELD_STAGE_TIMEOUT_S * 2),
+            timeout=HELD_STAGE_TIMEOUT_S * 3,
+        )
+        assert not held.timed_out
+        assert len(store.documents) == len(documents), (
+            "the sync was abandoned when its client went away: the server owns accepted work, "
+            "and a document left half-derived is what the recovery sweep exists to avoid"
+        )
+        answered = await control.connect(
+            path, control.Invoke(op="connector_list"), on_progress=lambda _: None
+        )
+        assert answered["ok"] is True, "the disconnect poisoned the socket for the next caller"
+    finally:
+        held.release.set()
+        await server.aclose()
+
+
+async def test_an_http_client_that_disconnects_during_held_preparation_keeps_the_sync() -> None:
+    """The socket test's guarantee, over a port, on the one network surface that can start a sync.
+
+    ``tests/api/test_both_surfaces.py`` proves a disconnected client does not cancel a *search*,
+    which parks in the retriever on the event loop. A sync is the case with something to lose:
+    it holds a lease, it publishes, and the stage it spends its time in is synchronous
+    preparation on a worker thread. A transport closing under that must not take the run with
+    it.
+
+    **There is deliberately no MCP half of this.** The served MCP server is built
+    ``read_only=True``, so ``connector_sync`` is not registered on it at all — not hidden behind
+    a permission, absent from the dispatch table — and a client there cannot start a sync to
+    then disconnect from. ``tests/mcp/test_transports.py`` holds that exclusion; asserting it
+    again here would be testing that test. The surfaces table marks ``connector_sync`` as having
+    an MCP tool because it does over stdio, where a person is present.
+
+    The call is abandoned as rudely as a client can manage — request task canceled and the
+    transport closed under it — while preparation is held.
+    """
+    held = HeldChunker()
+    documents = corpus(3, prefix="held")
+    service, ingestion, store = served(
+        {"proxied": fakes.ObservedConnector(documents, name="handbook")},
+        chunker=held,
+        fetch_concurrency=2,
+        parse_workers=1,
+    )
+
+    finished = asyncio.Event()
+    running = ingestion.sync
+
+    async def watched(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await running(*args, **kwargs)
+        finally:
+            finished.set()
+
+    ingestion.sync = watched
+
+    async with serving(_backend(service), web=False) as live:
+        # An exit stack rather than `async with`, because the client has to be closed *while a
+        # call is in flight* — the reason `tests/api/test_both_surfaces.py` gives.
+        attached = AsyncExitStack()
+        http = await attached.enter_async_context(live.http())
+        call = asyncio.create_task(http.post("/api/v1/admin/connectors/proxied/sync", json={}))
+
+        entered = await asyncio.wait_for(
+            asyncio.to_thread(held.entered.wait, HELD_STAGE_TIMEOUT_S / 3),
+            timeout=HELD_STAGE_TIMEOUT_S,
+        )
+        assert entered, "preparation was never reached, so the disconnect had nothing to race"
+
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+        await asyncio.gather(attached.aclose(), return_exceptions=True)
+        assert not finished.is_set(), "the sync finished before the client was even gone"
+
+        held.release.set()
+        await asyncio.wait_for(finished.wait(), timeout=HELD_STAGE_TIMEOUT_S)
+
+    await asyncio.wait_for(
+        asyncio.to_thread(held.exited.wait, HELD_STAGE_TIMEOUT_S * 2),
+        timeout=HELD_STAGE_TIMEOUT_S * 3,
+    )
+    assert not held.timed_out
+    assert len(store.documents) == len(documents), (
+        "the HTTP client going away abandoned the sync it started: the server owns accepted "
+        "work, and a half-derived corpus is what the recovery sweep exists to avoid"
     )

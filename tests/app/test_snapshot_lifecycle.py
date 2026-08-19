@@ -114,6 +114,51 @@ async def test_an_unfinished_run_whose_lease_has_lapsed_is_not_reported_as_runni
     )
 
 
+def test_a_lapsed_lease_reads_the_same_on_http_and_mcp() -> None:
+    """The lease-derived value is a surface fact, so both surfaces have to carry it.
+
+    The test above asserts parity on a run whose fixture leaves the lease fields unset, which
+    now projects ``incomplete`` — so it would keep passing if ``running`` were computed on only
+    one of the two surfaces, or on neither. This pins the distinction itself: the same run, once
+    with a live lease and once expired, has to read the same way through both.
+    """
+    backend = _backend()
+    run = backend.ingestion_.snapshot
+    assert run is not None
+    owned = {
+        "lease_owner": "pipeline:synthetic-owner",
+        "lease_expires_at": datetime.now(UTC) + timedelta(minutes=5),
+    }
+
+    seen: dict[str, set[str]] = {}
+    for label, update in (
+        ("live", owned),
+        ("lapsed", {**owned, "lease_expires_at": datetime.now(UTC) - timedelta(minutes=5)}),
+    ):
+        backend.ingestion_.snapshot = run.model_copy(update=update)
+        service = ApplicationService(backend)
+        tool = asyncio.run(
+            build_server(service).call_tool("snapshot_status", {"name": "synthetic-wiki"})
+        )
+        with client_for(backend) as client:
+            response = client.get("/api/v1/admin/connectors/synthetic-wiki/snapshot")
+        assert response.status_code == 200
+        http = cast("dict[str, Any]", cast("dict[str, Any]", response.json())["data"])
+        mcp = cast("dict[str, Any]", cast("dict[str, Any]", tool.structured_content)["data"])
+        http_outcome = cast("dict[str, Any]", http["lifecycle"])["outcome"]
+        mcp_outcome = cast("dict[str, Any]", mcp["lifecycle"])["outcome"]
+        assert http_outcome == mcp_outcome, (
+            f"the {label} lease reads {http_outcome!r} over HTTP and {mcp_outcome!r} over MCP"
+        )
+        seen[label] = {cast("str", http_outcome)}
+
+    assert seen["live"] == {"running"}
+    assert seen["lapsed"] == {"incomplete"}, (
+        "an expired lease has to reach both surfaces as an unowned run, or an operator reading "
+        "one of them still cannot tell active work from resumable work nobody is doing"
+    )
+
+
 def test_http_and_mcp_return_the_same_aggregate_snapshot_status() -> None:
     backend = _backend()
     service = ApplicationService(backend)

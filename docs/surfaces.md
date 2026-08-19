@@ -333,6 +333,19 @@ ids, paths, URIs, titles, content or exception context. Re-embedding exposes fin
 one-way identity of the live generation, not its private corpus-snapshot handle. Read-only MCP
 registration is unchanged: adding status fields does not add a write tool to the network surface.
 
+`outcome` says whether anybody is working on it, and for acquisition it is read from the run's
+lease rather than from the absence of a recorded failure — a worker that loses its run cannot
+write a diagnostic on its way out, so "no bad news" and "a live worker" are not the same fact.
+`running` therefore means a lease is held and unexpired; `incomplete` means unfinished and
+unowned, which is resumable rather than broken; `complete` and `failed` are terminal. A
+supervisor may act on `incomplete` immediately — `ingest.md` §13.4 states what it may assume and
+what it must not do.
+
+**This is not the `outcome` on `IngestReport`**, which describes one run that a caller just made
+rather than the durable state of a snapshot, and whose `incomplete` the scheduler counts as a
+failure to retry on its next interval (§5, `IngestReport`). The two share three value names and answer
+different questions; a consumer branching on the wrong one gets a plausible answer.
+
 `inventory_recovery` has four public-safe values: empty means ordinary same-manifest work;
 `reenumeration_required` means a completed inventory was invalidated and cannot promote;
 `reenumerating` means its fenced replacement is discovering from the committed position; and
