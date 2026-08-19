@@ -111,7 +111,12 @@ A module logger rather than a print or a swallowed exception, so an operator who
 logging sees it and one who has not is not spammed by a library.
 """
 
-_LANGUAGES_NAMED = 6
+LANGUAGES_NAMED = 6
+"""How many missing grammars the ``doctor`` check names before it starts counting.
+
+Public because the test that holds this check's message to its claim derives its arithmetic from
+it. Written down there instead, declaring a language failed that test with a puzzle rather than a
+defect."""
 """How many missing grammars ``doctor`` names before it counts the rest.
 
 Named at all because "seed the grammars" without saying which is a fix nobody can check;
@@ -3071,10 +3076,8 @@ class ApplicationService:
             # building a bundle on another host — advice for an air-gapped operator, shown to
             # everyone who had simply not run `init` yet. A host with no route to anything
             # reaches the *failing* branch above, whose message carries the search path.
-            over = len(missing) - _LANGUAGES_NAMED
-            named = ", ".join(missing[:_LANGUAGES_NAMED]) + (
-                f" and {over} more" if over > 0 else ""
-            )
+            over = len(missing) - LANGUAGES_NAMED
+            named = ", ".join(missing[:LANGUAGES_NAMED]) + (f" and {over} more" if over > 0 else "")
             carried = f" — {offline}" if located is not None else ""
             return r.Check(
                 name="grammars",

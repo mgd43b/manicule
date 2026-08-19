@@ -2024,6 +2024,197 @@ SELECT id FROM documents WHERE chunk_fp <> :current AND media_type IN (:code_typ
 The global refusal still stands — one vector table cannot hold two embedding spaces — but
 once a new fingerprint is adopted the repair is targeted instead of total.
 
+### 8.4 Diagrams — the same grammars, a different destination
+
+Ticket [#249](https://github.com/mgd43b/manicule/issues/249).
+
+A diagram authored as code is read with the machinery above and answers a different question
+with it. For a source file the tree yields anchors and symbols (§8.2), and the text a reader
+wants is already in the file — the grammar decides *where* the chunks begin, not what they say.
+For a diagram the tree yields the **meaning**, because the sentence a reader sees is in no line
+of the source.
+
+```dot
+auth  [label="Auth Service"];
+store [label="Token Store"];
+auth -> store [label="validates against"];
+```
+
+A reader of the rendered diagram sees *Auth Service validates against Token Store*. The embedded
+text holds `auth`, `store`, an arrow, and two string literals declared three lines away. **The
+join between an edge and its endpoints' labels is present nowhere in what the embedder reads**,
+so the fact the diagram exists to state — who relates to whom, and how — is not in the vector.
+
+That is the same defect class as the ones `manicule.parsers.confluence` was written for: content
+a reader sees that the index does not contain. It is not a ranking nuisance, and it is not fixed
+by weighting.
+
+#### 8.4.1 Declaring a notation, and what it drags in
+
+`tree-sitter-language-pack` ships `dot`, `mermaid` and `plantuml`. It is already a dependency,
+already MIT, and already bundled for air-gapped installs (§8.1.1), so **no notation here costs a
+new dependency** — each costs a row in `MEDIA_TYPES`:
+
+| Language | Media type | Registered |
+|---|---|---|
+| `dot` | `text/vnd.graphviz` | IANA |
+| `mermaid` | `text/x-mermaid` | no, so the conventional form |
+
+**`plantuml` has a grammar and is deliberately not declared, and this was a measurement rather
+than a preference.** Its tree does not model the language. `auth --> store : validates against`
+parses to a flat `command` containing `identifier` and `uniqkey` tokens — no node, no edge, no
+label, the arrow split into three punctuation tokens — so a reader would be re-implementing
+PlantUML's line grammar on top of a token soup rather than reading a tree, which is the second
+implementation §12 is wary of everywhere else. The gap it would close is also the smallest of the
+three: PlantUML states a relationship inline on one line, so what the embedder loses is the
+`[Auth Service] as auth` aliasing rather than the relation itself. Declaring the language would
+therefore add a grammar to every offline bundle and every fingerprint to buy nothing. A
+line-oriented PlantUML reader remains open as its own question, and it is not this section's
+mechanism.
+
+Three consequences follow from that row, and only the first is the one being asked for:
+
+- **The grammar becomes seedable.** `DECLARED_LANGUAGES` derives from `MEDIA_TYPES`, so
+  declaring the language is what makes `prefetch` fetch it, `build_grammar_bundle` carry it, and
+  `load_parser` accept it. Without the declaration there is no grammar to read a diagram with.
+- **`.dot` and `.mmd` files start routing to the code parser.** A consequence rather than a
+  goal, and a welcome one: a diagram file in a repository becomes a document with line anchors
+  instead of an unroutable byte stream. It yields no symbols, because `NODE_TYPE_DEFINITIONS`
+  describes neither grammar and inventing definitions for them would be `LineAnchor.symbol`
+  claiming structure the notation does not have. `.puml` is *not* in this list, because
+  `plantuml` is not declared — see below.
+- **`ChunkFingerprint.grammars` grows two entries** (§8.3). Adding a language is therefore an
+  index-affecting change on the terms §8.3 already sets, and the partial re-parse it permits is
+  the mechanism that makes adopting it affordable.
+
+The Markdown case is why this is worth more than the Confluence macro that prompted it: a fenced
+` ```mermaid ` block already carries `lang="mermaid"` out of `manicule.parsers.markdown`, so a
+mermaid reader pays off on every Markdown corpus without a connector being involved at all.
+
+**A Confluence `mermaid` or `plantuml` macro is a different matter, and it is a prerequisite
+rather than a detail.** `_unsupported_macro` preserved those bodies as `CODE` blocks with no
+`lang` at all ([#251](https://github.com/mgd43b/manicule/issues/251)), so a middleware selecting
+on `Chunk.lang` could not see them however many grammars were declared. `MACRO_LANGUAGES` is that
+table, and the wiki half of this section does not work without it.
+
+#### 8.4.2 The reading goes in `embed_text`, and nowhere else
+
+Three properties that already exist decide this, and together they leave exactly one seam:
+
+- **The lexical leg indexes `chunks.text`** (`manicule.storage.fts`), not `embed_text`. The
+  source therefore stays searchable verbatim — a node id, a `rankdir`, a `skinparam` — no matter
+  what the dense leg is given.
+- **`after_chunk` may rewrite `embed_text`**, and `MiddlewareRunner` refuses to let that happen
+  quietly: a hook that rewrites it with `mutates_embedded_text = False` raises
+  `MiddlewareViolationError`, because it would change every vector while both fingerprint
+  refusals passed. Declaring it folds the rewrite into the chunk fingerprint and the re-embed
+  follows on its own.
+- **`StructuralChunker.finalize` re-measures the result** against the chunk budget, and states
+  the obligation that creates: a growing middleware reserves space or emits a bounded
+  representation. It cannot split `embed_text`, because a split `embed_text` no longer
+  corresponds to the immutable `text` beside it.
+
+So the shape is a reader per notation plus one middleware, and **`Chunk.text` is never touched**.
+A citation into a diagram keeps quoting the source the page holds. The alternative — emitting the
+reading as its own block — was rejected for the reason `manicule.connectors.macros` already gives
+for unresolved includes: it would put manicule's own words inside a quotation attributed to the
+source. §5.4's distinction is what makes the narrow version safe, and it is the whole design.
+
+**It is off until it is configured, and that is not timidity.** `plugins.middleware` is an
+ordered list an operator writes, defaulting to empty:
+
+```toml
+[plugins]
+middleware = ["diagrams"]
+
+[plugins.config."middleware.diagrams"]
+languages = ["dot"]          # optional: narrower than the notations with readers
+max_statements = 64
+```
+
+Adopting it re-embeds the corpus, because that is what `mutates_embedded_text` means. A default
+that silently invalidated every vector on upgrade would be the opposite of the fingerprint
+discipline §8.3 exists for.
+
+#### 8.4.3 What the reading says, and what it drops
+
+Resolved relationships, in source order:
+
+```
+Auth architecture
+Auth Service → Token Store: validates against
+Token Store — Postgres
+group "Control plane": Auth Service, Token Store
+nodes: Audit Log
+```
+
+**An arrow rather than a sentence, and the arrow is the careful choice.** *Auth Service validates
+against Token Store* reads better where the label is a verb phrase, and asserts a sentence the
+diagram never stated where it is a protocol name — *Auth Service HTTP Token Store*. The arrow
+keeps all three terms adjacent, which is what the embedder needs, without claiming a grammar the
+source does not have. `—` is an edge the diagram draws without an arrowhead, and it means the
+direction was not stated rather than that it runs both ways.
+
+- **Labels are resolved through to the endpoints.** An edge between two identifiers contributes
+  nothing on its own; an edge between two *labels* is the fact. Where a node has no label its
+  identifier is used, because that is what the diagram draws.
+- **Grouping is kept.** A `subgraph cluster_*` label or a mermaid `subgraph`
+  is a statement about which things belong together, and it is often the only place a system
+  name appears.
+- **Styling is dropped entirely** — `color`, `shape`, `fontname`, `penwidth`, `rankdir`,
+  `skinparam`. It changes the picture and never what the picture says, and it is exactly the
+  syntax mass that made the raw source a poor embedding input.
+- **Order is the source's**, never a traversal's. A reading whose order depends on graph
+  structure would reorder itself when an unrelated node was added, re-embedding a diagram nobody
+  edited.
+
+**Bounding is deterministic, and says what it dropped.** Past the budget, whole relationships are
+dropped from the end and the reading states the count. A truncation mid-sentence would make the
+tail of the reading a fragment of a fact, and a silent one would make a partly-read diagram
+indistinguishable from a small one — `docs/connectors/confluence.md` §5 settles this same
+question the same way for macros.
+
+#### 8.4.4 Every failure keeps today's behavior
+
+A diagram whose source does not parse, a notation with no reader, a grammar that is not
+installed: in each case the chunk is returned unchanged, so `embed_text` stays breadcrumb + source
+and the corpus is what it is today. This is the same posture `dot_parse_warning` already takes —
+invalid DOT is still what the author wrote, still searchable, and the version somebody debugging
+the page most needs to find. A reader that refuses loudly here would fail an ingest over a
+diagram, which is a worse outcome than the diagram embedding as it does now.
+
+#### 8.4.5 Nothing is rendered, and that is not a limitation
+
+`_graphviz_macro` already refuses to lay out DOT, and the reason extends to everything in this
+section: a diagram body is authored by anyone with write access to the page, so running a layout
+engine over it is the thing that parser most exists not to do. This closes the multimodal variant
+as well — render each diagram to an image and embed it with a vision model — which would need a
+Graphviz binary in the image, a layout pass over untrusted input, and a second embedding space
+the vector table cannot hold (§8.3). Everything of value here is reachable from the source text.
+
+#### 8.4.6 draw.io is the exception, and is filed separately
+
+[#250](https://github.com/mgd43b/manicule/issues/250). It shares this section's goal and none of
+its mechanism: the diagram arrives as a page **attachment** rather than as a block, so it needs a
+media type claimed and a parser registered rather than a language declared, and an `mxfile` is
+XML — commonly deflate-compressed and base64-encoded inside `<diagram>`, sometimes plain — which
+needs no grammar and no new dependency, but does need the decompression bound §9.3 establishes.
+
+One thing worth knowing before scoping it: **a mermaid diagram inserted through draw.io does not
+retain its mermaid source.** draw.io converts it to native shapes at insert time, so the
+attachment holds `mxCell` nodes and edges. The extraction target is identical, so this costs
+nothing — but it means draw.io mermaid is served by the mxfile decoder and never by the mermaid
+grammar, and should not be budgeted twice.
+
+#### 8.4.7 This is a hypothesis, and it is measurable
+
+The claim is that resolving relationships into the embedding input makes diagrams retrievable by
+what they state. That is a claim about retrieval, so it is settled by
+[`evaluation.md`](evaluation.md) rather than by this section: on a corpus carrying architecture or
+sequence diagrams, queries naming a relationship should improve and nothing else should move.
+Being index-affecting is what makes the comparison honest — the fingerprint forces the re-embed,
+so the two runs are not silently sharing vectors.
+
 ---
 
 ## 9. Archives

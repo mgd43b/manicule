@@ -55,6 +55,8 @@ __all__ = [
     "CONFLUENCE_MEDIA_TYPE",
     "CONFLUENCE_MEDIA_TYPES",
     "CSV_MEDIA_TYPE",
+    "DIAGRAM_LANGUAGES",
+    "DIAGRAM_MIDDLEWARE_NAME",
     "MAIL_MEDIA_TYPES",
     "MARKDOWN_MEDIA_TYPES",
     "NOTEBOOK_MEDIA_TYPE",
@@ -74,6 +76,7 @@ __all__ = [
     "ADFConfig",
     "ArchiveConfig",
     "ConfluenceConfig",
+    "DiagramConfig",
     "MailConfig",
     "MarkdownConfig",
     "NotebookConfig",
@@ -340,6 +343,55 @@ class ConfluenceConfig(BaseModel):
     navigation macro on every one of them, where the placeholders are noise repeated ten
     thousand times — but the content is gone from the index either way, and only the notice is
     configurable."""
+
+
+DIAGRAM_MIDDLEWARE_NAME = "diagrams"
+"""The registered name of :class:`~manicule.parsers.diagrams.DiagramMiddleware`.
+
+Spelled once, here, because three places reach for it — the registration, the factory's refusal
+message, and the fingerprint declaration — and a second spelling would let one of them name a
+component that is not the one being built."""
+
+DIAGRAM_LANGUAGES: frozenset[str] = frozenset({"dot", "mermaid"})
+"""Notations :mod:`manicule.parsers.diagrams` reads relationships out of.
+
+Named here rather than beside the readers for the reason every media-type set is named here: the
+plugin registers a component's configuration model without importing the module that implements
+it, so anything registration needs eagerly lives in this module. ``tests/parsers/test_diagrams.py``
+holds the reader table to this set, so the two cannot drift.
+
+``plantuml`` has a grammar in the same pack and is deliberately absent — see
+:data:`~manicule.parsers.diagrams.DIAGRAM_LANGUAGES` for the measurement, and ``docs/parsing.md``
+§8.4.1 for the record.
+"""
+
+
+class DiagramConfig(BaseModel):
+    """Configuration for :class:`~manicule.parsers.diagrams.DiagramMiddleware`."""
+
+    languages: frozenset[str] = Field(
+        default=DIAGRAM_LANGUAGES,
+        description="Notations whose chunks have their embedding input replaced by the "
+        "relationships the diagram draws.",
+    )
+    """Narrowing this is how an operator keeps one notation's diagrams embedding as source while
+    another's are read. Naming a notation with no reader is not an error and does nothing, which
+    is the same direction of failure as a diagram that will not parse."""
+
+    max_statements: int = Field(
+        default=64,
+        ge=1,
+        description="Most lines one reading reports before the rest are counted.",
+    )
+    """A second bound above the character budget, which is already the length of the source being
+    replaced. It exists for the diagram that is mostly edges between short identifiers, where a
+    reading can stay well inside the character budget while becoming a list nobody would read —
+    and where the first sixty statements are what the vector should be about.
+
+    **Lines rather than relationships, and it is named for what it bounds.** A reading is
+    relationships *and* the diagram's title, its groupings and its unconnected nodes; a bound that
+    counted only edges would let the other three grow past it. Called ``max_relations`` it read as
+    a promise the code does not keep — adding a title would have silently cost an edge."""
 
 
 class ADFConfig(BaseModel):

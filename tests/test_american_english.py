@@ -227,6 +227,13 @@ EXTERNAL: tuple[tuple[str, str], ...] = (
         "either by name is covered by the same entry, which is why it is the bare call and "
         "not a longer fragment.",
     ),
+    (
+        'ac:name="colour"',
+        "Confluence spells the status macro's parameter this way, so a storage-format fixture "
+        "has to carry the real name. The test using it asserts that the value never reaches "
+        "the index; respelled, the fixture would stop resembling the markup it stands in for "
+        "and the assertion would prove nothing about a real page.",
+    ),
 )
 """Text that must survive because something outside this repository defines it.
 

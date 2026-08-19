@@ -42,6 +42,7 @@ from manicule.parsers.config import (
 )
 from manicule.parsers.confluence import (
     INTERPRETED_MACROS,
+    MACRO_LANGUAGES,
     ConfluenceStorageParser,
     dot_parse_warning,
 )
@@ -1198,6 +1199,88 @@ async def test_a_macro_outside_the_declaration_is_a_placeholder() -> None:
 
     assert [block.metadata.get("unsupported") for block in blocks] == [True]
     assert "roadmap-planner" not in INTERPRETED_MACROS
+
+
+# --- a parameter that is the whole of what a macro renders ------------------------------------
+
+
+async def test_a_status_macro_contributes_the_words_inside_its_lozenge() -> None:
+    """The parameter rule failing in the direction nobody checked.
+
+    ``status`` has no body at all, so its ``title`` is the entire visible content of the macro.
+    Absent from ``RENDERED_PARAMETERS`` it was dropped as configuration, and a page that said
+    *In Progress* reached the index as ``[unsupported macro: status]`` and nothing else — the
+    index missing something the page says, which is this module's own defect running backwards.
+    """
+    blocks = await _blocks(
+        '<ac:structured-macro ac:name="status">'
+        '<ac:parameter ac:name="colour">Yellow</ac:parameter>'
+        '<ac:parameter ac:name="title">In Progress</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+
+    assert "In Progress" in _texts(blocks)
+    assert "Yellow" not in _texts(blocks), "a color is styling, and styling is not content"
+
+
+async def test_a_jira_macro_renders_its_key_and_still_never_its_query() -> None:
+    """Both halves of the rule in one macro, which is why this one is worth stating.
+
+    The single-issue form renders the key as its link text, so the key is content. ``jqlQuery``
+    is rendered nowhere and changes what the macro does — it is the parameter the whole rule was
+    built for, and adding ``key`` beside it must not move it.
+    """
+    blocks = await _blocks(
+        '<ac:structured-macro ac:name="jira">'
+        '<ac:parameter ac:name="key">ENG-123</ac:parameter>'
+        '<ac:parameter ac:name="jqlQuery">project = ENG AND status = Open</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    indexed = _texts(blocks)
+
+    assert "ENG-123" in indexed
+    assert "jqlQuery" not in indexed
+    assert "status = Open" not in indexed
+
+
+# --- an unsupported body still knows what language it is ---------------------------------------
+
+
+@pytest.mark.parametrize(("macro", "language"), sorted(MACRO_LANGUAGES.items()))
+async def test_an_unsupported_macro_body_carries_the_language_its_name_declares(
+    macro: str, language: str
+) -> None:
+    """A macro being unsupported is a statement about its behavior, not about its body.
+
+    The body was kept and emitted with no language, though ``ac:name`` had said what the language
+    was all along. ``Chunk.lang`` was then ``None``, neither store promoted a value, and no
+    language restriction could select content that was sitting in the index.
+    """
+    blocks = await _blocks(
+        f'<ac:structured-macro ac:name="{macro}">'
+        "<ac:plain-text-body><![CDATA[A --> B : validates]]></ac:plain-text-body>"
+        "</ac:structured-macro>"
+    )
+    code = [block for block in blocks if block.kind is BlockKind.CODE]
+
+    assert [block.lang for block in code] == [language]
+
+
+async def test_a_macro_outside_the_language_table_leaves_its_body_undetermined() -> None:
+    """The negative control, and the safe direction.
+
+    A table that answered for every macro would be guessing; ``None`` is where every macro body
+    was before, and it is what "we do not know" has to look like.
+    """
+    blocks = await _blocks(
+        '<ac:structured-macro ac:name="roadmap-planner">'
+        "<ac:plain-text-body><![CDATA[weeks: 4]]></ac:plain-text-body>"
+        "</ac:structured-macro>"
+    )
+    code = [block for block in blocks if block.kind is BlockKind.CODE]
+
+    assert code, "the body of an unsupported macro is still kept"
+    assert [block.lang for block in code] == [None]
 
 
 # --- the generic HTML parser must not regress --------------------------------------------------

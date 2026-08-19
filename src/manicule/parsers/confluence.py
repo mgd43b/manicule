@@ -70,6 +70,7 @@ from manicule.parsers.web import recover_cdata
 __all__ = [
     "CONFLUENCE_MEDIA_TYPES",
     "INTERPRETED_MACROS",
+    "MACRO_LANGUAGES",
     "ConfluenceConfig",
     "ConfluenceStorageParser",
     "close_empty_elements",
@@ -101,12 +102,15 @@ which is a *property of* a task rather than a line of the page — it appeared i
 own one-word block reading "complete"."""
 
 RENDERED_PARAMETERS: Mapping[str, tuple[str, ...]] = {
+    "chart": ("title",),
     "code": ("title",),
     "noformat": ("title",),
     "expand": ("title",),
     "info": ("title",),
+    "jira": ("key",),
     "note": ("title",),
     "panel": ("title",),
+    "status": ("title",),
     "tip": ("title",),
     "warning": ("title",),
 }
@@ -124,7 +128,47 @@ has added an entry for keeps its parameters out of the index, which is the harml
 
 Writing it out found two silent discards that a global rule had hidden — ``expand`` and ``code``
 both render a title, and both were being dropped while their bodies were kept. That is the value
-of the enumeration: it makes each answer visible enough to be wrong in review."""
+of the enumeration: it makes each answer visible enough to be wrong in review.
+
+**Three rows were added later, and the reason they were missing is the more useful half.** The
+table was read as "the safe direction is to leave a macro out", and that is true only where the
+parameter is configuration. Where a parameter is *the whole of what the macro renders*, leaving it
+out is not harmless — it drops the content rather than protecting the index from it, which is this
+module's defect running backwards:
+
+- ``status`` — ``title`` is the text inside the lozenge, and a status macro has no body at all, so
+  a page said ``In Progress`` and the index held ``[unsupported macro: status]`` and nothing else.
+- ``jira`` — ``key`` is the issue the single-issue form renders as its link text. ``jqlQuery``
+  stays configuration; that is the row this whole rule was built for and it has not moved.
+- ``chart`` — ``title`` is drawn as the caption above the chart.
+
+Each is an observation about what Confluence draws, never an inference from a parameter being
+called ``title``. Tab macros (``card``, ``deck``) look like the same case and are deliberately
+absent: they ship in a third-party app, nobody here has confirmed what it renders, and an
+unchecked row is exactly what the enumeration exists to prevent."""
+
+MACRO_LANGUAGES: Mapping[str, str] = {
+    "mermaid": "mermaid",
+    "mermaid-cloud": "mermaid",
+    "plantuml": "plantuml",
+}
+"""What language an unsupported macro's verbatim body is written in, where its name says.
+
+``_unsupported_macro`` keeps a macro's ``ac:plain-text-body`` as a ``CODE`` block, which is right
+— a macro being unsupported is a statement about its *behavior*, never a license to drop the
+content it carries. It emitted that block with **no language at all**, and the macro's own
+``ac:name`` had said what the language was the whole time. ``Chunk.lang`` was therefore ``None``,
+so neither store promoted a value into the column ``Filter.langs`` resolves against, and no
+language restriction could select the block: on a corpus full of PlantUML the content sat in the
+index and the filter that exists to find it matched none of it.
+
+An enumeration for the same reason :data:`RENDERED_PARAMETERS` is one, and it cannot be a rule:
+``code``'s body is in whatever its ``language`` parameter says, ``noformat``'s is in nothing, and
+both are handled before this table is consulted. A macro nobody has enumerated stays untagged,
+which is where every macro was before.
+
+Two spellings of Mermaid because two apps ship it under different names, and a page written
+against one of them is not a different language from a page written against the other."""
 
 _PANEL_SEVERITIES: Mapping[str, str] = {
     "info": "info",
@@ -718,7 +762,12 @@ def _unsupported_macro(node: LexborNode, name: str, config: ConfluenceConfig) ->
         yield _Found(kind=BlockKind.PROSE, text=body_text, metadata={"macro": name})
     yield from structured
     if plain.strip():
-        yield _Found(kind=BlockKind.CODE, text=plain, metadata={"macro": name})
+        yield _Found(
+            kind=BlockKind.CODE,
+            text=plain,
+            lang=MACRO_LANGUAGES.get(name),
+            metadata={"macro": name},
+        )
 
 
 def _macro_name(node: LexborNode) -> str:

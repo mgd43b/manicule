@@ -24,14 +24,21 @@ from pydantic import BaseModel
 from manicule.container import keys
 from manicule.core.errors import ConfigError, UnknownComponentError
 from manicule.parsers import config as parser_config
-from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
+from manicule.parsers.config import DIAGRAM_MIDDLEWARE_NAME
+from manicule.plugins import (
+    BuildContext,
+    ComponentRegistry,
+    MiddlewareMetadata,
+    Plugin,
+    PluginManifest,
+)
 from manicule.plugins.registry import Factory
 
 if TYPE_CHECKING:
     from manicule.chunking import StructuralChunker
     from manicule.config.settings import Settings
     from manicule.core.fingerprints import ChunkFingerprint
-    from manicule.core.protocols import Parser
+    from manicule.core.protocols import Middleware, Parser
     from manicule.plugins.registry import MetadataContext
 
 CHUNKER_NAME = "structural"
@@ -341,6 +348,49 @@ class ParsingPlugin:
             metadata_factory=_chunker_metadata,
             summary="Configurable final embed_text budget and overlap; structural boundaries.",
         )
+        registry.add(
+            keys.MIDDLEWARE.named(DIAGRAM_MIDDLEWARE_NAME),
+            _build_diagram_middleware,
+            config_model=parser_config.DiagramConfig,
+            metadata_factory=_diagram_metadata,
+            summary="Embeds what a diagram states, leaving its source as the cited text.",
+        )
+
+
+def _build_diagram_middleware(context: BuildContext) -> Middleware:
+    """Construct the diagram middleware, importing its readers only when one is configured.
+
+    The import is here for the reason every parser's is: a corpus with no diagrams in it should
+    not load tree-sitter, and this middleware does not load it either until a chunk in a notation
+    it reads actually reaches :func:`~manicule.parsers.diagrams.reading`.
+
+    Raises:
+        ConfigError: The context carries configuration of some other type, which the container
+            cannot produce — see :func:`_build_parser` for why substituting a default here would
+            be worse than refusing.
+    """
+    from manicule.parsers.diagrams import DiagramMiddleware  # noqa: PLC0415 - see docstring
+
+    config = context.config
+    if not isinstance(config, parser_config.DiagramConfig):
+        msg = (
+            f"middleware {DIAGRAM_MIDDLEWARE_NAME!r} was built with {type(config).__name__} "
+            f"where it declares {parser_config.DiagramConfig.__name__}. Configuration reaching "
+            f"a factory is validated against the model the component registered."
+        )
+        raise ConfigError(msg)
+    return DiagramMiddleware(config)
+
+
+def _diagram_metadata(context: MetadataContext) -> MiddlewareMetadata:
+    """What the chunk fingerprint needs, declared without constructing the middleware.
+
+    ``mutates_embedded_text`` has to be answerable before anything is built, because the
+    fingerprint it feeds is compared at startup — and constructing this middleware to ask would
+    import the readers on every run, including the runs with no diagram in the corpus.
+    """
+    del context
+    return MiddlewareMetadata(name=DIAGRAM_MIDDLEWARE_NAME, mutates_embedded_text=True)
 
 
 def _factory_for(registration: _Registration) -> Factory[Parser]:
