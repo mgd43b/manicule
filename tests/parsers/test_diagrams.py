@@ -217,6 +217,35 @@ def test_a_mermaid_subgraph_reports_what_it_groups() -> None:
     assert 'group "Control plane": Auth Service' in read("mermaid", FLOWCHART)
 
 
+def test_a_mermaid_open_link_is_not_reported_as_a_direction() -> None:
+    """``---`` draws no arrowhead, so a direction would be a claim the diagram does not make.
+
+    The DOT reader already tells ``--`` from ``->``; this read every mermaid link as directed,
+    which put a one-way relationship in the vector for a line the author drew both-ways-or-neither.
+    """
+    result = read("mermaid", "flowchart LR\n  a[Auth] --- b[Bill]\n")
+
+    assert "Auth — Bill" in result
+    assert "→" not in result
+
+
+def test_a_bidirectional_mermaid_link_claims_less_rather_than_half() -> None:
+    """``<-->`` points both ways and the reading has no notation for "both".
+
+    Reported as a forward edge it would silently drop half of what the diagram states, so it is
+    reported undirected: claiming less is the only safe direction to be wrong in.
+    """
+    result = read("mermaid", "flowchart LR\n  a[Auth] <--> b[Bill]\n")
+
+    assert "Auth — Bill" in result
+    assert "→" not in result
+
+
+def test_an_arrowed_mermaid_link_is_still_a_direction() -> None:
+    """The negative control: reading every link as undirected would pass the two tests above."""
+    assert "Auth → Bill" in read("mermaid", "flowchart LR\n  a[Auth] --> b[Bill]\n")
+
+
 # --- every failure keeps today's behavior ------------------------------------------------------
 
 
@@ -241,6 +270,20 @@ def test_a_source_that_does_not_parse_produces_nothing_rather_than_guesses() -> 
 
 def test_an_empty_source_produces_nothing() -> None:
     assert reading("dot", "   \n ", budget=999, max_relations=8) is None
+
+
+def test_a_diagram_nested_past_any_call_stack_still_fails_safely() -> None:
+    """A body is authored by anyone with write access, so its nesting is untrusted input.
+
+    Walked recursively this raised ``RecursionError`` out of ``reading`` — failing the document
+    rather than leaving its embedding input alone, which is the opposite of what this module
+    promises. ``docs/parsing.md`` §9.3 bounds the same threat for archives.
+    """
+    require_grammars()
+    depth = 1500
+    source = "digraph {" + "subgraph { " * depth + "a -> b;" + " }" * depth + "}"
+
+    assert reading("dot", source, budget=200, max_relations=8) is None
 
 
 # --- bounding --------------------------------------------------------------------------------

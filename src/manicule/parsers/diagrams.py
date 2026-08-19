@@ -63,6 +63,12 @@ __all__ = [
 _ARROW: Final = "→"
 _EDGE: Final = "—"
 
+_MAX_NESTING: Final = 64
+"""How deep a scope may nest before a reader stops descending.
+
+Far past any diagram a person has drawn, and far short of the interpreter's call stack. It exists
+because the body is untrusted rather than because deep nesting is expected."""
+
 _NAMES_PER_LINE: Final = 8
 """How many unconnected node names one line of a reading carries.
 
@@ -149,10 +155,15 @@ def reading(language: str, source: str, *, budget: int, max_relations: int) -> s
         # A grammar nobody seeded is not an error here. The chunk keeps the embedding input it
         # has today, which is the behavior every other failure in this module also produces.
         return None
+    read = _READERS.get(language)
+    if read is None:
+        # Declared in `parsers.config` and dispatched here, which is two statements of one
+        # answer. A test holds them in step; this keeps the promise above without depending on
+        # a test in another file to do it.
+        return None
     data = source.encode()
     root = parser.parse(data).root_node
-    graph = _READERS[language](root, data)
-    return _render(graph, budget=budget, max_relations=max_relations)
+    return _render(read(root, data), budget=budget, max_relations=max_relations)
 
 
 # --- rendering -------------------------------------------------------------------------------
@@ -239,15 +250,21 @@ def _read_dot(root: Node, data: bytes) -> _Graph:
     return graph
 
 
-def _dot_scope(block: Node, data: bytes, graph: _Graph) -> tuple[str, list[str]]:
+def _dot_scope(block: Node, data: bytes, graph: _Graph, depth: int = 0) -> tuple[str, list[str]]:
     """One ``{ … }`` scope: its own ``label``, and the identifiers declared inside it.
 
     Recursive because a subgraph is a scope like any other, and an edge inside a cluster is an
     edge on the diagram. The members are returned so that the enclosing scope can record which
     identifiers a cluster groups without walking the same tree twice.
+
+    Bounded for the reason :func:`_walk` is: the body is untrusted, and nesting deeper than
+    :data:`_MAX_NESTING` raised ``RecursionError`` out of :func:`reading` rather than leaving the
+    chunk alone. Past the bound a scope contributes nothing, which costs a diagram nobody drew.
     """
     own_label = ""
     members: list[str] = []
+    if depth > _MAX_NESTING:
+        return own_label, members
     for statement in _statements(block):
         kind = statement.type
         if kind == "attribute":
@@ -265,7 +282,7 @@ def _dot_scope(block: Node, data: bytes, graph: _Graph) -> tuple[str, list[str]]
             members.extend(_dot_edges(statement, data, graph))
         elif kind == "subgraph":
             for inner in _children(statement, "block"):
-                label, inside = _dot_scope(inner, data, graph)
+                label, inside = _dot_scope(inner, data, graph, depth + 1)
                 members.extend(inside)
                 if label:
                     graph.groups.append(_Group(label, tuple(inside)))
@@ -344,16 +361,32 @@ def _read_mermaid(root: Node, data: bytes) -> _Graph:
 def _mermaid_flow(statement: Node, data: bytes, graph: _Graph) -> None:
     """``a[Auth] -->|validates| b`` — vertices and links alternate, and links carry the text."""
     vertices: list[str] = []
-    links: list[str] = []
+    links: list[tuple[str, bool]] = []
     for child in statement.children:
         if child.type == "flow_node":
             vertices.append(graph.note(_mermaid_vertex(child, data, graph)))
         elif child.type.startswith("flow_link"):
-            links.append(_mermaid_link_text(child, data))
-    for index, label in enumerate(links):
+            links.append((_mermaid_link_text(child, data), _mermaid_directed(child, data)))
+    for index, (label, directed) in enumerate(links):
         if index + 1 >= len(vertices):
             break
-        graph.edges.append(_Edge(vertices[index], vertices[index + 1], label))
+        graph.edges.append(_Edge(vertices[index], vertices[index + 1], label, directed))
+
+
+def _mermaid_directed(link: Node, data: bytes) -> bool:
+    """Whether this link draws an arrowhead, which is a claim and not decoration.
+
+    Mermaid's ``---`` is an open link with no arrowhead: reported as directed it would state a
+    direction the diagram does not, which is what the DOT reader already avoids by telling ``--``
+    from ``->``. ``<-->`` points both ways and is reported undirected as well — the reading has
+    no notation for "both", and claiming less is the only safe direction to be wrong in.
+
+    Read from the arrow token rather than from the whole link, because the link node also spans
+    the label, and a label carrying an angle bracket would otherwise decide the direction of the
+    relationship above it.
+    """
+    arrow = next((_text(node, data) for node in _descendants(link, "flow_link_arrow")), "")
+    return ">" in arrow and "<" not in arrow
 
 
 def _mermaid_vertex(node: Node, data: bytes, graph: _Graph) -> str:
@@ -502,9 +535,20 @@ def _descendants(node: Node, kind: str) -> Iterator[Node]:
 
 
 def _walk(node: Node) -> Iterator[Node]:
-    for child in node.children:
-        yield child
-        yield from _walk(child)
+    """Every descendant, depth-first, without recursing.
+
+    An explicit stack rather than recursion because the input is a diagram body anyone with write
+    access to a page can author, and one nested a couple of thousand levels deep raised
+    ``RecursionError`` straight out of :func:`reading` — failing the document instead of leaving
+    its embedding input alone, which is the opposite of what this module promises. ``docs/
+    parsing.md`` §9.3 bounds the same threat for archives; here the bound is free, because the
+    walk never needed a call stack.
+    """
+    stack = list(reversed(node.children))
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(reversed(current.children))
 
 
 def _statements(block: Node) -> Iterator[Node]:
