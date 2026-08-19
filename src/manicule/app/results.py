@@ -1739,6 +1739,10 @@ class MessagingHostInstalled(Payload):
     extension_id: str = Field(
         default="", description="The extension permitted to start the host. No other one can."
     )
+    extension_dir: str = Field(
+        default="",
+        description="The directory to load at chrome://extensions, resolved on this machine.",
+    )
 
 
 class ConnectorSignedIn(Payload):

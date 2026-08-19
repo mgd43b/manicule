@@ -1591,7 +1591,11 @@ def browser_auth_install() -> None:
     Nothing here grants access to a site. The extension asks Chrome for that itself, for the one
     origin you name in its popup, and Chrome's own dialog is what approves it.
     """
-    from manicule.cli.extension import EXTENSION_ID, install  # noqa: PLC0415
+    from manicule.cli.extension import (  # noqa: PLC0415
+        EXTENSION_ID,
+        extension_dir,
+        install,
+    )
 
     def run(service: ApplicationService) -> Awaitable[Payload]:
         async def written() -> Payload:
@@ -1599,6 +1603,7 @@ def browser_auth_install() -> None:
             return r.MessagingHostInstalled(
                 installed=tuple(str(path) for path in paths),
                 extension_id=EXTENSION_ID,
+                extension_dir=str(extension_dir()),
             )
 
         return written()

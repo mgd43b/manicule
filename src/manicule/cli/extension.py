@@ -57,6 +57,7 @@ __all__ = [
     "HOST_NAME",
     "MAX_COOKIES",
     "MAX_MESSAGE_BYTES",
+    "extension_dir",
     "handle",
     "host_manifest",
     "install",
@@ -334,6 +335,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 # --- installing the host manifest ---------------------------------------------------------------
+
+
+def extension_dir() -> Path:
+    """Where the extension's source lives on this machine, for the operator to load.
+
+    **Inside the package rather than at the repository root**, so that it ships in the wheel.
+    An extension at the root is present for somebody working in a checkout and absent for
+    everybody who installed manicule normally — and the instruction "load the extension
+    directory" would then name a directory most people do not have.
+
+    Resolved rather than described for the same reason: an absolute path printed by the command
+    is right on a checkout, a virtualenv and a system install alike, and none of them has to be
+    explained.
+    """
+    return Path(__file__).parent.parent / "extension"
 
 
 def manifest_dirs() -> dict[str, Path]:

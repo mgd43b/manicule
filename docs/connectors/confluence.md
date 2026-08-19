@@ -287,13 +287,30 @@ Everything above signs you in to a browser manicule opened. The extension does t
 reads the session you *already have* in your ordinary Chrome, and hands it over without opening
 anything.
 
+Two steps, once.
+
+**1. Connect manicule to your browser.**
+
 ```console
 $ manicule browser-auth install
 ```
 
-Then load `extension/` at `chrome://extensions` with developer mode on, and set your Confluence
-URL in its popup. Chrome asks whether to grant access to that one site; nothing is read until you
-say yes.
+That writes the messaging host manifest for every Chromium-family browser it finds, and prints
+the directory to load in the next step — resolved on your machine, so it is right whether you
+installed manicule with `pip` or are working in a checkout.
+
+**2. Load the extension.** In Chrome:
+
+1. open `chrome://extensions`
+2. turn on **Developer mode** (top right)
+3. click **Load unpacked** and choose the directory the command printed
+4. open the extension's popup and enter your Confluence URL
+
+Chrome asks whether to grant access to that one site. Nothing is read until you say yes.
+
+You will know it worked when the popup says `Held for <connector> as <account>` — that account
+is what your Confluence answered, not what the extension guessed, so seeing it means the session
+has been proved and is held.
 
 After that there is no login command at all. Sign in to your wiki the way you normally would —
 in your own browser, your own profile, your own device — and manicule follows within a couple of
@@ -350,6 +367,20 @@ The extension is an input, not an authority. Three checks, none of which trust i
 
 Nothing is written to disk. The session crosses to the running server and lives in its memory, as
 every other login path's does.
+
+#### When it does not connect
+
+**"could not reach manicule on this machine".** Chrome could not start the host. Either
+`browser-auth install` has not been run, or it was run for a different browser than the one the
+extension is loaded in — it only writes manifests for browsers whose profile already exists, so a
+browser first started afterwards needs the command run again.
+
+**"no connector configured for that site".** The URL in the popup does not match any enabled
+Confluence connector. It is compared by authority — scheme, host, port and context path — so
+check it names the same site as the connector's `base_url`.
+
+**"no manicule server is running".** Sessions live in the server's memory. Start one with
+`manicule serve`.
 
 #### Removing it
 

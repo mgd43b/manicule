@@ -458,9 +458,26 @@ def test_the_pinned_key_is_the_one_chrome_will_derive_the_id_from() -> None:
     import base64  # noqa: PLC0415 - only this assertion needs them
     import hashlib  # noqa: PLC0415
 
-    manifest = json.loads(
-        (Path(__file__).parents[2] / "extension" / "manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((host.extension_dir() / "manifest.json").read_text(encoding="utf-8"))
     digest = hashlib.sha256(base64.b64decode(manifest["key"])).hexdigest()[:32]
 
     assert "".join(chr(ord("a") + int(c, 16)) for c in digest) == host.EXTENSION_ID
+
+
+def test_the_extension_ships_where_the_command_says_it_is() -> None:
+    """A path printed to an operator has to be one they can open.
+
+    The extension lived at the repository root first, which meant it was present for anybody
+    working in a checkout and absent from the wheel — so "load the directory it printed" named
+    something most installations do not have. It is inside the package now, and this asserts the
+    four files are actually there rather than that a path string was constructed.
+    """
+    directory = host.extension_dir()
+
+    assert directory.is_dir()
+    assert {path.name for path in directory.iterdir()} >= {
+        "manifest.json",
+        "worker.js",
+        "popup.html",
+        "popup.js",
+    }

@@ -905,8 +905,13 @@ def render_messaging_host_installed(out: Console, payload: r.MessagingHostInstal
         out.print(f"  {escape(path)}")
     out.print(f"  only extension [bold]{escape(payload.extension_id)}[/bold] may start it")
     out.print("")
-    out.print("Next: load the `extension/` directory at chrome://extensions with developer mode")
-    out.print("on, then set your Confluence URL in its popup.")
+    out.print("")
+    out.print("Next, in Chrome:")
+    out.print("  1. open [bold]chrome://extensions[/bold]")
+    out.print("  2. turn on [bold]Developer mode[/bold] (top right)")
+    out.print("  3. click [bold]Load unpacked[/bold] and choose:")
+    out.print(f"       {escape(payload.extension_dir)}")
+    out.print("  4. open the extension's popup and enter your Confluence URL")
 
 
 def render_snapshot_status(out: Console, payload: r.SnapshotStatusReport) -> None:
