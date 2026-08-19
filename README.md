@@ -141,10 +141,10 @@ manicule search "how are citations verified"
 ### `init` first — it does more than write a file
 
 It picks the embedding backend this machine can run, then pre-seeds the two things no Python
-wheel ships: the 24 tree-sitter grammars the code parser needs, and the two BPE vocabularies
-every search measures a context with. Both are small, and both are the kind of thing manicule
-refuses to download in the middle of a question. Skip `init` and the first `search` refuses
-rather than fetching — `doctor` calls a missing vocabulary `failing`, in as many words, because
+wheel ships: the 26 tree-sitter grammars the code and diagram readers need, and the two BPE
+vocabularies every search measures a context with. Both are small, and both are the kind of
+thing manicule refuses to download in the middle of a question. Skip `init` and the first
+`search` refuses rather than fetching — `doctor` calls a missing vocabulary `failing`, in as many words, because
 no corpus can be searched without one.
 
 ### The model weights are the one thing `init` does not fetch

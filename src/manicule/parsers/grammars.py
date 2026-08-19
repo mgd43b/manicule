@@ -191,12 +191,14 @@ MEDIA_TYPES: Final[Mapping[str, str]] = {
     "csharp": "text/x-csharp",
     "css": "text/css",
     "dart": "text/x-dart",
+    "dot": "text/vnd.graphviz",
     "elixir": "text/x-elixir",
     "go": "text/x-go",
     "java": "text/x-java",
     "javascript": "text/javascript",
     "kotlin": "text/x-kotlin",
     "lua": "text/x-lua",
+    "mermaid": "text/x-mermaid",
     "ocaml": "text/x-ocaml",
     "php": "text/x-php",
     "python": "text/x-python",
@@ -212,10 +214,20 @@ MEDIA_TYPES: Final[Mapping[str, str]] = {
 }
 """Media type per declared language. The routing table, and the reason the set is declared.
 
-``text/javascript``, ``text/css`` and ``application/sql`` are IANA-registered; everything
-else uses the conventional ``text/x-`` form, since most programming languages have no
-registration. One language, one media type, and no two languages share one — asserted by
-this module's tests, because a collision would make routing depend on dictionary order.
+``text/javascript``, ``text/css``, ``application/sql`` and ``text/vnd.graphviz`` are
+IANA-registered; everything else uses the conventional ``text/x-`` form, since most programming
+languages have no registration. One language, one media type, and no two languages share one —
+asserted by this module's tests, because a collision would make routing depend on dictionary
+order.
+
+``dot`` and ``mermaid`` are here for a second reason on top of routing, and it is the reason
+they were added: declaring a language is what makes :func:`prefetch` fetch its grammar and
+:mod:`~manicule.parsers.grammar_bundle` carry it, so it is the prerequisite for
+:mod:`manicule.parsers.diagrams` reading a diagram at all (``docs/parsing.md`` §8.4.1). Routing
+``.dot`` and ``.mmd`` files to the code parser is the welcome consequence rather than the goal:
+they gain line anchors and no symbols, because :data:`NODE_TYPE_DEFINITIONS` describes neither
+grammar and inventing definitions for them would make ``LineAnchor.symbol`` claim structure the
+notation does not have.
 
 Notably absent, and deliberately: HTML, JSON, YAML, TOML and Markdown all have grammars in
 the pack, and all are routed elsewhere (``docs/parsing.md`` §2.4). Claiming ``text/html``

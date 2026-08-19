@@ -27,7 +27,7 @@ from typer.testing import CliRunner
 import manicule.cli.main as cli
 from manicule.app import commands
 from manicule.app.dispatch import run_op
-from manicule.app.service import ApplicationService
+from manicule.app.service import LANGUAGES_NAMED, ApplicationService
 from manicule.config.settings import Settings
 from manicule.core.errors import ConfigError, ParseError
 from manicule.parsers import grammars
@@ -529,8 +529,14 @@ def test_every_command_the_parsing_package_names_exists_with_the_flags_it_names(
     assert len(sources) > 1, f"{package} produced no modules to read"
     assert {"doctor --fix", "init"} <= named, f"the package stopped naming its callers: {named}"
     for claim in claims:
-        flags = [part for part in claim if part.startswith("-")]
-        offered = _options_of([part for part in claim if not part.startswith("-")])
+        # The command path ends at the first flag, and everything after it belongs to the flags
+        # rather than to the tree. Splitting on "does it start with a dash" instead read the
+        # *value* in `search --lang plantuml` as a subcommand and failed a claim that is true.
+        boundary = next(
+            (index for index, part in enumerate(claim) if part.startswith("-")), len(claim)
+        )
+        flags = [part for part in claim[boundary:] if part.startswith("-")]
+        offered = _options_of(claim[:boundary])
         assert set(flags) <= offered, (
             f"`manicule {' '.join(claim)}` names {flags}, and that command offers {sorted(offered)}"
         )
@@ -625,12 +631,16 @@ async def test_doctor_reports_a_missing_grammar_the_way_missing_grammars_claims_
     assert check.state == "degraded"
     assert grammars.PRESEED_COMMAND in check.detail
     assert str(tmp_path / "cache") in check.detail, "the configured cache is not what was checked"
-    # Every declared language is missing here, and naming all twenty-four is the paragraph
-    # that used to bury the fix. The count is the claim; a sample of the names makes it
-    # checkable, and `_a_short_list_is_named_in_full` below covers the case where the whole
-    # set fits.
+    # Every declared language is missing here, and naming all of them is the paragraph that
+    # used to bury the fix. The count is the claim; a sample of the names makes it checkable,
+    # and `_a_short_list_is_named_in_full` below covers the case where the whole set fits.
+    #
+    # Both numbers are derived rather than written down. They were literals, and declaring a
+    # language then failed this test with an arithmetic puzzle instead of a defect — the count
+    # is a property of the declared set, so it is read from the declared set.
+    overflow = len(grammars.DECLARED_LANGUAGES) - LANGUAGES_NAMED
     assert f"{len(grammars.DECLARED_LANGUAGES)} missing grammar(s)" in check.detail
-    assert "and 18 more" in check.detail
+    assert f"and {overflow} more" in check.detail
 
 
 async def test_doctor_names_a_short_list_of_missing_grammars_in_full(
