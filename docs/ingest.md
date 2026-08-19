@@ -2374,7 +2374,7 @@ Calls made in the absence of a stated position.
 | Reconcile: clean-completion-only, a deletion ceiling, soft delete only | §11.1 |
 | The sweep is scheduled and yields to backup and sync | §11.2 |
 | Watch never reconciles; debounce with a post-debounce re-`stat` | §12 |
-| Enumeration coverage is journaled; recovery/takeover remains separate orchestration | §13 |
+| Enumeration coverage is journaled; continuation stays a supervisor's, under a stated contract | §13.4 |
 
 Decisions the implementation added, each argued where it appears:
 

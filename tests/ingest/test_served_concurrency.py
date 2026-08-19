@@ -1063,3 +1063,74 @@ async def test_a_client_that_disconnects_during_held_preparation_does_not_strand
     finally:
         held.release.set()
         await server.aclose()
+
+
+async def test_an_http_client_that_disconnects_during_held_preparation_keeps_the_sync() -> None:
+    """The socket test's guarantee, over a port, on the one network surface that can start a sync.
+
+    ``tests/api/test_both_surfaces.py`` proves a disconnected client does not cancel a *search*,
+    which parks in the retriever on the event loop. A sync is the case with something to lose:
+    it holds a lease, it publishes, and the stage it spends its time in is synchronous
+    preparation on a worker thread. A transport closing under that must not take the run with
+    it.
+
+    **There is deliberately no MCP half of this.** The served MCP server is built
+    ``read_only=True``, so ``connector_sync`` is not registered on it at all — not hidden behind
+    a permission, absent from the dispatch table — and a client there cannot start a sync to
+    then disconnect from. ``tests/mcp/test_transports.py`` holds that exclusion; asserting it
+    again here would be testing that test. The surfaces table marks ``connector_sync`` as having
+    an MCP tool because it does over stdio, where a person is present.
+
+    The call is abandoned as rudely as a client can manage — request task canceled and the
+    transport closed under it — while preparation is held.
+    """
+    held = HeldChunker()
+    documents = corpus(3, prefix="held")
+    service, ingestion, store = served(
+        {"proxied": fakes.ObservedConnector(documents, name="handbook")},
+        chunker=held,
+        fetch_concurrency=2,
+        parse_workers=1,
+    )
+
+    finished = asyncio.Event()
+    running = ingestion.sync
+
+    async def watched(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await running(*args, **kwargs)
+        finally:
+            finished.set()
+
+    ingestion.sync = watched
+
+    async with serving(_backend(service), web=False) as live:
+        # An exit stack rather than `async with`, because the client has to be closed *while a
+        # call is in flight* — the reason `tests/api/test_both_surfaces.py` gives.
+        attached = AsyncExitStack()
+        http = await attached.enter_async_context(live.http())
+        call = asyncio.create_task(http.post("/api/v1/admin/connectors/proxied/sync", json={}))
+
+        entered = await asyncio.wait_for(
+            asyncio.to_thread(held.entered.wait, HELD_STAGE_TIMEOUT_S / 3),
+            timeout=HELD_STAGE_TIMEOUT_S,
+        )
+        assert entered, "preparation was never reached, so the disconnect had nothing to race"
+
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+        await asyncio.gather(attached.aclose(), return_exceptions=True)
+        assert not finished.is_set(), "the sync finished before the client was even gone"
+
+        held.release.set()
+        await asyncio.wait_for(finished.wait(), timeout=HELD_STAGE_TIMEOUT_S)
+
+    await asyncio.wait_for(
+        asyncio.to_thread(held.exited.wait, HELD_STAGE_TIMEOUT_S * 2),
+        timeout=HELD_STAGE_TIMEOUT_S * 3,
+    )
+    assert not held.timed_out
+    assert len(store.documents) == len(documents), (
+        "the HTTP client going away abandoned the sync it started: the server owns accepted "
+        "work, and a half-derived corpus is what the recovery sweep exists to avoid"
+    )
