@@ -159,12 +159,16 @@ class _Unit:
     tokens: int
     """Exact, for every unit that fits the text budget; ``budget + 1`` for one that does not.
 
-    Nothing reads this as a quantity except to compare it against a budget, and a unit over
-    the budget is always split before its count is read for anything else — so the count of
-    an oversized unit is a bit of information dressed as a number, and
+    A unit over the budget is either split before its count is read for anything else, or is
+    a heading, which :meth:`StructuralChunker._accumulate` drops without reading it — so the
+    count of an oversized unit is a bit of information dressed as a number, and
     :meth:`StructuralChunker._count_or_ceiling` declines to spend a megabyte of tokenizer
     time computing the rest of it. Anything added here that needs the true count of an
     oversized unit must take it itself.
+
+    ``test_no_group_is_ever_built_from_an_inexact_count`` holds the boundary: every unit that
+    reaches a group is checked against a fresh exact count, so a new split path that let an
+    unsplit oversized unit through would fail there rather than quietly shift a merge.
     """
 
     lang: str | None = None
@@ -661,12 +665,22 @@ class StructuralChunker:
         oversized block cost minutes of tokenizer time. A prefix that is already over budget
         settles the question, so the probe doubles until one is.
 
-        **The value is exact wherever anything reads it as a number.** Every reader of
-        :attr:`_Unit.tokens` either compares it against a budget — where ``budget + 1`` and
-        the true count decide identically — or reads it after the unit has been split, by
-        which point every fragment fits and was counted exactly. :func:`_dominant_kind` is
-        the one caller that compares two counts against each other rather than a budget, and
-        it runs only on groups under :data:`MIN_TOKENS`, where nothing can be over budget.
+        **A ceiling never reaches a group, so grouping never reads one.** The only unit that
+        can carry one is a unit :meth:`_to_units` is on its way to splitting — everything past
+        the text budget goes to :meth:`_split_table`, :meth:`_split_lines` or
+        :meth:`_split_prose`, and each of those emits parts that fit and were counted exactly,
+        hard-splitting whatever still does not — or a heading, whose count
+        :meth:`_accumulate` discards along with the unit, headings being boundaries rather
+        than content. Every unit that reaches :meth:`_accumulate` therefore has an exact
+        count, which is what the running sums, :meth:`_merge_short_tail` and
+        :func:`_dominant_kind` all read.
+
+        That is the property to preserve, and it is worth stating as such rather than as a
+        claim about any one caller: :func:`_dominant_kind` compares two counts against each
+        other rather than against a budget, and ``_merge_short_tail`` hands it the *preceding*
+        group, which is under no size limit at all. Neither fact matters while the counts it
+        sees are exact, and both would if a future path let an unsplit oversized unit into a
+        group.
 
         Blocks shorter than one probe — which is nearly all of them, since a chunk's worth of
         prose is a couple of thousand characters — take the single exact count they always

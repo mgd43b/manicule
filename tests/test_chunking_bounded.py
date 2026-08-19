@@ -17,12 +17,15 @@ The opt-in benchmark in ``tests/benchmarks`` is where wall-clock belongs.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 
 import pytest
 
 from manicule.chunking import MAX_TOKENS, StructuralChunker, TokenCounter
 from manicule.chunking import chunker as chunker_module
+from manicule.chunking.chunker import (
+    _Unit,  # pyright: ignore[reportPrivateUsage] - the boundary under test
+)
 from manicule.core.anchors import LineAnchor
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus, ParsedBlock
 
@@ -286,6 +289,45 @@ def test_the_probe_size_cannot_move_a_boundary(shape: str, probe: int) -> None:
         f"of {chunker_module.PROBE_CHARS_PER_TOKEN}. The search is only allowed to be faster "
         f"or slower for a bad guess — if it can also be *different*, the constant belongs in "
         f"the fingerprint and this is a version bump"
+    )
+
+
+@pytest.mark.parametrize("shape", list(SHAPES))
+def test_no_group_is_ever_built_from_an_inexact_count(shape: str) -> None:
+    """The invariant that lets :meth:`_count_or_ceiling` stop early without lying.
+
+    An over-budget count is recorded as ``budget + 1`` rather than measured, which is sound
+    only while no such unit reaches grouping: ``_accumulate``'s running sums,
+    ``_merge_short_tail`` and ``_dominant_kind`` all read ``tokens`` as a quantity, and the
+    last of them compares two of them against *each other* rather than against a budget.
+    Today nothing gets there — everything past the budget is split first, and headings are
+    dropped — but that is a property of the split paths, and split paths get added.
+
+    So this checks the boundary itself rather than any one caller's reasoning: every unit
+    handed to ``_accumulate`` is re-counted exactly and must already agree.
+    """
+    seen: list[_Unit] = []
+    original = StructuralChunker._accumulate  # pyright: ignore[reportPrivateUsage] - as above
+
+    def capturing(self: StructuralChunker, units: Sequence[_Unit]) -> list[list[_Unit]]:
+        seen.extend(units)
+        return original(self, units)
+
+    recorder = Recorder()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(StructuralChunker, "_accumulate", capturing)
+        chunker_recording(recorder).chunk(document(), [block_of(shape, 256 * 1024)])
+
+    assert seen, "the shape produced no units at all, so this asserted nothing"
+    inexact = [
+        (unit.kind, unit.tokens, characters_per_token(unit.text))
+        for unit in seen
+        if unit.tokens != characters_per_token(unit.text)
+    ]
+    assert not inexact, (
+        f"{len(inexact)} unit(s) reached grouping carrying a count that is not their exact "
+        f"one — first {inexact[:3]}. A ceiling is only a bit of information; past this point "
+        f"it is read as a quantity, and a merge decision made from one is silently wrong"
     )
 
 
