@@ -4609,6 +4609,14 @@ async def test_unchanged_revision_reuses_promoted_snapshot_without_body_download
     )
 
 
+WORKERS = 8
+"""Acquisition workers the reusable-manifest test runs with, pinned rather than inherited.
+
+Enough of them, against three times as many records, that several are inside the lookup together
+on every run. Read from here rather than from ``IngestPipeline``'s default so that lowering that
+default changes what the pipeline does and not what this test proves."""
+
+
 async def test_the_reusable_manifest_is_verified_once_across_every_acquisition_worker(
     store: SqliteDocStore,
     engine: AsyncEngine,
@@ -4619,15 +4627,20 @@ async def test_the_reusable_manifest_is_verified_once_across_every_acquisition_w
 
     The test above states the same property with two documents, and two documents rarely put two
     workers in the lookup at once — so it held for months and then failed one CI shard, which is
-    the worst way for a property to be checked. Twenty-four unchanged records across the default
-    eight workers puts several in flight together every time, and the lookup is held open across
-    a few event-loop turns so the window cannot close by luck on a fast machine.
+    the worst way for a property to be checked. Three records per worker puts several of them in
+    the lookup together every time, and the lookup is held open across a few event-loop turns so
+    the window cannot close by luck on a fast machine.
 
     Instrumenting the unguarded version showed exactly this: ``acquire-1`` enters while
     ``acquire-0`` is still inside the query, reads the memo as ``False``, and issues it again.
+
+    :data:`WORKERS` is passed to the pipeline rather than inherited from it. Eight is the default
+    today, and a default lowered to one would leave this test green while it reproduced nothing —
+    a test that cannot fail for the reason it exists, which is the shape #233 found in the
+    lease-heartbeat test after a refactor moved the seam it patched.
     """
     connector = fakes.DictConnector(
-        {f"public-shared-{index}": f"retained body {index}" for index in range(24)},
+        {f"public-shared-{index}": f"retained body {index}" for index in range(3 * WORKERS)},
         name="shared-manifest-source",
     )
     chunker = fakes.BlockChunker()
@@ -4645,6 +4658,7 @@ async def test_the_reusable_manifest_is_verified_once_across_every_acquisition_w
             middleware=MiddlewareRunner(()),
             chunk_fingerprint=chunker.fingerprint,
             detect_glossary=False,
+            fetch_concurrency=WORKERS,
         )
 
     first = await pipeline().run(connector)
@@ -4666,7 +4680,7 @@ async def test_the_reusable_manifest_is_verified_once_across_every_acquisition_w
         second = await pipeline().run(connector)
 
     assert first.snapshot_completeness == "complete"
-    assert second.skipped_version == 24
+    assert second.skipped_version == 3 * WORKERS
     assert calls == 1, "every worker after the first reads the memo instead of repeating the query"
     assert connector.fetches == fetches, "a verified manifest means no body is downloaded again"
 
