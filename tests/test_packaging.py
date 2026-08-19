@@ -26,8 +26,11 @@ part that can be checked from the tree, so it is checked where a developer sees 
 
 from __future__ import annotations
 
+import ast
+import builtins
 import re
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -36,6 +39,7 @@ from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
+from manicule import entry
 from manicule.core.version import CORE_VERSION
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -128,10 +132,22 @@ def test_the_console_script_is_guarded(pyproject: dict[str, Any]) -> None:
 
     # And the module it names holds to its own contract: nothing at module scope that a bare
     # install would not have. `sys` is the standard library; the CLI import is inside `main`.
-    source = (SRC / "entry.py").read_text()
-    module_scope_imports = re.findall(r"^(?:from|import)\s+(\S+)", source, re.MULTILINE)
-    assert set(module_scope_imports) <= {"__future__", "sys"}, (
-        f"manicule/entry.py imports {module_scope_imports} at module scope. Anything beyond the "
+    #
+    # Parsed rather than grepped. A regular expression over the source reads the docstring too,
+    # and this module's docstring is *about* imports — the line "a manicule whose own modules
+    # fail to / import is a broken installation" made `^import\s+(\S+)` report a module named
+    # `is`. `ast.parse(...).body` is module scope by construction, so the deferred import inside
+    # `main` is excluded because of where it is rather than because of how it is spelled.
+    tree = ast.parse((SRC / "entry.py").read_text())
+    imported: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imported |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+
+    assert imported <= {"__future__", "sys"}, (
+        f"manicule/entry.py imports {sorted(imported)} at module scope. Anything beyond the "
         "standard library defeats the guard: the import fails before it can be reported."
     )
 
@@ -225,3 +241,88 @@ def test_every_workspace_member_is_classified() -> None:
         "withheld one. Add it to PUBLISHED in this file, or to `withheld` here with the "
         "reason it must never reach PyPI."
     )
+
+
+def test_only_an_absent_dependency_gets_the_install_hint() -> None:
+    """A missing module is translated; an installed-but-incompatible one is not.
+
+    `from typer import Removed` against a Typer that no longer has `Removed` raises a plain
+    `ImportError` whose `.name` is still `'typer'`. Catching `ImportError` rather than
+    `ModuleNotFoundError` therefore answers a version conflict with "install `manicule[all]`" —
+    advice that cannot help, printed over the incompatibility it has just hidden.
+
+    `main` narrows to `ModuleNotFoundError`, which is what makes that impossible.
+    """
+    hint = entry.install_hint(ModuleNotFoundError("No module named 'typer'", name="typer"))
+    assert hint is not None
+    assert "manicule[all]" in hint
+
+    # A module nothing here provides gets no hint, so `main` re-raises it untouched: a manicule
+    # whose own modules fail to import is broken, not incomplete.
+    assert entry.install_hint(ModuleNotFoundError("no module named 'nacl'", name="nacl")) is None
+
+    # The premise of the narrowing, asserted against the exception the interpreter really
+    # constructs rather than assumed: a "cannot import name" failure carries the *module* in
+    # `.name` — so it would match `_PROVIDED_BY` — and is not a `ModuleNotFoundError`, which is
+    # the only reason the guard never sees it.
+    # Compiled at run time rather than written as an import statement. The symbol is absent on
+    # purpose — that absence *is* the fixture — and a static checker is right to reject the
+    # literal form, so writing it literally would trade a real demonstration for a suppression
+    # comment. What is under test is CPython's own behavior, which only a genuine failed import
+    # exhibits.
+    premise = compile("from json import ThisSymbolDoesNotExist", "<premise>", "exec")
+    with pytest.raises(ImportError) as mismatch:
+        exec(premise, {})  # noqa: S102 - the compiled statement above is the fixture
+
+    assert mismatch.value.name == "json"
+    assert not isinstance(mismatch.value, ModuleNotFoundError), (
+        "a `cannot import name` error is now a ModuleNotFoundError, so narrowing to it no longer "
+        "separates an absent dependency from an incompatible one. manicule/entry.py needs a "
+        "different discriminator."
+    )
+
+
+def _import_raising(exc: ImportError) -> Callable[..., Any]:
+    """An `__import__` that fails on the CLI module alone, with `exc`, and is otherwise real."""
+    real = builtins.__import__
+
+    def fake(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "manicule.cli.main":
+            raise exc
+        return real(name, *args, **kwargs)
+
+    return fake
+
+
+def test_main_translates_an_absent_dependency_and_propagates_everything_else(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`main` acts on the exception *class*, not just on `.name`.
+
+    The distinction it draws is invisible to `install_hint`, which never sees the class — so
+    testing that function alone leaves `except ImportError` and `except ModuleNotFoundError`
+    indistinguishable, and a revert to the broad one passes. Verified by mutation: with only the
+    `install_hint` assertions above, reverting the narrowing failed nothing.
+
+    This drives `main` itself, with the import made to fail on demand, which is the only place
+    the `except` clause is observable.
+    """
+    absent = ModuleNotFoundError("No module named 'typer'", name="typer")
+    monkeypatch.setattr(builtins, "__import__", _import_raising(absent))
+    with pytest.raises(SystemExit) as exited:
+        entry.main()
+
+    assert exited.value.code == 1
+    stderr = capsys.readouterr().err
+    assert "manicule[all]" in stderr
+    assert "Traceback" not in stderr
+
+    # The same module name, carried by the exception a version conflict raises. It must reach the
+    # caller as itself: the person needs to read "cannot import name", not an install hint for a
+    # package they already have.
+    incompatible = ImportError("cannot import name 'Removed' from 'typer'", name="typer")
+    monkeypatch.setattr(builtins, "__import__", _import_raising(incompatible))
+    with pytest.raises(ImportError) as propagated:
+        entry.main()
+
+    assert propagated.value is incompatible

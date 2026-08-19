@@ -14,9 +14,15 @@ would execute `manicule/cli/__init__.py`, and therefore `import typer`, before a
 could run. `manicule/__init__.py` reads distribution metadata and nothing else, so importing this
 module is safe on a bare install.
 
-Only a missing *extra* is translated. Anything else propagates untouched: a manicule whose own
-modules fail to import is a broken installation rather than an incomplete one, and printing an
-install hint over that would send someone to reinstall a package that is already present.
+Only a missing *extra* is translated, and "missing" means `ModuleNotFoundError` specifically
+rather than `ImportError` broadly. The distinction is load-bearing: `from typer import Removed`
+against an incompatible Typer raises a plain `ImportError` whose `.name` is still `'typer'`, so
+catching the base class would answer a version conflict with "install `manicule[all]`" — advice
+that cannot help, over a real incompatibility it has just hidden. An installed-but-wrong
+dependency and an absent one need different sentences, and only the second one is this module's.
+
+Anything else propagates untouched, for the same reason: a manicule whose own modules fail to
+import is a broken installation rather than an incomplete one.
 """
 
 from __future__ import annotations
@@ -52,6 +58,17 @@ are opted into by name — `manicule[all,rerank]`. See https://github.com/mgd43b
 """
 
 
+def install_hint(exc: ModuleNotFoundError) -> str | None:
+    """What to tell someone about `exc`, or `None` if this module has nothing to say about it.
+
+    Separate from :func:`main` so that the decision can be tested against a constructed
+    exception. Exercising it through the import statement instead would need the import to fail
+    on demand, and a test that reaches for that is testing its own machinery.
+    """
+    extra = _PROVIDED_BY.get(exc.name or "")
+    return None if extra is None else _HINT.format(module=exc.name, extra=extra)
+
+
 def main() -> None:
     """The console-script entry point, past the guard."""
     try:
@@ -59,16 +76,16 @@ def main() -> None:
         # import runs at interpreter start, before the `except` below exists to catch it, and
         # the guard becomes the traceback it was written to replace.
         from manicule.cli.main import main as _main  # noqa: PLC0415
-    except ImportError as exc:
-        extra = _PROVIDED_BY.get(exc.name or "")
-        if extra is None:
+    except ModuleNotFoundError as exc:
+        hint = install_hint(exc)
+        if hint is None:
             raise
         # stderr, because stdout is the `--json` channel and a caller piping this into `jq`
         # should read an empty stream rather than prose. Same rule the CLI itself holds to.
-        sys.stderr.write(_HINT.format(module=exc.name, extra=extra))
+        sys.stderr.write(hint)
         raise SystemExit(1) from exc
 
     _main()
 
 
-__all__ = ["main"]
+__all__ = ["install_hint", "main"]
