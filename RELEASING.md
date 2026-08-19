@@ -96,6 +96,11 @@ Fix the configuration, then republish that tag:
 **Actions → Release → Run workflow**, and give it the tag (`v0.1.0`).
 
 That path skips release-please entirely, checks out the tag, rebuilds from it and publishes.
+The publish and attach jobs carry an explicit `if: always() && needs.build.result == 'success'`
+for that reason: `skipped` propagates transitively through `needs`, so with the default
+condition they would inherit release-please's skip and the run would report green having
+uploaded nothing. `attach` additionally *fails* when either upload did not succeed, because a
+release that published nothing must not be a green run.
 `skip-existing: true` on both uploads means a tag whose *other* half already succeeded
 republishes cleanly rather than failing on the half that is already there. Only an identical
 filename is skipped — PyPI still refuses a changed artifact under a version it already has, so
