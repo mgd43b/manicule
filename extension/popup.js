@@ -28,13 +28,25 @@ document.getElementById("save").addEventListener("click", async () => {
   } catch {
     return show("That is not a URL.", "bad");
   }
+  // Refused here rather than at the permission call, which would fail with Chrome's own wording
+  // and no explanation. The manifest asks for `https://*/*`, so an http:// origin can never be
+  // granted — and a Confluence session cookie is `secure` in any case, so manicule would refuse
+  // to store one taken over plaintext.
+  if (url.protocol !== "https:") {
+    return show("Only https:// sites can be watched.", "bad");
+  }
+  // Stored normalized rather than as typed. manicule keys a held session by authority and
+  // treats a query or fragment as naming a *different* site, deliberately — so persisting a
+  // pasted URL that carried `?src=...` would produce "no connector configured for that site"
+  // against the very instance it names, which is the least debuggable refusal here.
+  const baseUrl = `${url.origin}${url.pathname}`.replace(/\/+$/, "");
   // Requested at runtime for one origin rather than declared in the manifest, so Chrome's own
   // dialog names the site and the extension holds no standing access to anything else.
-  const origin = `${url.origin}/*`;
-  const granted = await chrome.permissions.request({ origins: [origin] });
+  const granted = await chrome.permissions.request({ origins: [`${url.origin}/*`] });
   if (!granted) return show("Chrome declined access to that site.", "bad");
-  await chrome.storage.local.set({ baseUrl: site.value.trim() });
-  show(`Watching ${url.origin}. Sign in there and manicule will follow.`, "ok");
+  await chrome.storage.local.set({ baseUrl });
+  site.value = baseUrl;
+  show(`Watching ${baseUrl}. Sign in there and manicule will follow.`, "ok");
 });
 
 document.getElementById("send").addEventListener("click", () => {

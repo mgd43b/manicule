@@ -57,9 +57,14 @@ async function handOff(baseUrl) {
   } catch (e) {
     // The usual cause by a wide margin: the native host manifest is not installed, so Chrome
     // has nothing to start. Say the command rather than the exception.
+    //
+    // `e` is not necessarily an Error — a rejected port can surface as a string, and reading
+    // `.message` off null throws inside the handler, which would replace a useful refusal with
+    // a stack trace nobody sees.
+    const reason = e instanceof Error ? e.message : String(e);
     return {
       ok: false,
-      error: `could not reach manicule on this machine (${e.message}). Run: manicule browser-auth install`,
+      error: `could not reach manicule on this machine (${reason}). Run: manicule browser-auth install`,
     };
   }
 }

@@ -407,30 +407,48 @@ def install(
     would be manicule inventing a profile for a browser that is not installed — and the operator
     would then wonder why an extension they never loaded was mentioned in their filesystem.
 
+    **Nothing is written until there is somewhere to write it.** The shim is created after the
+    target list is known, so a platform this cannot serve, or a machine whose browsers have never
+    been started, is refused having left no trace — rather than leaving an executable under the
+    data directory that nothing will ever run.
+
     Raises:
-        ConfigError: No supported browser was found to install for.
+        ConfigError: The platform has no known manifest locations, or no supported browser
+            profile exists yet. The two are different problems with different answers, so they
+            are different messages.
     """
-    shim = _shim(data_dir / "browser-auth")
-    document = json.dumps(host_manifest(shim, extension_id=extension_id), indent=2)
-    written: list[Path] = []
+    directories = manifest_dirs()
+    if not directories:
+        msg = (
+            f"manicule does not know where {sys.platform} keeps native messaging host "
+            f"manifests, so the browser extension cannot be connected on this machine. The "
+            f"other login paths are unaffected: `manicule connector login <name>` still works."
+        )
+        raise ConfigError(msg)
+
     wanted = set(browsers) if browsers else None
-    for name, directory in manifest_dirs().items():
-        if wanted is not None and name not in wanted:
-            continue
-        if not directory.parent.exists():
-            continue
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path = directory / f"{HOST_NAME}.json"
-        path.write_text(document + "\n", encoding="utf-8")
-        written.append(path)
-    if not written:
-        known = ", ".join(sorted(manifest_dirs())) or "none on this platform"
+    targets = [
+        directory
+        for name, directory in directories.items()
+        if (wanted is None or name in wanted) and directory.parent.exists()
+    ]
+    if not targets:
+        known = ", ".join(sorted(directories))
         msg = (
             f"no supported browser profile was found to install the messaging host for. "
             f"manicule looks for: {known}. Start the browser once so it creates its profile "
             f"directory, then run this again."
         )
         raise ConfigError(msg)
+
+    shim = _shim(data_dir / "browser-auth")
+    document = json.dumps(host_manifest(shim, extension_id=extension_id), indent=2)
+    written: list[Path] = []
+    for directory in targets:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = directory / f"{HOST_NAME}.json"
+        path.write_text(document + "\n", encoding="utf-8")
+        written.append(path)
     return written
 
 

@@ -353,13 +353,18 @@ every other login path's does.
 
 #### Removing it
 
-Delete the extension at `chrome://extensions`, and delete the host manifest:
+Delete the extension at `chrome://extensions`, and delete the host manifests.
 
-```console
-$ rm ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/com.manicule.session_handoff.json
-```
+`manicule browser-auth install` prints every path it wrote — one per browser it found, and the
+locations differ by browser and by operating system — so those are the files to remove. Run it
+again if you no longer have the output; it is idempotent and reprints them.
 
-With either gone the pairing is broken and nothing can start the host.
+On macOS they are under `~/Library/Application Support/<browser>/NativeMessagingHosts/`, and on
+Linux under `~/.config/<browser>/NativeMessagingHosts/`, each named
+`com.manicule.session_handoff.json`.
+
+Removing either half breaks the pairing: with no extension there is nothing Chrome will start the
+host for, and with no manifest there is nothing to start.
 
 ### 1.1b Importing a browser state file
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import io
 import json
 import struct
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -32,7 +33,6 @@ from manicule.core.errors import ConfigError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
-    from pathlib import Path
 
 BASE = "https://wiki.example.test/confluence"
 SENTINEL = "not-a-real-session-value"
@@ -364,3 +364,103 @@ def test_a_refusal_is_an_answer_rather_than_a_dead_port() -> None:
     answered = host.read_message(stdout)
 
     assert answered == {"ok": False, "error": "the message names no site"}
+
+
+# --- installing the host manifest ------------------------------------------------------------
+
+
+def test_a_platform_with_no_known_locations_refuses_without_writing_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A regression. Nothing should be left behind by a refusal.
+
+    The shim used to be written before the target list was known, so on a platform manicule has
+    no manifest locations for it created an executable under the data directory that nothing
+    would ever run — and then refused with advice about starting a browser, which was not the
+    problem. Two different failures deserve two different messages and neither deserves a
+    leftover file.
+    """
+    monkeypatch.setattr(host, "manifest_dirs", dict)
+
+    with pytest.raises(ConfigError, match="does not know where"):
+        host.install(data_dir=tmp_path)
+
+    assert not (tmp_path / "browser-auth").exists(), "a refusal left an executable behind"
+
+
+def test_no_browser_profile_yet_refuses_with_the_advice_that_applies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other failure: manicule knows where to look and the browser has never been started."""
+    monkeypatch.setattr(
+        host, "manifest_dirs", lambda: {"chrome": tmp_path / "absent" / "NativeMessagingHosts"}
+    )
+
+    with pytest.raises(ConfigError, match="Start the browser once"):
+        host.install(data_dir=tmp_path)
+
+    assert not (tmp_path / "browser-auth").exists()
+
+
+def test_a_manifest_is_written_for_each_browser_that_has_a_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And only for those. Creating a directory for a browser that is not installed would be
+    manicule inventing a profile, and the operator wondering why an extension they never loaded
+    is mentioned in their filesystem."""
+    here, absent = tmp_path / "chrome", tmp_path / "brave"
+    here.mkdir()
+    monkeypatch.setattr(
+        host,
+        "manifest_dirs",
+        lambda: {
+            "chrome": here / "NativeMessagingHosts",
+            "brave": absent / "NativeMessagingHosts",
+        },
+    )
+
+    written = host.install(data_dir=tmp_path)
+
+    assert [path.parent.parent.name for path in written] == ["chrome"]
+    assert not absent.exists()
+
+
+def test_the_manifest_names_one_extension_and_a_shim_that_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`allowed_origins` is the authorization: Chrome starts the host for that id and no other.
+
+    The shim is checked for real rather than by its path, because a manifest naming an executable
+    that is not there is a pairing that looks installed and fails at the first hand-off.
+    """
+    profile = tmp_path / "chrome"
+    profile.mkdir()
+    monkeypatch.setattr(host, "manifest_dirs", lambda: {"chrome": profile / "NativeMessagingHosts"})
+
+    (written,) = host.install(data_dir=tmp_path)
+    document = json.loads(written.read_text(encoding="utf-8"))
+
+    assert document["allowed_origins"] == [f"chrome-extension://{host.EXTENSION_ID}/"]
+    assert document["type"] == "stdio"
+    shim = Path(document["path"])
+    assert shim.is_file(), "the manifest names a host that is not there"
+    assert shim.stat().st_mode & 0o077 == 0, "the shim is reachable by other users"
+
+
+def test_the_pinned_key_is_the_one_chrome_will_derive_the_id_from() -> None:
+    """The two halves of the pairing, checked against each other.
+
+    Chrome derives an extension's id from the SHA-256 of the public key in its manifest, first
+    128 bits, hex digits mapped onto `a`-`p`. `EXTENSION_ID` is what the host manifest permits.
+    If the key is ever regenerated without updating the constant, Chrome refuses to start the
+    host and says nothing useful about why — so the drift is caught here instead.
+    """
+    import base64  # noqa: PLC0415 - only this assertion needs them
+    import hashlib  # noqa: PLC0415
+
+    manifest = json.loads(
+        (Path(__file__).parents[2] / "extension" / "manifest.json").read_text(encoding="utf-8")
+    )
+    digest = hashlib.sha256(base64.b64decode(manifest["key"])).hexdigest()[:32]
+
+    assert "".join(chr(ord("a") + int(c, 16)) for c in digest) == host.EXTENSION_ID
