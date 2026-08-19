@@ -819,6 +819,18 @@ class _Sync:
     reconciled_deleted_count: int = 0
     reusable_snapshot_checked: bool = False
     reusable_snapshot_run_id: str | None = None
+    reusable_snapshot_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    """Held while the reusable manifest is looked up, because the memo beside it spans an await.
+
+    Every acquisition worker shares one :class:`_Sync`, so "read the flag, query, set the flag"
+    is a check-then-act across a suspension point. Measured rather than reasoned about: with
+    eight workers and twenty-four unchanged records, ``acquire-1`` enters while ``acquire-0`` is
+    still inside the query and reads the flag as ``False``, so both issue it.
+
+    **Setting the flag before the query instead would be worse, and it is the obvious fix.**
+    Every other worker would then read ``reusable_snapshot_run_id`` while it is still ``None``,
+    conclude there is nothing to reuse, and fetch bodies the run already holds — trading one
+    duplicate query for a download per document."""
     discovery_records_held: Gauge = field(default_factory=lambda: Gauge("discovery-records"))
 
     watching: Watching | None = None
@@ -2062,16 +2074,17 @@ class IngestPipeline:
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover - called only by the journal path
             return None
-        if not run.reusable_snapshot_checked:
-            promoted = await acquisitions.latest_promoted_snapshot(
-                run.connector.name, run.scope_fingerprint
-            )
-            if promoted is None:
-                promoted = await acquisitions.latest_promoted_snapshot_for_source_scope(
-                    run.connector.name, run.source_scope
+        async with run.reusable_snapshot_lock:
+            if not run.reusable_snapshot_checked:
+                promoted = await acquisitions.latest_promoted_snapshot(
+                    run.connector.name, run.scope_fingerprint
                 )
-            run.reusable_snapshot_run_id = None if promoted is None else promoted.id
-            run.reusable_snapshot_checked = True
+                if promoted is None:
+                    promoted = await acquisitions.latest_promoted_snapshot_for_source_scope(
+                        run.connector.name, run.source_scope
+                    )
+                run.reusable_snapshot_run_id = None if promoted is None else promoted.id
+                run.reusable_snapshot_checked = True
         if run.reusable_snapshot_run_id is None:
             return None
         reusable = await acquisitions.reusable_record_from_verified_snapshot(

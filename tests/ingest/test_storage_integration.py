@@ -4609,6 +4609,68 @@ async def test_unchanged_revision_reuses_promoted_snapshot_without_body_download
     )
 
 
+async def test_the_reusable_manifest_is_verified_once_across_every_acquisition_worker(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claim above, made to fail on demand rather than on a bad day.
+
+    The test above states the same property with two documents, and two documents rarely put two
+    workers in the lookup at once — so it held for months and then failed one CI shard, which is
+    the worst way for a property to be checked. Twenty-four unchanged records across the default
+    eight workers puts several in flight together every time, and the lookup is held open across
+    a few event-loop turns so the window cannot close by luck on a fast machine.
+
+    Instrumenting the unguarded version showed exactly this: ``acquire-1`` enters while
+    ``acquire-0`` is still inside the query, reads the memo as ``False``, and issues it again.
+    """
+    connector = fakes.DictConnector(
+        {f"public-shared-{index}": f"retained body {index}" for index in range(24)},
+        name="shared-manifest-source",
+    )
+    chunker = fakes.BlockChunker()
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    first = await pipeline().run(connector)
+    fetches = list(connector.fetches)
+    calls = 0
+    latest_promoted_snapshot = store.latest_promoted_snapshot
+
+    async def held_open(connector_name: str, scope_fingerprint: str):  # noqa: ANN202
+        nonlocal calls
+        calls += 1
+        # Yields rather than sleeps: every other worker runs to its own check while this one is
+        # suspended, which is the window the memo has to survive, and it costs no wall clock.
+        for _ in range(8):
+            await asyncio.sleep(0)
+        return await latest_promoted_snapshot(connector_name, scope_fingerprint)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "latest_promoted_snapshot", held_open)
+        second = await pipeline().run(connector)
+
+    assert first.snapshot_completeness == "complete"
+    assert second.skipped_version == 24
+    assert calls == 1, "every worker after the first reads the memo instead of repeating the query"
+    assert connector.fetches == fetches, "a verified manifest means no body is downloaded again"
+
+
 async def test_direct_native_pages_restart_from_an_exact_durable_prefix(
     store: SqliteDocStore,
     engine: AsyncEngine,
