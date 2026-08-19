@@ -109,7 +109,12 @@ Two extras are **not** in `[all]`, and the reason is size rather than taste:
 Neither is needed to index, search or ask. `rerank` buys the cross-encoder that the `balanced`
 and `precise` retrieval profiles rescore with — `fast` sets `rerank=False` and never constructs
 one — and `browser-auth` buys interactive sign-in for a Confluence Server behind an identity
-provider that has disabled tokens.
+provider that has disabled tokens — manicule opens a browser and you sign in there.
+
+**The Chrome extension needs neither**, and is the other way round: it reads the session already
+in your own browser and hands it over, so nothing is installed, nothing is downloaded and no
+window opens. `manicule browser-auth install`, then load the directory it prints. See
+[Confluence auth](docs/connectors/confluence.md#11a1-reusing-the-session-in-your-own-browser).
 
 Working on manicule rather than with it is [Development](#development); running it without a
 Python at all is [In a container](#in-a-container).
@@ -330,7 +335,7 @@ show what that envelope said rather than anything it worked out for itself.
 
 ### The command line
 
-Twenty-seven commands; `manicule --help` lists them. Under `--json` the result envelope is the
+Twenty-eight commands; `manicule --help` lists them. Under `--json` the result envelope is the
 whole of stdout — no prose, no progress, nothing else — and a failure is that same envelope with
 `"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads well-formed JSON whether
 the command succeeded or not.
@@ -458,8 +463,9 @@ it runs, and three things follow:
 - **Confluence sessions live in its memory and nowhere else** — no keychain, no file, no
   environment variable, so nothing prompts for a password and nothing is left on disk. They are
   gone when it stops, which is the right lifetime now that
-  `manicule connector login --browser` makes signing in again a few seconds of clicking. **No
-  server, no sync.**
+  `manicule connector login --browser` makes signing in again a few seconds of clicking — or
+  nothing at all, with the Chrome extension, which notices you signing in to the wiki normally
+  and hands the new session over by itself. **No server, no sync.**
 
 Per-source schedules are configuration:
 
@@ -545,9 +551,10 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/container` | Typed resolution and lifecycle. Assembled at startup, injected |
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
-| `src/manicule/cli` | Twenty-seven commands over that service, and nothing else |
+| `src/manicule/cli` | Twenty-eight commands over that service, and nothing else |
 | `src/manicule/mcp` | Forty MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
+| `src/manicule/extension` | A Chrome extension that hands this browser's Confluence session to a local manicule. No build step |
 | `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
 
