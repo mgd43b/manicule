@@ -1,0 +1,93 @@
+name: PR title
+
+# release-please computes the next version and the changelog from the Conventional Commits on
+# `main`. This repository squash-merges, so the commit on `main` is the **pull request title** —
+# which means the title is not a label, it is the input to the release. A title that is not
+# conventional does not merely read differently in the log: release-please ignores the commit
+# entirely, and the change lands in a release that does not mention it.
+#
+# History is currently mixed — `fix: fence rebuild evidence verification (#218)` beside
+# `Fix durable recovery after source deletion (#221)` — so this is a new constraint rather than
+# a description of what already happens. It is enforced here, on the title, at the one moment it
+# can still be edited.
+#
+# `edited` is in the list on purpose: without it, fixing a rejected title would not re-run the
+# check and the pull request would stay red for a problem that had been solved.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  conventional:
+    name: conventional commit title
+    runs-on: ubuntu-latest
+    steps:
+      # Checked with the repository's own Python rather than a third-party action. The rule is
+      # eight lines of regular expression; an action would be a supply-chain dependency with
+      # write access to nothing but the ability to run arbitrary code on every pull request,
+      # traded for no expressiveness this needs.
+      - name: check the title
+        env:
+          # Through the environment, never interpolated into the script body. A pull request
+          # title is attacker-controlled text, and `${{ ... }}` inside a `run:` block is
+          # substituted before the shell sees it — which is how a title containing a quote and a
+          # semicolon becomes a command.
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          # The types release-please knows, from release-please-config.json. A type outside this
+          # set is not a lesser sin than no type at all — release-please treats it the same way.
+          TYPES = (
+              "feat", "fix", "perf", "revert", "docs", "style",
+              "chore", "refactor", "test", "build", "ci",
+          )
+          PATTERN = re.compile(
+              rf"^(?:{'|'.join(TYPES)})"   # type
+              r"(?:\([a-z0-9][a-z0-9._/-]*\))?"  # optional scope
+              r"!?"                          # optional breaking-change marker
+              r": "                          # the separator, with its space
+              r"(?P<subject>.+)$"
+          )
+
+          title = os.environ["TITLE"]
+          match = PATTERN.match(title)
+          if match is None:
+              sys.stderr.write(
+                  f"The pull request title is not a Conventional Commit:\n\n    {title}\n\n"
+                  "This repository squash-merges, so this title becomes the commit on `main`,\n"
+                  "and release-please reads it to decide the next version and the changelog.\n"
+                  "A title it cannot parse is a change that ships without being mentioned.\n\n"
+                  f"Use one of: {', '.join(TYPES)}\n\n"
+                  "    fix: keep the previous revision searchable after a failed refresh\n"
+                  "    feat(connectors): index Confluence page attachments\n"
+                  "    feat!: rename the `--source` option to `--connector`\n\n"
+                  "`feat` bumps the minor, `fix` the patch, and a trailing `!` marks a breaking\n"
+                  "change. Edit the title — this check re-runs on edit.\n"
+              )
+              raise SystemExit(1)
+
+          subject = match.group("subject")
+          # release-please renders the subject verbatim into CHANGELOG.md. These two are not
+          # style opinions; they are what a generated changelog reads like when nobody checks.
+          if subject[0].isupper() and not subject.split()[0].isupper():
+              sys.stderr.write(
+                  f"Lowercase the subject: {subject!r}\n\n"
+                  "It is rendered verbatim into CHANGELOG.md, mid-sentence.\n"
+              )
+              raise SystemExit(1)
+          if subject.endswith("."):
+              sys.stderr.write(f"Drop the trailing period: {subject!r}\n")
+              raise SystemExit(1)
+
+          print(f"ok: {title}")
+          PY

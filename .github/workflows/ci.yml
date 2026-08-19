@@ -579,3 +579,125 @@ jobs:
       - name: the link check actually checked links
         if: ${{ !cancelled() }}
         run: python3 tools/check_link_report.py lychee-report.json
+
+  # What the release publishes is a wheel built from this tree, installed by somebody who has
+  # never seen it. Every other job here runs against the working tree with `uv sync`, and that
+  # is a different program: it has the dev group, the workspace's plugin fixtures, and an
+  # editable `src/` on the path. None of those exist for a person running `pip install manicule`.
+  #
+  # The gap is not hypothetical. Before this job existed, `pip install manicule` produced a
+  # console script whose first act was `ModuleNotFoundError: No module named 'typer'` — typer is
+  # in the `serve` extra, correctly, and nothing checked that the entry point survived its
+  # absence. A whole CI run was green over it.
+  dist:
+    name: dist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      # `--package manicule`: this is a uv workspace and `packages/*` holds two plugin
+      # distributions that are test fixtures. Naming the package is what keeps them out of the
+      # artifacts, here and in release.yml, which builds the same way.
+      #
+      # uv builds the wheel *from the sdist* rather than from the tree, so this also answers
+      # "does the sdist contain enough to build" — the failure mode where a wheel built locally
+      # works and the one PyPI builds is missing a directory nobody listed.
+      - name: build sdist and wheel
+        run: uv build --package manicule --out-dir dist
+
+      # `manicule-mlx` is the second published distribution — the Metal backend, GPL-3.0-or-later
+      # because it links `mlx-embeddings`, which is why it is not simply an extra. Built here on
+      # every pull request for the same reason the wheel above is: its sdist has to contain
+      # enough to build, and a release is a bad place to find out it does not. Its
+      # `mlx-embeddings` dependency is marked for Apple silicon, so on this runner the
+      # distribution installs and the backend is simply never constructed — which is exactly the
+      # state `packages/manicule-mlx/tests/` is written against.
+      - name: build the Metal backend distribution
+        run: uv build --package manicule-mlx --out-dir dist-mlx
+
+      # The templates, the static assets and the migrations are not Python, and hatchling
+      # includes them because they sit under `src/manicule/`, not because anything says so. A
+      # build backend or a layout change that stopped including them would leave a wheel that
+      # imports fine and serves a 500 on the first page render, and every test in this
+      # repository would still pass, because they all run from the source tree.
+      - name: the wheel carries what is not Python
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+
+          wheel = next(Path("dist").glob("*.whl"))
+          names = set(zipfile.ZipFile(wheel).namelist())
+
+          required = {
+              "manicule/py.typed",
+              "manicule/web/static/manicule.css",
+              "manicule/web/static/manicule.js",
+              "manicule/web/templates/layout.html",
+              "manicule/storage/migrations/script.py.mako",
+          }
+          missing = sorted(required - names)
+          if missing:
+              sys.exit(f"{wheel.name} is missing: {missing}")
+
+          # Counted rather than listed. Naming each migration would make this file something to
+          # edit on every schema change, and an assertion nobody can forget to update is worth
+          # more here than one that names what it found.
+          migrations = {n for n in names if n.startswith("manicule/storage/migrations/versions/")}
+          if not migrations:
+              sys.exit(f"{wheel.name} carries no alembic migrations")
+          print(f"{wheel.name}: {len(names)} files, {len(migrations)} migrations")
+          PY
+
+      # A bare install, which is what `pip install manicule` gives. The console script must
+      # print an install hint and exit 1 — not raise. `manicule.entry` exists for this and
+      # nothing else.
+      - name: a bare install explains itself instead of raising
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 /tmp/bare
+          uv pip install --python /tmp/bare/bin/python dist/*.whl
+          set +e
+          output=$(/tmp/bare/bin/manicule --version 2>&1)
+          status=$?
+          set -e
+          echo "${output}"
+          test "${status}" -eq 1 || { echo "expected exit 1, got ${status}" >&2; exit 1; }
+          case "${output}" in
+            *Traceback*) echo "the bare install raised instead of explaining" >&2; exit 1 ;;
+            *'manicule[all]'*) ;;
+            *) echo "the hint does not name the extra to install" >&2; exit 1 ;;
+          esac
+
+      # And the documented install, which is what the README tells people to type. This is the
+      # command under test, verbatim from `## Install`, against the artifact just built.
+      - name: the documented install produces a working command
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 /tmp/all
+          uv pip install --python /tmp/all/bin/python "$(echo dist/*.whl)[all]"
+          /tmp/all/bin/manicule --version
+          /tmp/all/bin/manicule --help > /dev/null
+
+      # And the Apple silicon install, which is the pair rather than either one. What is checked
+      # on Linux is that the two resolve together and that `manicule-mlx` claims the `mlx` slot
+      # in the public entry-point group — the registration, not the Metal execution. A backend
+      # that installs without registering is invisible at run time and raises nothing.
+      - name: the Apple silicon install registers the mlx backend
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 /tmp/pair
+          uv pip install --python /tmp/pair/bin/python \
+            "$(echo dist/*.whl)[all]" "$(echo dist-mlx/*.whl)"
+          /tmp/pair/bin/manicule --version
+          /tmp/pair/bin/python - <<'PY'
+          from importlib.metadata import entry_points
+          names = sorted(e.name for e in entry_points(group="manicule.plugins"))
+          print(names)
+          assert "mlx" in names, f"manicule-mlx did not register the mlx plugin: {names}"
+          PY

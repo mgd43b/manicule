@@ -8,6 +8,7 @@ An agent searches a private corpus or asks a grounded question, and gets evidenc
 to a real location in a real document — a page, a heading, a line, a cell.
 
 [![CI](https://github.com/mgd43b/manicule/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mgd43b/manicule/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/manicule.svg)](https://pypi.org/project/manicule/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
 [![packaged with uv](https://img.shields.io/badge/packaged%20with-uv-de5fe9.svg)](https://docs.astral.sh/uv/)
@@ -29,9 +30,11 @@ manicule doctor                   # what is wrong, and what to do about it
 > [!NOTE]
 > **Early, and runnable.** All four surfaces work today: point it at a directory, search it, ask
 > it questions, read it in a browser, hand the same operations to an assistant over MCP, or serve
-> them over HTTP. There is no release on PyPI yet, so it is installed from a checkout —
-> [below](#install). See [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is
-> being built in.
+> them over HTTP. Install it with `uv tool install "manicule[all]"` — [below](#install). It is
+> alpha and the version is `0.x`, which means what it says: interfaces may change between minor
+> versions, and the envelope contract in [`docs/surfaces.md`](docs/surfaces.md) is the part to
+> depend on. See [`PLAN.md`](PLAN.md) for the shape of the whole and the order it is being
+> built in.
 
 ## What it is
 
@@ -63,21 +66,54 @@ down in [`docs/surfaces.md`](docs/surfaces.md).
 
 ## Install
 
-> Requires [uv](https://docs.astral.sh/uv/) and Python 3.12 or newer.
+> Requires Python 3.12 or newer. With [uv](https://docs.astral.sh/uv/):
 
 ```bash
-git clone https://github.com/mgd43b/manicule && cd manicule
-uv sync --all-extras
-uv run manicule --version
+uv tool install "manicule[all]"
+manicule --version
 ```
 
-`--all-extras` is the whole system — the nine extras `pyproject.toml` declares: the parser stack
-and the ingest pipeline, storage, the embedding backend this machine can run, retrieval,
-generation, the connectors, the serving stack, and the optional cross-encoder reranker that
-comes with torch.
+That is the whole install — an isolated environment, `manicule` on `PATH`, and `uv tool upgrade
+manicule` later. With [pipx](https://pipx.pypa.io) it is `pipx install "manicule[all]"`, and
+`uvx --from "manicule[all]" manicule --version` runs it once without installing anything at all.
 
-Everything below writes `manicule`; from a checkout that is `uv run manicule`, or
-`.venv/bin/manicule` if you would rather not type `uv run` each time.
+**On Apple silicon, add the Metal backend:**
+
+```bash
+uv tool install "manicule[all]" --with manicule-mlx
+```
+
+[`manicule-mlx`](packages/manicule-mlx) is four to five times faster on the indexing path, and it
+is a separate distribution because it is GPL-3.0-or-later while manicule is MIT — see
+[License](#license) for what that means for you. Without it manicule runs `onnx` everywhere, and
+the vectors are the same either way: `backend` is excluded from the embedding fingerprint, so
+adding or removing the package is an operation rather than a migration.
+
+> [!IMPORTANT]
+> **`[all]` is not decoration — leaving it off gives you a program that cannot start.** manicule
+> itself carries no implementation dependencies, deliberately: that boundary is what lets a
+> plugin author depend on its contracts without installing a vector database and a model
+> runtime, and [`tests/test_import_boundary.py`](tests/test_import_boundary.py) fails the build
+> if it erodes. `[all]` is the extra that turns the library into the program — storage,
+> embeddings, the parsers, ingest, retrieval, generation, the connectors and the serving stack,
+> about 240 MB. A bare `pip install manicule` succeeds and then tells you this rather than
+> raising.
+
+Two extras are **not** in `[all]`, and the reason is size rather than taste:
+
+| | Cost | Add it with |
+|:---|:---|:---|
+| `rerank` | torch, and on Linux 2.7 GB of CUDA wheels behind it | `uv tool install "manicule[all,rerank]"` |
+| `browser-auth` | playwright, then a browser download | `uv tool install "manicule[all,browser-auth]"` |
+
+Neither is needed to index, search or ask. `rerank` buys the cross-encoder that the `balanced`
+and `precise` retrieval profiles rescore with — `fast` sets `rerank=False` and never constructs
+one — and `browser-auth` buys interactive sign-in for a Confluence Server behind an identity
+provider that has disabled tokens.
+
+Working on manicule rather than with it is [Development](#development); running it without a
+Python at all is [In a container](#in-a-container).
+
 
 > [!TIP]
 > **Two embedding backends, and one of them is chosen for you.** `manicule init` probes the
@@ -89,11 +125,11 @@ Everything below writes `manicule`; from a checkout that is `uv run manicule`, o
 
 ## First run
 
-The shortest path from a clone to an answer about your own documents.
+The shortest path from an install to an answer about your own documents.
 
 ```bash
 manicule init                             # config, grammars, vocabularies — seconds
-manicule index docs                       # this repository's own design documents
+manicule index ~/Documents                # walk it, parse it, chunk it, embed it
 manicule search "how are citations verified"
 ```
 

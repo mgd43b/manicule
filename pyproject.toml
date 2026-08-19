@@ -167,6 +167,30 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #1
   "jinja2>=3.1",
 ]
 
+# What `uv tool install "manicule[all]"` installs, and the one extra a person who just wants
+# the program should ever have to type. Every extra above is a *component* boundary, declared
+# by the ticket that built it; this is the *installation* boundary, and the two are not the
+# same question.
+#
+# It is deliberately not all nine. `rerank` and `browser-auth` are omitted, and the reason is
+# a measurement rather than a preference: on x86_64 Linux `rerank` resolves torch, which
+# resolves seventeen `nvidia-*` wheels and triton — 2.72 GB of download for a cross-encoder
+# the `fast` profile never constructs. `browser-auth` adds playwright, and then
+# `playwright install chromium` fetches a browser. Neither is reachable by accident, and both
+# compose onto this one by name when they are wanted:
+#
+#     uv tool install "manicule[all]"              # 126 packages, ~238 MB
+#     uv tool install "manicule[all,rerank]"       # the cross-encoder, and torch with it
+#     uv tool install "manicule[all,browser-auth]" # interactive Confluence Server sign-in
+#
+# This is the same set the Dockerfile's `EXTRAS` installs, and `tests/test_packaging.py` holds
+# the two together: an extra added above and forgotten here would give the image a component
+# the documented install does not have, which is the kind of drift nobody notices until an
+# operator reports a command missing from one of them.
+all = [
+  "manicule[storage,embeddings,ingest,parsers,retrieval,generation,connectors,serve]",
+]
+
 # The built-in parsers and the chunker register the same way a third-party plugin does, through
 # the public entry-point group. There is no shorter internal route, so the extension mechanism
 # is exercised by every installation rather than only by the people extending it.
@@ -181,6 +205,12 @@ generation = "manicule.generation.plugin:PLUGIN"
 [project.urls]
 Homepage = "https://github.com/mgd43b/manicule"
 Issues = "https://github.com/mgd43b/manicule/issues"
+# Rendered as the sidebar on the PyPI project page, which is the only navigation that works
+# there: the long description is README.md, and its relative links resolve against the
+# repository rather than against PyPI. Absolute URLs here so that a reader who lands on PyPI
+# can still reach the changelog and the design documents.
+Changelog = "https://github.com/mgd43b/manicule/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/mgd43b/manicule/tree/main/docs"
 
 [dependency-groups]
 dev = [
@@ -276,7 +306,10 @@ dev = [
 # server, which is also reachable as `python -m manicule.mcp` for a client that would rather
 # name a module than trust a console script to be on PATH.
 [project.scripts]
-manicule = "manicule.cli.main:main"
+# `manicule.entry`, not `manicule.cli.main`, and the indirection is the whole point: importing
+# `manicule.cli` imports Typer, so an installation without the `serve` extra cannot reach a
+# guard that lives inside that package. See the module docstring.
+manicule = "manicule.entry:main"
 
 [tool.uv.workspace]
 members = ["packages/*"]
