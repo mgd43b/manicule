@@ -175,6 +175,11 @@ def only(name: str, path: str = "/opt/browser") -> dict[str, Path]:
     return {name: Path(path)}
 
 
+def nothing_installed() -> dict[str, Path]:
+    """Discovery on a machine with no supported browser on it."""
+    return {}
+
+
 def test_one_installed_browser_is_chosen_without_being_named(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -210,7 +215,7 @@ def test_no_installed_browser_names_the_alternatives_rather_than_taking_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Acceptance criterion 4. Nothing is installed, and nothing else is silently used."""
-    monkeypatch.setattr(browser_module, "installed_browsers", lambda: dict[str, Path]())
+    monkeypatch.setattr(browser_module, "installed_browsers", nothing_installed)
 
     with pytest.raises(ProviderRefusedError) as refusal:
         resolve_browser("")
@@ -365,7 +370,7 @@ def test_a_provider_that_cannot_be_built_refuses_instead_of_returning_another(
     asked-for one cannot be built, and it would look like helpfulness. It raises instead, and
     what it must never do is return a `PlaywrightProvider`.
     """
-    monkeypatch.setattr(browser_module, "installed_browsers", lambda: dict[str, Path]())
+    monkeypatch.setattr(browser_module, "installed_browsers", nothing_installed)
     service = service_for("installed_chromium")
     service.settings.data_dir = tmp_path
 

@@ -20,12 +20,11 @@ import httpx
 import pytest
 
 import manicule.connectors.client as client_module
-from manicule.connectors.config import ConfluenceConfig
-from manicule.connectors.pagination import origin_of
 from manicule.connectors import ConnectorError, CursorExpiredError, UntrustedLinkError
 from manicule.connectors.client import ConfluenceClient
+from manicule.connectors.config import ConfluenceConfig
 from manicule.connectors.confluence import ConfluenceConnector
-from manicule.connectors.pagination import NextPage, next_page, split_query
+from manicule.connectors.pagination import NextPage, next_page, origin_of, split_query
 from manicule.testing import closing
 from tests.connectors.fake_confluence import CLOUD_BASE, FakeConfluence, FakePage
 from tests.connectors.support import (
@@ -374,6 +373,7 @@ async def test_a_request_off_the_configured_origin_is_refused_before_it_is_sent(
         await client.teardown()
 
     assert instance.requests == [], "the refusal must happen before anything is sent"
+
 
 # --- one reading of "the origin" ------------------------------------------------------------------
 
