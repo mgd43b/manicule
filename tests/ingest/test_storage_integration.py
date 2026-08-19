@@ -2571,7 +2571,11 @@ async def test_synchronous_document_preparation_does_not_block_lease_renewal(
     )
 
     task = asyncio.create_task(pipeline.run(connector))
-    await asyncio.wait_for(asyncio.to_thread(chunker.entered.wait, 10), timeout=15)
+    entered = await asyncio.wait_for(
+        asyncio.to_thread(chunker.entered.wait, HELD_STAGE_TIMEOUT_S / 3),
+        timeout=HELD_STAGE_TIMEOUT_S,
+    )
+    assert entered, "preparation was never reached, so nothing was held to interleave against"
 
     # The loop is expected to be fully alive while the synchronous stage is held: the
     # heartbeat renews, and a bounded durable status read answers.
@@ -2582,9 +2586,18 @@ async def test_synchronous_document_preparation_does_not_block_lease_renewal(
     chunker.release.set()
     report = await asyncio.wait_for(task, timeout=30)
 
+    await asyncio.wait_for(
+        asyncio.to_thread(chunker.exited.wait, HELD_STAGE_TIMEOUT_S * 2),
+        timeout=HELD_STAGE_TIMEOUT_S * 3,
+    )
+    assert not chunker.timed_out
     assert store.renewals >= renewals_wanted
     assert report.indexed == 1
     assert report.error_type == ""
+
+
+HELD_STAGE_TIMEOUT_S = 30.0
+"""How long a held stage waits to be released before it fails loudly rather than opening."""
 
 
 class _HeldChunker(fakes.BlockChunker):
@@ -2599,11 +2612,36 @@ class _HeldChunker(fakes.BlockChunker):
     def __init__(self) -> None:
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.exited = threading.Event()
+        self.timed_out = False
 
     @override
     def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
         self.entered.set()
-        self.release.wait(timeout=30)
+        try:
+            return self._held(document, blocks)
+        finally:
+            # Set on every path, because a run that loses its lease is torn down without
+            # waiting for this thread — so a test that read ``timed_out`` straight after the
+            # run returned would read it before this thread had finished deciding. Waiting on
+            # ``exited`` is what makes that flag worth asserting.
+            self.exited.set()
+
+    def _held(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+        if not self.release.wait(timeout=HELD_STAGE_TIMEOUT_S):
+            # A gate that was never opened means the interleaving under test did not happen.
+            # Proceeding anyway would let the test carry on and assert against a *different*
+            # ordering — passing or failing for reasons that have nothing to do with what it
+            # claims to check — so it is recorded and raised. Every test below reads
+            # ``timed_out`` before its own assertions, so the failure names this rather than
+            # the misleading consequence.
+            self.timed_out = True
+            msg = (
+                f"the held preparation stage was never released within "
+                f"{HELD_STAGE_TIMEOUT_S}s; the test did not reach the point where it opens "
+                f"the gate"
+            )
+            raise AssertionError(msg)
         return super().chunk(document, blocks)
 
 
@@ -2649,7 +2687,11 @@ async def test_takeover_while_synchronous_preparation_is_held_fences_the_stale_w
     )
 
     task = asyncio.create_task(pipeline.run(connector))
-    await asyncio.wait_for(asyncio.to_thread(chunker.entered.wait, 10), timeout=15)
+    entered = await asyncio.wait_for(
+        asyncio.to_thread(chunker.entered.wait, HELD_STAGE_TIMEOUT_S / 3),
+        timeout=HELD_STAGE_TIMEOUT_S,
+    )
+    assert entered, "preparation was never reached, so nothing was held to interleave against"
 
     durable = await store.latest_unsettled_acquisition_run(connector.name)
     assert durable is not None
@@ -2669,6 +2711,11 @@ async def test_takeover_while_synchronous_preparation_is_held_fences_the_stale_w
     chunker.release.set()
     report = await asyncio.wait_for(task, timeout=30)
 
+    await asyncio.wait_for(
+        asyncio.to_thread(chunker.exited.wait, HELD_STAGE_TIMEOUT_S * 2),
+        timeout=HELD_STAGE_TIMEOUT_S * 3,
+    )
+    assert not chunker.timed_out
     assert report.error_type == "AcquisitionLeaseLostError"
     assert report.indexed == 0
     assert report.retry_required, "a run that lost its lease has not finished its durable work"

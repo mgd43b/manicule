@@ -933,17 +933,46 @@ def _reader_was_running(reader: Reading) -> None:
 # --- a client that goes away while one document is being prepared ------------------------------
 
 
+HELD_STAGE_TIMEOUT_S = 30.0
+"""How long a held stage waits to be released before it fails loudly rather than opening."""
+
+
 class HeldChunker(fakes.BlockChunker):
     """A chunker that blocks synchronously, the way the production one does under a big block."""
 
     def __init__(self) -> None:
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.exited = threading.Event()
+        self.timed_out = False
 
     @override
     def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
         self.entered.set()
-        self.release.wait(timeout=30)
+        try:
+            return self._held(document, blocks)
+        finally:
+            # Set on every path, because a run that loses its lease is torn down without
+            # waiting for this thread — so a test that read ``timed_out`` straight after the
+            # run returned would read it before this thread had finished deciding. Waiting on
+            # ``exited`` is what makes that flag worth asserting.
+            self.exited.set()
+
+    def _held(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+        if not self.release.wait(timeout=HELD_STAGE_TIMEOUT_S):
+            # A gate that was never opened means the interleaving under test did not happen.
+            # Proceeding anyway would let the test carry on and assert against a *different*
+            # ordering — passing or failing for reasons that have nothing to do with what it
+            # claims to check — so it is recorded and raised. Every test below reads
+            # ``timed_out`` before its own assertions, so the failure names this rather than
+            # the misleading consequence.
+            self.timed_out = True
+            msg = (
+                f"the held preparation stage was never released within "
+                f"{HELD_STAGE_TIMEOUT_S}s; the test did not reach the point where it opens "
+                f"the gate"
+            )
+            raise AssertionError(msg)
         return super().chunk(document, blocks)
 
 
@@ -1002,7 +1031,11 @@ async def test_a_client_that_disconnects_during_held_preparation_does_not_strand
             ).to_line()
         )
         await writer.drain()
-        await asyncio.wait_for(asyncio.to_thread(held.entered.wait, 10), timeout=15)
+        entered = await asyncio.wait_for(
+            asyncio.to_thread(held.entered.wait, HELD_STAGE_TIMEOUT_S / 3),
+            timeout=HELD_STAGE_TIMEOUT_S,
+        )
+        assert entered, "preparation was never reached, so the close had nothing to race"
 
         writer.close()
         await writer.wait_closed()
@@ -1014,6 +1047,11 @@ async def test_a_client_that_disconnects_during_held_preparation_does_not_strand
         held.release.set()
         await asyncio.wait_for(finished.wait(), timeout=30)
 
+        await asyncio.wait_for(
+            asyncio.to_thread(held.exited.wait, HELD_STAGE_TIMEOUT_S * 2),
+            timeout=HELD_STAGE_TIMEOUT_S * 3,
+        )
+        assert not held.timed_out
         assert len(store.documents) == len(documents), (
             "the sync was abandoned when its client went away: the server owns accepted work, "
             "and a document left half-derived is what the recovery sweep exists to avoid"
