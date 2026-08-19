@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "manicule-mlx"
-version = "0.1.0"
+version = "0.1.1"
 description = "Metal-native embedding backend for manicule, on Apple Silicon."
 readme = "README.md"
 # GPL-3.0-or-later, and this is the package that carries it. `mlx-embeddings` is GPL-3.0, and
