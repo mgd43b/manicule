@@ -2266,6 +2266,61 @@ source and dropped — discovery reads the stop at the top of its loop, so an it
 in hand is abandoned rather than never fetched. Nothing is lost by that: no watermark was
 written, so the next sync sees it again.
 
+### 13.4 The supervisor handoff contract
+
+§13.2 says recovery is automatic *at the pipeline boundary*: a run that stops leaves a committed
+prefix, and the next run of that connector claims the same run rather than starting a new one.
+What it does not say is who starts that next run, and for acquisition there is no answer inside
+the process. §10.3's restart-recovery job is re-embed's, and it is re-embed's on purpose — an
+ownerless re-embed generation has no other actor that would ever resume it, while an acquisition
+run has a connector whose next sync is the resume. So the supervisor *is* the continuation, and
+what it needs is not a mechanism but a signal it can act on without reading private state.
+
+**The signal is `lifecycle.outcome` on `snapshot_status` (`surfaces.md` §4.0.1).** It is derived
+from the lease rather than from the absence of bad news, because a worker that loses its run
+cannot write a diagnostic on its way out — losing the lease is exactly the loss of the right to
+write the row. Three of the values are a handoff instruction:
+
+| `lifecycle.outcome` | What is true | What a supervisor does |
+|---|---|---|
+| `running` | A worker holds a lease that has not expired. It is renewed at a third of its lifetime for as long as that worker is alive (§13.2). | Nothing. Waiting is correct. |
+| `incomplete` | Unfinished and **nobody owns it** — the lease expired, or was released by a canceled or failed run. The committed prefix and the retained bytes are intact. | Sync that connector again, now. It claims the same run and continues from the prefix. |
+| `complete` | Settled, with omissions accounted for. | Nothing. |
+| `failed` | The manifest did not verify. | Escalate; this is not a retry. |
+
+**`incomplete` does not mean a fixed wall-clock wait.** A supervisor may act on it the moment it
+reads it, and should: the scheduled interval (`deployment.md` §6.2) is a floor on how often an
+*unprompted* sync happens, not a delay recovery has to serve. The one thing it cannot do is
+shorten a **live** lease. A process that dies runs no cleanup, so its lease is still held until
+its TTL expires, and a takeover before then is refused by the generation fence (§13.2) — which is
+the mechanism that makes "act immediately" safe rather than a way to get two writers.
+
+**What a resumed run does not do**, so that the cost of acting immediately is knowable:
+
+- It does not re-download what is already retained. Derivation resumes from the local snapshot
+  (§10's rung table); a run that is only missing derivation performs no connector call at all.
+- It does not republish what already published. A document is the transaction boundary, and the
+  committed prefix is skipped by the same change detection that skips an unchanged corpus.
+- It does not advance a watermark it did not earn. An interrupted run stays `retry_required`,
+  which is what stops a resumed-and-still-incomplete run from looking clean.
+
+**Nothing in the signal is private.** `lifecycle` is the closed aggregate object of
+`surfaces.md` §4.0.1 — counts, phase, outcome — and carries no source identity, no member id and
+no lease-owner token. A supervisor that needed the owner token to decide would be a supervisor
+that had to be trusted with it; it needs only to know whether anybody holds one.
+
+**The typed run result is the other half**, for a caller that ran the sync itself rather than
+polling status. `RunReport.error_type` names the exception class — `AcquisitionLeaseLostError`
+for a lost run — `retry_required` is true, and `complete` is false, so the three agree and a
+caller may act on any one of them. What it must not do is treat a report with an error as having
+enumerated everything: that is the same `--limit`-shaped mistake §13.2.2 describes.
+
+> **Not built.** A first-class in-process continuation for acquisition runs — a bounded retry
+> budget, an admitted-writer election, a recovery job at startup mirroring §10.3's — is filed
+> rather than deferred. It is the right shape if syncs ever run without a supervisor above them.
+> Today every deployment that runs a sync has one (`deployment.md` §6.3), and a retry budget
+> inside the process would be a second scheduler disagreeing with the first.
+
 ---
 
 ## 14. `doctor` — ingest checks
