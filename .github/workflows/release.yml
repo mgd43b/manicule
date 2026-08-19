@@ -1,8 +1,8 @@
 name: Release
 
 # release-please reads the Conventional Commits on `main` and keeps a release PR open that
-# bumps the version in pyproject.toml and writes CHANGELOG.md. Merging that PR creates the
-# `vX.Y.Z` tag and the GitHub Release; the publish job below then builds and pushes to PyPI.
+# bumps the version and writes CHANGELOG.md. Merging that PR creates the `vX.Y.Z` tag and the
+# GitHub Release; the publish job below then builds and pushes to PyPI.
 #
 # Nothing here is triggered by a tag. A tag push is how a release is *recorded*, and making it
 # the trigger would mean a hand-pushed tag could publish a version no release PR ever reviewed.
@@ -42,7 +42,8 @@ jobs:
       # Mandatory for OIDC trusted publishing. There is no API token in this repository's
       # secrets and there should never be one: the credential is minted per run, scoped to this
       # workflow in this repository, and expires. A leaked token cannot be replayed because
-      # there is nothing to leak.
+      # there is nothing to leak. Both projects register the *same* publisher — this repository,
+      # `release.yml`, environment `pypi` — so one workflow can push both.
       id-token: write
       # To attach the built distributions to the GitHub Release.
       contents: write
@@ -54,46 +55,75 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           # Pinned rather than left to the runner's default, so the interpreter that builds a
-          # release is a decision rather than whatever ubuntu-latest moved to this month. The
-          # wheel is `py3-none-any`, so this does not restrict what it installs onto.
+          # release is a decision rather than whatever ubuntu-latest moved to this month. Both
+          # wheels are `py3-none-any`, so this does not restrict what they install onto.
           python-version: "3.12"
 
-      # `--package manicule` explicitly: this is a uv workspace, and `packages/*` holds two
-      # plugin distributions that exist to be test fixtures. Neither is published, and naming
-      # the package is what keeps a future workspace member from silently arriving in `dist/`
-      # and being pushed to PyPI by the step below.
-      - name: build sdist and wheel
-        run: uv build --package manicule --out-dir dist
+      # **Two distributions, built and uploaded separately.** `manicule` is MIT; `manicule-mlx`
+      # is GPL-3.0-or-later, because it links `mlx-embeddings`, and that split is the entire
+      # reason the second package exists. They are versioned in lockstep — release-please bumps
+      # both from one release PR — because `manicule_mlx`'s plugin manifest pins a `core_version`
+      # range against manicule, and one version answering "which mlx goes with which manicule"
+      # is worth more than an independent cadence for a package that has no independent purpose.
+      #
+      # Each is named explicitly. `packages/` also holds two plugin distributions that exist to
+      # be test fixtures, and naming the packages is what keeps them off PyPI — a bare
+      # `uv build` in a workspace is the failure mode this avoids.
+      #
+      # uv builds each wheel *from its own sdist* rather than from the tree, so this also
+      # answers "does the sdist contain enough to build" — the failure where a local wheel works
+      # and the one PyPI would build is missing a directory nobody listed.
+      - name: build both distributions
+        run: |
+          uv build --package manicule     --out-dir dist/manicule
+          uv build --package manicule-mlx --out-dir dist/manicule-mlx
 
-      - name: the built artifacts are the two expected ones
-        # A guard on the glob the publish step passes. `dist/*` is what gets uploaded, and an
-        # unexpected file in there is either a stale artifact or a workspace member that leaked
-        # past `--package` — both of which are better as a failed release than a published one.
+      - name: the built artifacts are exactly the four expected ones
+        # A guard on the globs the publish steps pass. An unexpected file in either directory is
+        # either a stale artifact or a workspace member that leaked past `--package`, and both
+        # are better as a failed release than a published one.
         run: |
           set -euo pipefail
           version="${{ needs.release-please.outputs.tag_name }}"
           version="${version#v}"
-          expected="manicule-${version}-py3-none-any.whl manicule-${version}.tar.gz"
-          actual=$(cd dist && ls | sort | tr '\n' ' ')
-          echo "expected: ${expected} "
-          echo "actual:   ${actual}"
-          test "${actual}" = "${expected} "
+          for dist in manicule manicule-mlx; do
+            underscored="${dist//-/_}"
+            expected="${underscored}-${version}-py3-none-any.whl ${underscored}-${version}.tar.gz"
+            actual=$(cd "dist/${dist}" && ls | sort | tr '\n' ' ')
+            echo "${dist}: expected [${expected} ] actual [${actual}]"
+            test "${actual}" = "${expected} "
+          done
 
-      # The same check the `dist` job in ci.yml runs on every pull request, repeated here
-      # against the artifacts actually being published rather than against a rebuild of them.
-      - name: the wheel installs clean and the console script runs
+      # The same check the `dist` job in ci.yml runs on every pull request, repeated here against
+      # the artifacts actually being published rather than a rebuild of them. `manicule-mlx` is
+      # installed alongside, which is the combination the README tells an Apple silicon reader to
+      # install; on this Linux runner its `mlx-embeddings` marker is false, so what is proved
+      # here is that the distribution installs and its entry point resolves, not that Metal runs.
+      - name: the wheels install clean and the console script runs
         run: |
           set -euo pipefail
           uv venv --python 3.12 /tmp/smoke
-          uv pip install --python /tmp/smoke/bin/python "$(echo dist/*.whl)[all]"
+          uv pip install --python /tmp/smoke/bin/python \
+            "$(echo dist/manicule/*.whl)[all]" "$(echo dist/manicule-mlx/*.whl)"
           /tmp/smoke/bin/manicule --version
 
-      - name: publish to PyPI
+      # Two uploads rather than one over a merged directory, so a failure names the distribution
+      # that failed instead of reporting a rejected file. `manicule` goes first: `manicule-mlx`
+      # depends on it, and a resolver that finds the backend without the core it pins would be a
+      # worse partial state than the reverse.
+      - name: publish manicule to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/manicule
+
+      - name: publish manicule-mlx to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/manicule-mlx
 
       - name: attach the distributions to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
           gh release upload "${{ needs.release-please.outputs.tag_name }}"
-          dist/* --repo "${{ github.repository }}"
+          dist/manicule/* dist/manicule-mlx/* --repo "${{ github.repository }}"

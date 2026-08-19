@@ -609,6 +609,16 @@ jobs:
       - name: build sdist and wheel
         run: uv build --package manicule --out-dir dist
 
+      # `manicule-mlx` is the second published distribution — the Metal backend, GPL-3.0-or-later
+      # because it links `mlx-embeddings`, which is why it is not simply an extra. Built here on
+      # every pull request for the same reason the wheel above is: its sdist has to contain
+      # enough to build, and a release is a bad place to find out it does not. Its
+      # `mlx-embeddings` dependency is marked for Apple silicon, so on this runner the
+      # distribution installs and the backend is simply never constructed — which is exactly the
+      # state `packages/manicule-mlx/tests/` is written against.
+      - name: build the Metal backend distribution
+        run: uv build --package manicule-mlx --out-dir dist-mlx
+
       # The templates, the static assets and the migrations are not Python, and hatchling
       # includes them because they sit under `src/manicule/`, not because anything says so. A
       # build backend or a layout change that stopped including them would leave a wheel that
@@ -673,3 +683,21 @@ jobs:
           uv pip install --python /tmp/all/bin/python "$(echo dist/*.whl)[all]"
           /tmp/all/bin/manicule --version
           /tmp/all/bin/manicule --help > /dev/null
+
+      # And the Apple silicon install, which is the pair rather than either one. What is checked
+      # on Linux is that the two resolve together and that `manicule-mlx` claims the `mlx` slot
+      # in the public entry-point group — the registration, not the Metal execution. A backend
+      # that installs without registering is invisible at run time and raises nothing.
+      - name: the Apple silicon install registers the mlx backend
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 /tmp/pair
+          uv pip install --python /tmp/pair/bin/python \
+            "$(echo dist/*.whl)[all]" "$(echo dist-mlx/*.whl)"
+          /tmp/pair/bin/manicule --version
+          /tmp/pair/bin/python - <<'PY'
+          from importlib.metadata import entry_points
+          names = sorted(e.name for e in entry_points(group="manicule.plugins"))
+          print(names)
+          assert "mlx" in names, f"manicule-mlx did not register the mlx plugin: {names}"
+          PY

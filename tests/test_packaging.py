@@ -1,8 +1,8 @@
 """What a release ships, held against what this repository says it ships.
 
-Three facts decide whether `uv tool install "manicule[all]"` produces a working program, and
-none of them is checked by running the test suite — every other test here runs from the source
-tree, with the dev group installed and `src/` on the path, which is not what anybody installs.
+What decides whether `uv tool install "manicule[all]"` produces a working program is checked
+nowhere else: every other test here runs from the source tree, with the dev group installed and
+`src/` on the path, which is not what anybody installs.
 
 * The `all` extra and the Dockerfile's `EXTRAS` are the same set. They are two spellings of one
   decision — "what an installation of manicule contains" — written in two files that cannot see
@@ -10,10 +10,14 @@ tree, with the dev group installed and `src/` on the path, which is not what any
 * The console script survives an installation without the `serve` extra. `manicule.entry` exists
   for that and would be silently pointless if the entry point were ever pointed back at
   `manicule.cli.main:main`, which is the obvious-looking simplification.
-* The built-in plugins admit the version that is running. Every one of them declares
-  `core_version=">=0.1,<0.2"`, and release-please bumping `pyproject.toml` to 0.2.0 would ship a
-  manicule whose own parsers refuse to load — an entirely mechanical failure that no other test
-  in this repository would notice, on the one commit nobody rehearses.
+* Every plugin admits the version that is running. All of them declare
+  `core_version=">=0.1,<0.2"`, and release-please bumping to 0.2.0 would ship a manicule whose
+  own parsers refuse to load — an entirely mechanical failure that no other test in this
+  repository would notice, on the one commit nobody rehearses.
+* The release workflow builds and publishes both distributions, and no others. `manicule` is
+  MIT and `manicule-mlx` is GPL-3.0-or-later; the README tells an Apple silicon reader to
+  install the second, and a workflow that quietly stopped shipping it would make that
+  instruction false without failing anything.
 
 **What this does not do.** It does not build a wheel; that costs seconds and needs network, and
 the `dist` job in ci.yml does it on every pull request against the artifact itself. This is the
@@ -38,6 +42,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 SRC = REPO_ROOT / "src" / "manicule"
+PACKAGES = REPO_ROOT / "packages"
+RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
+
+# The workspace members that go to PyPI. `manicule` is MIT; `manicule-mlx` is
+# GPL-3.0-or-later because it links `mlx-embeddings`, which is the entire reason it is a
+# separate distribution rather than an extra. The other two members are test fixtures — a
+# reference plugin and a deliberately hostile one — and publishing either would put a parser
+# that hangs on purpose on the index.
+#
+# Written down here rather than inferred, because neither answer is a safe default for a
+# workspace member nobody classified: a new package silently published is a mistake that
+# cannot be taken back, and one silently withheld is a release that quietly does nothing.
+PUBLISHED = ("manicule", "manicule-mlx")
 
 # The two extras `all` deliberately omits, and the reason is in pyproject.toml beside them: on
 # x86_64 Linux `rerank` resolves torch and 2.72 GB of CUDA wheels, and `browser-auth` resolves
@@ -119,8 +136,8 @@ def test_the_console_script_is_guarded(pyproject: dict[str, Any]) -> None:
     )
 
 
-def test_the_builtin_plugins_admit_the_running_version() -> None:
-    """Every built-in plugin's declared `core_version` range contains the version installed.
+def test_every_plugin_admits_the_running_version() -> None:
+    """Every plugin here declares a `core_version` range that contains the running version.
 
     This is the test that fails on release-please's version-bump pull request, which is exactly
     where it should fail: the bump and the pins move together, in one reviewed commit, rather
@@ -130,12 +147,17 @@ def test_the_builtin_plugins_admit_the_running_version() -> None:
     if running == Version("0.0.0.dev0"):  # pragma: no cover - only in an uninstalled tree
         pytest.skip("manicule is not installed; CORE_VERSION has no distribution to read")
 
+    # Both trees. `src/manicule/*/plugin.py` is the six built-ins; `packages/*/src/**` is
+    # `manicule-mlx` and the two fixture plugins, which declare the same range and break on the
+    # same bump — the fixtures included, because the dev group installs them and their suites
+    # are how plugin discovery is tested at all.
+    candidates = [*SRC.rglob("plugin.py"), *PACKAGES.glob("*/src/*/__init__.py")]
     declarations = {
         path.relative_to(REPO_ROOT): match.group("range")
-        for path in sorted(SRC.rglob("plugin.py"))
+        for path in sorted(candidates)
         if (match := re.search(r'core_version="(?P<range>[^"]+)"', path.read_text()))
     }
-    assert declarations, "no built-in plugin declares a core_version; this test is reading wrong"
+    assert declarations, "no plugin declares a core_version; this test is reading the wrong paths"
 
     refused = {
         path: declared
@@ -145,8 +167,61 @@ def test_the_builtin_plugins_admit_the_running_version() -> None:
         if not SpecifierSet(declared, prereleases=True).contains(running)
     }
     assert not refused, (
-        f"manicule {running} is running, and these built-in plugins refuse it: {refused}.\n"
+        f"manicule {running} is running, and these plugins refuse it: {refused}.\n"
         "The version bump moved past the range they declare. Widen the pins in the same commit "
         "as the bump — a release that ships without them loads no parsers, no storage and no "
         "embedder, and reports each one as an incompatible plugin."
+    )
+
+
+def test_the_release_workflow_builds_every_published_distribution() -> None:
+    """`release.yml` builds exactly the workspace members that are meant to reach PyPI.
+
+    The failure this exists for is silent in the worst direction. `manicule-mlx` is what an
+    Apple silicon reader is told to install, and a release workflow that does not build it
+    publishes a README instructing people to install a package that is not there — green run,
+    green release, and the instruction is simply false.
+
+    The other direction is worse and also covered: `packages/` holds parsers that hang and
+    allocate without bound on purpose, and a `uv build` that stopped naming its package would
+    put them on the index, where nothing can be taken back.
+    """
+    workflow = RELEASE_WORKFLOW.read_text()
+    built = set(re.findall(r"uv build --package\s+(\S+)", workflow))
+    assert built == set(PUBLISHED), (
+        "release.yml and PUBLISHED disagree about what ships.\n"
+        f"  built by the workflow: {sorted(built)}\n"
+        f"  expected:              {sorted(PUBLISHED)}"
+    )
+
+    # Every published distribution is also uploaded. Building one and forgetting to publish it
+    # is the same false instruction with an extra step in between.
+    published = set(re.findall(r"packages-dir:\s*dist/(\S+)", workflow))
+    assert published == set(PUBLISHED), (
+        f"built but not published: {sorted(built - published)}; "
+        f"published but not built: {sorted(published - built)}"
+    )
+
+
+def test_every_workspace_member_is_classified() -> None:
+    """No workspace member is left neither published nor deliberately withheld.
+
+    `PUBLISHED` is a list, and a list goes stale the moment somebody adds a package without
+    reading it. This is what makes that impossible to do quietly: a new member fails here,
+    naming itself, and whoever added it decides which side it is on rather than inheriting an
+    answer from whichever default the tooling happened to have.
+    """
+    members = {
+        cast(dict[str, Any], tomllib.loads((path / "pyproject.toml").read_text())["project"])[
+            "name"
+        ]
+        for path in sorted(PACKAGES.iterdir())
+        if (path / "pyproject.toml").is_file()
+    }
+    withheld = {"manicule-plugin-example", "manicule-plugin-hostile"}
+
+    assert members == (set(PUBLISHED) - {"manicule"}) | withheld, (
+        f"packages/ holds {sorted(members)}, which is neither the published set nor the "
+        "withheld one. Add it to PUBLISHED in this file, or to `withheld` here with the "
+        "reason it must never reach PyPI."
     )
