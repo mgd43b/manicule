@@ -128,14 +128,16 @@ def notations() -> frozenset[str]:
     return frozenset(_READERS)
 
 
-def reading(language: str, source: str, *, budget: int, max_relations: int) -> str | None:
+def reading(language: str, source: str, *, budget: int, max_statements: int) -> str | None:
     """The relationships ``source`` draws, as text for an embedder, or ``None`` for nothing.
 
     Args:
         language: A notation in :data:`DIAGRAM_LANGUAGES`. Anything else returns ``None``.
         source: The diagram exactly as the document holds it.
         budget: Longest reading to return, in characters.
-        max_relations: Most relationships to report, before the character budget applies.
+        max_statements: Most lines to report, before the character budget applies. A
+            reading is relationships and also the title, the groupings and the unconnected
+            nodes, and this bounds all of them.
 
     Returns:
         The reading, or ``None`` when the notation has no reader, the grammar is unavailable,
@@ -163,13 +165,13 @@ def reading(language: str, source: str, *, budget: int, max_relations: int) -> s
         return None
     data = source.encode()
     root = parser.parse(data).root_node
-    return _render(read(root, data), budget=budget, max_relations=max_relations)
+    return _render(read(root, data), budget=budget, max_statements=max_statements)
 
 
 # --- rendering -------------------------------------------------------------------------------
 
 
-def _render(graph: _Graph, *, budget: int, max_relations: int) -> str | None:
+def _render(graph: _Graph, *, budget: int, max_statements: int) -> str | None:
     """The graph as lines, bounded twice and never truncated mid-fact.
 
     **The character budget is the length of the source being replaced**, which makes a budget
@@ -185,7 +187,7 @@ def _render(graph: _Graph, *, budget: int, max_relations: int) -> str | None:
     lines = list(_lines(graph))
     if not lines:
         return None
-    dropped = max(0, len(lines) - max_relations)
+    dropped = max(0, len(lines) - max_statements)
     kept = lines[: len(lines) - dropped]
     while kept:
         note = _dropped_note(dropped)
@@ -596,7 +598,7 @@ class DiagramMiddleware(Middleware):
             language,
             chunk.text,
             budget=len(chunk.text),
-            max_relations=self._config.max_relations,
+            max_statements=self._config.max_statements,
         )
         if derived is None:
             return chunk

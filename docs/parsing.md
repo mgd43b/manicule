@@ -2077,12 +2077,13 @@ Three consequences follow from that row, and only the first is the one being ask
 - **The grammar becomes seedable.** `DECLARED_LANGUAGES` derives from `MEDIA_TYPES`, so
   declaring the language is what makes `prefetch` fetch it, `build_grammar_bundle` carry it, and
   `load_parser` accept it. Without the declaration there is no grammar to read a diagram with.
-- **`.dot`, `.mmd` and `.puml` files start routing to the code parser.** A consequence rather
-  than a goal, and a welcome one: a diagram file in a repository becomes a document with line
-  anchors instead of an unroutable byte stream. It yields no symbols, because
-  `NODE_TYPE_DEFINITIONS` describes none of these grammars and inventing definitions for them
-  would be `LineAnchor.symbol` claiming structure the language does not have.
-- **`ChunkFingerprint.grammars` grows three entries** (§8.3). Adding a language is therefore an
+- **`.dot` and `.mmd` files start routing to the code parser.** A consequence rather than a
+  goal, and a welcome one: a diagram file in a repository becomes a document with line anchors
+  instead of an unroutable byte stream. It yields no symbols, because `NODE_TYPE_DEFINITIONS`
+  describes neither grammar and inventing definitions for them would be `LineAnchor.symbol`
+  claiming structure the notation does not have. `.puml` is *not* in this list, because
+  `plantuml` is not declared — see below.
+- **`ChunkFingerprint.grammars` grows two entries** (§8.3). Adding a language is therefore an
   index-affecting change on the terms §8.3 already sets, and the partial re-parse it permits is
   the mechanism that makes adopting it affordable.
 
@@ -2128,7 +2129,7 @@ middleware = ["diagrams"]
 
 [plugins.config."middleware.diagrams"]
 languages = ["dot"]          # optional: narrower than the notations with readers
-max_relations = 64
+max_statements = 64
 ```
 
 Adopting it re-embeds the corpus, because that is what `mutates_embedded_text` means. A default
@@ -2137,13 +2138,22 @@ discipline §8.3 exists for.
 
 #### 8.4.3 What the reading says, and what it drops
 
-Resolved relationships, in source order, as sentences an embedder can read:
+Resolved relationships, in source order:
 
 ```
-Auth Service validates against Token Store
-Token Store reads Postgres
+Auth architecture
+Auth Service → Token Store: validates against
+Token Store — Postgres
 group "Control plane": Auth Service, Token Store
+nodes: Audit Log
 ```
+
+**An arrow rather than a sentence, and the arrow is the careful choice.** *Auth Service validates
+against Token Store* reads better where the label is a verb phrase, and asserts a sentence the
+diagram never stated where it is a protocol name — *Auth Service HTTP Token Store*. The arrow
+keeps all three terms adjacent, which is what the embedder needs, without claiming a grammar the
+source does not have. `—` is an edge the diagram draws without an arrowhead, and it means the
+direction was not stated rather than that it runs both ways.
 
 - **Labels are resolved through to the endpoints.** An edge between two identifiers contributes
   nothing on its own; an edge between two *labels* is the fact. Where a node has no label its

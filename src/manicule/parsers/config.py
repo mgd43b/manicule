@@ -55,6 +55,8 @@ __all__ = [
     "CONFLUENCE_MEDIA_TYPE",
     "CONFLUENCE_MEDIA_TYPES",
     "CSV_MEDIA_TYPE",
+    "DIAGRAM_LANGUAGES",
+    "DIAGRAM_MIDDLEWARE_NAME",
     "MAIL_MEDIA_TYPES",
     "MARKDOWN_MEDIA_TYPES",
     "NOTEBOOK_MEDIA_TYPE",
@@ -74,6 +76,7 @@ __all__ = [
     "ADFConfig",
     "ArchiveConfig",
     "ConfluenceConfig",
+    "DiagramConfig",
     "MailConfig",
     "MarkdownConfig",
     "NotebookConfig",
@@ -375,15 +378,20 @@ class DiagramConfig(BaseModel):
     another's are read. Naming a notation with no reader is not an error and does nothing, which
     is the same direction of failure as a diagram that will not parse."""
 
-    max_relations: int = Field(
+    max_statements: int = Field(
         default=64,
         ge=1,
-        description="Most relationships one reading reports before the rest are counted.",
+        description="Most lines one reading reports before the rest are counted.",
     )
     """A second bound above the character budget, which is already the length of the source being
     replaced. It exists for the diagram that is mostly edges between short identifiers, where a
     reading can stay well inside the character budget while becoming a list nobody would read —
-    and where the first sixty relationships are what the vector should be about."""
+    and where the first sixty statements are what the vector should be about.
+
+    **Lines rather than relationships, and it is named for what it bounds.** A reading is
+    relationships *and* the diagram's title, its groupings and its unconnected nodes; a bound that
+    counted only edges would let the other three grow past it. Called ``max_relations`` it read as
+    a promise the code does not keep — adding a title would have silently cost an edge."""
 
 
 class ADFConfig(BaseModel):

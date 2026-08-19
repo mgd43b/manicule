@@ -88,7 +88,7 @@ SEQUENCE = """sequenceDiagram
 def read(language: str, source: str, *, budget: int = 10_000, limit: int = 64) -> str:
     """A reading, asserted to exist. The ``None`` cases have tests of their own."""
     require_grammars()
-    result = reading(language, source, budget=budget, max_relations=limit)
+    result = reading(language, source, budget=budget, max_statements=limit)
     assert result is not None, f"{language} produced no reading"
     return result
 
@@ -255,7 +255,7 @@ def test_a_notation_with_no_reader_produces_nothing() -> None:
     ``None`` rather than a refusal, because the caller's response to it is to leave the chunk
     exactly as it is — which is what every notation did before this module existed.
     """
-    assert reading("plantuml", "@startuml\na->b\n@enduml", budget=999, max_relations=8) is None
+    assert reading("plantuml", "@startuml\na->b\n@enduml", budget=999, max_statements=8) is None
 
 
 def test_a_source_that_does_not_parse_produces_nothing_rather_than_guesses() -> None:
@@ -265,11 +265,11 @@ def test_a_source_that_does_not_parse_produces_nothing_rather_than_guesses() -> 
     invents nothing for the part that did not.
     """
     require_grammars()
-    assert reading("dot", "digraph {", budget=999, max_relations=8) is None
+    assert reading("dot", "digraph {", budget=999, max_statements=8) is None
 
 
 def test_an_empty_source_produces_nothing() -> None:
-    assert reading("dot", "   \n ", budget=999, max_relations=8) is None
+    assert reading("dot", "   \n ", budget=999, max_statements=8) is None
 
 
 def test_a_diagram_nested_past_any_call_stack_still_fails_safely() -> None:
@@ -283,7 +283,7 @@ def test_a_diagram_nested_past_any_call_stack_still_fails_safely() -> None:
     depth = 1500
     source = "digraph {" + "subgraph { " * depth + "a -> b;" + " }" * depth + "}"
 
-    assert reading("dot", source, budget=200, max_relations=8) is None
+    assert reading("dot", source, budget=200, max_statements=8) is None
 
 
 # --- bounding --------------------------------------------------------------------------------
@@ -316,7 +316,7 @@ def test_what_a_bound_dropped_is_counted_rather_than_omitted() -> None:
     assert "more" in result
 
 
-def test_max_relations_bounds_a_reading_that_fits_the_character_budget() -> None:
+def test_max_statements_bounds_a_reading_that_fits_the_character_budget() -> None:
     """The second bound, for the diagram that is many edges between short identifiers.
 
     Such a reading stays well inside the character budget while becoming a list nobody would
@@ -333,7 +333,7 @@ def test_max_relations_bounds_a_reading_that_fits_the_character_budget() -> None
 def test_a_reading_that_cannot_fit_at_all_is_no_reading() -> None:
     """Below the budget for even one fact, the chunk keeps the embedding input it has."""
     require_grammars()
-    assert reading("dot", DOT, budget=3, max_relations=64) is None
+    assert reading("dot", DOT, budget=3, max_statements=64) is None
 
 
 # --- the declaration ---------------------------------------------------------------------------
