@@ -13,6 +13,7 @@ import hashlib
 import json
 import resource
 import sqlite3
+import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast, override
@@ -2496,6 +2497,105 @@ async def test_enumeration_renews_its_lease_while_the_source_cursor_is_blocked(
     connector.release.set()
     report = await task
 
+    assert report.indexed == 1
+    assert report.error_type == ""
+
+
+async def test_synchronous_document_preparation_does_not_block_lease_renewal(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The synchronous twin of the test above, and the one the async version could not catch.
+
+    Enumeration blocks on an ``await``, so the heartbeat coroutine keeps its turn on the loop
+    and that test passes whatever preparation does. Chunking, exact token counting and
+    glossary detection are compute-bound Python that never awaits, and they used to run on the
+    loop itself — so the heartbeat could not run *at all* while a document was being prepared,
+    however long that took. Measured on one synthetic 2 MiB block with the production
+    vocabulary: 513s of preparation against a 300s lease, zero of five renewals fired, and the
+    first thing to reach the loop afterwards was a generation-fenced renewal that had already
+    lost the run. The snapshot was complete and resumable; the sync was dead.
+
+    Held on a ``threading.Event`` rather than a sleep, and released on the renewal *count*
+    rather than a wall clock: the barrier stays shut until the heartbeat has fired twice, so a
+    loop that cannot run the heartbeat does not make this flaky, it makes it hang and fail.
+    """
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    renewals_wanted = 2
+
+    class CountingJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.renewals = 0
+            self.renewed_enough = asyncio.Event()
+
+        @override
+        async def renew_acquisition_lease(
+            self,
+            run_id: str,
+            owner: str,
+            generation: int,
+            *,
+            now: datetime,
+            expires_at: datetime,
+        ) -> bool:
+            result = await super().renew_acquisition_lease(
+                run_id, owner, generation, now=now, expires_at=expires_at
+            )
+            self.renewals += 1
+            if self.renewals >= renewals_wanted:
+                self.renewed_enough.set()
+            return result
+
+    class HeldChunker(fakes.BlockChunker):
+        """A chunker that blocks the way the real one does: synchronously, without awaiting."""
+
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        @override
+        def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+            self.entered.set()
+            self.release.wait(timeout=30)
+            return super().chunk(document, blocks)
+
+    store = CountingJournal()
+    await store.ensure_workspace()
+    chunker = HeldChunker()
+    connector = fakes.DictConnector(
+        {"public-held-document": "public synthetic line"}, name="held-preparation-source"
+    )
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=1,
+        acquisition_clock=fakes.ManualLeaseClock(),
+        detect_glossary=False,
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await asyncio.wait_for(asyncio.to_thread(chunker.entered.wait, 10), timeout=15)
+
+    # The loop is expected to be fully alive while the synchronous stage is held: the
+    # heartbeat renews, and a bounded durable status read answers.
+    await asyncio.wait_for(store.renewed_enough.wait(), timeout=15)
+    live = await asyncio.wait_for(store.latest_unsettled_acquisition_run(connector.name), timeout=5)
+    assert live is not None, "a bounded status read has to answer while preparation is held"
+
+    chunker.release.set()
+    report = await asyncio.wait_for(task, timeout=30)
+
+    assert store.renewals >= renewals_wanted
     assert report.indexed == 1
     assert report.error_type == ""
 

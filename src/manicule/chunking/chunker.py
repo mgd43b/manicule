@@ -82,12 +82,50 @@ oversized line whole. Version 3 repacks against each chunk's exact rendered brea
 admits only the overlap that still fits, and hard-splits every remaining oversized unit.
 Those changes move boundaries, so retained-source offline rebuild is required; relabeling
 the existing generation would leave its stored chunks and vectors falsely current.
+
+**3 stays 3 through the bounded-tokenization work**, and a version that only ever goes up is
+worth as much for the changes it declines to count. Every prefix search and every "does this
+fit" count became bounded — see :data:`PROBE_CHARS_PER_TOKEN` — which is a change to *how
+much of a string is measured*, never to which prefix the measurement selects. Bisection
+already required the count to be monotone over prefixes in order to be correct at all, and
+that is the entire assumption the doubling search adds; under it the two searches enclose the
+same largest satisfying element. So this is the opposite case to 2 -> 3: identical blocks
+produce identical chunks, and bumping would bill the corpus for a re-embed that changes
+nothing.
+
+Measured rather than asserted, because that is what the 1 -> 2 note above promises of a
+version decision: 4,000 randomized documents — every block kind, four counters at one to six
+characters per token, budgets of 128, 256 and 512, oversized rows, oversized code lines,
+newline-free and multibyte blocks — chunked under both bodies and compared as complete
+``Chunk`` lists, with no difference. The corpus round-trips and the benchmark under BGE-M3's
+own vocabulary agree: identical chunk counts at every size and shape.
 """
 
 MAX_TOKENS = 512
 OVERLAP_TOKENS = 64
 MIN_TOKENS = 64
 BREADCRUMB_TOKENS = STRUCTURAL_BREADCRUMB_TOKENS
+
+PROBE_CHARS_PER_TOKEN = 8
+"""How many characters per budgeted token the first probe of a bounded search reaches for.
+
+Every question this chunker asks the tokenizer about a large string is really a question
+about a *small* prefix of it: the cut that fills a 512-token budget is never more than a few
+thousand characters in, however many megabytes follow. The searches below therefore start at
+``max_tokens * PROBE_CHARS_PER_TOKEN`` characters and double until the answer is enclosed,
+instead of starting from the length of the whole string.
+
+**Eight because it is comfortably above every real tokenizer's ratio, not because it is
+right.** BGE-M3 averages three to four characters per token on prose and fewer on CJK; a
+whitespace stand-in reaches six on English. Overshooting costs nothing but a slightly larger
+first probe, and undershooting costs one extra doubling.
+
+It is deliberately **not** in :class:`~manicule.core.fingerprints.ChunkFingerprint`, and that
+is a property of the search rather than an oversight: the doubling continues until the
+predicate actually fails, so this value decides how many probes are taken and never which
+prefix is chosen. A tuning constant that could move a boundary would have to be recorded and
+would make every retune a corpus-wide re-embed — see :data:`CHUNKER_VERSION`.
+"""
 
 BLOCK_SEPARATOR = "\n\n"
 
@@ -117,7 +155,22 @@ class _Unit:
     kind: BlockKind
     anchor: Anchor
     heading_path: tuple[str, ...]
+
     tokens: int
+    """Exact, for every unit that fits the text budget; ``budget + 1`` for one that does not.
+
+    A unit over the budget is either split before its count is read for anything else, or is
+    a heading, which :meth:`StructuralChunker._accumulate` drops without reading it — so the
+    count of an oversized unit is a bit of information dressed as a number, and
+    :meth:`StructuralChunker._count_or_ceiling` declines to spend a megabyte of tokenizer
+    time computing the rest of it. Anything added here that needs the true count of an
+    oversized unit must take it itself.
+
+    ``test_no_group_is_ever_built_from_an_inexact_count`` holds the boundary: every unit that
+    reaches a group is checked against a fresh exact count, so a new split path that let an
+    unsplit oversized unit through would fail there rather than quietly shift a merge.
+    """
+
     lang: str | None = None
     """Carried from :attr:`ParsedBlock.lang`, so that a chunk can say what language it is in.
 
@@ -192,6 +245,7 @@ class StructuralChunker:
         self._min_tokens = min_tokens
         self._breadcrumb_tokens = breadcrumb_tokens
         self._text_budget = max_tokens - breadcrumb_tokens
+        self._probe_chars = max(1, max_tokens * PROBE_CHARS_PER_TOKEN)
         components = dict(version_components or {})
         suffix = "".join(f";{name}={value}" for name, value in sorted(components.items()))
         self.fingerprint = ChunkFingerprint(
@@ -293,7 +347,7 @@ class StructuralChunker:
 
     def _to_units(self, block: ParsedBlock) -> list[_Unit]:
         """One unit per block, unless the block does not fit and has to be split (§4.2)."""
-        tokens = self._counter(block.text)
+        tokens = self._count_or_ceiling(block.text)
         if block.kind is BlockKind.HEADING:
             # A heading is a boundary and a breadcrumb component, not content.
             return [
@@ -336,7 +390,7 @@ class StructuralChunker:
             kind=block.kind,
             anchor=block.anchor,
             heading_path=block.heading_path,
-            tokens=self._counter(text),
+            tokens=self._count_or_ceiling(text),
             lang=block.lang,
             metadata=metadata,
         )
@@ -385,13 +439,13 @@ class StructuralChunker:
         refs = _string_list(block.metadata.get("row_refs"))
         header = rows[:header_rows]
         header_text = "\n".join(header)
-        header_tokens = self._counter(header_text) if header else 0
+        header_tokens = self._count_or_ceiling(header_text) if header else 0
 
         parts: list[list[int]] = []
         current: list[int] = []
         running = header_tokens
         for index in range(header_rows, len(rows)):
-            row_tokens = self._counter(rows[index])
+            row_tokens = self._count_or_ceiling(rows[index])
             if current and running + row_tokens > self._text_budget:
                 parts.append(current)
                 current = []
@@ -447,6 +501,7 @@ class StructuralChunker:
             cut = self._longest_prefix_satisfying(
                 remaining,
                 lambda candidate: self._counter(f"{prefix}{candidate}") <= self._text_budget,
+                self._probe_chars,
             )
             if cut == 0:
                 # Repeating a header wider than the budget is physically impossible. Keep the
@@ -500,10 +555,10 @@ class StructuralChunker:
         # lose blank lines and make the non-overlap payload impossible to reconstruct exactly.
         for offset, line in enumerate(source_lines):
             candidate = "".join(value for _, value in (*current, (offset, line)))
-            if current and self._counter(candidate) > self._text_budget:
+            if current and self._count_or_ceiling(candidate) > self._text_budget:
                 flush()
             current.append((offset, line))
-            if self._counter(line) > self._text_budget:
+            if self._count_or_ceiling(line) > self._text_budget:
                 oversized = materialize(current)
                 current.clear()
                 units.extend(self._hard_split(oversized, "line"))
@@ -517,8 +572,9 @@ class StructuralChunker:
     def _split_text(self, text: str, template: _Unit, *, hard_split_kind: str) -> list[_Unit]:
         units: list[_Unit] = []
         for paragraph in paragraphs(text) or [text]:
-            if self._counter(paragraph) <= self._text_budget:
-                units.append(replace(template, text=paragraph, tokens=self._counter(paragraph)))
+            tokens = self._count_or_ceiling(paragraph)
+            if tokens <= self._text_budget:
+                units.append(replace(template, text=paragraph, tokens=tokens))
                 continue
             pieces = sentences(paragraph) or [paragraph]
             for packed in self._pack(pieces, " ", None, template=template):
@@ -541,7 +597,7 @@ class StructuralChunker:
         current: list[str] = []
         running = 0
         for piece in pieces:
-            tokens = self._counter(piece)
+            tokens = self._count_or_ceiling(piece)
             if current and running + tokens > self._text_budget:
                 units.append(self._materialize(joiner.join(current), block, template))
                 current = []
@@ -558,7 +614,7 @@ class StructuralChunker:
         if template is None:  # pragma: no cover - one of the two is always supplied
             msg = "a unit needs either a block or a template to inherit from"
             raise ChunkingError(msg)
-        return replace(template, text=text, tokens=self._counter(text))
+        return replace(template, text=text, tokens=self._count_or_ceiling(text))
 
     def _hard_split(self, unit: _Unit, kind: str) -> list[_Unit]:
         """Cut a single oversized piece at a token boundary, and record that it happened.
@@ -584,16 +640,60 @@ class StructuralChunker:
         the embedder guarantees, and a chunker that reconstructed text from token ids would
         produce different cuts under a tokenizer that round-trips imperfectly.
         """
-        low, high = 1, len(text)
+        fits = self._fits_budget
+        low, high = 1, _search_ceiling(text, fits, self._probe_chars)
         best = 1
         while low <= high:
             middle = (low + high) // 2
-            if self._counter(text[:middle]) <= self._text_budget:
+            if fits(text[:middle]):
                 best = middle
                 low = middle + 1
             else:
                 high = middle - 1
         return best
+
+    def _fits_budget(self, text: str) -> bool:
+        return self._counter(text) <= self._text_budget
+
+    def _count_or_ceiling(self, text: str) -> int:
+        """The exact token count when ``text`` fits the text budget, or the first count above
+        it when it does not — without handing the tokenizer more than a bounded prefix.
+
+        Counting a block to find out whether it needs splitting is the wrong way round when
+        the block is a megabyte: the answer is one bit, and paying for an exact count of
+        something about to be cut into a thousand pieces is the bulk of what made a single
+        oversized block cost minutes of tokenizer time. A prefix that is already over budget
+        settles the question, so the probe doubles until one is.
+
+        **A ceiling never reaches a group, so grouping never reads one.** The only unit that
+        can carry one is a unit :meth:`_to_units` is on its way to splitting — everything past
+        the text budget goes to :meth:`_split_table`, :meth:`_split_lines` or
+        :meth:`_split_prose`, and each of those emits parts that fit and were counted exactly,
+        hard-splitting whatever still does not — or a heading, whose count
+        :meth:`_accumulate` discards along with the unit, headings being boundaries rather
+        than content. Every unit that reaches :meth:`_accumulate` therefore has an exact
+        count, which is what the running sums, :meth:`_merge_short_tail` and
+        :func:`_dominant_kind` all read.
+
+        That is the property to preserve, and it is worth stating as such rather than as a
+        claim about any one caller: :func:`_dominant_kind` compares two counts against each
+        other rather than against a budget, and ``_merge_short_tail`` hands it the *preceding*
+        group, which is under no size limit at all. Neither fact matters while the counts it
+        sees are exact, and both would if a future path let an unsplit oversized unit into a
+        group.
+
+        Blocks shorter than one probe — which is nearly all of them, since a chunk's worth of
+        prose is a couple of thousand characters — take the single exact count they always
+        did, so no ordinary document pays for the guard.
+        """
+        if len(text) <= self._probe_chars:
+            return self._counter(text)
+        window = self._probe_chars
+        while window < len(text):
+            if not self._fits_budget(text[:window]):
+                return self._text_budget + 1
+            window *= 2
+        return self._counter(text)
 
     def _fit_final_bases(
         self, document: Document, groups: Sequence[Sequence[_Unit]]
@@ -645,7 +745,7 @@ class StructuralChunker:
             def fits_prefix(candidate: str) -> bool:
                 return fits_text(f"{repeated_prefix}{candidate}")
 
-            cut = self._longest_prefix_satisfying(remaining, fits_prefix)
+            cut = self._longest_prefix_satisfying(remaining, fits_prefix, self._probe_chars)
             if cut == 0:
                 msg = (
                     "the rendered breadcrumb and repeated table header leave no room for "
@@ -675,8 +775,8 @@ class StructuralChunker:
         return self._counter(embed_text)
 
     @staticmethod
-    def _longest_prefix_satisfying(text: str, fits: Callable[[str], bool]) -> int:
-        low, high = 1, len(text)
+    def _longest_prefix_satisfying(text: str, fits: Callable[[str], bool], probe: int) -> int:
+        low, high = 1, _search_ceiling(text, fits, probe)
         best = 0
         while low <= high:
             middle = (low + high) // 2
@@ -898,6 +998,44 @@ class StructuralChunker:
             if self._rendered_count(rendered, content) <= self._max_tokens:
                 return rendered
         return ""  # pragma: no cover - content fitting handles the empty-breadcrumb case
+
+
+def _search_ceiling(text: str, fits: Callable[[str], bool], probe: int) -> int:
+    """A bound on the longest satisfying prefix, found by doubling rather than by ``len(text)``.
+
+    Both prefix searches above bisected from ``high = len(text)``, which asks the tokenizer
+    about half of the string to locate a cut that is never more than a budget's worth of
+    characters in — and their callers peel one budget at a time, rerunning the search over
+    the whole shrinking tail. That is O(n^2) tokenizer work in the size of one block, and it
+    is what let a single oversized block hold a connector's ordered settlement for minutes:
+    measured on a synthetic 2 MiB newline-free block, 1.28 GB of text reached the tokenizer
+    to produce 1,169 chunks, growing 3.85x for every doubling of the input. Doubling a probe
+    finds the same ceiling in O(log answer) calls whose sizes sum to O(answer), which makes
+    the enclosing loop linear and every individual call bounded.
+
+    **The chosen prefix does not move, and that is not a claim about tokenizers.** Bisection
+    is only correct at all when ``fits`` is monotone over prefixes — a non-monotone predicate
+    makes the old search's answer depend on ``len(text)``, which is to say on how much
+    unrelated text happened to follow. This needs exactly that same property and no more: the
+    first failing probe proves the answer lies below it, so bisecting to this ceiling and
+    bisecting to ``len(text)`` search a range with the same largest satisfying element. So
+    ``probe`` costs probes when it is a poor guess and cannot change a boundary, which is why
+    :data:`PROBE_CHARS_PER_TOKEN` stays out of
+    :class:`~manicule.core.fingerprints.ChunkFingerprint` and why this needed no version bump.
+
+    Args:
+        text: The string being cut.
+        fits: The predicate being searched, monotone over prefixes.
+        probe: Characters in the first probe. Any positive value returns the same ceiling.
+
+    Returns:
+        A prefix length at least as large as the longest satisfying one, never past
+        ``len(text)``.
+    """
+    window = max(1, probe)
+    while window < len(text) and fits(text[:window]):
+        window *= 2
+    return min(window, len(text))
 
 
 def _join_units(units: Sequence[_Unit]) -> str:
