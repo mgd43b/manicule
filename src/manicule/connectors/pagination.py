@@ -73,12 +73,24 @@ def split_query(
 
 
 def origin_of(url: str) -> str:
-    """Scheme, host and port of ``url``, lowercased. Empty when it has no host."""
+    """Scheme, host and port of ``url``, lowercased. Empty when it has no host.
+
+    **An IPv6 literal gets its brackets back**, because ``urlsplit`` strips them and the result
+    is not merely ugly — it is ambiguous. ``https://[::1]:8443`` and ``https://[::1:8443]`` are
+    different servers, one a host with a port and one a host without, and both render as
+    ``https://::1:8443`` once the brackets are gone. Two origins that are not equal comparing
+    equal is a same-origin check passing for somewhere else, and — since
+    :func:`~manicule.connectors.sessions.authority_key` is built on this — one instance's held
+    session being offered to another.
+    """
     parsed = urlsplit(url)
     if not parsed.hostname:
         return ""
+    host = parsed.hostname.lower()
+    # A colon in a host is only ever an IPv6 literal; `urlsplit` has already taken the port off.
+    host = f"[{host}]" if ":" in host else host
     port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}{port}"
+    return f"{parsed.scheme.lower()}://{host}{port}"
 
 
 @dataclass(frozen=True, slots=True)

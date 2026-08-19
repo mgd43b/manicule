@@ -165,9 +165,11 @@ def _waits_for_a_person(browser_provider: str | None) -> bool:
 
     `--timeout` bounds that wait, so it is meaningful for the two browser providers and reaches
     nothing for the other two — importing a state file is immediate, and pasting a header waits
-    on the person rather than on a clock. Answering `False` for a name that parses to nothing is
-    deliberate: the refusal an operator should see first is the one naming the bad provider, not
-    a complaint about a timeout that was fine.
+    on the person rather than on a clock.
+
+    A name that parses to nothing answers `False`, and the caller runs this only **after** the
+    provider has been validated, so that case is unreachable from the command line: a mistyped
+    provider is refused by name before any question about the timeout is asked.
     """
     if browser_provider is None:
         return False
@@ -1467,10 +1469,6 @@ def connector_login(
     # in the service, because that one is a fact about the operation and every surface needs it.
     if allow_insecure_state and browser_state is None:
         raise typer.BadParameter(INSECURE_STATE_IS_AN_IMPORT_OPTION)
-    if timeout is not None and not (browser or _waits_for_a_person(browser_provider)):
-        raise typer.BadParameter(BROWSER_TIMEOUT_IS_A_BROWSER_OPTION)
-    if timeout is not None and timeout <= 0:
-        raise typer.BadParameter(BROWSER_TIMEOUT_MUST_BE_POSITIVE)
     # Which flags were typed together, and whether the provider named is one — both facts about
     # the *invocation*, so both answered here and before the server probe below. The service
     # checks mutual exclusion too, because every surface needs it; what this adds is the order.
@@ -1503,6 +1501,14 @@ def connector_login(
             )
         except ConfigError as exc:
             raise typer.BadParameter(str(exc)) from exc
+    # After the provider is known to be a real one, so that a mistyped `--browser-provider`
+    # is reported as the typo it is. Before this ordering, `--browser-provider instaled-chromium
+    # --timeout 10` complained about `--timeout` — which was fine — and said nothing about the
+    # name that was not, sending somebody to remove a correct flag.
+    if timeout is not None and not (browser or _waits_for_a_person(browser_provider)):
+        raise typer.BadParameter(BROWSER_TIMEOUT_IS_A_BROWSER_OPTION)
+    if timeout is not None and timeout <= 0:
+        raise typer.BadParameter(BROWSER_TIMEOUT_MUST_BE_POSITIVE)
 
     # Checked before anything is captured, and before anybody is asked to sign in. A person who
     # opens a browser, completes a second factor and *then* hears there is nowhere to put the

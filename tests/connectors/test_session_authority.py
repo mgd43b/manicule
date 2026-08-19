@@ -193,3 +193,42 @@ def test_a_url_that_will_not_parse_keeps_its_own_entry() -> None:
 def test_surrounding_whitespace_is_not_a_second_instance() -> None:
     """A trailing newline out of a config file or a shell is not a different wiki."""
     assert authority_key(f"  {SITE}/confluence \n") == authority_key(f"{SITE}/confluence")
+
+
+# --- addresses, which are hosts too ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("configured", "equivalent"),
+    [
+        ("https://[::1]/confluence", "https://[::1]:443/confluence"),
+        ("https://[2001:db8::1]/confluence", "https://[2001:DB8::1]/confluence/"),
+    ],
+    ids=["v6-default-port", "v6-case-and-slash"],
+)
+def test_one_ipv6_instance_is_one_entry(configured: str, equivalent: str) -> None:
+    """The same rules as a named host, which is the point: an address is not a special case."""
+    assert authority_key(configured) == authority_key(equivalent)
+
+
+def test_an_ipv6_port_is_not_confused_with_part_of_the_address() -> None:
+    """A regression, and it was a merge — the direction that costs a credential.
+
+    ``urlsplit`` hands back an IPv6 host without its brackets, so ``[::1]:8443`` (a host and a
+    port) and ``[::1:8443]`` (a longer host, default port) both rendered as ``::1:8443``. Two
+    different servers produced one authority key, which is a held session for one being offered
+    to the other — exactly what the isolation section above exists to prevent, missed because
+    every case in it used a named host.
+    """
+    with_port = authority_key("https://[::1]:8443/confluence")
+    longer_address = authority_key("https://[::1:8443]/confluence")
+
+    assert with_port != longer_address
+    assert "[" in with_port, "an IPv6 authority without brackets is ambiguous, not merely ugly"
+
+
+def test_ipv6_instances_that_differ_are_still_separate() -> None:
+    """Loopback and a documentation address are not the same wiki."""
+    assert authority_key("https://[::1]/confluence") != authority_key(
+        "https://[2001:db8::1]/confluence"
+    )

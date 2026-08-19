@@ -2401,3 +2401,38 @@ def test_the_minimal_invocations_cover_every_binder() -> None:
         "every operation that can be written as a Command needs a minimal invocation here, and "
         "every invocation here needs an operation"
     )
+
+
+def test_a_mistyped_provider_is_named_before_a_timeout_is_questioned(
+    bound: ApplicationService,
+) -> None:
+    """Two things are wrong with `--browser-provider instaled-chromium --timeout 10`, and only
+    one of them is: the timeout is fine and the provider does not exist.
+
+    The timeout guard used to run first and ask about the flag that was correct, so an operator
+    was sent to remove a `--timeout` that would have worked and told nothing about the typo. The
+    provider is validated first now, and this asserts the *ordering* rather than either check —
+    both passed on their own before.
+    """
+    del bound
+
+    result = run(
+        ["connector", "login", "wiki", "--browser-provider", "instaled-chromium", "--timeout", "10"]
+    )
+
+    refusal = _unwrapped(result.output)
+    assert result.exit_code != 0
+    assert "instaled-chromium" in refusal
+    assert "--timeout" not in refusal, "the flag that was correct is the one being complained about"
+
+
+def test_a_timeout_is_still_refused_against_a_provider_that_never_waits(
+    bound: ApplicationService,
+) -> None:
+    """The guard the reordering must not have disabled. Pasting a header waits on you."""
+    del bound
+
+    result = run(["connector", "login", "wiki", "--manual-cookie", "--timeout", "10"])
+
+    assert result.exit_code != 0
+    assert "--timeout" in _unwrapped(result.output)
