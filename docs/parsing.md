@@ -2164,7 +2164,7 @@ tail of the reading a fragment of a fact, and a silent one would make a partly-r
 indistinguishable from a small one — `docs/connectors/confluence.md` §5 settles this same
 question the same way for macros.
 
-#### 8.4.4 Every failure keeps today's behaviour
+#### 8.4.4 Every failure keeps today's behavior
 
 A diagram whose source does not parse, a notation with no reader, a grammar that is not
 installed: in each case the chunk is returned unchanged, so `embed_text` stays breadcrumb + source

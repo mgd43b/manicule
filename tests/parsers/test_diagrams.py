@@ -108,7 +108,7 @@ def test_a_dot_edge_reads_through_to_the_labels_at_its_ends() -> None:
 def test_an_identifier_with_no_label_is_used_as_it_is_drawn() -> None:
     """Graphviz draws the identifier when a node declares no label, and so does the reading.
 
-    Skipping the edge instead would silently drop half a diagram whose author never labelled
+    Skipping the edge instead would silently drop half a diagram whose author never labeled
     anything, which is the common case for a quick sketch.
     """
     assert "Token Store → db" in read("dot", DOT)

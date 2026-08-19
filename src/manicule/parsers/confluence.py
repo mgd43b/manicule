@@ -155,7 +155,7 @@ MACRO_LANGUAGES: Mapping[str, str] = {
 """What language an unsupported macro's verbatim body is written in, where its name says.
 
 ``_unsupported_macro`` keeps a macro's ``ac:plain-text-body`` as a ``CODE`` block, which is right
-— a macro being unsupported is a statement about its *behavior*, never a licence to drop the
+— a macro being unsupported is a statement about its *behavior*, never a license to drop the
 content it carries. It emitted that block with **no language at all**, and the macro's own
 ``ac:name`` had said what the language was the whole time. ``Chunk.lang`` was therefore ``None``,
 so neither store promoted a value into the column ``Filter.langs`` resolves against, and no

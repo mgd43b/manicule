@@ -1220,7 +1220,7 @@ async def test_a_status_macro_contributes_the_words_inside_its_lozenge() -> None
     )
 
     assert "In Progress" in _texts(blocks)
-    assert "Yellow" not in _texts(blocks), "a colour is styling, and styling is not content"
+    assert "Yellow" not in _texts(blocks), "a color is styling, and styling is not content"
 
 
 async def test_a_jira_macro_renders_its_key_and_still_never_its_query() -> None:
