@@ -38,8 +38,14 @@ from manicule.app.commands import Command
 from manicule.app.dispatch import error_info, run_op, writes
 from manicule.app.results import Envelope, failed
 from manicule.app.runtime import Runtime
-from manicule.app.service import DEFAULT_SOURCE, DEFAULT_SWEEP_BATCH, ApplicationService
+from manicule.app.service import (
+    DEFAULT_SOURCE,
+    DEFAULT_SWEEP_BATCH,
+    ApplicationService,
+    selected_provider,
+)
 from manicule.cli import proxy, render
+from manicule.config.settings import BrowserProvider, Settings
 from manicule.core.errors import ConfigError, ManiculeError
 from manicule.core.version import CORE_VERSION
 from manicule.generation.answers import EventKind
@@ -152,6 +158,27 @@ The same rule :data:`INSECURE_TARGET_IS_A_BACKUP_OPTION` states, and it bites ha
 nothing is the precise defect the option exists to prevent. Found by re-reading the diff against
 the convention rather than by anything failing.
 """
+
+
+def _waits_for_a_person(browser_provider: str | None) -> bool:
+    """Whether `--browser-provider <name>` names a path that waits for somebody to sign in.
+
+    `--timeout` bounds that wait, so it is meaningful for the two browser providers and reaches
+    nothing for the other two — importing a state file is immediate, and pasting a header waits
+    on the person rather than on a clock.
+
+    A name that parses to nothing answers `False`, and the caller runs this only **after** the
+    provider has been validated, so that case is unreachable from the command line: a mistyped
+    provider is refused by name before any question about the timeout is asked.
+    """
+    if browser_provider is None:
+        return False
+    folded = browser_provider.strip().lower().replace("-", "_")
+    return folded in {
+        BrowserProvider.INSTALLED_CHROMIUM.value,
+        BrowserProvider.BUNDLED_CHROMIUM.value,
+    }
+
 
 BROWSER_TIMEOUT_IS_A_BROWSER_OPTION = (
     "--timeout is how long to wait for a person to finish signing in, which only the --browser "
@@ -1375,6 +1402,14 @@ def connector_login(
         bool,
         typer.Option("--browser", help="Open a browser and sign in there instead of pasting."),
     ] = False,
+    browser_provider: Annotated[
+        str | None,
+        typer.Option(
+            "--browser-provider",
+            help="Which provider to sign in with: installed-chromium, bundled-chromium, "
+            "browser-state or manual-cookie. Overrides the workspace default for this run.",
+        ),
+    ] = None,
     browser_state: Annotated[
         Path | None,
         typer.Option(
@@ -1382,6 +1417,13 @@ def connector_login(
             help="Import cookies from a Playwright storage_state JSON file.",
         ),
     ] = None,
+    manual_cookie: Annotated[
+        bool,
+        typer.Option(
+            "--manual-cookie",
+            help="Paste a Cookie header, even where the workspace defaults to a browser.",
+        ),
+    ] = False,
     timeout: Annotated[
         float | None,
         typer.Option(
@@ -1427,7 +1469,43 @@ def connector_login(
     # in the service, because that one is a fact about the operation and every surface needs it.
     if allow_insecure_state and browser_state is None:
         raise typer.BadParameter(INSECURE_STATE_IS_AN_IMPORT_OPTION)
-    if timeout is not None and not browser:
+    # Which flags were typed together, and whether the provider named is one — both facts about
+    # the *invocation*, so both answered here and before the server probe below. The service
+    # checks mutual exclusion too, because every surface needs it; what this adds is the order.
+    # Without it a mistyped `--browser-provider` reports that no server is running, which sends
+    # somebody to start one only to be told they mistyped.
+    ways_in = [
+        label
+        for label, asked in (
+            ("--browser", browser),
+            ("--browser-provider", browser_provider is not None),
+            ("--browser-state", browser_state is not None),
+            ("--manual-cookie", manual_cookie),
+            ("--forget", forget),
+        )
+        if asked
+    ]
+    if len(ways_in) > 1:
+        raise typer.BadParameter(
+            f"{' and '.join(ways_in)} were given together, and each is a different thing to do "
+            f"with this source's credential. Pick one."
+        )
+    if browser_provider is not None:
+        try:
+            selected_provider(
+                browser=False,
+                browser_provider=browser_provider,
+                browser_state=None,
+                manual_cookie=False,
+                configured=BrowserProvider.MANUAL_COOKIE,
+            )
+        except ConfigError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    # After the provider is known to be a real one, so that a mistyped `--browser-provider`
+    # is reported as the typo it is. Before this ordering, `--browser-provider instaled-chromium
+    # --timeout 10` complained about `--timeout` — which was fine — and said nothing about the
+    # name that was not, sending somebody to remove a correct flag.
+    if timeout is not None and not (browser or _waits_for_a_person(browser_provider)):
         raise typer.BadParameter(BROWSER_TIMEOUT_IS_A_BROWSER_OPTION)
     if timeout is not None and timeout <= 0:
         raise typer.BadParameter(BROWSER_TIMEOUT_MUST_BE_POSITIVE)
@@ -1449,7 +1527,26 @@ def connector_login(
     # Prompting is skipped for every path that is not the paste, so `--browser` does not stop to
     # ask for the thing it is there to avoid — and `--forget` does not ask for a secret it is
     # about to delete.
-    manual = not (browser or browser_state is not None or forget)
+    # Which provider this invocation resolves to has to be known *here*, because it decides
+    # whether to stop and ask for a Cookie header. `selected_provider` is the same function the
+    # service applies, given this workspace's configured default, so the prompt and the capture
+    # cannot disagree about what is about to happen. Settings that will not load are left to the
+    # envelope below rather than guessed at: no prompt, then the real configuration error.
+    try:
+        configured = Settings(**STATE.overrides).authentication.confluence.default_provider
+    except (ManiculeError, ValueError, OSError):
+        configured = BrowserProvider.MANUAL_COOKIE
+    manual = (
+        not forget
+        and selected_provider(
+            browser=browser,
+            browser_provider=browser_provider,
+            browser_state=browser_state,
+            manual_cookie=manual_cookie,
+            configured=configured,
+        )
+        is BrowserProvider.MANUAL_COOKIE
+    )
     cookies = read_secret(SESSION_PROMPT) if manual else ""
     # Run here rather than sent to the server, and the store is what crosses instead. The
     # browser has to open where the person is; the credential has to end up where the syncs
@@ -1461,7 +1558,9 @@ def connector_login(
             cookies=cookies,
             forget=forget,
             browser=browser,
+            browser_provider=browser_provider,
             browser_state=browser_state,
+            manual_cookie=manual_cookie,
             timeout_seconds=timeout,
             allow_insecure_state=allow_insecure_state,
             store=proxy.HandoverStore(served),

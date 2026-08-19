@@ -45,6 +45,7 @@ from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_own
 from manicule.config.loader import load_settings
 from manicule.config.settings import (
     AuthMode,
+    BrowserProvider,
     ConnectorSettings,
     Role,
     Settings,
@@ -1045,6 +1046,8 @@ class ApplicationService:
         forget: bool = False,
         browser: bool = False,
         browser_state: Path | str | None = None,
+        manual_cookie: bool = False,
+        browser_provider: str | None = None,
         timeout_seconds: float | None = None,
         allow_insecure_state: bool = False,
         provider: BrowserSessionProvider | None = None,
@@ -1110,7 +1113,9 @@ class ApplicationService:
             label
             for label, asked in (
                 ("--browser", browser),
+                ("--browser-provider", browser_provider is not None),
                 ("--browser-state", browser_state is not None),
+                ("--manual-cookie", manual_cookie),
                 ("--forget", forget),
             )
             if asked
@@ -1159,22 +1164,39 @@ class ApplicationService:
                 forgotten=True,
             )
 
-        if browser:
-            session = await capture_cookies(
-                config,
-                await self._browser_cookies(
-                    config, provider=provider, timeout_seconds=timeout_seconds
-                ),
-                store=keeper,
-            )
-        elif browser_state is not None:
+        selected = self._selected_provider(
+            browser=browser,
+            browser_provider=browser_provider,
+            browser_state=browser_state,
+            manual_cookie=manual_cookie,
+            injected=provider,
+        )
+        if selected is BrowserProvider.BROWSER_STATE:
+            if browser_state is None:
+                msg = (
+                    f"the {selected.value!r} provider imports a Playwright storage_state "
+                    f"document and none was named. Pass `--browser-state <file>`, or choose a "
+                    f"provider that does not need one."
+                )
+                raise ConfigError(msg)
             session = await capture_cookies(
                 config,
                 _state_cookies(config, browser_state, allow_insecure=allow_insecure_state),
                 store=keeper,
             )
-        else:
+        elif selected is BrowserProvider.MANUAL_COOKIE:
             session = await capture(config, cookies, store=keeper)
+        else:
+            session = await capture_cookies(
+                config,
+                await self._browser_cookies(
+                    config,
+                    provider=provider,
+                    timeout_seconds=timeout_seconds,
+                    selected=selected,
+                ),
+                store=keeper,
+            )
         expires = session.captured_at + timedelta(hours=config.session_max_age_hours)
         return r.ConnectorSignedIn(
             name=name,
@@ -1185,12 +1207,32 @@ class ApplicationService:
             stored_in=keeper.describe(),
         )
 
+    def _selected_provider(
+        self,
+        *,
+        browser: bool,
+        browser_provider: str | None,
+        browser_state: Path | str | None,
+        manual_cookie: bool,
+        injected: BrowserSessionProvider | None,
+    ) -> BrowserProvider:
+        """This workspace's answer to :func:`selected_provider`."""
+        return selected_provider(
+            browser=browser,
+            browser_provider=browser_provider,
+            browser_state=browser_state,
+            manual_cookie=manual_cookie,
+            injected=injected,
+            configured=self.settings.authentication.confluence.default_provider,
+        )
+
     async def _browser_cookies(
         self,
         config: ConfluenceConfig,
         *,
         provider: BrowserSessionProvider | None,
         timeout_seconds: float | None,
+        selected: BrowserProvider = BrowserProvider.BUNDLED_CHROMIUM,
     ) -> Mapping[str, SecretStr]:
         """Sign in through a browser and return the cookies that belong to this instance.
 
@@ -1200,11 +1242,10 @@ class ApplicationService:
         never get past this line.
         """
         from manicule.connectors.browser import (  # noqa: PLC0415 - optional dependency
-            PlaywrightProvider,
             origin_cookies,
         )
 
-        driver = provider if provider is not None else PlaywrightProvider()
+        driver = provider if provider is not None else self._driver_for(selected)
         # `is None` rather than `or`: a `--timeout 0` is falsy, and folding it into the default
         # would silently wait five minutes for somebody who asked to wait none. Zero is refused
         # at the command line rather than substituted, so neither reading is invented here.
@@ -1220,6 +1261,34 @@ class ApplicationService:
             )
             raise ConfigError(msg)
         return found
+
+    def _driver_for(self, selected: BrowserProvider) -> BrowserSessionProvider:
+        """Build the provider object `selected` names, or refuse without trying another.
+
+        **Every failure here is a refusal rather than a substitution**, which is the whole of
+        acceptance criterion 4. A browser that is not installed, a name that matches two of
+        them, a profile directory that cannot be made safely — each raises
+        `ProviderRefusedError` naming what this machine does have, and none of them returns a
+        different provider that happens to work.
+
+        Raises:
+            ProviderRefusedError: The named provider cannot be built on this machine.
+        """
+        from manicule.connectors.browser import (  # noqa: PLC0415 - optional dependency
+            InstalledChromiumProvider,
+            PlaywrightProvider,
+            private_profile,
+            resolve_browser,
+        )
+
+        if selected is not BrowserProvider.INSTALLED_CHROMIUM:
+            return PlaywrightProvider()
+        auth = self.settings.authentication.confluence
+        profile = auth.profile_dir or (self.settings.data_dir / "browser-auth" / "default")
+        return InstalledChromiumProvider(
+            executable=resolve_browser(auth.installed_browser),
+            profile_dir=private_profile(profile),
+        )
 
     async def connector_list(self) -> r.ConnectorList:
         """Every configured source, with what the last run recorded."""
@@ -2214,7 +2283,7 @@ class ApplicationService:
             AuthMethod,
             ConfluenceConfig,
         )
-        from manicule.connectors.sessions import default_store, instance_key  # noqa: PLC0415
+        from manicule.connectors.sessions import authority_key, default_store  # noqa: PLC0415
 
         wanted: dict[str, str] = {}
         for name, configured in sorted(self.settings.connectors.items()):
@@ -2228,7 +2297,7 @@ class ApplicationService:
                 # fix a session for a source whose real problem is a setting.
                 continue
             if config.auth_method is AuthMethod.BROWSER_SESSION:
-                wanted[name] = instance_key(config.base_url)
+                wanted[name] = authority_key(config.base_url)
         if not wanted:
             return r.Check(
                 name="sessions",
@@ -5614,6 +5683,80 @@ def _local(path: Path | str) -> Path:
     blocking I/O that has to leave the event loop.
     """
     return Path(path).expanduser()
+
+
+def selected_provider(
+    *,
+    browser: bool,
+    browser_provider: str | None,
+    browser_state: Path | str | None,
+    manual_cookie: bool,
+    configured: BrowserProvider,
+    injected: BrowserSessionProvider | None = None,
+) -> BrowserProvider:
+    """Which way in this login uses, decided once, from flags and then from configuration.
+
+    **A module function taking `configured`, rather than a method reading settings**, because the
+    command line has to know the answer *before* a service exists: it decides whether to prompt
+    for a Cookie header, and a prompt appearing for a workspace that defaults to a browser would
+    ask somebody for exactly the thing the setting exists to avoid. Two implementations of this
+    rule would agree everywhere except that case.
+
+    **The decision is here rather than spread across the branches it feeds**, because the property
+    that matters is a negative one — that no path can silently become another path — and a
+    negative is only checkable where the whole choice is visible. A `--browser-provider` that
+    cannot start must raise; it must not arrive at the paste prompt having quietly become
+    `manual_cookie`.
+
+    Precedence is flags first, configuration second, and there is no third step. An explicit flag
+    is somebody overriding the workspace for one run; the workspace default is what a bare
+    `connector login` means; and a workspace that set nothing gets `manual_cookie`, which is what
+    every configuration written before this setting existed already did.
+
+    `--browser` is kept and resolves to *the configured browser* rather than to bundled Chromium.
+    On a workspace that opted in to `installed_chromium` that is the only reading which is not a
+    surprise, and on one that did not it lands on bundled Chromium — what the flag has always
+    meant. A workspace whose default is a non-browser provider still gets a browser from it,
+    because asking for a browser and being handed a paste prompt is the silent substitution this
+    function exists to prevent.
+
+    Args:
+        injected: A provider object supplied by a caller, which is the test seam. Its presence
+            means a browser path by definition — an object that opens a browser is the only thing
+            a caller passes one for — so it selects the configured browser rather than being
+            overridden by a `manual_cookie` default.
+    """
+    browsers = (BrowserProvider.INSTALLED_CHROMIUM, BrowserProvider.BUNDLED_CHROMIUM)
+    if browser_provider is not None:
+        return _named_provider(browser_provider)
+    if browser_state is not None:
+        return BrowserProvider.BROWSER_STATE
+    if manual_cookie:
+        return BrowserProvider.MANUAL_COOKIE
+    if browser or injected is not None:
+        return configured if configured in browsers else BrowserProvider.BUNDLED_CHROMIUM
+    return configured
+
+
+def _named_provider(requested: str) -> BrowserProvider:
+    """One `--browser-provider` value as a member, accepting the spelling a terminal invites.
+
+    Hyphens and underscores are both accepted because the flag reads as `installed-chromium` on
+    a command line and the setting reads as `installed_chromium` in TOML, and a person who typed
+    the other one has made no mistake worth a refusal. Case is folded for the same reason.
+
+    Raises:
+        ConfigError: The value names no provider. The message lists them, because a refusal for
+            a mistyped enum that does not say what the options were is a refusal that costs a
+            second run to learn nothing.
+    """
+    folded = requested.strip().lower().replace("-", "_")
+    try:
+        return BrowserProvider(folded)
+    except ValueError:
+        known = ", ".join(member.value.replace("_", "-") for member in BrowserProvider)
+        msg = f"--browser-provider {requested!r} names no provider. Available: {known}."
+        raise ConfigError(msg) from None
 
 
 def _state_cookies(

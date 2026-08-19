@@ -1037,6 +1037,117 @@ class ConnectorSettings(Section):
     )
 
 
+class BrowserProvider(StrEnum):
+    """How `connector login` gets hold of a Confluence session.
+
+    Four ways in, and naming them makes the choice a workspace's rather than a flag's. The two
+    browser members are deliberately *not* one member with a boolean beside it: which browser
+    opens is the whole question on a desktop whose identity provider treats an unfamiliar one
+    differently, and a setting that could not distinguish them would be a setting that could not
+    express the case this exists for.
+    """
+
+    INSTALLED_CHROMIUM = "installed_chromium"
+    """A supported Chromium-family browser already installed on this machine, driven through a
+    dedicated manicule profile. What an identity provider is most likely to recognize."""
+
+    BUNDLED_CHROMIUM = "bundled_chromium"
+    """The Chromium Playwright downloads. Needs nothing installed and is the most likely to be
+    refused by a conditional-access policy, because it is a device the policy has never seen."""
+
+    BROWSER_STATE = "browser_state"
+    """Import a Playwright `storage_state` document somebody else's tooling wrote."""
+
+    MANUAL_COOKIE = "manual_cookie"
+    """Paste a `Cookie` header from a browser you signed in to yourself.
+
+    The only member that drives no browser, and therefore the only one under which manicule
+    *cannot* see the page a password is typed into rather than merely not looking. It is the
+    historical default and it is not deprecated — see `manicule.connectors.sessions`.
+    """
+
+
+class ConfluenceAuthSettings(Section):
+    """How this workspace authenticates to Confluence, and what it keeps afterwards.
+
+    **Workspace-scoped rather than per connector, which is a departure worth its own paragraph.**
+    Every other Confluence setting lives in `[connectors.<name>].options` and is validated as
+    `ConfluenceConfig`, because every other Confluence setting is a fact about a *source*. These
+    are not. Which browser is installed is a fact about this machine, and a held session is
+    keyed by authority rather than by connector — so two connectors pointed at one wiki share one
+    sign-in, and per-connector provider settings would let them disagree about a decision only
+    one of them can make. The setting lives where the thing it configures lives.
+
+    **Nothing here writes a session to disk, and there is no setting that would.** A captured
+    session crosses to the server over the control socket and lives in its memory until the
+    process ends — the property `manicule.connectors.sessions` is built around. A restart means
+    signing in again, which against a session whose own lifetime is `session_max_age_hours` is a
+    small cost for never having a credential at rest.
+
+    **There is no `fallback` dial either, and its absence is the design.** A failed provider
+    raises a typed refusal naming the alternatives; it never quietly becomes a different provider. A
+    single-valued setting saying so would configure nothing, and this repository has already
+    removed one of those (`schedule_s`, #98) rather than ship a promise the code did not keep.
+    """
+
+    default_provider: BrowserProvider = Field(
+        default=BrowserProvider.MANUAL_COOKIE,
+        description="What `manicule connector login <name>` uses when no provider flag is "
+        "given. The default is the paste prompt, which is what every workspace written before "
+        "this setting existed already does.",
+    )
+    """The provider a bare `connector login` selects.
+
+    Defaulted to `manual_cookie` rather than to a browser, so that adding this section to the
+    settings tree changes nothing for an installation that does not set it. A default that
+    opened a browser would make an upgrade the moment somebody's `connector login` started
+    launching a window they did not ask for.
+    """
+
+    installed_browser: str = Field(
+        default="",
+        description="Which installed browser `installed_chromium` drives: a supported name "
+        "(`chrome`, `chromium`, `edge`, `brave`) or an absolute path to an executable. Empty "
+        "discovers one, and refuses rather than guessing when several are present.",
+    )
+
+    profile_dir: Path | None = Field(
+        default=None,
+        description="The dedicated profile directory `installed_chromium` signs in under. "
+        "Never your ordinary browser profile. Unset uses a private directory beneath the data "
+        "directory.",
+    )
+    """Where the authentication profile lives.
+
+    **A separate profile rather than the person's own, and this is a security boundary rather
+    than tidiness.** An ordinary daily-use profile is not available to an unrelated process by
+    design, and the ways to take it anyway — remote debugging on a running browser, copying the
+    profile, decrypting the cookie database — are all things manicule refuses to do. What it can
+    do honestly is sign in to a profile of its own, which is why this exists.
+
+    It holds live session cookies once used, so it is created user-only and documented as
+    changing the at-rest security boundary of the installation.
+    """
+
+    @field_validator("profile_dir")
+    @classmethod
+    def _expand(cls, value: Path | None) -> Path | None:
+        """Expand `~`, as the data and cache directories already do.
+
+        Without this a configured `~/.local/share/...` is a directory literally named `~` in
+        whatever the process's working directory happened to be — which for a launchd-started
+        server is not anywhere the operator would think to look, and which would hold a live
+        browser profile.
+        """
+        return None if value is None else value.expanduser()
+
+
+class AuthenticationSettings(Section):
+    """Per-protocol interactive authentication. Confluence is the only one that has any."""
+
+    confluence: ConfluenceAuthSettings = Field(default_factory=ConfluenceAuthSettings)
+
+
 class PluginSettings(Section):
     enabled: tuple[str, ...] | None = Field(
         default=None,
@@ -1093,6 +1204,7 @@ class Settings(BaseSettings):
     ingest: IngestSettings = Field(default_factory=IngestSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     connectors: dict[str, ConnectorSettings] = Field(default_factory=dict)
+    authentication: AuthenticationSettings = Field(default_factory=AuthenticationSettings)
     plugins: PluginSettings = Field(default_factory=PluginSettings)
     parser_fallbacks: dict[str, tuple[str, ...]] = Field(
         default_factory=dict,

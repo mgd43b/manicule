@@ -71,11 +71,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
+from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
 from manicule.connectors.config import ConfluenceConfig
 from manicule.connectors.credentials import BrowserSession
+from manicule.connectors.pagination import origin_of
 from manicule.core.errors import ConfigError
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
@@ -85,14 +87,17 @@ __all__ = [
     "SESSIONS",
     "SessionStore",
     "SessionVault",
+    "authority_key",
     "capture",
     "capture_cookies",
     "cookies_authenticate",
     "default_store",
-    "instance_key",
     "load_session",
     "parse_cookies",
 ]
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+"""The port each scheme implies, so that naming it explicitly is not a second instance."""
 
 _PROBE_PATH = "/rest/api/user/current"
 
@@ -128,7 +133,7 @@ class SessionStore(Protocol):
         ...
 
     def holding(self) -> dict[str, str]:
-        """Which instances this holds a session for, keyed by :func:`instance_key`.
+        """Which instances this holds a session for, keyed by :func:`authority_key`.
 
         On the protocol rather than on :class:`SessionVault` alone, so that ``doctor``'s session
         check asks *a store* rather than asking whichever object it can prove is the real one.
@@ -165,13 +170,13 @@ class SessionVault:
         return "the running server's memory, which does not survive it"
 
     def load(self, base_url: str) -> BrowserSession | None:
-        return self._sessions.get(instance_key(base_url))
+        return self._sessions.get(authority_key(base_url))
 
     async def save(self, session: BrowserSession) -> None:
-        self._sessions[instance_key(session.base_url)] = session
+        self._sessions[authority_key(session.base_url)] = session
 
     async def forget(self, base_url: str) -> bool:
-        return self._sessions.pop(instance_key(base_url), None) is not None
+        return self._sessions.pop(authority_key(base_url), None) is not None
 
     def __len__(self) -> int:
         """How many instances this holds a session for. For a diagnostic that must not read one.
@@ -479,15 +484,72 @@ def _named(payload: Mapping[str, object]) -> str:
     return ""
 
 
-def instance_key(base_url: str) -> str:
-    """The key a site's session is filed under.
+def authority_key(base_url: str) -> str:
+    """The key a site's session is filed under: one authority, one entry.
 
-    Normalized so that ``https://wiki.example.com`` and ``https://wiki.example.com/`` are one
-    entry rather than two, one of which would be found and the other silently not.
+    A session is not portable between instances, and filing it under the authority it came from
+    is what stops one being offered to another. Two connectors pointed at the same Confluence
+    are therefore one sign-in rather than two, and two pointed at different ones can never see
+    each other's credential — both of which are properties of this function alone.
 
-    Public, and named for a URL rather than for an account, because :meth:`SessionVault.holding`
-    reports these keys and a caller comparing a configured ``base_url`` against them has to
-    normalize it the same way. A second normalizer written at that call site would agree until
-    somebody configured a trailing slash — which is precisely the case this exists for.
+    **It normalizes only what a Confluence instance itself treats as insignificant**, because the
+    two directions of error here are not symmetric. Splitting one authority into two costs
+    somebody a second sign-in; merging two authorities into one hands a live corporate session
+    for one site to a connector configured for another. So every rule below is one where the
+    protocol, not this module's convenience, says the two spellings name the same server:
+
+    *Scheme and host are lowercased.* Neither is case-sensitive — DNS is not, and ``HTTPS://``
+        and ``https://`` are the same URL — so ``wiki.example.test`` and ``WIKI.example.test``
+        are one instance. This is done by :func:`~manicule.connectors.pagination.origin_of`
+        rather than here, so that the origin the link checker compares against and the authority
+        a session is filed under cannot come to disagree.
+
+    *Userinfo is dropped*, which :func:`origin_of` also does. A credential embedded in a
+        ``base_url`` is not part of which server this is, and it must not reach a vault key —
+        ``holding()`` reports these keys and ``doctor --json`` prints them, so a password left
+        in a configured URL would otherwise be echoed by a diagnostic.
+
+    *A default port is elided.* ``https://wiki.example.test:443`` and
+        ``https://wiki.example.test`` are the same server, and a person who wrote the port
+        explicitly in one connector and not in another would otherwise be asked to sign in
+        twice for one instance. Only the scheme's own default — a non-default port is a
+        different server and stays.
+
+    *A trailing slash is stripped from the context path, and nothing else about it is touched.*
+        The path is where a shared host stops being shared: an instance at ``/confluence`` and
+        one at ``/jira`` are different applications, and Confluence's own context path is
+        **case-sensitive**, so ``/Confluence`` is left distinct from ``/confluence``. Internal
+        segments are not collapsed and ``.`` and ``..`` are not resolved, because a ``base_url``
+        needing either is malformed and guessing at it would be a merge.
+
+    *The scheme itself is never normalized away.* ``http://`` and ``https://`` are different TLS
+        policies against the same host, and a session captured over one is not evidence about
+        the other.
+
+    A query or fragment, which a site root should not have, is kept verbatim — an unusable
+    ``base_url`` should produce its own unusable key rather than quietly collapsing onto a
+    working one. A value that will not parse falls through to its stripped self for the same
+    reason: two unparseable URLs must not become one entry.
+
+    Public, and named for the authority rather than for an account, because
+    :meth:`SessionVault.holding` reports these keys and a caller comparing a configured
+    ``base_url`` against them has to normalize it the same way. A second normalizer written at
+    that call site would agree until somebody configured a port or a capital letter — which is
+    precisely the case this exists for.
     """
-    return base_url.strip().rstrip("/")
+    text = base_url.strip()
+    origin = origin_of(text)
+    if not origin:
+        # Not a URL this can vouch for. Returning it as-is keeps it distinct from every other
+        # unparseable value, where a shared sentinel would file them all under one session.
+        return text
+    parsed = urlsplit(text)
+    port = parsed.port
+    if port is not None and port == _DEFAULT_PORTS.get(parsed.scheme.lower()):
+        origin = origin.rsplit(":", 1)[0]
+    remainder = parsed.path.rstrip("/")
+    if parsed.query:
+        remainder = f"{remainder}?{parsed.query}"
+    if parsed.fragment:
+        remainder = f"{remainder}#{parsed.fragment}"
+    return f"{origin}{remainder}"

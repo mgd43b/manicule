@@ -80,7 +80,7 @@ $ manicule connector login wiki                  # paste the Cookie header
 ```
 
 `--browser-state` imports a Playwright state file, for a machine that cannot open a window — a
-remote shell, a container — but can receive a file from one that can ([§1.1a](#11a-importing-a-browser-state-file)).
+remote shell, a container — but can receive a file from one that can ([§1.1b](#11b-importing-a-browser-state-file)).
 
 The paste path needs nothing installed and uses your own browser, which makes it the answer when
 a conditional-access policy declines a driven Chromium — a real case, and the reason it is kept
@@ -168,7 +168,120 @@ manicule's own ceiling on how long it will keep using one: a cookie carries no e
 can read, and an age manicule measures itself is the only thing that can turn "too old to try"
 into a **startup** refusal rather than something the first page of a sync discovers.
 
-### 1.1a Importing a browser state file
+### 1.1a Signing in through the Chrome you already have
+
+The browser `--browser` opens is the one Playwright downloads. It works, and on a corporate
+identity provider it is also the one most likely to be **refused**: conditional-access policies
+commonly recognize the browser and device a person actually uses, and decline a build they have
+never seen. The symptom is a window that sits at a policy screen until the timeout.
+
+`installed_chromium` drives your real Chrome instead:
+
+```toml
+[authentication.confluence]
+default_provider = "installed_chromium"
+installed_browser = "chrome"
+profile_dir = "~/.local/share/manicule/browser-auth/chrome-profile"
+```
+
+With that set, the plain command opens installed Chrome, and there is no flag to remember:
+
+```console
+$ manicule connector login wiki
+```
+
+`installed_browser` takes `chrome`, `chromium`, `edge`, `brave`, or an absolute path to an
+executable. Left empty it discovers one — and **refuses rather than choosing** when several are
+installed, because which browser holds your work identity is exactly the thing you know and
+manicule does not.
+
+Firefox and Safari are not supported here and say so when named. Playwright can drive Firefox,
+but a session captured there would need this whole flow re-proved against a different cookie jar;
+Safari cannot be driven with a private profile at all.
+
+#### It is your Chrome, with a profile of manicule's own
+
+This is the distinction that matters most, and it is worth being blunt about because the feature
+is easy to mistake for something it is not.
+
+**What it does:** launches the real Chrome application installed on your machine, using a
+separate profile directory that belongs to manicule. You sign in there once. The profile
+persists, so your identity provider sees a stable browser and device on later sign-ins, and
+subsequent logins are usually immediate.
+
+**What it does not do:** reuse the session in your everyday Chrome profile. Signing in to
+Confluence in your normal browser does not sign manicule in.
+
+That is not an oversight, and it is not a limitation manicule could remove by trying harder.
+A normal desktop browser deliberately does not make its live profile available to another
+process:
+
+- Chrome will not open a profile another Chrome already owns — a second launch is handed to the
+  running instance, which opens a window and exits, leaving the caller with nothing to read.
+- A browser that was not started with remote debugging exposes no endpoint to attach to.
+
+The remaining ways in are copying the profile, decrypting Chrome's cookie database, or turning on
+a debugging port on your everyday browser. manicule does none of them: the first two depend on
+undocumented internals that break at the next Chrome release, and the third opens a door any
+local process can walk through for as long as it is open.
+
+The practical consequence is small. You sign in to the manicule profile once, and again whenever
+that session ages past `session_max_age_hours`.
+
+**Your ordinary Chrome can stay open throughout.** A separate profile directory is a separate
+instance, so this neither disturbs nor reads your daily browser.
+
+#### The profile is a credential at rest
+
+Once signed in, the profile directory holds live session cookies. manicule creates it `0700` and
+refuses to use one that is a symlink, or that other users on this machine can reach — refuses
+rather than quietly tightening it, because a directory others could already write to may already
+have been written to, and silently fixing the mode would hide that.
+
+It is the one part of this feature that changes the installation's at-rest security boundary.
+Nothing else here writes a credential to disk: a captured session crosses to the running server
+over its control socket and lives in that process's memory until it stops. **A restart means
+signing in again**, which against a 12-hour session is a small price for never holding a
+credential on disk.
+
+#### When a provider cannot run
+
+A provider that cannot start **refuses, and nothing else is tried.** No silent fall back to the
+bundled Chromium, and no dropping through to the paste prompt — both would succeed at something
+other than what you asked for, which is the failure hardest to notice afterwards. The refusal
+names what this machine actually has:
+
+```console
+$ manicule connector login wiki
+Error: several supported browsers are installed (brave, chrome) and manicule will not choose
+which one holds your work identity. Set authentication.confluence.installed_browser to one of
+them.
+```
+
+Any path stays reachable for one run without changing configuration:
+
+```console
+$ manicule connector login wiki --browser-provider installed-chromium
+$ manicule connector login wiki --browser-provider bundled-chromium
+$ manicule connector login wiki --browser-state ./state.json
+$ manicule connector login wiki --manual-cookie
+```
+
+#### One sign-in covers every connector on that wiki
+
+Sessions are held per **authority** — scheme, host, port and context path, normalized. Two
+connectors pointed at `https://wiki.example.test/confluence` share one sign-in, and signing in
+through either satisfies both.
+
+Normalization is deliberately conservative, because the two mistakes are not equally bad. A split
+costs a second sign-in; a merge would hand one site's live session to a connector configured for
+another. So `WIKI.example.test`, `wiki.example.test:443` and a trailing slash are one instance,
+while `http://` and `https://`, `/confluence` and `/Confluence`, and any different host or port
+stay separate.
+
+`manicule doctor` reports which sources are covered, naming accounts and never cookies.
+
+### 1.1b Importing a browser state file
 
 `--browser-state` reads a Playwright `storage_state` JSON document — the thing
 `context.storage_state(path=...)` writes — and takes the cookies in it that apply to your
@@ -198,7 +311,7 @@ A state file from a different site is the usual cause of "no cookies for
 `https://confluence.example.test/confluence`" — the document records whatever was signed in when
 it was written.
 
-### 1.1b Signing out, and signing back in
+### 1.1c Signing out, and signing back in
 
 ```console
 $ manicule connector login wiki --forget      # remove the stored session
@@ -215,7 +328,7 @@ touched, so a timeout, a closed window, a dead cookie or a state file for the wr
 whatever was stored exactly as it was. There is no delete-then-write window because the write is
 the last thing that happens and it happens only on success.
 
-### 1.1c When it does not work
+### 1.1d When it does not work
 
 | Symptom | What it means | What to do |
 |---|---|---|

@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from manicule.connectors.cql import is_page_id
 from manicule.connectors.enriched import DEFAULT_PROFILE, EnrichedProfile
+from manicule.connectors.pagination import origin_of
 from manicule.core.errors import ConfigError
 
 __all__ = [
@@ -566,11 +567,19 @@ class ConfluenceConfig(BaseModel):
 
     @property
     def origin(self) -> str:
-        """Scheme, host and port of :attr:`base_url`, for checking links against."""
-        without_scheme = self.base_url.split("://", 1)
-        scheme = without_scheme[0]
-        rest = without_scheme[1] if len(without_scheme) > 1 else ""
-        return f"{scheme}://{rest.split('/', 1)[0]}"
+        """Scheme, host and port of :attr:`base_url`, for checking links against.
+
+        **Delegated to :func:`~manicule.connectors.pagination.origin_of` rather than derived
+        here**, because every caller compares this against that function's output — a link base
+        a response declared, a ``webui`` path joined onto one. Two spellings of "the origin"
+        agree on the common case and part company on the uncommon one, and the uncommon one here
+        was a ``base_url`` with a capital letter in the host or credentials embedded in it: this
+        property returned them verbatim, ``origin_of`` lowercased the host and dropped the
+        userinfo, and the comparison then declared a same-origin link untrusted. A connector
+        that refuses its own instance is a hard failure with a message pointing at the wrong
+        cause, so the two readings are now one reading.
+        """
+        return origin_of(self.base_url)
 
 
 def resolve_credentials(

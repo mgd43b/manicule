@@ -66,12 +66,17 @@ if TYPE_CHECKING:  # pragma: no cover - import-time only
 __all__ = [
     "BROWSER_EXTRA_ADVICE",
     "MAX_STATE_BYTES",
+    "SUPPORTED_BROWSERS",
     "BrowserSessionProvider",
     "CandidateCookie",
+    "InstalledChromiumProvider",
     "PlaywrightProvider",
     "cookies_from_state",
+    "installed_browsers",
     "origin_cookies",
+    "private_profile",
     "read_state_file",
+    "resolve_browser",
 ]
 
 BROWSER_EXTRA_ADVICE = (
@@ -425,77 +430,399 @@ class PlaywrightProvider:
                 context = await browser.new_context()
                 page = await context.new_page()
                 await page.goto(config.base_url)
-                return await self._wait(context, browser, config=config, deadline=deadline)
+                return await _wait(
+                    context,
+                    alive=browser.is_connected,
+                    config=config,
+                    deadline=deadline,
+                    poll_seconds=self._poll,
+                )
             finally:
                 # The browser is closed on every path, including the timeout and the refusal. A
                 # left-open headed Chromium is a window the person did not ask for holding a live
                 # session, which is worse than the failure that produced it.
                 await _closed(browser)
 
-    async def _wait(
+
+async def _wait(
+    context: BrowserContext,
+    *,
+    alive: Callable[[], bool],
+    config: ConfluenceConfig,
+    deadline: float,
+    poll_seconds: float,
+) -> Sequence[CandidateCookie]:
+    """Poll the jar until its cookies authenticate, the browser closes, or time runs out.
+
+    Three ways this ends badly and each says something different, because each has a
+    different next action. The one worth the extra state is the last:
+
+    *The window was closed.* Re-run and leave it open.
+
+    *Time ran out with cookies for this instance in the jar.* Sign-in was under way and did
+        not finish. A longer ``--timeout`` is the answer.
+
+    *Time ran out having never seen a cookie for this instance at all.* Sign-in never reached
+        Confluence, so waiting longer will not help — the browser was refused before it got
+        there (a conditional-access policy declining a driven Chromium is the usual cause) or
+        ``base_url`` names a host the sign-in never lands on. Telling this person to raise
+        the timeout sends them to wait five more minutes for the same nothing.
+
+    Distinguishing the last two costs one boolean: whether :func:`origin_cookies` ever
+    returned anything.
+
+    **One loop for every provider, and ``alive`` is why it is a parameter.** A browser this
+    process launched is asked ``is_connected``; a persistent profile has no separate browser
+    object and is alive while it still has a page open. Those are two questions, and a second
+    copy of this loop to ask the second one is how the bundled and installed paths would come
+    to disagree about what closing the window means.
+
+    **It is a heuristic and it is worth saying which way it is wrong.** An unauthenticated
+    Confluence commonly issues a session cookie on the first visit, before anybody has signed
+    in — so a browser that reached the instance and was then sent away still sets the flag,
+    and gets the "wait longer" message. The "never reached" case therefore fires for the
+    shape where something in front of Confluence intercepts the request before Confluence
+    answers at all, which is one conditional-access arrangement among several rather than the
+    whole class.
+
+    That is the safer direction to be wrong in. "Wait longer" costs somebody a timeout they
+    were going to spend anyway; "give up, this will never work" told to a person whose
+    provider merely needed another minute is advice that abandons a working setup. The
+    message itself claims no more than it knows — it names the two usual causes rather than
+    diagnosing one.
+    """
+    import asyncio  # noqa: PLC0415 - kept beside its only use
+
+    from manicule.connectors.sessions import cookies_authenticate  # noqa: PLC0415
+
+    loop = asyncio.get_running_loop()
+    reached_confluence = False
+    while True:
+        if not alive():
+            msg = (
+                "the browser was closed before sign-in finished, so there is no session to "
+                "store. Re-run the command and leave the window open until Confluence has "
+                "loaded as your signed-in user."
+            )
+            raise ConfigError(msg)
+        candidates = _cookies_of(await context.cookies())
+        relevant = origin_cookies(candidates, base_url=config.base_url)
+        if relevant:
+            reached_confluence = True
+            if await cookies_authenticate(config, relevant):
+                return candidates
+        if loop.time() >= deadline:
+            raise ConfigError(_gave_up(config, reached_confluence=reached_confluence))
+        await asyncio.sleep(poll_seconds)
+
+
+SUPPORTED_BROWSERS = ("chrome", "chromium", "edge", "brave")
+"""The Chromium-family browsers this can drive, by the name configuration uses.
+
+**A closed list, and the name is `installed_chromium` rather than `system_default` for the same
+reason.** Manicule can only claim a browser it can actually launch through Playwright's Chromium
+driver and test against; "whatever this operating system considers the default" includes Firefox
+and Safari, which this cannot drive at all, and a provider that named them would be a provider
+that failed at launch on the machines it most loudly promised to support.
+
+Firefox and Safari are absent rather than pending. Playwright can drive Firefox, but a Confluence
+session captured there would need this whole flow re-proved against a different cookie jar
+implementation, and Safari cannot be driven with a private profile at all. Both are honest
+absences and the refusal says so.
+"""
+
+_MAC_CANDIDATES: Mapping[str, tuple[str, ...]] = {
+    "chrome": ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",),
+    "chromium": ("/Applications/Chromium.app/Contents/MacOS/Chromium",),
+    "edge": ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",),
+    "brave": ("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",),
+}
+
+_LINUX_COMMANDS: Mapping[str, tuple[str, ...]] = {
+    "chrome": ("google-chrome", "google-chrome-stable"),
+    "chromium": ("chromium", "chromium-browser"),
+    "edge": ("microsoft-edge", "microsoft-edge-stable"),
+    "brave": ("brave-browser", "brave"),
+}
+
+_WINDOWS_CANDIDATES: Mapping[str, tuple[str, ...]] = {
+    "chrome": (r"C:\Program Files\Google\Chrome\Application\chrome.exe",),
+    "chromium": (r"C:\Program Files\Chromium\Application\chrome.exe",),
+    "edge": (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",),
+    "brave": (r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",),
+}
+
+
+def installed_browsers() -> dict[str, Path]:
+    """Every supported browser this machine has, by name.
+
+    **Platform-appropriate rather than one clever mechanism.** macOS puts an application at a
+    known path inside a bundle; Linux puts an executable on ``PATH`` under any of several names;
+    Windows uses ``Program Files``. A single strategy would be a strategy that is wrong on two
+    of the three, and the failure would read as "not installed" on a machine where the browser
+    is sitting in the dock.
+
+    Nothing here launches anything or reads a profile — it is a file-existence check, so it is
+    safe to call from a refusal path that is trying to say what the alternatives are.
+    """
+    import shutil  # noqa: PLC0415 - kept beside its only use
+    import sys  # noqa: PLC0415
+
+    found: dict[str, Path] = {}
+    if sys.platform == "darwin":
+        for name, paths in _MAC_CANDIDATES.items():
+            for raw in paths:
+                if Path(raw).exists():
+                    found[name] = Path(raw)
+                    break
+    elif sys.platform == "win32":
+        for name, paths in _WINDOWS_CANDIDATES.items():
+            for raw in paths:
+                if Path(raw).exists():
+                    found[name] = Path(raw)
+                    break
+    else:
+        for name, commands in _LINUX_COMMANDS.items():
+            for command in commands:
+                located = shutil.which(command)
+                if located:
+                    found[name] = Path(located)
+                    break
+    return found
+
+
+def resolve_browser(requested: str) -> Path:
+    """The executable to launch, or a refusal naming what this machine actually has.
+
+    Args:
+        requested: A supported name, an absolute path to an executable, or empty to discover.
+
+    Raises:
+        ProviderRefusedError: Nothing supported is installed, the request names something that
+            is not here, or discovery found several and cannot choose. **Ambiguity refuses
+            rather than picking**, because picking would mean signing in through a browser the
+            person did not choose — and on a machine with a work Chrome and a personal Brave,
+            which one carries the corporate identity is exactly the thing they know and this
+            does not.
+    """
+    from manicule.connectors.errors import ProviderRefusedError  # noqa: PLC0415
+
+    asked = requested.strip()
+    available = installed_browsers()
+    listing = ", ".join(sorted(available)) or "none"
+
+    if asked and ("/" in asked or "\\" in asked):
+        path = Path(asked).expanduser()
+        if not path.is_file():
+            msg = (
+                f"installed_browser names {asked!r}, which is not a file on this machine. Give "
+                f"an absolute path to a Chromium-family executable, or one of "
+                f"{', '.join(SUPPORTED_BROWSERS)}. Found installed: {listing}."
+            )
+            raise ProviderRefusedError(msg)
+        return path
+
+    if asked:
+        if asked not in SUPPORTED_BROWSERS:
+            msg = (
+                f"installed_browser names {asked!r}, which is not a browser manicule can drive. "
+                f"Supported: {', '.join(SUPPORTED_BROWSERS)}. Found installed: {listing}. "
+                f"Firefox and Safari are not supported by this provider — use "
+                f"`--browser-provider bundled-chromium`, or sign in yourself and use "
+                f"`--browser-state` or `--manual-cookie`."
+            )
+            raise ProviderRefusedError(msg)
+        if asked not in available:
+            msg = (
+                f"installed_browser is set to {asked!r} and it is not installed here. Found "
+                f"installed: {listing}. Install it, set authentication.confluence."
+                f"installed_browser to one of those, or use `--browser-provider "
+                f"bundled-chromium`, `--browser-state <file>` or `--manual-cookie`."
+            )
+            raise ProviderRefusedError(msg)
+        return available[asked]
+
+    if not available:
+        msg = (
+            f"no supported browser is installed, so there is nothing for installed_chromium to "
+            f"drive. Supported: {', '.join(SUPPORTED_BROWSERS)}. Install one, or use "
+            f"`--browser-provider bundled-chromium` (which downloads its own), "
+            f"`--browser-state <file>`, or `--manual-cookie`."
+        )
+        raise ProviderRefusedError(msg)
+    if len(available) > 1:
+        msg = (
+            f"several supported browsers are installed ({listing}) and manicule will not choose "
+            f"which one holds your work identity. Set authentication.confluence."
+            f"installed_browser to one of them."
+        )
+        raise ProviderRefusedError(msg)
+    return next(iter(available.values()))
+
+
+def private_profile(path: Path) -> Path:
+    """Create the authentication profile directory, user-only, refusing an unsafe one.
+
+    The profile holds live session cookies once it has been signed in to, so it is a credential
+    at rest and gets the treatment :func:`read_state_file` already gives an imported state file:
+    a symlink is refused rather than followed, a directory other users can reach is refused
+    rather than tightened, and the refusal names the command that fixes it.
+
+    **Refused rather than repaired**, because a directory that is group-writable may already
+    have been written to by somebody else, and quietly chmod-ing it would hide that this had
+    been true. The check does not apply on Windows, where the POSIX bits a stat reports are not
+    the access control the platform enforces.
+
+    Raises:
+        ProviderRefusedError: The path is a symlink, is not a directory, cannot be created, or
+            other users on this machine can reach it.
+    """
+    import sys  # noqa: PLC0415 - kept beside its only use
+
+    from manicule.connectors.errors import ProviderRefusedError  # noqa: PLC0415
+
+    resolved = path.expanduser()
+    if resolved.is_symlink():
+        msg = (
+            f"the browser profile path {resolved} is a symlink. It holds live session cookies "
+            f"once it is signed in to, so manicule will not follow one to write a credential "
+            f"somewhere it cannot vouch for. Point profile_dir at a real directory."
+        )
+        raise ProviderRefusedError(msg)
+    try:
+        resolved.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        msg = f"cannot create the browser profile directory {resolved}: {exc.strerror or exc}"
+        raise ProviderRefusedError(msg) from exc
+    if not resolved.is_dir():
+        msg = f"the browser profile path {resolved} exists and is not a directory"
+        raise ProviderRefusedError(msg)
+    if sys.platform != "win32":
+        mode = resolved.stat().st_mode
+        exposed = mode & (
+            stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH
+        )
+        if exposed:
+            msg = (
+                f"the browser profile directory {resolved} is reachable by other users on this "
+                f"machine (mode {stat.S_IMODE(mode):04o}), and it holds live session cookies. "
+                f"Run `chmod 700 {resolved}`."
+            )
+            raise ProviderRefusedError(msg)
+    return resolved
+
+
+class InstalledChromiumProvider:
+    """A browser already on this machine, driven through a profile of manicule's own.
+
+    Satisfies :class:`BrowserSessionProvider`, and exists because of one thing the bundled
+    Chromium cannot do: an identity provider's conditional-access policy commonly recognizes the
+    browser a person actually uses and declines one it has never seen. Driving the installed
+    build is the difference between a sign-in that completes and one that sits at a policy screen
+    until the timeout.
+
+    **It does not touch the person's own profile, and that is the boundary rather than a
+    default.** An ordinary daily-use profile is deliberately not available to an unrelated
+    process; the ways to take it anyway are remote debugging on a running browser, copying the
+    profile directory, or decrypting the cookie database, and all three are refused by this
+    project rather than implemented behind a flag. What is honest is a dedicated profile that
+    manicule creates and signs in to, which is what this is. The cost is stated plainly: the
+    person signs in there the first time, and the identity provider sees a new profile of a
+    familiar browser rather than a familiar profile.
+
+    **Automation is not concealed.** No user-agent is forged, no automation flag is suppressed,
+    and no security warning is dismissed. A policy may still refuse this, and when it does the
+    refusal says so and names the alternatives rather than retrying with the disguise on.
+
+    Everything the class asks of the browser is the cookie jar and whether a window is still
+    open — the same two questions :class:`PlaywrightProvider` asks, through the same loop, and
+    the test that asserts no page content is read over this module's source covers both.
+    """
+
+    def __init__(
         self,
-        context: BrowserContext,
-        browser: Browser,
         *,
-        config: ConfluenceConfig,
-        deadline: float,
+        executable: Path,
+        profile_dir: Path,
+        poll_seconds: float = 2.0,
+        headless: bool = False,
+    ) -> None:
+        """Args:
+        executable: The browser to launch, already resolved by :func:`resolve_browser`.
+        profile_dir: The dedicated profile, already created by :func:`private_profile`.
+        poll_seconds: How often to ask whether sign-in has completed.
+        headless: Off. A parameter only so a test can prove the launch is headed, on the same
+            principle as :class:`PlaywrightProvider`.
+        """
+        self._executable = executable
+        self._profile = profile_dir
+        self._poll = poll_seconds
+        self._headless = headless
+
+    async def authenticate(
+        self, config: ConfluenceConfig, *, timeout_seconds: float
     ) -> Sequence[CandidateCookie]:
-        """Poll the jar until its cookies authenticate, the browser closes, or time runs out.
+        """Open the installed browser at the instance and return the jar once it authenticates.
 
-        Three ways this ends badly and each says something different, because each has a
-        different next action. The one worth the extra state is the last:
-
-        *The window was closed.* Re-run and leave it open.
-
-        *Time ran out with cookies for this instance in the jar.* Sign-in was under way and did
-            not finish. A longer ``--timeout`` is the answer.
-
-        *Time ran out having never seen a cookie for this instance at all.* Sign-in never reached
-            Confluence, so waiting longer will not help — the browser was refused before it got
-            there (a conditional-access policy declining a driven Chromium is the usual cause) or
-            ``base_url`` names a host the sign-in never lands on. Telling this person to raise
-            the timeout sends them to wait five more minutes for the same nothing.
-
-        Distinguishing the last two costs one boolean: whether :func:`origin_cookies` ever
-        returned anything.
-
-        **It is a heuristic and it is worth saying which way it is wrong.** An unauthenticated
-        Confluence commonly issues a session cookie on the first visit, before anybody has signed
-        in — so a browser that reached the instance and was then sent away still sets the flag,
-        and gets the "wait longer" message. The "never reached" case therefore fires for the
-        shape where something in front of Confluence intercepts the request before Confluence
-        answers at all, which is one conditional-access arrangement among several rather than the
-        whole class.
-
-        That is the safer direction to be wrong in. "Wait longer" costs somebody a timeout they
-        were going to spend anyway; "give up, this will never work" told to a person whose
-        provider merely needed another minute is advice that abandons a working setup. The
-        message itself claims no more than it knows — it names the two usual causes rather than
-        diagnosing one.
+        Raises:
+            ProviderRefusedError: Playwright is not installed, or the browser would not start.
+                Named rather than reported as a generic failure, because this is the path that
+                must not become "so we used the bundled one instead".
+            ConfigError: The person closed the window, or the timeout elapsed.
         """
         import asyncio  # noqa: PLC0415 - kept beside its only use
 
-        from manicule.connectors.sessions import cookies_authenticate  # noqa: PLC0415
+        from manicule.connectors.errors import ProviderRefusedError  # noqa: PLC0415
 
-        loop = asyncio.get_running_loop()
-        reached_confluence = False
-        while True:
-            if not browser.is_connected():
-                msg = (
-                    "the browser was closed before sign-in finished, so there is no session to "
-                    "store. Re-run the command and leave the window open until Confluence has "
-                    "loaded as your signed-in user."
+        launcher = _async_playwright()
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        async with launcher() as driver:
+            try:
+                context = await driver.chromium.launch_persistent_context(
+                    str(self._profile),
+                    executable_path=str(self._executable),
+                    headless=self._headless,
                 )
-                raise ConfigError(msg)
-            candidates = _cookies_of(await context.cookies())
-            relevant = origin_cookies(candidates, base_url=config.base_url)
-            if relevant:
-                reached_confluence = True
-                if await cookies_authenticate(config, relevant):
-                    return candidates
-            if loop.time() >= deadline:
-                raise ConfigError(_gave_up(config, reached_confluence=reached_confluence))
-            await asyncio.sleep(self._poll)
+            except Exception as exc:
+                msg = (
+                    f"the installed browser at {self._executable} would not start "
+                    f"({type(exc).__name__}). Nothing has been stored and any previously stored "
+                    f"session is untouched. manicule does not fall back to another browser: "
+                    f"re-run with `--browser-provider bundled-chromium` to use Playwright's own "
+                    f"Chromium, or sign in yourself and use `--browser-state <file>` or "
+                    f"`--manual-cookie`."
+                )
+                raise ProviderRefusedError(msg) from exc
+            try:
+                page = await context.new_page()
+                await page.goto(config.base_url)
+                # A persistent context has no separate browser object to ask, so liveness is
+                # "has it still got a page open" — closing the last window is how a person
+                # cancels, and it has to end the wait rather than spin to the timeout.
+                return await _wait(
+                    context,
+                    alive=lambda: bool(context.pages),
+                    config=config,
+                    deadline=deadline,
+                    poll_seconds=self._poll,
+                )
+            finally:
+                # Closed on every path, as the bundled provider is: a left-open window holding a
+                # live session is worse than whatever failure produced it.
+                await _closed_context(context)
+
+
+async def _closed_context(context: BrowserContext) -> None:
+    """Close a persistent context, ignoring a failure to.
+
+    Mirrors :func:`_closed`. A close that raises during cleanup would replace the refusal the
+    caller is about to see with one about shutting a window, which is never the more useful of
+    the two.
+    """
+    import contextlib  # noqa: PLC0415 - kept beside its only use
+
+    with contextlib.suppress(Exception):
+        await context.close()
 
 
 def _gave_up(config: ConfluenceConfig, *, reached_confluence: bool) -> str:

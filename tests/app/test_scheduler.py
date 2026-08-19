@@ -476,3 +476,66 @@ def test_an_interval_of_zero_or_less_is_refused_at_configuration(interval: int) 
 
     with pytest.raises(ValidationError, match="schedule_s"):
         ConnectorSettings.model_validate({"type": "filesystem", "schedule_s": interval})
+
+
+# --- what a schedule must never do --------------------------------------------------------------
+
+
+def test_a_scheduled_sync_can_never_launch_a_browser() -> None:
+    """Acceptance criterion 13, asserted structurally because the behavioral version cannot fail.
+
+    A scheduled sync resolves its credential through `credential_for` -> `load_session`, which
+    reads the vault and nothing else. There is no provider anywhere on that path, so no browser
+    can open — and a test that merely ran a scheduled sync and observed no window would pass just
+    as happily against an implementation that had one, on a machine with no browser installed.
+
+    So the scheduler's **own source** is what is read, rather than the module's: `served.py` also
+    holds `ControlHandler`, which legitimately receives the session `connector login` captured,
+    and a module-wide search would forbid the one place the credential is *supposed* to arrive.
+
+    This fails the moment somebody "helpfully" makes an unattended job re-authenticate, which is
+    the change the criterion exists to prevent: a server that opens a sign-in window at three in
+    the morning on a machine nobody is sitting at, and blocks the schedule until it times out.
+    """
+    import inspect  # noqa: PLC0415 - kept beside its only use
+
+    from manicule.app.served import Scheduler  # noqa: PLC0415
+
+    body = inspect.getsource(Scheduler)
+    for opener in (
+        "PlaywrightProvider",
+        "InstalledChromiumProvider",
+        "connector_login(",
+        "launch_persistent_context",
+        "_driver_for",
+        "authenticate(",
+    ):
+        assert opener not in body, (
+            f"{opener} appears in the scheduler. An unattended job that can authenticate is one "
+            f"that opens a window on a machine nobody is sitting at."
+        )
+
+
+async def test_a_scheduled_sync_with_no_session_refuses_and_keeps_its_place() -> None:
+    """The behavior the criterion pairs with: refuse, say so, change nothing durable.
+
+    `awaiting_sign_in` is the state a person acts on. What matters beside it is that the run
+    recorded a failure rather than a success — a schedule that counted an unauthenticated run as
+    done would advance nothing and report everything as fine.
+    """
+    service, ingestion = service_with({"handbook": source(schedule_s=600)})
+    ingestion.failure = SessionMissingError("nobody has signed in to this instance")
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    record = scheduler.scheduled["handbook"]
+    assert record.awaiting_sign_in is True
+    assert record.failures == 1
+    assert record.runs == 0, "an unauthenticated run must not be counted as a completed sync"
