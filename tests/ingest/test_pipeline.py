@@ -6,6 +6,8 @@ surviving failure is certified by nothing if only its happy path is exercised.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError
 from typing import TYPE_CHECKING, override
@@ -164,6 +166,67 @@ async def test_post_chunk_middleware_growth_is_recounted_and_refused_before_embe
     assert failed.failed_stage is PipelineStage.MIDDLEWARE
     assert not store.chunks.get(failed.id)
     assert not vectors.rows
+
+
+async def test_a_chunker_raising_anything_else_still_blames_the_chunk_stage() -> None:
+    """The stage a failed document names has to be the stage that failed.
+
+    ``_prepare`` caught :class:`ChunkingError` around the chunk call and nothing else, so any
+    other exception a chunker raised fell through to the general handler that wraps parse,
+    chunk and embed — and that handler names :attr:`PipelineStage.EMBED`, because embedding is
+    the last stage it knows about. The document failed durably either way; it failed saying
+    the model refused it, before the model had been asked, and the acquisition record carried
+    ``EMBED_FAILED`` to match. An operator reading that goes and looks at the embedder.
+
+    ``MemoryError`` rather than a bare ``RuntimeError`` because it is the realistic one: a
+    chunker is arbitrary code, and the shipped one is reached by parsed blocks of unbounded
+    size.
+    """
+
+    class ExhaustedChunker(fakes.BlockChunker):
+        @override
+        def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+            del document, blocks
+            raise MemoryError("cannot allocate the working buffer")
+
+    pipeline, store, vectors = build(chunker=ExhaustedChunker())
+
+    await pipeline.run(fakes.DictConnector({"a": "alpha"}))
+
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.status is DocumentStatus.FAILED
+    assert document.failed_stage is PipelineStage.CHUNK, (
+        "a chunker that raised is a chunk-stage failure whatever it raised"
+    )
+    assert not store.chunks.get(document.id)
+    assert not vectors.rows
+
+
+async def test_a_chunker_that_is_canceled_does_not_record_the_interruption_as_its_fault() -> None:
+    """The other half of catching broadly: ``CancelledError`` must still propagate.
+
+    A shutdown that arrived during chunking and came back recorded as this document's typed
+    failure would be a document marked permanently broken by a ``Ctrl-C``, and the next sync
+    would skip it as settled.
+    """
+
+    class CancelledChunker(fakes.BlockChunker):
+        @override
+        def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+            del document, blocks
+            raise asyncio.CancelledError
+
+    pipeline, store, _ = build(chunker=CancelledChunker())
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await pipeline.run(fakes.DictConnector({"a": "alpha"}))
+
+    document = await store.find_document("memory", "a")
+    assert document is None or document.failed_stage is not PipelineStage.CHUNK, (
+        "an interruption is not the document's typed failure: recording it as one would mark "
+        "the document permanently broken by a Ctrl-C and let the next sync skip it as settled"
+    )
 
 
 async def test_the_write_order_marks_a_document_indexed_last() -> None:

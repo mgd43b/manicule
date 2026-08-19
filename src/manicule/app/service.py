@@ -223,17 +223,37 @@ def _snapshot_status_report(
         if run.state is AcquisitionRunState.INDEXING
         else "acquiring"
     )
+    now = datetime.now(UTC)
+    # "Running" is a claim about a live worker, so it is read off the lease rather than off
+    # the absence of bad news.
+    #
+    # A worker that lost its run does not get to update the row on its way out — that is what
+    # losing it means — so an unfinished run with no diagnostic used to project ``running``
+    # whether a process was working on it or nothing had touched it for an hour. The two look
+    # identical from here and are opposite operationally: one is progress, the other is
+    # resumable work that nobody has resumed. An operator who cannot tell them apart waits.
+    #
+    # The lease answers it directly. It is renewed at a third of its lifetime for exactly as
+    # long as a worker is alive, so an expired or unheld one is a run with no owner — which is
+    # ``incomplete``: unfinished, inactive, and resumable from what is already committed. That
+    # is also true of a cleanly released lease after a canceled run, which is the same
+    # situation arrived at politely.
+    held = (
+        run.lease_owner is not None
+        and run.lease_expires_at is not None
+        and run.lease_expires_at > now
+    )
     outcome: r.LifecycleOutcome = (
         "failed"
         if corrupt
         else "complete"
         if terminal
         else "incomplete"
-        if run.diagnostic is not None or omission_pending
+        if run.diagnostic is not None or omission_pending or not held
         else "running"
     )
     age = (
-        float(max(0, int((datetime.now(UTC) - run.updated_at).total_seconds())))
+        float(max(0, int((now - run.updated_at).total_seconds())))
         if pending and not terminal and not corrupt
         else None
     )

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from manicule.app.dispatch import run_op
@@ -62,6 +62,56 @@ def _backend() -> FakeBackend:
         updated_at=_NOW,
     )
     return backend
+
+
+async def test_an_unfinished_run_whose_lease_has_lapsed_is_not_reported_as_running() -> None:
+    """The distinction an operator needs and could not previously make.
+
+    ``running`` used to mean "unfinished and no diagnostic recorded", which a worker that lost
+    its acquisition lease cannot correct on its way out — losing the lease is precisely the
+    loss of the right to write the row. So a run being actively derived and a run nobody has
+    touched since a worker died projected the same word, and the difference between them is
+    whether waiting is the correct thing to do.
+
+    The failure that produced this: one synthetic multi-megabyte block held the event loop
+    inside synchronous preparation for longer than the lease, the heartbeat coroutine could
+    not run, and the run was lost while its snapshot stayed complete and resumable. Status
+    still said the sync was running. Nothing was.
+    """
+    backend = _backend()
+    run = backend.ingestion_.snapshot
+    assert run is not None
+
+    live = run.model_copy(
+        update={
+            "lease_owner": "pipeline:synthetic-owner",
+            "lease_expires_at": datetime.now(UTC) + timedelta(minutes=5),
+        }
+    )
+    backend.ingestion_.snapshot = live
+    working = await ApplicationService(backend).snapshot_status("synthetic-wiki")
+
+    lapsed = live.model_copy(update={"lease_expires_at": datetime.now(UTC) - timedelta(minutes=5)})
+    backend.ingestion_.snapshot = lapsed
+    idle = await ApplicationService(backend).snapshot_status("synthetic-wiki")
+
+    released = live.model_copy(update={"lease_owner": None, "lease_expires_at": None})
+    backend.ingestion_.snapshot = released
+    after_release = await ApplicationService(backend).snapshot_status("synthetic-wiki")
+
+    assert working.lifecycle.outcome == "running", (
+        "a live lease is the one thing that makes 'running' true, so it has to still say it"
+    )
+    assert idle.lifecycle.outcome == "incomplete", (
+        "an expired lease is a run with no worker: unfinished, inactive, and resumable from "
+        "what is already committed"
+    )
+    assert after_release.lifecycle.outcome == "incomplete", (
+        "a lease released by a canceled run is the same situation reached politely"
+    )
+    assert idle.lifecycle.can_continue_offline == working.lifecycle.can_continue_offline, (
+        "losing a lease costs the run its worker, not its retained bytes"
+    )
 
 
 def test_http_and_mcp_return_the_same_aggregate_snapshot_status() -> None:
