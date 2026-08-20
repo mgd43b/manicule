@@ -1711,8 +1711,43 @@ copies only the identity-verified vectors named by already-durable item payloads
 last durably certified predecessor namespace into its own, in byte-bounded pages. The durable
 source marker advances by lease-fenced CAS only after every copied page and the exact target
 row count validate; a crash or cancellation midway therefore leaves the prior complete source
-available to the next takeover. The lease is renewed and checked
-immediately before and after each awaited vector write. Vectors are reusable only
+available to the next takeover.
+
+**The lease is checked immediately before and after each awaited vector write, and renewed on a
+timer that does not depend on the writes at all.** The two are different jobs and the document
+used to name only one of them, which is how this defect got in — the same shape as
+[#261](https://github.com/mgd43b/manicule/issues/261), a document describing behavior the code
+did not have. It said the lease was
+"renewed and checked" at each vector write; the code checked and never renewed, and a checkpoint
+large enough for replay to outlast one lease could therefore never be replayed. The claim
+succeeded, the copy began, the expiry stayed where the claim had put it, and the first page after
+it passed lost a lease no other worker wanted — so the generation stayed resumable and could not
+advance, because every retry started another full replay under another finite lease.
+
+Checking is fencing and belongs to the store: it refuses to write into a namespace this worker no
+longer owns, whether or not anything is renewing, which is what makes it worth trusting.
+Renewing belongs to the worker, every `lease_seconds / 3` — three renewals per lease, so one
+missed round still leaves one before the expiry, the same cadence the acquisition heartbeat
+uses. It is a timer rather than a
+per-page or per-item count deliberately: replay duration is a property of the corpus and pages
+vary by encoded bytes, so a cadence keyed to the work is a cadence that drifts with it.
+
+**The heartbeat covers the whole build, not only the replay**, because replay is the larger of
+two unbounded stretches rather than the only one. One document's preparation — parse, chunk,
+exact token counts, embedding — runs *before* the renewal that follows it, so the renewal
+covering a document is the one that preceded it, and for the first document it is the claim. A
+single large document can outlast a lease on its own; the acquisition side measured that exact
+shape at 513 seconds of preparation against a 300-second lease, with none of five renewals
+firing; `tests/ingest/test_storage_integration.py` holds that lesson. The loop's per-document renewals stay where they
+are — they are cheap and they checkpoint progress — but they are no longer the only thing
+holding the lease.
+
+Renewal moves the expiry and nothing else. A real takeover increments the lease generation, so
+the renewal is refused; the worker stops there rather than at its next page, and the surface
+reports the lost lease it already knows. Lengthening the lease instead would not have fixed this
+— aggregate replay duration has no bound to pick.
+
+Vectors are reusable only
 when the vector store proves both the stored embedding-input identity and the target embedding
 identity. Validation requires exactly one readable vector in that unpublished publication for
 every replacement chunk; an old publication cannot satisfy the check.

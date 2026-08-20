@@ -8,11 +8,11 @@ impossible rather than a convention a caller may accidentally bypass.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, NoReturn, Protocol, cast, override, runtime_checkable
+from typing import TYPE_CHECKING, Final, NoReturn, Protocol, cast, override, runtime_checkable
 from uuid import uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -61,6 +61,35 @@ from manicule.parsers.expansion import (
 from manicule.parsers.versions import parse_fingerprint
 
 MAX_MISSING_DETAILS = 1000
+
+
+@dataclass(slots=True)
+class _LeaseHeartbeat:
+    """What the renewal timer has done, for the body it is holding a lease for.
+
+    ``lost`` is what separates the two ways a build stops at a cancellation: the caller asked
+    for one, or this worker no longer owns the generation. They arrive as the same exception
+    and mean opposite things.
+    """
+
+    lost: bool = False
+    renewals: int = 0
+
+
+LEASE_RENEWALS_PER_LEASE: Final = 3
+"""Renewals attempted per lease duration, over everything :meth:`_renewing_lease` covers.
+
+That is the whole build — a takeover's checkpoint replay and the document loop after it — rather
+than either one alone, because both are unbounded in aggregate and either can outlast the lease
+its generation was claimed under.
+
+Three rather than two, so a single failed or delayed renewal is survivable: renewals land at a
+third, two thirds and the whole of the lease, so losing the first still leaves one before the
+expiry. At two the first miss is already the last chance, and a heartbeat that cannot tolerate
+one bad round is a heartbeat that turns a slow database into a lost generation. The same ratio
+the acquisition heartbeat and the adaptive enumeration recorder use, kept identical because an
+operator reasoning about one lease should not have to learn a second cadence.
+"""
 
 if TYPE_CHECKING:
     from manicule.core.embedding import Vector
@@ -874,16 +903,40 @@ class OfflineGenerationRebuilder:
         if checkpoint.state in {RebuildState.FAILED, RebuildState.CANCELED}:
             raise RebuildTerminalError
         try:
-            return await self._build(
-                checkpoint,
-                estimate,
-                target,
-                owner=owner,
-                snapshot_run_id=snapshot_run_id,
-                missing_limit=missing_limit,
-                cancel=cancel,
-                lease_seconds=lease_seconds,
-            )
+            async with self._renewing_lease(
+                checkpoint, owner=owner, lease_seconds=lease_seconds
+            ) as lease:
+                try:
+                    return await self._build(
+                        checkpoint,
+                        estimate,
+                        target,
+                        owner=owner,
+                        snapshot_run_id=snapshot_run_id,
+                        missing_limit=missing_limit,
+                        cancel=cancel,
+                        lease_seconds=lease_seconds,
+                    )
+                except asyncio.CancelledError:
+                    # The caller's own cancellation is checked first, because it is the one the
+                    # caller asked for: a run canceled while its heartbeat happened to fail is
+                    # still a cancellation, and reporting it as a lost lease would send somebody
+                    # looking for a competing worker that never existed.
+                    if cancel is not None and cancel.is_set():
+                        raise
+                    if not lease.lost:
+                        raise
+                    # The cancellation was the heartbeat's own request and has now been turned
+                    # into a result, so the count that records it is cleared. Left standing it
+                    # would tell an enclosing `asyncio.timeout` or `TaskGroup` that this task is
+                    # still unwinding a cancellation nobody outside ever asked for — which is
+                    # how a lost lease would come back reported as somebody else's timeout.
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                    raise RebuildLeaseConflictError(
+                        "the generation lease could not be renewed while the rebuild ran"
+                    ) from None
         except (SQLAlchemyError, OSError):
             # Every refusal the build anticipates settles the generation itself. This catches
             # the ones nobody anticipated: a driver or filesystem failure from any store call
@@ -919,6 +972,86 @@ class OfflineGenerationRebuilder:
                 lease_generation=checkpoint.lease_generation,
                 now=self._clock(),
             )
+
+    @asynccontextmanager
+    async def _renewing_lease(
+        self,
+        checkpoint: RebuildCheckpoint,
+        *,
+        owner: str,
+        lease_seconds: int,
+    ) -> AsyncGenerator[_LeaseHeartbeat]:
+        """Hold this worker's lease for as long as the body runs, however long that is.
+
+        **Build duration is a property of the corpus, and the lease is not.** Two stretches of a
+        rebuild are unbounded in aggregate and were covered by nothing. A takeover replays every
+        vector its predecessor committed before it may stage anything of its own, in bounded
+        pages but an unbounded number of them. And one document's preparation — parse, chunk,
+        exact token counts, embedding — sits between the renewal that precedes it and the next
+        one, so a single large document is unbounded too. Either could outlast the lease its
+        generation was claimed under, and then the first fenced call after the expiry lost a
+        lease no competing worker wanted, leaving the generation resumable and unable to advance
+        because every retry began the same way.
+
+        **Renewal is on a timer, not on the work.** The loop below also renews per document,
+        which is a cadence only as good as documents are uniform. This one renews every
+        ``lease_seconds / 3`` no matter what the body is doing — the same cadence the acquisition
+        heartbeat uses, and for the same reason it exists there: preparation that never yields
+        long enough to renew is preparation that quietly ages out its own ownership.
+
+        **Renewing is not fencing, and this does not weaken it.** ``renew_generation`` moves the
+        expiry only for an unchanged owner and lease generation, and every fenced call still
+        makes its own assertion. What the heartbeat adds is noticing promptly: a real takeover
+        increments the lease generation, the renewal is refused, and the worker is canceled
+        there rather than continuing to write into a namespace it no longer owns.
+        """
+        work = asyncio.current_task()
+        if work is None:  # pragma: no cover - every awaited coroutine has an owning task
+            msg = "a rebuild lease heartbeat requires an owning task"
+            raise RuntimeError(msg)
+        state = _LeaseHeartbeat()
+
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(lease_seconds / LEASE_RENEWALS_PER_LEASE)
+                renewed_at = self._clock()
+                try:
+                    await self._store.renew_generation(
+                        checkpoint.generation_id,
+                        owner,
+                        checkpoint.lease_generation,
+                        now=renewed_at,
+                        expires_at=renewed_at + timedelta(seconds=lease_seconds),
+                    )
+                except Exception:  # noqa: BLE001 - every failure here means the same thing
+                    # Broad on purpose, and the one place in this file where that is right. A
+                    # refused renewal is a real takeover and arrives as
+                    # `RebuildLeaseConflictError`, a `RuntimeError` subclass that a list of
+                    # storage exceptions would miss entirely; a storage failure arrives as a
+                    # driver error; a plugin store may raise something this file has never
+                    # heard of. All three mean the same actionable thing — this worker no
+                    # longer holds the generation — and a list that missed one would leave the
+                    # heartbeat dead with an unhandled task exception while the superseded
+                    # worker kept writing.
+                    #
+                    # Nothing is carried out of the task, deliberately. It is joined inside a
+                    # `finally`, where re-raising would mask whatever the body was already
+                    # failing with, and a driver's message is not something to put in front of
+                    # somebody on the way to saying the lease is gone.
+                    state.lost = True
+                    work.cancel()
+                    return
+                state.renewals += 1
+
+        beat = asyncio.create_task(
+            heartbeat(), name=f"rebuild:{checkpoint.generation_id}-lease-heartbeat"
+        )
+        try:
+            yield state
+        finally:
+            beat.cancel()
+            with suppress(asyncio.CancelledError):
+                await beat
 
     async def _build(  # noqa: PLR0912, PLR0915 - explicit refusal/lease stages
         self,
