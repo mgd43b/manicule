@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/mgd43b/manicule/compare/v0.1.1...v0.1.2) (2026-08-20)
+
+
+### Bug Fixes
+
+* **connectors:** converge the Data Center inventory when a deep offset outlives the request timeout ([#260](https://github.com/mgd43b/manicule/issues/260)) ([90341cf](https://github.com/mgd43b/manicule/commit/90341cf16068bf6e781288fdbc12b26d1d372798))
+* settle a failed rebuild, refuse a busy writer, and stop pages waiting on the fleet ([#266](https://github.com/mgd43b/manicule/issues/266)) ([08b4ecc](https://github.com/mgd43b/manicule/commit/08b4eccd54a341385ea0425a263d3686448a7447)), closes [#257](https://github.com/mgd43b/manicule/issues/257)
+
 ## [0.1.1](https://github.com/mgd43b/manicule/compare/v0.1.0...v0.1.1) (2026-08-19)
 
 
