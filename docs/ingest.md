@@ -1731,6 +1731,16 @@ is survivable, the same cadence the acquisition heartbeat uses. It is a timer ra
 per-page or per-item count deliberately: replay duration is a property of the corpus and pages
 vary by encoded bytes, so a cadence keyed to the work is a cadence that drifts with it.
 
+**The heartbeat covers the whole build, not only the replay**, because replay is the larger of
+two unbounded stretches rather than the only one. One document's preparation — parse, chunk,
+exact token counts, embedding — runs *before* the renewal that follows it, so the renewal
+covering a document is the one that preceded it, and for the first document it is the claim. A
+single large document can outlast a lease on its own; the acquisition side measured that exact
+shape at 513 seconds of preparation against a 300-second lease, with none of five renewals
+firing; `tests/ingest/test_storage_integration.py` holds that lesson. The loop's per-document renewals stay where they
+are — they are cheap and they checkpoint progress — but they are no longer the only thing
+holding the lease.
+
 Renewal moves the expiry and nothing else. A real takeover increments the lease generation, so
 the renewal is refused; the worker stops there rather than at its next page, and the surface
 reports the lost lease it already knows. Lengthening the lease instead would not have fixed this

@@ -1633,3 +1633,90 @@ async def test_a_replay_shorter_than_the_lease_renews_nothing() -> None:
 
     assert store.replay_finished
     assert store.replay_renewals == 0
+
+
+@dataclass
+class CountingStore(FakeStore):
+    """A generation with no predecessor to replay, counting only what the heartbeat renews."""
+
+    renewals: int = 0
+    renewed_enough: asyncio.Event = field(default_factory=asyncio.Event)
+    renewals_wanted: int = 2
+
+    @override
+    async def renew_generation(
+        self,
+        generation_id: str,
+        owner: str,
+        lease_generation: int,
+        *,
+        now: object,
+        expires_at: object,
+    ) -> RebuildCheckpoint:
+        self.renewals += 1
+        if self.renewals >= self.renewals_wanted:
+            self.renewed_enough.set()
+        return await super().renew_generation(
+            generation_id, owner, lease_generation, now=now, expires_at=expires_at
+        )
+
+
+@dataclass
+class SlowPreparingDeriver(FakeDeriver):
+    """A document whose preparation outlasts the lease it is being prepared under."""
+
+    renewed_enough: asyncio.Event | None = None
+
+    @override
+    async def prepare(
+        self,
+        raw: RawDocument,
+        target: RebuildTarget,
+        *,
+        generation_id: str,
+        blob_ref: str,
+        title: str,
+        version_token: str | None,
+        connector: str | None = None,
+    ) -> PreparedReplacement:
+        if self.renewed_enough is not None:
+            # Bounded for the reason the replay fake gives: a build that renews never should
+            # fail the suite rather than hang it. A working heartbeat clears this in a third
+            # of a second.
+            await asyncio.wait_for(self.renewed_enough.wait(), timeout=10)
+        return await super().prepare(
+            raw,
+            target,
+            generation_id=generation_id,
+            blob_ref=blob_ref,
+            title=title,
+            version_token=version_token,
+            connector=connector,
+        )
+
+
+async def test_a_document_slower_than_its_lease_still_holds_it() -> None:
+    """The sibling of the replay defect, in the loop rather than before it.
+
+    Preparation — parse, chunk, exact token counts, embedding — runs *before* the renewal that
+    follows it, so the covering renewal for one document is the one that preceded it, and for
+    the first document it is the claim. A single large document can therefore outlast the lease
+    on its own, and the acquisition side already measured that shape: 513 seconds of preparation
+    against a 300-second lease, none of five renewals fired, and the run was dead while the
+    snapshot was complete and resumable.
+
+    The heartbeat covers the whole build rather than only the replay for exactly this reason.
+    """
+    item, body = source(0, "alpha\nbeta")
+    store = CountingStore(items=[item], renewals_wanted=2)
+    deriver = SlowPreparingDeriver(renewed_enough=store.renewed_enough)
+
+    checkpoint = await OfflineGenerationRebuilder(
+        store=store,
+        blobs=FakeBlobs({item.blob_ref: body}),
+        deriver=deriver,
+    ).run("promoted-run", target(), lease_seconds=1)
+
+    assert store.renewals >= 2, "a document slower than its lease has to renew during preparation"
+    assert checkpoint.state is RebuildState.PUBLISHED
+    assert deriver.calls == ["page-0"], "and it must be prepared once, not retried"
