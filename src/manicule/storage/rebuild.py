@@ -2253,6 +2253,36 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation.updated_at = now
             return _checkpoint(generation)
 
+    async def release_generation(
+        self,
+        generation_id: str,
+        code: RebuildRefusalCode,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> RebuildCheckpoint:
+        """Record why this attempt stopped and drop the lease, leaving the state as it was.
+
+        Every other settlement here is forward-only into a terminal state. This one deliberately
+        is not: the generation stays `building` or `validating`, which is what makes the next
+        `claim_generation` a takeover rather than a refusal, and what keeps the committed prefix
+        worth something after a failure that had nothing to do with it.
+
+        `diagnostic_count` accumulates instead of being set to one. A storage failure that
+        happens once is contention; the same one on the fourth attempt is a machine that needs
+        an operator, and the count is how that becomes visible without a log.
+        """
+        async with self._sessions.begin() as session:
+            generation = await self._required_generation(session, generation_id)
+            self._require_lease(generation, owner, lease_generation, now)
+            generation.diagnostic_code = code.value
+            generation.diagnostic_count += 1
+            generation.lease_owner = None
+            generation.lease_expires_at = None
+            generation.updated_at = now
+            return _checkpoint(generation)
+
     async def _required_generation(
         self, session: AsyncSession, generation_id: str
     ) -> models.DerivedGeneration:

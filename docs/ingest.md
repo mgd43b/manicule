@@ -1773,22 +1773,32 @@ Publication repeats snapshot, scope, fence, membership and vector-completeness c
 atomic transaction. A changed snapshot/scope/fence becomes a `RebuildLeaseError` conflict with a
 bounded durable diagnostic; incomplete replacement or vector evidence becomes
 `RebuildValidationError`. Neither path serializes the storage exception text, and both mark the
-still-owned generation failed before returning so cleanup and retry remain explicit.
+still-owned generation failed before returning so cleanup and retry remain explicit. A storage
+failure during publication is the exception, and is released rather than failed for the reason
+below: publication is one transaction, so a rolled-back one leaves a generation still worth
+publishing.
 The same boundary applies before publication: takeover replay verifies every copied vector page
 and its exact inventory, every resumed manifest page starts at the durable checkpoint, and retry
 output must match an already-staged digest. Expected corruption or snapshot movement receives the
 same bounded validation/conflict envelopes and failed cleanup state. An unexpected worker crash
 is different: it keeps the checkpoint resumable and does not manufacture a validation diagnosis.
 
-**A storage failure anywhere between the claim and publication settles the same way.** The
-refusals the build anticipates each mark their own generation, and publication always did; a
-driver or filesystem failure from an ordinary checkpoint write did not, and it left the row
-`building` with the counters it had reached, an owner that no longer existed and a lease that
-expired minutes later — a durable record describing a worker that was gone. One settlement now
-sits at the durable boundary instead, and it is best effort by construction: if the store is
-what broke, or the lease lapsed and another owner holds the generation, the attempt is dropped
-rather than chained, because that owner alone may write the row. Either way the caller receives
-`RebuildStorageError` and no exception text.
+**A storage failure anywhere between the claim and publication settles the same way, and that
+settlement is a release rather than an ending.** The refusals the build anticipates each mark
+their own generation failed, which is right for a diagnosis — a corrupt manifest, a replacement
+that does not validate — because retrying that work would fail the same way. A driver or
+filesystem failure is not a diagnosis of the work: a writer held SQLite past the busy timeout, a
+disk was briefly full, and the documents already committed are still correct. Ending the
+generation over one of those would discard every one of them, since `fail_generation` is terminal
+and a failed generation can never be claimed again.
+
+So one settlement sits at the durable boundary, and it records `storage_failed`, drops the lease,
+and leaves the state where it was. The next run's claim is then a takeover that resumes from the
+committed checkpoint, and `diagnostic_count` accumulates across attempts — one storage failure is
+contention, the same one on the fourth attempt is a machine that needs an operator. It is best
+effort by construction: if the store is what broke, or the lease lapsed and another owner holds
+the generation, the attempt is dropped rather than chained, because that owner alone may write the
+row. Either way the caller receives `RebuildStorageError` and no exception text.
 
 That leaves one honest state rather than two, because **`rebuild status` derives
 `lifecycle.outcome` from the lease exactly as `snapshot_status` does** (§13.4). A generation

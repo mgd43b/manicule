@@ -184,6 +184,32 @@ class RebuildStore(Protocol):
         now: datetime,
     ) -> RebuildCheckpoint: ...
 
+    async def release_generation(
+        self,
+        generation_id: str,
+        code: RebuildRefusalCode,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> RebuildCheckpoint:
+        """Record why this attempt stopped and give the generation up, without ending it.
+
+        The other settlement, :meth:`fail_generation`, is terminal: a generation it marks can
+        never be claimed again, and its committed prefix is only reachable through cleanup and
+        a fresh plan. That is right for a refusal the run has diagnosed — a corrupt manifest, a
+        replacement that does not validate — where retrying the same work would fail the same
+        way.
+
+        It is wrong for contention. A writer holding SQLite past the busy timeout, a disk that
+        was briefly full, a filesystem error that cleared: those say nothing about the work
+        already committed, and ending the generation over one of them discards every document
+        derived so far. This records the diagnostic and releases the lease, so status can say
+        what happened and to whom it happened — nobody — while the next run takes the
+        generation over and resumes from its checkpoint.
+        """
+        ...
+
 
 @runtime_checkable
 class RebuildBlobSource(Protocol):
@@ -868,7 +894,13 @@ class OfflineGenerationRebuilder:
             raise
 
     async def _settle_storage_failure(self, checkpoint: RebuildCheckpoint, owner: str) -> None:
-        """Record ``storage_failed`` on a claimed generation, best effort, before re-raising.
+        """Record ``storage_failed`` and give the generation up, best effort, before re-raising.
+
+        Released rather than failed, because a storage error is the one class of failure that
+        says nothing about the work: the documents already committed are still correct, and a
+        writer that held SQLite for six seconds is not a reason to derive ten thousand of them
+        again. The next run claims the same generation and resumes from its checkpoint, while
+        status reports it as nobody's — `incomplete` — for as long as that has not happened.
 
         Best effort is the design rather than a shortcut. Only a takeover's claim moves the
         lease generation, so the claimed checkpoint stays the right key for as long as this
@@ -880,7 +912,7 @@ class OfflineGenerationRebuilder:
         settle is left to lease recovery rather than to a stale owner.
         """
         with suppress(SQLAlchemyError, OSError, RebuildLeaseConflictError, KeyError):
-            await self._store.fail_generation(
+            await self._store.release_generation(
                 checkpoint.generation_id,
                 RebuildRefusalCode.STORAGE_FAILED,
                 owner=owner,

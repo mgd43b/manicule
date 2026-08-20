@@ -128,6 +128,7 @@ class FakeStore:
     publish_release: asyncio.Event | None = None
     claimed_owners: list[str] = field(default_factory=list[str])
     failed_code: RebuildRefusalCode | None = None
+    released_code: RebuildRefusalCode | None = None
 
     def _checkpoint(self, state: RebuildState | None = None) -> RebuildCheckpoint:
         next_sequence = 0
@@ -322,6 +323,21 @@ class FakeStore:
         del generation_id, owner, lease_generation, now
         self.failed_code = code
         return self._checkpoint(RebuildState.FAILED)
+
+    async def release_generation(
+        self,
+        generation_id: str,
+        code: RebuildRefusalCode,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> RebuildCheckpoint:
+        del generation_id, owner, lease_generation, now
+        self.released_code = code
+        # Deliberately not a terminal state: the point of releasing is that the generation is
+        # still there to be claimed.
+        return self._checkpoint()
 
 
 @dataclass
@@ -659,7 +675,7 @@ class UnsettleableStore(MidBuildStorageFailureStore):
     """The store cannot be told about the failure, because the lease is already gone."""
 
     @override
-    async def fail_generation(
+    async def release_generation(
         self,
         generation_id: str,
         code: RebuildRefusalCode,
@@ -673,7 +689,7 @@ class UnsettleableStore(MidBuildStorageFailureStore):
 
 
 @pytest.mark.asyncio
-async def test_a_storage_failure_mid_build_settles_the_generation_it_claimed() -> None:
+async def test_a_storage_failure_mid_build_gives_the_generation_up_without_ending_it() -> None:
     """What the run leaves behind is the whole point, not what it raises.
 
     A driver failure from a checkpoint write used to unwind past every handler in the build
@@ -681,6 +697,12 @@ async def test_a_storage_failure_mid_build_settles_the_generation_it_claimed() -
     durable row stayed ``building`` with the counters it had reached, an owner that no longer
     existed and a lease that expired minutes later, so status went on describing a rebuild as
     running with no worker, no diagnostic, and no way to tell the difference from here.
+
+    Released rather than failed, and the difference is thousands of documents. A writer that
+    held SQLite past the busy timeout says nothing about the work already committed, and
+    `fail_generation` is terminal — `claim_generation` refuses a failed generation forever, so
+    ending one over contention means cleanup and deriving the whole corpus again. This records
+    why the attempt stopped, drops the lease, and leaves the generation there to be taken over.
     """
     item, body = source(0, "private source body")
     store = MidBuildStorageFailureStore([item])
@@ -692,8 +714,11 @@ async def test_a_storage_failure_mid_build_settles_the_generation_it_claimed() -
             deriver=FakeDeriver(),
         ).run("promoted-run", target())
 
-    assert store.failed_code is RebuildRefusalCode.STORAGE_FAILED, (
+    assert store.released_code is RebuildRefusalCode.STORAGE_FAILED, (
         "a claimed generation the worker is abandoning has to carry why"
+    )
+    assert store.failed_code is None, (
+        "contention is not a diagnosis of the work, so it must not end the generation"
     )
     assert store.published is False
     rendered = str(caught.value).lower()
@@ -721,12 +746,13 @@ async def test_a_settlement_the_lease_no_longer_permits_does_not_rewrite_the_fai
             deriver=FakeDeriver(),
         ).run("promoted-run", target())
 
-    assert store.failed_code is None, "the store refused the settlement, so nothing recorded it"
+    assert store.released_code is None, "the store refused the settlement, so nothing recorded it"
+    assert store.failed_code is None
     assert store.published is False
 
 
 @pytest.mark.asyncio
-async def test_publication_integrity_failure_is_bounded_and_marks_generation_failed() -> None:
+async def test_publication_integrity_failure_is_bounded_and_gives_the_generation_up() -> None:
     item, body = source(0, "private source body")
     store = StorageFailureStore([item])
 
@@ -738,7 +764,10 @@ async def test_publication_integrity_failure_is_bounded_and_marks_generation_fai
         ).run("promoted-run", target())
 
     assert str(caught.value) == "offline rebuild storage failed"
-    assert store.failed_code is RebuildRefusalCode.STORAGE_FAILED
+    assert store.released_code is RebuildRefusalCode.STORAGE_FAILED, (
+        "publication is one transaction, so a rolled-back one leaves a generation worth keeping"
+    )
+    assert store.failed_code is None
     assert store.published is False
     rendered = str(caught.value).lower()
     for private in ("insert", "secret", "wiki.example.test", "/private", "sqlite"):
@@ -941,7 +970,14 @@ async def test_validation_snapshot_conflict_is_bounded_and_marks_generation_fail
 
 
 @pytest.mark.asyncio
-async def test_validation_storage_failure_is_bounded_and_marks_generation_failed() -> None:
+async def test_validation_storage_failure_is_bounded_and_gives_the_generation_up() -> None:
+    """A storage failure at validation is the same class as one mid-build, and settles the same.
+
+    Validation reads what is already staged. A driver failure there is a statement about the
+    database, not about the generation, so it releases rather than ends it — while a validation
+    failure that actually finds bad output still marks the generation failed, because retrying
+    that would produce the same bad output.
+    """
     item, body = source(0, "body")
     store = ValidationStorageFailureStore([item])
 
@@ -952,7 +988,8 @@ async def test_validation_storage_failure_is_bounded_and_marks_generation_failed
             deriver=FakeDeriver(),
         ).run("promoted-run", target())
 
-    assert store.failed_code is RebuildRefusalCode.STORAGE_FAILED
+    assert store.released_code is RebuildRefusalCode.STORAGE_FAILED
+    assert store.failed_code is None
     assert store.published is False
 
 
