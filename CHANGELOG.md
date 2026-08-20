@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/mgd43b/manicule/compare/v0.1.2...v0.1.3) (2026-08-20)
+
+
+### Features
+
+* **storage:** execute the two derived-index lifecycles the storage document describes ([#267](https://github.com/mgd43b/manicule/issues/267)) ([d699371](https://github.com/mgd43b/manicule/commit/d699371a3b3b62db3e79c4a8b443e9b881623b14))
+
 ## [0.1.2](https://github.com/mgd43b/manicule/compare/v0.1.1...v0.1.2) (2026-08-20)
 
 

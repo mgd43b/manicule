@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "manicule"
-version = "0.1.2"
+version = "0.1.3"
 description = "Self-hosted document search and answers, with citations that resolve."
 # `readme` is dynamic because the long description is README.md with its relative links
 # rewritten. See `[tool.hatch.metadata.hooks.fancy-pypi-readme]`.
