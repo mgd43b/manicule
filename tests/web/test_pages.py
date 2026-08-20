@@ -22,7 +22,7 @@ import pytest
 
 from manicule.api.security import Principal
 from manicule.app.service import ApplicationService
-from manicule.core.ann import AnnIndexState, AnnLifecycle
+from manicule.core.ann import AnnIndex, AnnIndexState, AnnLifecycle
 from manicule.core.errors import ManiculeError
 from manicule.web.areas import AREAS, NAVIGATION
 from manicule.web.rendering import (
@@ -105,6 +105,39 @@ def test_the_admin_page_shows_no_vector_card_for_a_store_with_no_index_lifecycle
 
     assert rendered.status_code == 200
     assert "Vector search" not in rendered.text
+
+
+def test_the_settings_page_never_prints_none_for_an_index_it_cannot_account_for() -> None:
+    """Optional fields are null for an index this installation did not build.
+
+    LanceDB records neither the partition count nor which build produced an index, so both are
+    genuinely unknown for a foreign one. Rendering the null verbatim puts "None partition(s)" on
+    the page, which reads as a value rather than as an absence — the opposite of what the null
+    is there to say.
+    """
+    backend, _ = backend_with_a_document()
+    backend.maintenance_.vector_index = AnnIndexState(
+        lifecycle=AnnLifecycle.READY,
+        threshold=100_000,
+        rows=300_000,
+        index=AnnIndex(
+            name="somebodys_own_index",
+            index_type="IVF_PQ",
+            distance_type=None,
+            indexed_rows=300_000,
+            unindexed_rows=0,
+            num_sub_vectors=None,
+        ),
+        detail="an index this installation did not build carries the vector column",
+    )
+    with client_for(backend) as client:
+        rendered = client.get("/ui/settings")
+
+    assert rendered.status_code == 200
+    assert "somebodys_own_index" in rendered.text
+    assert "None partition" not in rendered.text
+    assert "None distance" not in rendered.text
+    assert "unknown partition(s)" in rendered.text
 
 
 def test_lifecycle_history_form_submits_an_offset_aware_cutoff_through_its_rendered_action() -> (

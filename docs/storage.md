@@ -1037,7 +1037,7 @@ documented point while continuing to scan every vector, and no surface said so.
 | `pending` | At or past the threshold, no index. Still exact, now linear | `manicule build-vector-index --yes` |
 | `ready` | An index covers the corpus within the refresh bound | Nothing |
 | `stale` | The rows the index does not cover would themselves cross the threshold | `manicule build-vector-index --yes` |
-| `disabled` | `ann_index_threshold` is `0`. Exhaustive permanently, by choice | Nothing |
+| `disabled` | `storage.ann_index_threshold` is `0`. Exhaustive permanently, by choice | Nothing |
 
 `exhaustive` and `pending` are the same *behavior* and opposite *findings*, which is why they
 are two states rather than one "unindexed". So are `exhaustive` and `disabled`: one is a

@@ -894,6 +894,13 @@ class LanceVectorStore:
 
         More than one can exist for exactly as long as it takes a repeat build to clear it —
         see the ordering :meth:`build_ann_index` explains — so this picks rather than refuses.
+
+        **A foreign index wins the report whenever one is present, even beside a managed one.**
+        Preferring ours would report ``recognized`` over a column that also carries an index
+        this project cannot account for — and :meth:`build_ann_index` refuses beside one, so
+        the status would have described a healthy index while every attempt to maintain it was
+        declined for a reason nothing had reported. The unaccountable index is the fact that
+        decides what the boundary may do, so it is the fact that gets reported.
         """
         listed = [
             config
@@ -903,8 +910,9 @@ class LanceVectorStore:
         if not listed:
             return None
         parsed = [(parse_ann_index_name(str(config.name)), config) for config in listed]
+        foreign = [config for read, config in parsed if read is None]
         ours = [(read, config) for read, config in parsed if read is not None]
-        read, config = max(ours, key=lambda pair: pair[0][0]) if ours else (None, listed[0])
+        read, config = (None, foreign[0]) if foreign else max(ours, key=lambda pair: pair[0][0])
         name = str(config.name)
         statistics = await table.index_stats(name)
         details = getattr(config, "index_details", None)

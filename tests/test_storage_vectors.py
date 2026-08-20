@@ -1283,6 +1283,38 @@ async def test_an_index_this_installation_did_not_build_is_refused_rather_than_r
     await store.teardown()
 
 
+async def test_a_foreign_index_beside_a_managed_one_is_still_what_gets_reported(
+    tmp_path: Path,
+) -> None:
+    """The case where preferring our own index would report a health it cannot deliver.
+
+    Both exist on the vector column. Reporting the managed one would say ``ready`` with a
+    partition count and a build generation — and then every attempt to maintain it would be
+    declined, because the boundary refuses beside an index it cannot account for. The status and
+    the refusal would disagree, and only one of them would be reachable by an operator wondering
+    why nothing happens.
+    """
+    directory = tmp_path / "vectors"
+    stocked = await _stocked(directory, ANN_THRESHOLD)
+    built = await stocked.build_ann_index(threshold=ANN_THRESHOLD)
+    await stocked.teardown()
+    await _create_foreign_index(directory)
+    store = await prepared(directory)
+
+    state = await store.ann_index_state(threshold=ANN_THRESHOLD)
+
+    assert built.built, "this test is only interesting if a managed index was there first"
+    assert state.index is not None
+    assert not state.index.recognized, (
+        "the unaccountable index is what decides whether the boundary may act, so it is what "
+        "the status has to name"
+    )
+    assert state.index.num_partitions is None
+    with pytest.raises(VectorStoreStateError, match="somebodys_own_index"):
+        await store.build_ann_index(threshold=ANN_THRESHOLD, force=True)
+    await store.teardown()
+
+
 async def test_the_index_state_of_a_directory_with_no_vectors_is_an_answer_not_an_error(
     store: LanceVectorStore,
 ) -> None:
