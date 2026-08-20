@@ -333,9 +333,10 @@ ids, paths, URIs, titles, content or exception context. Re-embedding exposes fin
 one-way identity of the live generation, not its private corpus-snapshot handle. Read-only MCP
 registration is unchanged: adding status fields does not add a write tool to the network surface.
 
-`outcome` says whether anybody is working on it, and for acquisition it is read from the run's
-lease rather than from the absence of a recorded failure — a worker that loses its run cannot
-write a diagnostic on its way out, so "no bad news" and "a live worker" are not the same fact.
+`outcome` says whether anybody is working on it, and for an acquisition run and a derived
+rebuild generation alike it is read from the lease rather than from the absence of a recorded
+failure — a worker that loses its work cannot write a diagnostic on its way out, so "no bad
+news" and "a live worker" are not the same fact.
 `running` therefore means a lease is held and unexpired; `incomplete` means unfinished and
 unowned, which is resumable rather than broken; `complete` and `failed` are terminal. A
 supervisor may act on `incomplete` immediately — `ingest.md` §13.4 states what it may assume and
@@ -732,6 +733,20 @@ parsing English; `remedy` is what to do about it — a command where there is on
 shortest actionable instruction. `remedy` is empty on a healthy check, and on one whose repair
 depends on how the state was reached rather than on a step that can be named: an empty `remedy`
 means manicule has nothing specific to suggest, never that the check is fine.
+
+**`component:*` checks are the only part of a diagnosis that leaves the machine**, and they
+are bounded twice because of it. Components are asked concurrently rather than in turn, so a
+diagnosis costs the slowest remote check instead of the sum of all of them; one that does not
+answer within its own timeout is `degraded` with a detail saying so, and the whole sweep has a
+deadline past which outstanding checks are named as outstanding rather than dropped. "It did
+not answer" is never rendered as `ok`.
+
+A sweep also answers for a short while rather than being repeated per page load, because
+ordinary navigation asks the same fleet-wide question several times in a few seconds. Reuse is
+declared where it happens: every component check carries `observed_seconds_ago` and
+`freshly_measured` in its `facts`, and a check that was not measured just now says so in its
+`detail` too. A cached green is never presented as a new one, and a component constructed since
+the last sweep is measured rather than answered for.
 
 **These four states are the only status vocabulary manicule has**, and `--json` reports exactly
 the words the terminal prints. A contract spelling its statuses differently from the human

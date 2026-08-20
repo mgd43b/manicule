@@ -1773,12 +1773,39 @@ Publication repeats snapshot, scope, fence, membership and vector-completeness c
 atomic transaction. A changed snapshot/scope/fence becomes a `RebuildLeaseError` conflict with a
 bounded durable diagnostic; incomplete replacement or vector evidence becomes
 `RebuildValidationError`. Neither path serializes the storage exception text, and both mark the
-still-owned generation failed before returning so cleanup and retry remain explicit.
+still-owned generation failed before returning so cleanup and retry remain explicit. A storage
+failure during publication is the exception, and is released rather than failed for the reason
+below: publication is one transaction, so a rolled-back one leaves a generation still worth
+publishing.
 The same boundary applies before publication: takeover replay verifies every copied vector page
 and its exact inventory, every resumed manifest page starts at the durable checkpoint, and retry
 output must match an already-staged digest. Expected corruption or snapshot movement receives the
 same bounded validation/conflict envelopes and failed cleanup state. An unexpected worker crash
 is different: it keeps the checkpoint resumable and does not manufacture a validation diagnosis.
+
+**A storage failure anywhere between the claim and publication settles the same way, and that
+settlement is a release rather than an ending.** The refusals the build anticipates each mark
+their own generation failed, which is right for a diagnosis — a corrupt manifest, a replacement
+that does not validate — because retrying that work would fail the same way. A driver or
+filesystem failure is not a diagnosis of the work: a writer held SQLite past the busy timeout, a
+disk was briefly full, and the documents already committed are still correct. Ending the
+generation over one of those would discard every one of them, since `fail_generation` is terminal
+and a failed generation can never be claimed again.
+
+So one settlement sits at the durable boundary, and it records `storage_failed`, drops the lease,
+and leaves the state where it was. The next run's claim is then a takeover that resumes from the
+committed checkpoint, and `diagnostic_count` accumulates across attempts — one storage failure is
+contention, the same one on the fourth attempt is a machine that needs an operator. It is best
+effort by construction: if the store is what broke, or the lease lapsed and another owner holds
+the generation, the attempt is dropped rather than chained, because that owner alone may write the
+row. Either way the caller receives `RebuildStorageError` and no exception text.
+
+That leaves one honest state rather than two, because **`rebuild status` derives
+`lifecycle.outcome` from the lease exactly as `snapshot_status` does** (§13.4). A generation
+nobody owns reads `incomplete` — unfinished, inactive, and resumable from its committed
+checkpoint — never `running`. A takeover replaying its predecessor's vectors before it claims is
+covered by the same rule, and so is a settlement that could not be written: an operator can tell
+active work from work waiting to be resumed without being told the owner token.
 
 ### 10.5 Source and derived lifecycle boundaries
 
@@ -1926,6 +1953,15 @@ bounded peak-memory and temporary-disk estimates, elapsed-time estimate, target 
 one-way target identity. The transient plan snapshot is deleted before the command returns.
 Source ids, URIs, snapshot/revision handles, weights paths, complete configuration and inventory
 digests never cross an operator or network surface.
+
+**`plan` is an inspection command, not a read-only transaction.** The snapshot it prices is a
+durable one, so it takes SQLite's writer slot with `BEGIN IMMEDIATE` like any other writer, and
+while an offline rebuild or a sync holds that slot it cannot have it. That refusal is
+`StorageBusyError` — the same private-safe type acquisition exhaustion returns — carrying the
+clause that nothing was planned and nothing durable changed, and never the driver's statement,
+bound values or database path. Every surface renders it identically: HTTP answers 503, the CLI
+exits nonzero, and `/ui/reembed` renders the refusal rather than the unhandled 500 an
+unconverted driver exception used to produce.
 
 `start` performs the same exact-target plan, checks local temporary capacity, and atomically
 persists the complete snapshot and an immediately acquirable, ownerless journal row under the
@@ -2153,6 +2189,15 @@ external `SQLITE_BUSY`/`SQLITE_LOCKED`; exhaustion returns the private-safe `Sto
 closes the failed session, releases the logical lease after workers join, and leaves the committed
 prefix immediately resumable. The public envelope contains no SQL, bound values, source identity,
 or machine path.
+
+**Every managed writer to the database queues there, not only the journal.** A second queue is
+not a queue: retained-blob marker bookkeeping — one row per acquired document — used to open its
+transaction straight against the engine while the journal's writes waited their turn, and losing
+that race raised the driver's own locked-database error. That is not a capacity refusal and was
+never an anticipated ingest outcome, so it unwound the task group: an acquisition thousands of
+documents in stopped where it stood, recorded no omission, and put the `DELETE` statement and a
+bound parameter into a report that crosses every surface. The admission lock is one object per
+engine, shared by the modules that write through it.
 
 An unchanged-token result is one fenced transaction too: it moves the journal record to
 `unchanged` and refreshes the indexed document's `last_seen_at` under the same writer lock. A

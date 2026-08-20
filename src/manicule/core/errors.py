@@ -107,10 +107,15 @@ class StorageBusyError(ManiculeError):
     control envelope.
     """
 
-    def __init__(self) -> None:
-        super().__init__(
-            "durable storage is temporarily busy; the committed acquisition prefix is safe"
-        )
+    def __init__(self, reassurance: str = "the committed acquisition prefix is safe") -> None:
+        """Args:
+        reassurance: What the caller keeps despite the refusal, in its own operation's terms.
+            The default is acquisition's, which is where this type started; a read that only
+            wanted the writer slot for a moment says instead that it changed nothing. Both
+            halves matter to somebody deciding whether to retry, and neither is derivable
+            from the type name.
+        """
+        super().__init__(f"durable storage is temporarily busy; {reassurance}")
 
 
 class NameInUseError(ManiculeError):

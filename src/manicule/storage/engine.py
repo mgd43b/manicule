@@ -6,12 +6,15 @@ most common way a SQLite schema full of ``REFERENCES`` clauses turns out to enfo
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import stat
+import threading
+import weakref
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -48,6 +51,65 @@ still declares its foreign keys, and nothing enforces them.
 "async SQLAlchemy" does not serialize writers. Without it, concurrent work fails immediately
 with ``SQLITE_BUSY`` rather than waiting.
 """
+
+
+SQLITE_BUSY_RETRY_DELAYS: Final = (0.0, 0.01, 0.05)
+"""How a writer that lost the slot waits before asking again, and how many times.
+
+Short and bounded. What this absorbs is another writer holding SQLite for a moment, which on
+one machine is what contention looks like; a conflict that outlives three attempts is a
+condition an operator has to know about rather than one to keep waiting on.
+"""
+
+_WRITER_ADMISSION: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
+_WRITER_ADMISSION_LOCK = threading.Lock()
+
+
+def writer_admission(engine: AsyncEngine) -> asyncio.Lock:
+    """The one queue every managed writer to this database waits in.
+
+    SQLite has a single writer, and "async SQLAlchemy" does not serialize anything — each
+    connection runs on its own thread, so concurrent writers race for the slot instead of
+    queueing for it. Losing that race is not always waitable either: a transaction that has
+    already read and then writes is asking for an upgrade, and SQLite refuses those
+    immediately rather than risk a deadlock, whatever ``busy_timeout`` says.
+
+    So writers queue here first, before opening a transaction. **One lock per engine, shared by
+    every module that writes**, because a second queue is not a queue: the acquisition journal
+    waiting politely while blob bookkeeping writes whenever it likes is the arrangement that
+    produced a run-ending `database is locked` on a five-row DELETE.
+    """
+    with _WRITER_ADMISSION_LOCK:
+        admission = _WRITER_ADMISSION.get(engine)
+        if admission is None:
+            admission = asyncio.Lock()
+            _WRITER_ADMISSION[engine] = admission
+        return admission
+
+
+def sqlite_busy(error: BaseException) -> bool:
+    """Recognize SQLITE_BUSY through SQLAlchemy without retaining its SQL-shaped wrapper.
+
+    Here rather than beside one caller because two now ask the same question — the acquisition
+    journal, which retries, and re-embed's writer transactions, which refuse — and a second
+    copy of this walk would be a second answer to "is this contention or corruption". The walk
+    is needed at all because SQLAlchemy wraps the driver error and a retry policy keyed on
+    message text is a retry policy that stops working when a driver rewords itself.
+    """
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        code = getattr(current, "sqlite_errorcode", None)
+        if isinstance(code, int) and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return True
+        for related in (getattr(current, "orig", None), current.__cause__, current.__context__):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    return False
 
 
 class StorageLayoutError(Exception):

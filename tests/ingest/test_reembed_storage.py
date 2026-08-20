@@ -12,10 +12,11 @@ from typing import TYPE_CHECKING, override
 import lancedb
 import pytest
 from pydantic import TypeAdapter
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, event, func, insert, select, update
 
 from manicule.core.content import Chunk
 from manicule.core.embedding import IndexFingerprints, Vector
+from manicule.core.errors import StorageBusyError
 from manicule.ingest.reembed import (
     CorpusSnapshot,
     PublishOutcome,
@@ -31,7 +32,7 @@ from manicule.ingest.reembed import (
 from manicule.ingest.sweeps import sweep_vectors
 from manicule.storage import models
 from manicule.storage.docstore import SqliteDocStore
-from manicule.storage.engine import VECTORS_DIRNAME
+from manicule.storage.engine import VECTORS_DIRNAME, create_engine
 from manicule.storage.migrator import downgrade
 from manicule.storage.reembed import (
     LanceShadowGenerations,
@@ -54,7 +55,9 @@ from tests.storage_helpers import fingerprint, make_chunk, make_document
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from sqlalchemy.engine.interfaces import DBAPIConnection
     from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.pool import ConnectionPoolEntry
 
     from manicule.ingest.reembed import ReembedLease, ShadowGeneration
     from manicule.storage.docstore import SqliteDocStore
@@ -365,6 +368,56 @@ async def seeded_run(
         lease=lease,
     )
     return authority, shadows, run, lease, generation, source, [0.0, 1.0, 0.0, 0.0], corpus
+
+
+async def test_a_writer_slot_another_process_holds_refuses_without_the_driver_s_words(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    """The lock is real here, not simulated, because the wrapper is what used to escape.
+
+    Opening a corpus snapshot takes SQLite's writer slot outright — that is what
+    ``BEGIN IMMEDIATE`` is for — and on a single-file database another writer holding it is
+    ordinary rather than exceptional. What was not ordinary was the result: SQLAlchemy's
+    ``OperationalError``, carrying the statement and the database path, escaping a read-only
+    planning call and reaching the browser as an unhandled 500.
+
+    The second engine sets ``busy_timeout`` to zero so the contention is decided immediately
+    instead of five seconds from now. That changes when SQLite gives up, not what it reports.
+    """
+    await store.ensure_workspace()
+    probe = create_engine(data_dir)
+
+    def refuse_to_wait(dbapi_connection: DBAPIConnection, _record: ConnectionPoolEntry) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA busy_timeout = 0")
+        finally:
+            cursor.close()
+
+    event.listen(probe.sync_engine, "connect", refuse_to_wait)
+    holder = await engine.connect()
+    try:
+        await holder.exec_driver_sql("BEGIN IMMEDIATE")
+        with pytest.raises(StorageBusyError) as refused:
+            await SqliteReembedCorpus(probe, "default").begin_snapshot()
+    finally:
+        await holder.rollback()
+        await holder.close()
+        await probe.dispose()
+
+    message = str(refused.value)
+    assert "temporarily busy" in message
+    assert "nothing durable changed" in message, (
+        "a caller deciding whether to retry needs to know the refused read cost it nothing"
+    )
+    for driver_text in ("BEGIN", "IMMEDIATE", "locked", "sqlite", str(data_dir)):
+        assert driver_text not in message
+    async with engine.connect() as connection:
+        count = (
+            await connection.execute(select(func.count()).select_from(models.ReembedCorpusSnapshot))
+        ).scalar_one()
+    assert count == 0, "a refused snapshot is one that was never begun"
+    await downgrade(engine, "6e31b7d592ac")
 
 
 @pytest.mark.parametrize(

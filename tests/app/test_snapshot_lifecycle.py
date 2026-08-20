@@ -277,6 +277,52 @@ async def test_rebuild_plan_is_deferred_and_live_status_reports_remaining_items(
     assert status.lifecycle.estimated_remaining_items == 1
 
 
+async def test_a_generation_left_building_with_no_live_lease_is_not_reported_as_running() -> None:
+    """The same distinction the acquisition side already draws, on the derived side.
+
+    A rebuild that dies mid-build cannot correct its own row on the way out — a storage failure
+    is exactly the loss of the ability to write it — so ``building`` covers two opposite
+    situations: a worker deriving documents right now, and a checkpoint nobody has touched
+    since a worker died beside it. The lease is the only evidence that separates them, and an
+    operator who cannot tell them apart waits on work that will never resume.
+    """
+    backend = _backend()
+    service = ApplicationService(backend)
+
+    backend.ingestion_.rebuild_lease = (
+        "offline-rebuild-synthetic",
+        datetime.now(UTC) + timedelta(minutes=5),
+    )
+    working = await service.rebuild_status("generation-aggregate-1")
+
+    backend.ingestion_.rebuild_lease = (
+        "offline-rebuild-synthetic",
+        datetime.now(UTC) - timedelta(minutes=5),
+    )
+    lapsed = await service.rebuild_status("generation-aggregate-1")
+
+    backend.ingestion_.rebuild_lease = None
+    unowned = await service.rebuild_status("generation-aggregate-1")
+
+    assert working.lifecycle.outcome == "running", (
+        "a live lease is the one thing that makes 'running' true of a generation"
+    )
+    assert lapsed.lifecycle.outcome == "incomplete", (
+        "an expired lease is a generation with no worker: unfinished, inactive, and resumable "
+        "from the documents already committed"
+    )
+    assert unowned.lifecycle.outcome == "incomplete", (
+        "a generation whose lease was never held reads the same way, because it is the same "
+        "situation: durable progress and nobody advancing it"
+    )
+    assert lapsed.documents_built == working.documents_built, (
+        "losing a lease costs the generation its worker, not its committed documents"
+    )
+    assert lapsed.lifecycle.can_continue_offline, (
+        "the whole point of saying 'incomplete' is that resuming is the available move"
+    )
+
+
 async def test_rebuild_plan_missing_inputs_is_a_typed_refused_surface_result() -> None:
     backend = _backend()
     backend.ingestion_.rebuild_missing_count = 1

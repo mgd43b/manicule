@@ -913,6 +913,12 @@ class FakeIngestion:
 
     rebuild_missing_count: int = 0
     rebuild_failure: Exception | None = None
+    rebuild_lease: tuple[str, datetime] | None = None
+    """Owner and expiry of the generation :meth:`rebuild_status` reports, when one is held.
+
+    Unset by default, because that is what a generation left behind by a dead worker looks
+    like: a durable row still describing unfinished work with nobody on it.
+    """
 
     async def rebuild_plan(self, snapshot_run_id: str) -> RebuildEstimate:
         if self.rebuild_failure is not None:
@@ -951,6 +957,7 @@ class FakeIngestion:
     async def rebuild_status(self, generation_id: str) -> RebuildCheckpoint | None:
         if self.rebuild_failure is not None:
             raise self.rebuild_failure
+        owner, expires_at = self.rebuild_lease or (None, None)
         return RebuildCheckpoint(
             generation_id=generation_id,
             state=RebuildState.BUILDING,
@@ -960,6 +967,9 @@ class FakeIngestion:
             chunks_built=3,
             vectors_reused=0,
             vectors_embedded=3,
+            lease_owner=owner,
+            lease_generation=1 if owner else 0,
+            lease_expires_at=expires_at,
         )
 
     async def reindex(self, document_id: str) -> ReindexReport:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from manicule.core.acquisition import AcquiredSource
 from manicule.core.content import Chunk, Document
@@ -175,6 +175,9 @@ class RebuildCheckpoint(BaseModel):
     vectors_embedded: int = Field(ge=0)
     lease_owner: str | None = None
     lease_generation: int = Field(default=0, ge=0)
+    # Aware, because a status surface asks whether this lease is still live and a naive
+    # timestamp cannot answer that without guessing a timezone.
+    lease_expires_at: AwareDatetime | None = None
     fence_generation: int | None = Field(default=None, ge=1)
     diagnostic_code: RebuildRefusalCode | None = None
     diagnostic_count: int = Field(default=0, ge=0)

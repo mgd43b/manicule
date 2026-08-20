@@ -22,10 +22,12 @@ from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import TypeAdapter
 from sqlalchemy import delete, func, insert, or_, select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from manicule.core.content import Chunk
 from manicule.core.embedding import EmbedFingerprint, Vector, embedding_input_identity
+from manicule.core.errors import StorageBusyError
 from manicule.ingest.reembed import (
     ChunkKey,
     CorpusSnapshot,
@@ -45,6 +47,7 @@ from manicule.ingest.reembed import (
     SnapshotInventoryDigester,
 )
 from manicule.storage import models
+from manicule.storage.engine import sqlite_busy
 from manicule.storage.rows import to_chunk, to_document
 from manicule.storage.types import utcnow
 from manicule.storage.vectors import LanceVectorStore, generation_pin
@@ -70,6 +73,27 @@ def _json(adapter: TypeAdapter[Any], value: object) -> str:
 def _generation_id(workspace_id: str, run_id: str) -> str:
     identity = f"{workspace_id}\0{run_id}"
     return f"reembed-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+async def _begin_immediate(connection: AsyncConnection, *, reassurance: str) -> None:
+    """Take SQLite's writer slot now, or refuse in a vocabulary a surface can render.
+
+    ``BEGIN IMMEDIATE`` is how these transactions avoid upgrading a reader mid-way, and its
+    failure mode is the ordinary one on a single-file database: another writer holds it, the
+    busy timeout runs out, and SQLite says so. Left alone that arrives at the caller as a
+    driver exception carrying SQL and a machine path, which :func:`~manicule.app.dispatch.run_op`
+    deliberately does not convert — so it reached the browser as an unhandled 500 from a page
+    whose only crime was asking what a re-embed would cost.
+
+    Contention is not corruption, so it refuses as :class:`StorageBusyError`: bounded, typed,
+    already carrying a retry hint, and holding none of the driver's text.
+    """
+    try:
+        await connection.exec_driver_sql("BEGIN IMMEDIATE")
+    except SQLAlchemyError as error:
+        if not sqlite_busy(error):
+            raise
+        raise StorageBusyError(reassurance) from error
 
 
 class SqliteReembedCorpus:
@@ -106,7 +130,9 @@ class SqliteReembedCorpus:
         snapshot_id = f"snapshot-{uuid.uuid4().hex}"
         connection = await self._engine.connect()
         try:
-            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            await _begin_immediate(
+                connection, reassurance="no plan was made and nothing durable changed"
+            )
             revision = str(
                 (
                     await connection.execute(
@@ -409,7 +435,9 @@ class SqliteReembedStore:
         """Hold SQLite's writer lock and the current fence across an external mutation."""
         connection = await self._engine.connect()
         try:
-            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            await _begin_immediate(
+                connection, reassurance="this run's committed checkpoint is unchanged"
+            )
             await self._require_lease(connection, run_id, lease)
             yield connection
             await self._require_lease(connection, run_id, lease)
@@ -1048,7 +1076,9 @@ class SqliteReembedStore:
     async def _immediate(self) -> AsyncGenerator[AsyncConnection]:
         connection = await self._engine.connect()
         try:
-            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            await _begin_immediate(
+                connection, reassurance="this run's committed checkpoint is unchanged"
+            )
             yield connection
             await connection.commit()
         except BaseException:

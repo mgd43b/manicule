@@ -76,6 +76,13 @@ Nowhere in this package. Every page does the same three things:
    envelope every other surface serializes;
 3. render that envelope.
 
+**The operations of one page run together.** They are independent by construction — counts, a
+diagnosis, a list of workspaces — so awaiting them one after another cost a page the sum of its
+parts for no reason beyond the order somebody wrote them in, and put the slowest operation in
+front of every other. `manicule.web.rendering.panels` runs them at once and hands them back in
+the requested order, so a template neither knows nor reorders. A panel that fails still fails
+alone: it is the same envelope, shown in its own place on the page, beside the ones that worked.
+
 **It renders against the service rather than consuming its own HTTP API.** The alternative — a
 page that fetches `/api/v1/...` from the process serving it — was rejected because it would need
 a credential to talk to itself. With `security.auth.mode = api_key` every request carries a key,

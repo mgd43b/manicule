@@ -46,7 +46,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from manicule.api.context import Service
 from manicule.web.areas import AREAS, NAVIGATION
-from manicule.web.rendering import SCRIPT, STYLESHEET, panel, render
+from manicule.web.rendering import SCRIPT, STYLESHEET, PanelCall, panel, panels, render
 from manicule.web.security import Guest, Operator, Reader
 
 router = APIRouter(prefix="/ui", tags=["web"])
@@ -105,11 +105,14 @@ async def dashboard(service: Service, caller: Reader) -> HTMLResponse:
         title="Dashboard",
         service=service,
         caller=caller,
-        panels={
-            "stats": await panel("stats", service, service.stats),
-            "doctor": await panel("doctor", service, service.doctor),
-            "workspaces": await panel("workspace_list", service, service.workspace_list),
-        },
+        panels=await panels(
+            service,
+            {
+                "stats": ("stats", service.stats),
+                "doctor": ("doctor", service.doctor),
+                "workspaces": ("workspace_list", service.workspace_list),
+            },
+        ),
     )
 
 
@@ -314,10 +317,13 @@ async def collections(service: Service, caller: Reader) -> HTMLResponse:
         title="Collections",
         service=service,
         caller=caller,
-        panels={
-            "collections": await panel("collection_list", service, service.collection_list),
-            "tags": await panel("tag_list", service, service.tag_list),
-        },
+        panels=await panels(
+            service,
+            {
+                "collections": ("collection_list", service.collection_list),
+                "tags": ("tag_list", service.tag_list),
+            },
+        ),
     )
 
 
@@ -379,12 +385,13 @@ async def plugins(service: Service, caller: Operator) -> HTMLResponse:
         title="Plugins",
         service=service,
         caller=caller,
-        panels={
-            "plugins": await panel(
-                "plugin_list", service, lambda: service.plugin_list(registry=False)
-            ),
-            "health": await panel("plugin_health", service, service.plugin_health),
-        },
+        panels=await panels(
+            service,
+            {
+                "plugins": ("plugin_list", lambda: service.plugin_list(registry=False)),
+                "health": ("plugin_health", service.plugin_health),
+            },
+        ),
     )
 
 
@@ -429,18 +436,17 @@ async def admin(
         title="Admin",
         service=service,
         caller=caller,
-        panels={
-            "index": await panel("index_status", service, service.index_status),
-            "quality": await panel("search_quality", service, service.search_quality),
-            "queries": await panel(
-                "query_logs", service, lambda: service.query_logs(limit=limit, offset=offset)
-            ),
-            "audit": await panel(
-                "audit_log", service, lambda: service.audit_log(limit=limit, offset=offset)
-            ),
-            "plugins": await panel("plugin_health", service, service.plugin_health),
-            "connectors": await panel("connector_list", service, service.connector_list),
-        },
+        panels=await panels(
+            service,
+            {
+                "index": ("index_status", service.index_status),
+                "quality": ("search_quality", service.search_quality),
+                "queries": ("query_logs", lambda: service.query_logs(limit=limit, offset=offset)),
+                "audit": ("audit_log", lambda: service.audit_log(limit=limit, offset=offset)),
+                "plugins": ("plugin_health", service.plugin_health),
+                "connectors": ("connector_list", service.connector_list),
+            },
+        ),
         extra={"limit": limit, "offset": offset},
     )
 
@@ -454,18 +460,16 @@ async def _reembed_page(
     *,
     run_id: str = "",
 ) -> HTMLResponse:
-    panels = {"plan": await panel("reembed_plan", service, service.reembed_plan)}
+    requested: dict[str, tuple[str, PanelCall]] = {"plan": ("reembed_plan", service.reembed_plan)}
     if run_id:
-        panels["status"] = await panel(
-            "reembed_status", service, lambda: service.reembed_status(run_id)
-        )
+        requested["status"] = ("reembed_status", lambda: service.reembed_status(run_id))
     return render(
         "reembed.html",
         area="reembed",
         title="Re-embed",
         service=service,
         caller=caller,
-        panels=panels,
+        panels=await panels(service, requested),
         extra={"run_id": run_id},
     )
 
@@ -497,36 +501,31 @@ async def lifecycle_page(
     generation_id: Annotated[str, Query(max_length=200)] = "",
 ) -> HTMLResponse:
     """Read-only lifecycle plans; destructive confirmation stays outside the browser."""
-    panels = {
-        "reset": await panel(
+    requested: dict[str, tuple[str, PanelCall]] = {
+        "reset": (
             "lifecycle_reset_derived",
-            service,
             lambda: service.lifecycle_reset_derived(dry_run=True),
         ),
-        "cleanup": await panel(
+        "cleanup": (
             "lifecycle_cleanup_generations",
-            service,
             lambda: service.lifecycle_cleanup_generations(dry_run=True),
         ),
     }
     if before is not None:
-        panels["history"] = await panel(
+        requested["history"] = (
             "lifecycle_release_history",
-            service,
             lambda: service.lifecycle_release_history(before, dry_run=True),
         )
     if run_id:
-        panels["snapshot"] = await panel(
+        requested["snapshot"] = (
             "lifecycle_delete_snapshot",
-            service,
             lambda: service.lifecycle_delete_snapshot(run_id, dry_run=True),
         )
-        panels["rebuild"] = await panel(
-            "rebuild_plan", service, lambda: service.rebuild_plan(run_id)
-        )
+        requested["rebuild"] = ("rebuild_plan", lambda: service.rebuild_plan(run_id))
     if generation_id:
-        panels["rebuild_status"] = await panel(
-            "rebuild_status", service, lambda: service.rebuild_status(generation_id)
+        requested["rebuild_status"] = (
+            "rebuild_status",
+            lambda: service.rebuild_status(generation_id),
         )
     return render(
         "lifecycle.html",
@@ -534,7 +533,7 @@ async def lifecycle_page(
         title="Lifecycle",
         service=service,
         caller=caller,
-        panels=panels,
+        panels=await panels(service, requested),
         extra={
             "before": before.isoformat() if before is not None else "",
             "run_id": run_id,
@@ -566,10 +565,10 @@ async def settings(service: Service, caller: Operator) -> HTMLResponse:
         title="Settings",
         service=service,
         caller=caller,
-        panels={
-            "doctor": await panel("doctor", service, service.doctor),
-            "index": await panel("index_status", service, service.index_status),
-        },
+        panels=await panels(
+            service,
+            {"doctor": ("doctor", service.doctor), "index": ("index_status", service.index_status)},
+        ),
     )
 
 
@@ -594,10 +593,13 @@ async def auth(service: Service, caller: Operator) -> HTMLResponse:
         title="API keys",
         service=service,
         caller=caller,
-        panels={
-            "api_keys": await panel("api_key_list", service, service.api_key_list),
-            "providers": await panel("auth_providers", service, service.auth_providers),
-        },
+        panels=await panels(
+            service,
+            {
+                "api_keys": ("api_key_list", service.api_key_list),
+                "providers": ("auth_providers", service.auth_providers),
+            },
+        ),
         extra={"key_id": caller.identity.key_id, "key_name": caller.identity.key_name},
     )
 

@@ -1052,6 +1052,98 @@ async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omiss
     assert "wiki.example.test" not in rendered
 
 
+async def test_a_released_generation_keeps_its_prefix_and_is_taken_over_by_the_next_run(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The difference between a settlement and an ending, on the one row where it costs.
+
+    A storage failure says nothing about the documents already derived — a writer held SQLite
+    for six seconds, a disk was briefly full — so it records why the attempt stopped and gives
+    the generation up. `fail_generation` would be the other thing: `claim_generation` refuses a
+    failed generation forever, so ending one over contention means cleanup and deriving the
+    whole corpus again for a condition that had already passed.
+
+    Two attempts release here, because the count is what tells an operator that a failure they
+    were told was transient is not.
+    """
+    rebuilds, claimed, _ = await staged_glossary_generation(store, engine, data_dir)
+    # Read the row rather than trusting the claim: the fixture staged and began validating
+    # after it, and what release has to preserve is where the generation actually got to.
+    before = await rebuilds.checkpoint(claimed.generation_id)
+    built = before.documents_built
+    assert built, "the fixture has to have committed something for losing it to mean anything"
+
+    released = await rebuilds.release_generation(
+        claimed.generation_id,
+        RebuildRefusalCode.STORAGE_FAILED,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+    assert released.state is before.state, (
+        "released is not ended: the state it was in is the state it stays in, which is what "
+        "makes the next claim a takeover rather than a refusal"
+    )
+    assert released.state is not RebuildState.FAILED
+    assert released.diagnostic_code is RebuildRefusalCode.STORAGE_FAILED
+    assert released.diagnostic_count == 1
+    assert released.lease_owner is None, "nobody owns it, which is what status reports"
+    assert released.lease_expires_at is None
+    assert released.documents_built == built
+
+    successor = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "successor",
+        now=NOW + timedelta(minutes=1),
+        expires_at=NOW + timedelta(minutes=6),
+    )
+
+    assert successor.state is RebuildState.BUILDING
+    assert successor.documents_built == built, "the takeover resumes rather than starting over"
+    assert successor.next_sequence == before.next_sequence
+    assert successor.lease_generation > claimed.lease_generation
+    assert successor.lease_owner == "successor"
+
+    again = await rebuilds.release_generation(
+        claimed.generation_id,
+        RebuildRefusalCode.STORAGE_FAILED,
+        owner="successor",
+        lease_generation=successor.lease_generation,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert again.diagnostic_count == 2, (
+        "one storage failure is contention; the same one twice is a machine somebody has to look at"
+    )
+
+
+async def test_releasing_a_generation_another_owner_holds_is_refused(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """Giving up a generation is still a write, and a lost lease is the loss of that right."""
+    rebuilds, claimed, _ = await staged_glossary_generation(store, engine, data_dir)
+    await rebuilds.claim_generation(
+        claimed.generation_id,
+        "successor",
+        now=NOW + timedelta(minutes=10),
+        expires_at=NOW + timedelta(minutes=15),
+    )
+
+    with pytest.raises(RebuildLeaseConflictError):
+        await rebuilds.release_generation(
+            claimed.generation_id,
+            RebuildRefusalCode.STORAGE_FAILED,
+            owner="glossary-publisher",
+            lease_generation=claimed.lease_generation,
+            now=NOW + timedelta(minutes=11),
+        )
+
+
 @pytest.mark.parametrize("damage", ["missing", "corrupt", "symlink", "ref", "manifest"])
 async def test_publication_rechecks_retained_blob_integrity_before_settlement(
     store: SqliteDocStore,

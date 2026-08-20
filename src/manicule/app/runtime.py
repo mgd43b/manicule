@@ -25,8 +25,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Self, cast, override
+from typing import TYPE_CHECKING, Any, Final, Self, cast, override
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -36,7 +37,7 @@ from manicule.container import keys
 from manicule.container.container import Container, build_container
 from manicule.core.content import RawDocument
 from manicule.core.errors import ManiculeError, PolicyError, UnknownEntityError
-from manicule.core.lifecycle import HealthState
+from manicule.core.lifecycle import HealthReport, HealthState
 from manicule.ingest.capacity import CapacityRefusedError
 from manicule.ingest.recovery import InstanceLock
 from manicule.plugins.manifest import ComponentKind
@@ -166,6 +167,28 @@ class _Lazy:
     value: object | None = None
 
 
+COMPONENT_HEALTH_TTL_S: Final = 10.0
+"""How long one component-health sweep answers for before it is taken again.
+
+Long enough that a page and its refresh do not each go out to every configured source; short
+enough that an operator who has just fixed something sees it, rather than learning to distrust
+the page and go to a terminal.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _Observation:
+    """One component-health sweep: what it found, when, and of what.
+
+    ``scope`` is what was constructed at the time. Kept because a sweep is only an answer
+    about the components it actually asked.
+    """
+
+    report: HealthReport
+    at: float
+    scope: tuple[str, ...]
+
+
 class Runtime:
     """A whole manicule, assembled from configuration and what plugins registered."""
 
@@ -180,6 +203,8 @@ class Runtime:
         self._writer = writer
         self._lock: InstanceLock | None = None
         self._derived_mutation_lock = asyncio.Lock()
+        self._health: _Observation | None = None
+        self._health_lock = asyncio.Lock()
 
     # --- lifecycle --------------------------------------------------------------------------
 
@@ -472,16 +497,51 @@ class Runtime:
         — and an empty list is the honest answer to "how are the components you have not made
         yet", where a fabricated "ok" would be a diagnostic that reports health it never
         measured.
+
+        **Recent observations are reused rather than re-measured**, because this is the one
+        part of ``doctor`` that leaves the machine, and ordinary navigation asks for it
+        repeatedly: a dashboard, a refresh, the settings page beside it. What that buys is
+        paid for honestly — every check says how long ago it was observed, and one that was
+        not measured just now says so rather than presenting an old green as a new one.
         """
-        report = await self._container.health()
+        observation, fresh = await self._component_health()
+        age = max(0.0, monotonic() - observation.at)
         return [
             Check(
                 name=f"component:{check.name}",
                 state=_state_name(check.state),
-                detail=check.detail,
+                detail=check.detail if fresh else f"{check.detail} (observed {age:.0f}s ago)",
+                facts={"observed_seconds_ago": round(age, 3), "freshly_measured": fresh},
             )
-            for check in sorted(report.checks, key=lambda check: check.name)
+            for check in sorted(observation.report.checks, key=lambda check: check.name)
         ]
+
+    async def _component_health(self) -> tuple[_Observation, bool]:
+        """The last sweep while it is recent, or a new one. Never two at once.
+
+        The lock is what makes a page cheap rather than merely cached: a dashboard runs its
+        panels together, and without it the first two would each start their own fleet-wide
+        sweep and the cache would be populated twice by the work it exists to avoid.
+
+        The scope check is why the cache cannot go quietly stale in the way that matters.
+        Components are built lazily, so the set of things worth asking grows during a process's
+        life; an observation taken before a connector existed is not an observation of a
+        healthy connector, and reusing it would report health for something nobody asked.
+        """
+        scope = tuple(self._container.describe())
+        async with self._health_lock:
+            current = self._health
+            if (
+                current is not None
+                and current.scope == scope
+                and monotonic() - current.at < COMPONENT_HEALTH_TTL_S
+            ):
+                return current, False
+            observed = _Observation(
+                report=await self._container.health(), at=monotonic(), scope=scope
+            )
+            self._health = observed
+            return observed, True
 
     # --- construction -----------------------------------------------------------------------
 
