@@ -82,9 +82,51 @@ class DiscoveredDoc(BaseModel):
         return self.ref.source_id
 
 
+class EnumerationProgress(BaseModel):
+    """Aggregate-only facts about a connector's live enumeration, for durable diagnostics.
+
+    Counts, sizes and closed booleans — never a source identity, space key, URL, credential
+    or response fragment, because everything here is persisted on the acquisition run and
+    served by every status surface. A connector that adapts its request shape mid-walk (the
+    Confluence direct inventory shrinks its page size when a deep offset times out) is
+    otherwise indistinguishable from one that is hung, and an operator who cannot tell those
+    apart restarts a run that was working.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="The current stream's next explicit offset — a count of rows already "
+        "admitted, never a source identity.",
+    )
+    requested_page_size: int | None = Field(
+        default=None,
+        ge=1,
+        description="The page size the next request will ask for, after any adaptation.",
+    )
+    timeout_retries: int = Field(
+        default=0,
+        ge=0,
+        description="How many requests timed out and were re-asked with a smaller page.",
+    )
+    page_size_reduced: bool = Field(
+        default=False,
+        description="Whether any timeout shrank the requested page below its configured size.",
+    )
+    reached_empty_page: bool | None = Field(
+        default=None,
+        description="Whether the walk ended at a validated explicit empty page. ``None`` when "
+        "the enumeration does not prove its end that way — an incremental query, or a "
+        "connector without explicit offsets.",
+    )
+
+
 __all__ = [
     "DiscoveredDoc",
     "DocRef",
+    "EnumerationProgress",
     "SourceId",
     "Watermark",
 ]

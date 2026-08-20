@@ -41,6 +41,10 @@ from manicule.storage.vectors import LanceVectorStore
 from tests.fakes import HashEmbedder
 from tests.storage_helpers import make_chunk, make_document
 
+_LEGACY_NOW = "2026-08-18 00:00:00+00:00"
+"""Written as text, the way the stored column holds it: binding a `datetime` through raw
+SQL reaches sqlite3's deprecated adapter rather than the type this schema declares."""
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -1409,5 +1413,97 @@ async def test_a_document_whose_parse_is_unaffected_records_no_staleness(data_di
         assert "content_hash" not in recorded, (
             "a document whose parse is unaffected was marked as owing a re-parse"
         )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
+async def test_enumeration_progress_upgrades_a_database_that_predates_it(
+    data_dir: Path,
+) -> None:
+    """An existing run keeps "no adaptive claim" rather than acquiring a false one.
+
+    The tri-state column is the reason this needs its own test: backfilling
+    ``enumeration_reached_empty_page`` with ``false`` would report every run recorded before
+    this revision — and every search-backed run after it — as an authoritative walk that
+    stopped short of its end, which is a different and alarming fact.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="f3c18a9d72e1")
+        async with engine.connect() as connection:
+            before = (await connection.execute(text("PRAGMA table_info(acquisition_runs)"))).all()
+        assert "enumeration_page_size" not in {row[1] for row in before}
+
+        # Written with raw SQL rather than through the store: the ORM already knows about the
+        # columns this revision adds, so it cannot speak to the schema that predates them —
+        # which is exactly the database this test exists to migrate.
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces (id, name, mode, settings, created_at, "
+                    " derived_reset_epoch) "
+                    "VALUES ('workspace-legacy', 'legacy', 'personal', '{}', :now, 0)"
+                ),
+                {"now": _LEGACY_NOW},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO connectors (id, workspace_id, name, type, config, "
+                    " sync_interval_seconds, status, metadata, created_at) "
+                    "VALUES ('connector-legacy', 'workspace-legacy', 'wiki', 'confluence', "
+                    " '{}', 0, 'idle', '{}', :now)"
+                ),
+                {"now": _LEGACY_NOW},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO acquisition_runs "
+                    "(id, workspace_id, connector_id, connector_name, source_scope, "
+                    " scope_fingerprint, full_inventory_authority, scope_inventory_complete, "
+                    " promotion_policy, state, inventory_state, reconciled_deleted_count, "
+                    " omission_count, omission_reasons, lease_generation, discovered_count, "
+                    " acquired_count, indexed_count, unchanged_count, reused_count, "
+                    " retry_count, metadata_bytes, acquired_blob_bytes, created_at, updated_at) "
+                    "VALUES ('legacy-run', 'workspace-legacy', 'connector-legacy', 'wiki', "
+                    " 'legacy-scope', 'legacy-fingerprint', '', 1, 'require_complete', "
+                    " 'enumerating', 'current', 0, 0, '{}', 0, 0, 0, 0, 0, 0, 0, 0, 0, "
+                    " :now, :now)"
+                ),
+                {"now": _LEGACY_NOW},
+            )
+
+        await upgrade(engine)
+        async with engine.connect() as connection:
+            after = (await connection.execute(text("PRAGMA table_info(acquisition_runs)"))).all()
+        columns = {row[1] for row in after}
+        assert {
+            "enumeration_offset",
+            "enumeration_page_size",
+            "enumeration_timeout_retries",
+            "enumeration_page_size_reduced",
+            "enumeration_reached_empty_page",
+        } <= columns
+
+        async with engine.connect() as connection:
+            migrated = (
+                await connection.execute(
+                    text(
+                        "SELECT enumeration_offset, enumeration_page_size, "
+                        " enumeration_timeout_retries, enumeration_page_size_reduced, "
+                        " enumeration_reached_empty_page "
+                        "FROM acquisition_runs WHERE id = 'legacy-run'"
+                    )
+                )
+            ).one()
+        # NULL, not zero and not false: the pre-existing run made no adaptive claim, and the
+        # tri-state empty-page column must keep saying so rather than reporting a walk that
+        # stopped short of an end it never promised to reach.
+        assert migrated.enumeration_offset is None
+        assert migrated.enumeration_page_size is None
+        assert migrated.enumeration_reached_empty_page is None
+        assert migrated.enumeration_timeout_retries == 0
+        assert migrated.enumeration_page_size_reduced == 0
+        assert await current(engine) == head_revision()
     finally:
         await engine.dispose()

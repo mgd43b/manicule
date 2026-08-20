@@ -45,7 +45,7 @@ from manicule.core.errors import (
     UnknownEntityError,
 )
 from manicule.core.ids import acquisition_marker_id
-from manicule.core.sources import Watermark
+from manicule.core.sources import EnumerationProgress, Watermark
 from manicule.ingest.capacity import (
     CapacityDiagnostic,
     CapacityRefusedError,
@@ -512,6 +512,11 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         retry_count=row.retry_count,
         metadata_bytes=row.metadata_bytes,
         acquired_blob_bytes=row.acquired_blob_bytes,
+        enumeration_offset=row.enumeration_offset,
+        enumeration_page_size=row.enumeration_page_size,
+        enumeration_timeout_retries=row.enumeration_timeout_retries,
+        enumeration_page_size_reduced=row.enumeration_page_size_reduced,
+        enumeration_reached_empty_page=row.enumeration_reached_empty_page,
         diagnostic=_safe_diagnostic(row.diagnostic),
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -2142,6 +2147,57 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                 ),
             )
             return result.rowcount == 1
+
+    @translate_storage_capacity_errors
+    async def record_acquisition_enumeration_progress(
+        self,
+        run_id: str,
+        owner: str,
+        generation: int,
+        *,
+        now: datetime,
+        progress: EnumerationProgress,
+        diagnostic: AcquisitionDiagnostic | UnsetValue | None = UNSET,
+    ) -> bool:
+        """Persist aggregate adaptive-enumeration facts under the run's generation fence.
+
+        ``diagnostic`` carries three intents, told apart the same way record updates tell
+        them apart everywhere else in this journal: :data:`UNSET` leaves whatever is stored
+        (the ordinary between-pages update), ``None`` clears it (a fresh enumeration starting
+        over must not inherit the last failure's category), and a value records the typed
+        terminal category — adaptive timeout exhaustion, most importantly — while the lease
+        is still held, so a status read after release sees why the run stopped.
+        """
+        values: dict[str, object] = {
+            "enumeration_offset": progress.offset,
+            "enumeration_page_size": progress.requested_page_size,
+            "enumeration_timeout_retries": progress.timeout_retries,
+            "enumeration_page_size_reduced": progress.page_size_reduced,
+            "enumeration_reached_empty_page": progress.reached_empty_page,
+            "updated_at": utcnow(),
+        }
+        if not isinstance(diagnostic, UnsetValue):
+            values["diagnostic"] = (
+                None if diagnostic is None else diagnostic.model_dump(mode="json")
+            )
+        async with self._sessions.begin() as session:
+            await self._begin_capacity_guard(session)
+            matched = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.AcquisitionRun)
+                    .where(
+                        models.AcquisitionRun.id == run_id,
+                        models.AcquisitionRun.workspace_id == self._workspace_id,
+                        models.AcquisitionRun.lease_owner == owner,
+                        models.AcquisitionRun.lease_generation == generation,
+                        models.AcquisitionRun.lease_expires_at > now,
+                        models.AcquisitionRun.superseded_at.is_(None),
+                    )
+                    .values(**values)
+                ),
+            )
+            return matched.rowcount == 1
 
     @translate_storage_capacity_errors
     async def record_acquisition_run_metadata(

@@ -165,6 +165,30 @@ class FakePage:
 
 
 @dataclass(slots=True)
+class SlowOffset:
+    """Progressive large-offset latency on the direct content inventory, deterministically.
+
+    The production shape this reproduces: the source stays reachable and healthy, early
+    offsets answer normally, and a request at a deep ``start`` stops answering within the
+    client's timeout **only when it asks for too many rows** — the same offset still answers a
+    smaller page. A fixture that slept for real would be a suite nobody runs, so the timeout
+    is raised (or, for the gateway shape, answered as a 504) the moment the request arrives.
+    """
+
+    start: int
+    """Offsets at or past this are slow."""
+
+    max_limit: int
+    """The largest requested limit the slow region still answers. Judged against the limit
+    the request *asked for*, before the fake's own page-size cap — the timeout is a property
+    of the request shape, and the cap is the source's separate lie about page sizes."""
+
+    gateway: bool = False
+    """Answer with a 504 instead of a transport-level read timeout — the same fact reported
+    by whatever sits in front of Confluence rather than by the socket."""
+
+
+@dataclass(slots=True)
 class FakeAttachment:
     id: str
     title: str
@@ -280,6 +304,9 @@ class FakeConfluence:
         difference is a subtree's worth of documents. A fixture needs to be able to produce the
         first without producing the second.
         """
+
+        self.slow_offsets: list[SlowOffset] = []
+        """Where the direct content inventory becomes too slow for large pages."""
 
         self.rejects_status_field = False
         """Whether a CQL query containing ``status`` is answered with an HTTP 400.
@@ -480,6 +507,15 @@ class FakeConfluence:
         kind = request.url.params.get("type", "")
         status = request.url.params.get("status", "")
         expanded = request.url.params.get("expand", "")
+        requested_start = int(request.url.params.get("start", "0") or "0")
+        requested_limit = int(
+            request.url.params.get("limit", str(self.page_size)) or self.page_size
+        )
+        for slow in self.slow_offsets:
+            if requested_start >= slow.start and requested_limit > slow.max_limit:
+                if slow.gateway:
+                    return httpx.Response(504, json={})
+                raise httpx.ReadTimeout("synthetic large-offset read timeout", request=request)
         items: list[FakePage | FakeAttachment] = []
         if status == "current" and kind == "page":
             items.extend(
@@ -494,11 +530,8 @@ class FakeConfluence:
                 if item.space == space and item.page_id in self.pages
             )
         rows = [self._result(item, expanded) for item in sorted(items, key=lambda item: item.id)]
-        limit = min(
-            int(request.url.params.get("limit", str(self.page_size)) or self.page_size),
-            self.page_size,
-        )
-        start = int(request.url.params.get("start", "0") or "0")
+        limit = min(requested_limit, self.page_size)
+        start = requested_start
         window = rows[start : start + limit]
         payload: dict[str, Any] = {
             "results": window,

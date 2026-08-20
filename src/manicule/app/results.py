@@ -70,6 +70,7 @@ type LifecycleOutcome = Literal[
 ]
 type InventoryRecovery = Literal["", "reenumeration_required", "reenumerating", "reconciled"]
 type FullInventoryAuthority = Literal["", "search", "direct_current_content"]
+type EnumerationFailureCode = Literal["", "source_timeout", "cursor_expired", "authentication"]
 type LifecycleRefusalCode = Literal[
     "capacity",
     "snapshot_not_promoted",
@@ -151,6 +152,32 @@ class LifecycleProgress(Payload):
     inventory_recovery: InventoryRecovery = ""
     reconciled_deleted_items: int = Field(default=0, ge=0)
     full_inventory_authority: FullInventoryAuthority = ""
+
+    enumeration_offset: int | None = Field(
+        default=None,
+        ge=0,
+        description="The enumeration's current explicit offset, as a count of rows already "
+        "admitted in its current stream — never a source identity.",
+    )
+    enumeration_page_size: int | None = Field(
+        default=None,
+        ge=1,
+        description="The effective requested page size after any timeout adaptation. ``None`` "
+        "means the connector made no adaptive claim.",
+    )
+    enumeration_timeout_retries: int = Field(default=0, ge=0)
+    enumeration_page_size_reduced: bool = False
+    enumeration_reached_empty_page: bool | None = Field(
+        default=None,
+        description="Whether the authoritative walk ended at a validated explicit empty page. "
+        "``None`` when the enumeration does not prove its end that way; ``False`` while it "
+        "has not; ``True`` only at the true end.",
+    )
+    enumeration_failure_code: EnumerationFailureCode = ""
+    """The typed terminal category an enumeration failure earned — ``source_timeout`` when
+    the bounded adaptive page-size policy was exhausted. Together these six fields let a
+    status reader tell active progress, retryable source latency, exhausted timeout and
+    terminal completion apart without a single private value."""
 
     @model_validator(mode="after")
     def terminal_and_refusal_are_consistent(self) -> Self:
@@ -1494,6 +1521,12 @@ class IngestReport(Payload):
     inventory_recovery: InventoryRecovery = ""
     reconciled_deleted_items: int = Field(default=0, ge=0)
     full_inventory_authority: FullInventoryAuthority = ""
+    enumeration_offset: int | None = Field(default=None, ge=0)
+    enumeration_page_size: int | None = Field(default=None, ge=1)
+    enumeration_timeout_retries: int = Field(default=0, ge=0)
+    enumeration_page_size_reduced: bool = False
+    enumeration_reached_empty_page: bool | None = None
+    enumeration_failure_code: EnumerationFailureCode = ""
     retry_required: bool = False
     derivation_deferred: bool = False
     intentionally_bounded: bool = False

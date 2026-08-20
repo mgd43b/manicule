@@ -60,11 +60,14 @@ from uuid import uuid4
 from manicule.chunking import finalize_chunks
 from manicule.connectors.errors import (
     BodyUnavailableError,
+    CursorExpiredError,
     NotFoundError,
     RemoteError,
+    RequestTimeoutError,
     SessionExpiredError,
 )
 from manicule.core.acquisition import (
+    UNSET,
     AcquiredSource,
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
@@ -79,6 +82,7 @@ from manicule.core.acquisition import (
     SnapshotCompleteness,
     SnapshotItemOutcome,
     SnapshotPromotionPolicy,
+    UnsetValue,
 )
 from manicule.core.content import (
     SETTLED,
@@ -99,9 +103,9 @@ from manicule.core.errors import (
     StorageBusyError,
 )
 from manicule.core.ids import content_hash, document_id
-from manicule.core.protocols import BatchedDiscoveryConnector
+from manicule.core.protocols import BatchedDiscoveryConnector, EnumerationProgressConnector
 from manicule.core.provenance import Provenance
-from manicule.core.sources import DiscoveredDoc
+from manicule.core.sources import DiscoveredDoc, EnumerationProgress
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError
 from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
@@ -109,6 +113,7 @@ from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.ports import (
     AcquisitionStore,
     BatchedAcquisitionStore,
+    EnumerationProgressStore,
     FencedIngestStore,
     GlossaryWriter,
 )
@@ -223,6 +228,30 @@ def _acquisition_diagnostic(exc: Exception) -> AcquisitionDiagnostic:
     else:
         code = AcquisitionFailureCode.FETCH_FAILED
     return AcquisitionDiagnostic(stage=AcquisitionStage.ACQUISITION, code=code)
+
+
+def _enumeration_diagnostic(exc: Exception) -> AcquisitionDiagnostic | None:
+    """The typed terminal category an enumeration failure earns, or ``None`` for the rest.
+
+    ``source_timeout`` is the one that must never be mistaken for anything else: a timed-out
+    offset is not deletion evidence, not an end-of-inventory marker and not an authentication
+    problem, and the remedy — re-run, or retune the adaptive page-size dials — is different
+    from every other code's. The rest keep the generic error fields the report already
+    carries; a run-level category is recorded only where a closed vocabulary word exists for
+    it, because an ``UNKNOWN`` stamped over every failure would tell an operator nothing the
+    error type did not.
+    """
+    if isinstance(exc, RequestTimeoutError):
+        code = AcquisitionFailureCode.SOURCE_TIMEOUT
+    elif isinstance(exc, CursorExpiredError):
+        code = AcquisitionFailureCode.CURSOR_EXPIRED
+    elif isinstance(exc, SessionExpiredError) or (
+        isinstance(exc, RemoteError) and exc.status_code in {401, 403}
+    ):
+        code = AcquisitionFailureCode.AUTHENTICATION
+    else:
+        return None
+    return AcquisitionDiagnostic(stage=AcquisitionStage.ENUMERATION, code=code)
 
 
 def _snapshot_diagnostic(exc: Exception) -> AcquisitionDiagnostic:
@@ -451,6 +480,25 @@ class RunReport:
     enumeration_completed: bool = True
     """Whether discovery exhausted the source rather than stopping or raising."""
 
+    enumeration_offset: int | None = None
+    enumeration_page_size: int | None = None
+    enumeration_timeout_retries: int = 0
+    enumeration_page_size_reduced: bool = False
+    enumeration_reached_empty_page: bool | None = None
+    """Aggregate adaptive-enumeration facts, for connectors that report them.
+
+    Counts, one size, closed booleans. ``None`` for the offset and page size means the
+    connector made no claim, and the tri-state empty-page flag keeps "no such claim" distinct
+    from "an authoritative walk stopped short" — see
+    :class:`~manicule.core.sources.EnumerationProgress`.
+    """
+
+    enumeration_failure_code: str = ""
+    """Closed :class:`~manicule.core.acquisition.AcquisitionFailureCode` value for an
+    enumeration failure that earned one — ``source_timeout`` when the bounded adaptive
+    page-size policy was exhausted. Empty for a clean run and for failures whose category
+    the generic ``error_type`` already names as well as a vocabulary word would."""
+
     glossary_failures: list[str] = field(default_factory=list[str])
     """One line per document whose definitions the detector could not read.
 
@@ -622,6 +670,12 @@ class RunReport:
                     else "complete"
                 ),
                 "enumeration_completed": self.enumeration_completed,
+                "enumeration_offset": self.enumeration_offset,
+                "enumeration_page_size": self.enumeration_page_size,
+                "enumeration_timeout_retries": self.enumeration_timeout_retries,
+                "enumeration_page_size_reduced": self.enumeration_page_size_reduced,
+                "enumeration_reached_empty_page": self.enumeration_reached_empty_page,
+                "enumeration_failure_code": self.enumeration_failure_code,
                 "watermark_advanced": self.watermark_advanced,
                 "snapshot_completeness": self.snapshot_completeness,
                 "snapshot_omissions": self.snapshot_omissions,
@@ -734,6 +788,12 @@ class RunReport:
             "full_inventory_authority": _closed_full_inventory_authority(
                 self.full_inventory_authority
             ),
+            "enumeration_offset": self.enumeration_offset,
+            "enumeration_page_size": self.enumeration_page_size,
+            "enumeration_timeout_retries": self.enumeration_timeout_retries,
+            "enumeration_page_size_reduced": self.enumeration_page_size_reduced,
+            "enumeration_reached_empty_page": self.enumeration_reached_empty_page,
+            "enumeration_failure_code": self.enumeration_failure_code,
         }
 
 
@@ -1428,6 +1488,21 @@ class IngestPipeline:
             else durable.inventory_state.value
         )
         report.reconciled_deleted_items = durable.reconciled_deleted_count
+        # A page-size claim on the row means a progress-reporting enumeration wrote it — this
+        # process's, or the one whose completed enumeration this run resumed. Rows without one
+        # keep whatever the in-process stamping said (possibly nothing), so a store without
+        # the optional capability cannot blank a report that knows more than it does.
+        if durable.enumeration_page_size is not None:
+            report.enumeration_offset = durable.enumeration_offset
+            report.enumeration_page_size = durable.enumeration_page_size
+            report.enumeration_timeout_retries = durable.enumeration_timeout_retries
+            report.enumeration_page_size_reduced = durable.enumeration_page_size_reduced
+            report.enumeration_reached_empty_page = durable.enumeration_reached_empty_page
+        if (
+            durable.diagnostic is not None
+            and durable.diagnostic.stage is AcquisitionStage.ENUMERATION
+        ):
+            report.enumeration_failure_code = durable.diagnostic.code.value
 
     async def _record_run_completion(self, run: _Sync, *, crashed: bool) -> None:
         """Publish diagnostics only while this invocation still owns their durable order."""
@@ -1746,13 +1821,30 @@ class IngestPipeline:
             run.report.error_type = type(exc).__name__
             run.report.error_message = "source enumeration failed"
             run.report.error = f"{type(exc).__name__}: source enumeration failed"
+            diagnostic = _enumeration_diagnostic(exc)
+            if diagnostic is not None:
+                run.report.enumeration_failure_code = diagnostic.code.value
         finally:
             closer = getattr(stream, "aclose", None)
             if closer is not None:
                 await closer()
+            if isinstance(run.connector, EnumerationProgressConnector):
+                self._stamp_enumeration_progress(run, run.connector.enumeration_progress())
             # However discovery ended, the stage in front of it has to be told, or every fetch
             # worker waits for an item that is never coming and the run never returns.
             refs.finish()
+
+    @staticmethod
+    def _stamp_enumeration_progress(run: _Sync, snapshot: EnumerationProgress | None) -> None:
+        """Mirror the connector's aggregate adaptive facts onto the run's public report."""
+        if snapshot is None:
+            return
+        report = run.report
+        report.enumeration_offset = snapshot.offset
+        report.enumeration_page_size = snapshot.requested_page_size
+        report.enumeration_timeout_retries = snapshot.timeout_retries
+        report.enumeration_page_size_reduced = snapshot.page_size_reduced
+        report.enumeration_reached_empty_page = snapshot.reached_empty_page
 
     @staticmethod
     async def _durable_discovery_batches(
@@ -1797,6 +1889,46 @@ class IngestPipeline:
             run.report.limited = True
             return
         native_pages = isinstance(run.connector, BatchedDiscoveryConnector)
+        progress_source = (
+            run.connector if isinstance(run.connector, EnumerationProgressConnector) else None
+        )
+        progress_store = (
+            acquisitions if isinstance(acquisitions, EnumerationProgressStore) else None
+        )
+        persisted: EnumerationProgress | None = None
+
+        async def record_progress(
+            diagnostic: AcquisitionDiagnostic | UnsetValue | None = UNSET,
+        ) -> None:
+            """Persist the connector's aggregate adaptive facts whenever they change.
+
+            Timeouts, shrinks and the empty-page end are rare events, so this costs one fenced
+            write per change rather than one per page — a happy walk writes once. The first
+            write of an enumeration explicitly clears any stored diagnostic, because a fresh
+            walk must not inherit the category its failed predecessor recorded.
+            """
+            nonlocal persisted
+            if progress_source is None:
+                return
+            snapshot = progress_source.enumeration_progress()
+            self._stamp_enumeration_progress(run, snapshot)
+            if progress_store is None or snapshot is None:
+                return
+            effective = diagnostic
+            if isinstance(effective, UnsetValue) and persisted is None:
+                effective = None
+            if snapshot == persisted and isinstance(effective, UnsetValue):
+                return
+            if await progress_store.record_acquisition_enumeration_progress(
+                run.acquisition_run_id,
+                run.lease_owner,
+                run.lease_generation,
+                now=self._acquisition_clock(),
+                progress=snapshot,
+                diagnostic=effective,
+            ):
+                persisted = snapshot
+
         stream = self._durable_discovery_batches(run)
         try:
             while not run.stop.is_set():
@@ -1855,12 +1987,17 @@ class IngestPipeline:
                     run.accepted,
                     max((record.sequence for record in appended), default=run.accepted - 1) + 1,
                 )
+                await record_progress()
                 if run.limit is not None and run.accepted >= run.limit:
                     run.report.limited = True
                     break
             if not run.stop.is_set() and not run.report.limited:
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now)
+                # The source iterator is exhausted, so the connector's progress now carries
+                # its completion claim — for the authoritative direct walk, that every stream
+                # ended at a validated explicit empty page.
+                await record_progress()
                 completed = await acquisitions.complete_acquisition_enumeration(
                     run.acquisition_run_id,
                     run.connector.watermark,
@@ -1878,6 +2015,14 @@ class IngestPipeline:
                 run.report.error_type = type(exc).__name__
                 run.report.error_message = "source enumeration failed"
                 run.report.error = f"{type(exc).__name__}: source enumeration failed"
+                diagnostic = _enumeration_diagnostic(exc)
+                if diagnostic is not None:
+                    run.report.enumeration_failure_code = diagnostic.code.value
+                # Recorded while the lease is still held, so a status read after release sees
+                # the typed category and the final adaptive facts. Best effort: nothing here
+                # may bury the failure being reported.
+                with contextlib.suppress(Exception):
+                    await record_progress(diagnostic if diagnostic is not None else UNSET)
         finally:
             closer = getattr(stream, "aclose", None)
             if closer is not None:

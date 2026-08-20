@@ -354,6 +354,18 @@ validated retained bodies, and `reconciled_deleted_items` counts predecessor ide
 from that complete replacement. Neither count identifies a member. Incomplete enumeration keeps
 the recovery active and the deletion count at zero.
 
+Six more fields describe a live enumeration that adapts its requests to source latency:
+`enumeration_offset` (a count of rows already admitted in the current stream, never a source
+identity), `enumeration_page_size`, `enumeration_timeout_retries`,
+`enumeration_page_size_reduced`, `enumeration_reached_empty_page`, and
+`enumeration_failure_code` — the closed set `source_timeout`, `cursor_expired`, `authentication`
+or empty. They separate active progress from retryable source latency from an exhausted timeout:
+a walk shrinking its pages is making progress, and without these it reads identically to a hung
+one. `enumeration_reached_empty_page` is tri-state — absent means the enumeration does not prove
+its end with an explicit empty page, which is the ordinary case for a search-backed or
+incremental walk, and is not the same claim as `false`. Absent `enumeration_offset` and
+`enumeration_page_size` likewise mean the connector made no adaptive claim rather than zero.
+
 ### Operations with no MCP tool, and why
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,

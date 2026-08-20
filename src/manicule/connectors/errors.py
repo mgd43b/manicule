@@ -25,6 +25,7 @@ __all__ = [
     "ProviderRefusedError",
     "RateLimitedError",
     "RemoteError",
+    "RequestTimeoutError",
     "SessionExpiredError",
     "SessionMissingError",
     "UntrustedLinkError",
@@ -75,6 +76,25 @@ class CursorExpiredError(ConnectorError):
     answer to that is an error or, worse, a fresh first page — which would enumerate the
     opening of the corpus twice and the tail never. Refusing before the request is sent makes
     the failure legible and keeps the run's incompleteness honest.
+    """
+
+
+class RequestTimeoutError(ConnectorError):
+    """One request ran out of time while the source stayed reachable and healthy.
+
+    Raised only when the caller asked for timeouts surfaced
+    (``ConfluenceClient.get_json(..., surface_read_timeouts=True)``), for a read timeout or an
+    explicitly classified transient gateway timeout (504). Everything else — a connection
+    refused, a 500, a throttle — keeps the ordinary retry policy, because those are not
+    statements about the *shape* of the request.
+
+    Its own class because a timeout at a deep pagination offset is the one failure where
+    repeating the same request is known to be useless and *changing* it is known to help: the
+    source can often answer the same offset with a smaller page. The authoritative direct
+    inventory catches exactly this type to shrink its requested page size at the same offset,
+    and treats every other failure as final. A timed-out offset is therefore never deletion
+    evidence and never an end-of-inventory marker — it is a request that needs a different
+    size, or a typed incomplete run.
     """
 
 

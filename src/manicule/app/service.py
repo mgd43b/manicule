@@ -300,6 +300,16 @@ def _snapshot_status_report(
             ),
             reconciled_deleted_items=run.reconciled_deleted_count,
             full_inventory_authority=_public_full_inventory_authority(run.full_inventory_authority),
+            enumeration_offset=run.enumeration_offset,
+            enumeration_page_size=run.enumeration_page_size,
+            enumeration_timeout_retries=run.enumeration_timeout_retries,
+            enumeration_page_size_reduced=run.enumeration_page_size_reduced,
+            enumeration_reached_empty_page=run.enumeration_reached_empty_page,
+            enumeration_failure_code=(
+                _public_enumeration_failure_code(run.diagnostic.code.value)
+                if run.diagnostic is not None and run.diagnostic.stage.value == "enumeration"
+                else ""
+            ),
         ),
     )
 
@@ -5479,6 +5489,12 @@ def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:
         inventory_recovery=report.inventory_recovery,
         reconciled_deleted_items=report.reconciled_deleted_items,
         full_inventory_authority=_public_full_inventory_authority(report.full_inventory_authority),
+        enumeration_offset=report.enumeration_offset,
+        enumeration_page_size=report.enumeration_page_size,
+        enumeration_timeout_retries=report.enumeration_timeout_retries,
+        enumeration_page_size_reduced=report.enumeration_page_size_reduced,
+        enumeration_reached_empty_page=report.enumeration_reached_empty_page,
+        enumeration_failure_code=_public_enumeration_failure_code(report.enumeration_failure_code),
         retry_required=incomplete,
         derivation_deferred=report.derivation_deferred,
         intentionally_bounded=bounded,
@@ -5510,6 +5526,17 @@ def _public_full_inventory_authority(value: str) -> r.FullInventoryAuthority:
         return "search"
     if value == "direct_current_content":
         return "direct_current_content"
+    return ""
+
+
+def _public_enumeration_failure_code(value: str) -> r.EnumerationFailureCode:
+    """Closed aggregate value; a durable string outside the vocabulary reads as none."""
+    if value == "source_timeout":
+        return "source_timeout"
+    if value == "cursor_expired":
+        return "cursor_expired"
+    if value == "authentication":
+        return "authentication"
     return ""
 
 

@@ -28,23 +28,29 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+import time
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 from pydantic import JsonValue
 
 from manicule.connectors import cql, subtree
-from manicule.connectors.client import ConfluenceClient
+from manicule.connectors.client import BoundedHistory, ConfluenceClient
 from manicule.connectors.config import (
     CONNECTOR_NAME,
     ConfluenceConfig,
     Deployment,
     FullInventoryAuthority,
 )
-from manicule.connectors.errors import BodyUnavailableError, ConnectorError, NotFoundError
+from manicule.connectors.errors import (
+    BodyUnavailableError,
+    ConnectorError,
+    NotFoundError,
+    RequestTimeoutError,
+)
 from manicule.connectors.macros import (
     IncludedPage,
     Lookup,
@@ -61,7 +67,13 @@ from manicule.connectors.subtree import CONTENT_PATH, SEARCH_PATH, Subtree
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.lifecycle import HealthReport, Metric
 from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
-from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
+from manicule.core.sources import (
+    DiscoveredDoc,
+    DocRef,
+    EnumerationProgress,
+    SourceId,
+    Watermark,
+)
 from manicule.parsers.config import CONFLUENCE_MEDIA_TYPE
 
 __all__ = [
@@ -118,8 +130,33 @@ _SPACE_PATH = "/rest/api/space"
 _V2_PAGE_PATH = "/api/v2/pages"
 
 _SEARCH_EXPAND = "version,ancestors,space,container"
-_DIRECT_EXPAND = _SEARCH_EXPAND
 _STORAGE_EXPAND = "body.storage,version,ancestors,space"
+
+_DIRECT_PAGE_EXPAND = "version,space"
+_DIRECT_ATTACHMENT_EXPAND = "version,space,container"
+"""What the authoritative direct inventory asks the list endpoint to expand, per type.
+
+**The inventory projection is the minimum that proves membership and selects a reusable
+retained revision, measured against what each row is actually read for.** A page row needs
+its explicit id, type, ``current`` status, canonical space, positive revision, modification
+time and canonical-link evidence — id/type/status/title/``_links.webui`` arrive unexpanded,
+``version`` carries the revision and its instant, and ``space`` proves the row belongs to the
+space that was asked for. An attachment row additionally needs its container relationship,
+which is what makes its parent page provable at inventory time.
+
+``ancestors`` is deliberately **not** expanded here, unlike the search projection: breadcrumb
+ancestry proves nothing about whole-space membership, and the page fetch obtains it
+authoritatively from the same response that carries the body (``_STORAGE_EXPAND``), which is
+the copy that is retained. Body and full provenance likewise come from the fetch. Retained-body
+reuse stays revision-safe because the inventory's ``version.number`` is the change token the
+journal compares, and a fetched body older than it is refused rather than certified
+(:meth:`ConfluenceConnector.fetched_revision_at_least`).
+
+Expanding less is not a timing optimization first — it is what keeps a deep-offset request as
+small as the membership question it asks. The high-offset latency this walk adapts to grows
+with both the offset and the per-row expansion cost; the projection bounds the second factor,
+and the adaptive page size below bounds the first.
+"""
 
 PAGE = "page"
 ATTACHMENT = "attachment"
@@ -225,6 +262,26 @@ class _Body:
     Absent is the ordinary answer, and absent is what is recorded."""
 
 
+@dataclass(slots=True)
+class _DirectProgress:
+    """Live adaptive-pagination state for one authoritative direct enumeration.
+
+    Mutable and connector-private; :meth:`ConfluenceConnector.enumeration_progress` projects
+    it into the frozen aggregate-only :class:`~manicule.core.sources.EnumerationProgress` the
+    pipeline persists. ``page_size`` is the one value the timeout policy is allowed to change,
+    and it survives across the spaces and types of one enumeration on purpose: latency that
+    grew with the offset in one stream is evidence about the source, not about the stream.
+    """
+
+    configured: int
+    page_size: int
+    offset: int = 0
+    timeout_retries: int = 0
+    page_size_reduced: bool = False
+    streams: int = 0
+    completed: bool = False
+
+
 class ConfluenceConnector:
     """Discovers, fetches and reconciles Confluence pages and their attachments."""
 
@@ -237,7 +294,12 @@ class ConfluenceConnector:
             return False
 
     def __init__(
-        self, config: ConfluenceConfig, client: ConfluenceClient, *, name: str = CONNECTOR_NAME
+        self,
+        config: ConfluenceConfig,
+        client: ConfluenceClient,
+        *,
+        name: str = CONNECTOR_NAME,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         # The configured source's name, defaulting to the type for a caller outside the
         # container. Two Confluence sites, or two space subsets of one site, are two sources;
@@ -246,9 +308,13 @@ class ConfluenceConnector:
         self.name = name
         self._config = config
         self._client = client
+        # For the cumulative-time ceiling on one timed-out offset. Injected in tests so the
+        # ceiling is arithmetic rather than waiting.
+        self._clock = clock if clock is not None else time.monotonic
         self._observed: dict[str, str] = {}
         self._carried: dict[str, str] = {}
         self._enumerated = False
+        self._direct_progress: _DirectProgress | None = None
 
     @property
     def source_scope(self) -> str:
@@ -453,6 +519,7 @@ class ConfluenceConnector:
         self._observed = {}
         self._carried = dict(carried)
         self._enumerated = False
+        self._direct_progress = self._fresh_direct_progress()
 
         spaces = await self._spaces()
         scope = await self._scope(spaces)
@@ -484,6 +551,8 @@ class ConfluenceConnector:
                     # hide a member created around this walk.
                     self._observed[space] = _EMPTY_DIRECT_POSITION
             self._enumerated = True
+            if self._direct_progress is not None:
+                self._direct_progress.completed = True
         finally:
             if scope is not None:
                 scope.close()
@@ -633,69 +702,140 @@ class ConfluenceConnector:
             is FullInventoryAuthority.DIRECT_CURRENT_CONTENT
         )
 
+    def _fresh_direct_progress(self) -> _DirectProgress | None:
+        if not self._direct_full_inventory:
+            return None
+        return _DirectProgress(configured=self._config.page_size, page_size=self._config.page_size)
+
+    def enumeration_progress(self) -> EnumerationProgress | None:
+        """Aggregate-only adaptive pagination facts, or ``None`` outside a direct walk.
+
+        Counts and closed values only — the pipeline persists this on the acquisition run and
+        every status surface serves it, so nothing here may name a space, a page or a URL.
+        """
+        progress = self._direct_progress
+        if progress is None:
+            return None
+        return EnumerationProgress(
+            offset=progress.offset,
+            requested_page_size=progress.page_size,
+            timeout_retries=progress.timeout_retries,
+            page_size_reduced=progress.page_size_reduced,
+            # None until a direct stream has run: an enumeration that answered everything
+            # from CQL never proves its end with an empty page, and must not claim to.
+            reached_empty_page=(None if not progress.streams else progress.completed),
+        )
+
     async def _direct_batches(
         self, space: str, kind: str
     ) -> AsyncIterator[Sequence[tuple[Mapping[str, object], str]]]:
-        """Yield exact native direct-resource pages, with immutable scope pinned on every link."""
-        params = [
+        """Walk the authoritative inventory by explicit offsets to a validated empty page.
+
+        **Completion has exactly one shape: a well-formed page with zero rows.** A missing
+        ``_links.next``, a page shorter than the requested limit, a request timeout, a locally
+        expected count — none of them ends the walk, because each has been observed lying: the
+        native link disappears at round offsets on some builds, the source silently caps the
+        page size below the request, and a deep offset can time out while still holding rows.
+        The next offset is always this one plus the rows actually returned, so a source that
+        caps or shrinks pages advances exactly as far as what arrived.
+
+        The response's declared coordinates are validated against the request rather than
+        trusted (:func:`_validated_direct_page`), every emitted identity is checked against a
+        disk-backed bounded history so a repeated or non-advancing page is a refusal rather
+        than a loop, and the declared link base must stay on the configured origin. What this
+        method never does is *end early*: a slow offset is retried smaller
+        (:meth:`_direct_page`), and everything else raises.
+        """
+        progress = self._direct_progress
+        if progress is None:  # pragma: no cover - callers create it structurally
+            msg = "the authoritative direct walk was started without its progress state"
+            raise ConnectorError(msg)
+        url = self._client.url(CONTENT_PATH)
+        expand = _DIRECT_PAGE_EXPAND if kind == PAGE else _DIRECT_ATTACHMENT_EXPAND
+        scope = (
             ("spaceKey", space),
             ("type", kind),
             ("status", "current"),
-            ("expand", _DIRECT_EXPAND),
-            ("limit", str(self._config.page_size)),
-        ]
-
-        def validate_next(
-            url: str, following: Sequence[tuple[str, str]]
-        ) -> Sequence[tuple[str, str]]:
-            expected_path = urlsplit(self._client.url(CONTENT_PATH)).path
-            if urlsplit(url).path != expected_path:
-                raise ConnectorError(
-                    "authoritative current-content pagination changed its resource path"
-                )
-            for key, value in (
-                ("spaceKey", space),
-                ("type", kind),
-                ("status", "current"),
-                ("expand", _DIRECT_EXPAND),
-            ):
-                values = [found for name, found in following if name == key]
-                if any(found != value for found in values):
+            ("expand", expand),
+        )
+        progress.streams += 1
+        progress.offset = 0
+        emitted = BoundedHistory()
+        try:
+            start = 0
+            while True:
+                payload = await self._direct_page(url, scope, start=start)
+                base = _link_base(payload, self._config.base_url)
+                if origin_of(base) != self._config.origin:
                     raise ConnectorError(
-                        "authoritative current-content pagination changed its immutable scope"
+                        "authoritative current-content inventory declared an untrusted link base"
                     )
-            immutable = {"spaceKey", "type", "status", "expand", "limit"}
-            native = [(key, value) for key, value in following if key not in immutable]
-            if any(key not in {"start", "cursor"} for key, _ in native):
-                raise ConnectorError(
-                    "authoritative current-content pagination changed its immutable scope"
-                )
-            coordinates = {key for key, _ in native}
-            if len(coordinates) != 1:
-                raise ConnectorError(
-                    "authoritative current-content pagination supplied an invalid cursor"
-                )
-            for coordinate in coordinates:
-                values = [value for key, value in native if key == coordinate]
+                rows = _validated_direct_page(payload, start=start, requested=progress.page_size)
+                if not rows:
+                    return
+                for row in rows:
+                    row_id = _str(row.get("id"))
+                    if not row_id:
+                        raise ConnectorError(
+                            "authoritative current-content inventory returned incomplete or "
+                            "out-of-scope metadata"
+                        )
+                    if not emitted.add(row_id):
+                        raise ConnectorError(
+                            "authoritative current-content pagination repeated an identity "
+                            "across page boundaries"
+                        )
+                yield tuple((row, base) for row in rows)
+                start += len(rows)
+                progress.offset = start
                 if (
-                    len(values) != 1
-                    or not values[0]
-                    or (coordinate == "start" and (not values[0].isdigit() or int(values[0]) < 0))
+                    self._config.adaptive_page_size_growth
+                    and progress.page_size < progress.configured
                 ):
-                    raise ConnectorError(
-                        "authoritative current-content pagination supplied an invalid cursor"
-                    )
-            return [*params, *native]
+                    progress.page_size = min(progress.configured, progress.page_size * 2)
+        finally:
+            emitted.close()
 
-        async for payload in self._client.paginate(
-            self._client.url(CONTENT_PATH), params, validate_next=validate_next
-        ):
-            base = _link_base(payload, self._config.base_url)
-            if origin_of(base) != self._config.origin:
-                raise ConnectorError(
-                    "authoritative current-content inventory declared an untrusted link base"
-                )
-            yield tuple((result, base) for result in _direct_results(payload))
+    async def _direct_page(
+        self, url: str, scope: Sequence[tuple[str, str]], *, start: int
+    ) -> Mapping[str, object]:
+        """One offset's response, shrinking only the requested limit when it times out.
+
+        The immutable scope, the offset, the status filter and the expansion contract travel
+        unchanged through every retry; the limit is the single degree of freedom, halved from
+        the last value down to the configured floor. Only a surfaced timeout
+        (:class:`~manicule.connectors.errors.RequestTimeoutError`: a read timeout, or an
+        explicitly classified transient gateway 504) is retried this way — an authentication
+        or authorization failure, a malformed or untrusted response, an ordinary 4xx and a
+        cancellation all propagate untouched, because none of them gets better smaller.
+
+        Both ceilings are per offset: attempts bound the count and cumulative time bounds the
+        stall. When either is spent the *original typed failure* is re-raised, so the run ends
+        as the timeout it was rather than as a policy of its own.
+        """
+        progress = self._direct_progress
+        if progress is None:  # pragma: no cover - reached only through _direct_batches
+            msg = "the authoritative direct walk was started without its progress state"
+            raise ConnectorError(msg)
+        config = self._config
+        attempts = 0
+        began = self._clock()
+        while True:
+            params = [*scope, ("limit", str(progress.page_size)), ("start", str(start))]
+            try:
+                return await self._client.get_json(url, params, surface_read_timeouts=True)
+            except RequestTimeoutError:
+                attempts += 1
+                progress.timeout_retries += 1
+                if (
+                    attempts >= config.adaptive_max_attempts_per_offset
+                    or self._clock() - began >= config.adaptive_max_seconds_per_offset
+                ):
+                    raise
+                reduced = max(config.adaptive_min_page_size, progress.page_size // 2)
+                if reduced < progress.page_size:
+                    progress.page_size = reduced
+                    progress.page_size_reduced = True
 
     def _direct_discovered(
         self,
@@ -727,17 +867,10 @@ class ConfluenceConnector:
             and webui
             and origin_of(_join(base, webui)) == self._config.origin
         )
-        if kind == PAGE:
-            ancestors = result.get("ancestors")
-            valid = (
-                valid
-                and isinstance(ancestors, list)
-                and all(
-                    _str(_obj(entry).get("id")) and _str(_obj(entry).get("title"))
-                    for entry in cast("Sequence[object]", ancestors or [])
-                )
-            )
-        elif kind == ATTACHMENT:
+        # A page row's membership evidence ends here on purpose: ancestry proves nothing about
+        # whole-space membership, so the inventory does not expand it (`_DIRECT_PAGE_EXPAND`)
+        # and the fetch reads it from the same response that carries the retained body.
+        if kind == ATTACHMENT:
             container = _obj(result.get("container"))
             download = _str(links.get("download"))
             parent_webui = _str(_obj(container.get("_links")).get("webui"))
@@ -995,6 +1128,7 @@ class ConfluenceConnector:
         scope = await self._scope(spaces)
         if scope is None:
             types = (PAGE, ATTACHMENT) if self._config.include_attachments else (PAGE,)
+            self._direct_progress = self._fresh_direct_progress()
             for space in spaces:
                 if self._direct_full_inventory:
                     for kind in types:
@@ -1551,6 +1685,61 @@ def _direct_results(payload: Mapping[str, object]) -> tuple[Mapping[str, object]
             "authoritative current-content inventory returned a malformed results page"
         )
     return tuple(cast("Mapping[str, object]", entry) for entry in entries)
+
+
+def _validated_direct_page(
+    payload: Mapping[str, object], *, start: int, requested: int
+) -> tuple[Mapping[str, object], ...]:
+    """The page's rows, after its declared coordinates are checked against the request.
+
+    The declared ``start``, ``limit`` and ``size`` are the source's description of the page it
+    answered with, and each is validated when present rather than trusted: a ``start`` other
+    than the one requested is an answer to a different question, a ``limit`` above the request
+    is a mutated shape, a ``size`` that disagrees with the rows is a self-contradiction, and
+    more rows than were asked for is a page nothing requested. A declared limit *below* the
+    request is the one disagreement that is ordinary — the source silently caps page sizes —
+    and the walk advances by the rows that actually arrived, so a cap costs requests rather
+    than members.
+
+    An empty page that still declares ``_links.next`` is refused too: zero rows is the walk's
+    only completion evidence, and a page claiming both "nothing here" and "more follows" is
+    not evidence of anything.
+    """
+    rows = _direct_results(payload)
+    declared_start = payload.get("start")
+    if declared_start is not None and _int(declared_start) != start:
+        raise ConnectorError(
+            "authoritative current-content pagination reported coordinates that disagree "
+            "with the request"
+        )
+    declared_limit = payload.get("limit")
+    if declared_limit is not None:
+        limit = _int(declared_limit)
+        if limit is None or limit < 1 or limit > requested:
+            raise ConnectorError(
+                "authoritative current-content pagination reported coordinates that disagree "
+                "with the request"
+            )
+    declared_size = payload.get("size")
+    if declared_size is not None and _int(declared_size) != len(rows):
+        raise ConnectorError(
+            "authoritative current-content pagination reported coordinates that disagree "
+            "with the request"
+        )
+    if len(rows) > requested:
+        raise ConnectorError(
+            "authoritative current-content pagination reported coordinates that disagree "
+            "with the request"
+        )
+    if not rows:
+        links = _obj(payload.get("_links"))
+        following = links.get("next")
+        if isinstance(following, str) and following.strip():
+            raise ConnectorError(
+                "authoritative current-content inventory returned an empty page that still "
+                "declared a next link"
+            )
+    return rows
 
 
 def _ancestor_titles(result: Mapping[str, object]) -> tuple[str, ...]:

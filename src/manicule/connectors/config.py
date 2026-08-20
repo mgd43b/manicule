@@ -352,6 +352,50 @@ class ConfluenceConfig(BaseModel):
         "configuration says.",
     )
 
+    adaptive_min_page_size: int = Field(
+        default=1,
+        ge=1,
+        le=250,
+        description="Smallest page the authoritative direct inventory will shrink to when a "
+        "request times out at an offset. The floor of the halving policy, never the start.",
+    )
+    """Applies only to the Server/Data Center ``direct_current_content`` walk, where response
+    time grows with the offset and a full page can exceed the request timeout while a smaller
+    page at the same offset still answers. Shrinking changes nothing about membership: the
+    same rows arrive in the same order across more, smaller requests. Deliberately absent from
+    the scope fingerprint for exactly that reason — retuning it must not force a full
+    re-enumeration."""
+
+    adaptive_max_attempts_per_offset: int = Field(
+        default=8,
+        ge=1,
+        description="How many timed-out requests one offset may absorb before the run stops "
+        "with a typed incomplete result.",
+    )
+    """Eight covers the default halving ladder (100 → 50 → 25 → 12 → 6 → 3 → 1) with slack.
+    When it is spent the original timeout is raised, the durable prefix is kept, and nothing
+    is promoted — a slow offset is never allowed to read as the end of the inventory."""
+
+    adaptive_max_seconds_per_offset: float = Field(
+        default=240.0,
+        gt=0.0,
+        description="Longest cumulative time the adaptive policy may spend at one offset "
+        "before giving up with a typed incomplete result.",
+    )
+    """The wall-clock twin of ``adaptive_max_attempts_per_offset``: attempts bound the count,
+    this bounds the stall an operator watches. Both are ceilings on one offset rather than on
+    the run, because the run's length is the corpus's business."""
+
+    adaptive_page_size_growth: bool = Field(
+        default=False,
+        description="Whether a successful page after a timeout shrink may cautiously grow the "
+        "requested size again, doubling per successful page back toward page_size.",
+    )
+    """Off by default. The observed failure is *progressive* large-offset latency, where a
+    regrown page re-times-out a few offsets later and every recovery costs a full request
+    timeout of stall. Turn it on for a source whose slowness is patchy rather than
+    progressive."""
+
     watermark_overlap_minutes: int = Field(
         default=5,
         ge=0,
@@ -453,6 +497,14 @@ class ConfluenceConfig(BaseModel):
                 "page for it to include or leave out. Set root_page_ids to the tree(s) this "
                 "source should index, or remove include_root_pages — a setting that silently "
                 "does nothing reads like one that is in force."
+            )
+            raise ValueError(msg)
+        if self.adaptive_min_page_size > self.page_size:
+            msg = (
+                f"adaptive_min_page_size ({self.adaptive_min_page_size}) is larger than "
+                f"page_size ({self.page_size}). The adaptive floor is where a timed-out "
+                f"request shrinks *down* to; a floor above the starting size would make the "
+                f"first shrink an enlargement."
             )
             raise ValueError(msg)
         if self.auth is AuthMethod.BROWSER_SESSION and self.deployment is not Deployment.SERVER:

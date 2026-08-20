@@ -90,6 +90,14 @@ class AcquisitionFailureCode(StrEnum):
     AUTHENTICATION = "authentication"
     CAPACITY = "capacity"
     CURSOR_EXPIRED = "cursor_expired"
+    SOURCE_TIMEOUT = "source_timeout"
+    """The source stayed reachable but a request ran out of time after bounded adaptation.
+
+    Distinct from every other code because its remedy is different: nothing is wrong with the
+    credential, the scope or the content — re-running resumes, and the adaptive page-size
+    dials (``adaptive_min_page_size`` and friends) are the knobs that change the outcome.
+    """
+
     FETCH_FAILED = "fetch_failed"
     MISSING_BODY = "missing_body"
     SNAPSHOT_MISSING = "snapshot_missing"
@@ -279,6 +287,20 @@ class AcquisitionRun(BaseModel):
     retry_count: int = Field(ge=0)
     metadata_bytes: int = Field(ge=0)
     acquired_blob_bytes: int = Field(ge=0)
+    enumeration_offset: int | None = Field(default=None, ge=0)
+    enumeration_page_size: int | None = Field(default=None, ge=1)
+    enumeration_timeout_retries: int = Field(default=0, ge=0)
+    enumeration_page_size_reduced: bool = False
+    enumeration_reached_empty_page: bool | None = None
+    """Live adaptive-enumeration aggregates, present only for connectors that report them.
+
+    ``enumeration_reached_empty_page`` is tri-state on purpose: ``None`` means the run's
+    enumeration does not prove its end with an explicit empty page (a search-backed walk, an
+    incremental query), ``False`` means the authoritative walk has not reached one, ``True``
+    means it did. Collapsing ``None`` into ``False`` would read as "an authoritative walk
+    stopped short" for every connector that never made the claim.
+    """
+
     diagnostic: AcquisitionDiagnostic | None = None
     created_at: datetime
     updated_at: datetime

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 from typing import cast
@@ -18,7 +18,7 @@ from manicule.connectors.config import (
     Deployment,
     FullInventoryAuthority,
 )
-from manicule.connectors.confluence import ConfluenceConnector
+from manicule.connectors.confluence import ANCESTOR_IDS, ANCESTORS, ConfluenceConnector
 from manicule.core.sources import DiscoveredDoc, Watermark
 from tests.connectors.fake_confluence import FakeAttachment, FakeConfluence, FakePage
 from tests.connectors.support import connected, drain, ids, server_config
@@ -112,10 +112,21 @@ async def test_direct_full_inventory_reaches_true_end_when_search_diverges() -> 
     assert all(request.url.params["type"] in {"page", "attachment"} for request in direct_requests)
     assert sum(request.url.params["type"] == "page" for request in direct_requests) > 14
     assert all(request.url.params["status"] == "current" for request in direct_requests)
+    # The inventory projection is per type and minimal: membership evidence only, with
+    # ancestry and bodies obtained authoritatively by the fetch.
     assert all(
-        request.url.params["expand"] == "version,ancestors,space,container"
+        request.url.params["expand"]
+        == ("version,space" if request.url.params["type"] == "page" else "version,space,container")
         for request in direct_requests
     )
+    # Both the discovery walk and the reconciliation walk end at the explicit empty page —
+    # offset 102 on a 102-page space — never at a page-size boundary or a missing next link.
+    page_starts = [
+        int(request.url.params.get("start", "0"))
+        for request in direct_requests
+        if request.url.params["type"] == "page"
+    ]
+    assert page_starts.count(102) == 2
 
 
 @pytest.mark.parametrize("spaces", [("DOCS",), ("DOCS", "OPS")])
@@ -223,7 +234,28 @@ async def test_direct_page_and_attachment_discovery_matches_search_metadata() ->
     finally:
         await search.teardown()
         await direct.teardown()
-    assert found == searched
+
+    assert set(found) == set(searched)
+    # Attachments carry their container relationship at inventory time on both paths, so the
+    # rows agree completely.
+    assert found[attachment.id] == searched[attachment.id]
+    # A page's membership evidence agrees completely too; the one deliberate difference is
+    # ancestry, which the direct projection defers to the fetch — it proves nothing about
+    # whole-space membership and the fetch reads it from the response that carries the
+    # retained body.
+    direct_metadata = dict(found[page.id].ref.metadata)
+    search_metadata = dict(searched[page.id].ref.metadata)
+    assert direct_metadata.pop(ANCESTORS) == ["DOCS"]
+    assert search_metadata.pop(ANCESTORS) == ["DOCS", "Operations"]
+    assert direct_metadata.pop(ANCESTOR_IDS) == []
+    assert search_metadata.pop(ANCESTOR_IDS) == ["anc-0"]
+    assert direct_metadata == search_metadata
+    assert found[page.id].ref.source_id == searched[page.id].ref.source_id
+    assert found[page.id].ref.uri == searched[page.id].ref.uri
+    assert found[page.id].version_token == searched[page.id].version_token
+    assert found[page.id].title == searched[page.id].title
+    assert found[page.id].media_type == searched[page.id].media_type
+    assert found[page.id].size_bytes == searched[page.id].size_bytes
 
 
 async def test_direct_native_page_is_consumed_before_its_next_request() -> None:
@@ -266,7 +298,9 @@ async def test_direct_native_page_is_consumed_before_its_next_request() -> None:
         for request in instance.requests
         if request.url.path.endswith("/rest/api/content")
     ]
-    assert starts == ["0", "2", "4"]
+    # Explicit offsets advance by the rows actually returned, and the walk ends only at the
+    # validated explicit empty page — the request at offset 5 — never at the short page.
+    assert starts == ["0", "2", "4", "5"]
 
 
 def _row() -> dict[str, object]:
@@ -282,84 +316,164 @@ def _row() -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize(
-    "next_link",
-    [
-        "/rest/api/content?start=1&type=attachment",
-        "/rest/api/content?start=1&ancestor=400000",
-        "/rest/api/content?start=one",
-        "/rest/api/content?start=1&start=2",
-        "/rest/api/content?start=1&cursor=opaque",
-        "/rest/api/content?limit=2",
-    ],
-)
-async def test_direct_next_links_cannot_mutate_or_narrow_scope(next_link: str) -> None:
-    def handle(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/rest/api/space/DOCS"):
-            return httpx.Response(200, json={"key": "DOCS"})
-        if request.url.path.endswith("/rest/api/content"):
-            return httpx.Response(
-                200,
-                json={
-                    "results": [_row()],
-                    "_links": {"base": BASE, "next": next_link},
-                },
-            )
-        raise AssertionError("unexpected synthetic request")
-
-    config = _direct(include_attachments=False)
-    connector = ConfluenceConnector(
+def _direct_connector(
+    handle: Callable[[httpx.Request], httpx.Response], **overrides: object
+) -> ConfluenceConnector:
+    config = _direct(include_attachments=False, **overrides)
+    return ConfluenceConnector(
         config,
         ConfluenceClient(config, transport=httpx.MockTransport(handle), clock=lambda: 0.0),
     )
-    await connector.setup()
-    try:
-        with pytest.raises(ConnectorError, match="authoritative current-content pagination"):
-            await drain(connector.discover(None))
-    finally:
-        await connector.teardown()
 
 
 @pytest.mark.parametrize(
-    ("next_link", "failure"),
+    ("declared", "failure"),
     [
-        (
-            "https://wiki.example.test:444/rest/api/content?start=1",
-            "another host",
-        ),
-        (
-            "/rest/api/content?start=0",
-            "pagination was sent back to a page it has already followed",
-        ),
+        ({"start": 5}, "coordinates that disagree"),
+        ({"start": "one"}, "coordinates that disagree"),
+        ({"limit": 500}, "coordinates that disagree"),
+        ({"limit": 0}, "coordinates that disagree"),
+        ({"size": 7}, "coordinates that disagree"),
     ],
 )
-async def test_direct_next_links_fail_closed_on_cross_origin_and_loops(
-    next_link: str, failure: str
+async def test_direct_reported_coordinates_that_disagree_are_refused(
+    declared: dict[str, object], failure: str
 ) -> None:
+    """The response's own ``start``/``limit``/``size`` are validated, never trusted."""
+
     def handle(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/rest/api/space/DOCS"):
             return httpx.Response(200, json={"key": "DOCS"})
         if request.url.path.endswith("/rest/api/content"):
             return httpx.Response(
-                200,
-                json={
-                    "results": [_row()],
-                    "_links": {"base": BASE, "next": next_link},
-                },
+                200, json={"results": [_row()], "_links": {"base": BASE}, **declared}
             )
         raise AssertionError("unexpected synthetic request")
 
-    config = _direct(include_attachments=False)
-    connector = ConfluenceConnector(
-        config,
-        ConfluenceClient(config, transport=httpx.MockTransport(handle), clock=lambda: 0.0),
-    )
+    connector = _direct_connector(handle)
     await connector.setup()
     try:
         with pytest.raises(ConnectorError, match=failure):
             await drain(connector.discover(None))
     finally:
         await connector.teardown()
+
+
+async def test_direct_walk_refuses_more_rows_than_it_asked_for() -> None:
+    """A page larger than the request is a mutated shape, not a bonus."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/space/DOCS"):
+            return httpx.Response(200, json={"key": "DOCS"})
+        rows = [{**_row(), "id": str(400100 + number)} for number in range(3)]
+        return httpx.Response(200, json={"results": rows, "_links": {"base": BASE}})
+
+    connector = _direct_connector(handle, page_size=2)
+    await connector.setup()
+    try:
+        with pytest.raises(ConnectorError, match="coordinates that disagree"):
+            await drain(connector.discover(None))
+    finally:
+        await connector.teardown()
+
+
+async def test_direct_walk_refuses_an_empty_page_that_still_declares_next() -> None:
+    """Zero rows is the only completion evidence; zero rows plus "more follows" is neither."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/space/DOCS"):
+            return httpx.Response(200, json={"key": "DOCS"})
+        return httpx.Response(
+            200,
+            json={
+                "results": [],
+                "_links": {"base": BASE, "next": "/rest/api/content?start=100"},
+            },
+        )
+
+    connector = _direct_connector(handle)
+    await connector.setup()
+    try:
+        with pytest.raises(ConnectorError, match="empty page that still declared a next link"):
+            await drain(connector.discover(None))
+    finally:
+        await connector.teardown()
+
+
+async def test_direct_walk_refuses_a_cross_origin_link_base() -> None:
+    """A declared link base off the configured origin fails the walk closed."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/space/DOCS"):
+            return httpx.Response(200, json={"key": "DOCS"})
+        return httpx.Response(
+            200,
+            json={
+                "results": [_row()],
+                "_links": {"base": "https://wiki.example.test:444/confluence"},
+            },
+        )
+
+    connector = _direct_connector(handle)
+    await connector.setup()
+    try:
+        with pytest.raises(ConnectorError, match="untrusted link base"):
+            await drain(connector.discover(None))
+    finally:
+        await connector.teardown()
+
+
+async def test_direct_walk_refuses_repeated_identities_across_page_boundaries() -> None:
+    """A source that repeats a row — a loop, a non-advancing page — is a refusal, not a walk."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/space/DOCS"):
+            return httpx.Response(200, json={"key": "DOCS"})
+        # The same single row for every offset, with coordinates that echo the request —
+        # exactly what a broken deep-pagination layer serves.
+        start = int(request.url.params.get("start", "0"))
+        return httpx.Response(
+            200,
+            json={"results": [_row()], "start": start, "size": 1, "_links": {"base": BASE}},
+        )
+
+    connector = _direct_connector(handle, page_size=1)
+    await connector.setup()
+    try:
+        with pytest.raises(ConnectorError, match="repeated an identity"):
+            await drain(connector.discover(None))
+    finally:
+        await connector.teardown()
+
+
+async def test_a_missing_next_link_at_a_round_offset_does_not_end_the_walk() -> None:
+    """The native link disappearing early is not completion; later offsets still hold rows."""
+    rows = [{**_row(), "id": str(400100 + number)} for number in range(3)]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/space/DOCS"):
+            return httpx.Response(200, json={"key": "DOCS"})
+        start = int(request.url.params.get("start", "0"))
+        limit = int(request.url.params.get("limit", "1"))
+        window = rows[start : start + limit]
+        # No _links.next anywhere, at any offset — the walk must not care.
+        return httpx.Response(
+            200,
+            json={
+                "results": window,
+                "start": start,
+                "size": len(window),
+                "_links": {"base": BASE},
+            },
+        )
+
+    connector = _direct_connector(handle, page_size=2)
+    await connector.setup()
+    try:
+        found = await drain(connector.discover(None))
+    finally:
+        await connector.teardown()
+    assert ids(found) == ["400100", "400101", "400102"]
 
 
 @pytest.mark.parametrize("results", [None, {}, ["not-an-object"]])

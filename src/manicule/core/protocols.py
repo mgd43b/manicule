@@ -49,7 +49,13 @@ from manicule.core.organization import (
     TrashEntry,
 )
 from manicule.core.retrieval import Candidate, Context, Filter, Query
-from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
+from manicule.core.sources import (
+    DiscoveredDoc,
+    DocRef,
+    EnumerationProgress,
+    SourceId,
+    Watermark,
+)
 
 # --- ingest ------------------------------------------------------------------------------
 
@@ -1039,6 +1045,20 @@ class BatchedReconciliationConnector(Protocol):
     """Optionally preserves source-native cursor pages during deletion enumeration."""
 
     def reconcile_batches(self) -> AsyncIterator[Sequence[SourceId]]: ...
+
+
+@runtime_checkable
+class EnumerationProgressConnector(Protocol):
+    """Optionally exposes aggregate-only live enumeration facts for durable diagnostics.
+
+    ``None`` means the current operation has nothing adaptive to report — an incremental
+    query, or a connector that never changes its request shape. Durable ingest persists a
+    non-``None`` snapshot on the acquisition run whenever it changes, so status surfaces can
+    distinguish a walk that is adapting to source latency from one that is hung, without the
+    connector ever touching storage.
+    """
+
+    def enumeration_progress(self) -> EnumerationProgress | None: ...
 
 
 # --- middleware --------------------------------------------------------------------------

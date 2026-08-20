@@ -925,6 +925,25 @@ rebuild consume the promoted retained manifest, so disabling or losing the conne
 successful direct walk does not change membership, require a source call, or leave acquisition
 backlog after publication.
 
+A connector that adapts its request shape mid-walk reports aggregate progress the same way.
+`enumeration_offset` (a count of rows already admitted in the current stream, never a source
+identity), `enumeration_page_size` (the effective requested size after any adaptation),
+`enumeration_timeout_retries`, `enumeration_page_size_reduced`, `enumeration_reached_empty_page`
+and `enumeration_failure_code` are persisted on the acquisition run whenever they change — one
+fenced write per change, so a walk that never adapts writes once — and are served by ingest
+results, connector-list, lifecycle and snapshot status on every surface. Together they separate
+the four states an operator otherwise cannot: active progress, retryable source latency (a walk
+shrinking its pages is making progress, not hung), exhausted timeout, and terminal completion.
+
+`enumeration_reached_empty_page` is deliberately tri-state. Absent means the enumeration does not
+prove its end with an explicit empty page — a search-backed walk, an incremental query — while
+`false` means an authoritative walk has not reached one and `true` means it did. Collapsing
+absent into `false` would report every connector that never made the claim as having stopped
+short. `enumeration_failure_code` is the closed set `source_timeout`, `cursor_expired`,
+`authentication` or empty; `source_timeout` is the one whose remedy is a setting
+(`adaptive_min_page_size` and its siblings, `docs/connectors/confluence.md` §2) rather than a
+repeat, and it is never a deletion, a missing document or a credential failure.
+
 The aggregate fields `inventory_recovery`, `reused_items` and `reconciled_deleted_items` appear in
 ingest results, connector lifecycle status and snapshot status. They contain no source identity,
 title, URL, blob hash, credential or exception text. Existing databases are migrated by marking

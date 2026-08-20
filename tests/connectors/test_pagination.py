@@ -34,7 +34,6 @@ from tests.connectors.support import (
     connected,
     drain,
     ids,
-    server_config,
 )
 
 
@@ -258,18 +257,14 @@ async def test_cursor_history_io_is_included_in_the_cursor_age(
     """A stalled disk ledger cannot open an unchecked expiry window before request two."""
     instance = _instance()
     clock = Clock()
-    original = client_module._CursorHistory.add  # pyright: ignore[reportPrivateUsage]
+    original = client_module.BoundedHistory.add
 
-    def delayed_add(
-        history: Any,
-        url: str,
-        params: list[tuple[str, str]],
-    ) -> bool:
-        added = original(history, url, params)
+    def delayed_add(history: Any, *parts: str) -> bool:
+        added = original(history, *parts)
         clock.advance(61.0)
         return added
 
-    monkeypatch.setattr("manicule.connectors.client._CursorHistory.add", delayed_add)
+    monkeypatch.setattr("manicule.connectors.client.BoundedHistory.add", delayed_add)
     connector = await connected(
         instance,
         cloud_config(
@@ -318,43 +313,6 @@ async def test_a_next_link_that_repeats_without_a_cursor_stops_the_walk() -> Non
             await drain(client.paginate(client.url("/rest/api/content/search")))
     finally:
         await client.teardown()
-
-
-async def test_a_validator_can_remove_every_native_next_parameter() -> None:
-    """An empty validated override is intentional, not a request to restore unsafe params."""
-    base_url = "https://wiki.example.test/confluence"
-    requests: list[httpx.Request] = []
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if len(requests) == 1:
-            return httpx.Response(
-                200,
-                json={
-                    "results": [],
-                    "_links": {
-                        "base": base_url,
-                        "next": "/rest/api/content/search?cursor=untrusted-native-coordinate",
-                    },
-                },
-            )
-        return httpx.Response(200, json={"results": [], "_links": {"base": base_url}})
-
-    config = server_config(base_url)
-    client = ConfluenceClient(config, transport=httpx.MockTransport(handle), clock=lambda: 0.0)
-    await client.setup()
-    try:
-        await drain(
-            client.paginate(
-                client.url("/rest/api/content/search"),
-                validate_next=lambda _url, _params: (),
-            )
-        )
-    finally:
-        await client.teardown()
-
-    assert len(requests) == 2
-    assert not requests[1].url.query
 
 
 async def test_a_request_off_the_configured_origin_is_refused_before_it_is_sent() -> None:
