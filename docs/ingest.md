@@ -929,9 +929,18 @@ A connector that adapts its request shape mid-walk reports aggregate progress th
 `enumeration_offset` (a count of rows already admitted in the current stream, never a source
 identity), `enumeration_page_size` (the effective requested size after any adaptation),
 `enumeration_timeout_retries`, `enumeration_page_size_reduced`, `enumeration_reached_empty_page`
-and `enumeration_failure_code` are persisted on the acquisition run whenever they change — one
-fenced write per change, so a walk that never adapts writes once — and are served by ingest
-results, connector-list, lifecycle and snapshot status on every surface. Together they separate
+and `enumeration_failure_code` are persisted on the acquisition run and served by ingest results,
+connector-list, lifecycle and snapshot status on every surface.
+
+Those writes are paced, because the two obvious policies are both wrong. Writing whenever any
+field changed would write once per source page — the offset moves every page — which doubles the
+fenced writes on the enumeration hot path, where journal admission already writes once per page.
+Writing only when the *adaptive* fields change would freeze the stored offset, and a stationary
+offset is exactly how an operator identifies a hung run. So a change to the rare facts that alter
+what somebody does — a timeout, a page-size reduction, the empty-page end — is written at the
+next page boundary, and an offset that has merely advanced is written no more often than the
+lease renews. The in-process run report is stamped unconditionally, so an immediate result is
+always exact; only the durable row is paced. Together they separate
 the four states an operator otherwise cannot: active progress, retryable source latency (a walk
 shrinking its pages is making progress, not hung), exhausted timeout, and terminal completion.
 

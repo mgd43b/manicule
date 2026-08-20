@@ -1896,18 +1896,29 @@ class IngestPipeline:
             acquisitions if isinstance(acquisitions, EnumerationProgressStore) else None
         )
         persisted: EnumerationProgress | None = None
+        persisted_at: datetime | None = None
+        # The offset is the only field that moves every page, and the two obvious policies are
+        # both wrong. Writing whenever anything changed doubles the fenced writes on the
+        # enumeration hot path — journal admission already writes once per page — to keep a
+        # counter current that nobody polls that fast. Treating the offset as informational and
+        # writing only on adaptive change freezes the stored offset instead, which is worse: a
+        # healthy fast walk would show a stationary offset, and "the offset is not moving" is
+        # exactly how an operator identifies a hung run. So the rare facts that change what
+        # somebody *does* — a timeout, a shrink, the empty-page end — are written immediately,
+        # and an offset that has merely advanced is written no more often than the lease renews.
+        progress_interval = timedelta(seconds=self._acquisition_lease_s / 3)
 
         async def record_progress(
             diagnostic: AcquisitionDiagnostic | UnsetValue | None = UNSET,
         ) -> None:
-            """Persist the connector's aggregate adaptive facts whenever they change.
+            """Persist the connector's aggregate adaptive facts, bounded per enumeration.
 
-            Timeouts, shrinks and the empty-page end are rare events, so this costs one fenced
-            write per change rather than one per page — a happy walk writes once. The first
-            write of an enumeration explicitly clears any stored diagnostic, because a fresh
-            walk must not inherit the category its failed predecessor recorded.
+            The in-process report is stamped unconditionally, so an immediate result is always
+            exact; only the durable row is paced. The first write of an enumeration explicitly
+            clears any stored diagnostic, because a fresh walk must not inherit the category
+            its failed predecessor recorded.
             """
-            nonlocal persisted
+            nonlocal persisted, persisted_at
             if progress_source is None:
                 return
             snapshot = progress_source.enumeration_progress()
@@ -1917,17 +1928,29 @@ class IngestPipeline:
             effective = diagnostic
             if isinstance(effective, UnsetValue) and persisted is None:
                 effective = None
-            if snapshot == persisted and isinstance(effective, UnsetValue):
-                return
+            now = self._acquisition_clock()
+            if persisted is not None and isinstance(effective, UnsetValue):
+                if snapshot == persisted:
+                    return
+                adapted = snapshot.model_copy(update={"offset": 0}) != persisted.model_copy(
+                    update={"offset": 0}
+                )
+                if (
+                    not adapted
+                    and persisted_at is not None
+                    and now - persisted_at < progress_interval
+                ):
+                    return
             if await progress_store.record_acquisition_enumeration_progress(
                 run.acquisition_run_id,
                 run.lease_owner,
                 run.lease_generation,
-                now=self._acquisition_clock(),
+                now=now,
                 progress=snapshot,
                 diagnostic=effective,
             ):
                 persisted = snapshot
+                persisted_at = now
 
         stream = self._durable_discovery_batches(run)
         try:

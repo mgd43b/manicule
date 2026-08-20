@@ -41,9 +41,9 @@ from manicule.storage.vectors import LanceVectorStore
 from tests.fakes import HashEmbedder
 from tests.storage_helpers import make_chunk, make_document
 
+# Written as text, the way the stored column holds it: binding a `datetime` through raw SQL
+# reaches sqlite3's deprecated adapter rather than the type this schema declares.
 _LEGACY_NOW = "2026-08-18 00:00:00+00:00"
-"""Written as text, the way the stored column holds it: binding a `datetime` through raw
-SQL reaches sqlite3's deprecated adapter rather than the type this schema declares."""
 
 if TYPE_CHECKING:
     from pathlib import Path

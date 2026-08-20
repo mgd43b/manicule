@@ -31,6 +31,7 @@ from manicule.connectors.config import FullInventoryAuthority
 from manicule.connectors.confluence import ConfluenceConnector
 from manicule.connectors.sessions import SessionVault
 from manicule.core.acquisition import (
+    UNSET,
     AcquiredSource,
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
@@ -45,6 +46,7 @@ from manicule.core.acquisition import (
     SnapshotCompleteness,
     SnapshotItemOutcome,
     SnapshotPromotionPolicy,
+    UnsetValue,
 )
 from manicule.core.content import (
     IN_FLIGHT,
@@ -58,7 +60,7 @@ from manicule.core.content import (
 from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.rebuild import RebuildCheckpoint, RebuildState, RebuildTarget
-from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
+from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, Watermark
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.middleware import MiddlewareRunner
@@ -6837,3 +6839,111 @@ async def test_exhausted_adaptive_timeout_is_a_typed_incomplete_run_that_keeps_i
     assert run.diagnostic.code.value == "source_timeout"
     assert run.enumeration_page_size_reduced is True
     assert run.enumeration_reached_empty_page is False
+
+
+async def test_enumeration_progress_writes_are_paced_rather_than_one_per_page(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """Adaptive facts are written the moment they change; a moving offset is paced.
+
+    Both obvious policies are wrong and this pins the one that is not. Writing whenever
+    anything changed would double the fenced writes on the enumeration hot path — journal
+    admission already writes once per page — for a counter nobody polls that fast. Writing
+    only when the adaptive fields change would freeze the stored offset, and a stationary
+    offset is exactly how an operator identifies a hung run.
+    """
+    base = "https://wiki.example.test/confluence"
+    pages = [
+        FakePage(id=f"synthetic-{number:05d}", title=f"Public synthetic {number}", space="DOCS")
+        for number in range(30)
+    ]
+    instance = FakeConfluence(base_url=base, pages=pages, page_size=2)
+    instance.slow_offsets.append(SlowOffset(start=20, max_limit=1))
+    config = server_config(
+        base,
+        spaces=("DOCS",),
+        include_attachments=False,
+        page_size=4,
+        full_inventory_authority=FullInventoryAuthority.DIRECT_CURRENT_CONTENT,
+    )
+    connector = await connected(instance, config)
+
+    class CountingProgressStore(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.progress_writes: list[EnumerationProgress] = []
+
+        @override
+        async def record_acquisition_enumeration_progress(
+            self,
+            run_id: str,
+            owner: str,
+            generation: int,
+            *,
+            now: datetime,
+            progress: EnumerationProgress,
+            diagnostic: AcquisitionDiagnostic | UnsetValue | None = UNSET,
+        ) -> bool:
+            self.progress_writes.append(progress)
+            return await super().record_acquisition_enumeration_progress(
+                run_id,
+                owner,
+                generation,
+                now=now,
+                progress=progress,
+                diagnostic=diagnostic,
+            )
+
+    journal = CountingProgressStore()
+    await journal.ensure_workspace()
+    chunker = fakes.BlockChunker()
+    try:
+        report = await IngestPipeline(
+            store=journal,
+            acquisitions=journal,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        ).run(connector, acquire_only=True)
+    finally:
+        await connector.teardown()
+
+    inventory_requests = [
+        request for request in instance.requests if request.url.path.endswith("/rest/api/content")
+    ]
+
+    assert report.enumeration_reached_empty_page is True
+    assert report.enumeration_timeout_retries == 2
+    # Far more source pages than progress writes: the offset alone does not buy a write.
+    assert len(inventory_requests) > 15
+    assert len(journal.progress_writes) < len(inventory_requests)
+    # Every adaptive change is written at the next page boundary rather than paced away.
+    #
+    # Both reductions here happen inside one request cycle at one offset — the connector
+    # halves twice before any page comes back — so the intermediate (1 retry, limit 2) state
+    # is not observable to the pipeline at all, and the walk is not "adapting silently": the
+    # cumulative counters carry it. The window in which a struggling offset has changed
+    # nothing durable is bounded by `adaptive_max_seconds_per_offset`, after which the run
+    # terminates and records `source_timeout`; the lease heartbeat proves liveness meanwhile.
+    written = [
+        (write.timeout_retries, write.requested_page_size, write.reached_empty_page)
+        for write in journal.progress_writes
+    ]
+    assert (0, 4, False) in written, "the opening state must be recorded before any adaptation"
+    assert (2, 1, False) in written, "the reductions must be written at the next page boundary"
+    assert written[-1] == (2, 1, True), "the empty-page end is the last thing written"
+    # The durable row agrees with the report rather than trailing it at the terminal boundary.
+    durable = await journal.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.enumeration_reached_empty_page is True
+    assert durable.enumeration_timeout_retries == 2
+    assert durable.enumeration_page_size == 1
+    assert durable.enumeration_offset == report.enumeration_offset
