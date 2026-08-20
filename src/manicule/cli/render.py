@@ -570,6 +570,23 @@ def _add_vector_index_rows(table: Table, index: r.VectorIndexState) -> None:
         table.add_row("  refresh", _build_hint("the uncovered tail crossed the threshold"))
 
 
+def render_vector_sweep(out: Console, payload: r.VectorSweepReport) -> None:
+    """What one pass removed, or why it declined.
+
+    A pass that removed nothing and a pass that never ran are printed differently, because they
+    mean opposite things: the first is a clean index and the second is work still outstanding.
+    """
+    if not payload.ran:
+        out.print(f"[yellow]the sweep did not run:[/yellow] {escape(payload.blocked_by)}")
+        return
+    table = _folding_table()
+    table.add_row("vectors removed", str(payload.vectors_removed))
+    table.add_row("documents purged", str(payload.documents_purged))
+    out.print(table)
+    if not payload.vectors_removed and not payload.documents_purged:
+        out.print("[dim]nothing was waiting to be swept[/dim]")
+
+
 def render_vector_index(out: Console, payload: r.VectorIndexReport) -> None:
     table = _folding_table()
     before, after = payload.before, payload.after
@@ -1215,6 +1232,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     ),
     r.IndexStatus: lambda out, p: render_index_status(out, _as(r.IndexStatus, p)),
     r.VectorIndexReport: lambda out, p: render_vector_index(out, _as(r.VectorIndexReport, p)),
+    r.VectorSweepReport: lambda out, p: render_vector_sweep(out, _as(r.VectorSweepReport, p)),
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),
     r.Diagnosis: lambda out, p: render_diagnosis(out, _as(r.Diagnosis, p)),
     r.ConnectorList: lambda out, p: render_connectors(out, _as(r.ConnectorList, p)),

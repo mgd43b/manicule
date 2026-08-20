@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from manicule.ingest.pipeline import RunReport, Watching
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
+    from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
 
@@ -227,6 +228,21 @@ class Ingesting(Protocol):
         Which fingerprints count as current is decided here rather than passed in. A partial
         set makes every document its parser produced look stale, which is a repair that cannot
         end, so no surface is given the chance to supply one.
+        """
+        ...
+
+    async def sweep_vectors(self, *, batch: int, soft_delete_grace_s: float) -> SweepResult:
+        """Remove the vectors SQLite has already forgotten, and purge expired soft deletes.
+
+        On this port beside the other two sweeps rather than on :class:`Maintenance`, because
+        it is the same shape of thing: a bounded pass over derived rows that has to reach a
+        store :class:`DocumentSurface` cannot — the tombstone list — and has to use the *same*
+        vector handle a sync would, so the two are never writing to two different resolutions
+        of the publication pointer.
+
+        Bounded by ``batch`` rather than run to completion. One pass cannot monopolize the
+        writer, and the work is idempotent, so a corpus with a large backlog drains over
+        several passes instead of blocking one caller for all of them.
         """
         ...
 

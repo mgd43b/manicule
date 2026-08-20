@@ -654,6 +654,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "lifecycle_release_history": r.LifecycleReport,
     "lifecycle_delete_snapshot": r.LifecycleReport,
     "vector_index_build": r.VectorIndexReport,
+    "vector_sweep": r.VectorSweepReport,
     "doctor": r.Diagnosis,
     "connector_list": r.ConnectorList,
     "snapshot_status": r.SnapshotStatusReport,
@@ -1822,6 +1823,28 @@ def cleanup_derived_generations(
         )
         return
     submit(Command("lifecycle_cleanup_generations", {"dry_run": not yes}))
+
+
+@app.command("sweep-vectors")
+def sweep_vectors() -> None:
+    """Remove the vectors of chunks this index has already deleted.
+
+    Deleting a chunk cannot delete its vector in the same breath: LanceDB has no soft delete
+    and the two stores are not one transaction, so the delete records a tombstone and something
+    has to read the list. Until it does, the vector stays — still in the table, still consuming
+    a top-k slot ahead of the join that hides it.
+
+    A served manicule already runs this every `ingest.sweep_interval_s`, so you rarely need to
+    type it. What it is for is draining a backlog now rather than at the next interval — after a
+    large reconciliation, or on an index that predates the schedule existing. It goes to the
+    server like every other write command.
+
+    One bounded pass of `ingest.sweep_batch` tombstones. Running it again resumes; running it
+    against a clean index does nothing. It also purges documents whose soft-delete grace period
+    has expired, after which restoring one costs a re-parse from retained bytes rather than
+    being free.
+    """
+    submit(Command("vector_sweep", {}))
 
 
 @app.command("build-vector-index")

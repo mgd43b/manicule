@@ -1,7 +1,14 @@
 """The scheduled sweep that removes vectors SQLite has already forgotten.
 
 Tombstones are written by a trigger inside the transaction that deletes a chunk, so the list
-is never behind the truth. Nothing had a *runner*; this is it.
+is never behind the truth. This is the pass that reads them.
+
+**It is scheduled by :meth:`~manicule.app.served.Scheduler._run_sweep`**, on
+``ingest.sweep_interval_s``, and reachable by hand through ``manicule sweep-vectors``. Said
+here because this module spent a while describing a runner nothing ran: the trigger wrote
+tombstones, the list only grew, and every deleted chunk kept its vector — competing for
+top-``k`` slots ahead of the join that hides it — while three settings described a cadence
+that did not exist.
 
 **It reads tombstones. It never anti-joins.** Sweeping by comparing every id in the vector
 table against ``chunks`` races concurrent ingest: an id written after the scan began looks
@@ -11,12 +18,16 @@ ever names something that *was* deleted, so it cannot make that mistake. It is a
 small table instead of the whole index.
 
 **Scheduled, not triggered by deletion.** Otherwise a large reconciliation produces a sweep
-storm during a sync. And it yields, always, to two things:
+storm during a sync.
 
-* **a backup** — the backup lock blocks exactly this sweep and the blob GC, because they are
-  the only two operations that remove data;
-* **an active sync** — so an ingest run and a purge are never competing for the same vector
-  table.
+**What it yields to, stated as it is rather than as it should be.** The caller takes the
+derived-mutation guard, which serializes a pass against a reset, a rebuild and a re-embed
+publication — the operations that move the publication pointer underneath it. It is *not*
+serialized against a running sync, and the tombstone design is what makes that safe rather
+than merely tolerable: the list only ever names ids that were already deleted, so a vector
+written after the pass began cannot be in it. The exclusion against a hot backup is still
+unenforced — :func:`~manicule.storage.backup.create_backup` records it as the caller's
+responsibility, and no lock implements it yet.
 
 The soft-delete pass is the same sweep's second half. Within the grace period a restore is
 free; after it, the document's chunks are purged and a restore costs a re-parse from retained
@@ -30,7 +41,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from manicule.core.content import DocumentStatus
 
@@ -38,6 +49,7 @@ if TYPE_CHECKING:
     from manicule.ingest.ports import IngestStore
 
 
+@runtime_checkable
 class VectorSweepTarget(Protocol):
     """The vector-store surface a sweep needs.
 

@@ -2393,6 +2393,7 @@ MINIMAL: dict[str, list[str]] = {
     "snapshot_status": ["connector", "snapshot", "handbook"],
     "upgrade": ["upgrade"],
     "vector_index_build": ["build-vector-index", "--yes"],
+    "vector_sweep": ["sweep-vectors"],
     "workspace_switch": ["workspace", "switch", "other"],
 }
 """How to invoke each write command with **nothing optional given**.

@@ -1637,10 +1637,35 @@ an orphan, and the sweep deletes a live vector. A tombstone list only ever names
 *were* deleted, so it cannot. It is also cheap — the sweep reads a small table instead of the
 whole index.
 
-The runner lives in `manicule.ingest.sweeps`, is scheduled rather than triggered by deletion,
-and yields to both a backup and an active sync. Its ordering is this document's ordering: the
-vectors go first and the tombstones are cleared second, so a crash between them costs one
-wasted pass rather than a live vector with nothing left to record that it should go.
+The runner lives in `manicule.ingest.sweeps` and is scheduled rather than triggered by
+deletion. Its ordering is this document's ordering: the vectors go first and the tombstones are
+cleared second, so a crash between them costs one wasted pass rather than a live vector with
+nothing left to record that it should go.
+
+**What schedules it.** A served process runs one bounded pass every
+`ingest.sweep_interval_s` (default one hour), retiring `ingest.sweep_batch` tombstones and
+purging documents past `ingest.soft_delete_grace_s`. The first pass is one interval after
+startup, not at startup: restarting the server is something an operator does deliberately and
+often, and a restart that immediately began deleting would make it an event rather than a
+no-op. `manicule sweep-vectors` runs the same pass by hand, for draining a backlog now rather
+than at the next interval.
+
+Until that loop existed the trigger wrote tombstones and nothing read them
+([#261](https://github.com/mgd43b/manicule/issues/261) found the same shape of gap one section
+up). A chunk that was deleted or re-chunked left its vector in the table permanently, competing
+for top-`k` slots ahead of the join that hides it, and a soft-deleted document's grace period
+never expired because nothing was watching for it to. Three settings described the cadence of a
+loop that did not exist.
+
+**What it yields to, stated exactly.** The pass takes the derived-mutation guard, which
+serializes it against a reset, a rebuild and a re-embed publication — the operations that move
+the publication pointer underneath it. It is deliberately *not* serialized against a running
+sync, and the tombstone design is what makes that safe rather than merely tolerable: the list
+only ever names ids that were already deleted, so a vector written after the pass began cannot
+be in it. **The exclusion against a hot backup is not yet enforced by a lock** — `backup.py`
+records it as the caller's responsibility, and that remains true; a backup taken during a sweep
+can capture a torn moment between a vector's removal and its tombstone being cleared, which the
+next pass then repairs on the restored copy.
 
 ### 8.3 Recovery
 

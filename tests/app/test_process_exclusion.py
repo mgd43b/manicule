@@ -292,6 +292,7 @@ WRITERS: frozenset[str] = frozenset(
         "restore",
         "upgrade",
         "vector_index_build",
+        "vector_sweep",
         "workspace_switch",
     }
 )
@@ -592,10 +593,12 @@ def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exc
         "cleanup-derived-generations",
         "release-source-history",
         "reset-derived",
-        # `build-vector-index` emits `vector_index_build`: the operations are grouped by the
+        # `sweep-vectors` emits `vector_sweep`, and `build-vector-index` emits
+        # `vector_index_build`: the operations are grouped by the
         # noun they act on so a client sees `vector_index_*` together, and the command is named
         # for what an operator types. Same shape as `reset-derived` above.
         "build-vector-index",
+        "sweep-vectors",
         "snapshot-delete",
         "connector-snapshot",
         "connector-verify",

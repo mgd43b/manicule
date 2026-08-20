@@ -74,6 +74,7 @@ from manicule.ingest.reembed import (
     ReembedState,
 )
 from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
+from manicule.ingest.sweeps import SweepResult
 from manicule.retrieval.retriever import RetrievalResult
 from manicule.storage.organization import normalize_name
 
@@ -801,6 +802,14 @@ class FakeIngestion:
     connectors: dict[str, object] = field(default_factory=dict[str, object])
     snapshot: AcquisitionRun | None = None
     snapshot_verified: bool = True
+    vector_sweep: SweepResult = field(default_factory=SweepResult)
+    """What one pass of the vector sweep reports. A clean index by default."""
+    vector_sweeps: list[tuple[int, float]] = field(default_factory=list[tuple[int, float]])
+    """Every pass asked for, as ``(batch, soft_delete_grace_s)``.
+
+    Both recorded because both are settings, and a setting that parses but never reaches the
+    sweep is indistinguishable from one that works until somebody changes it.
+    """
     """Constructed connectors, by instance name, for :meth:`connector`.
 
     Deliberately populated by the test with an object built through the **real** factory rather
@@ -1050,6 +1059,10 @@ class FakeIngestion:
         if dry_run:
             return StaleSweep(dry_run=True, selected=self.sweep.selected)
         return self.sweep
+
+    async def sweep_vectors(self, *, batch: int, soft_delete_grace_s: float) -> SweepResult:
+        self.vector_sweeps.append((batch, soft_delete_grace_s))
+        return self.vector_sweep
 
     async def glossary_fingerprint(self) -> GlossaryFingerprint:
         """The real one, deliberately, rather than a stand-in with made-up fields.

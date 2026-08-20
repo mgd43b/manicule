@@ -22,7 +22,7 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 ## CLI — 48
 
 Ticket: #8 — **built.** The 48 rows below are upstream capability items, not the current command
-count. Manicule exposes 28 top-level commands; `manicule --help` and the asserted inventory in
+count. Manicule exposes 29 top-level commands; `manicule --help` and the asserted inventory in
 [`docs/surfaces.md`](docs/surfaces.md) are authoritative. Several bare verbs below are subcommands,
 so the mapping is noted where it is not obvious. The output shape is also a contract there.
 
@@ -164,9 +164,12 @@ than assume it.
   a tool no client can describe, and the description is how an assistant knows when to call it.
 
 **Deliberately not tools.** `reset-index`, `backup`, `restore`, `import`, `upgrade`, `start`,
-`stop`, `collection orphans`, rebuild execution/resume and the `auth` verbs are command-line only.
-Each destroys data, mints a credential, changes what the installation is or starts wide derived
-publication work, and a surface called unattended should not be able to do any of that.
+`stop`, `collection orphans`, `sweep-vectors`, rebuild execution/resume and the `auth` verbs are
+command-line only. Each destroys data, mints a credential, changes what the installation is or
+starts wide derived publication work, and a surface called unattended should not be able to do
+any of that. `sweep-vectors` purges soft-deleted documents whose grace period has expired, after
+which restoring one costs a re-parse rather than being free — and it needs no assistant, because
+a served installation already runs it on a schedule.
 `collection orphans` moves every document outside every collection into the trash, which in a
 corpus where collections are optional is most of it.
 

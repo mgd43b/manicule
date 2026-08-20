@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Forty-one MCP tools and twenty-nine CLI commands. They are not a one-to-one mapping: some
+Forty-one MCP tools and thirty CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -278,6 +278,7 @@ server and the built command tree.
 | `rebuild_run` | — | `rebuild execute` / `rebuild resume` | durable derived generation publication |
 | `rebuild_status` | ✓ | `rebuild status` | private-safe aggregate rebuild checkpoint |
 | `vector_index_build` | ✓ dry-run only | `build-vector-index [--yes] [--force]` | ANN index state before and after; whether a build ran |
+| `vector_sweep` | — | `sweep-vectors` | vectors removed and documents purged in one bounded pass |
 | `lifecycle_reset_derived` | ✓ dry-run only | `reset-derived --dry-run/--yes` | aggregate derived rows removed; source roots retained |
 | `lifecycle_cleanup_generations` | ✓ dry-run only | `cleanup-derived-generations [--yes]` | eligible/protected generations and temporary bytes |
 | `lifecycle_release_history` | ✓ dry-run only | `release-source-history BEFORE [--yes]` | policy-eligible history and uniquely released bytes |

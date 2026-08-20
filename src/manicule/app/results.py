@@ -1676,6 +1676,43 @@ class IndexStatus(Payload):
     data_dir: str = ""
 
 
+class VectorSweepReport(Payload):
+    """What one bounded pass of the vector sweep removed, or what stopped it.
+
+    Aggregate counts only — no chunk id, no document id, no URI. The subject of this operation
+    is what the corpus has *deleted*, and a report naming those rows would print a list of what
+    somebody removed to a terminal and to whatever a shell pipeline points at.
+
+    ``blocked_by`` empty is the normal case. A non-empty one is not a failure either: it is the
+    sweep declining to run right now, which is a thing it is designed to do and a different
+    outcome from a pass that ran and found nothing.
+    """
+
+    vectors_removed: int = Field(
+        default=0,
+        ge=0,
+        description="Tombstoned vectors deleted from the vector store this pass. Bounded by "
+        "``ingest.sweep_batch``, so a backlog drains over several passes rather than "
+        "monopolizing the writer for one.",
+    )
+    documents_purged: int = Field(
+        default=0,
+        ge=0,
+        description="Soft-deleted documents whose grace period expired and whose chunks were "
+        "removed. Past this point a restore costs a re-parse from retained bytes.",
+    )
+    blocked_by: str = Field(
+        default="",
+        description="Why the pass declined to run, or empty if it ran. Declining is a "
+        "designed outcome, not an error.",
+    )
+    ran: bool = Field(
+        default=True,
+        description="Whether the pass actually ran. Reported beside ``blocked_by`` so a "
+        "caller does not have to read emptiness as a boolean.",
+    )
+
+
 class VectorIndexReport(Payload):
     """What one pass of the ANN maintenance boundary did.
 
@@ -2255,6 +2292,7 @@ __all__ = [
     "UpgradeReport",
     "VectorIndexReport",
     "VectorIndexState",
+    "VectorSweepReport",
     "Workbench",
     "WorkbenchBlock",
     "WorkspaceList",

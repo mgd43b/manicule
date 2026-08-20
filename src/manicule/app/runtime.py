@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from manicule.ingest.ports import IngestStore
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
+    from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
     from manicule.storage.docstore import SqliteDocStore
     from manicule.storage.reembed import (
@@ -1660,6 +1661,48 @@ class _Ingestion:
             parse_fingerprints=current,
             batch=batch,
         )
+
+    async def sweep_vectors(self, *, batch: int, soft_delete_grace_s: float) -> SweepResult:
+        """One bounded pass of the tombstone sweep and the soft-delete purge.
+
+        Guarded like the other two sweeps, which is what serializes it against a reset, a
+        rebuild and a re-embed publication — the operations that move the publication pointer
+        underneath it. It is deliberately *not* serialized against a running sync: the
+        tombstone design makes that safe rather than merely tolerable, because the list only
+        ever names ids that were already deleted, so a vector written after the pass began
+        cannot be in it (``docs/storage.md`` §8.2).
+
+        The plain vector handle rather than the prepared one. Deleting a row needs the
+        directory's own recorded fingerprint and no embedder, and a sweep that constructed a
+        model runtime would be unable to run on exactly the machine whose index most needs
+        draining.
+        """
+        from manicule.ingest.sweeps import (  # noqa: PLC0415
+            SweepResult,
+            VectorSweepTarget,
+            sweep_vectors,
+        )
+
+        async with self._runtime.derived_mutation_guard():
+            vectors = await self._runtime.vectors()
+            if not isinstance(vectors, VectorSweepTarget):
+                # Said rather than skipped. `VectorStore` does not require chunk-level
+                # deletion, so a plugin backend can legitimately lack it — and a sweep that
+                # reported "0 removed" for a store it could not address would read exactly
+                # like a clean index.
+                return SweepResult(
+                    blocked_by=(
+                        f"the configured vector store ({type(vectors).__name__}) cannot delete "
+                        f"individual chunks, so tombstoned vectors cannot be swept from it"
+                    )
+                )
+            store = await self._runtime.documents()
+            return await sweep_vectors(
+                store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
+                vectors,
+                batch=batch,
+                soft_delete_grace_s=soft_delete_grace_s,
+            )
 
     async def glossary_fingerprint(self) -> GlossaryFingerprint:
         """What the installed detector would produce under this configuration.

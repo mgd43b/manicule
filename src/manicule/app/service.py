@@ -1952,6 +1952,36 @@ class ApplicationService:
             data_dir=str(self.settings.data_dir),
         )
 
+    async def sweep_vectors(self) -> r.VectorSweepReport:
+        """Run one bounded pass of the vector sweep.
+
+        A chunk deleted from SQLite leaves its vector behind: LanceDB has no soft delete, and
+        the delete trigger records a tombstone inside the same transaction rather than reaching
+        across stores (``docs/storage.md`` §8.2). Something has to read that list, and until it
+        does the vectors stay — still in the table, still consuming top-``k`` slots ahead of the
+        join that hides them.
+
+        **Scheduled rather than triggered by deletion**, which is why this exists as an
+        operation at all: a reconciliation that removes ten thousand documents would otherwise
+        produce ten thousand sweeps in the middle of a sync. A served process runs it on
+        ``ingest.sweep_interval_s``, and this is the same pass reached by hand — for draining a
+        backlog now rather than at the next interval.
+
+        Bounded by ``ingest.sweep_batch``. Running it again resumes, and running it against a
+        clean index is a no-op.
+        """
+        ingestion = await self._backend.ingestion()
+        swept = await ingestion.sweep_vectors(
+            batch=self.settings.ingest.sweep_batch,
+            soft_delete_grace_s=self.settings.ingest.soft_delete_grace_s,
+        )
+        return r.VectorSweepReport(
+            vectors_removed=swept.vectors_removed,
+            documents_purged=swept.documents_purged,
+            blocked_by=swept.blocked_by,
+            ran=swept.ran,
+        )
+
     async def vector_index_build(
         self, *, force: bool = False, dry_run: bool = False
     ) -> r.VectorIndexReport:

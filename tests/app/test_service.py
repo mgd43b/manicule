@@ -41,6 +41,7 @@ from manicule.core.retrieval import Candidate, Filter, RetrievalProfile
 from manicule.embedding.runtimes import hub
 from manicule.embedding.runtimes.hub import OFFLINE_ENV
 from manicule.ingest.pipeline import RunReport
+from manicule.ingest.sweeps import SweepResult
 from manicule.plugins.registry import discover
 from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
 from manicule.storage.organization import resolve_filter
@@ -2765,6 +2766,45 @@ async def test_status_names_the_detector_beside_the_other_three_stages(
 
     assert status.glossary.startswith(f"{DETECTOR} rules sha256:")
     assert status.stale_glossary == 1
+
+
+async def test_the_vector_sweep_carries_the_settings_that_bound_it(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Both are settings, and both reached nothing until the sweep had a caller.
+
+    `sweep_batch` is what stops one pass monopolizing the writer, and `soft_delete_grace_s` is
+    what decides whether restoring a document is free or costs a re-parse. A setting that parses
+    and never arrives looks exactly like one that works.
+    """
+    service.settings.ingest.sweep_batch = 11
+    service.settings.ingest.soft_delete_grace_s = 5.0
+    backend.ingestion_.vector_sweep = SweepResult(vectors_removed=4, documents_purged=1)
+
+    report = await service.sweep_vectors()
+
+    assert backend.ingestion_.vector_sweeps == [(11, 5.0)]
+    assert report.vectors_removed == 4
+    assert report.documents_purged == 1
+    assert report.ran
+    assert not report.blocked_by
+
+
+async def test_a_sweep_that_declined_reports_why_rather_than_reporting_nothing_removed(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """A clean index and a pass that never ran are opposite findings that count the same.
+
+    Both remove zero vectors. One means there is nothing to do and the other means the work is
+    still outstanding, and an operator who cannot tell them apart stops looking.
+    """
+    backend.ingestion_.vector_sweep = SweepResult(blocked_by="a backup is running")
+
+    report = await service.sweep_vectors()
+
+    assert not report.ran
+    assert report.blocked_by == "a backup is running"
+    assert report.vectors_removed == 0
 
 
 async def test_status_reports_whether_dense_search_is_still_exhaustive(
