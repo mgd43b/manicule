@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -10,8 +11,11 @@ from manicule.app.dispatch import run_op
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.core.acquisition import (
+    AcquisitionDiagnostic,
+    AcquisitionFailureCode,
     AcquisitionRun,
     AcquisitionRunState,
+    AcquisitionStage,
     SnapshotCompleteness,
     SnapshotPromotionPolicy,
 )
@@ -310,3 +314,80 @@ async def test_rebuild_refusal_is_a_typed_failure_envelope() -> None:
     assert envelope.error is not None
     assert envelope.error.type == "RebuildRefusedError"
     assert envelope.error.message == "missing_local_input"
+
+
+async def test_adaptive_enumeration_facts_reach_status_without_a_private_value() -> None:
+    """The four states an operator has to tell apart, and none of them names a source thing.
+
+    Active progress, retryable source latency, exhausted timeout and terminal completion.
+    Before these fields a walk shrinking its pages to survive a slow deep offset was
+    indistinguishable from a hung one, and the only way to tell was a value nobody may print.
+    """
+    backend = _backend()
+    snapshot = backend.ingestion_.snapshot
+    assert snapshot is not None
+    backend.ingestion_.snapshot = snapshot.model_copy(
+        update={
+            "enumeration_offset": 17_800,
+            "enumeration_page_size": 12,
+            "enumeration_timeout_retries": 3,
+            "enumeration_page_size_reduced": True,
+            "enumeration_reached_empty_page": False,
+        }
+    )
+    latency = (await ApplicationService(backend).snapshot_status("synthetic-wiki")).lifecycle
+
+    assert latency.enumeration_offset == 17_800
+    assert latency.enumeration_page_size == 12
+    assert latency.enumeration_timeout_retries == 3
+    assert latency.enumeration_page_size_reduced is True
+    assert latency.enumeration_reached_empty_page is False
+    assert latency.enumeration_failure_code == ""
+
+    exhausted_run = backend.ingestion_.snapshot
+    assert exhausted_run is not None
+    backend.ingestion_.snapshot = exhausted_run.model_copy(
+        update={
+            "diagnostic": AcquisitionDiagnostic(
+                stage=AcquisitionStage.ENUMERATION,
+                code=AcquisitionFailureCode.SOURCE_TIMEOUT,
+            )
+        }
+    )
+    exhausted = (await ApplicationService(backend).snapshot_status("synthetic-wiki")).lifecycle
+    assert exhausted.enumeration_failure_code == "source_timeout"
+
+    complete_run = backend.ingestion_.snapshot
+    assert complete_run is not None
+    backend.ingestion_.snapshot = complete_run.model_copy(
+        update={
+            "diagnostic": None,
+            "enumeration_reached_empty_page": True,
+            "enumeration_timeout_retries": 0,
+            "enumeration_page_size_reduced": False,
+        }
+    )
+    complete = (await ApplicationService(backend).snapshot_status("synthetic-wiki")).lifecycle
+    assert complete.enumeration_reached_empty_page is True
+    assert complete.enumeration_failure_code == ""
+
+    # A connector that makes no adaptive claim keeps the tri-state distinction: absent is not
+    # "an authoritative walk stopped short".
+    silent_run = backend.ingestion_.snapshot
+    assert silent_run is not None
+    backend.ingestion_.snapshot = silent_run.model_copy(
+        update={
+            "enumeration_offset": None,
+            "enumeration_page_size": None,
+            "enumeration_reached_empty_page": None,
+        }
+    )
+    silent = (await ApplicationService(backend).snapshot_status("synthetic-wiki")).lifecycle
+    assert silent.enumeration_offset is None
+    assert silent.enumeration_page_size is None
+    assert silent.enumeration_reached_empty_page is None
+
+    # Aggregates only: no source identity, space key, URL or raw exception text anywhere.
+    serialized = json.dumps(latency.model_dump(mode="json"))
+    assert "synthetic-wiki" not in serialized
+    assert "http" not in serialized

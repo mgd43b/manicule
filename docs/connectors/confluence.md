@@ -536,11 +536,86 @@ mismatched evidence fails the aggregate enumeration; it is never converted to an
 filled from the request. Under strict policy that run cannot promote. `allow_omissions` may still
 represent typed body-fetch omissions, but it cannot promote an inventory known to be incomplete.
 
-Data Center native `next` links commonly contain only `start` and `limit`. The connector follows
-that native coordinate while re-pinning space, type, status, expansion, and configured page size
-on every request. An explicit conflict, extra narrowing parameter, malformed coordinate,
-cross-origin link, or loop fails closed. A response page is committed before its next link is
-requested, and only a direct walk's true end authorizes reconciliation.
+**The walk is by explicit offsets, and its only end condition is a validated empty page.** The
+connector builds every request itself — space, type, `status=current`, the type's expansion and
+the requested `limit`, with `start` advanced by *the number of rows the previous response
+actually returned*. It does not follow the native `next` link, because on this resource the link
+is not evidence: it has been observed absent at round offsets while later explicit offsets still
+held rows, so treating its absence as completion silently truncates the inventory. Neither is a
+page shorter than the requested limit an end — the source caps page sizes below what is asked
+for — nor a request timeout, nor a locally expected count, nor a search-index aggregate. Only a
+well-formed page carrying zero rows completes the walk, and an empty page that still declares a
+`next` link is refused rather than believed.
+
+Each response's own `start`, `limit` and `size` are validated against the request when present,
+more rows than were asked for is a refusal, every emitted identity is checked against a
+disk-backed bounded history so a repeated or non-advancing page fails closed rather than looping,
+and the declared link base must stay on the configured origin. A response page is committed
+before the next offset is requested, and only a direct walk's true end authorizes reconciliation.
+
+### Adaptive page size at a slow offset
+
+On a large space this resource gets slower as `start` grows. Past some depth a full configured
+page can exceed `request_timeout_seconds` while the *same offset* still answers a smaller page —
+so a fixed page size fails at that offset on every attempt, forever, while the source is
+reachable and healthy.
+
+When a direct inventory request fails specifically with a retryable read timeout or an explicitly
+classified transient gateway timeout, the connector retries **the same offset and the same
+immutable scope with a smaller requested limit**, halving from the last value down to
+`adaptive_min_page_size`. Nothing else about the request changes: not `start`, not the space,
+type or status, not the expansion contract. `tests/connectors/test_adaptive_pagination.py`
+records every request the transport sees and fails if an adaptive retry changes anything but the
+limit.
+
+| Option | Default | What it bounds |
+|---|---|---|
+| `adaptive_min_page_size` | `1` | How small a page the shrink may ask for |
+| `adaptive_max_attempts_per_offset` | `8` | Timed-out requests one offset may absorb |
+| `adaptive_max_seconds_per_offset` | `240` | Cumulative time spent at one offset |
+| `adaptive_page_size_growth` | `false` | Whether a later success may regrow the page |
+
+Growth is off by default because the observed latency is *progressive*: a regrown page
+re-times-out a few offsets later, and each recovery costs a full request timeout of stall. Turn
+it on for a source whose slowness is patchy rather than depth-dependent.
+
+None of these four is part of the scope fingerprint, so retuning them never forces a
+re-enumeration. They change how a membership question is asked, never what it means: the same
+rows arrive in the same order, across more and smaller requests.
+
+**Only a timeout adapts.** An authentication or authorization failure, a malformed or untrusted
+response, a mutated source scope, a cancellation, a lost lease, a storage failure and an ordinary
+non-timeout 4xx all propagate unchanged — none of them gets better when asked for fewer rows, and
+retrying them smaller would turn one clear error into several and hide which it was. When the
+bounded policy is exhausted the **original typed timeout** is raised, so the run ends as the
+thing that happened rather than as a policy of its own.
+
+Exhaustion is safe and resumable, and specifically is *not* an end of inventory: the durable
+prefix is kept, the lease is released so a retry can start immediately, no completion marker or
+candidate watermark is written, nothing is promoted, and deletion reconciliation does not run.
+The run records `source_timeout` as its typed category, which is what tells an operator that the
+remedy is these dials rather than a credential or a missing page.
+
+### What the inventory projection asks for
+
+The direct inventory expands only what proves whole-space membership and selects a reusable
+retained revision:
+
+| Row | Expansion | Why |
+|---|---|---|
+| `page` | `version,space` | id, type, `current` status, title and `_links.webui` arrive unexpanded; `version` carries the revision and its instant; `space` proves the row is in the space that was asked for |
+| `attachment` | `version,space,container` | the same, plus the container relationship that makes its parent page provable at inventory time |
+
+`ancestors` is deliberately **not** expanded here, unlike the search projection: breadcrumb
+ancestry proves nothing about membership, and the page fetch obtains it authoritatively from the
+same response that carries the retained body (§4). Bodies and full provenance likewise come from
+the fetch. Retained-body reuse stays revision-safe because the inventory's `version.number` is
+the change token the journal compares, and a fetched body older than it is refused rather than
+certified.
+
+This is not a timing optimization dressed up as a projection — nothing was removed to make a test
+faster. High-offset latency grows with both the offset and the per-row expansion cost; the
+projection bounds the second, and the adaptive page size bounds the first.
 
 **Incremental** — a per-space watermark of the last successful sync, which adds one clause to
 whichever of those two the deployment uses:

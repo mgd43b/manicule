@@ -13,7 +13,7 @@ from email.utils import format_datetime
 import httpx
 import pytest
 
-from manicule.connectors import ConnectorError, RateLimitedError
+from manicule.connectors import ConnectorError, RateLimitedError, RequestTimeoutError
 from manicule.connectors.client import BACKOFF_BASE_SECONDS, ConfluenceClient
 from manicule.connectors.config import Deployment
 from tests.connectors.fake_confluence import CLOUD_BASE, SERVER_BASE, FakeConfluence, FakePage
@@ -218,3 +218,98 @@ async def test_server_authenticates_with_a_bearer_token() -> None:
         await client.teardown()
 
     assert instance.requests[0].headers["authorization"] == "Bearer pat"
+
+
+# --- surfaced timeouts -----------------------------------------------------------------------
+
+
+def _timing_out(failures: int, *responses: httpx.Response) -> httpx.MockTransport:
+    """A transport whose first ``failures`` requests raise a read timeout."""
+    remaining = {"count": failures}
+    queue = list(responses)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if remaining["count"] > 0:
+            remaining["count"] -= 1
+            raise httpx.ReadTimeout("synthetic read timeout", request=request)
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    return httpx.MockTransport(handle)
+
+
+async def test_a_read_timeout_is_surfaced_on_the_first_failure_when_asked() -> None:
+    """The caller that can change the request gets the timeout, not a same-shape retry."""
+    waits = Waits()
+    client = await _client(_timing_out(5, httpx.Response(200, json={})), waits)
+    try:
+        with pytest.raises(RequestTimeoutError, match="request_timeout_seconds"):
+            await client.get_json(client.url("/rest/api/content"), surface_read_timeouts=True)
+    finally:
+        await client.teardown()
+
+    assert client.requests == 1, "a surfaced timeout must not be retried at the same shape"
+    assert waits.seconds == []
+
+
+async def test_a_read_timeout_keeps_the_ordinary_retry_policy_by_default() -> None:
+    """Nothing changes for callers that did not ask: transport retries, then a plain failure."""
+    waits = Waits()
+    client = await _client(_timing_out(2, httpx.Response(200, json={"results": []})), waits)
+    try:
+        await client.get_json(client.url("/rest/api/content"))
+    finally:
+        await client.teardown()
+
+    assert client.requests == 3
+    assert waits.seconds == [BACKOFF_BASE_SECONDS, BACKOFF_BASE_SECONDS * 2]
+
+
+async def test_a_connection_failure_is_still_retried_when_timeouts_are_surfaced() -> None:
+    """Only the read timeout is about the request's shape; a refused connection is not."""
+    waits = Waits()
+    attempts = {"count": 0}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise httpx.ConnectError("synthetic refused connection", request=request)
+        return httpx.Response(200, json={"results": []})
+
+    client = await _client(httpx.MockTransport(handle), waits)
+    try:
+        await client.get_json(client.url("/rest/api/content"), surface_read_timeouts=True)
+    finally:
+        await client.teardown()
+
+    assert attempts["count"] == 2
+    assert waits.seconds == [BACKOFF_BASE_SECONDS]
+
+
+async def test_a_gateway_timeout_is_classified_with_the_read_timeout_when_asked() -> None:
+    """504 is the same fact reported by whatever sits in front of Confluence."""
+    waits = Waits()
+    client = await _client(_responder(httpx.Response(504, json={})), waits)
+    try:
+        with pytest.raises(RequestTimeoutError, match="gateway"):
+            await client.get_json(client.url("/rest/api/content"), surface_read_timeouts=True)
+    finally:
+        await client.teardown()
+
+    assert client.requests == 1
+    assert waits.seconds == []
+
+
+async def test_a_gateway_timeout_stays_a_retried_server_error_by_default() -> None:
+    """Without the flag, a 504 keeps the widening-gap retry every 5xx gets."""
+    waits = Waits()
+    client = await _client(
+        _responder(httpx.Response(504, json={}), httpx.Response(200, json={"results": []})),
+        waits,
+    )
+    try:
+        await client.get_json(client.url("/rest/api/content"))
+    finally:
+        await client.teardown()
+
+    assert client.requests == 2
+    assert waits.seconds == [BACKOFF_BASE_SECONDS]

@@ -45,6 +45,7 @@ from manicule.connectors.errors import (
     NotFoundError,
     RateLimitedError,
     RemoteError,
+    RequestTimeoutError,
     SessionExpiredError,
     UntrustedLinkError,
 )
@@ -60,7 +61,13 @@ from manicule.connectors.pagination import next_page, origin_of
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     import httpx
 
-__all__ = ["BACKOFF_BASE_SECONDS", "MAX_REDIRECTS", "ConfluenceClient", "Downloaded"]
+__all__ = [
+    "BACKOFF_BASE_SECONDS",
+    "MAX_REDIRECTS",
+    "BoundedHistory",
+    "ConfluenceClient",
+    "Downloaded",
+]
 
 BACKOFF_BASE_SECONDS = 0.5
 """First delay after a retryable failure. Doubles per attempt, capped by configuration."""
@@ -74,12 +81,15 @@ type Params = Sequence[tuple[str, str]]
 type Json = Mapping[str, object]
 
 
-class _CursorHistory:
-    """Disk-backed, bounded-memory fingerprints of requests already followed.
+class BoundedHistory:
+    """Disk-backed, bounded-memory fingerprints of values already seen.
 
-    A digest collision can only refuse a safe request; it cannot let a pagination cycle pass.
-    The unnamed SQLite database is a temporary file deleted when this object closes, and its
-    page cache is explicitly bounded independently of the number of source pages.
+    The loop guard for anything that must not repeat over an enumeration whose size is the
+    source's to choose: followed pagination requests, and the identities an authoritative
+    inventory has already emitted. A digest collision can only refuse a safe value; it cannot
+    let a repeat pass. The unnamed SQLite database is a temporary file deleted when this object
+    closes, and its page cache is explicitly bounded independently of the number of entries —
+    which is what lets a corpus-sized membership check obey a page-sized memory budget.
     """
 
     def __init__(self) -> None:
@@ -93,9 +103,10 @@ class _CursorHistory:
                 database.close()
             raise ConnectorError("cannot create the bounded pagination history") from exc
 
-    def add(self, url: str, params: Sequence[tuple[str, str]]) -> bool:
+    def add(self, *parts: str) -> bool:
+        """Record ``parts`` as one seen value; ``False`` if it was already recorded."""
         digest = hashlib.sha256()
-        for part in (url, *(part for pair in params for part in pair)):
+        for part in parts:
             encoded = part.encode()
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
@@ -227,14 +238,27 @@ class ConfluenceClient:
             raise UntrustedLinkError(msg)
         return url
 
-    async def get_json(self, url: str, params: Params = ()) -> Json:
+    async def get_json(
+        self, url: str, params: Params = (), *, surface_read_timeouts: bool = False
+    ) -> Json:
         """GET ``url`` and decode a JSON object from it.
+
+        Args:
+            url: Where to ask, checked against the configured origin before anything is sent.
+            params: Query parameters, encoded by the HTTP client.
+            surface_read_timeouts: Raise :class:`RequestTimeoutError` on the first read
+                timeout or 504 instead of retrying the identical request. For a caller that
+                can *change* the request — the authoritative direct inventory shrinks its page
+                size at the same offset — same-shape retries only spend the budget on the
+                shape that already failed. Every other failure keeps the ordinary policy.
 
         Raises:
             ConnectorError: The response was not a JSON object, which for these endpoints
                 means something other than the API answered — a proxy login page, most often.
+            RequestTimeoutError: Only with ``surface_read_timeouts``, and only for the two
+                timeout shapes described above.
         """
-        response = await self._get(url, params)
+        response = await self._get(url, params, surface_read_timeouts=surface_read_timeouts)
         try:
             payload: object = response.json()
         except ValueError as exc:
@@ -251,13 +275,7 @@ class ConfluenceClient:
             raise ConnectorError(msg)
         return cast("Json", payload)
 
-    async def paginate(
-        self,
-        url: str,
-        params: Params = (),
-        *,
-        validate_next: Callable[[str, Params], Params | None] | None = None,
-    ) -> AsyncIterator[Json]:
+    async def paginate(self, url: str, params: Params = ()) -> AsyncIterator[Json]:
         """Yield each page of a cursor-paginated response, following ``_links.next``.
 
         Three failures are guarded here, and each is silent without a guard:
@@ -273,7 +291,7 @@ class ConfluenceClient:
         """
         current_url = url
         current_params: Params = params
-        followed = _CursorHistory()
+        followed = BoundedHistory()
         try:
             while True:
                 payload = await self.get_json(current_url, current_params)
@@ -284,16 +302,14 @@ class ConfluenceClient:
                 if following is None:
                     return
                 next_params = following.params
-                if validate_next is not None:
-                    validated = validate_next(following.url, following.params)
-                    if validated is not None:
-                        next_params = validated
 
                 # The history insertion is disk-backed on purpose. Include that I/O in the
                 # cursor's held time: checking before it would leave an unguarded stall between
                 # the check and the next request, which is precisely where an expired cursor
                 # must never be followed.
-                is_new = followed.add(following.url, next_params)
+                is_new = followed.add(
+                    following.url, *(part for pair in next_params for part in pair)
+                )
                 held = self._clock() - received
                 if held > self._config.cursor_lifetime_seconds:
                     msg = (
@@ -399,9 +415,11 @@ class ConfluenceClient:
                 await self._retry_transport(exc, url, attempt)
         raise self._exhausted(url)
 
-    async def _get(self, url: str, params: Params) -> httpx.Response:
+    async def _get(
+        self, url: str, params: Params, *, surface_read_timeouts: bool = False
+    ) -> httpx.Response:
         for _ in range(MAX_REDIRECTS + 1):
-            response = await self._attempt(url, params)
+            response = await self._attempt(url, params, surface_read_timeouts=surface_read_timeouts)
             redirect = self._redirect(url, response.status_code, response.headers)
             if redirect is None:
                 self._verify(
@@ -414,7 +432,9 @@ class ConfluenceClient:
             url, params = redirect, ()
         raise self._looping(url)
 
-    async def _attempt(self, url: str, params: Params) -> httpx.Response:
+    async def _attempt(
+        self, url: str, params: Params, *, surface_read_timeouts: bool = False
+    ) -> httpx.Response:
         """One URL's worth of requesting, including the retries. Redirects are the caller's."""
         client = self._require_client()
         url = self._checked(url)
@@ -425,8 +445,16 @@ class ConfluenceClient:
             try:
                 response = await client.get(url, params=list(params), headers=self._headers())
             except httpx.TransportError as exc:
+                if surface_read_timeouts and isinstance(exc, httpx.ReadTimeout):
+                    raise self._timed_out(url) from exc
                 await self._retry_transport(exc, url, attempt)
                 continue
+            if surface_read_timeouts and response.status_code == HTTPStatus.GATEWAY_TIMEOUT:
+                # A gateway timeout here is the same fact as a read timeout — the source is
+                # reachable and this request shape was too slow for whatever sits in front of
+                # it — so it is classified with the read timeout rather than retried as a
+                # server fault.
+                raise self._timed_out(url, status=response.status_code)
             wait = self._retry_delay(response.status_code, response.headers, attempt)
             if wait is not None:
                 await self._sleep(wait)
@@ -588,6 +616,21 @@ class ConfluenceClient:
             f"the account is authenticated but not permitted to read {url}.{detail} The index "
             f"holds what this account can see and nothing else — restricted spaces stay "
             f"invisible unless the account is granted them."
+        )
+
+    def _timed_out(self, url: str, status: int | None = None) -> RequestTimeoutError:
+        """A surfaced timeout, named so the caller adapts the request instead of repeating it."""
+        shape = (
+            f"answered {status} — a gateway in front of it gave up waiting"
+            if status is not None
+            else f"did not answer within the {self._config.request_timeout_seconds:.0f}s "
+            f"request timeout (request_timeout_seconds)"
+        )
+        return RequestTimeoutError(
+            f"{url} {shape}. The caller asked for timeouts surfaced rather than retried, "
+            f"because repeating the identical request into a source that just proved too slow "
+            f"for it spends the whole budget on the shape that failed; a smaller request at "
+            f"the same position is the retry that can succeed."
         )
 
     def _exhausted(self, url: str) -> ConnectorError:

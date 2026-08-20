@@ -32,6 +32,7 @@ from manicule.connectors.errors import (
     NotFoundError,
     RateLimitedError,
     RemoteError,
+    RequestTimeoutError,
     SessionExpiredError,
     UntrustedLinkError,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "NotFoundError",
     "RateLimitedError",
     "RemoteError",
+    "RequestTimeoutError",
     "SessionExpiredError",
     "UntrustedLinkError",
     "resolve_credentials",

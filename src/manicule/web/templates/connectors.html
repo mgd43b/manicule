@@ -12,7 +12,7 @@
 {% if panels.connectors.ok %}
 {% if panels.connectors.data.connectors %}
 <table>
-  <thead><tr><th>Name</th><th>Type</th><th>Full inventory</th><th>Enabled</th><th>Installed</th><th>Last sync</th><th>Outcome</th><th>Retry</th><th>Status</th><th>Documents</th><th></th></tr></thead>
+  <thead><tr><th>Name</th><th>Type</th><th>Full inventory</th><th>Enabled</th><th>Installed</th><th>Last sync</th><th>Outcome</th><th>Retry</th><th>Enumeration</th><th>Status</th><th>Documents</th><th></th></tr></thead>
   <tbody>
     {% for item in panels.connectors.data.connectors %}
     <tr>
@@ -24,6 +24,17 @@
       <td>{{ item.last_synced_at or 'never' }}</td>
       <td>{{ item.last_outcome or '—' }}</td>
       <td>{{ 'yes' if item.retry_required else 'no' }}</td>
+      {#- Aggregate counts only. A walk adapting to source latency reads as progress here
+          rather than as a stalled run; nothing about which pages or spaces is surfaced. -#}
+      <td>
+        {%- if item.last_lifecycle and item.last_lifecycle.enumeration_failure_code -%}
+        stopped: {{ item.last_lifecycle.enumeration_failure_code }}
+        {%- elif item.last_lifecycle and item.last_lifecycle.enumeration_timeout_retries -%}
+        {{ item.last_lifecycle.enumeration_timeout_retries }} timeout retr{{ 'y' if item.last_lifecycle.enumeration_timeout_retries == 1 else 'ies' }}, page size {{ item.last_lifecycle.enumeration_page_size or '—' }}
+        {%- elif item.last_lifecycle and item.last_lifecycle.enumeration_reached_empty_page -%}
+        reached explicit end
+        {%- else -%}—{%- endif -%}
+      </td>
       <td>{{ item.status or '—' }}</td>
       <td>{{ item.documents if item.documents is not none else '—' }}</td>
       <td class="actions">

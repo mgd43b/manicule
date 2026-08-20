@@ -431,6 +431,39 @@ def render_stale_glossary(out: Console, payload: r.StaleGlossaryReport) -> None:
 # --- ingest -----------------------------------------------------------------------------------
 
 
+def _add_enumeration_rows(table: Table, payload: r.IngestReport) -> None:
+    """Adaptive-pagination rows, only when the source's latency changed the request shape.
+
+    A row reading "no" on every ordinary run is a row nobody reads on the run where it
+    finally says something.
+    """
+    if payload.enumeration_timeout_retries:
+        table.add_row("source timeout retries", str(payload.enumeration_timeout_retries))
+    if payload.enumeration_page_size_reduced and payload.enumeration_page_size is not None:
+        table.add_row("page size reduced to", str(payload.enumeration_page_size))
+    if payload.enumeration_failure_code:
+        table.add_row("enumeration stopped by", escape(payload.enumeration_failure_code))
+
+
+def _retry_advice(payload: r.IngestReport) -> str:
+    """What to do about an incomplete run, in terms of the thing that would change it."""
+    if payload.enumeration_failure_code == "source_timeout":
+        # The one remedy that is a setting rather than a repeat: the source stayed healthy
+        # and the bounded shrink ran out, so the dials are what change the outcome. Named,
+        # because "run it again" on its own would loop.
+        return (
+            "the source stayed reachable but a request kept timing out after the page size "
+            "was reduced as far as adaptive_min_page_size allows; the durable prefix was kept "
+            "and the watermark was not advanced. Running again resumes; if it recurs, lower "
+            "adaptive_min_page_size or raise adaptive_max_attempts_per_offset"
+        )
+    if payload.inventory_recovery == "reenumeration_required":
+        return (
+            "the watermark was not advanced; running again starts a fresh fenced source enumeration"
+        )
+    return "the watermark was not advanced, so running it again resumes"
+
+
 def render_ingest(out: Console, payload: r.IngestReport) -> None:
     table = Table(box=None, show_header=False, pad_edge=False)
     table.add_row("source", escape(payload.connector))
@@ -448,6 +481,7 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
         table.add_row("inventory recovery", escape(payload.inventory_recovery))
     if payload.reconciled_deleted_items:
         table.add_row("disappeared items reconciled", str(payload.reconciled_deleted_items))
+    _add_enumeration_rows(table, payload)
     if payload.derivation_deferred:
         table.add_row("derivation deferred", "yes (snapshot retained locally)")
     if payload.expanded:
@@ -463,13 +497,7 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     if payload.retry_required:
         detail = payload.incomplete_reason.message if payload.incomplete_reason else "unknown"
         out.print(f"[red]the run did not finish: {escape(detail)}[/red]")
-        if payload.inventory_recovery == "reenumeration_required":
-            out.print(
-                "[dim]the watermark was not advanced; running again starts a fresh fenced "
-                "source enumeration[/dim]"
-            )
-        else:
-            out.print("[dim]the watermark was not advanced, so running it again resumes[/dim]")
+        out.print(f"[dim]{_retry_advice(payload)}[/dim]")
         return
     if payload.intentionally_bounded:
         out.print(
@@ -933,6 +961,22 @@ def render_snapshot_status(out: Console, payload: r.SnapshotStatusReport) -> Non
             f"inventory recovery: {escape(progress.inventory_recovery)}; "
             f"disappeared items reconciled: {progress.reconciled_deleted_items}"
         )
+    # The line that separates "adapting to a slow source" from "hung": a walk that is
+    # shrinking its requests is making progress, and only these counts say so.
+    if progress.enumeration_timeout_retries or progress.enumeration_page_size_reduced:
+        offset = progress.enumeration_offset
+        out.print(
+            f"source timeout retries: {progress.enumeration_timeout_retries}; "
+            f"requested page size: {progress.enumeration_page_size or '—'}; "
+            f"offset: {offset if offset is not None else '—'}"
+        )
+    if progress.enumeration_reached_empty_page is not None:
+        out.print(
+            "authoritative inventory reached its explicit end: "
+            f"{'yes' if progress.enumeration_reached_empty_page else 'no'}"
+        )
+    if progress.enumeration_failure_code:
+        out.print(f"enumeration stopped by: {escape(progress.enumeration_failure_code)}")
 
 
 def render_collection(out: Console, payload: r.CollectionSummary) -> None:

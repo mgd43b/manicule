@@ -31,6 +31,7 @@ from manicule.connectors.config import FullInventoryAuthority
 from manicule.connectors.confluence import ConfluenceConnector
 from manicule.connectors.sessions import SessionVault
 from manicule.core.acquisition import (
+    UNSET,
     AcquiredSource,
     AcquisitionDiagnostic,
     AcquisitionFailureCode,
@@ -45,6 +46,7 @@ from manicule.core.acquisition import (
     SnapshotCompleteness,
     SnapshotItemOutcome,
     SnapshotPromotionPolicy,
+    UnsetValue,
 )
 from manicule.core.content import (
     IN_FLIGHT,
@@ -58,7 +60,7 @@ from manicule.core.content import (
 from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.rebuild import RebuildCheckpoint, RebuildState, RebuildTarget
-from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
+from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, Watermark
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.middleware import MiddlewareRunner
@@ -79,7 +81,7 @@ from manicule.storage.models import FTS_TOKENIZER
 from manicule.storage.rebuild import SqliteRebuildStore
 from manicule.storage.vectors import LanceVectorStore
 from tests.app.fakes import FakeBackend, FakeIngestion
-from tests.connectors.fake_confluence import FakeConfluence, FakePage
+from tests.connectors.fake_confluence import FakeConfluence, FakePage, SlowOffset
 from tests.connectors.support import Clock as ConfluenceClock
 from tests.connectors.support import client_for, cloud_config, connected, server_config
 from tests.fakes import HashEmbedder
@@ -4937,7 +4939,7 @@ async def test_the_reusable_manifest_is_verified_once_across_every_acquisition_w
     assert connector.fetches == fetches, "a verified manifest means no body is downloaded again"
 
 
-async def test_direct_native_pages_restart_from_an_exact_durable_prefix(
+async def test_direct_native_pages_restart_from_an_exact_durable_prefix(  # noqa: PLR0915 - one interruption/restart evidence record
     store: SqliteDocStore,
     engine: AsyncEngine,
     data_dir: Path,
@@ -5016,8 +5018,15 @@ async def test_direct_native_pages_restart_from_an_exact_durable_prefix(
 
     assert completed.enumeration_completed
     assert completed.snapshot_completeness == "complete"
+    # Completion is the validated explicit empty page and nothing else, so the durable row
+    # says so — and says the source's latency never forced the request shape to adapt.
+    assert completed.enumeration_reached_empty_page is True
+    assert completed.enumeration_timeout_retries == 0
+    assert completed.enumeration_page_size_reduced is False
+    assert completed.enumeration_failure_code == ""
     promoted = await store.latest_promoted_snapshot(connector.name, connector.scope_fingerprint)
     assert promoted is not None
+    assert promoted.enumeration_reached_empty_page is True
     records = await store.list_acquisition_records(promoted.id)
     assert [record.sequence for record in records] == list(range(7))
     restarted = [
@@ -5028,6 +5037,9 @@ async def test_direct_native_pages_restart_from_an_exact_durable_prefix(
         "2",
         "4",
         "6",
+        # The source caps pages at 2 below the requested 250, so offset 6 returns one row and
+        # offset 7 returns the empty page that ends the walk. A short page is not an end.
+        "7",
     ]
     body_requests = [
         request for request in instance.requests if "/rest/api/content/" in request.url.path
@@ -6562,3 +6574,376 @@ async def test_migrated_chunks_are_replaced_by_the_next_sync_and_none_keeps_a_st
             "a chunk survived with an id that does not derive from the identity it hangs off"
         )
     await vectors.teardown()
+
+
+async def test_large_offset_timeout_converges_promotes_and_finishes_offline(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The whole reported defect, end to end, through the real connector and journal.
+
+    A full requested page, a deterministic timeout at a large synthetic offset, a reduction of
+    nothing but the page size at that same offset, convergence to a validated explicit empty
+    page, a promoted complete snapshot with a committed watermark, and then local derivation
+    finished after source access is removed entirely. The evidence record at the bottom is the
+    acceptance matrix: every claim the fix makes, as one comparison a reader can diff.
+    """
+    base = "https://wiki.example.test/confluence"
+    total = 400
+    pages = [
+        FakePage(id=f"synthetic-{number:05d}", title=f"Public synthetic {number}", space="DOCS")
+        for number in range(total)
+    ]
+    instance = FakeConfluence(base_url=base, pages=pages, page_size=25)
+    # Progressive large-offset latency: past offset 200 the source answers nothing larger than
+    # six rows, while staying reachable and healthy for every smaller request.
+    instance.slow_offsets.append(SlowOffset(start=200, max_limit=6))
+    config = server_config(
+        base,
+        spaces=("DOCS",),
+        include_attachments=False,
+        page_size=250,
+        full_inventory_authority=FullInventoryAuthority.DIRECT_CURRENT_CONTENT,
+    )
+    connector = await connected(instance, config)
+    chunker = fakes.BlockChunker()
+    vectors = LanceVectorStore(data_dir / "adaptive-vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    blobs = BlobStore(engine, data_dir)
+
+    def pipeline() -> IngestPipeline:
+        return IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=blobs,
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=vectors,
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        )
+
+    try:
+        acquired = await pipeline().run(connector, acquire_only=True)
+
+        inventory_requests = [
+            request
+            for request in instance.requests
+            if request.url.path.endswith("/rest/api/content")
+        ]
+        offsets = [int(request.url.params.get("start", "0")) for request in inventory_requests]
+        limits = [int(request.url.params["limit"]) for request in inventory_requests]
+        timed_out_offset = 200
+        at_offset = [
+            request
+            for request in inventory_requests
+            if int(request.url.params.get("start", "0")) == timed_out_offset
+        ]
+        # Nothing but the limit moved while the request shrank, asserted over the recorded wire
+        # traffic rather than over the connector's intentions.
+        assert len(at_offset) > 1, "the large offset must have been retried at a smaller page"
+        assert (
+            len(
+                {
+                    (
+                        request.url.params["spaceKey"],
+                        request.url.params["type"],
+                        request.url.params["status"],
+                        request.url.params["expand"],
+                        request.url.params["start"],
+                    )
+                    for request in at_offset
+                }
+            )
+            == 1
+        ), "an adaptive retry changed something other than the requested limit"
+
+        promoted = await store.latest_unsettled_acquisition_run(connector.name)
+        assert promoted is not None
+        source_requests = len(instance.requests)
+
+        # Source access removed completely: every path answers a sign-in page, so anything that
+        # reached the instance from here would fail loudly rather than quietly succeed.
+        instance.sign_out()
+        derived = await pipeline().run(connector)
+        indexed = await store.list_documents(limit=total + 10)
+    finally:
+        await connector.teardown()
+
+    observed_process_peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert observed_process_peak_rss > 0
+    evidence = {
+        "source_documents": total,
+        "enumerated": acquired.discovered,
+        "indexed_offline": derived.indexed,
+        "unique_indexed_identities": len({document.source_id for document in indexed}),
+        "membership_exact": {document.source_id for document in indexed}
+        == {page.id for page in pages},
+        "first_requested_limit": limits[0],
+        "limits_at_timed_out_offset": [
+            limit
+            for offset, limit in zip(offsets, limits, strict=True)
+            if offset == timed_out_offset
+        ],
+        "final_requested_limit": acquired.enumeration_page_size,
+        "page_size_reduced": acquired.enumeration_page_size_reduced,
+        "timeout_retries": acquired.enumeration_timeout_retries,
+        "reached_explicit_empty_page": acquired.enumeration_reached_empty_page,
+        "final_offset_requested": offsets[-1],
+        "enumeration_failure_code": acquired.enumeration_failure_code,
+        "acquisition_error": acquired.error,
+        "acquisition_retry_required": acquired.retry_required,
+        "enumeration_completed": acquired.enumeration_completed,
+        "snapshot_completeness": acquired.snapshot_completeness,
+        "snapshot_promoted": promoted.promoted_at is not None,
+        "watermark_committed": promoted.watermark_committed_at is not None,
+        "watermark_advanced": acquired.watermark_advanced,
+        "snapshot_omissions": acquired.snapshot_omissions,
+        "full_inventory_authority": acquired.full_inventory_authority,
+        "offline_source_requests": len(instance.requests) - source_requests,
+        "offline_pending_backlog": derived.durable_pending,
+        "offline_retry_required": derived.retry_required,
+        "unsettled_runs_after_derivation": await store.latest_unsettled_acquisition_run(
+            connector.name
+        ),
+        "peak_retained_bodies": acquired.stages.peak_bodies,
+        "observed_process_peak_rss_native_units": observed_process_peak_rss,
+    }
+    assert evidence == {
+        "source_documents": total,
+        "enumerated": total,
+        "indexed_offline": total,
+        "unique_indexed_identities": total,
+        "membership_exact": True,
+        # It began with the full configured page, halved at the one offset the source could not
+        # answer, and never asked that offset for the same size twice.
+        "first_requested_limit": 250,
+        "limits_at_timed_out_offset": [250, 125, 62, 31, 15, 7, 3],
+        "final_requested_limit": 3,
+        "page_size_reduced": True,
+        "timeout_retries": 6,
+        # The walk ended where it must: a validated explicit empty page at offset 400, past the
+        # last row, rather than at a page-size boundary or a missing native next link.
+        "reached_explicit_empty_page": True,
+        "final_offset_requested": total,
+        # Convergence, so no terminal category and no retry.
+        "enumeration_failure_code": "",
+        "acquisition_error": "",
+        "acquisition_retry_required": False,
+        "enumeration_completed": True,
+        "snapshot_completeness": "complete",
+        "snapshot_promoted": True,
+        "watermark_committed": True,
+        "watermark_advanced": True,
+        "snapshot_omissions": 0,
+        "full_inventory_authority": "direct_current_content",
+        # Derivation ran entirely from retained bytes: the signed-out instance was never asked.
+        "offline_source_requests": 0,
+        "offline_pending_backlog": 0,
+        "offline_retry_required": False,
+        "unsettled_runs_after_derivation": None,
+        # Bounded by the configured page and hand-off depths, not by the 400-document corpus.
+        "peak_retained_bodies": acquired.stages.peak_bodies,
+        "observed_process_peak_rss_native_units": observed_process_peak_rss,
+    }
+    assert acquired.stages.peak_bodies <= 32, "retained bodies must stay bounded by the hand-offs"
+    await vectors.teardown()
+
+
+async def test_exhausted_adaptive_timeout_is_a_typed_incomplete_run_that_keeps_its_prefix(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """Bounded policy exhaustion is safe, typed and resumable — never an end of inventory.
+
+    The offset that will not answer sits past a committed prefix, so this exercises the whole
+    refusal at once: the durable prefix survives, the lease is released for an immediate
+    retry, nothing is promoted, no watermark is committed, deletion reconciliation does not
+    run, and the reason recorded is ``source_timeout`` rather than a deletion, a missing
+    document or an authentication failure.
+    """
+    base = "https://wiki.example.test/confluence"
+    pages = [
+        FakePage(id=f"synthetic-{number:05d}", title=f"Public synthetic {number}", space="DOCS")
+        for number in range(40)
+    ]
+    instance = FakeConfluence(base_url=base, pages=pages, page_size=10)
+    # Nothing at all answers from offset 20 on, at any size, so the bounded ladder runs out.
+    instance.slow_offsets.append(SlowOffset(start=20, max_limit=0))
+    config = server_config(
+        base,
+        spaces=("DOCS",),
+        include_attachments=False,
+        page_size=20,
+        adaptive_max_attempts_per_offset=4,
+        full_inventory_authority=FullInventoryAuthority.DIRECT_CURRENT_CONTENT,
+    )
+    connector = await connected(instance, config)
+    chunker = fakes.BlockChunker()
+    try:
+        report = await IngestPipeline(
+            store=store,
+            acquisitions=store,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        ).run(connector, acquire_only=True)
+    finally:
+        await connector.teardown()
+
+    run = await store.latest_unsettled_acquisition_run(connector.name)
+    assert run is not None
+    prefix = await store.list_acquisition_records(run.id)
+    at_dead_offset = [
+        request
+        for request in instance.requests
+        if request.url.path.endswith("/rest/api/content")
+        and request.url.params.get("start") == "20"
+    ]
+
+    assert report.retry_required
+    assert report.enumeration_completed is False
+    # The typed category, and the two things it must never be mistaken for.
+    assert report.enumeration_failure_code == "source_timeout"
+    assert report.error_type == "RequestTimeoutError"
+    assert report.snapshot_omission_reasons == {}
+    assert report.inventory_recovery == ""
+    # A slow offset is not the end of the inventory, and the walk says so.
+    assert report.enumeration_reached_empty_page is False
+    assert report.enumeration_timeout_retries == 4
+    assert len(at_dead_offset) == 4, "the attempt ceiling bounds requests at one offset"
+
+    # The committed prefix survives whole, and nothing beyond it was invented.
+    assert [record.sequence for record in prefix] == list(range(20))
+    assert run.discovered_count == 20
+    assert run.enumeration_completed_at is None
+    assert run.candidate_watermark is None
+    assert run.promoted_at is None
+    assert run.watermark_committed_at is None
+    assert run.reconciled_deleted_count == 0
+    assert report.watermark_advanced is False
+    # Released rather than held to expiry, so the retry can begin immediately.
+    assert run.lease_owner is None
+    assert run.diagnostic is not None
+    assert run.diagnostic.code.value == "source_timeout"
+    assert run.enumeration_page_size_reduced is True
+    assert run.enumeration_reached_empty_page is False
+
+
+async def test_enumeration_progress_writes_are_paced_rather_than_one_per_page(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """Adaptive facts are written the moment they change; a moving offset is paced.
+
+    Both obvious policies are wrong and this pins the one that is not. Writing whenever
+    anything changed would double the fenced writes on the enumeration hot path — journal
+    admission already writes once per page — for a counter nobody polls that fast. Writing
+    only when the adaptive fields change would freeze the stored offset, and a stationary
+    offset is exactly how an operator identifies a hung run.
+    """
+    base = "https://wiki.example.test/confluence"
+    pages = [
+        FakePage(id=f"synthetic-{number:05d}", title=f"Public synthetic {number}", space="DOCS")
+        for number in range(30)
+    ]
+    instance = FakeConfluence(base_url=base, pages=pages, page_size=2)
+    instance.slow_offsets.append(SlowOffset(start=20, max_limit=1))
+    config = server_config(
+        base,
+        spaces=("DOCS",),
+        include_attachments=False,
+        page_size=4,
+        full_inventory_authority=FullInventoryAuthority.DIRECT_CURRENT_CONTENT,
+    )
+    connector = await connected(instance, config)
+
+    class CountingProgressStore(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.progress_writes: list[EnumerationProgress] = []
+
+        @override
+        async def record_acquisition_enumeration_progress(
+            self,
+            run_id: str,
+            owner: str,
+            generation: int,
+            *,
+            now: datetime,
+            progress: EnumerationProgress,
+            diagnostic: AcquisitionDiagnostic | UnsetValue | None = UNSET,
+        ) -> bool:
+            self.progress_writes.append(progress)
+            return await super().record_acquisition_enumeration_progress(
+                run_id,
+                owner,
+                generation,
+                now=now,
+                progress=progress,
+                diagnostic=diagnostic,
+            )
+
+    journal = CountingProgressStore()
+    await journal.ensure_workspace()
+    chunker = fakes.BlockChunker()
+    try:
+        report = await IngestPipeline(
+            store=journal,
+            acquisitions=journal,
+            blobs=BlobStore(engine, data_dir),
+            chunker=chunker,
+            embedder=HashEmbedder(),
+            vectors=fakes.MemoryVectors(),
+            runner=InProcessRunner({"lines": fakes.LineParser()}),
+            resolve_chain=lambda _: ["lines"],
+            middleware=MiddlewareRunner(()),
+            chunk_fingerprint=chunker.fingerprint,
+            detect_glossary=False,
+        ).run(connector, acquire_only=True)
+    finally:
+        await connector.teardown()
+
+    inventory_requests = [
+        request for request in instance.requests if request.url.path.endswith("/rest/api/content")
+    ]
+
+    assert report.enumeration_reached_empty_page is True
+    assert report.enumeration_timeout_retries == 2
+    # Far more source pages than progress writes: the offset alone does not buy a write.
+    assert len(inventory_requests) > 15
+    assert len(journal.progress_writes) < len(inventory_requests)
+    # Every adaptive change is written at the next page boundary rather than paced away.
+    #
+    # Both reductions here happen inside one request cycle at one offset — the connector
+    # halves twice before any page comes back — so the intermediate (1 retry, limit 2) state
+    # is not observable to the pipeline at all, and the walk is not "adapting silently": the
+    # cumulative counters carry it. The window in which a struggling offset has changed
+    # nothing durable is bounded by `adaptive_max_seconds_per_offset`, after which the run
+    # terminates and records `source_timeout`; the lease heartbeat proves liveness meanwhile.
+    written = [
+        (write.timeout_retries, write.requested_page_size, write.reached_empty_page)
+        for write in journal.progress_writes
+    ]
+    assert (0, 4, False) in written, "the opening state must be recorded before any adaptation"
+    assert (2, 1, False) in written, "the reductions must be written at the next page boundary"
+    assert written[-1] == (2, 1, True), "the empty-page end is the last thing written"
+    # The durable row agrees with the report rather than trailing it at the terminal boundary.
+    durable = await journal.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.enumeration_reached_empty_page is True
+    assert durable.enumeration_timeout_retries == 2
+    assert durable.enumeration_page_size == 1
+    assert durable.enumeration_offset == report.enumeration_offset

@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.reconciliation import CompletedInventory, ReconciliationAssessment
     from manicule.core.retrieval import Filter
-    from manicule.core.sources import SourceId, Watermark
+    from manicule.core.sources import EnumerationProgress, SourceId, Watermark
 
 
 @runtime_checkable
@@ -579,6 +579,29 @@ class BatchedAcquisitionStore(Protocol):
         lease_generation: int,
         now: datetime,
     ) -> Sequence[AcquisitionRecord]: ...
+
+
+@runtime_checkable
+class EnumerationProgressStore(Protocol):
+    """Optional durable home for aggregate-only adaptive-enumeration diagnostics.
+
+    Optional the same way :class:`BatchedAcquisitionStore` is: the pipeline persists a
+    connector's :class:`~manicule.core.sources.EnumerationProgress` snapshot whenever it
+    changes, and a store without this capability simply leaves status readers with the
+    counters they already had. ``diagnostic`` distinguishes leave-as-is (:data:`UNSET`),
+    clear (``None``, a fresh enumeration), and record-terminal-category (a value).
+    """
+
+    async def record_acquisition_enumeration_progress(
+        self,
+        run_id: str,
+        owner: str,
+        generation: int,
+        *,
+        now: datetime,
+        progress: EnumerationProgress,
+        diagnostic: AcquisitionDiagnostic | UnsetValue | None = UNSET,
+    ) -> bool: ...
 
 
 @runtime_checkable

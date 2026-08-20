@@ -330,6 +330,16 @@ class AcquisitionRun(Base):
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     metadata_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     acquired_blob_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Aggregate-only adaptive enumeration facts — counts, a size, closed booleans; never a
+    # source identity. NULLs mean "the connector made no such claim", which is a different
+    # fact from zero or false and must survive the round trip.
+    enumeration_offset: Mapped[int | None] = mapped_column(Integer)
+    enumeration_page_size: Mapped[int | None] = mapped_column(Integer)
+    enumeration_timeout_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    enumeration_page_size_reduced: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    enumeration_reached_empty_page: Mapped[bool | None] = mapped_column(Boolean)
     diagnostic: Mapped[JsonValue | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
