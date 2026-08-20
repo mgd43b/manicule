@@ -49,6 +49,7 @@ exact failure this project keeps finding — green, wrong, and invisible.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
@@ -211,6 +212,31 @@ async def panel(
     the object the other three surfaces serialize.
     """
     return Panel(envelope=await run_op(op, service.workspace, call))
+
+
+type PanelCall = Callable[[], Awaitable[Payload]]
+"""One page panel's operation, ready to run: the service call with its arguments already bound."""
+
+
+async def panels(
+    service: ApplicationService, requested: Mapping[str, tuple[str, PanelCall]]
+) -> dict[str, Panel]:
+    """Run every panel a page is made of at once, and return them by name.
+
+    A page is several independent operations, and awaiting them in a dict literal ran them in
+    the order somebody happened to write them: the counts, then a diagnosis that leaves the
+    machine, then the workspaces — each waiting on the one above it for no reason other than
+    the shape of the source. One slow panel therefore delayed panels that did not depend on
+    it, which is the part a reader notices, because the page arrives at the speed of its worst
+    operation plus all the others.
+
+    Nothing here decides what a page shows. A failed panel is still that panel's failure, in
+    the same envelope :func:`panel` builds, and the returned order is the requested one so a
+    template does not reorder itself when the network does.
+    """
+    ordered = list(requested)
+    started = [panel(op, service, call) for op, call in (requested[name] for name in ordered)]
+    return dict(zip(ordered, await asyncio.gather(*started), strict=True))
 
 
 def render(

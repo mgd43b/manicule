@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -239,6 +240,50 @@ def test_a_missing_document_is_a_404_page_rather_than_an_empty_one() -> None:
     assert response.status_code == NOT_FOUND
     assert "UnknownEntityError" in response.text
     assert "text/html" in response.headers["content-type"]
+
+
+def test_a_page_runs_its_panels_together_rather_than_in_the_order_they_are_written() -> None:
+    """Proved by making them wait for each other, not by timing them.
+
+    A dashboard is counts, a diagnosis and the workspaces, and nothing about any of them
+    depends on another. Awaited in a dict literal they still ran in written order, so the page
+    cost the sum — and the diagnosis in the middle is the one that goes out to every configured
+    source, which is how a local page came to take seconds.
+
+    Each of the two panels here blocks until the other has started. Run in sequence the first
+    would wait for a panel that has not been reached, so the deadline is the assertion: the
+    page can only answer if both were in flight at once.
+    """
+    backend, _ = backend_with_a_document()
+    counting = asyncio.Event()
+    listing = asyncio.Event()
+    both = 2.0
+
+    original_count = backend.store.count_documents
+    original_workspaces = backend.maintenance_.workspaces
+
+    async def counted() -> int:
+        counting.set()
+        async with asyncio.timeout(both):
+            await listing.wait()
+        return await original_count()
+
+    async def workspaces() -> Sequence[tuple[str, str, str]]:
+        listing.set()
+        async with asyncio.timeout(both):
+            await counting.wait()
+        return await original_workspaces()
+
+    backend.store.count_documents = counted  # pyright: ignore[reportAttributeAccessIssue]
+    backend.maintenance_.workspaces = workspaces
+
+    with client_for(backend) as client:
+        response = client.get("/ui")
+
+    assert response.status_code == 200
+    assert "stats failed" not in response.text, (
+        "a panel timed out waiting for one that had not started, so they still run in turn"
+    )
 
 
 def test_a_panel_that_failed_does_not_take_the_rest_of_the_page_with_it() -> None:

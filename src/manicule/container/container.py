@@ -22,9 +22,10 @@ Misconfiguration fails before construction
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from types import TracebackType
-from typing import Self, cast
+from typing import Final, Self, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -57,6 +58,27 @@ from manicule.plugins.registry import (
     MetadataContext,
     discover,
 )
+
+HEALTH_CHECK_TIMEOUT_S: Final = 2.0
+"""How long one component may take to answer before the sweep stops waiting on it.
+
+Two seconds is well past a local check and past a healthy remote one; what it excludes is a
+source that is unreachable rather than slow, where the honest report is that nobody knows yet.
+"""
+
+HEALTH_DEADLINE_S: Final = 5.0
+"""How long the whole sweep may take, whatever the per-check clock allows.
+
+The per-check timeout alone bounds one component. This bounds the answer: with enough
+components, enough of them slow, the sum can still outrun whoever asked.
+"""
+
+HEALTH_CONCURRENCY: Final = 8
+"""How many components are asked at once.
+
+Bounded rather than unlimited because these are outbound requests, and a diagnostic that
+opened a connection per configured source would be its own incident on a large installation.
+"""
 
 
 class _MetadataResolver:
@@ -500,21 +522,71 @@ class Container:
     # --- observability --------------------------------------------------------------
 
     async def health(self) -> HealthReport:
-        """Ask every started component how it is, and combine the answers.
+        """Ask every started component how it is, at once, and combine the answers.
+
+        **Concurrently, and under two clocks, because some of these questions leave the
+        machine.** A connector's health check is an outbound request, so asking each in turn
+        cost the sum of every remote latency — a local page took seconds to say that local
+        storage was fine, and it took longer with each source an operator configured. The
+        component that is slow is now the only thing waiting on it.
+
+        Neither clock is a judgment about the component. A check that passes
+        :data:`HEALTH_CHECK_TIMEOUT_S` is reported ``degraded`` rather than ``failing``,
+        because "it did not answer in two seconds" is not evidence that a source is down; it
+        is evidence that this diagnostic cannot say. :data:`HEALTH_DEADLINE_S` bounds the
+        whole sweep for the same reason, and what it bounds is the *report*, not the fleet:
+        checks that answered are kept, and the ones still outstanding are named as
+        outstanding. A sweep that returned only the fast components would be a green report
+        that had not looked.
 
         A component that raises instead of reporting is itself a health signal, and is
         recorded as failing rather than allowed to break the check.
         """
-        reports: dict[str, HealthReport] = {}
+        checkable: list[tuple[str, SupportsHealth]] = []
         for kind, name in self._started:
             instance = self._instances.get((kind, name))
-            if not isinstance(instance, SupportsHealth):
-                continue
-            label = f"{kind.value}:{name}"
+            if isinstance(instance, SupportsHealth):
+                checkable.append((f"{kind.value}:{name}", instance))
+        if not checkable:
+            return HealthReport.rollup({})
+
+        admitted = asyncio.Semaphore(HEALTH_CONCURRENCY)
+
+        async def observe(instance: SupportsHealth) -> HealthReport:
             try:
-                reports[label] = await instance.health()
+                async with admitted, asyncio.timeout(HEALTH_CHECK_TIMEOUT_S):
+                    return await instance.health()
+            except TimeoutError:
+                return HealthReport.degraded(
+                    f"health check did not answer within {HEALTH_CHECK_TIMEOUT_S:g}s",
+                    remedy="Check the component directly; this diagnostic stopped waiting.",
+                )
             except Exception as exc:  # noqa: BLE001 - an exception here is the diagnosis
-                reports[label] = HealthReport.failing(f"health check raised: {exc}")
+                return HealthReport.failing(f"health check raised: {exc}")
+
+        started = {
+            label: asyncio.create_task(observe(instance), name=f"health:{label}")
+            for label, instance in checkable
+        }
+        _, outstanding = await asyncio.wait(started.values(), timeout=HEALTH_DEADLINE_S)
+        for task in outstanding:
+            task.cancel()
+        if outstanding:
+            await asyncio.gather(*outstanding, return_exceptions=True)
+        # Rebuilt in start order rather than in completion order, so that running the same
+        # sweep twice does not reorder a report somebody is diffing.
+        reports = {
+            label: (
+                task.result()
+                if task not in outstanding
+                else HealthReport.degraded(
+                    f"health check was still running at the {HEALTH_DEADLINE_S:g}s deadline "
+                    "for the whole sweep",
+                    remedy="Check the component directly; this diagnostic stopped waiting.",
+                )
+            )
+            for label, task in started.items()
+        }
         return HealthReport.rollup(reports)
 
     def metrics(self) -> list[Metric]:

@@ -35,6 +35,7 @@ from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
 from manicule.core.errors import InsecureTargetError, ManiculeError
+from manicule.core.lifecycle import HealthReport
 from manicule.generation.config import GENERATOR_NAME
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
@@ -177,6 +178,97 @@ def test_a_container_can_be_built_from_nothing_but_defaults(manicule_environment
 
 
 # --- the runtime, end to end -------------------------------------------------------------------
+
+
+class CountingContainer:
+    """Just enough container to observe the caching policy: what exists, and how it is.
+
+    A real container would work and would also make the assertion about sweep *counts* depend
+    on component construction, which is not what is under test here.
+    """
+
+    def __init__(self) -> None:
+        self.sweeps = 0
+        self.constructed = ["middleware:remote"]
+
+    def describe(self) -> list[str]:
+        return list(self.constructed)
+
+    async def health(self) -> HealthReport:
+        self.sweeps += 1
+        await asyncio.sleep(0)
+        return HealthReport.rollup({"remote": HealthReport.healthy("answered")})
+
+
+def _runtime_over(container: CountingContainer, environment: Path) -> Runtime:
+    built = Runtime(Settings(data_dir=environment / "data"))
+    built._container = cast("Any", container)  # pyright: ignore[reportPrivateUsage]
+    return built
+
+
+async def test_a_recent_component_sweep_answers_again_and_says_how_old_it_is(
+    manicule_environment: Path,
+) -> None:
+    """The remote part of ``doctor`` is the part ordinary navigation asks for repeatedly.
+
+    A dashboard, the refresh after it and the settings page beside it are three requests for
+    the same fleet-wide question within a few seconds, and answering each by going out to
+    every configured source is how a local page came to cost seconds.
+
+    What makes reuse honest is that it is declared. A cached check says how long ago it was
+    observed and that it was not measured just now — because the failure mode of a cache in a
+    diagnostic is not staleness, it is a green that somebody reads as current.
+    """
+    container = CountingContainer()
+    runtime = _runtime_over(container, manicule_environment)
+
+    first = await runtime.component_checks()
+    second = await runtime.component_checks()
+
+    assert container.sweeps == 1, "the second read went back out to every component"
+    assert [check.name for check in first] == ["component:remote"]
+    assert first[0].facts["freshly_measured"] is True
+    assert second[0].facts["freshly_measured"] is False
+    assert "observed" in second[0].detail, "a cached check that reads as fresh is the whole risk"
+    assert cast("float", second[0].facts["observed_seconds_ago"]) >= 0.0
+    assert second[0].state == first[0].state
+
+
+async def test_two_panels_asking_at_once_produce_one_sweep_between_them(
+    manicule_environment: Path,
+) -> None:
+    """A page runs its panels together now, which is what makes this reachable.
+
+    Without the lock the dashboard's own panels would race: both would find nothing cached,
+    both would sweep, and the cache would be filled twice by exactly the work it exists to
+    avoid.
+    """
+    container = CountingContainer()
+    runtime = _runtime_over(container, manicule_environment)
+
+    await asyncio.gather(runtime.component_checks(), runtime.component_checks())
+
+    assert container.sweeps == 1
+
+
+async def test_a_component_built_since_the_last_sweep_is_not_answered_for(
+    manicule_environment: Path,
+) -> None:
+    """Components are built lazily, so the set worth asking about grows during a process.
+
+    An observation taken before a connector existed is not an observation of a healthy
+    connector. Reusing it would report health for something nobody ever asked, which is worse
+    than the latency the cache was added to remove.
+    """
+    container = CountingContainer()
+    runtime = _runtime_over(container, manicule_environment)
+
+    await runtime.component_checks()
+    container.constructed.append("connector:synthetic-wiki")
+    after = await runtime.component_checks()
+
+    assert container.sweeps == 2
+    assert after[0].facts["freshly_measured"] is True
 
 
 async def test_the_database_is_migrated_before_it_is_read(runtime: Runtime) -> None:

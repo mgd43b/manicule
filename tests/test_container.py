@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import Callable
 from typing import override
+from unittest.mock import patch
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
 from manicule.config.settings import Settings
 from manicule.container import Container, build_container, check_wiring, keys
+from manicule.container import container as container_module
 from manicule.core.errors import (
     CircularDependencyError,
     ConfigError,
@@ -357,6 +361,91 @@ async def test_a_health_check_that_raises_is_itself_the_diagnosis(settings: Sett
 
     assert report.state is HealthState.FAILING
     assert "connection reset" in report.checks[0].detail
+
+
+async def test_twelve_remote_components_are_asked_at_once_rather_than_in_turn(
+    settings: Settings,
+) -> None:
+    """The defect was arithmetic: a local page cost the sum of every remote latency.
+
+    A connector's health check is an outbound request. Asked one after another, twelve of them
+    at a quarter-second each is three seconds before a dashboard can say that SQLite is fine —
+    and it grows with every source somebody configures, which is the wrong direction for a
+    diagnostic to scale.
+
+    The bound asserted here is deliberately loose. What it has to exclude is the serial sum,
+    not a particular scheduler's timing, and a test that pinned the concurrency exactly would
+    fail the next time :data:`HEALTH_CONCURRENCY` moved for a good reason.
+    """
+    delay = 0.25
+    fleet = 12
+
+    class Slow(Recorder):
+        @override
+        async def health(self) -> HealthReport:
+            await asyncio.sleep(delay)
+            return HealthReport.healthy()
+
+    registry = ComponentRegistry().bind("test")
+    for index in range(fleet):
+        registry.add(keys.MIDDLEWARE.named(f"remote-{index}"), lambda _: Slow("remote", []))
+    container = Container(settings, registry)
+    for index in range(fleet):
+        container.get(keys.MIDDLEWARE.named(f"remote-{index}"))
+
+    async with container:
+        started = time.perf_counter()
+        report = await container.health()
+        elapsed = time.perf_counter() - started
+
+    assert len(report.checks) == fleet
+    assert report.state is HealthState.OK
+    serial = delay * fleet
+    assert elapsed < serial / 2, (
+        f"{fleet} checks of {delay}s took {elapsed:.2f}s, which is the sum rather than a sweep"
+    )
+
+
+async def test_a_component_that_never_answers_is_bounded_and_does_not_hide_the_others(
+    settings: Settings,
+) -> None:
+    """A check that hangs used to hang the page, and there was no state that said so.
+
+    ``degraded`` rather than ``failing`` on purpose: not answering within the timeout is not
+    evidence that a source is down, only that this diagnostic stopped waiting. Reporting it as
+    a failure would page somebody about a slow network, and reporting it as ``ok`` would be the
+    green that a health check exists to not produce.
+    """
+
+    class Hangs(Recorder):
+        @override
+        async def health(self) -> HealthReport:
+            await asyncio.sleep(3600)
+            raise AssertionError("the sweep waited for a check that never answers")
+
+    registry = ComponentRegistry().bind("test")
+    registry.add(keys.MIDDLEWARE.named("fine"), lambda _: Recorder("fine", []))
+    registry.add(keys.MIDDLEWARE.named("hangs"), lambda _: Hangs("hangs", []))
+    container = Container(settings, registry)
+    container.get(keys.MIDDLEWARE.named("fine"))
+    container.get(keys.MIDDLEWARE.named("hangs"))
+
+    with patch.object(container_module, "HEALTH_CHECK_TIMEOUT_S", 0.05):
+        async with container:
+            started = time.perf_counter()
+            # Bounded here as well as under test: a sweep that lost its timeout would
+            # otherwise hang this suite for an hour instead of failing it in a second.
+            async with asyncio.timeout(5):
+                report = await container.health()
+            elapsed = time.perf_counter() - started
+
+    checks = {check.name: check for check in report.checks}
+    assert elapsed < 1.0, "the sweep waited on a check it had already given up on"
+    assert checks["middleware:fine"].state is HealthState.OK, (
+        "one component that will not answer must not take the report of one that did"
+    )
+    assert checks["middleware:hangs"].state is HealthState.DEGRADED
+    assert "did not answer" in checks["middleware:hangs"].detail
 
 
 async def test_metrics_are_labeled_with_where_they_came_from(
