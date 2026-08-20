@@ -7,7 +7,6 @@ import hashlib
 import hmac
 import json
 import shutil
-import sqlite3
 import threading
 import weakref
 from dataclasses import dataclass, field
@@ -56,6 +55,7 @@ from manicule.ingest.capacity import (
     translate_storage_capacity_errors as _translate_storage_capacity_errors,
 )
 from manicule.storage import models
+from manicule.storage.engine import sqlite_busy
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import next_observation, utcnow
 
@@ -153,24 +153,6 @@ def _clear_replaced_lease_tokens(
     )
 
 
-def _sqlite_busy(error: BaseException) -> bool:
-    """Recognize SQLITE_BUSY through SQLAlchemy without retaining its SQL-shaped wrapper."""
-    pending: list[BaseException] = [error]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        code = getattr(current, "sqlite_errorcode", None)
-        if isinstance(code, int) and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
-            return True
-        for related in (getattr(current, "orig", None), current.__cause__, current.__context__):
-            if isinstance(related, BaseException):
-                pending.append(related)
-    return False
-
-
 def translate_storage_capacity_errors[F: Callable[..., Coroutine[Any, Any, Any]]](
     operation: F,
 ) -> F:
@@ -199,7 +181,7 @@ def translate_storage_capacity_errors[F: Callable[..., Coroutine[Any, Any, Any]]
                 try:
                     result = await capacity_safe(*args, **kwargs)
                 except Exception as error:
-                    if not _sqlite_busy(error):
+                    if not sqlite_busy(error):
                         raise
                     exhausted = True
                 else:

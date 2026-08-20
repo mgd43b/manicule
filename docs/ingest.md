@@ -1944,6 +1944,15 @@ one-way target identity. The transient plan snapshot is deleted before the comma
 Source ids, URIs, snapshot/revision handles, weights paths, complete configuration and inventory
 digests never cross an operator or network surface.
 
+**`plan` is an inspection command, not a read-only transaction.** The snapshot it prices is a
+durable one, so it takes SQLite's writer slot with `BEGIN IMMEDIATE` like any other writer, and
+while an offline rebuild or a sync holds that slot it cannot have it. That refusal is
+`StorageBusyError` — the same private-safe type acquisition exhaustion returns — carrying the
+clause that nothing was planned and nothing durable changed, and never the driver's statement,
+bound values or database path. Every surface renders it identically: HTTP answers 503, the CLI
+exits nonzero, and `/ui/reembed` renders the refusal rather than the unhandled 500 an
+unconverted driver exception used to produce.
+
 `start` performs the same exact-target plan, checks local temporary capacity, and atomically
 persists the complete snapshot and an immediately acquirable, ownerless journal row under the
 id the operator supplied **before embedding starts**. There is no create-then-release gap. If a

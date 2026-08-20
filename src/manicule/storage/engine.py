@@ -50,6 +50,31 @@ with ``SQLITE_BUSY`` rather than waiting.
 """
 
 
+def sqlite_busy(error: BaseException) -> bool:
+    """Recognize SQLITE_BUSY through SQLAlchemy without retaining its SQL-shaped wrapper.
+
+    Here rather than beside one caller because two now ask the same question — the acquisition
+    journal, which retries, and re-embed's writer transactions, which refuse — and a second
+    copy of this walk would be a second answer to "is this contention or corruption". The walk
+    is needed at all because SQLAlchemy wraps the driver error and a retry policy keyed on
+    message text is a retry policy that stops working when a driver rewords itself.
+    """
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        code = getattr(current, "sqlite_errorcode", None)
+        if isinstance(code, int) and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return True
+        for related in (getattr(current, "orig", None), current.__cause__, current.__context__):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    return False
+
+
 class StorageLayoutError(Exception):
     """The data directory is not usable as one."""
 

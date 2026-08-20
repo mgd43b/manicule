@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any, cast
+
 import pytest
 
+from manicule.api.envelopes import SERVICE_UNAVAILABLE, status_for
 from manicule.app.dispatch import run_op
 from manicule.app.service import ApplicationService
-from manicule.core.errors import UnknownEntityError
+from manicule.core.errors import StorageBusyError, UnknownEntityError
 from manicule.ingest.reembed import ReembedState
+from manicule.web.rendering import panel
+from tests.api.support import client_for
 from tests.app.fakes import FakeBackend
+
+if TYPE_CHECKING:
+    from manicule.ingest.reembed import ReembedPlan
 
 
 async def test_plan_and_run_reports_never_serialize_private_commitment_fields() -> None:
@@ -82,3 +90,64 @@ async def test_failed_reembed_execution_is_not_a_success_envelope() -> None:
     assert envelope.error is not None
     assert envelope.error.type == "ReembedLifecycleError"
     assert envelope.data is None
+
+
+async def test_planning_refused_the_writer_slot_is_a_typed_result_rather_than_a_500() -> None:
+    """The planning page is an inspection surface, and it used to be able to crash one.
+
+    Pricing a re-embed opens a durable corpus snapshot, and that snapshot takes SQLite's
+    writer slot with ``BEGIN IMMEDIATE``. While an offline rebuild held the writer, the
+    refusal arrived as the driver's own ``database is locked`` — an exception
+    :func:`~manicule.app.dispatch.run_op` deliberately does not convert, because converting
+    arbitrary exceptions is how a defect gets reported as a tidy result. So opening
+    ``/ui/reembed`` produced an unhandled ASGI traceback and an opaque 503-shaped problem
+    dressed as a 500, over and over, for a page that had asked a read-only question.
+
+    Contention is now refused in the vocabulary every surface already renders, so the page,
+    the API and the tool all say the same bounded thing and none of them says it in SQL.
+    """
+    backend = FakeBackend()
+    service = ApplicationService(backend)
+
+    async def busy() -> tuple[ReembedPlan, str, int]:
+        raise StorageBusyError("no plan was made and nothing durable changed")
+
+    backend.ingestion_.reembed_plan = busy
+
+    envelope = await panel("reembed_plan", service, service.reembed_plan)
+    with client_for(backend) as client:
+        page = client.get("/ui/reembed")
+
+    assert envelope.envelope.ok is False
+    error = envelope.envelope.error
+    assert error is not None
+    assert error.type == "StorageBusyError"
+    assert error.hint, "a busy writer is a retry, and the caller has to be told that"
+    assert status_for(envelope.envelope) == SERVICE_UNAVAILABLE, (
+        "contention is temporary and the request was well formed, so it is not a client error"
+    )
+    assert page.status_code == 200, "an inspection page renders its refusal, it does not crash"
+    assert "text/html" in page.headers["content-type"]
+    rendered = page.text.lower()
+    assert "temporarily busy" in rendered
+    for driver_text in ("begin immediate", "database is locked", "traceback", ".sqlite"):
+        assert driver_text not in rendered
+
+
+async def test_a_busy_refusal_reads_the_same_over_http_as_it_does_on_the_page() -> None:
+    """One refusal, one shape. A page that agreed with nothing would be a second contract."""
+    backend = FakeBackend()
+    service = ApplicationService(backend)
+
+    async def busy() -> tuple[ReembedPlan, str, int]:
+        raise StorageBusyError("no plan was made and nothing durable changed")
+
+    backend.ingestion_.reembed_plan = busy
+
+    with client_for(backend) as client:
+        response = client.get("/api/v1/admin/reembed")
+    http = cast("dict[str, Any]", response.json())
+    web = (await panel("reembed_plan", service, service.reembed_plan)).envelope.as_json()
+
+    assert response.status_code == SERVICE_UNAVAILABLE
+    assert http == web

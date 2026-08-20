@@ -85,7 +85,9 @@ _HINTS: dict[type[Exception], str] = {
         "Free durable ingest capacity or raise the configured limit, then retry."
     ),
     StorageBusyError: (
-        "Retry the same operation; it resumes from the last committed durable prefix."
+        "Another writer holds durable storage. Retry the same operation — durable work "
+        "resumes from its last committed prefix, and a read that was refused the writer slot "
+        "changed nothing."
     ),
     RebuildRefusedError: (
         "Inspect `rebuild plan` for aggregate missing-input and capacity estimates, then retry."
