@@ -517,6 +517,102 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
 # --- state ------------------------------------------------------------------------------------
 
 
+_VECTOR_INDEX_STYLE: Mapping[str, str] = {
+    "disabled": "dim",
+    "exhaustive": "green",
+    "pending": "yellow",
+    "ready": "green",
+    "stale": "yellow",
+}
+"""How each lifecycle reads at a glance.
+
+``exhaustive`` is green rather than dim: exact search is the design working, not a feature
+switched off. ``pending`` and ``stale`` are the two that want somebody, and neither is red —
+both are slow rather than wrong, and coloring a latency finding like a fault trains people to
+ignore the color that means data is missing.
+"""
+
+
+def _build_hint(reason: str) -> str:
+    """``reason``, dimmed, with the command to type left bright inside it.
+
+    The markup has to balance within the one string: a cell that opened no ``[dim]`` and closed
+    one would raise :class:`rich.errors.MarkupError` at render time rather than merely looking
+    wrong, and it would do it only on the branch where a build is due — which is the branch
+    somebody sees when something needs doing.
+    """
+    return f"[dim]{escape(reason)}; run [/dim]manicule build-vector-index --yes"
+
+
+def _add_vector_index_rows(table: Table, index: r.VectorIndexState) -> None:
+    """The dense search path, as two or three lines under the counts.
+
+    Only ever a summary. What the index *is* — its partitions, its metric, its build — is on
+    `--json` for anyone comparing two installations, because a person running `status` is
+    asking whether search is all right rather than how it is configured.
+    """
+    style = _VECTOR_INDEX_STYLE.get(index.lifecycle, "dim")
+    table.add_row("vector search", f"[{style}]{escape(index.lifecycle)}[/{style}]")
+    if index.exact:
+        table.add_row(
+            "  neighbors",
+            "exact over every vector" + (f", {index.rows} of them" if index.rows else ""),
+        )
+        if index.due:
+            table.add_row("  awaiting build", _build_hint(f"past the {index.threshold} threshold"))
+        return
+    table.add_row("  index", escape(index.index_name or "unnamed"))
+    if index.unindexed_rows:
+        # Named as a scan rather than as a gap, because that is what it costs. The rows are
+        # searched either way; what the number measures is how much of each query is linear.
+        table.add_row("  scanned per query", f"{index.unindexed_rows} row(s) not yet indexed")
+    if index.due:
+        table.add_row("  refresh", _build_hint("the uncovered tail crossed the threshold"))
+
+
+def render_vector_sweep(out: Console, payload: r.VectorSweepReport) -> None:
+    """What one pass removed, or why it declined.
+
+    A pass that removed nothing and a pass that never ran are printed differently, because they
+    mean opposite things: the first is a clean index and the second is work still outstanding.
+    """
+    if not payload.ran:
+        out.print(f"[yellow]the sweep did not run:[/yellow] {escape(payload.blocked_by)}")
+        return
+    table = _folding_table()
+    table.add_row("vectors removed", str(payload.vectors_removed))
+    table.add_row("documents purged", str(payload.documents_purged))
+    out.print(table)
+    if not payload.vectors_removed and not payload.documents_purged:
+        out.print("[dim]nothing was waiting to be swept[/dim]")
+
+
+def render_vector_index(out: Console, payload: r.VectorIndexReport) -> None:
+    table = _folding_table()
+    before, after = payload.before, payload.after
+    table.add_row("was", escape(before.lifecycle))
+    table.add_row("now", escape(after.lifecycle))
+    table.add_row("vectors", str(after.rows))
+    if after.index_name:
+        table.add_row("index", escape(after.index_name))
+        table.add_row(
+            "shape",
+            f"{escape(after.index_type or 'unknown')}, "
+            f"{after.num_partitions} partition(s), {after.num_sub_vectors} sub-vector(s), "
+            f"{escape(after.distance_metric or 'unknown')} distance",
+        )
+        table.add_row(
+            "coverage", f"{after.coverage:.1%} of {after.indexed_rows + after.unindexed_rows}"
+        )
+    if payload.replaced:
+        table.add_row("replaced", escape(payload.replaced))
+    out.print(table)
+    if payload.detail:
+        out.print(f"[dim]{escape(payload.detail)}[/dim]")
+    if payload.dry_run:
+        out.print("\n[dim]a plan. [/dim]--yes[dim] performs it[/dim]")
+
+
 def render_index_status(out: Console, payload: r.IndexStatus) -> None:
     table = _folding_table()
     table.add_row("documents", str(payload.documents))
@@ -531,6 +627,8 @@ def render_index_status(out: Console, payload: r.IndexStatus) -> None:
         # `status` after upgrading is asking exactly this question, and a line naming the
         # detector with nothing next to it would read as "current".
         table.add_row("  awaiting re-detection", str(payload.stale_glossary))
+    if payload.vector_index is not None:
+        _add_vector_index_rows(table, payload.vector_index)
     table.add_row("schema", escape(payload.schema_revision or "unmigrated"))
     table.add_row("data directory", escape(payload.data_dir))
     out.print(table)
@@ -1133,6 +1231,8 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
         out, _as(r.SnapshotStatusReport, p)
     ),
     r.IndexStatus: lambda out, p: render_index_status(out, _as(r.IndexStatus, p)),
+    r.VectorIndexReport: lambda out, p: render_vector_index(out, _as(r.VectorIndexReport, p)),
+    r.VectorSweepReport: lambda out, p: render_vector_sweep(out, _as(r.VectorSweepReport, p)),
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),
     r.Diagnosis: lambda out, p: render_diagnosis(out, _as(r.Diagnosis, p)),
     r.ConnectorList: lambda out, p: render_connectors(out, _as(r.ConnectorList, p)),

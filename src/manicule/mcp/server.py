@@ -1,4 +1,4 @@
-"""The MCP server: forty tools, each a few lines over the application service.
+"""The MCP server: forty-one tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -212,6 +212,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "lifecycle_cleanup_generations",
     "lifecycle_release_history",
     "lifecycle_delete_snapshot",
+    "vector_index_build",
     "stats",
     "doctor",
     "connector_list",
@@ -845,6 +846,20 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         return await dispatch("reembed_status", lambda: service.reembed_status(run_id))
 
     @register.tool(READS)
+    async def vector_index_build() -> dict[str, Any]:
+        """Plan the ANN index build dense search is due for, without performing one.
+
+        Reports whether search is currently exhaustive, indexed or stale, and what a build
+        would produce. Dry-run only on this surface: an IVF-PQ build over a large corpus is
+        minutes of CPU, and starting one is an operator's decision rather than an assistant's.
+        `manicule build-vector-index --yes` is what performs it.
+        """
+        return await dispatch(
+            "vector_index_build",
+            lambda: service.vector_index_build(dry_run=True),
+        )
+
+    @register.tool(READS)
     async def lifecycle_reset_derived() -> dict[str, Any]:
         """Dry-run the derived-only reset. Source manifests and retained bytes are protected."""
         return await dispatch(
@@ -1081,6 +1096,7 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             lifecycle_cleanup_generations,
             lifecycle_release_history,
             lifecycle_delete_snapshot,
+            vector_index_build,
             stats,
             doctor,
             connector_list,

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from manicule.app.results import ApiKeySummary, Check
     from manicule.config.settings import Settings
     from manicule.core.acquisition import AcquisitionRun
+    from manicule.core.ann import AnnIndexBuild, AnnIndexState
     from manicule.core.content import Chunk, Document, DocumentStatus
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.fingerprints import GlossaryFingerprint
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
     from manicule.ingest.pipeline import RunReport, Watching
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
+    from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
 
@@ -229,6 +231,21 @@ class Ingesting(Protocol):
         """
         ...
 
+    async def sweep_vectors(self, *, batch: int, soft_delete_grace_s: float) -> SweepResult:
+        """Remove the vectors SQLite has already forgotten, and purge expired soft deletes.
+
+        On this port beside the other two sweeps rather than on :class:`Maintenance`, because
+        it is the same shape of thing: a bounded pass over derived rows that has to reach a
+        store :class:`DocumentSurface` cannot — the tombstone list — and has to use the *same*
+        vector handle a sync would, so the two are never writing to two different resolutions
+        of the publication pointer.
+
+        Bounded by ``batch`` rather than run to completion. One pass cannot monopolize the
+        writer, and the work is idempotent, so a corpus with a large backlog drains over
+        several passes instead of blocking one caller for all of them.
+        """
+        ...
+
     async def glossary_fingerprint(self) -> GlossaryFingerprint:
         """What the installed detector would produce under this configuration.
 
@@ -321,6 +338,26 @@ class Maintenance(Protocol):
 
     async def reset_index(self) -> ResetOutcome:
         """Reset one workspace's complete derived identity and return aggregate evidence."""
+        ...
+
+    async def vector_index_state(self) -> AnnIndexState | None:
+        """Whether dense search is exhaustive, indexed or stale — ``None`` if unsupported.
+
+        ``None`` is the answer for a vector store with no ANN lifecycle at all, and it is a
+        different claim from :attr:`~manicule.core.ann.AnnLifecycle.EXHAUSTIVE`: one backend
+        has chosen exact search, the other cannot report on the question. A status surface
+        that collapsed them would show a fabricated "exact" for a store nobody asked.
+        """
+        ...
+
+    async def build_vector_index(
+        self, *, force: bool = False, dry_run: bool = False
+    ) -> AnnIndexBuild | None:
+        """Perform whatever ANN build is due, or report what one would do.
+
+        Returns ``None`` on a store without the capability, on the same terms as
+        :meth:`vector_index_state`.
+        """
         ...
 
     async def plan_reset_derived(self) -> LifecyclePlan: ...

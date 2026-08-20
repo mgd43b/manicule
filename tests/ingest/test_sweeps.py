@@ -143,3 +143,25 @@ async def test_a_second_pass_over_the_same_tombstones_is_a_no_op() -> None:
     again = await sweep_vectors(store, vectors)
 
     assert again.vectors_removed == 0
+
+
+async def test_the_sweep_target_is_a_protocol_a_backend_can_fail_to_satisfy() -> None:
+    """Checked at runtime, because ``VectorStore`` does not require chunk-level deletion.
+
+    A plugin backend can legitimately implement the vector protocol without ``delete_chunks``.
+    The wiring has to be able to *notice* that rather than casting past it, because a sweep
+    that reported "0 removed" for a store it could not address would read exactly like a clean
+    index — and the tombstone table would grow behind it forever.
+    """
+    from manicule.ingest.sweeps import VectorSweepTarget  # noqa: PLC0415
+
+    class DocumentOnly:
+        async def delete_document(self, document_id: str) -> None:
+            del document_id
+
+    class Both(DocumentOnly):
+        async def delete_chunks(self, chunk_ids: list[str]) -> None:
+            del chunk_ids
+
+    assert not isinstance(DocumentOnly(), VectorSweepTarget)
+    assert isinstance(Both(), VectorSweepTarget)

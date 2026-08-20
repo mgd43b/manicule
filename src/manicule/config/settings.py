@@ -46,6 +46,7 @@ from manicule.config.providers import (
     runs_in_process,
 )
 from manicule.core.acquisition import SnapshotPromotionPolicy
+from manicule.core.ann import MINIMUM_ANN_INDEX_THRESHOLD
 from manicule.core.errors import PolicyError
 from manicule.core.retrieval import RetrievalProfile
 
@@ -510,6 +511,39 @@ class StorageSettings(Section):
         description="Optional snapshot identity to include in scheduled deletion dry runs. "
         "The scheduler records aggregate impact only and cannot confirm deletion.",
     )
+    ann_index_threshold: int = Field(
+        default=100_000,
+        ge=0,
+        description="Vectors above which dense search stops being exhaustive and an IVF-PQ "
+        "index is wanted. Below it search is exact and an index would trade recall for "
+        "latency nobody is waiting on. The same number, applied to the rows an existing index "
+        "does not cover, is when that index reads as stale. ``0`` keeps search exhaustive "
+        "permanently and leaves any index already built alone.",
+    )
+
+    @field_validator("ann_index_threshold")
+    @classmethod
+    def _threshold_can_be_honored(cls, value: int) -> int:
+        """Refuse a threshold no build could ever satisfy.
+
+        An 8-bit product quantizer needs 256 vectors to train a codebook, and LanceDB refuses
+        the build below that. A threshold of 50 therefore does not mean "index early" — it
+        means every surface reports a build as due, forever, and every attempt to perform one
+        is declined for a reason that has nothing to do with the number the operator set.
+        Caught here, it is a typo at startup instead.
+
+        Raises:
+            ValueError: The threshold is neither ``0`` nor a value a build could reach.
+        """
+        if value != 0 and value < MINIMUM_ANN_INDEX_THRESHOLD:
+            msg = (
+                f"storage.ann_index_threshold is {value}, which no index can be built at: an "
+                f"8-bit product quantizer needs {MINIMUM_ANN_INDEX_THRESHOLD} vectors to "
+                f"train. Use 0 to keep search exhaustive, or a threshold of at least "
+                f"{MINIMUM_ANN_INDEX_THRESHOLD}."
+            )
+            raise ValueError(msg)
+        return value
 
 
 class IngestSettings(Section):

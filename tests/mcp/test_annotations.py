@@ -12,13 +12,14 @@ cannot be satisfied by a plausible-looking annotation, and it is the reason the 
 worth publishing at all: a client that auto-approves ``search`` on the strength of
 ``readOnlyHint`` is trusting this assertion, not the decorator.
 
-Two fields are excluded from that comparison **by name**, and each is a decision rather than a
+Three fields are excluded from that comparison **by name**, and each is a decision rather than a
 tolerance. ``FakeRetriever.seen`` is test instrumentation — a record that a query reached a
 retriever, which is how other suites prove one did *not*. ``FakeTelemetry.queries`` is the query
 log, and it is the single write retrieval performs; ``manicule.app.dispatch`` has carried that
 exception since before this file existed, ``manicule.mcp.server.hints`` restates it where the
-annotation is made, and ``docs/surfaces.md`` §4.1 says what it costs. Anything else moving fails
-here.
+annotation is made, and ``docs/surfaces.md`` §4.1 says what it costs.
+``FakeMaintenance.vector_index_builds`` is instrumentation again — a record that an ANN build was
+asked for, which is how other suites prove a dry run stayed one. Anything else moving fails here.
 """
 
 from __future__ import annotations
@@ -220,11 +221,16 @@ async def test_the_mutations_and_the_reads_together_are_the_whole_surface(
 
 
 def _installation(backend: FakeBackend) -> FakeBackend:
-    """Everything the fakes hold, with the two moving parts named in this module's docstring
+    """Everything the fakes hold, with the moving parts named in this module's docstring
     cleared so that two snapshots of an unchanged installation compare equal."""
     copied = copy.deepcopy(backend)
     copied.retriever_.seen.clear()
     copied.telemetry_.queries.clear()
+    # Instrumentation, on the same terms as `retriever_.seen`: a record that a build was
+    # *asked for*, which other suites use to prove a dry run stayed a dry run. The dry run
+    # itself writes nothing — that is what this test is checking, and the recorder cannot be
+    # the thing that fails it.
+    copied.maintenance_.vector_index_builds.clear()
     return copied
 
 
@@ -285,6 +291,7 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
         "snapshot_verify": {"snapshot_id": "read-snapshot"},
         "rebuild_plan": {"snapshot_id": "read-snapshot"},
         "rebuild_status": {"generation_id": "read-generation"},
+        "vector_index_build": {},
         "config_get": {},
         "workspace_list": {},
         # `registry` left off deliberately. It is why this tool's `openWorldHint` is true, and

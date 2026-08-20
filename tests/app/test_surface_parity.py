@@ -108,12 +108,12 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_forty_tools(service: ApplicationService) -> None:
-    """Forty, named, and matching the declared surface."""
+def test_the_server_offers_exactly_forty_one_tools(service: ApplicationService) -> None:
+    """Forty-one, named, and matching the declared surface."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 40
+    assert len(offered) == 41
 
 
 def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
@@ -181,7 +181,7 @@ def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
     }.isdisjoint(TOOL_NAMES)
 
 
-def test_the_command_line_offers_exactly_twenty_eight_commands() -> None:
+def test_the_command_line_offers_exactly_thirty_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
@@ -207,6 +207,7 @@ def test_the_command_line_offers_exactly_twenty_eight_commands() -> None:
         "auth",
         "backup",
         "browser-auth",
+        "build-vector-index",
         "cleanup-derived-generations",
         "collection",
         "completion",
@@ -229,10 +230,11 @@ def test_the_command_line_offers_exactly_twenty_eight_commands() -> None:
         "snapshot-delete",
         "start",
         "stop",
+        "sweep-vectors",
         "upgrade",
         "workspace",
     ]
-    assert len(names) == 28
+    assert len(names) == 30
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(
@@ -405,6 +407,13 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
         {"run_id": "missing-run"},
         ["reembed", "status", "missing-run"],
         ("GET", "/api/v1/admin/reembed/missing-run", {}),
+        None,
+    ),
+    (
+        "vector_index_build",
+        {},
+        ["build-vector-index"],
+        ("GET", "/api/v1/admin/vector-index", {}),
         None,
     ),
     (

@@ -20,6 +20,7 @@ from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors.errors import ConnectorError, SessionMissingError
 from manicule.ingest.reembed import ReembedRecovery
+from manicule.ingest.sweeps import SweepResult
 from tests.app.fakes import FakeBackend, FakeIngestion
 
 if TYPE_CHECKING:
@@ -160,8 +161,129 @@ async def test_a_scheduled_sync_runs_without_a_command_being_typed() -> None:
     finally:
         await scheduler.aclose()
 
-    assert clock.asked[0] == 600, "the loop waited for something other than its interval"
+    # The set rather than the first element. Two loops share this clock — the source's and the
+    # vector sweep's — so which one reaches its sleep first is task-start order and not a claim
+    # worth asserting. What is worth asserting is that each waited for its own configured
+    # interval rather than for a default, and naming both is what keeps a cadence that quietly
+    # stopped being armed from passing here.
+    assert set(clock.asked) == {600, service.settings.ingest.sweep_interval_s}
     assert scheduler.scheduled["handbook"].runs == 1
+
+
+async def test_the_vector_sweep_runs_on_cadence_without_a_command_being_typed() -> None:
+    """The loop `docs/storage.md` §8.2 has always described and nothing ran.
+
+    The delete trigger has been writing tombstones since #33. Until this loop existed nothing
+    read them, so a chunk deleted or re-chunked left its vector in LanceDB permanently — still
+    consuming a top-`k` slot ahead of the join that hides it — and `ingest.sweep_interval_s` was
+    a setting with nothing behind it.
+
+    Asserted through the service the command line would have called, and about the *sweep
+    happening* rather than about the setting being present, on the same reasoning as the source
+    loop above.
+    """
+    service, ingestion = service_with({})
+    ingestion.vector_sweep = SweepResult(vectors_removed=7, documents_purged=2)
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        assert scheduler.sweeps is not None
+        assert ingestion.vector_sweeps == [], "a sweep ran before its first interval elapsed"
+        await clock.tick()
+        assert scheduler.sweeps.runs == 1
+    finally:
+        await scheduler.aclose()
+
+    assert set(clock.asked) == {service.settings.ingest.sweep_interval_s}
+    assert scheduler.sweeps is not None
+    assert scheduler.sweeps.vectors_removed == 7
+    assert scheduler.sweeps.documents_purged == 2
+    assert scheduler.sweeps.failures == 0
+
+
+async def test_the_sweep_loop_carries_the_settings_that_bound_it() -> None:
+    """Two settings that parsed and reached nothing until this loop existed.
+
+    A batch that never arrives is indistinguishable from one that works right up until somebody
+    changes it and nothing happens, which is the failure this records rather than infers.
+    """
+    service, ingestion = service_with({})
+    service.settings.ingest.sweep_batch = 17
+    service.settings.ingest.soft_delete_grace_s = 42.0
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert ingestion.vector_sweeps == [(17, 42.0)]
+
+
+async def test_a_sweep_that_declined_is_counted_apart_from_one_that_failed() -> None:
+    """They need opposite things: one is the design working, the other wants somebody.
+
+    A pass blocked by a backup or a lifecycle mutation is the gate doing its job. Folding it
+    into `failures` would make a healthy installation look like it was erroring hourly.
+    """
+    service, ingestion = service_with({})
+    ingestion.vector_sweep = SweepResult(blocked_by="a backup is running")
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert scheduler.sweeps is not None
+    assert scheduler.sweeps.blocked == 1
+    assert scheduler.sweeps.failures == 0
+    assert scheduler.sweeps.vectors_removed == 0
+
+
+async def test_a_failing_sweep_does_not_end_the_loop() -> None:
+    """Every failure this can see is transient, and the work is idempotent.
+
+    A loop that exited on the first would need a restart to resume and would give no sign it had
+    stopped — which for a sweep means the tombstone table growing silently, the exact condition
+    this whole loop exists to prevent.
+    """
+    service, ingestion = service_with({})
+    calls = 0
+
+    async def failing(*, batch: int, soft_delete_grace_s: float) -> SweepResult:
+        del batch, soft_delete_grace_s
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("the writer was busy")
+        return SweepResult(vectors_removed=3)
+
+    ingestion.sweep_vectors = failing
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert scheduler.sweeps is not None
+    assert scheduler.sweeps.failures == 1
+    assert scheduler.sweeps.last_error_type == "OSError"
+    assert scheduler.sweeps.vectors_removed == 3, "the pass after the failure still ran"
 
 
 async def test_configured_lifecycle_plans_run_as_a_real_aggregate_only_scheduler_job() -> None:

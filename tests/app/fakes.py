@@ -33,6 +33,7 @@ from manicule.app.tenancy import belongs_to
 from manicule.config.settings import Settings
 from manicule.core.acquisition import AcquisitionRun
 from manicule.core.anchors import HeadingAnchor
+from manicule.core.ann import AnnIndexBuild, AnnIndexState, AnnLifecycle
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
 from manicule.core.embedding import IndexFingerprints
 from manicule.core.errors import NameInUseError, UnknownEntityError
@@ -73,6 +74,7 @@ from manicule.ingest.reembed import (
     ReembedState,
 )
 from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
+from manicule.ingest.sweeps import SweepResult
 from manicule.retrieval.retriever import RetrievalResult
 from manicule.storage.organization import normalize_name
 
@@ -800,6 +802,14 @@ class FakeIngestion:
     connectors: dict[str, object] = field(default_factory=dict[str, object])
     snapshot: AcquisitionRun | None = None
     snapshot_verified: bool = True
+    vector_sweep: SweepResult = field(default_factory=SweepResult)
+    """What one pass of the vector sweep reports. A clean index by default."""
+    vector_sweeps: list[tuple[int, float]] = field(default_factory=list[tuple[int, float]])
+    """Every pass asked for, as ``(batch, soft_delete_grace_s)``.
+
+    Both recorded because both are settings, and a setting that parses but never reaches the
+    sweep is indistinguishable from one that works until somebody changes it.
+    """
     """Constructed connectors, by instance name, for :meth:`connector`.
 
     Deliberately populated by the test with an object built through the **real** factory rather
@@ -1050,6 +1060,10 @@ class FakeIngestion:
             return StaleSweep(dry_run=True, selected=self.sweep.selected)
         return self.sweep
 
+    async def sweep_vectors(self, *, batch: int, soft_delete_grace_s: float) -> SweepResult:
+        self.vector_sweeps.append((batch, soft_delete_grace_s))
+        return self.vector_sweep
+
     async def glossary_fingerprint(self) -> GlossaryFingerprint:
         """The real one, deliberately, rather than a stand-in with made-up fields.
 
@@ -1105,6 +1119,22 @@ class FakeMaintenance:
     """Every export asked for, on the same terms and for the same reason as :attr:`backups`."""
     backup_error: Exception | None = None
     """Raised instead of writing, for tests about how a refusal reaches the caller."""
+    vector_index: AnnIndexState | None = field(
+        default_factory=lambda: AnnIndexState(
+            lifecycle=AnnLifecycle.EXHAUSTIVE, threshold=100_000, rows=1
+        )
+    )
+    """What the vector store reports about its ANN index, or ``None`` for a store with none.
+
+    Defaults to a small corpus below the threshold, which is what a fake backend's corpus is:
+    exhaustive, exact, and nothing due. Tests about the transition set it themselves.
+    """
+    vector_index_builds: list[tuple[bool, bool]] = field(default_factory=list[tuple[bool, bool]])
+    """Every build asked for, as ``(force, dry_run)``.
+
+    A dry run that reached storage as a real build is the failure this records — the same
+    reason :attr:`backups` records its flag.
+    """
 
     async def schema_revision(self) -> str | None:
         return self.revision
@@ -1129,6 +1159,22 @@ class FakeMaintenance:
     async def reset_index(self) -> ResetOutcome:
         self.resets += 1
         return self.reset
+
+    async def vector_index_state(self) -> AnnIndexState | None:
+        return self.vector_index
+
+    async def build_vector_index(
+        self, *, force: bool = False, dry_run: bool = False
+    ) -> AnnIndexBuild | None:
+        self.vector_index_builds.append((force, dry_run))
+        if self.vector_index is None:
+            return None
+        return AnnIndexBuild(
+            before=self.vector_index,
+            after=self.vector_index,
+            built=not dry_run and self.vector_index.due,
+            dry_run=dry_run,
+        )
 
     async def plan_reset_derived(self) -> LifecyclePlan:
         return LifecyclePlan(operation=LifecycleOperation.RESET_DERIVED)

@@ -1018,10 +1018,102 @@ outside its own ranking.
 
 **No ANN index below a threshold.** Exhaustive search over a few tens of thousands of vectors
 is fast and *exact*; an IVF_PQ index built too early costs recall for latency nobody is
-waiting on. Build one when the row count crosses `ann_index_threshold` (default 100 000),
-with `num_partitions ≈ sqrt(n)`. Note the interaction with §6.6: once an ANN index exists,
-a pushed-down predicate is applied against partitions rather than the full set, so filter
-selectivity starts affecting recall as well as speed.
+waiting on. Build one when the row count crosses `storage.ann_index_threshold` (default
+100 000), with `num_partitions ≈ sqrt(n)`. Note the interaction with §6.6: once an ANN index
+exists, a pushed-down predicate is applied against partitions rather than the full set, so
+filter selectivity starts affecting recall as well as speed.
+
+The rest of this section is that sentence's lifecycle, written out because the version that
+stopped at "build one when" described a transition nothing executed
+([#261](https://github.com/mgd43b/manicule/issues/261)): a corpus could grow past the
+documented point while continuing to scan every vector, and no surface said so.
+`manicule.core.ann` is the rule as code and the only place it is written down.
+
+#### 6.2.1 Five states, and what each one claims
+
+| State | What is true | What to do |
+|---|---|---|
+| `exhaustive` | Below the threshold. Every result is an exact nearest neighbor | Nothing. This is the design working |
+| `pending` | At or past the threshold, no index. Still exact, now linear | `manicule build-vector-index --yes` |
+| `ready` | An index covers the corpus within the refresh bound | Nothing |
+| `stale` | The rows the index does not cover would themselves cross the threshold | `manicule build-vector-index --yes` |
+| `disabled` | `storage.ann_index_threshold` is `0`. Exhaustive permanently, by choice | Nothing |
+
+`exhaustive` and `pending` are the same *behavior* and opposite *findings*, which is why they
+are two states rather than one "unindexed". So are `exhaustive` and `disabled`: one is a
+corpus that is small, the other an operator who decided. A status surface that collapsed
+either pair would report a corpus as healthy while it scanned a million vectors per query, or
+report a deliberate choice as a threshold not yet reached.
+
+**A threshold below 256 is refused at startup.** An 8-bit product quantizer has one centroid
+per code, so it cannot train on fewer than 256 vectors and LanceDB declines the build. A
+threshold of 50 is therefore not "index early" — it is a permanent `pending` that no build can
+clear, and catching it in configuration validation makes it a typo instead of a status line
+nobody can act on.
+
+#### 6.2.2 Where the state is kept: nowhere
+
+Nothing records that a build is due. The state is a pure function of three things that already
+exist — the configured threshold, the committed row count, and whatever LanceDB says about the
+indexes on the vector column — so it is computed at the moment it is asked and there is no
+second copy to go stale.
+
+That is what makes the schedule durable without a queue. A publication that crosses the
+threshold does not write a work item that a crash could lose; it moves the row count, and the
+row count is the schedule. Restart the process, and the build is still due for the same reason
+it was due before.
+
+The same choice covers the two facts LanceDB does not record. It reports an index's type, its
+metric and its indexed/unindexed row counts, and nothing about how many partitions it was
+trained with or which build produced it — so those travel in the index's **name**,
+`manicule_ivfpq_g<generation>_p<partitions>`. This is §6.5's reasoning applied one level down:
+a derived artifact that carries its own identity cannot disagree with a record of what it
+should be, because there is no record. An index on the vector column under any other name is
+somebody's deliberate act; it is reported with those two fields empty rather than guessed at,
+and the maintenance boundary refuses to replace it.
+
+#### 6.2.3 The build never costs the search path
+
+Two properties, and both come from LanceDB rather than from care taken here:
+
+* **Uncovered rows are still searched.** Fragments the index does not cover are scanned flat
+  and merged into the ranked result, so a vector published one second after a build is
+  findable immediately. Coverage is therefore *latency owed*, never *results missing* — which
+  is the premise the whole refresh policy rests on. Were it false, staleness would be a
+  correctness bug and could not be left to a schedule at all.
+* **The new index is created before the old one is dropped.** A build that fails leaves the
+  previous index in place and serving. A build that succeeds and dies before the drop leaves
+  two indexes — disk spent twice, one wasted pass, repaired by running it again. Of those two
+  failures the cheap one is the one that survives, which is §8.2's ordering argument for the
+  sweep applied here.
+
+**The refresh policy is the same comparison as the first build**, applied to the rows the index
+does not cover: an uncovered tail large enough to have crossed the threshold on its own is a
+tail large enough to be paying for. One dial rather than two that interact. A refresh is one
+build at the current row count, taking the `sqrt(n)` that implies and incrementing the build
+generation, so two status reads at identical coverage can still be told apart.
+
+#### 6.2.4 Why publication does not build
+
+The build is an operator's action, reached through `manicule build-vector-index` and reported
+by `manicule status`. It is deliberately *not* scheduled by the publication that crosses the
+threshold: an IVF_PQ build over a six-figure corpus is minutes of CPU, and the boundary that
+would otherwise own it is a document commit with a person waiting on it. The publication makes
+the build **due**; it does not perform it.
+
+The MCP and HTTP surfaces expose the dry run only, on the rule the lifecycle boundaries already
+follow (`docs/surfaces.md` §6.1): an assistant may report that a build is wanted and may not
+start one.
+
+**There is deliberately no `building` state**, and that follows from the same decision. A build
+runs in the foreground of the command that asked for it, so "building" is a command that has not
+returned yet — a fact about a process, which the state table in §6.2.1 does not describe and
+could not describe honestly. A durable `building` row would have to be written before the build
+and cleared after it, and a crash in between leaves a marker that outlives the work: exactly the
+"is somebody deriving this right now, or did a worker die beside it?" ambiguity `docs/ingest.md`
+needs a lease to resolve for rebuilds. Nothing here is worth that machinery, because there is
+nothing to resume. A build that dies has changed nothing, and the state it left behind is the
+state it started in — still `pending`, still `stale`, still due for the same reason.
 
 ### 6.3 Fingerprints, and the refusal
 
@@ -1545,10 +1637,35 @@ an orphan, and the sweep deletes a live vector. A tombstone list only ever names
 *were* deleted, so it cannot. It is also cheap — the sweep reads a small table instead of the
 whole index.
 
-The runner lives in `manicule.ingest.sweeps`, is scheduled rather than triggered by deletion,
-and yields to both a backup and an active sync. Its ordering is this document's ordering: the
-vectors go first and the tombstones are cleared second, so a crash between them costs one
-wasted pass rather than a live vector with nothing left to record that it should go.
+The runner lives in `manicule.ingest.sweeps` and is scheduled rather than triggered by
+deletion. Its ordering is this document's ordering: the vectors go first and the tombstones are
+cleared second, so a crash between them costs one wasted pass rather than a live vector with
+nothing left to record that it should go.
+
+**What schedules it.** A served process runs one bounded pass every
+`ingest.sweep_interval_s` (default one hour), retiring `ingest.sweep_batch` tombstones and
+purging documents past `ingest.soft_delete_grace_s`. The first pass is one interval after
+startup, not at startup: restarting the server is something an operator does deliberately and
+often, and a restart that immediately began deleting would make it an event rather than a
+no-op. `manicule sweep-vectors` runs the same pass by hand, for draining a backlog now rather
+than at the next interval.
+
+Until that loop existed the trigger wrote tombstones and nothing read them
+([#261](https://github.com/mgd43b/manicule/issues/261) found the same shape of gap one section
+up). A chunk that was deleted or re-chunked left its vector in the table permanently, competing
+for top-`k` slots ahead of the join that hides it, and a soft-deleted document's grace period
+never expired because nothing was watching for it to. Three settings described the cadence of a
+loop that did not exist.
+
+**What it yields to, stated exactly.** The pass takes the derived-mutation guard, which
+serializes it against a reset, a rebuild and a re-embed publication — the operations that move
+the publication pointer underneath it. It is deliberately *not* serialized against a running
+sync, and the tombstone design is what makes that safe rather than merely tolerable: the list
+only ever names ids that were already deleted, so a vector written after the pass began cannot
+be in it. **The exclusion against a hot backup is not yet enforced by a lock** — `backup.py`
+records it as the caller's responsibility, and that remains true; a backup taken during a sweep
+can capture a torn moment between a vector's removal and its tombstone being cleared, which the
+next pass then repairs on the restored copy.
 
 ### 8.3 Recovery
 
@@ -1977,6 +2094,10 @@ one.
 | FTS5 is external-content over `chunks` and trigger-maintained | §6.1 |
 | The vector row carries the chunk as `chunk_json`, because the protocol requires a self-sufficient store | §6.2 |
 | The vector row carries its own `embed_identity`, so nothing outside it asserts that it is current | §6.2 |
+| The ANN lifecycle is a function of the row count and the index's own metadata; nothing records that a build is due | §6.2.2 |
+| An index carries its build generation and partition count in its name, because LanceDB records neither | §6.2.2 |
+| A refresh is the first build's comparison applied to the rows the index does not cover | §6.2.3 |
+| The build is an operator action; publication makes it due and does not perform it | §6.2.4 |
 | The lexical query is one joined statement so `LIMIT` applies after filtering | §6.1 |
 | The sweep collects soft-deleted documents after a grace period, trading free restore against vector top-`k` dilution | §8.2 |
 | Two FTS columns with BM25 weights `1.0 / 0.4` | §6.1 |

@@ -54,6 +54,28 @@ manicule config set rag.profile precise</pre>
     <dt>Chunking fingerprint</dt><dd><code>{{ panels.index.data.chunk_fingerprint or 'none' }}</code></dd>
     <dt>Documents</dt><dd>{{ panels.index.data.documents }}</dd>
     <dt>Chunks</dt><dd>{{ panels.index.data.chunks }}</dd>
+    {#
+      Every optional field here falls back to "unknown" rather than rendering `None`. They are
+      null for an index this installation did not build — LanceDB records neither the partition
+      count nor which build produced it — and "None partition(s)" reads as a value rather than
+      as an absence, which is the opposite of what the null is saying.
+    #}
+    {% if panels.index.data.vector_index %}
+    {% set vectors = panels.index.data.vector_index %}
+    <dt>Vector search</dt>
+    <dd>
+      {{ vectors.lifecycle }} · threshold {{ vectors.threshold or 'off' }}
+      {% if vectors.index_name %}
+      · <code>{{ vectors.index_name }}</code>,
+      {% set partitions = vectors.num_partitions if vectors.num_partitions is not none else 'unknown' %}
+      {% set metric = vectors.distance_metric if vectors.distance_metric is not none else 'unknown' %}
+      {{ vectors.index_type if vectors.index_type is not none else 'unknown type' }} over
+      {{ partitions }} partition(s), {{ metric }} distance,
+      {{ vectors.unindexed_rows }} row(s) not yet indexed
+      {% endif %}
+      {% if vectors.detail %}<br><span class="muted">{{ vectors.detail }}</span>{% endif %}
+    </dd>
+    {% endif %}
   </dl>
   <p class="muted">
     The fingerprints are shown in their canonical form. A prettied identity is one nobody can

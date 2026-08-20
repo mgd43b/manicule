@@ -509,7 +509,7 @@ refine a number that then gets clamped and rounded to a multiple anyway.
 
 | Knob | Default | Why that value |
 |---|---|---|
-| `overfetch_min` | 3 | A healthy single-workspace index still loses rows to the soft-delete grace window, in-flight documents and unswept tombstones. 3× removes the retry from the common path, and over an exhaustive search below the ANN threshold it is not measurable |
+| `overfetch_min` | 3 | A healthy single-workspace index still loses rows to the soft-delete grace window, in-flight documents and unswept tombstones. 3× removes the retry from the common path, and over an exhaustive search below the ANN threshold (`docs/storage.md` §6.2) it is not measurable. That threshold now has a lifecycle behind it rather than only a number, so the claim is checkable: `manicule status` says whether this index is still exhaustive. Past the threshold the over-fetch stops being free — it costs probes against an IVF_PQ index rather than a longer linear scan, which is the same interaction §3.3 flags for filters |
 | `overfetch_max` | 20 | Past this the plan should have inverted to the pre-filter regime (§3.3); the cap is what makes that visible in the trace rather than absorbed as latency |
 | `absolute_row_cap` | 2000 | Every over-fetched row is a `chunk_json` decode. The cap bounds the work independently of the multiplier |
 

@@ -19,12 +19,15 @@ made.
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING
+import shutil
+from typing import TYPE_CHECKING, Final
 
 import lancedb
 import pytest
+from lancedb.index import IvfPq
 
 from manicule.core.anchors import HeadingAnchor, Unlocated
+from manicule.core.ann import MINIMUM_ANN_INDEX_THRESHOLD, AnnLifecycle, partitions_for
 from manicule.core.content import BlockKind, Chunk
 from manicule.core.embedding import (
     EmbedFingerprint,
@@ -36,13 +39,17 @@ from manicule.core.embedding import (
 from manicule.core.errors import FingerprintMismatchError
 from manicule.core.protocols import VectorStore
 from manicule.core.retrieval import Filter
+from manicule.storage.engine import VECTORS_DIRNAME
 from manicule.storage.vectors import (
     CHUNK_ID_COLUMN,
+    DISTANCE_METRIC,
     EXEMPT_FILTER_FIELDS,
     IDENTITY_COLUMN,
     META_TABLE,
     PUBLICATION_COLUMN,
+    VECTOR_COLUMN,
     LanceVectorStore,
+    PublishedLanceVectorStore,
     VectorStoreStateError,
     predicate_for,
     quote,
@@ -58,6 +65,8 @@ from manicule.testing import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
     from manicule.core.embedding import Vector
 
@@ -1013,3 +1022,393 @@ async def _drop_generation_columns(directory: Path, embed: EmbedFingerprint) -> 
     table = await connection.open_table(table_name(embed))
     await table.drop_columns([CHUNK_ID_COLUMN, PUBLICATION_COLUMN])
     connection.close()
+
+
+# --- the ANN index lifecycle -----------------------------------------------------------------
+#
+# `docs/storage.md` §6.2 promises a transition — exhaustive below `ann_index_threshold`, an
+# IVF-PQ index above it — and #261 found nothing in the product executing it. These are the
+# other half of `tests/test_core_ann.py`: that a real LanceDB table reaches each state the rule
+# describes, and answers correctly in every one of them.
+#
+# The threshold used here is 256 rather than the shipped 100 000, because 256 is the floor an
+# 8-bit product quantizer can train at and therefore the smallest corpus that can exercise a
+# real build. A test that stubbed the build would be a test of the classification, which
+# `tests/test_core_ann.py` already is.
+
+ANN_THRESHOLD: Final = MINIMUM_ANN_INDEX_THRESHOLD
+
+
+def scattered(dimension: int, count: int, *, seed: int = 3) -> list[list[float]]:
+    """``count`` deterministic vectors spread through the positive orthant.
+
+    Not `spread`: one-hot vectors take only `dimension` distinct values, and a product
+    quantizer trained on four distinct points is not a quantizer. These give the codebook
+    something to actually partition.
+    """
+    rng = random.Random(seed)  # noqa: S311 - a fixture, seeded so a build is reproducible
+    return [[rng.random() + 0.1 for _ in range(dimension)] for _ in range(count)]
+
+
+async def _stocked(directory: Path, count: int, *, dimension: int = 4) -> LanceVectorStore:
+    """A store holding ``count`` scattered vectors plus one exactly at the first axis.
+
+    The last chunk is `"target"` and its vector is the axis a query can be aimed down, so
+    "did search still find the right row" is a question with an unambiguous answer.
+    """
+    store = await prepared(directory, dimension)
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(count)]
+    vectors = scattered(dimension, count)
+    await store.upsert([*chunks, chunk("target", position=count)], [*vectors, spread(dimension, 0)])
+    return store
+
+
+async def test_a_corpus_below_the_threshold_keeps_exact_search_and_is_offered_no_index(
+    tmp_path: Path,
+) -> None:
+    """The state #261 says is correct, and the one the document already describes.
+
+    Exhaustive search over a few tens of thousands of vectors is fast and *exact*. The
+    maintenance boundary is asked here and declines, which is the behavior that keeps an
+    early index — and the recall it would permanently cost — from being built by a cron job.
+    """
+    store = await _stocked(tmp_path / "vectors", 10)
+
+    state = await store.ann_index_state(threshold=ANN_THRESHOLD)
+    build = await store.build_ann_index(threshold=ANN_THRESHOLD)
+
+    assert state.lifecycle is AnnLifecycle.EXHAUSTIVE
+    assert state.exact
+    assert not state.due
+    assert state.index is None
+    assert not build.built
+    assert (await store.ann_index_state(threshold=ANN_THRESHOLD)).index is None
+    await store.teardown()
+
+
+async def test_crossing_the_threshold_makes_a_build_due_and_the_boundary_performs_it(
+    tmp_path: Path,
+) -> None:
+    """#261's reproduction, end to end, at the pinned LanceDB version.
+
+    The corpus crosses the documented transition point through the ordinary write path, the
+    supported maintenance boundary is invoked, and the index metadata is then read back from
+    LanceDB itself. Before this ticket every one of these assertions failed at the last step,
+    because nothing scheduled a build at all.
+    """
+    store = await _stocked(tmp_path / "vectors", ANN_THRESHOLD)
+    due = await store.ann_index_state(threshold=ANN_THRESHOLD)
+
+    build = await store.build_ann_index(threshold=ANN_THRESHOLD)
+
+    assert due.lifecycle is AnnLifecycle.PENDING, "the corpus is past the documented threshold"
+    assert due.exact, "pending is exact and slow, never approximate"
+    assert build.built
+    after = build.after
+    assert after.lifecycle is AnnLifecycle.READY
+    assert after.index is not None
+    assert after.index.index_type == "IVF_PQ"
+    assert after.index.distance_type == DISTANCE_METRIC
+    assert after.index.num_partitions == partitions_for(after.rows)
+    assert after.index.build_generation == 1
+    assert after.index.coverage == 1.0
+    assert not after.due
+    await store.teardown()
+
+
+async def test_search_answers_correctly_on_both_sides_of_the_build(tmp_path: Path) -> None:
+    """The index changes what a query costs, not which row is nearest to it.
+
+    Asserted on the one row whose answer is not a matter of degree: a vector lying exactly on
+    the query's axis is the nearest neighbor at cosine 1.0 whether the search scanned every
+    row or probed a partition. The *other* neighbors do move — that is what an approximate
+    index is — so nothing here asserts their order, which would be asserting that IVF-PQ is
+    not IVF-PQ.
+    """
+    store = await _stocked(tmp_path / "vectors", ANN_THRESHOLD)
+    query = spread(4, 0)
+    before = await store.search(query, k=3)
+
+    await store.build_ann_index(threshold=ANN_THRESHOLD)
+    after = await store.search(query, k=3)
+
+    assert before[0].chunk.id == "target"
+    assert before[0].score == pytest.approx(1.0)
+    assert after[0].chunk.id == "target", "an index must not lose the row it is nearest to"
+    assert after[0].score == pytest.approx(1.0)
+    assert len(after) == 3, "search stays available and still fills the requested k"
+    await store.teardown()
+
+
+async def test_vectors_published_after_a_build_are_searched_before_they_are_indexed(
+    tmp_path: Path,
+) -> None:
+    """The refresh policy's premise: an uncovered row is latency owed, never a result missing.
+
+    LanceDB scans the fragments the index does not cover and merges them into the ranked
+    result, so a publication that lands the instant after a build is findable immediately.
+    Were that not true the whole staleness policy would be a correctness bug rather than a
+    performance one, and the index could not be refreshed on a schedule at all.
+    """
+    store = await _stocked(tmp_path / "vectors", ANN_THRESHOLD)
+    await store.build_ann_index(threshold=ANN_THRESHOLD)
+
+    await store.upsert([chunk("published-after-the-build", position=1)], [spread(4, 1)])
+    state = await store.ann_index_state(threshold=ANN_THRESHOLD)
+    found = await store.search(spread(4, 1), k=1)
+
+    assert state.index is not None
+    assert state.index.unindexed_rows == 1
+    assert state.index.coverage < 1.0
+    assert state.lifecycle is AnnLifecycle.READY, "one uncovered row is not a stale index"
+    assert found[0].chunk.id == "published-after-the-build"
+    assert found[0].score == pytest.approx(1.0)
+    await store.teardown()
+
+
+async def test_an_uncovered_tail_past_the_threshold_goes_stale_and_a_rebuild_clears_it(
+    tmp_path: Path,
+) -> None:
+    """The stated refresh policy, and the bounded action that answers it.
+
+    The rebuild is one build: it trains at the current row count, takes the new partition
+    count that implies, and increments the build generation so two status reads at identical
+    coverage can still be told apart. The superseded index is dropped rather than accumulated —
+    two indexes on one column is disk spent twice to answer one question.
+    """
+    store = await _stocked(tmp_path / "vectors", ANN_THRESHOLD)
+    first = await store.build_ann_index(threshold=ANN_THRESHOLD)
+    await store.upsert(
+        [chunk(f"late-{index}", position=index) for index in range(ANN_THRESHOLD)],
+        scattered(4, ANN_THRESHOLD, seed=9),
+    )
+
+    stale = await store.ann_index_state(threshold=ANN_THRESHOLD)
+    rebuilt = await store.build_ann_index(threshold=ANN_THRESHOLD)
+
+    assert stale.lifecycle is AnnLifecycle.STALE
+    assert stale.due
+    assert rebuilt.built
+    assert rebuilt.after.lifecycle is AnnLifecycle.READY
+    assert rebuilt.after.index is not None
+    assert rebuilt.after.index.build_generation == 2
+    assert rebuilt.after.index.coverage == 1.0
+    assert first.after.index is not None
+    assert rebuilt.replaced == first.after.index.name
+    await store.teardown()
+
+
+async def test_a_dry_run_reports_the_build_it_would_do_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Every other boundary here plans by default, and an index build is the most expensive."""
+    store = await _stocked(tmp_path / "vectors", ANN_THRESHOLD)
+
+    planned = await store.build_ann_index(threshold=ANN_THRESHOLD, dry_run=True)
+
+    assert planned.dry_run
+    assert not planned.built
+    assert str(partitions_for(planned.before.rows)) in planned.detail
+    assert (await store.ann_index_state(threshold=ANN_THRESHOLD)).index is None
+    await store.teardown()
+
+
+async def test_a_corpus_too_small_to_train_is_declined_rather_than_attempted(
+    tmp_path: Path,
+) -> None:
+    """``--force`` over a handful of vectors would otherwise reach LanceDB and raise.
+
+    Configuration cannot produce this — a threshold below the codebook size is refused at
+    startup — but ``--force`` names a row count of its own, so the floor is checked where the
+    build happens as well as where the setting is read.
+    """
+    store = await _stocked(tmp_path / "vectors", 10)
+
+    declined = await store.build_ann_index(threshold=ANN_THRESHOLD, force=True)
+
+    assert not declined.built
+    assert str(MINIMUM_ANN_INDEX_THRESHOLD) in declined.detail
+    assert (await store.ann_index_state(threshold=ANN_THRESHOLD)).index is None
+    await store.teardown()
+
+
+async def test_switching_the_threshold_off_stops_new_builds_without_dropping_an_old_one(
+    tmp_path: Path,
+) -> None:
+    """A configuration change that destroyed a built index on its way past would be a surprise.
+
+    ``disabled`` says new builds will not happen. What is already built is still the search
+    path, so it is still what status describes.
+    """
+    store = await _stocked(tmp_path / "vectors", ANN_THRESHOLD)
+    await store.build_ann_index(threshold=ANN_THRESHOLD)
+
+    off = await store.ann_index_state(threshold=0)
+    declined = await store.build_ann_index(threshold=0)
+
+    assert off.lifecycle is AnnLifecycle.READY
+    assert off.index is not None
+    assert not off.due
+    assert not declined.built
+    assert (await store.ann_index_state(threshold=0)).index is not None
+    await store.teardown()
+
+
+async def test_an_index_this_installation_did_not_build_is_refused_rather_than_replaced(
+    tmp_path: Path,
+) -> None:
+    """Somebody made it deliberately, and the boundary does not know what for.
+
+    Its partition count and build generation are unrecoverable — LanceDB records neither, and
+    the name does not carry them — so it is reported with those fields empty rather than with
+    a plausible guess, and every attempt to manage it refuses by name.
+    """
+    directory = tmp_path / "vectors"
+    stocked = await _stocked(directory, ANN_THRESHOLD)
+    await stocked.teardown()
+    await _create_foreign_index(directory)
+    # Reopened rather than reused, because that is the shape this actually arrives in: somebody
+    # built the index against the directory, and the next process to start finds it there.
+    store = await prepared(directory)
+
+    state = await store.ann_index_state(threshold=ANN_THRESHOLD)
+
+    assert state.index is not None
+    assert not state.index.recognized
+    assert state.index.num_partitions is None
+    assert state.index.build_generation is None
+    assert "did not build" in state.detail
+    with pytest.raises(VectorStoreStateError, match="somebodys_own_index"):
+        await store.build_ann_index(threshold=ANN_THRESHOLD, force=True)
+    await store.teardown()
+
+
+async def test_a_foreign_index_beside_a_managed_one_is_still_what_gets_reported(
+    tmp_path: Path,
+) -> None:
+    """The case where preferring our own index would report a health it cannot deliver.
+
+    Both exist on the vector column. Reporting the managed one would say ``ready`` with a
+    partition count and a build generation — and then every attempt to maintain it would be
+    declined, because the boundary refuses beside an index it cannot account for. The status and
+    the refusal would disagree, and only one of them would be reachable by an operator wondering
+    why nothing happens.
+    """
+    directory = tmp_path / "vectors"
+    stocked = await _stocked(directory, ANN_THRESHOLD)
+    built = await stocked.build_ann_index(threshold=ANN_THRESHOLD)
+    await stocked.teardown()
+    await _create_foreign_index(directory)
+    store = await prepared(directory)
+
+    state = await store.ann_index_state(threshold=ANN_THRESHOLD)
+
+    assert built.built, "this test is only interesting if a managed index was there first"
+    assert state.index is not None
+    assert not state.index.recognized, (
+        "the unaccountable index is what decides whether the boundary may act, so it is what "
+        "the status has to name"
+    )
+    assert state.index.num_partitions is None
+    with pytest.raises(VectorStoreStateError, match="somebodys_own_index"):
+        await store.build_ann_index(threshold=ANN_THRESHOLD, force=True)
+    await store.teardown()
+
+
+async def test_the_index_state_of_a_directory_with_no_vectors_is_an_answer_not_an_error(
+    store: LanceVectorStore,
+) -> None:
+    """A fresh installation asking whether its index is current has a reasonable question."""
+    state = await store.ann_index_state(threshold=ANN_THRESHOLD)
+
+    assert state.rows == 0
+    assert state.index is None
+    assert state.exact
+    assert not state.due
+
+
+async def _create_foreign_index(directory: Path) -> None:
+    """An index on the vector column under a name this project would never choose."""
+    connection = await lancedb.connect_async(directory)
+    table = await connection.open_table(table_name(fingerprint()))
+    await table.create_index(
+        VECTOR_COLUMN,
+        config=IvfPq(distance_type=DISTANCE_METRIC, num_partitions=4, num_sub_vectors=1),
+        name="somebodys_own_index",
+    )
+    connection.close()
+
+
+async def test_a_published_handle_answers_about_an_index_it_has_not_created_yet(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """A fresh installation's status must not raise on the way to saying "nothing yet".
+
+    The live handle follows SQLite's publication pointer and pins a generation for every
+    operation, and on a first run there is no vectors directory to pin. Asking whether search
+    is still exhaustive is a reasonable question before anything has been ingested — it is on
+    the same payload as the document count, which is zero rather than an error.
+    """
+    root = data_dir / VECTORS_DIRNAME
+    shutil.rmtree(root, ignore_errors=True)
+    live = PublishedLanceVectorStore(root, engine)
+
+    state = await live.ann_index_state(threshold=ANN_THRESHOLD)
+    untouched = not root.exists()
+    build = await live.build_ann_index(threshold=ANN_THRESHOLD)
+
+    assert untouched, (
+        "`index_status` is classified read-only, and opening a LanceDB connection creates the "
+        "directory it points at: reporting that a store is empty must not build part of it"
+    )
+    assert state.rows == 0
+    assert state.lifecycle is AnnLifecycle.EXHAUSTIVE
+    assert state.generation is None, (
+        "there is no published generation yet, and naming one would be inventing the very "
+        "thing the field exists to report"
+    )
+    assert not build.built
+
+
+async def test_a_build_that_fails_leaves_the_previous_index_serving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering promise, checked by breaking the build rather than by reading the code.
+
+    The new index is created before the old one is dropped, so a build that raises has taken
+    nothing away: the previous index is still there, still covers what it covered, and still
+    answers. The opposite ordering would spend the failure on the search path — an installation
+    that dropped back to a linear scan because a rebuild it never asked for went wrong.
+    """
+    from lancedb.table import AsyncTable  # noqa: PLC0415 - only this test replaces a method
+
+    store = await _stocked(tmp_path / "vectors", ANN_THRESHOLD)
+    first = await store.build_ann_index(threshold=ANN_THRESHOLD)
+    await store.upsert(
+        [chunk(f"late-{index}", position=index) for index in range(ANN_THRESHOLD)],
+        scattered(4, ANN_THRESHOLD, seed=9),
+    )
+
+    async def refuse(*_args: object, **_kwargs: object) -> None:
+        msg = "synthetic build failure"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(AsyncTable, "create_index", refuse)
+    with pytest.raises(RuntimeError, match="synthetic build failure"):
+        await store.build_ann_index(threshold=ANN_THRESHOLD)
+    monkeypatch.undo()
+
+    survived = await store.ann_index_state(threshold=ANN_THRESHOLD)
+    found = await store.search(spread(4, 0), k=1)
+
+    assert first.after.index is not None
+    assert survived.index is not None
+    assert survived.index.name == first.after.index.name, (
+        "the failed build must not have taken the last known-good index with it"
+    )
+    assert survived.index.build_generation == 1
+    assert survived.lifecycle is AnnLifecycle.STALE, (
+        "still stale, because the refresh that would have cleared it did not happen"
+    )
+    assert found[0].chunk.id == "target", "and the corpus still answers from it"
+    await store.teardown()

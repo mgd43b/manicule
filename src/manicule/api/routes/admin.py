@@ -130,6 +130,21 @@ async def reembed_cleanup(service: Service, caller: AdminPrincipal, run_id: str)
     return await respond("reembed_cleanup", service, lambda: service.reembed_cleanup(run_id))
 
 
+@router.get(
+    "/vector-index",
+    name="vector_index_build",
+    summary="Aggregate dry run for the ANN index build dense search is due for.",
+)
+async def vector_index_build(service: Service, caller: AdminPrincipal) -> Response:
+    """Dry run only. A build is minutes of CPU and stays a local operator action."""
+    del caller
+    return await respond(
+        "vector_index_build",
+        service,
+        lambda: service.vector_index_build(dry_run=True),
+    )
+
+
 @router.get("/lifecycle/reset-derived", name="lifecycle_reset_derived")
 async def lifecycle_reset_derived(service: Service, caller: AdminPrincipal) -> Response:
     """Aggregate dry run only; destructive lifecycle actions remain local operator actions."""

@@ -62,6 +62,7 @@ __all__ = [
     "SESSIONS_HELD",
     "ControlHandler",
     "ScheduledSource",
+    "ScheduledVectorSweep",
     "Scheduler",
     "Serving",
     "announce",
@@ -313,14 +314,44 @@ class ScheduledLifecyclePlans:
     last_error_type: str = ""
 
 
+@dataclass(slots=True)
+class ScheduledVectorSweep:
+    """Aggregate-only outcome of the vector sweep loop.
+
+    Counts, never ids. What this operation removes is what somebody deleted, and a scheduler
+    record naming those rows would keep a list of deletions in memory for the life of the
+    process, reachable from every status surface that reads the scheduler.
+
+    ``blocked`` counts passes that declined rather than failed — a backup or a lifecycle
+    mutation holding the guard. Separate from ``failures`` because they need opposite things:
+    one is the design working and the other wants somebody.
+    """
+
+    interval_s: float
+    runs: int = 0
+    failures: int = 0
+    blocked: int = 0
+    vectors_removed: int = 0
+    documents_purged: int = 0
+    last_error_type: str = ""
+
+
 class SchedulerConfiguration(dict[str, float]):
-    """Connector intervals plus the separately typed lifecycle planning cadence."""
+    """Connector intervals plus the separately typed maintenance cadences."""
 
     lifecycle_interval_s: float | None
+    sweep_interval_s: float | None
 
-    def __init__(self, sources: Mapping[str, float], *, lifecycle_interval_s: float | None) -> None:
+    def __init__(
+        self,
+        sources: Mapping[str, float],
+        *,
+        lifecycle_interval_s: float | None,
+        sweep_interval_s: float | None = None,
+    ) -> None:
         super().__init__(sources)
         self.lifecycle_interval_s = lifecycle_interval_s
+        self.sweep_interval_s = sweep_interval_s
 
 
 class Scheduler:
@@ -373,6 +404,9 @@ class Scheduler:
         self._lifecycle_interval_s = (
             sources.lifecycle_interval_s if isinstance(sources, SchedulerConfiguration) else None
         )
+        self._sweep_interval_s = (
+            sources.sweep_interval_s if isinstance(sources, SchedulerConfiguration) else None
+        )
         self._tasks: set[asyncio.Task[None]] = set()
         self.scheduled: dict[str, ScheduledSource] = {
             name: ScheduledSource(name=name, interval_s=interval)
@@ -382,6 +416,11 @@ class Scheduler:
         self.lifecycle = (
             ScheduledLifecyclePlans(interval_s=self._lifecycle_interval_s)
             if self._lifecycle_interval_s is not None
+            else None
+        )
+        self.sweeps = (
+            ScheduledVectorSweep(interval_s=self._sweep_interval_s)
+            if self._sweep_interval_s is not None
             else None
         )
 
@@ -403,6 +442,11 @@ class Scheduler:
                 if configured.schedule_s is not None and configured.enabled
             },
             lifecycle_interval_s=service.settings.storage.lifecycle_plan_schedule_s,
+            # Unconditional, unlike the lifecycle cadence above. That one is opt-in because
+            # planning a deletion boundary is something an operator asks for; this one removes
+            # rows SQLite has already forgotten, and an installation that never runs it grows a
+            # vector table of deleted chunks that dilute every search until somebody notices.
+            sweep_interval_s=service.settings.ingest.sweep_interval_s,
         )
 
     def start(self) -> None:
@@ -417,6 +461,12 @@ class Scheduler:
             )
             self._tasks.add(lifecycle)
             lifecycle.add_done_callback(self._tasks.discard)
+        if self._sweep_interval_s is not None:
+            sweeping = asyncio.create_task(
+                self._run_sweep(self._sweep_interval_s), name="schedule:vector-sweep"
+            )
+            self._tasks.add(sweeping)
+            sweeping.add_done_callback(self._tasks.discard)
         for name, interval in self._sources.items():
             task = asyncio.create_task(self._run(name, interval), name=f"schedule:{name}")
             self._tasks.add(task)
@@ -483,6 +533,46 @@ class Scheduler:
                     record.last_error_type = (
                         str(error.get("type", "")) if isinstance(error, dict) else ""
                     )
+
+    async def _run_sweep(self, interval_s: float) -> None:
+        """Remove the vectors SQLite has already forgotten, on cadence, forever.
+
+        The loop ``docs/storage.md`` §8.2 has always described and nothing ran. Until it
+        existed the tombstone table only grew: a chunk deleted or re-chunked left its vector in
+        LanceDB permanently, competing for top-``k`` slots ahead of the join that hides it, and
+        a soft-deleted document's grace period never expired because nothing was watching for
+        it to.
+
+        **The first pass is one interval after startup**, on the same reasoning the source
+        loops use: restarting the server is something an operator does deliberately and often,
+        and a restart that immediately began deleting would make it an event rather than a
+        no-op.
+
+        **Nothing here ends the loop.** A pass that raises is counted and the loop waits and
+        tries again, because every failure this can see is transient by construction — a busy
+        writer, a generation being republished underneath it — and the work is idempotent, so
+        the next pass simply does what this one did not. A loop that exited on the first would
+        need a restart to resume and would give no sign it had stopped.
+        """
+        record = self.sweeps
+        if record is None:  # defensive: construction and start normally make this impossible
+            return
+        while True:
+            await self._sleep(interval_s)
+            try:
+                swept = await self._service.sweep_vectors()
+            except asyncio.CancelledError:
+                raise
+            except (ManiculeError, ValueError, OSError) as exc:
+                record.failures += 1
+                record.last_error_type = type(exc).__name__
+                continue
+            record.runs += 1
+            if not swept.ran:
+                record.blocked += 1
+                continue
+            record.vectors_removed += swept.vectors_removed
+            record.documents_purged += swept.documents_purged
 
     async def _recover_reembedding(self) -> None:
         """Resume ownerless durable runs once at startup; run status remains authoritative."""

@@ -33,6 +33,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from manicule.core.anchors import Anchor
+from manicule.core.ann import AnnIndexBuild, AnnIndexState
 from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
 from manicule.core.embedding import EmbedFingerprint, StoredVector, TokenStates, Vector
 from manicule.core.fingerprints import ChunkFingerprint
@@ -409,6 +410,31 @@ class VectorStore(Protocol):
 
     async def count(self) -> int:
         """How many vectors are stored."""
+        ...
+
+
+@runtime_checkable
+class AnnIndexMaintenance(Protocol):
+    """Optionally reports and maintains an approximate-nearest-neighbor index.
+
+    Optional the same way :class:`EnumerationProgressConnector` is, and for the same reason:
+    the capability belongs to a backend that has one, not to every backend. Exhaustive search
+    is exact, so a store that never builds an index is not a degraded store — it is a store
+    whose search is always the reference answer, and requiring it to implement two methods
+    that can only refuse would make the protocol describe a lifecycle it does not have.
+
+    A store without this capability reports no index state at all rather than an empty one.
+    ``docs/storage.md`` §6.2 is the lifecycle these two methods execute.
+    """
+
+    async def ann_index_state(self, *, threshold: int) -> AnnIndexState:
+        """Whether search is exhaustive, indexed, or overdue — measured, never recorded."""
+        ...
+
+    async def build_ann_index(
+        self, *, threshold: int, force: bool = False, dry_run: bool = False
+    ) -> AnnIndexBuild:
+        """Bring the index up to what ``threshold`` asks for, without interrupting search."""
         ...
 
 
@@ -1141,6 +1167,7 @@ class Middleware(Protocol):
 
 __all__ = [
     "CLOSE_DEADLINE_S",
+    "AnnIndexMaintenance",
     "ChunkRelationStore",
     "Chunker",
     "CollectionStore",
