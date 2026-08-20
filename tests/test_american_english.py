@@ -272,9 +272,17 @@ sentence that explains the rename and not the next casual use of it.
 """
 
 SKIP_SUFFIXES = frozenset({".png", ".lock"})
-SKIP_NAMES = frozenset({"LICENSE", "uv.lock"})
-"""``LICENSE`` is the GPL's text, reproduced verbatim; ``uv.lock`` is generated. Neither is
-this project's prose, and editing either to satisfy a spelling check would be a defect."""
+SKIP_NAMES = frozenset({"LICENSE", "uv.lock", ".test_durations"})
+"""``LICENSE`` is the GPL's text, reproduced verbatim; ``uv.lock`` and ``.test_durations`` are
+generated. None of them is this project's prose, and editing any of them to satisfy a spelling
+check would be a defect.
+
+``.test_durations`` earns its place here by holding the node ids of
+``test_the_check_catches_a_spelling_of_each_family``, whose parameters are British spellings
+because that is what it exists to catch. Regenerating the durations file therefore copies this
+file's own fixtures into the tracked tree, and the sweep flagged the checker for testing the
+checker. The alternative -- ids that do not contain the words -- would make the parametrization
+unreadable to protect a file nobody writes by hand."""
 
 SELF = Path(__file__).name
 

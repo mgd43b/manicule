@@ -929,7 +929,20 @@ class BlobStore:
         marker_completed = False
         marker_path = self._stage_path(staging_key) if staging_key is not None else None
         marker_existed = marker_path is not None and marker_path.exists()
-        async with self._sessions() as session:
+        # **This is a managed writer, and it was the one that never queued.** Every other
+        # writer to this database waits in `writer_admission` before opening a transaction;
+        # retention did not, so it raced the acquisition journal at SQLite's level instead of
+        # queueing with it — exactly the arrangement `writer_admission` exists to prevent. It
+        # cost what an unqueued writer costs: `BEGIN IMMEDIATE` here averaged 5.98ms against
+        # the journal's 0.77ms, because the difference is `busy_timeout` rather than a queue,
+        # and a 1,000-document recovery spent a fifth of its wall clock in it.
+        #
+        # **Inside the durable locks, not outside**, because `_reconcile_marker_page` already
+        # takes marker locks and then admission through `_forget_markers`. Acquiring admission
+        # first here would invert that order against a shared lock shard, which is a deadlock
+        # rather than a slow path. File locks before admission, admission before the
+        # transaction, everywhere.
+        async with writer_admission(self._engine), self._sessions() as session:
             # SQLite's write reservation spans the aggregate check, filesystem publication,
             # and descriptor commit. Separate BlobStore instances and processes therefore
             # cannot each spend the same observed capacity.
