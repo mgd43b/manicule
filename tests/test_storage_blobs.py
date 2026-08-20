@@ -31,6 +31,7 @@ from manicule.storage.blobs import (
     should_compress,
 )
 from manicule.storage.docstore import SqliteDocStore
+from manicule.storage.engine import writer_admission
 from tests.storage_helpers import make_document
 
 if TYPE_CHECKING:
@@ -269,6 +270,60 @@ async def test_canceled_staging_write_is_joined_before_cancellation_returns(
     staging = blobs.root / "acquisition-staging"
     assert not list(blobs._stage_partial_root().glob("*.partial"))  # pyright: ignore[reportPrivateUsage]
     assert len([path for path in staging.iterdir() if path.is_file()]) == 1
+
+
+async def test_retaining_acquired_bytes_waits_in_the_writer_queue(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """Retention is a managed writer, and it is the one that used to skip the queue.
+
+    ``writer_admission`` is a queue only if *every* writer joins it -- the module docstring
+    says so, and names the run-ending ``database is locked`` that proved it. Retention did not
+    join: it opened ``BEGIN IMMEDIATE`` directly and raced the acquisition journal at SQLite's
+    level, where losing costs ``busy_timeout`` rather than a place in line. A 1,000-document
+    recovery spent a fifth of its wall clock there.
+
+    Asserted as "no write transaction was opened", not as "the call had not returned yet". The
+    weaker form passes for any reason the task might be slow, including reasons that have
+    nothing to do with the queue, and would keep passing if retention went back to writing
+    whenever it liked.
+    """
+    blobs = BlobStore(engine, data_dir)
+    raw = RawDocument(
+        source_id="queued-id",
+        uri="https://queued.invalid/body",
+        media_type="text/plain",
+        content="public queued body",
+    )
+    reservations: list[str] = []
+
+    def record_reservation(_conn: Any, _cursor: Any, statement: str, *_rest: Any) -> None:
+        if statement.strip().upper().startswith("BEGIN"):
+            reservations.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record_reservation)
+    admission = writer_admission(engine)
+    await admission.acquire()
+    try:
+        task = asyncio.create_task(blobs.retain_acquisition("run\0queued-id", raw))
+        # Retention has real work ahead of the queue -- staging cleanup and the durable lock
+        # shards, both of which reach a worker thread -- so yielding once would prove nothing
+        # about where it stopped. This waits long enough for an unqueued writer to arrive.
+        await asyncio.sleep(0.5)
+        assert reservations == [], (
+            "retention opened a write transaction while the writer queue was held by someone "
+            f"else: {reservations}. It is a managed writer and has to wait its turn."
+        )
+        assert not task.done()
+    finally:
+        admission.release()
+
+    retention, acquired = await asyncio.wait_for(task, timeout=10)
+    assert reservations, "releasing the queue did not let the retention through"
+    assert retention.ref == content_hash(raw.as_bytes())
+    assert acquired.content_hash == retention.ref
+    event.remove(engine.sync_engine, "before_cursor_execute", record_reservation)
 
 
 async def test_durable_thread_failure_takes_precedence_over_cancellation() -> None:
