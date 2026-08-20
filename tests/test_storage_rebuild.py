@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import tracemalloc
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -14,6 +15,7 @@ import pytest
 from pydantic import JsonValue
 from sqlalchemy import delete, event, select, text, update
 
+import manicule.storage.rebuild as rebuild_storage
 from manicule.core.acquisition import (
     AcquiredSource,
     AcquisitionDiagnostic,
@@ -2968,3 +2970,237 @@ async def test_expired_owner_is_fenced_after_takeover(  # noqa: PLR0915 - one ta
             now=takeover_now + timedelta(seconds=6),
             expires_at=takeover_now + timedelta(minutes=3),
         )
+
+
+# --- lease renewal during checkpoint replay ---------------------------------------------------
+
+
+async def _replayable_takeover(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    *,
+    items: int,
+    lease_seconds: int,
+) -> tuple[SqliteRebuildStore, LanceVectorStore, RebuildCheckpoint, RebuildCheckpoint, str]:
+    """A generation with ``items`` staged replacements and a fresh short-leased takeover.
+
+    Several items rather than one because replay pages per item: a single-item checkpoint
+    replays in one bounded copy and can never outlive any lease, which is exactly the shape
+    the existing takeover coverage already has and the shape this defect hides behind.
+    """
+    run_id, blob_ref, raw = await promoted_snapshot(store, engine, data_dir)
+    embed = EmbedFingerprint(
+        model_id="test/embed",
+        dimension=4,
+        pooling=Pooling.MEAN,
+        normalized=True,
+        tokenizer_id="test/tokenizer",
+        max_sequence_length=128,
+    )
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    plan = await rebuilds.plan_rebuild(
+        run_id,
+        RebuildTarget(
+            parser_routing="routing-v2",
+            parser_set=("plain@2",),
+            chunk_fingerprint="chunk-v2",
+            embedding_fingerprint=embed.canonical(),
+            glossary_fingerprint="glossary-v2",
+            fts_tokenizer="unicode61",
+            batch_documents=1,
+            max_memory_bytes=1_000_000,
+            max_temporary_bytes=10_000_000,
+        ),
+        missing_limit=10,
+    )
+    first = await rebuilds.claim_generation(
+        plan.generation_id, "first", now=NOW, expires_at=NOW + timedelta(minutes=10)
+    )
+    for sequence in range(items):
+        document = make_document(
+            source="wiki",
+            source_id=f"{raw.source_id}-{sequence}",
+            body=raw.as_bytes(),
+            uri=raw.uri,
+            media_type=raw.media_type,
+        ).model_copy(
+            update={
+                "publication_id": plan.generation_id,
+                "original_ref": blob_ref,
+                "version_token": "v2",
+                "status": DocumentStatus.INDEXED,
+            }
+        )
+        chunk = make_chunk(document, 0, f"{raw.as_text()} {sequence}")
+        await vectors.upsert(
+            [chunk], [[1.0, 0.0, 0.0, 0.0]], publication_id=first.vector_publication_id
+        )
+        await rebuilds.stage_replacements(
+            plan.generation_id,
+            [(sequence, DerivedReplacement(document=document, chunks=(chunk,), vector_embedded=1))],
+            expected_next_sequence=sequence,
+            owner="first",
+            lease_generation=first.lease_generation,
+            now=NOW,
+        )
+    takeover_at = NOW + timedelta(minutes=20)
+    second = await rebuilds.claim_generation(
+        plan.generation_id,
+        "second",
+        now=takeover_at,
+        expires_at=takeover_at + timedelta(seconds=lease_seconds),
+    )
+    assert second.predecessor_vector_publication_id == first.vector_publication_id
+    return rebuilds, vectors, first, second, plan.generation_id
+
+
+class ReplayClock:
+    """A clock the replay itself advances, so a long replay needs no wall-clock time.
+
+    Advancing on the vector store's own bounded copy is what makes this deterministic: replay
+    duration is a function of how many pages it copies, not of how the event loop happened to
+    schedule. ``asyncio.sleep`` would make the same test pass or fail on machine load.
+    """
+
+    def __init__(self, start: datetime, *, per_page: timedelta) -> None:
+        self.now = start
+        self._per_page = per_page
+        self.pages = 0
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance_one_page(self) -> None:
+        self.pages += 1
+        self.now += self._per_page
+
+
+async def test_replay_enforces_the_lease_it_was_handed_rather_than_extending_it(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay fences on the lease and never extends it; keeping it alive is the caller's job.
+
+    Asserted so the division stays where it is. The store's business is refusing to write into a
+    namespace this worker no longer owns, and it does that whether or not anybody is renewing —
+    which is what makes the fencing worth trusting. Moving renewal *into* here would make the
+    check and the thing it checks the same code.
+
+    This is also the defect's shape, seen from below: nothing renewed, so a replay longer than
+    one lease could never finish, and every retry began another full replay under another finite
+    lease. :func:`test_replay_across_several_leases_completes_when_the_lease_is_renewed` is the
+    same replay with a heartbeat over it, and
+    ``tests/ingest/test_generation_rebuild.py`` covers the worker that now provides one.
+    """
+    rebuilds, vectors, first, second, generation_id = await _replayable_takeover(
+        store, engine, data_dir, items=6, lease_seconds=5
+    )
+    clock = ReplayClock(NOW + timedelta(minutes=20), per_page=timedelta(seconds=3))
+    monkeypatch.setattr(rebuild_storage, "utcnow", clock)
+    original_copy = vectors.copy_publication
+
+    async def slow_copy(*args: object, **kwargs: object) -> None:
+        clock.advance_one_page()
+        await original_copy(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(vectors, "copy_publication", slow_copy)
+
+    with pytest.raises(RebuildLeaseConflictError, match="lease"):
+        await rebuilds.copy_checkpointed_vectors(
+            generation_id,
+            first.vector_publication_id,
+            owner="second",
+            lease_generation=second.lease_generation,
+            now=clock.now,
+        )
+
+    assert clock.pages >= 2, "replay must get far enough to outlive the lease"
+
+
+async def test_replay_across_several_leases_completes_when_the_lease_is_renewed(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same replay, renewed between pages, against the real store and a real vector table.
+
+    The worker's heartbeat is a timer over a fake store elsewhere; this is the half that fake
+    cannot answer — that a renewal landing *while* replay is mid-flight is tolerated by the
+    production path rather than tripping one of the guards replay carries. Replay re-reads the
+    generation row every page and compares ``next_sequence`` against the value it started with,
+    so a renewal that touched anything but the expiry would surface here as a checkpoint that
+    moved under the worker.
+
+    Renewal runs in a task of its own, handed the turn by the replay itself: no sleeps and no
+    scheduling luck, but a genuine second task writing to SQLite while replay is mid-page, which
+    is the contention an inline renewal would quietly avoid testing.
+    """
+    lease_seconds = 5
+    rebuilds, vectors, first, second, generation_id = await _replayable_takeover(
+        store, engine, data_dir, items=6, lease_seconds=lease_seconds
+    )
+    clock = ReplayClock(NOW + timedelta(minutes=20), per_page=timedelta(seconds=3))
+    monkeypatch.setattr(rebuild_storage, "utcnow", clock)
+    original_copy = vectors.copy_publication
+
+    page_reached = asyncio.Event()
+    renewed = asyncio.Event()
+
+    async def heartbeat() -> None:
+        while True:
+            await page_reached.wait()
+            page_reached.clear()
+            await rebuilds.renew_generation(
+                generation_id,
+                "second",
+                second.lease_generation,
+                now=clock.now,
+                expires_at=clock.now + timedelta(seconds=lease_seconds),
+            )
+            renewed.set()
+
+    async def slow_copy(*args: object, **kwargs: object) -> None:
+        clock.advance_one_page()
+        renewed.clear()
+        page_reached.set()
+        await renewed.wait()
+        await original_copy(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(vectors, "copy_publication", slow_copy)
+    beat = asyncio.ensure_future(heartbeat())
+    try:
+        await rebuilds.copy_checkpointed_vectors(
+            generation_id,
+            first.vector_publication_id,
+            owner="second",
+            lease_generation=second.lease_generation,
+            now=clock.now,
+        )
+    finally:
+        beat.cancel()
+        with suppress(asyncio.CancelledError):
+            await beat
+
+    elapsed = clock.now - (NOW + timedelta(minutes=20))
+    assert elapsed > timedelta(seconds=lease_seconds * 2), (
+        "the replay has to outlast more than two leases for this to be the case under test"
+    )
+    checkpoint = await rebuilds.checkpoint(generation_id)
+    assert checkpoint.lease_owner == "second", "renewal must not move ownership"
+    assert checkpoint.lease_generation == second.lease_generation, "nor the fencing generation"
+    assert checkpoint.lease_expires_at is not None
+    assert checkpoint.lease_expires_at > clock.now, "and the expiry has to have moved with it"
+    assert checkpoint.vector_publication_id == second.vector_publication_id, (
+        "a completed replay certifies the takeover's own namespace"
+    )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, override
 
 import pytest
@@ -1412,3 +1413,223 @@ async def test_container_member_failure_matches_live_identity_and_parse_stage() 
     assert depth_limited.failed_stage is None
     assert depth_limited.content_hash == content_hash(depth_limited.uri)
     assert depth_limited.metadata["reason"] == "container depth exceeds the configured limit"
+
+
+# --- checkpoint replay holds its own lease ----------------------------------------------------
+
+
+@dataclass
+class ReplayingStore(FakeStore):
+    """A takeover whose checkpoint replay outlives the lease it was claimed under.
+
+    Replay blocks until the heartbeat has renewed ``renewals_wanted`` times, so the test asserts
+    on a *count* rather than on elapsed time: a build that cannot renew does not make this flaky,
+    it makes it hang and fail. That is the same shape as the acquisition heartbeat's coverage,
+    and for the same reason — a wall-clock barrier turns a scheduling accident into a green run.
+    """
+
+    renewals_wanted: int = 2
+    renewals: int = 0
+    expiries: list[datetime] = field(default_factory=list[datetime])
+    replay_renewals: int = 0
+    replay_expiries: list[datetime] = field(default_factory=list[datetime])
+    """Renewals seen while replay was running, apart from the document loop's own.
+
+    Scoped deliberately: the loop below renews twice per document, so a total would report a
+    healthy heartbeat for a build that never renewed during replay at all — which is exactly
+    the defect.
+    """
+    replay_finished: bool = False
+    renewal_error: Exception | None = None
+    renewed_enough: asyncio.Event = field(default_factory=asyncio.Event)
+    replay_started: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @override
+    async def claim_generation(
+        self, generation_id: str, owner: str, *, now: object, expires_at: object
+    ) -> RebuildCheckpoint:
+        checkpoint = await super().claim_generation(
+            generation_id, owner, now=now, expires_at=expires_at
+        )
+        return checkpoint.model_copy(
+            update={"predecessor_vector_publication_id": "predecessor-publication"}
+        )
+
+    @override
+    async def renew_generation(
+        self,
+        generation_id: str,
+        owner: str,
+        lease_generation: int,
+        *,
+        now: object,
+        expires_at: object,
+    ) -> RebuildCheckpoint:
+        if self.renewal_error is not None:
+            raise self.renewal_error
+        self.renewals += 1
+        if isinstance(expires_at, datetime):
+            self.expiries.append(expires_at)
+        if self.renewals >= self.renewals_wanted:
+            self.renewed_enough.set()
+        return await super().renew_generation(
+            generation_id, owner, lease_generation, now=now, expires_at=expires_at
+        )
+
+    @override
+    async def copy_checkpointed_vectors(
+        self,
+        generation_id: str,
+        source_publication_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+        cancel: asyncio.Event | None = None,
+    ) -> None:
+        del generation_id, source_publication_id, owner, lease_generation, now
+        self.replay_started.set()
+        waiters = [asyncio.ensure_future(self.renewed_enough.wait())]
+        if cancel is not None:
+            waiters.append(asyncio.ensure_future(cancel.wait()))
+        try:
+            # Bounded, and the bound is not a timing assumption. A working heartbeat renews
+            # every third of a one-second lease, so it clears this in well under a second; the
+            # margin exists only so that a build which renews *never* fails the suite in ten
+            # seconds instead of hanging it forever, which is what an unbounded wait on an
+            # event nothing will set would do to CI.
+            await asyncio.wait(waiters, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+        if not self.renewed_enough.is_set() and (cancel is None or not cancel.is_set()):
+            msg = "replay waited for renewals that never came"
+            raise AssertionError(msg)
+        if cancel is not None and cancel.is_set():
+            raise asyncio.CancelledError
+        self.replay_renewals = self.renewals
+        self.replay_expiries = list(self.expiries)
+        self.replay_finished = True
+
+
+def _replaying(*, renewals_wanted: int) -> tuple[ReplayingStore, OfflineGenerationRebuilder]:
+    """A takeover rebuilder over one synthetic document, ready to replay."""
+    item, body = source(0, "alpha\nbeta")
+    store = ReplayingStore(items=[item], renewals_wanted=renewals_wanted)
+    rebuilder = OfflineGenerationRebuilder(
+        store=store,
+        blobs=FakeBlobs({item.blob_ref: body}),
+        deriver=FakeDeriver(),
+    )
+    return store, rebuilder
+
+
+async def test_replay_renews_its_lease_for_as_long_as_replay_takes() -> None:
+    """The defect: a takeover replaying a large checkpoint outlived its own lease.
+
+    The expiry was fixed when the generation was claimed and nothing moved it while replay ran,
+    so a checkpoint big enough to take longer than one lease could never be replayed — and every
+    retry started another full replay under another finite, unrenewed lease. No competing worker
+    is involved anywhere in this test; the worker lost a lease nobody else wanted.
+    """
+    store, rebuilder = _replaying(renewals_wanted=2)
+
+    checkpoint = await rebuilder.run("promoted-run", target(), lease_seconds=1)
+
+    assert store.replay_finished, "replay has to finish rather than lose its lease part way"
+    assert store.replay_renewals >= 2, (
+        "a replay spanning more than one lease has to renew more than once"
+    )
+    assert checkpoint.state is RebuildState.PUBLISHED
+
+
+async def test_the_durable_expiry_advances_while_owner_and_generation_stay_put() -> None:
+    """Renewing is not fencing: the expiry moves and the identity behind it does not.
+
+    A renewal that changed the owner or the lease generation would be a takeover wearing a
+    heartbeat's clothes, and would make every fenced assertion downstream meaningless.
+    """
+    store, rebuilder = _replaying(renewals_wanted=3)
+
+    await rebuilder.run("promoted-run", target(), lease_seconds=1)
+
+    assert len(store.replay_expiries) >= 3
+    assert store.replay_expiries == sorted(store.replay_expiries), (
+        "each renewal must move the expiry forward"
+    )
+    assert store.replay_expiries[-1] > store.replay_expiries[0]
+
+
+async def test_a_takeover_during_replay_stops_the_superseded_worker() -> None:
+    """The case fencing exists for, and the one a storage-only except list would miss.
+
+    A real takeover increments the lease generation, so the renewal is refused with
+    ``RebuildLeaseConflictError`` — a ``RuntimeError`` subclass, not a storage failure. The
+    heartbeat has to recognize it, stop the worker, and let the surface report a lost lease
+    rather than leaving a superseded worker copying into a namespace it no longer owns.
+    """
+    store, rebuilder = _replaying(renewals_wanted=99)
+    store.renewal_error = RebuildLeaseConflictError("generation lease changed or expired")
+
+    with pytest.raises(RebuildLeaseError):
+        await rebuilder.run("promoted-run", target(), lease_seconds=1)
+
+    assert not store.replay_finished, "a superseded worker must not finish replaying"
+    assert not store.published, "and must not publish"
+
+
+async def test_a_renewal_failure_is_reported_safely_and_leaves_the_generation_resumable() -> None:
+    """A storage failure under the heartbeat says the lease is gone, and nothing else.
+
+    The driver's own message never reaches the caller: what comes out is the bounded lease
+    vocabulary the surface already maps, and the generation is left where it was rather than
+    failed or canceled, so the next worker resumes from the same checkpoint.
+    """
+    store, rebuilder = _replaying(renewals_wanted=99)
+    store.renewal_error = OSError("/private/data/manicule.db is unreadable")
+
+    with pytest.raises(RebuildLeaseError) as caught:
+        await rebuilder.run("promoted-run", target(), lease_seconds=1)
+
+    assert "/private" not in str(caught.value)
+    assert "manicule.db" not in str(caught.value)
+    assert store.failed_code is None, "a lost lease is not this generation's failure to record"
+    assert not store.published
+
+
+async def test_canceling_during_replay_stays_a_cancellation() -> None:
+    """A run canceled while its heartbeat is healthy is canceled, not fenced.
+
+    The two arrive at the same place — a ``CancelledError`` out of replay — and mean opposite
+    things. Reporting a cancellation as a lost lease would send somebody looking for a competing
+    worker that never existed.
+    """
+    store, rebuilder = _replaying(renewals_wanted=99)
+    cancel = asyncio.Event()
+
+    async def cancel_once_replaying() -> None:
+        await store.replay_started.wait()
+        cancel.set()
+
+    watcher = asyncio.ensure_future(cancel_once_replaying())
+    with pytest.raises(asyncio.CancelledError):
+        await rebuilder.run("promoted-run", target(), lease_seconds=1, cancel=cancel)
+    await watcher
+
+    assert not store.replay_finished
+    assert not store.published, "the predecessor publication is still the certified one"
+
+
+async def test_a_replay_shorter_than_the_lease_renews_nothing() -> None:
+    """The heartbeat is paced by the lease, so an ordinary takeover pays for no renewals.
+
+    Worth pinning because the cheap fix — renewing at every page — would pass every test above
+    while turning a small replay into a burst of writes proportional to the checkpoint.
+    """
+    store, rebuilder = _replaying(renewals_wanted=0)
+    store.renewed_enough.set()
+
+    await rebuilder.run("promoted-run", target(), lease_seconds=300)
+
+    assert store.replay_finished
+    assert store.replay_renewals == 0

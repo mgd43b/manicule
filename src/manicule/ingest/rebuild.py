@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, NoReturn, Protocol, cast, override, runtime_checkable
+from typing import TYPE_CHECKING, Final, NoReturn, Protocol, cast, override, runtime_checkable
 from uuid import uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -61,6 +61,16 @@ from manicule.parsers.expansion import (
 from manicule.parsers.versions import parse_fingerprint
 
 MAX_MISSING_DETAILS = 1000
+
+LEASE_RENEWALS_PER_LEASE: Final = 3
+"""Renewals attempted per lease duration during checkpoint replay.
+
+Three rather than two, so a single failed or delayed renewal is survivable: at two the first
+miss is already the last chance, and a heartbeat that cannot tolerate one bad round is a
+heartbeat that turns a slow database into a lost generation. The same ratio the acquisition
+heartbeat and the adaptive enumeration recorder use, kept identical because an operator
+reasoning about one lease should not have to learn a second cadence.
+"""
 
 if TYPE_CHECKING:
     from manicule.core.embedding import Vector
@@ -920,6 +930,115 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
 
+    async def _replay_checkpointed_vectors(
+        self,
+        checkpoint: RebuildCheckpoint,
+        source_publication_id: str,
+        *,
+        owner: str,
+        cancel: asyncio.Event | None,
+        lease_seconds: int,
+    ) -> None:
+        """Replay a predecessor's checkpointed vectors, holding the lease for as long as it takes.
+
+        **Replay duration is a property of the corpus, and the lease is not.** A takeover copies
+        every vector the previous worker had already committed, in bounded pages, before it may
+        stage anything of its own — and a checkpoint large enough for that to outlast one lease
+        could never be replayed at all. The claim succeeded, the copy began, the expiry stayed
+        where the claim put it, and the first page after it passed lost a lease no other worker
+        wanted. Every retry then started another full replay under another finite lease, so the
+        generation stayed resumable and could never advance.
+
+        **Renewal is on a timer, not on the work.** The document loop below renews per document,
+        which is a cadence only as good as documents are uniform; replay has no documents to key
+        off and its pages vary by encoded bytes. So this renews every ``lease_seconds / 3``
+        regardless of how many pages have gone by — twice per lease, so one missed renewal is
+        survivable, which is the same cadence the acquisition heartbeat and the adaptive
+        enumeration recorder already use.
+
+        **Renewing is not fencing, and this does not weaken it.** ``renew_generation`` moves the
+        expiry only for an unchanged owner and lease generation; a real takeover increments the
+        lease generation, so renewal fails and every remaining page fails its own assertion in
+        the store. What the heartbeat adds is the ability to notice promptly rather than at the
+        next page: it cancels the work and this converts that cancellation into the lease
+        conflict the surface already knows, so a stale worker stops instead of copying into a
+        namespace it no longer owns.
+        """
+        work = asyncio.current_task()
+        if work is None:  # pragma: no cover - every awaited coroutine has an owning task
+            msg = "checkpoint replay requires an owning task"
+            raise RuntimeError(msg)
+        lease_lost = asyncio.Event()
+
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(lease_seconds / LEASE_RENEWALS_PER_LEASE)
+                renewed_at = self._clock()
+                try:
+                    await self._store.renew_generation(
+                        checkpoint.generation_id,
+                        owner,
+                        checkpoint.lease_generation,
+                        now=renewed_at,
+                        expires_at=renewed_at + timedelta(seconds=lease_seconds),
+                    )
+                except (
+                    RebuildLeaseConflictError,
+                    ManiculeError,
+                    ValueError,
+                    OSError,
+                    SQLAlchemyError,
+                ):
+                    # `RebuildLeaseConflictError` first and by name, because it is not an
+                    # error condition at all — it is a real takeover, the case fencing exists
+                    # for, and it arrives here as a `RuntimeError` subclass that a list of
+                    # storage exceptions would miss. Missing it would leave the heartbeat
+                    # dying with an unhandled task exception while the superseded worker kept
+                    # copying, which is the opposite of prompt.
+                    #
+                    # None of them is carried out of the task. Whatever it was, the fact the
+                    # caller can act on is that this worker no longer holds the generation —
+                    # and a driver's message is not something to put in front of somebody, or
+                    # in a log, on the way to saying so.
+                    lease_lost.set()
+                    work.cancel()
+                    return
+
+        beat = asyncio.create_task(
+            heartbeat(), name=f"rebuild:{checkpoint.generation_id}-replay-heartbeat"
+        )
+        try:
+            await self._store.copy_checkpointed_vectors(
+                checkpoint.generation_id,
+                source_publication_id,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+                cancel=cancel,
+            )
+        except asyncio.CancelledError:
+            # The caller's own cancellation is checked first, because it is the one the caller
+            # asked for: a run canceled while its heartbeat happened to fail is still a
+            # cancellation, and reporting it as a lost lease would send somebody looking for a
+            # competing worker that never existed.
+            if cancel is not None and cancel.is_set():
+                raise
+            if lease_lost.is_set():
+                # The cancellation was this method's own request, and it has now been turned
+                # into a result, so the count that records it is cleared. Left standing it
+                # would tell an enclosing `asyncio.timeout` or `TaskGroup` that this task is
+                # still unwinding a cancellation nobody outside ever asked for — which is how
+                # a lost lease would come back reported as somebody else's timeout.
+                work.uncancel()
+                raise RebuildLeaseConflictError(
+                    "the generation lease could not be renewed during checkpoint replay"
+                ) from None
+            raise
+        finally:
+            beat.cancel()
+            with suppress(asyncio.CancelledError):
+                await beat
+
     async def _build(  # noqa: PLR0912, PLR0915 - explicit refusal/lease stages
         self,
         checkpoint: RebuildCheckpoint,
@@ -935,13 +1054,12 @@ class OfflineGenerationRebuilder:
         """Derive every remaining document and publish, under a lease this worker holds."""
         if checkpoint.predecessor_vector_publication_id is not None:
             try:
-                await self._store.copy_checkpointed_vectors(
-                    checkpoint.generation_id,
+                await self._replay_checkpointed_vectors(
+                    checkpoint,
                     checkpoint.predecessor_vector_publication_id,
                     owner=owner,
-                    lease_generation=checkpoint.lease_generation,
-                    now=self._clock(),
                     cancel=cancel,
+                    lease_seconds=lease_seconds,
                 )
             except RebuildPublicationConflictError as exc:
                 await self._fail_build_conflict(checkpoint, owner, exc)
