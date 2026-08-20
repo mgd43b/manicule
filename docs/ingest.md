@@ -1726,8 +1726,9 @@ advance, because every retry started another full replay under another finite le
 
 Checking is fencing and belongs to the store: it refuses to write into a namespace this worker no
 longer owns, whether or not anything is renewing, which is what makes it worth trusting.
-Renewing belongs to the worker, every `lease_seconds / 3` — twice per lease, so one missed round
-is survivable, the same cadence the acquisition heartbeat uses. It is a timer rather than a
+Renewing belongs to the worker, every `lease_seconds / 3` — three renewals per lease, so one
+missed round still leaves one before the expiry, the same cadence the acquisition heartbeat
+uses. It is a timer rather than a
 per-page or per-item count deliberately: replay duration is a property of the corpus and pages
 vary by encoded bytes, so a cadence keyed to the work is a cadence that drifts with it.
 

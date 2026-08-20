@@ -77,13 +77,18 @@ class _LeaseHeartbeat:
 
 
 LEASE_RENEWALS_PER_LEASE: Final = 3
-"""Renewals attempted per lease duration during checkpoint replay.
+"""Renewals attempted per lease duration, over everything :meth:`_renewing_lease` covers.
 
-Three rather than two, so a single failed or delayed renewal is survivable: at two the first
-miss is already the last chance, and a heartbeat that cannot tolerate one bad round is a
-heartbeat that turns a slow database into a lost generation. The same ratio the acquisition
-heartbeat and the adaptive enumeration recorder use, kept identical because an operator
-reasoning about one lease should not have to learn a second cadence.
+That is the whole build — a takeover's checkpoint replay and the document loop after it — rather
+than either one alone, because both are unbounded in aggregate and either can outlast the lease
+its generation was claimed under.
+
+Three rather than two, so a single failed or delayed renewal is survivable: renewals land at a
+third, two thirds and the whole of the lease, so losing the first still leaves one before the
+expiry. At two the first miss is already the last chance, and a heartbeat that cannot tolerate
+one bad round is a heartbeat that turns a slow database into a lost generation. The same ratio
+the acquisition heartbeat and the adaptive enumeration recorder use, kept identical because an
+operator reasoning about one lease should not have to learn a second cadence.
 """
 
 if TYPE_CHECKING:
