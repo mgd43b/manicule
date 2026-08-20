@@ -1904,8 +1904,11 @@ class IngestPipeline:
         # writing only on adaptive change freezes the stored offset instead, which is worse: a
         # healthy fast walk would show a stationary offset, and "the offset is not moving" is
         # exactly how an operator identifies a hung run. So the rare facts that change what
-        # somebody *does* — a timeout, a shrink, the empty-page end — are written immediately,
-        # and an offset that has merely advanced is written no more often than the lease renews.
+        # somebody *does* — a timeout, a shrink, the empty-page end — are written at the next
+        # page boundary, and an offset that has merely advanced is written no more often than
+        # the lease renews. This runs at page boundaries, so adaptation *within* one offset is
+        # visible once that offset resolves; `adaptive_max_seconds_per_offset` bounds how long
+        # that can take, and the lease heartbeat proves liveness in the meantime.
         progress_interval = timedelta(seconds=self._acquisition_lease_s / 3)
 
         async def record_progress(
