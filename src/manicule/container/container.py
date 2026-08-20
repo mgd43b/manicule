@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from types import TracebackType
 from typing import Final, Self, cast
 
@@ -568,25 +569,40 @@ class Container:
             label: asyncio.create_task(observe(instance), name=f"health:{label}")
             for label, instance in checkable
         }
-        _, outstanding = await asyncio.wait(started.values(), timeout=HEALTH_DEADLINE_S)
-        for task in outstanding:
-            task.cancel()
-        if outstanding:
-            await asyncio.gather(*outstanding, return_exceptions=True)
-        # Rebuilt in start order rather than in completion order, so that running the same
-        # sweep twice does not reorder a report somebody is diffing.
-        reports = {
-            label: (
-                task.result()
-                if task not in outstanding
-                else HealthReport.degraded(
-                    f"health check was still running at the {HEALTH_DEADLINE_S:g}s deadline "
-                    "for the whole sweep",
-                    remedy="Check the component directly; this diagnostic stopped waiting.",
+        try:
+            await asyncio.wait(started.values(), timeout=HEALTH_DEADLINE_S)
+            # Each task's own state decides, rather than the pending set `asyncio.wait` returned.
+            # The two agree today — nothing awaits between that partition and this — but a check
+            # that answered has to be kept because it answered, not because a set computed a
+            # moment earlier still says so. Read before the cancellation below, so a component
+            # that made it under the deadline is never reported as one that did not.
+            #
+            # Built in start order rather than completion order, so that running the same sweep
+            # twice does not reorder a report somebody is diffing.
+            reports = {
+                label: (
+                    task.result()
+                    if task.done() and not task.cancelled()
+                    else HealthReport.degraded(
+                        f"health check was still running at the {HEALTH_DEADLINE_S:g}s deadline "
+                        "for the whole sweep",
+                        remedy="Check the component directly; this diagnostic stopped waiting.",
+                    )
                 )
-            )
-            for label, task in started.items()
-        }
+                for label, task in started.items()
+            }
+        finally:
+            # `asyncio.wait` does not cancel what it waits on, and neither does a cancellation
+            # of whoever called this. Without this the sweep's own tasks would outlive it —
+            # still asking remote components on behalf of a request that no longer exists, and
+            # touching component instances a shutdown is in the middle of tearing down.
+            for task in started.values():
+                task.cancel()
+            # Awaited while unwinding so the cancellations land here rather than whenever the
+            # loop next runs. A cancellation arriving during that is suppressed, not lost: the
+            # one already propagating is what continues out of this block.
+            with suppress(asyncio.CancelledError):
+                await asyncio.gather(*started.values(), return_exceptions=True)
         return HealthReport.rollup(reports)
 
     def metrics(self) -> list[Metric]:

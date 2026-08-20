@@ -50,6 +50,7 @@ exact failure this project keeps finding — green, wrong, and invisible.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
@@ -235,8 +236,20 @@ async def panels(
     template does not reorder itself when the network does.
     """
     ordered = list(requested)
-    started = [panel(op, service, call) for op, call in (requested[name] for name in ordered)]
-    return dict(zip(ordered, await asyncio.gather(*started), strict=True))
+    started = [
+        asyncio.create_task(panel(op, service, call), name=f"panel:{name}")
+        for name, (op, call) in ((name, requested[name]) for name in ordered)
+    ]
+    try:
+        return dict(zip(ordered, await asyncio.gather(*started), strict=True))
+    finally:
+        # A panel operation that raises something `run_op` does not convert is a defect, and it
+        # still reaches the caller as one. What it must not also do is leave this page's other
+        # panels running against a request that has already unwound.
+        for task in started:
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.gather(*started, return_exceptions=True)
 
 
 def render(
