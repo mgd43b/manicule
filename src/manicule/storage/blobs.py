@@ -18,12 +18,13 @@ import os
 import shutil
 import stat
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, Concatenate, NoReturn, cast
 from uuid import uuid4
 
 from sqlalchemy import and_, delete, func, select, text, union, update
@@ -31,6 +32,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.acquisition import AcquiredSource
 from manicule.core.content import RawDocument, Retention
+from manicule.core.errors import StorageBusyError
 from manicule.core.ids import acquisition_marker_id, content_hash
 from manicule.ingest.capacity import (
     CapacityDiagnostic,
@@ -41,7 +43,13 @@ from manicule.ingest.capacity import (
     translate_storage_capacity_errors,
 )
 from manicule.storage import models
-from manicule.storage.engine import BLOBS_DIRNAME, session_factory
+from manicule.storage.engine import (
+    BLOBS_DIRNAME,
+    SQLITE_BUSY_RETRY_DELAYS,
+    session_factory,
+    sqlite_busy,
+    writer_admission,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine, Iterator, Sequence
@@ -230,6 +238,44 @@ def should_compress(media_type: str | None) -> bool:
     return lowered.startswith(_COMPRESSIBLE_PREFIXES) or lowered.endswith(_COMPRESSIBLE_SUFFIXES)
 
 
+def _admitted_writer[**P, R](
+    operation: Callable[Concatenate[BlobStore, P], Coroutine[Any, Any, R]],
+) -> Callable[Concatenate[BlobStore, P], Coroutine[Any, Any, R]]:
+    """Queue this write with every other writer to the database, and retry a lost slot.
+
+    Marker bookkeeping is small, frequent and — until this — unmanaged: a `DELETE` of one row
+    per acquired document, opened straight against the engine while eight fetch workers drove
+    journal transitions through the acquisition module's queue. Its failure was not proportional
+    to its size. A lost writer slot raised the driver's own `database is locked`, which is not a
+    capacity refusal and so reached the run as an unexpected failure: the task group unwound, an
+    acquisition thousands of documents in stopped where it stood, and the report carried the SQL
+    statement and a bound parameter to every surface that reads one.
+
+    Both halves are the same omission. Queueing removes the race, the bounded retry absorbs a
+    conflict with a writer outside the queue, and exhausting it raises
+    :class:`~manicule.core.errors.StorageBusyError` — which the pipeline already knows is an
+    orderly, retryable stop that keeps the committed prefix and says nothing about SQL.
+    """
+
+    @wraps(operation)
+    async def admitted(store: BlobStore, *args: P.args, **kwargs: P.kwargs) -> R:
+        async with writer_admission(store.engine):
+            for delay in SQLITE_BUSY_RETRY_DELAYS:
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    return await operation(store, *args, **kwargs)
+                except Exception as error:
+                    if not sqlite_busy(error):
+                        raise
+            # Outside the handler: no SQL, bound value or path survives into a durable report.
+            raise StorageBusyError(
+                "the acquired bytes are retained and the run resumes from its journal"
+            ) from None
+
+    return admitted
+
+
 class BlobStore:
     """Content-addressed storage for original source bytes.
 
@@ -259,6 +305,11 @@ class BlobStore:
         self._legacy_scan: Iterator[os.DirEntry[str]] | None = None
         self._legacy_scan_complete = False
         self._marker_cursor = ""
+
+    @property
+    def engine(self) -> AsyncEngine:
+        """The database these blobs are recorded in, and whose writer queue they join."""
+        return self._engine
 
     @property
     def root(self) -> Path:
@@ -1166,6 +1217,7 @@ class BlobStore:
             return None
         return self._marker_identity(cast("dict[str, object]", raw))
 
+    @_admitted_writer
     async def _record_markers(
         self,
         markers: Sequence[tuple[str, dict[str, object], bool, datetime]],
@@ -1191,6 +1243,7 @@ class BlobStore:
                 statement.on_conflict_do_nothing(index_elements=[models.AcquisitionMarker.name])
             )
 
+    @_admitted_writer
     async def _forget_markers(self, names: Sequence[str]) -> None:
         if not names:
             return

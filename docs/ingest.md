@@ -2190,6 +2190,15 @@ closes the failed session, releases the logical lease after workers join, and le
 prefix immediately resumable. The public envelope contains no SQL, bound values, source identity,
 or machine path.
 
+**Every managed writer to the database queues there, not only the journal.** A second queue is
+not a queue: retained-blob marker bookkeeping — one row per acquired document — used to open its
+transaction straight against the engine while the journal's writes waited their turn, and losing
+that race raised the driver's own locked-database error. That is not a capacity refusal and was
+never an anticipated ingest outcome, so it unwound the task group: an acquisition thousands of
+documents in stopped where it stood, recorded no omission, and put the `DELETE` statement and a
+bound parameter into a report that crosses every surface. The admission lock is one object per
+engine, shared by the modules that write through it.
+
 An unchanged-token result is one fenced transaction too: it moves the journal record to
 `unchanged` and refreshes the indexed document's `last_seen_at` under the same writer lock. A
 takeover cannot land between durable coverage and presence bookkeeping. The public `last_run`

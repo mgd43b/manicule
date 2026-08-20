@@ -15,10 +15,11 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, override
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from manicule.core.acquisition import AcquiredSource, AcquisitionRecordState, AcquisitionSource
 from manicule.core.content import RawDocument
+from manicule.core.errors import StorageBusyError
 from manicule.core.ids import content_hash
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityRefusedError, CapacityResource
@@ -2497,6 +2498,96 @@ async def test_legacy_admission_cannot_overwrite_concurrent_new_marker_registrat
             )
         ).scalar_one()
     assert inventory_ref == retained.ref == content_hash(b"new bytes")
+
+
+def _refuse_to_wait(dbapi_connection: Any, _record: Any) -> None:
+    """Take SQLite's five-second wait away, so contention is decided now rather than later."""
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA busy_timeout = 0")
+    finally:
+        cursor.close()
+
+
+async def test_a_marker_write_that_loses_the_writer_is_refused_without_the_driver_s_words(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """The failure that ended an eight-thousand-document acquisition, in two seconds.
+
+    Marker bookkeeping is one row per acquired document, and it used to open its transaction
+    straight against the engine while the journal's own writes queued at the acquisition
+    module's admission lock. Losing that race raised `sqlite3.OperationalError: database is
+    locked`, which is not a capacity refusal and was never anticipated as an ingest outcome: the
+    task group unwound, an acquisition thousands of documents in stopped where it stood with no
+    omission recorded, and the report carried the `DELETE` statement and a bound parameter out to
+    every surface that reads one.
+
+    The refusal is now typed, and it is the type the pipeline already treats as an orderly
+    retryable stop. `manicule/manicule#257`.
+    """
+    event.listen(engine.sync_engine, "connect", _refuse_to_wait)
+    blobs = BlobStore(engine, data_dir)
+    raw = RawDocument(
+        source_id="synthetic-marker",
+        uri="https://wiki.example.test/marker",
+        media_type="text/plain",
+        content="public retained body",
+    )
+    await blobs.retain_acquisition("staging-key", raw)
+
+    holder = await engine.connect()
+    try:
+        await holder.exec_driver_sql("BEGIN IMMEDIATE")
+        with pytest.raises(StorageBusyError) as refused:
+            await blobs.complete_acquisition("staging-key")
+    finally:
+        await holder.rollback()
+        await holder.close()
+
+    message = str(refused.value)
+    assert "temporarily busy" in message
+    assert "resumes from its journal" in message, (
+        "a run deciding whether to retry needs to know the acquired bytes survived the refusal"
+    )
+    for driver_text in ("DELETE", "acquisition_markers", "locked", "sqlite", str(data_dir)):
+        assert driver_text not in message
+
+
+async def test_a_marker_write_survives_a_writer_that_lets_go(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Contention that passes is absorbed, which is the whole reason for a bounded retry.
+
+    Without this the test above would be satisfied by refusing every contended write, turning a
+    momentary conflict into a stopped run — the same defect wearing a better error type.
+    """
+    event.listen(engine.sync_engine, "connect", _refuse_to_wait)
+    blobs = BlobStore(engine, data_dir)
+    raw = RawDocument(
+        source_id="synthetic-marker-two",
+        uri="https://wiki.example.test/marker-two",
+        media_type="text/plain",
+        content="public retained body",
+    )
+    await blobs.retain_acquisition("staging-key-two", raw)
+
+    holder = await engine.connect()
+    await holder.exec_driver_sql("BEGIN IMMEDIATE")
+
+    async def let_go() -> None:
+        await asyncio.sleep(0.005)
+        await holder.rollback()
+        await holder.close()
+
+    async with asyncio.TaskGroup() as both:
+        both.create_task(let_go())
+        both.create_task(blobs.complete_acquisition("staging-key-two"))
+
+    async with engine.connect() as connection:
+        remaining = (
+            await connection.execute(text("SELECT COUNT(*) FROM acquisition_markers"))
+        ).scalar_one()
+    assert remaining == 0, "the retry has to finish the write, not merely survive the conflict"
 
 
 async def test_a_leaked_file_is_found_by_the_directory_scan(

@@ -55,7 +55,7 @@ from manicule.ingest.capacity import (
     translate_storage_capacity_errors as _translate_storage_capacity_errors,
 )
 from manicule.storage import models
-from manicule.storage.engine import sqlite_busy
+from manicule.storage.engine import SQLITE_BUSY_RETRY_DELAYS, sqlite_busy, writer_admission
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import next_observation, utcnow
 
@@ -73,7 +73,6 @@ _ACQUIRED_SOURCE = TypeAdapter(AcquiredSource)
 _DIAGNOSTIC = TypeAdapter(AcquisitionDiagnostic)
 _OMISSION_REASONS = TypeAdapter(dict[AcquisitionFailureCode, int])
 
-_SQLITE_BUSY_RETRY_DELAYS = (0.0, 0.01, 0.05)
 _ACQUISITION_BATCH_LIMIT = 250
 
 
@@ -83,9 +82,13 @@ def _empty_abandoned_leases() -> set[tuple[str, str, str, int]]:
 
 @dataclass
 class _EngineWriterState:
-    """One cancellation-safe admission queue and abandoned-lease set per engine."""
+    """The abandoned-lease set per engine.
 
-    admission: asyncio.Lock = field(default_factory=asyncio.Lock)
+    The admission queue used to live here too. It is now
+    :func:`~manicule.storage.engine.writer_admission`, shared with every other writer to the
+    same database — a queue only one module joins leaves the others racing it.
+    """
+
     abandoned_leases: set[tuple[str, str, str, int]] = field(
         default_factory=_empty_abandoned_leases
     )
@@ -173,9 +176,9 @@ def translate_storage_capacity_errors[F: Callable[..., Coroutine[Any, Any, Any]]
         # asyncio.Lock queues managed writers before they open a transaction. Cancellation of a
         # waiter removes it from the queue; cancellation of an owner exits this context only
         # after the operation's session context has rolled back and closed.
-        async with state.admission:
+        async with writer_admission(store.engine):
             exhausted = False
-            for delay in _SQLITE_BUSY_RETRY_DELAYS:
+            for delay in SQLITE_BUSY_RETRY_DELAYS:
                 if delay:
                     await asyncio.sleep(delay)
                 try:
