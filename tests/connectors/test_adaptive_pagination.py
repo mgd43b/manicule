@@ -397,7 +397,7 @@ async def test_cancellation_during_an_adaptive_retry_is_not_absorbed() -> None:
     finally:
         await connector.teardown()
 
-    assert requests == 2, "the cancelled attempt must not be followed by another retry"
+    assert requests == 2, "the canceled attempt must not be followed by another retry"
     progress = connector.enumeration_progress()
     assert progress is not None
     # The prefix admitted before the stop is still what the walk had reached, and the run is
