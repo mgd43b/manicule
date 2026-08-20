@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     )
     from manicule.config.settings import Settings
     from manicule.core.acquisition import AcquisitionRun
+    from manicule.core.ann import AnnIndexBuild, AnnIndexState
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.protocols import Connector, Embedder, Parser, VectorStore
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
@@ -2119,6 +2120,38 @@ class _Maintenance:
         async with self._runtime.derived_mutation_guard():
             lifecycle = self._source_lifecycle(await self._runtime.documents())
             return await self._reset_derived_joined(lifecycle)
+
+    async def vector_index_state(self) -> AnnIndexState | None:
+        from manicule.core.protocols import AnnIndexMaintenance  # noqa: PLC0415
+
+        vectors = await self._runtime.vectors()
+        if not isinstance(vectors, AnnIndexMaintenance):
+            return None
+        return await vectors.ann_index_state(threshold=self._ann_index_threshold)
+
+    async def build_vector_index(
+        self, *, force: bool = False, dry_run: bool = False
+    ) -> AnnIndexBuild | None:
+        """Build through the plain vector handle rather than the prepared one.
+
+        ``prepared_vectors`` calls ``ensure_ready``, which constructs the embedder to read its
+        fingerprint. An index build needs the vectors that already exist and the dimension the
+        directory records — loading a model runtime to rebuild an index over vectors it did not
+        produce would make this the one maintenance operation that cannot run on a machine
+        whose embedder is unavailable, which is a machine that still deserves a working index.
+        """
+        from manicule.core.protocols import AnnIndexMaintenance  # noqa: PLC0415
+
+        vectors = await self._runtime.vectors()
+        if not isinstance(vectors, AnnIndexMaintenance):
+            return None
+        return await vectors.build_ann_index(
+            threshold=self._ann_index_threshold, force=force, dry_run=dry_run
+        )
+
+    @property
+    def _ann_index_threshold(self) -> int:
+        return self._runtime.settings.storage.ann_index_threshold
 
     async def plan_reset_derived(self) -> LifecyclePlan:
         return await self._source_lifecycle(await self._runtime.documents()).plan_reset_derived()

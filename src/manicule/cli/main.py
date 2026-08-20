@@ -653,6 +653,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "lifecycle_cleanup_generations": r.LifecycleReport,
     "lifecycle_release_history": r.LifecycleReport,
     "lifecycle_delete_snapshot": r.LifecycleReport,
+    "vector_index_build": r.VectorIndexReport,
     "doctor": r.Diagnosis,
     "connector_list": r.ConnectorList,
     "snapshot_status": r.SnapshotStatusReport,
@@ -1821,6 +1822,43 @@ def cleanup_derived_generations(
         )
         return
     submit(Command("lifecycle_cleanup_generations", {"dry_run": not yes}))
+
+
+@app.command("build-vector-index")
+def build_vector_index(
+    *,
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Perform the build. Without it this only plans.")
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Build even when nothing is due, at the current row count. For a corpus "
+            "whose index you want rebuilt early rather than at the next staleness bound.",
+        ),
+    ] = False,
+) -> None:
+    """Build or refresh the ANN index dense search uses, without interrupting search.
+
+    Below `storage.ann_index_threshold` there is nothing to do: search over a few tens of
+    thousands of vectors is exhaustive, exact and fast, and an index built early trades recall
+    for latency nobody is waiting on. Past it, `manicule status` reports the build as due and
+    this is what performs it.
+
+    Plans by default and writes nothing, like every other boundary here. The build itself is
+    minutes of CPU over a large corpus and holds no lock a search waits on: the new index is
+    created before the old one is dropped, and rows the index does not yet cover are scanned
+    and merged into the ranked result throughout — so results stay correct the whole way, and
+    a build that fails leaves the previous search path exactly as it found it.
+    """
+    if not yes:
+        emit(
+            "vector_index_build",
+            lambda service: service.vector_index_build(force=force, dry_run=True),
+        )
+        return
+    submit(Command("vector_index_build", {"force": force, "dry_run": False}))
 
 
 @app.command("release-source-history")

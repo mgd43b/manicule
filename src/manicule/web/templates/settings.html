@@ -54,6 +54,20 @@ manicule config set rag.profile precise</pre>
     <dt>Chunking fingerprint</dt><dd><code>{{ panels.index.data.chunk_fingerprint or 'none' }}</code></dd>
     <dt>Documents</dt><dd>{{ panels.index.data.documents }}</dd>
     <dt>Chunks</dt><dd>{{ panels.index.data.chunks }}</dd>
+    {% if panels.index.data.vector_index %}
+    <dt>Vector search</dt>
+    <dd>
+      {{ panels.index.data.vector_index.lifecycle }} ·
+      threshold {{ panels.index.data.vector_index.threshold or 'off' }}
+      {% if panels.index.data.vector_index.index_name %}
+      · <code>{{ panels.index.data.vector_index.index_name }}</code>,
+      {{ panels.index.data.vector_index.index_type }} over
+      {{ panels.index.data.vector_index.num_partitions }} partition(s),
+      {{ panels.index.data.vector_index.distance_metric }} distance,
+      {{ panels.index.data.vector_index.unindexed_rows }} row(s) not yet indexed
+      {% endif %}
+    </dd>
+    {% endif %}
   </dl>
   <p class="muted">
     The fingerprints are shown in their canonical form. A prettied identity is one nobody can

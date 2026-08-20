@@ -33,6 +33,7 @@ from manicule.app.tenancy import belongs_to
 from manicule.config.settings import Settings
 from manicule.core.acquisition import AcquisitionRun
 from manicule.core.anchors import HeadingAnchor
+from manicule.core.ann import AnnIndexBuild, AnnIndexState, AnnLifecycle
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
 from manicule.core.embedding import IndexFingerprints
 from manicule.core.errors import NameInUseError, UnknownEntityError
@@ -1105,6 +1106,22 @@ class FakeMaintenance:
     """Every export asked for, on the same terms and for the same reason as :attr:`backups`."""
     backup_error: Exception | None = None
     """Raised instead of writing, for tests about how a refusal reaches the caller."""
+    vector_index: AnnIndexState | None = field(
+        default_factory=lambda: AnnIndexState(
+            lifecycle=AnnLifecycle.EXHAUSTIVE, threshold=100_000, rows=1
+        )
+    )
+    """What the vector store reports about its ANN index, or ``None`` for a store with none.
+
+    Defaults to a small corpus below the threshold, which is what a fake backend's corpus is:
+    exhaustive, exact, and nothing due. Tests about the transition set it themselves.
+    """
+    vector_index_builds: list[tuple[bool, bool]] = field(default_factory=list[tuple[bool, bool]])
+    """Every build asked for, as ``(force, dry_run)``.
+
+    A dry run that reached storage as a real build is the failure this records — the same
+    reason :attr:`backups` records its flag.
+    """
 
     async def schema_revision(self) -> str | None:
         return self.revision
@@ -1129,6 +1146,22 @@ class FakeMaintenance:
     async def reset_index(self) -> ResetOutcome:
         self.resets += 1
         return self.reset
+
+    async def vector_index_state(self) -> AnnIndexState | None:
+        return self.vector_index
+
+    async def build_vector_index(
+        self, *, force: bool = False, dry_run: bool = False
+    ) -> AnnIndexBuild | None:
+        self.vector_index_builds.append((force, dry_run))
+        if self.vector_index is None:
+            return None
+        return AnnIndexBuild(
+            before=self.vector_index,
+            after=self.vector_index,
+            built=not dry_run and self.vector_index.due,
+            dry_run=dry_run,
+        )
 
     async def plan_reset_derived(self) -> LifecyclePlan:
         return LifecyclePlan(operation=LifecycleOperation.RESET_DERIVED)

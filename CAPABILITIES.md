@@ -13,16 +13,16 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | Area | Items | Ticket |
 |---|---:|---|
 | CLI capability items | 48 | #8 — **built** |
-| MCP capability items | 41 | #8 — **built** |
-| HTTP endpoints | 60 | #11 — **built** |
+| MCP capability items | 42 | #8 — **built** |
+| HTTP endpoints | 61 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **207** | |
+| **Total** | **209** | |
 
 ## CLI — 48
 
 Ticket: #8 — **built.** The 48 rows below are upstream capability items, not the current command
-count. Manicule exposes 27 top-level commands; `manicule --help` and the asserted inventory in
+count. Manicule exposes 28 top-level commands; `manicule --help` and the asserted inventory in
 [`docs/surfaces.md`](docs/surfaces.md) are authoritative. Several bare verbs below are subcommands,
 so the mapping is noted where it is not obvious. The output shape is also a contract there.
 
@@ -104,16 +104,16 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
   connector-free derived publication with no separate settlement command.
 
-## MCP tools — 41
+## MCP tools — 42
 
-Ticket: #8 — **built.** Forty implemented tools over the same application service the command
+Ticket: #8 — **built.** Forty-one implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
-The checklist below has forty-one capability items because it also records the deliberately
+The checklist below has forty-two capability items because it also records the deliberately
 declined catch-all `run-command` surface; that item is not a registered MCP tool.
 
-**All forty over stdio; the twenty-three read-only ones over a socket.** MCP is also served
+**All forty-one over stdio; the twenty-four read-only ones over a socket.** MCP is also served
 at `/mcp/` on the HTTP port, and every mutating tool is *absent* from that surface rather than
 refused on it — see [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are
 unreachable from a network by construction, and a socket has to replace that property rather
@@ -157,6 +157,7 @@ than assume it.
 - [x] `snapshot_status`
 - [x] `snapshot_verify`
 - [x] `stats`
+- [x] `vector_index_build`
 - [x] `workspace_list`
 - [x] `workspace_switch`
 - [ ] ~~a catch-all tool~~ — not built. A tool whose arguments decide which operation runs is
@@ -169,7 +170,7 @@ publication work, and a surface called unattended should not be able to do any o
 `collection orphans` moves every document outside every collection into the trash, which in a
 corpus where collections are optional is most of it.
 
-## HTTP endpoints — 60
+## HTTP endpoints — 61
 
 Ticket: #11 — **built.** Twelve route groups over the same application service the CLI and the
 MCP server use: health · documents · chat · conversations · collections · tags · admin ·
@@ -201,6 +202,7 @@ name — an absence with no test is an absence that comes back.
 - [x] `GET    /api/v1/admin/query-logs`
 - [x] `GET    /api/v1/admin/search-quality`
 - [x] `GET    /api/v1/admin/stats`
+- [x] `GET    /api/v1/admin/vector-index` — aggregate ANN index dry run only
 - [x] `GET    /api/v1/collections/:id/counts`
 - [x] `GET    /api/v1/collections/:id/documents`
 - [x] `GET    /api/v1/collections`

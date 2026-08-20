@@ -363,6 +363,9 @@ BINDERS: Mapping[str, Binder] = {
     "upgrade": lambda service, args, report: service.upgrade(
         version=args.optional_text("version"), skip_backup=args.flag("skip_backup")
     ),
+    "vector_index_build": lambda service, args, report: service.vector_index_build(
+        force=args.flag("force"), dry_run=args.flag("dry_run")
+    ),
     "workspace_switch": lambda service, args, report: service.workspace_switch(
         args.text("name"), create=args.flag("create")
     ),

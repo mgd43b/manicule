@@ -437,6 +437,58 @@ def _unwrapped(output: str) -> str:
     return " ".join(stripped.split())
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        r.VectorIndexState(
+            lifecycle="exhaustive", threshold=100_000, rows=1_200, exact=True, due=False
+        ),
+        r.VectorIndexState(
+            lifecycle="pending", threshold=100_000, rows=100_001, exact=True, due=True
+        ),
+        r.VectorIndexState(lifecycle="disabled", threshold=0, rows=0, exact=True, due=False),
+        r.VectorIndexState(
+            lifecycle="ready",
+            threshold=1_000,
+            rows=100_000,
+            exact=False,
+            due=False,
+            index_name="manicule_ivfpq_g1_p316",
+            indexed_rows=100_000,
+            coverage=1.0,
+        ),
+        r.VectorIndexState(
+            lifecycle="stale",
+            threshold=1_000,
+            rows=101_000,
+            exact=False,
+            due=True,
+            index_name="manicule_ivfpq_g2_p316",
+            indexed_rows=100_000,
+            unindexed_rows=1_000,
+            coverage=100_000 / 101_000,
+        ),
+    ],
+    ids=["exhaustive", "pending", "disabled", "ready", "stale"],
+)
+def test_every_vector_index_state_renders(state: r.VectorIndexState) -> None:
+    """All five, because the markup is per-branch and only two branches print a command.
+
+    Rich raises on a closing tag with no opening one, so a cell that dims a hint and leaves the
+    tags unbalanced does not merely look wrong — it takes `manicule status` down, and only on
+    the branch where something needs doing. Which is the branch somebody is reading it on.
+    """
+    out = render.console()
+    with out.capture() as captured:
+        render.render_index_status(out, r.IndexStatus(documents=1, chunks=1, vector_index=state))
+
+    rendered = _unwrapped(captured.get())
+    assert state.lifecycle in rendered
+    assert ("manicule build-vector-index --yes" in rendered) == state.due, (
+        "the command to type is shown exactly when there is something to do"
+    )
+
+
 def test_allow_insecure_state_is_refused_without_a_state_file_rather_than_ignored(
     bound: ApplicationService,
 ) -> None:
@@ -2340,6 +2392,7 @@ MINIMAL: dict[str, list[str]] = {
     "restore": ["backup", "--restore", "backup.tar.gz"],
     "snapshot_status": ["connector", "snapshot", "handbook"],
     "upgrade": ["upgrade"],
+    "vector_index_build": ["build-vector-index", "--yes"],
     "workspace_switch": ["workspace", "switch", "other"],
 }
 """How to invoke each write command with **nothing optional given**.

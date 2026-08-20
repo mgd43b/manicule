@@ -13,6 +13,28 @@
   {% if panels.index.ok %}
   <article class="card"><h2>Documents</h2><p class="figure">{{ panels.index.data.documents }}</p></article>
   <article class="card"><h2>Chunks</h2><p class="figure">{{ panels.index.data.chunks }}</p></article>
+  {% if panels.index.data.vector_index %}
+  {#
+    The one card here that is about latency rather than about how much is stored. A corpus that
+    has grown past the point where every query scans every vector is invisible in the two counts
+    beside it, which is the gap #261 found.
+  #}
+  <article class="card">
+    <h2>Vector search</h2>
+    <p class="figure">{{ panels.index.data.vector_index.lifecycle }}</p>
+    <p class="muted">
+      {% if panels.index.data.vector_index.exact %}
+      exact over {{ panels.index.data.vector_index.rows }} vector(s)
+      {% else %}
+      {{ '%.0f' % (panels.index.data.vector_index.coverage * 100) }}% indexed
+      of {{ panels.index.data.vector_index.rows }}
+      {% endif %}
+      {% if panels.index.data.vector_index.due %}
+      · <code>manicule build-vector-index --yes</code>
+      {% endif %}
+    </p>
+  </article>
+  {% endif %}
   {% endif %}
   {% if panels.queries.ok %}
   <article class="card"><h2>Queries logged</h2><p class="figure">{{ panels.queries.data.total }}</p></article>

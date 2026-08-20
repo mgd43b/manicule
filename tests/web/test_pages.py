@@ -22,6 +22,7 @@ import pytest
 
 from manicule.api.security import Principal
 from manicule.app.service import ApplicationService
+from manicule.core.ann import AnnIndexState, AnnLifecycle
 from manicule.core.errors import ManiculeError
 from manicule.web.areas import AREAS, NAVIGATION
 from manicule.web.rendering import (
@@ -68,6 +69,42 @@ def test_the_fourteen_areas_are_the_thirteen_pages_and_the_frame() -> None:
     """The area list and the pages cannot drift apart without this failing."""
     assert set(PAGE_FOR_AREA) | {"layout"} == set(AREAS)
     assert len(AREAS) == 14
+
+
+def test_the_admin_page_shows_whether_vector_search_is_still_exhaustive() -> None:
+    """The operator surface #261 says reported nothing about the dense search path.
+
+    Two cards beside it count what is stored, and neither moves when a corpus grows past the
+    point where every query scans every vector. This card is the one that does — and when a
+    build is due it carries the command, because a page that names a problem and not its remedy
+    sends the reader to the documentation to find out what they already wanted.
+    """
+    backend, _ = backend_with_a_document()
+    backend.maintenance_.vector_index = AnnIndexState(
+        lifecycle=AnnLifecycle.PENDING, threshold=100_000, rows=100_001
+    )
+    with client_for(backend) as client:
+        rendered = client.get("/ui/admin")
+
+    assert rendered.status_code == 200
+    assert "Vector search" in rendered.text
+    assert "pending" in rendered.text
+    assert "manicule build-vector-index --yes" in rendered.text
+
+
+def test_the_admin_page_shows_no_vector_card_for_a_store_with_no_index_lifecycle() -> None:
+    """A backend that cannot answer the question renders nothing rather than a fabricated state.
+
+    ``exhaustive`` is a measurement. Printing it for a store nobody asked would be a card that
+    looks like every other card on the page and is not backed by anything.
+    """
+    backend, _ = backend_with_a_document()
+    backend.maintenance_.vector_index = None
+    with client_for(backend) as client:
+        rendered = client.get("/ui/admin")
+
+    assert rendered.status_code == 200
+    assert "Vector search" not in rendered.text
 
 
 def test_lifecycle_history_form_submits_an_offset_aware_cutoff_through_its_rendered_action() -> (

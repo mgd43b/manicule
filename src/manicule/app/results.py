@@ -1541,6 +1541,85 @@ class IngestReport(Payload):
 # --- state, statistics and diagnosis -------------------------------------------------------
 
 
+class VectorIndexState(Payload):
+    """Whether dense search is exhaustive, indexed, or overdue for a rebuild.
+
+    Every number here is measured at the moment it is asked — from the row count and from
+    LanceDB's own index statistics — rather than read from a record of what a build once did.
+    A second copy of "how many rows does the index cover" is a copy that goes stale the next
+    time anything is written, and an operator acting on a stale coverage figure is exactly the
+    failure ``docs/storage.md`` §6.2 is trying to prevent.
+
+    ``lifecycle`` is the **stable identifier** and the thing to select on: ``disabled``,
+    ``exhaustive``, ``pending``, ``ready``, ``stale``. ``exact`` is the one fact a person
+    reading a status page usually wants — whether results are still exact nearest neighbors —
+    and it is true for all three index-free states, which is why it is its own field rather
+    than something to be recovered by comparing ``lifecycle`` against a list.
+    """
+
+    lifecycle: str = Field(
+        description="Stable identifier for the state. Selected on; never reworded."
+    )
+    threshold: int = Field(
+        ge=0,
+        description="Vectors above which an index is wanted, and — applied to the rows an "
+        "index does not cover — above which it reads as stale. ``0`` is exhaustive forever.",
+    )
+    rows: int = Field(ge=0, description="Vectors in the live generation's table.")
+    exact: bool = Field(
+        description="Whether every result is currently an exact nearest neighbor, which is "
+        "true whenever no index exists — including while a build is due."
+    )
+    due: bool = Field(description="Whether the maintenance boundary has work to do here.")
+    generation: str | None = Field(
+        default=None,
+        description="The published vector generation this state describes. An index belongs "
+        "to the generation it was built in, so a re-embed starts a new one with no index. "
+        "``None`` where nothing has been published yet, which is not the same as the legacy "
+        "generation and is not guessed at as one.",
+    )
+    index_name: str | None = None
+    index_type: str | None = Field(
+        default=None, description="``IVF_PQ`` for an index this installation built."
+    )
+    distance_metric: str | None = Field(
+        default=None,
+        description="The metric the index was trained with. Must equal the metric queries "
+        "use, or the index partitions the space one way and probes it another.",
+    )
+    num_partitions: int | None = Field(
+        default=None,
+        description="IVF partitions the index was trained with, ``≈ sqrt(n)`` at build time. "
+        "``None`` for an index this installation did not build: LanceDB does not record the "
+        "number, and a guess is worse than an absence.",
+    )
+    num_sub_vectors: int | None = Field(
+        default=None, description="PQ sub-vectors each stored vector is split into."
+    )
+    build_generation: int | None = Field(
+        default=None,
+        description="Which build produced the live index, counting from one. Increments on "
+        "every rebuild, so two status reads can be told apart even at identical coverage.",
+    )
+    indexed_rows: int = Field(default=0, ge=0)
+    unindexed_rows: int = Field(
+        default=0,
+        ge=0,
+        description="Rows appended since the build. Still searched — LanceDB scans them and "
+        "merges — so this is latency owed, not results missing.",
+    )
+    coverage: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Indexed rows over accounted rows. ``1.0`` when nothing has been "
+        "appended since the build, and ``1.0`` rather than ``0.0`` over an empty table.",
+    )
+    detail: str = Field(
+        default="", description="Why the state is what it is, when the numbers do not say it."
+    )
+
+
 class IndexStatus(Payload):
     """What is in the index, and whether it is coherent.
 
@@ -1587,8 +1666,36 @@ class IndexStatus(Payload):
         "looks like from the corpus's side, and `manicule document reindex --stale-glossary` "
         "is what clears it.",
     )
+    vector_index: VectorIndexState | None = Field(
+        default=None,
+        description="Whether dense search is exhaustive, indexed or stale. ``None`` means the "
+        "configured vector store has no ANN lifecycle to report on — a different claim from "
+        "``exhaustive``, which is a store that has one and is deliberately not using it.",
+    )
     schema_revision: str | None = None
     data_dir: str = ""
+
+
+class VectorIndexReport(Payload):
+    """What one pass of the ANN maintenance boundary did.
+
+    ``before`` and ``after`` are the same shape ``index_status`` reports, so the result of a
+    build and the status read a minute later are read the same way rather than being two
+    vocabularies for one subject.
+    """
+
+    built: bool = Field(
+        description="Whether an index was actually created. ``False`` for every outcome that "
+        "changed nothing — nothing due, too few rows to train, a dry run — and ``detail`` "
+        "says which."
+    )
+    dry_run: bool = False
+    before: VectorIndexState
+    after: VectorIndexState
+    replaced: str | None = Field(
+        default=None, description="The index this build superseded, if it superseded one."
+    )
+    detail: str = Field(default="", description="What happened, or why nothing did.")
 
 
 class Stats(Payload):
@@ -2146,6 +2253,8 @@ __all__ = [
     "TrashList",
     "TrashedDocument",
     "UpgradeReport",
+    "VectorIndexReport",
+    "VectorIndexState",
     "Workbench",
     "WorkbenchBlock",
     "WorkspaceList",

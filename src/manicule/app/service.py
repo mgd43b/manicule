@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     from manicule.connectors.filesystem import FilesystemConnector
     from manicule.connectors.sessions import SessionStore
     from manicule.core.acquisition import AcquisitionRun
+    from manicule.core.ann import AnnIndexState
     from manicule.core.content import Chunk, Document
     from manicule.core.organization import Collection, CollectionRule, Tag
     from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
@@ -1941,8 +1942,50 @@ class ApplicationService:
             # would produce, and the count beside it is how much of the corpus disagrees.
             glossary=detector.describe(),
             stale_glossary=await store.count_documents(glossary_fp_other_than=detector.canonical()),
+            # Whether dense search is still exhaustive, and whether it should be. The one
+            # number here that is about *latency* rather than about coherence, and it is on
+            # this payload rather than a surface of its own because "is my index all right"
+            # is one question: a corpus that has quietly grown past the point where every
+            # query scans every vector is not visible in any of the counts above it.
+            vector_index=_reported_vector_index(await maintenance.vector_index_state()),
             schema_revision=await maintenance.schema_revision(),
             data_dir=str(self.settings.data_dir),
+        )
+
+    async def vector_index_build(
+        self, *, force: bool = False, dry_run: bool = False
+    ) -> r.VectorIndexReport:
+        """Perform the ANN build ``index_status`` says is due, or report what one would do.
+
+        The bounded maintenance action behind the lifecycle in ``docs/storage.md`` §6.2. It is
+        an operator's call rather than something a publication does on its way past: an IVF-PQ
+        build over a six-figure corpus is minutes of CPU, and the boundary that would otherwise
+        own it is a document commit that has a person waiting on it.
+
+        Nothing it does stops a search. The new index is created before the old one is dropped,
+        and LanceDB scans whatever the index does not cover and merges it into the ranked
+        result, so the corpus answers throughout — from the previous index plus a flat tail —
+        and a build that fails leaves the previous search path exactly as it found it.
+
+        Raises:
+            ConfigError: The configured vector store has no ANN lifecycle to maintain.
+        """
+        maintenance = await self._backend.maintenance()
+        build = await maintenance.build_vector_index(force=force, dry_run=dry_run)
+        if build is None:
+            msg = (
+                f"the configured vector store ({self.settings.storage.vector_db}) does not "
+                f"maintain an approximate-nearest-neighbor index. Its search is exhaustive and "
+                f"exact, and there is nothing here to build."
+            )
+            raise ConfigError(msg)
+        return r.VectorIndexReport(
+            built=build.built,
+            dry_run=build.dry_run,
+            before=_vector_index_state(build.before),
+            after=_vector_index_state(build.after),
+            replaced=build.replaced,
+            detail=build.detail,
         )
 
     async def ready(self) -> bool:
@@ -6056,6 +6099,44 @@ def _validate_structural_chunker_config(
         )
         msg = f'invalid plugins.config."chunker.structural": {detail}'
         raise ConfigError(msg) from exc
+
+
+def _vector_index_state(state: AnnIndexState) -> r.VectorIndexState:
+    """Flatten the store's index state into the payload every surface reports.
+
+    Flat rather than nested, because the index's own facts and the corpus's facts are read
+    together — "316 partitions over 100 000 vectors, 40 of them uncovered" is one sentence —
+    and a nested ``index`` object would make half of it optional at every call site that only
+    wants to know whether search is still exact.
+    """
+    index = state.index
+    return r.VectorIndexState(
+        lifecycle=str(state.lifecycle),
+        threshold=state.threshold,
+        rows=state.rows,
+        exact=state.exact,
+        due=state.due,
+        generation=state.generation,
+        index_name=index.name if index else None,
+        index_type=index.index_type if index else None,
+        distance_metric=index.distance_type if index else None,
+        num_partitions=index.num_partitions if index else None,
+        num_sub_vectors=index.num_sub_vectors if index else None,
+        build_generation=index.build_generation if index else None,
+        indexed_rows=index.indexed_rows if index else 0,
+        unindexed_rows=index.unindexed_rows if index else 0,
+        coverage=index.coverage if index else 1.0,
+        detail=state.detail,
+    )
+
+
+def _reported_vector_index(state: AnnIndexState | None) -> r.VectorIndexState | None:
+    """The same conversion for a backend that may have no ANN lifecycle at all.
+
+    The optional case wraps the total one rather than the reverse, so no call site that already
+    holds a state has to reason about a ``None`` the type says cannot arrive.
+    """
+    return None if state is None else _vector_index_state(state)
 
 
 def _as_list(value: object) -> list[object]:

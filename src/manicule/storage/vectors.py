@@ -65,14 +65,27 @@ import shutil
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final
 
 import lancedb
+from lancedb.index import IvfPq
 from lancedb.pydantic import LanceModel
 from lancedb.pydantic import Vector as FixedSizeVector
 from lancedb.query import ColumnOrdering
 from pydantic import create_model
 
+from manicule.core.ann import (
+    PQ_CODE_BITS,
+    AnnIndex,
+    AnnIndexBuild,
+    AnnIndexState,
+    ann_index_name,
+    classify,
+    parse_ann_index_name,
+    partitions_for,
+    sub_vectors_for,
+)
 from manicule.core.content import LEGACY_PUBLICATION, Chunk
 from manicule.core.embedding import (
     FLOAT32_EPSILON,
@@ -120,6 +133,16 @@ SOURCE_SEQUENCE_COLUMN: Final = "source_sequence"
 SOURCE_CREATED_AT_COLUMN: Final = "source_created_at"
 DISTANCE_COLUMN: Final = "_distance"
 
+DISTANCE_METRIC: Final = "cosine"
+"""The metric every query and every index is built with.
+
+One constant rather than two string literals, because the query's metric and the index's
+metric agreeing is not a detail: an IVF-PQ index trained under L2 and queried under cosine
+partitions the space one way and probes it another, and the result is a ranked list that is
+wrong without being empty. ``docs/storage.md`` §6.2 is why it is cosine at all — vectors are
+L2-normalized on the way in, so ``1 - distance`` is a real cosine similarity.
+"""
+
 IDENTITY_QUERY_PAGE: Final = 512
 """Chunk ids per ``IN`` predicate when reading rows back. See :meth:`LanceVectorStore._rows_for`."""
 
@@ -163,6 +186,12 @@ cross-workspace rows consuming top-``k`` slots, and
 check is the reason this exemption is acceptable at all: without it, "the boundary is enforced
 somewhere else" is a claim nothing verifies.
 """
+
+
+_FOREIGN_INDEX_DETAIL: Final = (
+    "an index this installation did not build carries the vector column; its partition count "
+    "and build generation are unknown, and the maintenance boundary will not replace it"
+)
 
 
 class VectorStoreStateError(ManiculeError):
@@ -719,7 +748,7 @@ class LanceVectorStore:
         if not any(query):
             return await self._unranked(table, k, predicate)
 
-        search = table.vector_search(query).distance_type("cosine")
+        search = table.vector_search(query).distance_type(DISTANCE_METRIC)
         if predicate is not None:
             search = search.where(predicate)
         records = (
@@ -742,6 +771,174 @@ class LanceVectorStore:
         if table is None:
             return 0
         return await table.count_rows()
+
+    # --- approximate search --------------------------------------------------------------
+
+    async def ann_index_state(self, *, threshold: int) -> AnnIndexState:
+        """Whether search here is exhaustive, indexed, or overdue for a rebuild.
+
+        Reads only what already exists: the row count, and whatever LanceDB says about the
+        indexes on the vector column. Nothing is recorded on the side, so this cannot disagree
+        with the store it describes and a crash cannot leave it stale — there is no second copy
+        of the answer to go out of date.
+
+        A directory with no vector table at all reports zero rows rather than raising. Asking a
+        fresh installation whether its index is current is a reasonable question with a
+        reasonable answer, and :meth:`ensure_ready` has not necessarily run.
+        """
+        table = await self._existing_table()
+        if table is None:
+            return AnnIndexState(
+                lifecycle=classify(threshold=threshold, rows=0, index=None),
+                threshold=threshold,
+                rows=0,
+                detail="this directory holds no vectors yet",
+            )
+        rows = await table.count_rows()
+        index = await self._ann_index(table)
+        return AnnIndexState(
+            lifecycle=classify(threshold=threshold, rows=rows, index=index),
+            threshold=threshold,
+            rows=rows,
+            index=index,
+            detail="" if index is None or index.recognized else _FOREIGN_INDEX_DETAIL,
+        )
+
+    async def build_ann_index(
+        self, *, threshold: int, force: bool = False, dry_run: bool = False
+    ) -> AnnIndexBuild:
+        """Bring the ANN index up to what :meth:`ann_index_state` says is wanted.
+
+        **The new index is created before the old one is dropped**, which is the whole of the
+        promise that a failed build never costs the search path. A build that raises leaves the
+        previous index in place and serving; a build that succeeds and then dies before the drop
+        leaves two indexes, which costs disk and one wasted pass and is repaired by running this
+        again. Between those two failures the cheap one is the one that survives, which is the
+        ordering ``docs/storage.md`` §8.2 already argues for on the sweep.
+
+        Nothing here stops a search. LanceDB scans fragments the index does not cover and merges
+        them into the ranked result, so a corpus mid-build answers from the old index plus a
+        flat scan of the tail — slower, never wrong, never empty.
+
+        Args:
+            threshold: The row count at which an index becomes wanted, and — applied to the
+                rows an existing index does not cover — at which it becomes stale.
+            force: Build even when nothing is due, at the current row count. For an operator
+                who has changed the partition rule or wants the tail folded in early.
+            dry_run: Report what a build would do and write nothing.
+
+        Raises:
+            VectorStoreStateError: If the vector column already carries an index this project
+                did not create. Replacing it is somebody's deliberate act to undo, not this
+                boundary's to guess at.
+        """
+        before = await self.ann_index_state(threshold=threshold)
+        unchanged = AnnIndexBuild(before=before, after=before, dry_run=dry_run)
+        if before.index is not None and not before.index.recognized:
+            raise VectorStoreStateError(
+                f"the vector column carries an index named {before.index.name!r}, which this "
+                f"installation did not build. Drop it before asking for a managed index: two "
+                f"indexes on one column is not a state this boundary will create."
+            )
+        if not force and not before.due:
+            return replace(unchanged, detail=f"nothing is due: the index is {before.lifecycle}")
+        if not before.buildable:
+            return replace(
+                unchanged,
+                detail=(
+                    f"{before.rows} vectors is below the {before.minimum_rows} an 8-bit "
+                    f"product quantizer needs to train"
+                ),
+            )
+        table = await self._existing_table()
+        if table is None:  # defensive: `buildable` already required rows, which requires a table
+            return replace(unchanged, detail="this directory holds no vectors yet")
+        fingerprint = await self.fingerprint()
+        if fingerprint is None:  # defensive: a table cannot exist without its meta row
+            raise VectorStoreStateError(
+                f"{self._directory} holds vectors with no recorded fingerprint; repair the "
+                f"directory before building an index over them"
+            )
+        generation = 1 if before.index is None else (before.index.build_generation or 0) + 1
+        partitions = partitions_for(before.rows)
+        sub_vectors = sub_vectors_for(fingerprint.dimension)
+        name = ann_index_name(build_generation=generation, num_partitions=partitions)
+        if dry_run:
+            return replace(
+                unchanged,
+                detail=(
+                    f"would build {name}: IVF_PQ over {before.rows} vectors, {partitions} "
+                    f"partitions, {sub_vectors} sub-vectors, {DISTANCE_METRIC} distance"
+                ),
+            )
+        await table.create_index(
+            VECTOR_COLUMN,
+            config=IvfPq(
+                distance_type=DISTANCE_METRIC,
+                num_partitions=partitions,
+                num_sub_vectors=sub_vectors,
+                # Passed rather than defaulted: the row floor this method refuses below is
+                # ``2 ** num_bits``, and a library default that moved would move one of those
+                # two numbers and not the other.
+                num_bits=PQ_CODE_BITS,
+            ),
+            name=name,
+            replace=True,
+        )
+        await self._drop_superseded_indexes(table, keeping=name)
+        after = await self.ann_index_state(threshold=threshold)
+        return AnnIndexBuild(before=before, after=after, built=True, detail=f"built {name}")
+
+    async def _ann_index(self, table: AsyncTable) -> AnnIndex | None:
+        """The index on the vector column, preferring the newest one this project built.
+
+        More than one can exist for exactly as long as it takes a repeat build to clear it —
+        see the ordering :meth:`build_ann_index` explains — so this picks rather than refuses.
+        """
+        listed = [
+            config
+            for config in await table.list_indices()
+            if VECTOR_COLUMN in [str(column) for column in config.columns]
+        ]
+        if not listed:
+            return None
+        parsed = [(parse_ann_index_name(str(config.name)), config) for config in listed]
+        ours = [(read, config) for read, config in parsed if read is not None]
+        read, config = max(ours, key=lambda pair: pair[0][0]) if ours else (None, listed[0])
+        name = str(config.name)
+        statistics = await table.index_stats(name)
+        details = getattr(config, "index_details", None)
+        compression = details.get("compression") if isinstance(details, dict) else None
+        sub_vectors = compression.get("num_sub_vectors") if isinstance(compression, dict) else None
+        return AnnIndex(
+            name=name,
+            index_type=str(statistics.index_type) if statistics else str(config.index_type),
+            distance_type=(
+                str(statistics.distance_type)
+                if statistics and statistics.distance_type is not None
+                else None
+            ),
+            indexed_rows=int(statistics.num_indexed_rows) if statistics else 0,
+            unindexed_rows=int(statistics.num_unindexed_rows) if statistics else 0,
+            num_sub_vectors=int(sub_vectors) if isinstance(sub_vectors, int) else None,
+            build_generation=None if read is None else read[0],
+            num_partitions=None if read is None else read[1],
+        )
+
+    async def _drop_superseded_indexes(self, table: AsyncTable, *, keeping: str) -> None:
+        """Remove earlier builds of ours, and only ours.
+
+        An index nobody here named is left where it is. :meth:`build_ann_index` refuses to run
+        beside one at all, so reaching this with a foreign index present means it appeared
+        during the build — and deleting something an operator made, during an operation that
+        never said it would, is not a repair.
+        """
+        for config in await table.list_indices():
+            name = str(config.name)
+            if name == keeping or parse_ann_index_name(name) is None:
+                continue
+            if VECTOR_COLUMN in [str(column) for column in config.columns]:
+                await table.drop_index(name)
 
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> Mapping[str, StoredVector]:
         """What this store holds for each of ``chunks``, and whether it can still be used.
@@ -1325,6 +1522,48 @@ class PublishedLanceVectorStore:
     async def count(self) -> int:
         async with self._operation() as store:
             return await store.count()
+
+    async def ann_index_state(self, *, threshold: int) -> AnnIndexState:
+        """The live generation's index state, named with the generation it describes.
+
+        An index belongs to the physical generation it was built in, so a re-embed that
+        publishes a new one starts from no index and reports :attr:`AnnLifecycle.PENDING`
+        honestly. Carrying the pointer on the state is what stops that reading as a regression:
+        the coverage did not drop, the generation changed underneath it.
+
+        **The vector root is checked before an operation is opened**, because opening one takes
+        a generation pin and a LanceDB connection, and both create directories. This is the read
+        behind ``index_status``; a read that has to build part of the store in order to report
+        that the store is empty is not one an operator can run freely. No root means no
+        generation under it either, so the absence is the whole answer.
+        """
+        if not await asyncio.to_thread(self._directory.exists):
+            return AnnIndexState(
+                lifecycle=classify(threshold=threshold, rows=0, index=None),
+                threshold=threshold,
+                rows=0,
+                detail="this workspace holds no vectors yet",
+            )
+        async with self._operation() as store:
+            state = await store.ann_index_state(threshold=threshold)
+        return replace(state, generation=self._publication_pointer or LEGACY_PUBLICATION)
+
+    async def build_ann_index(
+        self, *, threshold: int, force: bool = False, dry_run: bool = False
+    ) -> AnnIndexBuild:
+        """Build into whichever generation is live, pinned for the length of the build.
+
+        The pin is what makes a long build safe beside generation cleanup: the directory the
+        index is being written into cannot be removed while it is being written.
+        """
+        async with self._operation() as store:
+            build = await store.build_ann_index(threshold=threshold, force=force, dry_run=dry_run)
+        pointer = self._publication_pointer or LEGACY_PUBLICATION
+        return replace(
+            build,
+            before=replace(build.before, generation=pointer),
+            after=replace(build.after, generation=pointer),
+        )
 
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> Mapping[str, StoredVector]:
         async with self._operation() as store:

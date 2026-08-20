@@ -31,6 +31,7 @@ from manicule.app.service import (
 from manicule.config.settings import Settings, config_file
 from manicule.connectors.enriched import AdapterOutcome
 from manicule.connectors.filesystem import ENRICHED_KEY
+from manicule.core.ann import AnnIndex, AnnIndexState, AnnLifecycle
 from manicule.core.content import Chunk, Document, DocumentStatus
 from manicule.core.errors import ConfigError, UnknownEntityError
 from manicule.core.ids import document_id
@@ -2764,6 +2765,116 @@ async def test_status_names_the_detector_beside_the_other_three_stages(
 
     assert status.glossary.startswith(f"{DETECTOR} rules sha256:")
     assert status.stale_glossary == 1
+
+
+async def test_status_reports_whether_dense_search_is_still_exhaustive(
+    service: ApplicationService,
+) -> None:
+    """The gap #261 found, one surface along from the store that had it.
+
+    Every other number on this payload is about how much is stored. None of them moves when a
+    corpus grows past the point where each query scans every vector, so an installation could
+    cross the documented transition with nothing anywhere saying so.
+    """
+    status = await service.index_status()
+
+    assert status.vector_index is not None
+    assert status.vector_index.lifecycle == AnnLifecycle.EXHAUSTIVE
+    assert status.vector_index.exact
+    assert not status.vector_index.due
+
+
+async def test_status_says_when_a_build_is_due_rather_than_only_that_none_exists(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """``pending`` and ``exhaustive`` are the same behavior and opposite findings.
+
+    Both are "no index, every vector scanned". One is the design working and the other is a
+    corpus that has outgrown it, and an operator who cannot tell them apart either builds an
+    index too early or never builds one at all.
+    """
+    backend.maintenance_.vector_index = AnnIndexState(
+        lifecycle=AnnLifecycle.PENDING, threshold=100_000, rows=100_001
+    )
+
+    status = await service.index_status()
+
+    assert status.vector_index is not None
+    assert status.vector_index.due
+    assert status.vector_index.exact, "a pending index is exact and slow, never approximate"
+
+
+async def test_status_carries_what_the_index_is_rather_than_only_that_there_is_one(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Type, metric, partitions, build generation and coverage, which is what #261 asked for.
+
+    They are what makes two installations comparable and what makes a rebuild visible: the
+    build generation moves when nothing else does.
+    """
+    backend.maintenance_.vector_index = AnnIndexState(
+        lifecycle=AnnLifecycle.STALE,
+        threshold=1_000,
+        rows=101_000,
+        generation="reembed-2026-08",
+        index=AnnIndex(
+            name="manicule_ivfpq_g2_p316",
+            index_type="IVF_PQ",
+            distance_type="cosine",
+            indexed_rows=100_000,
+            unindexed_rows=1_000,
+            num_sub_vectors=64,
+            build_generation=2,
+            num_partitions=316,
+        ),
+    )
+
+    reported = (await service.index_status()).vector_index
+
+    assert reported is not None
+    assert reported.index_type == "IVF_PQ"
+    assert reported.distance_metric == "cosine"
+    assert reported.num_partitions == 316
+    assert reported.num_sub_vectors == 64
+    assert reported.build_generation == 2
+    assert reported.generation == "reembed-2026-08"
+    assert reported.coverage == pytest.approx(100_000 / 101_000)
+    assert not reported.exact
+    assert reported.due
+
+
+async def test_a_store_with_no_ann_lifecycle_reports_nothing_rather_than_exhaustive(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """ "This backend has no index" and "this backend chose not to build one" are two claims.
+
+    Collapsing them would put a fabricated ``exhaustive`` on the status of a store nobody ever
+    asked, which is a measurement invented to fill a field.
+    """
+    backend.maintenance_.vector_index = None
+
+    status = await service.index_status()
+
+    assert status.vector_index is None
+    with pytest.raises(ConfigError, match="does not maintain"):
+        await service.vector_index_build()
+
+
+async def test_the_maintenance_boundary_plans_by_default_and_builds_only_when_told(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """An IVF-PQ build is minutes of CPU, so it is asked for rather than arrived at."""
+    backend.maintenance_.vector_index = AnnIndexState(
+        lifecycle=AnnLifecycle.PENDING, threshold=100_000, rows=100_001
+    )
+
+    planned = await service.vector_index_build(dry_run=True)
+    performed = await service.vector_index_build()
+
+    assert planned.dry_run
+    assert not planned.built
+    assert performed.built
+    assert backend.maintenance_.vector_index_builds == [(False, True), (False, False)]
 
 
 async def test_status_and_mcp_payload_do_not_expose_a_local_weights_path(

@@ -291,6 +291,7 @@ WRITERS: frozenset[str] = frozenset(
         "reset_index",
         "restore",
         "upgrade",
+        "vector_index_build",
         "workspace_switch",
     }
 )
@@ -563,11 +564,12 @@ def _cli_commands() -> set[str]:
 def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exception() -> None:
     """The hole the operation list alone leaves, closed.
 
-    ``_cli_ops`` finds operations, and an operation is what a command *emits*. Three commands
+    ``_cli_ops`` finds operations, and an operation is what a command *emits*. Four commands
     emit none — ``completion`` and ``config show`` because they open nothing, ``start`` and
     ``stop`` because one opens its own runtime and the other signals somebody else's — so a
     check built only on operations would report a complete enumeration while saying nothing
-    about four of the forty-two things an operator can type.
+    about those four. The count is deliberately not written down here: it moves whenever a
+    command is added, and a number in a docstring that nothing asserts goes stale silently.
 
     Comparing command names against operation names needs the mapping to be regular, and it is:
     ``document reindex`` emits ``document_reindex``. Where it is not, the command has to be
@@ -590,6 +592,10 @@ def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exc
         "cleanup-derived-generations",
         "release-source-history",
         "reset-derived",
+        # `build-vector-index` emits `vector_index_build`: the operations are grouped by the
+        # noun they act on so a client sees `vector_index_*` together, and the command is named
+        # for what an operator types. Same shape as `reset-derived` above.
+        "build-vector-index",
         "snapshot-delete",
         "connector-snapshot",
         "connector-verify",

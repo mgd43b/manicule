@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from manicule.app.results import ApiKeySummary, Check
     from manicule.config.settings import Settings
     from manicule.core.acquisition import AcquisitionRun
+    from manicule.core.ann import AnnIndexBuild, AnnIndexState
     from manicule.core.content import Chunk, Document, DocumentStatus
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.fingerprints import GlossaryFingerprint
@@ -321,6 +322,26 @@ class Maintenance(Protocol):
 
     async def reset_index(self) -> ResetOutcome:
         """Reset one workspace's complete derived identity and return aggregate evidence."""
+        ...
+
+    async def vector_index_state(self) -> AnnIndexState | None:
+        """Whether dense search is exhaustive, indexed or stale — ``None`` if unsupported.
+
+        ``None`` is the answer for a vector store with no ANN lifecycle at all, and it is a
+        different claim from :attr:`~manicule.core.ann.AnnLifecycle.EXHAUSTIVE`: one backend
+        has chosen exact search, the other cannot report on the question. A status surface
+        that collapsed them would show a fabricated "exact" for a store nobody asked.
+        """
+        ...
+
+    async def build_vector_index(
+        self, *, force: bool = False, dry_run: bool = False
+    ) -> AnnIndexBuild | None:
+        """Perform whatever ANN build is due, or report what one would do.
+
+        Returns ``None`` on a store without the capability, on the same terms as
+        :meth:`vector_index_state`.
+        """
         ...
 
     async def plan_reset_derived(self) -> LifecyclePlan: ...

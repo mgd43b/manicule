@@ -323,7 +323,7 @@ shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifec
 
 | Surface | Started by | Shape |
 |:---|:---|:---|
-| **MCP** | `manicule start --mcp-only` | 40 tools over stdio, which opens no socket; 23 read-only tools at `/mcp/` when served over a port |
+| **MCP** | `manicule start --mcp-only` | 41 tools over stdio, which opens no socket; 24 read-only tools at `/mcp/` when served over a port |
 | **Command line** | `manicule <command>` | 27 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 12 areas of server-rendered HTML, 11 in the navigation |
@@ -417,7 +417,7 @@ has a route, so there is no upload and no configuration write here either.
 
 ### The MCP server
 
-The primary interface: forty tools over the same service, speaking stdio by default,
+The primary interface: forty-one tools over the same service, speaking stdio by default,
 which opens no socket at all. To let Claude Code use your index:
 
 ```bash
@@ -552,7 +552,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
 | `src/manicule/cli` | Twenty-eight commands over that service, and nothing else |
-| `src/manicule/mcp` | Forty MCP tools over that service, and nothing else |
+| `src/manicule/mcp` | Forty-one MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/extension` | A Chrome extension that hands this browser's Confluence session to a local manicule. No build step |
 | `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |
