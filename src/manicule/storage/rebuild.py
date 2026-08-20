@@ -250,6 +250,7 @@ def _checkpoint(
         vectors_embedded=row.vectors_embedded,
         lease_owner=row.lease_owner,
         lease_generation=row.lease_generation,
+        lease_expires_at=row.lease_expires_at,
         fence_generation=row.fence_generation,
         diagnostic_code=(
             RebuildRefusalCode(row.diagnostic_code) if row.diagnostic_code is not None else None

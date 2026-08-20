@@ -629,6 +629,102 @@ class DerivationFailure(FakeDeriver):
         raise ParseError("secret body at /private/path from https://wiki.example.test")
 
 
+class MidBuildStorageFailureStore(FakeStore):
+    """A driver failure from the middle of the build, which nothing along the way wrapped.
+
+    Publication failures were always settled. This one is raised by an ordinary checkpoint
+    write, which is where a locked, corrupted or full database actually shows up.
+    """
+
+    @override
+    async def stage_replacements(
+        self,
+        generation_id: str,
+        replacements: Sequence[tuple[int, DerivedReplacement]],
+        *,
+        expected_next_sequence: int,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> RebuildCheckpoint:
+        del generation_id, replacements, expected_next_sequence, owner, lease_generation, now
+        raise IntegrityError(
+            "UPDATE private_table SET body = ? WHERE id = ?",
+            ("https://wiki.example.test/private?cookie=secret",),
+            RuntimeError("/private/machine/workspace.sqlite"),
+        )
+
+
+class UnsettleableStore(MidBuildStorageFailureStore):
+    """The store cannot be told about the failure, because the lease is already gone."""
+
+    @override
+    async def fail_generation(
+        self,
+        generation_id: str,
+        code: RebuildRefusalCode,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> RebuildCheckpoint:
+        del generation_id, code, owner, lease_generation, now
+        raise RebuildLeaseConflictError("generation lease changed or expired")
+
+
+@pytest.mark.asyncio
+async def test_a_storage_failure_mid_build_settles_the_generation_it_claimed() -> None:
+    """What the run leaves behind is the whole point, not what it raises.
+
+    A driver failure from a checkpoint write used to unwind past every handler in the build
+    and out through the typed boundary, which reported it correctly and settled nothing. The
+    durable row stayed ``building`` with the counters it had reached, an owner that no longer
+    existed and a lease that expired minutes later, so status went on describing a rebuild as
+    running with no worker, no diagnostic, and no way to tell the difference from here.
+    """
+    item, body = source(0, "private source body")
+    store = MidBuildStorageFailureStore([item])
+
+    with pytest.raises(RebuildStorageError) as caught:
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is RebuildRefusalCode.STORAGE_FAILED, (
+        "a claimed generation the worker is abandoning has to carry why"
+    )
+    assert store.published is False
+    rendered = str(caught.value).lower()
+    for private in ("update", "secret", "wiki.example.test", "/private", "sqlite"):
+        assert private not in rendered
+
+
+@pytest.mark.asyncio
+async def test_a_settlement_the_lease_no_longer_permits_does_not_rewrite_the_failure() -> None:
+    """Losing the lease is exactly the loss of the right to write the row.
+
+    If the lease lapsed while this worker was inside the failing call, another owner may hold
+    the generation now, and that owner alone decides what it says. So the settlement is an
+    attempt rather than a guarantee: it is dropped, the storage failure the caller has to act
+    on survives unchanged, and the unsettled row is left to lease recovery — which is a state
+    the surfaces can describe, because an unowned generation no longer reads as running.
+    """
+    item, body = source(0, "private source body")
+    store = UnsettleableStore([item])
+
+    with pytest.raises(RebuildStorageError):
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.failed_code is None, "the store refused the settlement, so nothing recorded it"
+    assert store.published is False
+
+
 @pytest.mark.asyncio
 async def test_publication_integrity_failure_is_bounded_and_marks_generation_failed() -> None:
     item, body = source(0, "private source body")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, NoReturn, Protocol, cast, override, runtime_checkable
@@ -810,7 +811,7 @@ class OfflineGenerationRebuilder:
             # is retained for server diagnostics but can never cross the application boundary.
             raise RebuildStorageError from exc
 
-    async def _run(  # noqa: PLR0912, PLR0915 - explicit terminal/refusal/lease stages
+    async def _run(
         self,
         snapshot_run_id: str,
         target: RebuildTarget,
@@ -846,6 +847,60 @@ class OfflineGenerationRebuilder:
             return checkpoint
         if checkpoint.state in {RebuildState.FAILED, RebuildState.CANCELED}:
             raise RebuildTerminalError
+        try:
+            return await self._build(
+                checkpoint,
+                estimate,
+                target,
+                owner=owner,
+                snapshot_run_id=snapshot_run_id,
+                missing_limit=missing_limit,
+                cancel=cancel,
+                lease_seconds=lease_seconds,
+            )
+        except (SQLAlchemyError, OSError):
+            # Every refusal the build anticipates settles the generation itself. This catches
+            # the ones nobody anticipated: a driver or filesystem failure from any store call
+            # between the claim and publication, which used to unwind past every handler and
+            # leave the row `building` with a lease that then quietly expired — work reported
+            # as running with no worker, no diagnostic and nothing to resume from but a guess.
+            await self._settle_storage_failure(checkpoint, owner)
+            raise
+
+    async def _settle_storage_failure(self, checkpoint: RebuildCheckpoint, owner: str) -> None:
+        """Record ``storage_failed`` on a claimed generation, best effort, before re-raising.
+
+        Best effort is the design rather than a shortcut. Only a takeover's claim moves the
+        lease generation, so the claimed checkpoint stays the right key for as long as this
+        worker runs. What can also be true is that the store is the thing that broke, or that
+        the lease expired and another owner holds the row now — and that owner alone may mutate
+        it. Both are settlements this worker is not entitled to make, while the original failure
+        is what the caller needs to see. So the attempt is suppressed rather than chained: the
+        run reports :class:`RebuildStorageError` either way, and a row this worker could not
+        settle is left to lease recovery rather than to a stale owner.
+        """
+        with suppress(SQLAlchemyError, OSError, RebuildLeaseConflictError, KeyError):
+            await self._store.fail_generation(
+                checkpoint.generation_id,
+                RebuildRefusalCode.STORAGE_FAILED,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+
+    async def _build(  # noqa: PLR0912, PLR0915 - explicit refusal/lease stages
+        self,
+        checkpoint: RebuildCheckpoint,
+        estimate: RebuildEstimate,
+        target: RebuildTarget,
+        *,
+        owner: str,
+        snapshot_run_id: str,
+        missing_limit: int,
+        cancel: asyncio.Event | None,
+        lease_seconds: int,
+    ) -> RebuildCheckpoint:
+        """Derive every remaining document and publish, under a lease this worker holds."""
         if checkpoint.predecessor_vector_publication_id is not None:
             try:
                 await self._store.copy_checkpointed_vectors(
@@ -1072,15 +1127,6 @@ class OfflineGenerationRebuilder:
             await self._fail_build_conflict(checkpoint, owner, exc)
         try:
             await self._store.validate_generation(checkpoint.generation_id)
-        except (SQLAlchemyError, OSError) as exc:
-            await self._store.fail_generation(
-                checkpoint.generation_id,
-                RebuildRefusalCode.STORAGE_FAILED,
-                owner=owner,
-                lease_generation=checkpoint.lease_generation,
-                now=self._clock(),
-            )
-            raise RebuildStorageError from exc
         except RebuildPublicationConflictError as exc:
             await self._fail_build_conflict(checkpoint, owner, exc)
         except RebuildPublicationValidationError as exc:
@@ -1162,18 +1208,6 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
             raise RebuildValidationError from exc
-        except (SQLAlchemyError, OSError) as exc:
-            # Publication is one relational transaction, so this runs only after its rollback.
-            # Marking the durable generation failed makes retry/cleanup explicit while the live
-            # generation and vector pointer remain untouched.
-            await self._store.fail_generation(
-                checkpoint.generation_id,
-                RebuildRefusalCode.STORAGE_FAILED,
-                owner=owner,
-                lease_generation=checkpoint.lease_generation,
-                now=self._clock(),
-            )
-            raise RebuildStorageError from exc
 
 
 def build_offline_rebuilder(

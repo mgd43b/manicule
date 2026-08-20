@@ -1780,6 +1780,23 @@ output must match an already-staged digest. Expected corruption or snapshot move
 same bounded validation/conflict envelopes and failed cleanup state. An unexpected worker crash
 is different: it keeps the checkpoint resumable and does not manufacture a validation diagnosis.
 
+**A storage failure anywhere between the claim and publication settles the same way.** The
+refusals the build anticipates each mark their own generation, and publication always did; a
+driver or filesystem failure from an ordinary checkpoint write did not, and it left the row
+`building` with the counters it had reached, an owner that no longer existed and a lease that
+expired minutes later — a durable record describing a worker that was gone. One settlement now
+sits at the durable boundary instead, and it is best effort by construction: if the store is
+what broke, or the lease lapsed and another owner holds the generation, the attempt is dropped
+rather than chained, because that owner alone may write the row. Either way the caller receives
+`RebuildStorageError` and no exception text.
+
+That leaves one honest state rather than two, because **`rebuild status` derives
+`lifecycle.outcome` from the lease exactly as `snapshot_status` does** (§13.4). A generation
+nobody owns reads `incomplete` — unfinished, inactive, and resumable from its committed
+checkpoint — never `running`. A takeover replaying its predecessor's vectors before it claims is
+covered by the same rule, and so is a settlement that could not be written: an operator can tell
+active work from work waiting to be resumed without being told the owner token.
+
 ### 10.5 Source and derived lifecycle boundaries
 
 Lifecycle work is four operations, not one broadly destructive reset:

@@ -434,8 +434,27 @@ def _rebuild_run_report(checkpoint: RebuildCheckpoint) -> r.RebuildRunReport:
     terminal = checkpoint.state.value in {"published", "failed", "canceled"}
     failed = checkpoint.state.value == "failed"
     canceled = checkpoint.state.value == "canceled"
+    # Read "running" off the lease, for the reason :func:`_snapshot_status_report` sets out at
+    # length: a generation left `building` by a worker that died and a generation being built
+    # right now are the same row, and only the lease separates them. A rebuild reaches that
+    # state the same way an acquisition does — a storage failure the worker could not settle on
+    # its way out, or a takeover still replaying its predecessor's vectors before it claims.
+    # Unowned means `incomplete`: unfinished, inactive, resumable from what is committed.
+    held = (
+        checkpoint.lease_owner is not None
+        and checkpoint.lease_expires_at is not None
+        and checkpoint.lease_expires_at > datetime.now(UTC)
+    )
     outcome: r.LifecycleOutcome = (
-        "failed" if failed else "canceled" if canceled else "complete" if terminal else "running"
+        "failed"
+        if failed
+        else "canceled"
+        if canceled
+        else "complete"
+        if terminal
+        else "running"
+        if held
+        else "incomplete"
     )
     phase: r.LifecyclePhase = (
         "failed" if failed else "canceled" if canceled else "complete" if terminal else "rebuilding"
