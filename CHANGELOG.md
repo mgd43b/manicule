@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/mgd43b/manicule/compare/v0.1.3...v0.1.4) (2026-08-20)
+
+
+### Bug Fixes
+
+* **ingest:** renew the rebuild lease while a takeover replays its checkpoint ([#269](https://github.com/mgd43b/manicule/issues/269)) ([63ce9aa](https://github.com/mgd43b/manicule/commit/63ce9aab9f8d9d4d88286bc0dcc561b8a5181336))
+
 ## [0.1.3](https://github.com/mgd43b/manicule/compare/v0.1.2...v0.1.3) (2026-08-20)
 
 
