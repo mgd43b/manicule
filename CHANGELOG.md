@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/mgd43b/manicule/compare/v0.1.5...v0.1.6) (2026-08-21)
+
+
+### Bug Fixes
+
+* **ingest:** batch and checkpoint rebuild replay and validation ([#274](https://github.com/mgd43b/manicule/issues/274)) ([68ed328](https://github.com/mgd43b/manicule/commit/68ed3288568985f4086f3c3d1c00c6835a929261))
+
 ## [0.1.5](https://github.com/mgd43b/manicule/compare/v0.1.4...v0.1.5) (2026-08-21)
 
 
