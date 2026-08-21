@@ -1231,11 +1231,22 @@ that "unverified" can never be mistaken for "verified":
 
 `manicule vector-checksum --yes` runs the backfill: one bounded page per pass, hashing vectors
 already on disk, contacting nothing and re-embedding nothing. It is resumable and idempotent by
-construction rather than by bookkeeping — the page is selected by "records no checksum", so a row
-a pass finished is not a row the next pass can see. There is no cursor to persist and none to
-lose; an interruption costs at most the page in flight, and a pass after the last one reads
-nothing. A row whose stored vector cannot be hashed at all is left exactly as it was and counted,
-because a checksum over an already-damaged vector would certify the damage.
+construction rather than by bookkeeping — the page is selected by "records **neither** half of
+the pair", so a row a pass finished is not a row the next pass can see. There is no cursor to
+persist and none to lose; an interruption costs at most the page in flight, and a pass after the
+last one reads nothing.
+
+Two kinds of row are deliberately outside every page it selects, and for the same reason:
+
+- **A vector that cannot be hashed at all** — non-finite, or unreadable. Left exactly as it was
+  and counted, because a checksum over an already-damaged vector would certify the damage.
+- **A row carrying one half of the pair.** That is *malformed*, not unrecorded: its two halves
+  were not written together, and nothing can be compared against it. A checksum-only predicate
+  would sweep it into the page, and a freshly computed digest over whatever the vector is now
+  would replace a row announcing a contradiction with one that verifies forever. Half a record is
+  evidence; overwriting it is the one thing a backfill must not do. Counting the *pair* is what
+  keeps it out — and because half a record is malformed by looking at the two columns alone, the
+  cheap counting mode reports it rather than leaving it to a scan nobody may run.
 
 **A backfill fixes the numbers as they are, not as they were.** Hashing a row that was corrupted
 *before* the backfill records a digest over the corrupted bytes, and that row then verifies

@@ -361,6 +361,43 @@ def _embed_text_of(record: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _unrecorded_checksum_predicate() -> str:
+    """Rows that record *neither* half of the numerical-integrity pair.
+
+    Pair-aware rather than checksum-only, and the difference is a row that carries one column
+    and not the other. Such a row is not an upgrade backlog item — it is a row whose two halves
+    were not written together, which
+    :func:`~manicule.core.embedding.verify_stored_checksum` calls ``malformed``. Counting it as
+    unrecorded would inflate the backfill's number with damage, and — the part that actually
+    bites — it would put the row inside the backfill's page, where a freshly computed digest
+    over whatever the vector is *now* would erase the contradiction the row was announcing.
+    Half a record is evidence; overwriting it is the one thing the backfill must not do.
+
+    ``NULL`` is spelled out beside ``''`` because a column added by a migration and a column
+    written by a row are not guaranteed to agree on which absence they use, and
+    :func:`_checksum_of` already treats the two the same on the read side.
+    """
+    empty = quote("")
+    return (
+        f"(({CHECKSUM_COLUMN} = {empty} OR {CHECKSUM_COLUMN} IS NULL) "
+        f"AND ({CHECKSUM_VERSION_COLUMN} = {empty} OR {CHECKSUM_VERSION_COLUMN} IS NULL))"
+    )
+
+
+def _half_written_checksum_predicate() -> str:
+    """Rows carrying exactly one half of the pair.
+
+    Malformed by inspection of the columns alone — no vector is read and nothing is hashed —
+    which is what lets the counting mode of :meth:`LanceVectorStore.checksum_coverage` report
+    them. Without it a half-written row is invisible to every surface that cannot afford a
+    scan, and "complete" would be true over a table holding one.
+    """
+    empty = quote("")
+    recorded = f"({CHECKSUM_COLUMN} <> {empty} AND {CHECKSUM_COLUMN} IS NOT NULL)"
+    versioned = f"({CHECKSUM_VERSION_COLUMN} <> {empty} AND {CHECKSUM_VERSION_COLUMN} IS NOT NULL)"
+    return f"(({recorded} AND NOT {versioned}) OR (NOT {recorded} AND {versioned}))"
+
+
 def _checksum_of(record: dict[str, Any]) -> tuple[str, str]:
     """The numerical-integrity pair a row carries, as two strings.
 
@@ -1071,9 +1108,19 @@ class LanceVectorStore:
             # `recorded = 0` says. Reporting it as unscanned would hide a corpus that is owed a
             # backfill behind the same value a store without the capability returns.
             return VectorChecksumCoverage(rows=rows, recomputed=recompute)
-        recorded = rows - await table.count_rows(f"{CHECKSUM_COLUMN} = {quote('')}")
+        recorded = rows - await table.count_rows(_unrecorded_checksum_predicate())
         if not recompute:
-            return VectorChecksumCoverage(rows=rows, recorded=recorded)
+            # A half-written pair is malformed by looking at the two columns, which costs a
+            # third predicate and no vector read. Reported here rather than left to the scan,
+            # because a surface that cannot afford a scan is exactly the one that would
+            # otherwise call a table holding such a row complete.
+            half_written = await table.count_rows(_half_written_checksum_predicate())
+            return VectorChecksumCoverage(
+                rows=rows,
+                recorded=recorded,
+                failed=half_written,
+                failures=({VectorIntegrity.MALFORMED.value: half_written} if half_written else {}),
+            )
         verified = 0
         failures: dict[str, int] = {}
         async for page in self._integrity_pages(table, page_size=page_size):
@@ -1113,6 +1160,12 @@ class LanceVectorStore:
         :attr:`~manicule.core.embedding.VectorChecksumBackfill.unhashable`. Writing a checksum
         over a non-finite vector would certify a row that can never be ranked.
 
+        **A row carrying one half of the pair is never selected at all.** It is malformed
+        rather than unrecorded, and a pass that hashed it would replace a row announcing that
+        its two halves disagree with one that verifies — the same laundering the unhashable
+        branch above refuses, arriving through the column rather than the vector. See
+        :func:`_unrecorded_checksum_predicate`.
+
         Args:
             limit: Rows to consider in this pass. The bound on both the query and the memory.
             dry_run: Report what a pass would do and write nothing.
@@ -1131,7 +1184,9 @@ class LanceVectorStore:
         # `open_existing` deliberately is not: a read must never evolve the schema of a
         # generation somebody is searching. Idempotent, so a resumed pass costs nothing.
         await self._ensure_generation_columns(table)
-        predicate = f"{CHECKSUM_COLUMN} = {quote('')}"
+        # The same predicate coverage counts, so the two can never disagree about which rows
+        # are owed a checksum — and so a half-written pair stays outside this page.
+        predicate = _unrecorded_checksum_predicate()
         outstanding = await table.count_rows(predicate)
         if outstanding == 0:
             return VectorChecksumBackfill(dry_run=dry_run)

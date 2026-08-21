@@ -610,9 +610,11 @@ as far as anything knows; what is true is that nothing has vouched for their num
 **After upgrading.** Run `manicule vector-checksum --yes` until `remaining` reaches zero. Each
 pass reads and rewrites one bounded page (`storage.checksum_backfill_batch`, default 512),
 hashes vectors already on disk, and contacts nothing — no model, no connector, no source system.
-It is safe to interrupt: the next pass selects rows that still record no checksum, so it resumes
-without a cursor and cannot duplicate or skip a row. Running it once more after it finishes reads
-nothing.
+It is safe to interrupt: the next pass selects rows that still record neither half of the
+checksum pair, so it resumes without a cursor and cannot duplicate or skip a row. Running it once
+more after it finishes reads nothing. Rows it will never touch — a vector it cannot hash, or a row
+holding one half of the pair and not the other — are reported as `failed` rather than backfilled,
+because writing over them would erase what they are telling you.
 
 **What a backfill cannot do.** It records a checksum over the bytes as they are *now*. A row that
 was already corrupted gets a digest over the corruption and verifies from then on. That is not

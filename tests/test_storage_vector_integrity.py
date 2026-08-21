@@ -243,7 +243,7 @@ def test_a_checksum_valid_row_still_has_to_pass_every_provenance_check() -> None
 
     The vector below is intact and its checksum is correct. What is wrong is that the row
     records the embedding input of a *different* string, which is the stale-vector failure the
-    identity check exists for — and a store that treated a good checksum as a licence to reuse
+    identity check exists for — and a store that treated a good checksum as a license to reuse
     would have quietly reintroduced it.
     """
     asked = chunk("chunk-a")
@@ -893,6 +893,82 @@ async def test_the_backfill_leaves_a_vector_it_cannot_hash_exactly_as_it_found_i
         await read_column(directory, fingerprint(), "chunk-0", CHECKSUM_COLUMN)
         == UNRECORDED_CHECKSUM
     )
+    await reopened.teardown()
+
+
+async def test_a_half_written_pair_is_malformed_rather_than_awaiting_a_backfill(
+    tmp_path: Path,
+) -> None:
+    """One column without the other is damage, and counting alone can say so.
+
+    The distinction matters because the two call for opposite responses. A row recording
+    neither half is an upgrade backlog item and a bounded backfill clears it. A row recording
+    one half is a row whose two halves were not written together — nothing can be compared
+    against it, and counting it as backlog would hide it inside a number an operator is
+    watching go to zero.
+    """
+    directory = tmp_path / "vectors"
+    store = await prepared(directory)
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
+    await store.upsert(chunks, [spread(index) for index in range(3)])
+    await store.teardown()
+
+    # Two ways to write half a record, and neither is an absent one.
+    await rewrite_row(
+        directory, fingerprint(), "chunk-0", {CHECKSUM_VERSION_COLUMN: UNRECORDED_CHECKSUM}
+    )
+    await rewrite_row(directory, fingerprint(), "chunk-1", {CHECKSUM_COLUMN: UNRECORDED_CHECKSUM})
+
+    reopened = LanceVectorStore(directory)
+    counted = await reopened.checksum_coverage()
+
+    assert counted.unverified == 0, "neither row is owed a backfill"
+    assert counted.failed == 2
+    assert counted.failures == {VectorIntegrity.MALFORMED.value: 2}
+    assert not counted.complete, (
+        "a table holding a contradicted row is not complete, and counting is enough to know it"
+    )
+
+    recomputed = await reopened.checksum_coverage(recompute=True)
+
+    assert (recomputed.verified, recomputed.failed) == (1, 2)
+    assert recomputed.failures == {VectorIntegrity.MALFORMED.value: 2}
+    verdicts = await reopened.stored_vectors(chunks)
+    assert verdicts["chunk-0"].integrity is VectorIntegrity.MALFORMED
+    assert verdicts["chunk-1"].integrity is VectorIntegrity.MALFORMED
+    await reopened.teardown()
+
+
+async def test_the_backfill_never_overwrites_half_a_record(tmp_path: Path) -> None:
+    """The sharp edge of counting the pair rather than one column of it.
+
+    A row holding a version and no checksum *looks* like an unrecorded row to a
+    checksum-only predicate. Selecting it would compute a fresh digest over whatever the
+    vector is now and write both columns — turning a row that was announcing a contradiction
+    into one that verifies forever, which is the same laundering the unhashable branch
+    refuses, arriving through the column instead of the vector.
+    """
+    directory = tmp_path / "vectors"
+    store = await prepared(directory)
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(2)]
+    await store.upsert(chunks, [spread(index) for index in range(2)])
+    await store.teardown()
+    await rewrite_row(directory, fingerprint(), "chunk-0", {CHECKSUM_COLUMN: UNRECORDED_CHECKSUM})
+
+    reopened = await prepared(directory)
+    result = await reopened.backfill_checksums()
+
+    assert (result.scanned, result.written, result.remaining) == (0, 0, 0), (
+        "there is nothing here a backfill is allowed to touch"
+    )
+    assert await read_column(directory, fingerprint(), "chunk-0", CHECKSUM_COLUMN) == (
+        UNRECORDED_CHECKSUM
+    ), "the half-written row is exactly as it was found"
+    assert (
+        await read_column(directory, fingerprint(), "chunk-0", CHECKSUM_VERSION_COLUMN)
+        == VECTOR_CHECKSUM_VERSION
+    )
+    assert (await reopened.checksum_coverage()).failed == 1, "and it is still reported"
     await reopened.teardown()
 
 
