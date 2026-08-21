@@ -181,7 +181,15 @@ class RebuildStore(Protocol):
         now: datetime,
     ) -> RebuildCheckpoint: ...
 
-    async def validate_generation(self, generation_id: str) -> None: ...
+    async def validate_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: datetime,
+        cancel: asyncio.Event | None = None,
+    ) -> None: ...
 
     async def publish_generation(
         self,
@@ -1291,7 +1299,13 @@ class OfflineGenerationRebuilder:
         except RebuildPublicationConflictError as exc:
             await self._fail_build_conflict(checkpoint, owner, exc)
         try:
-            await self._store.validate_generation(checkpoint.generation_id)
+            await self._store.validate_generation(
+                checkpoint.generation_id,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+                cancel=cancel,
+            )
         except RebuildPublicationConflictError as exc:
             await self._fail_build_conflict(checkpoint, owner, exc)
         except RebuildPublicationValidationError as exc:

@@ -278,7 +278,16 @@ class FakeStore:
         assert len(self.staged) == len(self.items)
         return self._checkpoint(RebuildState.VALIDATING)
 
-    async def validate_generation(self, generation_id: str) -> None:
+    async def validate_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+        cancel: asyncio.Event | None = None,
+    ) -> None:
+        del owner, lease_generation, now, cancel
         assert generation_id == "generation-v2"
         assert not self.published
         if self.late_cancel is not None:
@@ -594,22 +603,46 @@ class AssertLeaseSeamStore(FakeStore):
 
 class ValidationFailureStore(FakeStore):
     @override
-    async def validate_generation(self, generation_id: str) -> None:
-        del generation_id
+    async def validate_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+        cancel: asyncio.Event | None = None,
+    ) -> None:
+        del generation_id, owner, lease_generation, now, cancel
         raise RuntimeError("invalid row https://wiki.example.test/private token=secret")
 
 
 class ValidationConflictStore(FakeStore):
     @override
-    async def validate_generation(self, generation_id: str) -> None:
-        del generation_id
+    async def validate_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+        cancel: asyncio.Event | None = None,
+    ) -> None:
+        del generation_id, owner, lease_generation, now, cancel
         raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
 
 
 class ValidationStorageFailureStore(FakeStore):
     @override
-    async def validate_generation(self, generation_id: str) -> None:
-        del generation_id
+    async def validate_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+        cancel: asyncio.Event | None = None,
+    ) -> None:
+        del generation_id, owner, lease_generation, now, cancel
         raise IntegrityError(
             "SELECT private_column FROM private_table WHERE secret = ?",
             ("cookie=secret",),

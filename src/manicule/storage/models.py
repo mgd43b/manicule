@@ -1449,6 +1449,16 @@ class DerivedGeneration(Base):
     evidence_verification_digest: Mapped[str | None] = mapped_column(Text)
     evidence_verification_lease_generation: Mapped[int | None] = mapped_column(Integer)
     evidence_verified_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    # Distinct from `lease_expires_at`/`updated_at`: only a durable replay or validation page
+    # commit moves this, so a heartbeat renewing a stalled worker's lease cannot masquerade as
+    # useful progress. See `RebuildCheckpoint.last_progress_at`.
+    last_progress_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    replay_lease_generation: Mapped[int | None] = mapped_column(Integer)
+    replay_checkpoint_sequence: Mapped[int | None] = mapped_column(Integer)
+    replayed_vector_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    validation_lease_generation: Mapped[int | None] = mapped_column(Integer)
+    validation_checkpoint_sequence: Mapped[int | None] = mapped_column(Integer)
+    validated_vector_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     fence_generation: Mapped[int | None] = mapped_column(Integer)
     lease_owner: Mapped[str | None] = mapped_column(Text)
     lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -1482,7 +1492,13 @@ class DerivedGeneration(Base):
             "expected_item_count >= 0 AND next_sequence >= 0 AND documents_built >= 0 "
             "AND chunks_built >= 0 AND vectors_reused >= 0 AND vectors_embedded >= 0 "
             "AND lease_generation >= 0 AND diagnostic_count >= 0 "
-            "AND (fence_generation IS NULL OR fence_generation >= 1)",
+            "AND (fence_generation IS NULL OR fence_generation >= 1) "
+            "AND (replay_lease_generation IS NULL OR replay_lease_generation >= 1) "
+            "AND (replay_checkpoint_sequence IS NULL OR replay_checkpoint_sequence >= 0) "
+            "AND replayed_vector_count >= 0 "
+            "AND (validation_lease_generation IS NULL OR validation_lease_generation >= 1) "
+            "AND (validation_checkpoint_sequence IS NULL OR validation_checkpoint_sequence >= 0) "
+            "AND validated_vector_count >= 0",
             name="derived_generation_counts_are_not_negative",
         ),
         CheckConstraint(
