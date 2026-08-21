@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.5](https://github.com/mgd43b/manicule/compare/v0.1.4...v0.1.5) (2026-08-21)
+
+
+### Features
+
+* **storage:** give every stored vector a versioned checksum over its persisted bytes ([#273](https://github.com/mgd43b/manicule/issues/273)) ([734b5dd](https://github.com/mgd43b/manicule/commit/734b5dd1e1a5768c4c150d98f5be220e73929039))
+
+
+### Performance Improvements
+
+* **ci:** rebalance the test shards, and fix the writer that made them slow ([#271](https://github.com/mgd43b/manicule/issues/271)) ([a141829](https://github.com/mgd43b/manicule/commit/a141829df21471eec5223db204a4457ade8cbfdf))
+
 ## [0.1.4](https://github.com/mgd43b/manicule/compare/v0.1.3...v0.1.4) (2026-08-20)
 
 
