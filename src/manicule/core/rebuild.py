@@ -178,6 +178,16 @@ class RebuildCheckpoint(BaseModel):
     # Aware, because a status surface asks whether this lease is still live and a naive
     # timestamp cannot answer that without guessing a timezone.
     lease_expires_at: AwareDatetime | None = None
+    # Distinct from `lease_expires_at`: only a durable replay page, validation page, staged
+    # batch, or publication commit moves this, so a healthy heartbeat renewing a stalled
+    # worker's lease cannot read as content progress. Retained-source evidence verification
+    # does not move it — it also runs as a read-only repair pass over an already-published
+    # generation, where nothing should read as new progress.
+    last_progress_at: AwareDatetime | None = None
+    replayed_items: int = Field(default=0, ge=0)
+    replayed_vectors: int = Field(default=0, ge=0)
+    validated_items: int = Field(default=0, ge=0)
+    validated_vectors: int = Field(default=0, ge=0)
     fence_generation: int | None = Field(default=None, ge=1)
     diagnostic_code: RebuildRefusalCode | None = None
     diagnostic_count: int = Field(default=0, ge=0)

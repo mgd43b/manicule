@@ -887,6 +887,28 @@ class RebuildRunReport(Payload):
     chunks_built: int = Field(ge=0)
     vectors_reused: int = Field(ge=0)
     vectors_embedded: int = Field(ge=0)
+    replayed_items: int = Field(
+        default=0,
+        ge=0,
+        description="Items whose vectors a takeover has durably re-verified into the fresh "
+        "physical namespace, from the current lease generation's checkpoint only.",
+    )
+    replayed_vectors: int = Field(default=0, ge=0)
+    validated_items: int = Field(
+        default=0,
+        ge=0,
+        description="Items validation has durably checkpointed past, from the current lease "
+        "generation's checkpoint only — resets to 0 after a takeover until it re-covers ground.",
+    )
+    validated_vectors: int = Field(default=0, ge=0)
+    last_progress_at: str | None = Field(
+        default=None,
+        description="When a durable replay page, validation page, staged batch, or "
+        "publication last committed — distinct from lease renewal, which proves only that a "
+        "worker is alive, not that work advanced. Retained-source evidence verification does "
+        "not move it: it also runs as a read-only repair pass over an already-published, "
+        "immutable generation, where nothing should read as new progress.",
+    )
     diagnostic_code: str | None = None
     lifecycle: LifecycleProgress
 

@@ -585,7 +585,11 @@ async def publish_one_replacement(
         estimate_id,
         owner,
         now=NOW,
-        expires_at=NOW + timedelta(minutes=5),
+        # Comfortably past any real elapsed time this suite could ever run under: validation's
+        # per-page checkpoint commit fences against a live clock (`utcnow()`), not `NOW`, so the
+        # claimed lease has to stay valid against real wall-clock time, not just the fixed `NOW`
+        # this fixture otherwise reasons about.
+        expires_at=NOW + timedelta(days=36500),
     )
     replacement_document = document.model_copy(
         update={
@@ -630,7 +634,9 @@ async def publish_one_replacement(
         lease_generation=claimed.lease_generation,
         now=NOW,
     )
-    await rebuilds.validate_generation(estimate_id)
+    await rebuilds.validate_generation(
+        estimate_id, owner=owner, lease_generation=claimed.lease_generation, now=NOW
+    )
     return await rebuilds.publish_generation(
         estimate_id,
         owner=owner,
@@ -709,7 +715,9 @@ async def staged_glossary_generation(
         plan.generation_id,
         "glossary-publisher",
         now=NOW,
-        expires_at=NOW + timedelta(minutes=5),
+        # See `publish_one_replacement`: validation's checkpoint commit fences against a live
+        # clock, so this has to stay valid against real wall-clock time, not just `NOW`.
+        expires_at=NOW + timedelta(days=36500),
     )
     replacements: list[tuple[int, DerivedReplacement]] = []
     documents: list[Document] = []
@@ -791,7 +799,12 @@ async def staged_glossary_generation(
         lease_generation=claimed.lease_generation,
         now=NOW,
     )
-    await rebuilds.validate_generation(plan.generation_id)
+    await rebuilds.validate_generation(
+        plan.generation_id,
+        owner="glossary-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
     return rebuilds, checkpoint, tuple(documents)
 
 
@@ -965,7 +978,7 @@ async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omiss
         plan.generation_id,
         "partial-publisher",
         now=NOW,
-        expires_at=NOW + timedelta(minutes=5),
+        expires_at=NOW + timedelta(days=36500),
     )
     replacements: list[tuple[int, DerivedReplacement]] = []
     for sequence, (raw, blob_ref) in enumerate(zip(raws, blob_refs, strict=True)):
@@ -1016,7 +1029,12 @@ async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omiss
         lease_generation=claimed.lease_generation,
         now=NOW,
     )
-    await rebuilds.validate_generation(plan.generation_id)
+    await rebuilds.validate_generation(
+        plan.generation_id,
+        owner="partial-publisher",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
     published = await rebuilds.publish_generation(
         plan.generation_id,
         owner="partial-publisher",
@@ -1129,11 +1147,14 @@ async def test_releasing_a_generation_another_owner_holds_is_refused(
 ) -> None:
     """Giving up a generation is still a write, and a lost lease is the loss of that right."""
     rebuilds, claimed, _ = await staged_glossary_generation(store, engine, data_dir)
+    # Past `staged_glossary_generation`'s own (real-time-safe) claim expiry, so this simulates
+    # "the original lease has now expired" the same way the pre-existing 5-minute-window
+    # version of this test did against its shorter expiry.
     await rebuilds.claim_generation(
         claimed.generation_id,
         "successor",
-        now=NOW + timedelta(minutes=10),
-        expires_at=NOW + timedelta(minutes=15),
+        now=NOW + timedelta(days=36500, minutes=10),
+        expires_at=NOW + timedelta(days=36500, minutes=15),
     )
 
     with pytest.raises(RebuildLeaseConflictError):
@@ -1142,7 +1163,7 @@ async def test_releasing_a_generation_another_owner_holds_is_refused(
             RebuildRefusalCode.STORAGE_FAILED,
             owner="glossary-publisher",
             lease_generation=claimed.lease_generation,
-            now=NOW + timedelta(minutes=11),
+            now=NOW + timedelta(days=36500, minutes=11),
         )
 
 
@@ -1476,7 +1497,9 @@ async def test_canceled_evidence_verification_leaves_no_fence_and_retry_recovers
         blobs=BlobStore(engine, data_dir),
         vectors=vectors,
     )
-    await rebuilds.validate_generation(generation_id)
+    await rebuilds.validate_generation(
+        generation_id, owner="glossary-publisher", lease_generation=lease_generation, now=NOW
+    )
     published = await rebuilds.publish_generation(
         generation_id,
         owner="glossary-publisher",
@@ -1514,11 +1537,13 @@ async def test_successor_takeover_fences_slow_stale_evidence_verifier(
         workspace_id=store.workspace_id,
         blobs=BlobStore(engine, data_dir),
     )
+    # Past `staged_glossary_generation`'s own (real-time-safe) claim expiry — see
+    # `test_releasing_a_generation_another_owner_holds_is_refused`.
     claimed = await successor.claim_generation(
         generation_id,
         "successor-verifier",
-        now=NOW + timedelta(minutes=10),
-        expires_at=NOW + timedelta(minutes=20),
+        now=NOW + timedelta(days=36500, minutes=10),
+        expires_at=NOW + timedelta(days=36500, minutes=20),
     )
     blobs.verification_release.set()
 
@@ -1633,6 +1658,103 @@ async def test_many_unique_evidence_streams_with_fixed_shard_and_descriptor_stat
     assert descriptors_after <= descriptors_before + 2
     assert len(list((blobs.root / "evidence-pins" / "by-digest").iterdir())) == item_count
     assert peak < 12 * 1024 * 1024
+
+
+async def test_evidence_page_batches_one_join_per_page_not_per_document(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_evidence_page` must not round-trip once per document for its snapshot lookup.
+
+    `_EVIDENCE_PAGE` was `1` for exactly this reason: reading N documents took 2N SQLite round
+    trips — N document-item reads plus N per-item snapshot reads, one document at a time. With a
+    real page size, reading a whole page costs one query for the items and one bounded join for
+    their snapshots, regardless of how many documents the page holds.
+    """
+    monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 5)
+    item_count = 5
+    raws = tuple(
+        RawDocument(
+            source_id=f"batched-{index}",
+            uri=f"https://wiki.example.test/batched/{index}",
+            media_type="text/plain",
+            content=f"batched evidence document {index}",
+        )
+        for index in range(item_count)
+    )
+    run_id, blob_refs = await promoted_snapshot_many(store, engine, data_dir, raws)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine, workspace_id=store.workspace_id, blobs=BlobStore(engine, data_dir), vectors=vectors
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    claimed = await rebuilds.claim_generation(
+        plan.generation_id, "batch-worker", now=NOW, expires_at=NOW + timedelta(minutes=5)
+    )
+    replacements: list[tuple[int, DerivedReplacement]] = []
+    for sequence, (raw, blob_ref) in enumerate(zip(raws, blob_refs, strict=True)):
+        document = make_document(
+            source="wiki",
+            source_id=raw.source_id,
+            body=raw.as_bytes(),
+            uri=raw.uri,
+            media_type=raw.media_type,
+        ).model_copy(
+            update={
+                "publication_id": plan.generation_id,
+                "original_ref": blob_ref,
+                "version_token": "v2",
+                "status": DocumentStatus.INDEXED,
+            }
+        )
+        chunk = make_chunk(document, 0, raw.as_text())
+        replacements.append(
+            (sequence, DerivedReplacement(document=document, chunks=(chunk,), vector_embedded=1))
+        )
+        await vectors.upsert(
+            [chunk], [[1.0, 0.0, 0.0, 0.0]], publication_id=claimed.vector_publication_id
+        )
+    await rebuilds.stage_replacements(
+        plan.generation_id,
+        replacements,
+        expected_next_sequence=0,
+        owner="batch-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+    sessions = session_factory(engine)
+    item_selects = 0
+    record_selects = 0
+
+    def count_selects(*args: object) -> None:
+        nonlocal item_selects, record_selects
+        statement = args[2]
+        if not isinstance(statement, str):
+            return
+        if "FROM derived_generation_items" in statement:
+            item_selects += 1
+        if "FROM acquisition_records" in statement:
+            record_selects += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_selects)
+    try:
+        async with sessions() as session:
+            generation = await session.get(models.DerivedGeneration, plan.generation_id)
+            assert generation is not None
+            pairs = await rebuilds._evidence_page(  # pyright: ignore[reportPrivateUsage]
+                session, generation, after=-1
+            )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_selects)
+
+    assert len(pairs) == item_count
+    assert item_selects == 1
+    assert record_selects == 1, "one bounded join for the whole page, not one per document"
 
 
 async def test_published_replay_repairs_a_legacy_unsettled_handoff_exactly_once(
@@ -2151,7 +2273,12 @@ async def test_multi_source_generation_resumes_and_publishes_once_atomically(
         lease_generation=resumed.lease_generation,
         now=resumed_at,
     )
-    await rebuilds.validate_generation(plan.generation_id)
+    await rebuilds.validate_generation(
+        plan.generation_id,
+        owner="resumed-worker",
+        lease_generation=resumed.lease_generation,
+        now=resumed_at,
+    )
     published = await rebuilds.publish_generation(
         plan.generation_id,
         owner="resumed-worker",
@@ -2439,7 +2566,8 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         estimate.generation_id,
         "worker",
         now=NOW,
-        expires_at=NOW + timedelta(minutes=5),
+        # Real-time-safe: validation's per-page checkpoint commit fences against a live clock.
+        expires_at=NOW + timedelta(days=36500),
     )
     replacement_document = old.model_copy(
         update={
@@ -2528,7 +2656,12 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         lease_generation=claimed.lease_generation,
         now=NOW,
     )
-    await rebuilds.validate_generation(estimate.generation_id)
+    await rebuilds.validate_generation(
+        estimate.generation_id,
+        owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
     # A #187 pointer swap after staging must win the CAS without publishing relational rows.
     async with sessions.begin() as session:
         index_state = await session.get(models.IndexState, "default")
@@ -2661,7 +2794,12 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
             )
         )
     with pytest.raises(RebuildPublicationValidationError) as caught:
-        await rebuilds.validate_generation(estimate.generation_id)
+        await rebuilds.validate_generation(
+            estimate.generation_id,
+            owner="worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
     assert caught.value.code is RebuildRefusalCode.INVALID_REPLACEMENT
 
 
@@ -2873,15 +3011,29 @@ async def test_expired_owner_is_fenced_after_takeover(  # noqa: PLR0915 - one ta
     assert "/private" not in str(invalid.value)
     assert await certified_publication() == first.vector_publication_id
 
+    # The scenarios above all held "second"'s own lease generation, and the last of them —
+    # `unavailable_replay_inventory` — copied and verified the single staged page before its
+    # invented total-count mismatch raised, durably checkpointing that page under this exact
+    # lease generation. A resumable replay is supposed to trust that: rather than proving a
+    # worker crash mid-copy, reusing "second" here would prove only that an already-checkpointed
+    # page is not recopied. So this scenario claims its own fresh takeover, like the ones after
+    # it, to give the crash something in-flight to crash on.
     monkeypatch.setattr(vectors, "publication_row_count", original_row_count)
+    second_crash = await rebuilds.claim_generation(
+        plan.generation_id,
+        "second-crash",
+        now=takeover_now + timedelta(seconds=1),
+        expires_at=takeover_now + timedelta(seconds=1, milliseconds=500),
+    )
+    assert second_crash.predecessor_vector_publication_id == first.vector_publication_id
     monkeypatch.setattr(vectors, "copy_publication", crash_after_page)
     with pytest.raises(RuntimeError, match="crashed after the first replay page"):
         await rebuilds.copy_checkpointed_vectors(
             plan.generation_id,
             first.vector_publication_id,
-            owner="second",
-            lease_generation=second.lease_generation,
-            now=takeover_now,
+            owner="second-crash",
+            lease_generation=second_crash.lease_generation,
+            now=takeover_now + timedelta(seconds=1),
         )
     assert await certified_publication() == first.vector_publication_id
     third = await rebuilds.claim_generation(
@@ -2970,6 +3122,381 @@ async def test_expired_owner_is_fenced_after_takeover(  # noqa: PLR0915 - one ta
             now=takeover_now + timedelta(seconds=6),
             expires_at=takeover_now + timedelta(minutes=3),
         )
+
+
+# --- durable, resumable replay and validation checkpoints -------------------------------------
+
+
+async def _two_document_generation(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path, *, owner: str
+) -> tuple[
+    SqliteRebuildStore, LanceVectorStore, RebuildCheckpoint, tuple[Document, ...], tuple[str, ...]
+]:
+    """Stage two single-chunk replacements and enter ``VALIDATING`` without validating them."""
+    raws = (
+        RawDocument(
+            source_id="resumable-one",
+            uri="https://wiki.example.test/resumable-one",
+            media_type="text/plain",
+            content="first resumable document",
+        ),
+        RawDocument(
+            source_id="resumable-two",
+            uri="https://wiki.example.test/resumable-two",
+            media_type="text/plain",
+            content="second resumable document",
+        ),
+    )
+    run_id, blob_refs = await promoted_snapshot_many(store, engine, data_dir, raws)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine, workspace_id=store.workspace_id, blobs=BlobStore(engine, data_dir), vectors=vectors
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    # Real time, not the fixed `NOW`: validation's per-page checkpoint commit fences against a
+    # live clock, and some callers of this fixture take the generation over via a later,
+    # real-time-anchored claim — a claim expiry fixed to `NOW` would already read as expired to
+    # both.
+    claim_now = datetime.now(UTC)
+    claimed = await rebuilds.claim_generation(
+        plan.generation_id, owner, now=claim_now, expires_at=claim_now + timedelta(minutes=5)
+    )
+    replacements: list[tuple[int, DerivedReplacement]] = []
+    documents: list[Document] = []
+    for sequence, (raw, blob_ref) in enumerate(zip(raws, blob_refs, strict=True)):
+        document = make_document(
+            source="wiki",
+            source_id=raw.source_id,
+            body=raw.as_bytes(),
+            uri=raw.uri,
+            media_type=raw.media_type,
+        ).model_copy(
+            update={
+                "publication_id": plan.generation_id,
+                "original_ref": blob_ref,
+                "version_token": "v2",
+                "status": DocumentStatus.INDEXED,
+            }
+        )
+        chunk = make_chunk(document, 0, raw.as_text())
+        replacements.append(
+            (sequence, DerivedReplacement(document=document, chunks=(chunk,), vector_embedded=1))
+        )
+        documents.append(document)
+        await vectors.upsert(
+            [chunk], [[1.0, 0.0, 0.0, 0.0]], publication_id=claimed.vector_publication_id
+        )
+    await rebuilds.stage_replacements(
+        plan.generation_id,
+        replacements,
+        expected_next_sequence=0,
+        owner=owner,
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    await rebuilds.begin_validation(
+        plan.generation_id, owner=owner, lease_generation=claimed.lease_generation, now=NOW
+    )
+    return rebuilds, vectors, claimed, tuple(documents), blob_refs
+
+
+async def test_validation_resumes_past_a_durably_checkpointed_page(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupted validation resumes after its last durable page, not from the beginning.
+
+    Two documents, one relational evidence page each (`_EVIDENCE_PAGE` forced to one). The first
+    call is made to fail while checking the second document's vectors, after the first document's
+    page has already committed. The second call must verify only the second document — the whole
+    point of a durable per-page checkpoint is that the first is never asked about again.
+    """
+    monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 1)
+    rebuilds, vectors, claimed, documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="resumable-worker"
+    )
+    original_page_complete = vectors.publication_page_is_complete
+    calls: list[str] = []
+
+    async def fail_on_second_document(
+        publication_id: str, chunks: Sequence[Chunk], *, embedding_fingerprint: str
+    ) -> bool:
+        calls.append(chunks[0].document_id)
+        if chunks[0].document_id == documents[1].id:
+            raise ValueError("private injected failure /private/path")
+        return await original_page_complete(
+            publication_id, chunks, embedding_fingerprint=embedding_fingerprint
+        )
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", fail_on_second_document)
+    with pytest.raises(RebuildPublicationValidationError):
+        await rebuilds.validate_generation(
+            claimed.generation_id,
+            owner="resumable-worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+    assert calls == [documents[0].id, documents[1].id]
+
+    sessions = session_factory(engine)
+    async with sessions() as session:
+        row = (await session.execute(select(models.DerivedGeneration))).scalar_one()
+        assert row.validation_lease_generation == claimed.lease_generation
+        assert row.validation_checkpoint_sequence == 0, "only the first document's page committed"
+        assert row.validated_vector_count == 1
+        assert row.last_progress_at is not None
+
+    calls.clear()
+    monkeypatch.setattr(vectors, "publication_page_is_complete", original_page_complete)
+    resumed_calls: list[str] = []
+
+    async def counting_page_complete(
+        publication_id: str, chunks: Sequence[Chunk], *, embedding_fingerprint: str
+    ) -> bool:
+        resumed_calls.append(chunks[0].document_id)
+        return await original_page_complete(
+            publication_id, chunks, embedding_fingerprint=embedding_fingerprint
+        )
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", counting_page_complete)
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="resumable-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    assert resumed_calls == [documents[1].id], "resume must not re-verify the checkpointed page"
+
+    published = await rebuilds.publish_generation(
+        claimed.generation_id,
+        owner="resumable-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    assert published.state is RebuildState.PUBLISHED
+
+
+async def test_takeover_invalidates_a_stale_validation_checkpoint(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkpoint recorded under a superseded lease generation is never resumed from.
+
+    Trusting it would mean trusting page evidence checked against a physical vector namespace
+    the new owner may not even share — the same reasoning :meth:`copy_checkpointed_vectors`
+    applies to its own replay checkpoint.
+    """
+    monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 1)
+    rebuilds, vectors, claimed, documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="stale-worker"
+    )
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="stale-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    sessions = session_factory(engine)
+    async with sessions() as session:
+        before = (await session.execute(select(models.DerivedGeneration))).scalar_one()
+        assert before.validation_lease_generation == claimed.lease_generation
+        assert before.validation_checkpoint_sequence == 1
+
+    # Past `_two_document_generation`'s own claim expiry (real time plus five minutes), so this
+    # is a genuine takeover rather than a live-owner conflict.
+    takeover_now = datetime.now(UTC) + timedelta(minutes=10)
+    taken_over = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "new-worker",
+        now=takeover_now,
+        expires_at=takeover_now + timedelta(minutes=5),
+    )
+    assert taken_over.lease_generation == claimed.lease_generation + 1
+    await rebuilds.copy_checkpointed_vectors(
+        claimed.generation_id,
+        claimed.vector_publication_id,
+        owner="new-worker",
+        lease_generation=taken_over.lease_generation,
+        now=takeover_now,
+    )
+    # A takeover's claim resets state to `BUILDING`, exactly as it does the document loop's own
+    # checkpoint — replay is one more thing a new owner must redo before it may re-enter
+    # validation.
+    await rebuilds.begin_validation(
+        claimed.generation_id,
+        owner="new-worker",
+        lease_generation=taken_over.lease_generation,
+        now=takeover_now,
+    )
+    original_page_complete = vectors.publication_page_is_complete
+    seen: list[str] = []
+
+    async def tracking_page_complete(
+        publication_id: str, chunks: Sequence[Chunk], *, embedding_fingerprint: str
+    ) -> bool:
+        seen.append(chunks[0].document_id)
+        return await original_page_complete(
+            publication_id, chunks, embedding_fingerprint=embedding_fingerprint
+        )
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", tracking_page_complete)
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="new-worker",
+        lease_generation=taken_over.lease_generation,
+        now=takeover_now,
+    )
+    assert seen == [documents[0].id, documents[1].id], (
+        "a stale checkpoint from a superseded lease generation must not be trusted"
+    )
+
+
+async def test_replay_resumes_past_an_already_copied_page_under_the_same_lease(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker that crashes and retries under its own still-valid lease does not recopy.
+
+    Two documents replay one page at a time. The first attempt is made to crash while copying
+    the second page, after the first has already copied, verified and durably checkpointed. The
+    retry, still holding the same lease, must copy only the second.
+    """
+    monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 1)
+    rebuilds, vectors, claimed, documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="replay-worker"
+    )
+
+    # Past `_two_document_generation`'s own claim expiry (real time plus five minutes), so this
+    # is a genuine takeover rather than a live-owner conflict.
+    takeover_now = datetime.now(UTC) + timedelta(minutes=10)
+    taken_over = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "replay-two",
+        now=takeover_now,
+        expires_at=takeover_now + timedelta(minutes=5),
+    )
+    assert taken_over.predecessor_vector_publication_id == claimed.vector_publication_id
+
+    original_copy = vectors.copy_publication
+    copied: list[str] = []
+
+    async def crash_on_second_document(
+        source_publication_id: str, target_publication_id: str, chunks: Sequence[Chunk]
+    ) -> None:
+        copied.append(chunks[0].document_id)
+        await original_copy(source_publication_id, target_publication_id, chunks)
+        if chunks[0].document_id == documents[1].id:
+            raise VectorStoreStateError("private crash /private/path")
+
+    monkeypatch.setattr(vectors, "copy_publication", crash_on_second_document)
+    with pytest.raises(RebuildPublicationValidationError):
+        await rebuilds.copy_checkpointed_vectors(
+            claimed.generation_id,
+            claimed.vector_publication_id,
+            owner="replay-two",
+            lease_generation=taken_over.lease_generation,
+            now=takeover_now,
+        )
+    assert copied == [documents[0].id, documents[1].id]
+
+    sessions = session_factory(engine)
+    async with sessions() as session:
+        row = (await session.execute(select(models.DerivedGeneration))).scalar_one()
+        assert row.replay_lease_generation == taken_over.lease_generation
+        assert row.replay_checkpoint_sequence == 0
+        assert row.replayed_vector_count == 1
+
+    copied.clear()
+    monkeypatch.setattr(vectors, "copy_publication", original_copy)
+    resumed_copies: list[str] = []
+
+    async def counting_copy(
+        source_publication_id: str, target_publication_id: str, chunks: Sequence[Chunk]
+    ) -> None:
+        resumed_copies.append(chunks[0].document_id)
+        await original_copy(source_publication_id, target_publication_id, chunks)
+
+    monkeypatch.setattr(vectors, "copy_publication", counting_copy)
+    await rebuilds.copy_checkpointed_vectors(
+        claimed.generation_id,
+        claimed.vector_publication_id,
+        owner="replay-two",
+        lease_generation=taken_over.lease_generation,
+        now=takeover_now,
+    )
+    assert resumed_copies == [documents[1].id], "resume must not recopy the checkpointed page"
+
+
+async def test_last_progress_at_is_distinct_from_lease_renewal(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """A heartbeat that only renews a lease must not read as content progress.
+
+    ``renew_generation`` is the exact call the timer-driven lease heartbeat makes; it must move
+    ``lease_expires_at`` without moving ``last_progress_at``. Only a durable staged batch does.
+    """
+    run_id, blob_ref, raw = await promoted_snapshot(store, engine, data_dir)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine, workspace_id=store.workspace_id, blobs=BlobStore(engine, data_dir), vectors=vectors
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    claimed = await rebuilds.claim_generation(
+        plan.generation_id, "heartbeat-worker", now=NOW, expires_at=NOW + timedelta(minutes=5)
+    )
+    checkpoint = await rebuilds.checkpoint(claimed.generation_id)
+    assert checkpoint.last_progress_at is None
+
+    renewed = await rebuilds.renew_generation(
+        plan.generation_id,
+        "heartbeat-worker",
+        claimed.lease_generation,
+        now=NOW + timedelta(minutes=1),
+        expires_at=NOW + timedelta(minutes=6),
+    )
+    assert renewed.last_progress_at is None, "a lease renewal alone is not progress"
+    assert renewed.lease_expires_at == NOW + timedelta(minutes=6)
+
+    document = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=raw.as_bytes(),
+        uri=raw.uri,
+        media_type=raw.media_type,
+    ).model_copy(
+        update={
+            "publication_id": plan.generation_id,
+            "original_ref": blob_ref,
+            "version_token": "v2",
+            "status": DocumentStatus.INDEXED,
+        }
+    )
+    chunk = make_chunk(document, 0, raw.as_text())
+    await vectors.upsert(
+        [chunk], [[1.0, 0.0, 0.0, 0.0]], publication_id=claimed.vector_publication_id
+    )
+    staged_at = NOW + timedelta(minutes=2)
+    staged = await rebuilds.stage_replacements(
+        plan.generation_id,
+        [(0, DerivedReplacement(document=document, chunks=(chunk,), vector_embedded=1))],
+        expected_next_sequence=0,
+        owner="heartbeat-worker",
+        lease_generation=claimed.lease_generation,
+        now=staged_at,
+    )
+    assert staged.last_progress_at == staged_at, "a durable staged batch is real progress"
 
 
 # --- lease renewal during checkpoint replay ---------------------------------------------------

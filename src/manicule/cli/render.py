@@ -1265,6 +1265,15 @@ def render_rebuild_run(out: Console, payload: r.RebuildRunReport) -> None:
         f"{payload.chunks_built} chunks; "
         f"{payload.vectors_reused} vectors reused, {payload.vectors_embedded} embedded"
     )
+    if payload.replayed_items or payload.validated_items:
+        out.print(
+            f"replay: {payload.replayed_items}/{payload.expected_items} items, "
+            f"{payload.replayed_vectors} vectors; "
+            f"validated: {payload.validated_items}/{payload.expected_items} items, "
+            f"{payload.validated_vectors} vectors"
+        )
+    if payload.last_progress_at:
+        out.print(f"last progress: {escape(payload.last_progress_at)}")
     if payload.diagnostic_code:
         out.print(f"[red]diagnostic: {escape(payload.diagnostic_code)}[/red]")
 

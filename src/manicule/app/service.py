@@ -471,6 +471,13 @@ def _rebuild_run_report(checkpoint: RebuildCheckpoint) -> r.RebuildRunReport:
         chunks_built=checkpoint.chunks_built,
         vectors_reused=checkpoint.vectors_reused,
         vectors_embedded=checkpoint.vectors_embedded,
+        replayed_items=checkpoint.replayed_items,
+        replayed_vectors=checkpoint.replayed_vectors,
+        validated_items=checkpoint.validated_items,
+        validated_vectors=checkpoint.validated_vectors,
+        last_progress_at=(
+            checkpoint.last_progress_at.isoformat() if checkpoint.last_progress_at else None
+        ),
         diagnostic_code=(
             checkpoint.diagnostic_code.value if checkpoint.diagnostic_code is not None else None
         ),

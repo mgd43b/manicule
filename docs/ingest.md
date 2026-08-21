@@ -1818,6 +1818,25 @@ output must match an already-staged digest. Expected corruption or snapshot move
 same bounded validation/conflict envelopes and failed cleanup state. An unexpected worker crash
 is different: it keeps the checkpoint resumable and does not manufacture a validation diagnosis.
 
+**Replay and validation read relational evidence a bounded page at a time, not one document
+per round trip**, and durably checkpoint after each page. `_EVIDENCE_PAGE` bounds both the
+`derived_generation_items` page a replay or validation pass reads and the single bounded join
+that resolves that whole page's retained-snapshot rows — one relational lookup per page rather
+than one per document. Every completed page commits a fenced checkpoint
+(`replay_lease_generation`/`replay_checkpoint_sequence`/`replayed_vector_count` for replay,
+`validation_lease_generation`/`validation_checkpoint_sequence`/`validated_vector_count` for
+validation) alongside `last_progress_at`. A worker that crashes and retries under the *same*
+still-held lease generation resumes after its last committed page instead of redoing the whole
+phase; a checkpoint recorded under a superseded lease generation is never trusted; a real
+takeover always copies or validates from the beginning, because it names a fresh physical
+vector namespace the old checkpoint's evidence does not describe. `last_progress_at` moves only
+on a durable page, staged batch, or publication commit — never on the timer-driven lease
+heartbeat alone, so a healthy renewal against a stalled cursor cannot read as content progress.
+`rebuild status` and the dashboard expose `replayed_items`/`replayed_vectors`,
+`validated_items`/`validated_vectors`, and `last_progress_at` alongside the existing build
+counters, all workspace-scoped aggregates with no document, chunk, vector, or source identity in
+them.
+
 **A storage failure anywhere between the claim and publication settles the same way, and that
 settlement is a release rather than an ending.** The refusals the build anticipates each mark
 their own generation failed, which is right for a diagnosis — a corrupt manifest, a replacement

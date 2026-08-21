@@ -60,17 +60,24 @@ from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator, Sequence
     from contextlib import AbstractAsyncContextManager
     from datetime import datetime
 
     from sqlalchemy import CursorResult
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-    from manicule.core.content import Chunk
+    from manicule.core.content import Chunk, Document
 
 _REPLACEMENT = TypeAdapter(DerivedReplacement)
-_EVIDENCE_PAGE = 1
+_EVIDENCE_PAGE = 100
+"""Documents per bounded relational validation/replay page.
+
+Was ``1``: every takeover replay and every validation pass read and round-tripped one document
+at a time, turning a corpus of any size into that many serial SQLite queries. Matched against
+``_INVENTORY_PAGE`` rather than chosen independently, since both bound the same class of
+relational page and an operator reasoning about one should not have to learn a second number.
+"""
 _INVENTORY_PAGE = 100
 
 
@@ -239,6 +246,11 @@ def _vector_pages(chunks: Sequence[Chunk], *, max_bytes: int) -> Iterator[tuple[
 def _checkpoint(
     row: models.DerivedGeneration, *, predecessor_vector_publication_id: str | None = None
 ) -> RebuildCheckpoint:
+    # A checkpoint recorded under a lease generation other than the row's current one belongs
+    # to a superseded attempt — a takeover replays or validates into a fresh physical namespace,
+    # so that count is not this generation's progress and must read as zero rather than stale.
+    replay_current = row.replay_lease_generation == row.lease_generation
+    validation_current = row.validation_lease_generation == row.lease_generation
     return RebuildCheckpoint(
         generation_id=row.id,
         state=row.state,
@@ -251,6 +263,19 @@ def _checkpoint(
         lease_owner=row.lease_owner,
         lease_generation=row.lease_generation,
         lease_expires_at=row.lease_expires_at,
+        last_progress_at=row.last_progress_at,
+        replayed_items=(
+            row.replay_checkpoint_sequence + 1
+            if replay_current and row.replay_checkpoint_sequence is not None
+            else 0
+        ),
+        replayed_vectors=row.replayed_vector_count if replay_current else 0,
+        validated_items=(
+            row.validation_checkpoint_sequence + 1
+            if validation_current and row.validation_checkpoint_sequence is not None
+            else 0
+        ),
+        validated_vectors=row.validated_vector_count if validation_current else 0,
         fence_generation=row.fence_generation,
         diagnostic_code=(
             RebuildRefusalCode(row.diagnostic_code) if row.diagnostic_code is not None else None
@@ -829,7 +854,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildPublicationConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED)
             await self._require_live_vector_binding(session, generation)
 
-    async def copy_checkpointed_vectors(  # noqa: PLR0912 - explicit replay validation stages
+    async def copy_checkpointed_vectors(  # noqa: PLR0912, PLR0915 - explicit replay validation stages
         self,
         generation_id: str,
         source_publication_id: str,
@@ -838,11 +863,32 @@ class SqliteRebuildStore(WorkspaceScoped):
         lease_generation: int,
         now: datetime,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
-        """Replay only durable item vectors into a takeover's fresh physical namespace."""
+        """Replay only durable item vectors into a takeover's fresh physical namespace.
+
+        ``clock``, not bare ``utcnow()``, supplies each checkpoint commit's live timestamp:
+        callers that inject a deterministic clock everywhere else (tests, and the offline
+        runner's own ``self._clock``) need that same clock here too, or a checkpoint commit's
+        fresh-time fence would compare a caller's simulated time against the real wall clock and
+        refuse a lease the caller believes is still held.
+        """
+        live_clock = clock or utcnow
         target_publication = vector_publication_id(generation_id, owner, lease_generation)
-        after = -1
-        expected_vectors = 0
+        async with self._sessions() as session:
+            generation = await self._required_generation(session, generation_id)
+            self._require_lease(generation, owner, lease_generation, now)
+            # A checkpoint is only trustworthy under the lease generation that wrote it: that
+            # is what named `target_publication` above, so a matching record means this call is
+            # resuming the same in-progress copy into the same physical namespace rather than
+            # replaying after a takeover into a fresh, empty one.
+            resumable = generation.replay_lease_generation == lease_generation
+            after = (
+                generation.replay_checkpoint_sequence
+                if resumable and generation.replay_checkpoint_sequence is not None
+                else -1
+            )
+            expected_vectors = generation.replayed_vector_count if resumable else 0
         checkpoint_sequence: int | None = None
         while True:
             if cancel is not None and cancel.is_set():
@@ -910,6 +956,14 @@ class SqliteRebuildStore(WorkspaceScoped):
                         now=utcnow(),
                     )
             after = rows[-1].sequence
+            await self._commit_replay_checkpoint(
+                generation_id,
+                owner,
+                lease_generation,
+                checkpoint_sequence=after,
+                replayed_vectors=expected_vectors,
+                now=live_clock(),
+            )
         if await self._publication_row_count(target_publication) != expected_vectors:
             raise RebuildPublicationValidationError
         async with self._sessions.begin() as session:
@@ -919,6 +973,31 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildLeaseConflictError("checkpoint advanced during vector replay")
             generation.vector_publication_id = target_publication
             generation.updated_at = utcnow()
+
+    async def _commit_replay_checkpoint(
+        self,
+        generation_id: str,
+        owner: str,
+        lease_generation: int,
+        *,
+        checkpoint_sequence: int,
+        replayed_vectors: int,
+        now: datetime,
+    ) -> None:
+        """Persist one durable, fenced replay page boundary.
+
+        Bounded to one writer transaction per document page (not per vector, per
+        :data:`_EVIDENCE_PAGE`), and refused if this worker no longer holds the lease it copied
+        under — a superseded worker must not leave a checkpoint the new owner would trust.
+        """
+        async with self._sessions.begin() as session:
+            generation = await self._required_generation(session, generation_id)
+            self._require_lease(generation, owner, lease_generation, now)
+            generation.replay_lease_generation = lease_generation
+            generation.replay_checkpoint_sequence = checkpoint_sequence
+            generation.replayed_vector_count = replayed_vectors
+            generation.last_progress_at = now
+            generation.updated_at = now
 
     async def snapshot_inputs(
         self, generation_id: str, *, after_sequence: int, limit: int
@@ -1086,6 +1165,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 nested.vector_embedded for _, item in replacements for nested in item.flattened()
             )
             generation.vector_publication_id = current_vector_publication
+            generation.last_progress_at = now
             generation.updated_at = now
             await session.flush()
             return _checkpoint(generation)
@@ -1109,35 +1189,116 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation.updated_at = now
             return _checkpoint(generation)
 
-    async def validate_generation(self, generation_id: str) -> None:
+    async def validate_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: datetime,
+        cancel: asyncio.Event | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        """Verify every staged replacement's vectors in durable, resumable, fenced pages.
+
+        Staged items are sealed the moment ``begin_validation`` leaves ``BUILDING``
+        (:meth:`stage_replacements` refuses further writes once the state has moved on), so a
+        checkpoint recorded here under the lease generation that is still current is trustworthy
+        evidence rather than a bare counter — the same argument :meth:`copy_checkpointed_vectors`
+        makes for replay. A generation already ``PUBLISHED`` may still be asked to revalidate
+        (an operator confirmation, or a repair path); that read-only pass fences against nothing
+        because publication itself already settled the lease, and it neither trusts nor writes a
+        checkpoint since there is no in-progress attempt to resume.
+
+        ``clock`` supplies each checkpoint commit's live timestamp — see
+        :meth:`copy_checkpointed_vectors` for why that has to be the caller's own clock rather
+        than a bare ``utcnow()``.
+        """
+        live_clock = clock or utcnow
         async with self._sessions() as session:
             generation = await self._required_generation(session, generation_id)
             if generation.state not in {RebuildState.VALIDATING, RebuildState.PUBLISHED}:
                 raise RebuildPublicationValidationError
+            validating = generation.state is RebuildState.VALIDATING
+            if validating:
+                self._require_lease(generation, owner, lease_generation, now)
+            effective_owner = owner if validating else (generation.lease_owner or "")
+            effective_lease_generation = (
+                lease_generation if validating else generation.lease_generation
+            )
             await self._verify_complete_header(session, generation)
             target = RebuildTarget.model_validate(generation.target)
-            physical_publication = vector_publication_id(
-                generation_id, generation.lease_owner or "", generation.lease_generation
+            expected_item_count = generation.expected_item_count
+            resumable = validating and generation.validation_lease_generation == lease_generation
+            after = (
+                generation.validation_checkpoint_sequence
+                if resumable and generation.validation_checkpoint_sequence is not None
+                else -1
             )
-            expected_vectors = 0
-            after = -1
-            while after + 1 < generation.expected_item_count:
+            expected_vectors = generation.validated_vector_count if resumable else 0
+        physical_publication = vector_publication_id(
+            generation_id, effective_owner, effective_lease_generation
+        )
+        while after + 1 < expected_item_count:
+            if cancel is not None and cancel.is_set():
+                raise asyncio.CancelledError
+            async with self._sessions() as session:
+                generation = await self._required_generation(session, generation_id)
+                if validating:
+                    self._require_lease(generation, owner, lease_generation, now)
                 pairs = await self._evidence_page(session, generation, after=after)
-                for row, snapshot in pairs:
-                    replacement = self._validated_replacement(row, snapshot)
-                    chunks = replacement.flattened_chunks()
-                    expected_vectors += len(chunks)
-                    for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                        if not await self._publication_page_is_complete(
-                            physical_publication,
-                            page,
-                            embedding_fingerprint=target.embedding_fingerprint,
-                        ):
-                            raise RebuildPublicationValidationError
-                after = pairs[-1][0].sequence
-            if await self._publication_row_count(physical_publication) != expected_vectors:
-                raise RebuildPublicationValidationError
+            for row, snapshot in pairs:
+                replacement = self._validated_replacement(row, snapshot)
+                chunks = replacement.flattened_chunks()
+                expected_vectors += len(chunks)
+                for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
+                    if cancel is not None and cancel.is_set():
+                        raise asyncio.CancelledError
+                    if not await self._publication_page_is_complete(
+                        physical_publication,
+                        page,
+                        embedding_fingerprint=target.embedding_fingerprint,
+                    ):
+                        raise RebuildPublicationValidationError
+            after = pairs[-1][0].sequence
+            if validating:
+                await self._commit_validation_checkpoint(
+                    generation_id,
+                    owner,
+                    lease_generation,
+                    checkpoint_sequence=after,
+                    validated_vectors=expected_vectors,
+                    now=live_clock(),
+                )
+        if await self._publication_row_count(physical_publication) != expected_vectors:
+            raise RebuildPublicationValidationError
         await self._record_evidence_verification(generation_id)
+
+    async def _commit_validation_checkpoint(
+        self,
+        generation_id: str,
+        owner: str,
+        lease_generation: int,
+        *,
+        checkpoint_sequence: int,
+        validated_vectors: int,
+        now: datetime,
+    ) -> None:
+        """Persist one durable, fenced validation page boundary.
+
+        Bounded to one writer transaction per relational evidence page (not per vector, per
+        :data:`_EVIDENCE_PAGE`), and refused if this worker no longer holds the lease it
+        validated under — a superseded worker must not leave a checkpoint the new owner would
+        trust.
+        """
+        async with self._sessions.begin() as session:
+            generation = await self._required_generation(session, generation_id)
+            self._require_lease(generation, owner, lease_generation, now)
+            generation.validation_lease_generation = lease_generation
+            generation.validation_checkpoint_sequence = checkpoint_sequence
+            generation.validated_vector_count = validated_vectors
+            generation.last_progress_at = now
+            generation.updated_at = now
 
     async def publish_generation(
         self,
@@ -1359,6 +1520,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation.published_vector_inventory_digest = state.vector_inventory_digest
             generation.state = RebuildState.PUBLISHED
             generation.published_at = now
+            generation.last_progress_at = now
             generation.updated_at = now
             await self._settle_published_generation(session, generation, now=now)
             await session.flush()
@@ -2102,29 +2264,44 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
             ).scalars()
         )
-        snapshots: list[models.AcquisitionRecord] = []
+        documents: list[Document] = []
         for item in items:
             try:
-                document = _REPLACEMENT.validate_python(item.payload).document
+                documents.append(_REPLACEMENT.validate_python(item.payload).document)
             except ValueError as exc:
                 raise RebuildPublicationValidationError from exc
-            snapshot = (
-                await session.execute(
-                    select(models.AcquisitionRecord)
-                    .join(
-                        models.DerivedGenerationSnapshot,
-                        models.DerivedGenerationSnapshot.run_id == models.AcquisitionRecord.run_id,
-                    )
-                    .where(
-                        models.DerivedGenerationSnapshot.generation_id == generation.id,
-                        models.DerivedGenerationSnapshot.connector_name == document.source,
-                        models.AcquisitionRecord.workspace_id == self._workspace_id,
-                        models.AcquisitionRecord.source_id == document.source_id,
-                        models.AcquisitionRecord.blob_ref.is_not(None),
-                        models.AcquisitionRecord.acquired_source.is_not(None),
-                    )
+        # One bounded join per page rather than one round trip per document: the page is
+        # already capped at `_EVIDENCE_PAGE`, so the `IN` predicates below stay bounded by the
+        # same constant regardless of how large the generation is.
+        by_key: dict[tuple[str, str], models.AcquisitionRecord] = {}
+        if documents:
+            rows = await session.execute(
+                select(models.AcquisitionRecord, models.DerivedGenerationSnapshot.connector_name)
+                .join(
+                    models.DerivedGenerationSnapshot,
+                    models.DerivedGenerationSnapshot.run_id == models.AcquisitionRecord.run_id,
                 )
-            ).scalar_one_or_none()
+                .where(
+                    models.DerivedGenerationSnapshot.generation_id == generation.id,
+                    models.DerivedGenerationSnapshot.connector_name.in_(
+                        {document.source for document in documents}
+                    ),
+                    models.AcquisitionRecord.workspace_id == self._workspace_id,
+                    models.AcquisitionRecord.source_id.in_(
+                        {document.source_id for document in documents}
+                    ),
+                    models.AcquisitionRecord.blob_ref.is_not(None),
+                    models.AcquisitionRecord.acquired_source.is_not(None),
+                )
+            )
+            for record, connector_name in rows:
+                key = (connector_name, record.source_id)
+                if key in by_key:
+                    raise RebuildPublicationValidationError
+                by_key[key] = record
+        snapshots: list[models.AcquisitionRecord] = []
+        for document in documents:
+            snapshot = by_key.get((document.source, document.source_id))
             if snapshot is None:
                 raise RebuildPublicationValidationError
             snapshots.append(snapshot)

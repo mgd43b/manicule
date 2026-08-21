@@ -73,6 +73,9 @@
     <dt>State</dt><dd>{{ panels.rebuild_status.data.state }}</dd>
     <dt>Documents built</dt><dd>{{ panels.rebuild_status.data.documents_built }}</dd>
     <dt>Chunks built</dt><dd>{{ panels.rebuild_status.data.chunks_built }}</dd>
+    <dt>Vectors replayed</dt><dd>{{ panels.rebuild_status.data.replayed_items }} items, {{ panels.rebuild_status.data.replayed_vectors }} vectors</dd>
+    <dt>Vectors validated</dt><dd>{{ panels.rebuild_status.data.validated_items }} items, {{ panels.rebuild_status.data.validated_vectors }} vectors</dd>
+    <dt>Last progress</dt><dd>{{ panels.rebuild_status.data.last_progress_at or "none yet" }}</dd>
     <dt>Phase</dt><dd>{{ panels.rebuild_status.data.lifecycle.phase }}</dd>
   </dl>
   {% else %}{{ m.failed(panels.rebuild_status) }}{% endif %}
