@@ -145,6 +145,7 @@ class RebuildStore(Protocol):
         lease_generation: int,
         now: datetime,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None: ...
 
     async def snapshot_inputs(
@@ -189,6 +190,7 @@ class RebuildStore(Protocol):
         lease_generation: int,
         now: datetime,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None: ...
 
     async def publish_generation(
@@ -1083,6 +1085,7 @@ class OfflineGenerationRebuilder:
                     lease_generation=checkpoint.lease_generation,
                     now=self._clock(),
                     cancel=cancel,
+                    clock=self._clock,
                 )
             except RebuildPublicationConflictError as exc:
                 await self._fail_build_conflict(checkpoint, owner, exc)
@@ -1305,6 +1308,7 @@ class OfflineGenerationRebuilder:
                 lease_generation=checkpoint.lease_generation,
                 now=self._clock(),
                 cancel=cancel,
+                clock=self._clock,
             )
         except RebuildPublicationConflictError as exc:
             await self._fail_build_conflict(checkpoint, owner, exc)

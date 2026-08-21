@@ -50,7 +50,7 @@ from manicule.parsers.versions import parse_fingerprint
 from tests.ingest.fakes import BlockChunker, PassThrough
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
     from pathlib import Path
 
 
@@ -227,8 +227,9 @@ class FakeStore:
         lease_generation: int,
         now: object,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
     ) -> None:
-        del generation_id, source_publication_id, owner, lease_generation, now, cancel
+        del generation_id, source_publication_id, owner, lease_generation, now, cancel, clock
 
     async def snapshot_inputs(
         self, generation_id: str, *, after_sequence: int, limit: int
@@ -286,8 +287,9 @@ class FakeStore:
         lease_generation: int,
         now: object,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
     ) -> None:
-        del owner, lease_generation, now, cancel
+        del owner, lease_generation, now, cancel, clock
         assert generation_id == "generation-v2"
         assert not self.published
         if self.late_cancel is not None:
@@ -485,8 +487,9 @@ class ResumeVectorValidationStore(FakeStore):
         lease_generation: int,
         now: object,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
     ) -> None:
-        del generation_id, source_publication_id, owner, lease_generation, now, cancel
+        del generation_id, source_publication_id, owner, lease_generation, now, cancel, clock
         raise RebuildPublicationValidationError
 
 
@@ -501,8 +504,9 @@ class ResumeMemoryBoundStore(ResumeVectorValidationStore):
         lease_generation: int,
         now: object,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
     ) -> None:
-        del generation_id, source_publication_id, owner, lease_generation, now, cancel
+        del generation_id, source_publication_id, owner, lease_generation, now, cancel, clock
         raise RebuildPublicationValidationError(RebuildRefusalCode.MEMORY_BOUND)
 
 
@@ -611,8 +615,9 @@ class ValidationFailureStore(FakeStore):
         lease_generation: int,
         now: object,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
     ) -> None:
-        del generation_id, owner, lease_generation, now, cancel
+        del generation_id, owner, lease_generation, now, cancel, clock
         raise RuntimeError("invalid row https://wiki.example.test/private token=secret")
 
 
@@ -626,8 +631,9 @@ class ValidationConflictStore(FakeStore):
         lease_generation: int,
         now: object,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
     ) -> None:
-        del generation_id, owner, lease_generation, now, cancel
+        del generation_id, owner, lease_generation, now, cancel, clock
         raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
 
 
@@ -641,8 +647,9 @@ class ValidationStorageFailureStore(FakeStore):
         lease_generation: int,
         now: object,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
     ) -> None:
-        del generation_id, owner, lease_generation, now, cancel
+        del generation_id, owner, lease_generation, now, cancel, clock
         raise IntegrityError(
             "SELECT private_column FROM private_table WHERE secret = ?",
             ("cookie=secret",),
@@ -1519,8 +1526,9 @@ class ReplayingStore(FakeStore):
         lease_generation: int,
         now: object,
         cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
     ) -> None:
-        del generation_id, source_publication_id, owner, lease_generation, now
+        del generation_id, source_publication_id, owner, lease_generation, now, clock
         self.replay_started.set()
         waiters = [asyncio.ensure_future(self.renewed_enough.wait())]
         if cancel is not None:
