@@ -1,4 +1,4 @@
-"""The MCP server: forty-one tools, each a few lines over the application service.
+"""The MCP server: forty-two tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -212,6 +212,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "lifecycle_cleanup_generations",
     "lifecycle_release_history",
     "lifecycle_delete_snapshot",
+    "vector_checksum",
     "vector_index_build",
     "stats",
     "doctor",
@@ -860,6 +861,29 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         )
 
     @register.tool(READS)
+    async def vector_checksum() -> dict[str, Any]:
+        """Report whether the stored vectors are still numerically what was written.
+
+        Every vector this version writes records a checksum over the exact float32 values that
+        reach disk, and this recomputes each one and compares. It catches the corruption no
+        provenance check can — a bit flip that leaves one finite component as another finite
+        component, with the chunk id, embedding identity, fingerprint and dimension all intact.
+
+        A match means the numbers on disk are the numbers that were written. It does **not**
+        mean the model produced the right vector for the text; only re-embedding establishes
+        that, and nothing here calls the embedder. It also does not defend against anything able
+        to rewrite a vector and its checksum together.
+
+        Read-only on this surface: rows written before checksums existed are reported as
+        unverified, and `manicule vector-checksum --yes` is what backfills them. Aggregate
+        counts only — no checksum value, vector component, chunk text or document identifier.
+        """
+        return await dispatch(
+            "vector_checksum",
+            lambda: service.vector_checksum(verify=True, dry_run=True),
+        )
+
+    @register.tool(READS)
     async def lifecycle_reset_derived() -> dict[str, Any]:
         """Dry-run the derived-only reset. Source manifests and retained bytes are protected."""
         return await dispatch(
@@ -1096,6 +1120,7 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             lifecycle_cleanup_generations,
             lifecycle_release_history,
             lifecycle_delete_snapshot,
+            vector_checksum,
             vector_index_build,
             stats,
             doctor,

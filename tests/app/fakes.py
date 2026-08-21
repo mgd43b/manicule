@@ -35,7 +35,11 @@ from manicule.core.acquisition import AcquisitionRun
 from manicule.core.anchors import HeadingAnchor
 from manicule.core.ann import AnnIndexBuild, AnnIndexState, AnnLifecycle
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
-from manicule.core.embedding import IndexFingerprints
+from manicule.core.embedding import (
+    IndexFingerprints,
+    VectorChecksumBackfill,
+    VectorChecksumCoverage,
+)
 from manicule.core.errors import NameInUseError, UnknownEntityError
 from manicule.core.glossary import QueryExpansion
 from manicule.core.ids import chunk_id, content_hash, document_id
@@ -1135,6 +1139,18 @@ class FakeMaintenance:
     A dry run that reached storage as a real build is the failure this records — the same
     reason :attr:`backups` records its flag.
     """
+    vector_checksums: VectorChecksumCoverage | None = field(
+        default_factory=lambda: VectorChecksumCoverage(rows=1, recorded=1)
+    )
+    """Coverage the vector store reports, or ``None`` for a store that keeps no checksums.
+
+    Defaults to a fully covered one-row corpus, which is what a fake backend's corpus is after
+    a write by any build that has this contract. Tests about an upgrade set it themselves.
+    """
+    vector_checksum_backfills: list[tuple[int, bool]] = field(
+        default_factory=list[tuple[int, bool]]
+    )
+    """Every backfill asked for, as ``(limit, dry_run)``, on the same terms as the index build."""
 
     async def schema_revision(self) -> str | None:
         return self.revision
@@ -1175,6 +1191,23 @@ class FakeMaintenance:
             built=not dry_run and self.vector_index.due,
             dry_run=dry_run,
         )
+
+    async def vector_checksum_coverage(
+        self, *, recompute: bool = False
+    ) -> VectorChecksumCoverage | None:
+        coverage = self.vector_checksums
+        if coverage is None or not recompute:
+            return coverage
+        return replace(coverage, verified=coverage.recorded, recomputed=True)
+
+    async def backfill_vector_checksums(
+        self, *, limit: int, dry_run: bool = False
+    ) -> VectorChecksumBackfill | None:
+        self.vector_checksum_backfills.append((limit, dry_run))
+        coverage = self.vector_checksums
+        if coverage is None:
+            return None
+        return VectorChecksumBackfill(remaining=coverage.unverified, dry_run=dry_run)
 
     async def plan_reset_derived(self) -> LifecyclePlan:
         return LifecyclePlan(operation=LifecycleOperation.RESET_DERIVED)

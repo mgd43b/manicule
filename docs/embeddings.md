@@ -687,6 +687,12 @@ passes and nobody should meet it by accident.
   component is `NaN` or infinite, or if a finite Python value becomes infinite in Lance's
   float32 representation. The check runs at the shared canonicalization boundary before the
   vector can influence a publication identity or enter the index.
+- **A stored vector's metadata cannot vouch for its numbers.** Identity, fingerprint, dimension
+  and finiteness all stay true when one finite component becomes another finite component, so
+  every row also carries a versioned SHA-256 over the exact float32 values written to disk,
+  recomputed on read. It detects accidental corruption and nothing else — not whether the model
+  produced the right vector, and not an actor who can rewrite both halves.
+  `docs/storage.md` §6.2.5.
 - **A conversion is not the model.** `BAAI/bge-m3` ships no safetensors, so MLX runs community
   weights; a quantized one is a different vector space under the same name and is refused at
   load. §1.0.

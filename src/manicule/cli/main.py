@@ -653,6 +653,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "lifecycle_cleanup_generations": r.LifecycleReport,
     "lifecycle_release_history": r.LifecycleReport,
     "lifecycle_delete_snapshot": r.LifecycleReport,
+    "vector_checksum": r.VectorChecksumReport,
     "vector_index_build": r.VectorIndexReport,
     "vector_sweep": r.VectorSweepReport,
     "doctor": r.Diagnosis,
@@ -1847,6 +1848,54 @@ def sweep_vectors() -> None:
     submit(Command("vector_sweep", {}))
 
 
+@app.command("vector-checksum")
+def vector_checksum(
+    *,
+    verify: Annotated[
+        bool,
+        typer.Option(
+            "--verify",
+            help="Recompute every recorded checksum from the stored vector instead of only "
+            "counting the column. A bounded scan of the corpus; writes nothing.",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Perform one bounded backfill pass. Without it this only reports.",
+        ),
+    ] = False,
+) -> None:
+    """Report — and backfill — the checksums that prove stored vectors are numerically intact.
+
+    Every vector written by this version records a SHA-256 over the exact float32 values that
+    reach disk, and every read recomputes it. That catches the one corruption no other check
+    can: a bit flip that turns one finite component into another finite one, leaving the chunk
+    id, the embedding identity, the fingerprint, the dimension and the publication all correct.
+
+    Be clear about what it establishes. A match says the numbers on disk are the numbers that
+    were written. It does **not** say the model produced the right vector for the text — only
+    re-embedding says that, and it costs a corpus-sized forward pass rather than a hash. It also
+    does not defend against anything able to rewrite a vector and its checksum together; the
+    digest is unkeyed and stored beside what it describes.
+
+    Vectors written before this version carry no checksum. They stay readable and are reported
+    as unverified rather than as damaged — `--yes` runs one bounded pass that gives them one,
+    computed from the bytes already on disk, contacting nothing and re-embedding nothing. Run it
+    until `remaining` reaches zero; each pass resumes where the last stopped, and one more pass
+    after that reads nothing. Note what a backfilled checksum can and cannot claim: it fixes the
+    numbers as they are *now*, so it protects against future corruption and cannot detect past
+    corruption. Only a rebuild from retained source bytes can do that.
+    """
+    if not yes:
+        # The read path, taking no writer lock: this is a diagnostic, and one that cannot run
+        # while a sync is running is one nobody can use at the moment they want it.
+        emit("vector_checksum", lambda service: service.vector_checksum(verify=verify))
+        return
+    submit(Command("vector_checksum", {"verify": verify, "dry_run": False}))
+
+
 @app.command("build-vector-index")
 def build_vector_index(
     *,
@@ -1866,7 +1915,7 @@ def build_vector_index(
 
     Below `storage.ann_index_threshold` there is nothing to do: search over a few tens of
     thousands of vectors is exhaustive, exact and fast, and an index built early trades recall
-    for latency nobody is waiting on. Past it, `manicule status` reports the build as due and
+    for latency nobody is waiting on. Past it, `manicule index` reports the build as due and
     this is what performs it.
 
     Plans by default and writes nothing, like every other boundary here. The build itself is

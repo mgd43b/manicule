@@ -35,7 +35,14 @@ from typing import Protocol, runtime_checkable
 from manicule.core.anchors import Anchor
 from manicule.core.ann import AnnIndexBuild, AnnIndexState
 from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
-from manicule.core.embedding import EmbedFingerprint, StoredVector, TokenStates, Vector
+from manicule.core.embedding import (
+    EmbedFingerprint,
+    StoredVector,
+    TokenStates,
+    Vector,
+    VectorChecksumBackfill,
+    VectorChecksumCoverage,
+)
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.generation import Token
 from manicule.core.organization import (
@@ -435,6 +442,42 @@ class AnnIndexMaintenance(Protocol):
         self, *, threshold: int, force: bool = False, dry_run: bool = False
     ) -> AnnIndexBuild:
         """Bring the index up to what ``threshold`` asks for, without interrupting search."""
+        ...
+
+
+@runtime_checkable
+class VectorIntegrityMaintenance(Protocol):
+    """Optionally reports and repairs the numerical-integrity coverage of stored vectors.
+
+    Optional on the same terms as :class:`AnnIndexMaintenance`: the capability belongs to a
+    backend that persists vectors somewhere a checksum can be written beside them, not to every
+    backend. A store without it reports no coverage at all rather than a coverage of nothing —
+    ``docs/storage.md`` §6.2.5 is the contract these two methods execute.
+
+    Neither method may call an embedder, a parser, a connector or a source system. That is the
+    property the whole design rests on: numerical integrity is established from bytes already on
+    disk, which is why it can be checked routinely and re-embedding cannot.
+    """
+
+    async def checksum_coverage(
+        self, *, recompute: bool = False, page_size: int = 512
+    ) -> VectorChecksumCoverage:
+        """How many stored vectors carry a checksum, and — with ``recompute`` — still match.
+
+        Counting is cheap enough for a status page; recomputing is a bounded scan of the corpus
+        and is what an operator asks for. Aggregate counts only: no checksum value, no vector
+        component and no chunk identifier crosses this boundary.
+        """
+        ...
+
+    async def backfill_checksums(
+        self, *, limit: int = 512, dry_run: bool = False
+    ) -> VectorChecksumBackfill:
+        """Give one bounded page of pre-checksum rows the checksum their stored vector implies.
+
+        Resumable and idempotent: the page is selected by "records no checksum", so a finished
+        row is not a row the next pass can see and there is no cursor to lose.
+        """
         ...
 
 
@@ -1182,6 +1225,7 @@ __all__ = [
     "TagStore",
     "TokenStateEmbedder",
     "TrashStore",
+    "VectorIntegrityMaintenance",
     "VectorStore",
     "VersionStore",
     "aclose",

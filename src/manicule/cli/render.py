@@ -587,6 +587,63 @@ def render_vector_sweep(out: Console, payload: r.VectorSweepReport) -> None:
         out.print("[dim]nothing was waiting to be swept[/dim]")
 
 
+def _add_vector_checksum_rows(table: Table, coverage: r.VectorChecksumCoverageReport) -> None:
+    """Numerical integrity, as one line under the counts and a second only when it is owed.
+
+    Silent on a table nobody has looked at and on one that is fully covered by a mere count,
+    because a status page that printed a line about checksums every time would train people to
+    skip it — and the one time it says ``failed`` is the time it must not be skipped.
+    """
+    if not coverage.scanned:
+        return
+    if coverage.failed:
+        listed = ", ".join(f"{count} {kind}" for kind, count in sorted(coverage.failures.items()))
+        table.add_row("vector integrity", f"[red]{coverage.failed} row(s) failed[/red]")
+        table.add_row("  refusals", escape(listed))
+        return
+    if coverage.unverified:
+        table.add_row(
+            "vector integrity",
+            f"[yellow]{coverage.recorded} of {coverage.rows} row(s) checksummed[/yellow]",
+        )
+        table.add_row(
+            "  unverified",
+            f"[dim]{coverage.unverified} row(s) predate checksums; run "
+            f"[/dim]manicule vector-checksum --yes",
+        )
+        return
+    if coverage.recomputed:
+        table.add_row("vector integrity", f"[green]{coverage.verified} row(s) verified[/green]")
+
+
+def render_vector_checksum(out: Console, payload: r.VectorChecksumReport) -> None:
+    """Coverage, what the pass did, and the one sentence saying what to do next.
+
+    The detail line is always printed, including when nothing is wrong — this is a command
+    somebody runs *because* they are worried about a directory, and "nothing here needs doing"
+    is the answer they came for rather than noise.
+    """
+    if not payload.supported:
+        out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
+        return
+    coverage = payload.coverage
+    table = _folding_table()
+    table.add_row("vectors", str(coverage.rows))
+    table.add_row("checksummed", f"{coverage.recorded} of {coverage.rows}")
+    if coverage.recomputed:
+        table.add_row("verified", str(coverage.verified))
+        table.add_row("failed", str(coverage.failed))
+    if payload.written or payload.remaining or payload.unhashable:
+        table.add_row("written this pass", f"{payload.written} of {payload.scanned} read")
+        if payload.unhashable:
+            table.add_row("left untouched", f"{payload.unhashable} unhashable row(s)")
+        table.add_row("remaining", str(payload.remaining))
+    out.print(table)
+    if payload.dry_run and payload.remaining:
+        out.print("[dim]nothing was written; add [/dim]--yes[dim] to run one pass[/dim]")
+    out.print(f"[dim]{escape(payload.detail)}[/dim]")
+
+
 def render_vector_index(out: Console, payload: r.VectorIndexReport) -> None:
     table = _folding_table()
     before, after = payload.before, payload.after
@@ -629,6 +686,8 @@ def render_index_status(out: Console, payload: r.IndexStatus) -> None:
         table.add_row("  awaiting re-detection", str(payload.stale_glossary))
     if payload.vector_index is not None:
         _add_vector_index_rows(table, payload.vector_index)
+    if payload.vector_checksums is not None:
+        _add_vector_checksum_rows(table, payload.vector_checksums)
     table.add_row("schema", escape(payload.schema_revision or "unmigrated"))
     table.add_row("data directory", escape(payload.data_dir))
     out.print(table)
@@ -1269,6 +1328,9 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     ),
     r.CollectionCounts: lambda out, p: render_collection_counts(out, _as(r.CollectionCounts, p)),
     r.CollectionOrphans: lambda out, p: render_collection_orphans(out, _as(r.CollectionOrphans, p)),
+    r.VectorChecksumReport: lambda out, p: render_vector_checksum(
+        out, _as(r.VectorChecksumReport, p)
+    ),
 }
 """Payload type to renderer.
 

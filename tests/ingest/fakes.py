@@ -31,7 +31,9 @@ from manicule.core.content import (
     Retention,
 )
 from manicule.core.embedding import (
+    UNRECORDED_CHECKSUM,
     UNRECORDED_IDENTITY,
+    VECTOR_CHECKSUM_VERSION,
     EmbedFingerprint,
     IndexFingerprints,
     StoredVector,
@@ -40,6 +42,7 @@ from manicule.core.embedding import (
     choose_stored_vector,
     classify_stored_vector,
     embedding_input_identity,
+    vector_checksum,
 )
 from manicule.core.errors import ParseError
 from manicule.core.fingerprints import ChunkFingerprint
@@ -567,16 +570,19 @@ UTC_ZERO = datetime.fromtimestamp(0, tz=UTC)
 class VectorRow:
     """One stored row, holding what a Lance row holds.
 
-    The chunk travels with the vector because a real row carries ``chunk_json``, and the
-    embedding-input identity travels with both because a real row carries ``embed_identity``.
-    A fake that kept only the vector could not answer whether a stored vector still describes
-    a chunk, which is the question the reuse path is about.
+    The chunk travels with the vector because a real row carries ``chunk_json``, the
+    embedding-input identity travels with both because a real row carries ``embed_identity``,
+    and the checksum travels with all three because a real row carries ``vector_checksum``. A
+    fake that kept only the vector could not answer whether a stored vector still describes a
+    chunk, which is the question the reuse path is about — nor whether its numbers are still
+    the numbers that were written, which is the question the integrity path is about.
     """
 
     document_id: str
     vector: Vector
     embed_text: str
     identity: str
+    checksum: str = ""
 
 
 class MemoryVectors:
@@ -606,15 +612,23 @@ class MemoryVectors:
     ) -> None:
         del publication_id
         for chunk, vector in zip(chunks, vectors, strict=True):
+            # A tuple whatever the caller handed over. A real row is a typed column and reads
+            # back the same shape however it was written, so a fake that kept the caller's
+            # container would make a reused vector — which arrives as a tuple — compare unequal
+            # to the identical vector it replaced.
+            #
+            # **Checksummed over exactly what this store keeps**, which is the contract: a
+            # digest describes the persisted representation, and this store's is the tuple
+            # rather than Lance's normalized float32. `tests.fakes.MemoryVectorStore` is the
+            # one held to the backend contract, and it canonicalizes first because that is what
+            # its real counterpart persists.
+            stored = tuple(vector)
             self.rows[chunk.id] = VectorRow(
                 document_id=chunk.document_id,
-                # Stored as a tuple whatever the caller handed over. A real row is a typed
-                # column and reads back the same shape however it was written, so a fake that
-                # kept the caller's container would make a reused vector — which arrives as a
-                # tuple — compare unequal to the identical vector it replaced.
-                vector=tuple(vector),
+                vector=stored,
                 embed_text=chunk.embed_text,
                 identity=self._identity_of(chunk),
+                checksum=vector_checksum(stored),
             )
 
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
@@ -639,6 +653,10 @@ class MemoryVectors:
             stored_vector=list(row.vector),
             embed=self._fingerprint,
             middleware=self._middleware,
+            recorded_checksum=row.checksum,
+            recorded_checksum_version=(
+                VECTOR_CHECKSUM_VERSION if row.checksum else UNRECORDED_CHECKSUM
+            ),
         )
 
     def _row_by_identity(self, identity: str) -> VectorRow | None:

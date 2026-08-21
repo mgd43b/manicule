@@ -33,6 +33,7 @@ from manicule.connectors.enriched import AdapterOutcome
 from manicule.connectors.filesystem import ENRICHED_KEY
 from manicule.core.ann import AnnIndex, AnnIndexState, AnnLifecycle
 from manicule.core.content import Chunk, Document, DocumentStatus
+from manicule.core.embedding import VectorChecksumCoverage
 from manicule.core.errors import ConfigError, UnknownEntityError
 from manicule.core.ids import document_id
 from manicule.core.organization import CollectionRule
@@ -2822,6 +2823,144 @@ async def test_status_reports_whether_dense_search_is_still_exhaustive(
     assert status.vector_index.lifecycle == AnnLifecycle.EXHAUSTIVE
     assert status.vector_index.exact
     assert not status.vector_index.due
+
+
+async def test_status_reports_checksum_coverage_without_recomputing_it(
+    service: ApplicationService,
+) -> None:
+    """Two counts and a flag saying which question they answer.
+
+    ``status`` is polled. Recomputing every digest is a scan of the corpus, so what it reports
+    is how many rows *carry* a checksum — which is the question an upgrade is asking — and it
+    says so, because a cheap count rendered as verification is a clean bill of health nobody
+    earned.
+    """
+    status = await service.index_status()
+
+    assert status.vector_checksums is not None
+    assert (status.vector_checksums.rows, status.vector_checksums.recorded) == (1, 1)
+    assert not status.vector_checksums.recomputed
+    assert status.vector_checksums.verified == 0, "counting a column is not verifying it"
+    assert status.vector_checksums.complete
+
+
+async def test_status_separates_rows_awaiting_a_backfill_from_rows_that_failed(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """An upgrade in progress and a damaged directory call for opposite responses.
+
+    A single "96% healthy" would merge them, and the operator's next move differs entirely:
+    one is a bounded backfill they run when convenient, the other is a rebuild.
+    """
+    backend.maintenance_.vector_checksums = VectorChecksumCoverage(rows=100, recorded=40)
+
+    status = await service.index_status()
+
+    assert status.vector_checksums is not None
+    assert (status.vector_checksums.recorded, status.vector_checksums.unverified) == (40, 60)
+    assert status.vector_checksums.failed == 0
+    assert not status.vector_checksums.complete
+
+
+async def test_status_reports_no_coverage_at_all_for_a_store_that_keeps_none(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """``None`` is "this backend cannot answer", which is not a coverage of zero."""
+    backend.maintenance_.vector_checksums = None
+
+    status = await service.index_status()
+
+    assert status.vector_checksums is None
+
+
+async def test_doctor_calls_an_unfinished_backfill_degraded_and_names_the_command(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Not ``failing``: nothing is broken.
+
+    The rows are readable, searchable and correct as far as anything knows. What is true is
+    that nothing has vouched for their numbers yet — a thing to finish rather than a fault to
+    repair, and the remedy is a command somebody can actually run.
+    """
+    backend.maintenance_.vector_checksums = VectorChecksumCoverage(rows=100, recorded=40)
+
+    diagnosis = await service.doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vector_integrity")
+
+    assert check.state == "degraded"
+    assert check.remedy == "manicule vector-checksum --yes"
+    assert check.facts["unverified"] == 60
+
+
+async def test_doctor_calls_a_recorded_refusal_failing(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The other state, and the one no provenance check could have produced."""
+    backend.maintenance_.vector_checksums = VectorChecksumCoverage(
+        rows=100, recorded=100, verified=97, failed=3, failures={"mismatched": 3}, recomputed=True
+    )
+
+    diagnosis = await service.doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vector_integrity")
+
+    assert check.state == "failing"
+    assert check.facts["failed"] == 3
+
+
+async def test_doctor_exposes_no_checksum_value_or_chunk_identifier(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """``doctor --json`` is what somebody pastes into an issue.
+
+    Every fact is a count or a boolean, and the failure vocabulary is fixed, so the worst this
+    can disclose about a corpus is how big it is and what kind of damage it holds.
+    """
+    backend.maintenance_.vector_checksums = VectorChecksumCoverage(
+        rows=100, recorded=100, verified=99, failed=1, failures={"mismatched": 1}, recomputed=True
+    )
+
+    diagnosis = await service.doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vector_integrity")
+
+    assert all(isinstance(value, (int, bool)) for value in check.facts.values())
+
+
+async def test_the_checksum_command_plans_before_it_writes(service: ApplicationService) -> None:
+    """The default is the one that writes nothing, like every other boundary here."""
+    report = await service.vector_checksum()
+
+    assert report.supported
+    assert report.dry_run
+    assert report.coverage.rows == 1
+    assert not report.coverage.recomputed
+
+
+async def test_the_checksum_command_verifies_only_when_asked(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Recomputing is a scan of the corpus, so it is a flag rather than the default."""
+    verified = await service.vector_checksum(verify=True)
+
+    assert verified.coverage.recomputed
+    assert verified.coverage.verified == 1
+    assert backend.maintenance_.vector_checksum_backfills == [(512, True)], (
+        "even the verifying invocation plans the backfill rather than performing one"
+    )
+
+
+async def test_the_checksum_command_reports_a_backend_that_keeps_no_checksums(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """A refusal that names the store, rather than a report of zero coverage."""
+    backend.maintenance_.vector_checksums = None
+
+    report = await service.vector_checksum()
+
+    assert not report.supported
+    assert "does not" in report.detail
+    assert backend.maintenance_.vector_checksum_backfills == [], (
+        "a store with no lifecycle is not asked to run a pass of one"
+    )
 
 
 async def test_status_says_when_a_build_is_due_rather_than_only_that_none_exists(

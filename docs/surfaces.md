@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Forty-one MCP tools and thirty CLI commands. They are not a one-to-one mapping: some
+Forty-two MCP tools and thirty-one CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -278,6 +278,7 @@ server and the built command tree.
 | `rebuild_run` | — | `rebuild execute` / `rebuild resume` | durable derived generation publication |
 | `rebuild_status` | ✓ | `rebuild status` | private-safe aggregate rebuild checkpoint |
 | `vector_index_build` | ✓ dry-run only | `build-vector-index [--yes] [--force]` | ANN index state before and after; whether a build ran |
+| `vector_checksum` | ✓ verify only | `vector-checksum [--verify] [--yes]` | aggregate numerical-integrity coverage and typed failure counts; no checksum value or chunk id |
 | `vector_sweep` | — | `sweep-vectors` | vectors removed and documents purged in one bounded pass |
 | `lifecycle_reset_derived` | ✓ dry-run only | `reset-derived --dry-run/--yes` | aggregate derived rows removed; source roots retained |
 | `lifecycle_cleanup_generations` | ✓ dry-run only | `cleanup-derived-generations [--yes]` | eligible/protected generations and temporary bytes |
@@ -376,7 +377,7 @@ incremental walk, and is not the same claim as `false`. Absent `enumeration_offs
 corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The forty-one tools read
+assistant can call unattended should not be able to do any of that. The forty-two tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
 surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
 `collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
@@ -404,7 +405,7 @@ secret as a parameter, and a session cookie in a tool call is a session cookie i
 ### 4.1 What each tool says it does, and why that is not permission
 
 Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
-`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-four of the forty-one say they only
+`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-four of the forty-two say they only
 read.
 
 **They are a description, and nothing in manicule reads them back.** No tool is gated on its own

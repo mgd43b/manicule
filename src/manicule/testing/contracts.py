@@ -27,7 +27,13 @@ from typing import TYPE_CHECKING
 
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
-from manicule.core.embedding import EmbedFingerprint, Pooling, Vector, VectorState
+from manicule.core.embedding import (
+    EmbedFingerprint,
+    Pooling,
+    Vector,
+    VectorIntegrity,
+    VectorState,
+)
 from manicule.core.errors import ContextOverflowError, FingerprintMismatchError, ManiculeError
 from manicule.core.organization import ChunkRelationType, CitationState, CollectionRule
 from manicule.core.protocols import (
@@ -400,6 +406,58 @@ async def assert_vector_store_rejects_foreign_vectors(
     _fail(
         "the store accepted a second model with the same dimension. Vectors from two models "
         "are not comparable, and nothing downstream can detect that they were mixed"
+    )
+
+
+async def assert_vector_store_records_vector_checksums(
+    make_store: Callable[[], VectorStore], chunks: Sequence[Chunk]
+) -> None:
+    """Check that a store records a checksum over the numbers it actually persists.
+
+    Every provenance check a vector store makes compares a row against *metadata* — its
+    recorded embedding input, its fingerprint, its dimension, its publication. A bit flip that
+    turns one finite component into another finite component leaves all of that intact, so
+    without a checksum there is nothing in the row for the corruption to disagree with, and the
+    damaged vector is reused and ranked forever.
+
+    Run against every store manicule ships and any store a plugin contributes, because the
+    guarantee belongs to the *backend*: a store that wrote no checksum would report
+    :attr:`~manicule.core.embedding.VectorIntegrity.UNVERIFIED` for a row it had just written,
+    and the whole publication fence downstream would then refuse it.
+
+    Two cases, and the second is the one a store that hashes the wrong thing fails:
+
+    1. **A row just written verifies.** The store recorded a checksum and recomputing it from
+       what was read back matches.
+    2. **It verifies for a vector that is not already unit length.** A store that hashed the
+       *argument* rather than the canonical values it persists would pass the first case,
+       because a one-hot vector needs no normalization, and fail here — which is exactly the
+       shape of the bug, since real embedders return vectors a hair off unit length.
+    """
+    fingerprint = _fingerprint(8)
+    store = make_store()
+    await store.ensure_ready(fingerprint)
+    if not chunks:  # pragma: no cover - the caller supplies a fixture with enough
+        _fail("this check needs at least one chunk")
+    stored = chunks[0]
+
+    await store.upsert([stored], [[1.0 if column == 0 else 0.0 for column in range(8)]])
+    verdict = (await store.stored_vectors([stored]))[stored.id]
+    _require(
+        verdict.integrity is VectorIntegrity.VERIFIED,
+        f"the store read back a row it had just written as {verdict.integrity.value!r} rather "
+        f"than verified. A newly written row must record a checksum over the numbers it "
+        f"persists, or nothing downstream can tell a corrupted vector from a correct one",
+    )
+
+    await store.upsert([stored], [[3.0, -4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    rescaled = (await store.stored_vectors([stored]))[stored.id]
+    _require(
+        rescaled.integrity is VectorIntegrity.VERIFIED,
+        f"the store read back a rescaled vector as {rescaled.integrity.value!r}. The checksum "
+        f"has to be taken *after* whatever normalization and float32 conversion storage "
+        f"performs — hashing the caller's argument produces a digest that no readback can "
+        f"ever match, and every row then looks corrupt",
     )
 
 
@@ -1354,6 +1412,7 @@ __all__ = [
     "assert_tag_store_contract",
     "assert_trash_store_contract",
     "assert_vector_store_is_dimension_agnostic",
+    "assert_vector_store_records_vector_checksums",
     "assert_vector_store_rejects_foreign_vectors",
     "assert_version_store_contract",
     "closing",

@@ -570,6 +570,65 @@ the write commands already in flight, and the MCP sessions and the HTTP server c
 second `SIGTERM` — or a second `Ctrl-C` — stops waiting. `docs/surfaces.md` §6.2 has the order
 and why it is that order.
 
+### 6.4 Keeping the vectors honest
+
+Vectors are the one part of the data directory that no amount of metadata can vouch for. A
+chunk's text is content-addressed, a blob has a digest, a document has a fingerprint — but a
+vector is a thousand floats whose only distinguishing property is being those floats. Change one
+of them into another perfectly valid float and every identity, fingerprint, dimension and
+publication check in manicule still passes.
+
+So every vector manicule writes carries a SHA-256 over the exact `float32` values that reach
+disk, recomputed on every read. `docs/storage.md` §6.2.5 has the contract; what an operator needs
+is the four-way distinction it sits inside, because these get called "integrity" interchangeably
+and only one of them is what a green check means:
+
+| You want to know | What answers it | What it costs |
+|---|---|---|
+| Are the stored numbers the numbers that were written? | the vector checksum — `manicule vector-checksum --verify` | a hash per row; ~18,000 rows/s at `D = 1024` |
+| Is this vector this chunk's, made by this model? | the embedding-input identity and the fingerprint, on every read | a comparison per row |
+| Did the model produce the *right* vector for the text? | re-embedding, and nothing else | a forward pass per row — hours over a large corpus |
+| Could somebody have changed a vector without leaving a trace? | nothing manicule ships | out of scope |
+
+The last row is not a hedge. The checksum is unkeyed and stored beside the vector it describes,
+so anything with write access to the data directory can change both. It detects **accident** —
+bit rot, a partial write, a storage layer that rewrote a block — and says nothing about an
+actor. `<data_dir>` permissions (§2) are what keep actors out.
+
+**Reading the report.** `manicule index` with no path and `manicule doctor` both report
+coverage as two counts, and the distinction between them is the whole point:
+
+```text
+vector integrity   412 of 1,204 row(s) checksummed
+  unverified       792 row(s) predate checksums; run manicule vector-checksum --yes
+```
+
+`unverified` is not damage. It is a corpus indexed before this version, whose rows carry no
+checksum because none existed when they were written. They are readable, searchable and correct
+as far as anything knows; what is true is that nothing has vouched for their numbers.
+
+**After upgrading.** Run `manicule vector-checksum --yes` until `remaining` reaches zero. Each
+pass reads and rewrites one bounded page (`storage.checksum_backfill_batch`, default 512),
+hashes vectors already on disk, and contacts nothing — no model, no connector, no source system.
+It is safe to interrupt: the next pass selects rows that still record neither half of the
+checksum pair, so it resumes without a cursor and cannot duplicate or skip a row. Running it once
+more after it finishes reads nothing. Rows it will never touch — a vector it cannot hash, or a row
+holding one half of the pair and not the other — are reported as `failed` rather than backfilled,
+because writing over them would erase what they are telling you.
+
+**What a backfill cannot do.** It records a checksum over the bytes as they are *now*. A row that
+was already corrupted gets a digest over the corruption and verifies from then on. That is not
+fixable from inside — nothing on disk records what the vector used to be — so if you have reason
+to suspect *past* corruption, the answer is `manicule rebuild plan <snapshot>` followed by
+`manicule rebuild execute <snapshot>`, which re-derives vectors from the retained source bytes
+(`docs/storage.md` §7) rather than trusting what is in the vector table. A backfill protects the
+future; a rebuild is what re-establishes the past.
+
+**`failing` means something else entirely.** A recorded checksum that no longer matches its
+vector is a row whose numbers changed after they were written. `manicule vector-checksum
+--verify` reports how many and of what kind without printing any of them; the response is a
+rebuild of the affected generation and a look at the disk underneath it, not a backfill.
+
 ## 7. Still open
 
 Not settled here, and deliberately:

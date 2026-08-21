@@ -35,7 +35,11 @@ if TYPE_CHECKING:
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.ann import AnnIndexBuild, AnnIndexState
     from manicule.core.content import Chunk, Document, DocumentStatus
-    from manicule.core.embedding import IndexFingerprints
+    from manicule.core.embedding import (
+        IndexFingerprints,
+        VectorChecksumBackfill,
+        VectorChecksumCoverage,
+    )
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.organization import Collection as DocumentCollection
     from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
@@ -357,6 +361,27 @@ class Maintenance(Protocol):
 
         Returns ``None`` on a store without the capability, on the same terms as
         :meth:`vector_index_state`.
+        """
+        ...
+
+    async def vector_checksum_coverage(
+        self, *, recompute: bool = False
+    ) -> VectorChecksumCoverage | None:
+        """How much of the live generation's numerical integrity is established.
+
+        ``None`` for a vector store that keeps no checksums at all, which is a different claim
+        from a coverage of zero: one backend cannot answer the question, the other has a corpus
+        that is owed a backfill.
+        """
+        ...
+
+    async def backfill_vector_checksums(
+        self, *, limit: int, dry_run: bool = False
+    ) -> VectorChecksumBackfill | None:
+        """Run one bounded, resumable checksum backfill pass, or report what one would do.
+
+        Returns ``None`` on a store without the capability, on the same terms as
+        :meth:`vector_checksum_coverage`.
         """
         ...
 

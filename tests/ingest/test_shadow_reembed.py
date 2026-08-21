@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import struct
 from collections.abc import Sequence
 from dataclasses import asdict, replace
 from typing import override
@@ -11,7 +12,14 @@ from typing import override
 import pytest
 
 from manicule.core.content import Chunk, Document
-from manicule.core.embedding import EmbedFingerprint, Vector
+from manicule.core.embedding import (
+    VECTOR_CHECKSUM_VERSION,
+    EmbedFingerprint,
+    Vector,
+    VectorIntegrity,
+    vector_checksum,
+    verify_stored_checksum,
+)
 from manicule.core.errors import ContextOverflowError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.ingest.reembed import (
@@ -81,7 +89,7 @@ class Authority:
         self.highest_fence: dict[str, int] = {}
         self.generations: dict[str, ShadowGeneration] = {}
         self.seals: dict[str, ShadowInspection] = {}
-        self.rows: dict[str, dict[str, tuple[SnapshotChunk, tuple[float, ...]]]] = {}
+        self.rows: dict[str, dict[str, tuple[SnapshotChunk, tuple[float, ...], str]]] = {}
         self.receipts: dict[str, PublicationReceipt] = {}
         self.prepare_calls = 0
         self.upsert_attempts = 0
@@ -238,7 +246,10 @@ class Authority:
         target = self.rows[generation.id]
         for stored, vector in zip(chunks, vectors, strict=True):
             physical_id = f"{generation.id}:{stored.chunk.id}"
-            target[physical_id] = (stored, tuple(vector))
+            # A checksum over exactly what this store keeps, recorded on write and recomputed in
+            # `inspect` — the same two-sided rule the Lance backend follows, so a validation
+            # test run against this fake exercises the numerical fence rather than skipping it.
+            target[physical_id] = (stored, tuple(vector), vector_checksum(vector))
 
     async def inspect(
         self, generation: ShadowGeneration, *, lease: ReembedLease
@@ -251,9 +262,9 @@ class Authority:
         if self.inspection_override is not None:
             return self.inspection_override
         rows = self.rows[generation.id]
-        dimensions = {len(vector) for _, vector in rows.values()}
+        dimensions = {len(vector) for _, vector, _ in rows.values()}
         stored_rows = sorted(
-            (stored for stored, _ in rows.values()),
+            (stored for stored, _, _ in rows.values()),
             key=lambda item: (
                 item.chunk.document_id,
                 item.chunk.position,
@@ -266,18 +277,32 @@ class Authority:
         inventory = SnapshotChunkDigester()
         for stored in stored_rows:
             inventory.add(stored)
+        verdicts = [
+            verify_stored_checksum(
+                vector, recorded=checksum, version=VECTOR_CHECKSUM_VERSION, required=True
+            )
+            for _, vector, checksum in rows.values()
+        ]
+        failures: dict[str, int] = {}
+        for verdict in verdicts:
+            if verdict is not VectorIntegrity.VERIFIED:
+                failures[verdict.value] = failures.get(verdict.value, 0) + 1
         return ShadowInspection(
             rows=len(rows),
             unique_chunks=len({stored.chunk.id for stored in stored_rows}),
             dimension=dimensions.pop() if len(dimensions) == 1 else 0,
-            finite=all(math.isfinite(value) for _, vector in rows.values() for value in vector),
+            finite=all(math.isfinite(value) for _, vector, _ in rows.values() for value in vector),
             fingerprint=generation.fingerprint,
             inventory_digest=inventory.hexdigest(),
             lineage_valid=all(
                 physical_id == f"{generation.id}:{stored.chunk.id}"
-                for physical_id, (stored, _) in rows.items()
+                for physical_id, (stored, _, _) in rows.items()
             ),
             retrieval_ready=True,
+            checksums_verified=sum(
+                1 for verdict in verdicts if verdict is VectorIntegrity.VERIFIED
+            ),
+            checksum_failures=dict(sorted(failures.items())),
         )
 
     async def seal(
@@ -632,6 +657,7 @@ async def test_prepare_refuses_to_rebind_an_existing_shadow_identity() -> None:
     authority.rows[original.id]["sentinel"] = (
         SnapshotChunk(raw, f"legacy:{raw.id}", "legacy", raw.position + 1),
         (1.0,),
+        vector_checksum((1.0,)),
     )
 
     with pytest.raises(ReembedError, match="identity is immutable"):
@@ -847,6 +873,11 @@ async def test_shadow_reembed_refuses_actual_text_beyond_the_stored_chunk_policy
         ("sequence", "physical chunk inventory"),
         ("physical_key", "invalid chunk or embedding lineage"),
         ("missing", "expected 2 rows"),
+        # The one no other row in this table can catch. Every case above corrupts *metadata* —
+        # a vector id, a sequence, a physical key, a whole row — and the inventory digest or the
+        # lineage check disagrees with it. Move one finite component of the vector itself and
+        # every one of those still agrees; only the checksum written beside it does not.
+        ("vector", "numerical integrity"),
     ],
 )
 async def test_inspection_recomputes_actual_physical_rows_and_rejects_corruption(
@@ -862,13 +893,20 @@ async def test_inspection_recomputes_actual_physical_rows_and_rejects_corruption
     generation_id = f"shadow:{run.id}"
     rows = authority.rows[generation_id]
     physical_id = next(iter(rows))
-    stored, vector = rows[physical_id]
+    stored, vector, checksum = rows[physical_id]
     if corruption == "vector_id":
-        rows[physical_id] = (replace(stored, vector_id="corrupt-vector-id"), vector)
+        rows[physical_id] = (replace(stored, vector_id="corrupt-vector-id"), vector, checksum)
     elif corruption == "sequence":
-        rows[physical_id] = (replace(stored, sequence=stored.sequence + 100), vector)
+        rows[physical_id] = (replace(stored, sequence=stored.sequence + 100), vector, checksum)
     elif corruption == "physical_key":
         rows["wrong-physical-key"] = rows.pop(physical_id)
+    elif corruption == "vector":
+        moved = struct.unpack(">I", struct.pack(">f", vector[0]))[0] + 1
+        rows[physical_id] = (
+            stored,
+            (struct.unpack(">f", struct.pack(">I", moved))[0], *vector[1:]),
+            checksum,
+        )
     else:
         rows.pop(physical_id)
     authority.release_inspection.set()
@@ -903,6 +941,7 @@ async def test_validation_faults_never_replace_live_generation(
         inventory_digest=run.commitment.chunk_inventory_digest,
         lineage_valid=True,
         retrieval_ready=True,
+        checksums_verified=1,
     )
     authority.inspection_override = replace(valid, **change)
 
