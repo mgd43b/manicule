@@ -51,6 +51,7 @@ from manicule.storage.vectors import (
 )
 from tests.fakes import HashEmbedder
 from tests.storage_helpers import fingerprint, make_chunk, make_document
+from tests.vector_helpers import nudged, read_column, rewrite_row
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -570,6 +571,11 @@ async def test_on_disk_shadow_validates_publishes_and_runtime_follows_pointer(
     assert inspection.inventory_digest == run.commitment.chunk_inventory_digest
     assert inspection.lineage_valid
     assert inspection.retrieval_ready
+    assert inspection.checksums_verified == 1, (
+        "the numerical check rides along with the read the inspection was already doing, so a "
+        "validated generation has had every one of its vectors recomputed and compared"
+    )
+    assert not inspection.checksum_failures
     with pytest.raises(ReembedError, match="exact validated shadow generation"):
         await shadows.seal(generation, replace(inspection, finite=False), lease=lease)
     await shadows.seal(generation, inspection, lease=lease)
@@ -1086,6 +1092,63 @@ async def test_inspection_recomputes_every_retrieval_and_source_identity_column(
         not inspection.lineage_valid
         or inspection.inventory_digest != run.commitment.chunk_inventory_digest
     )
+
+
+async def test_a_mutated_vector_fails_the_shadow_seal_though_every_identity_still_matches(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    """The one corruption the ten identity columns above cannot see.
+
+    Every column in the parametrized test is *metadata*, and a bit flip in the vector changes
+    none of it: the physical key, the chunk id, the document, the kind, the language, the
+    position, the embedding identity and the whole source lineage stay exactly right. What
+    moves is one finite float32 into the next one, and the checksum written beside it is the
+    only thing in the row with an opinion about that.
+
+    A publication is the last moment anything is watching, so the seal refuses rather than
+    recording an inspection that verified nothing.
+    """
+    clock = Clock()
+    _, shadows, _, lease, generation, source, vector, _ = await seeded_run(
+        engine, store, data_dir, clock, run_id="mutated-vector"
+    )
+    await shadows.upsert(generation, [source], [vector], lease=lease)
+    embed = HashEmbedder(dimension=4).fingerprint
+    directory = shadows.directory(generation.id)
+    stored = await read_column(directory, embed, source.chunk.id, "vector")
+    await rewrite_row(directory, embed, source.chunk.id, {"vector": nudged(stored)})
+
+    inspection = await shadows.inspect(generation, lease=lease)
+
+    assert inspection.lineage_valid, (
+        "every identity column still agrees, which is precisely why the checksum is needed"
+    )
+    assert inspection.checksums_verified == 0
+    assert inspection.checksum_failures == {"mismatched": 1}
+    with pytest.raises(ReembedError, match="exact validated shadow generation"):
+        await shadows.seal(generation, inspection, lease=lease)
+
+
+async def test_an_inspection_that_verified_no_checksums_cannot_seal_a_generation(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    """The field defaults to zero, and the seal compares it to the planned chunk count.
+
+    That is what makes an inspection taken by a build without this contract — restored from a
+    persisted record written before the upgrade — fail closed. A boolean would have defaulted
+    to "fine" and published a generation nothing had checked.
+    """
+    clock = Clock()
+    _, shadows, _, lease, generation, source, vector, _ = await seeded_run(
+        engine, store, data_dir, clock, run_id="unverified-seal"
+    )
+    await shadows.upsert(generation, [source], [vector], lease=lease)
+    inspection = await shadows.inspect(generation, lease=lease)
+
+    with pytest.raises(ReembedError, match="exact validated shadow generation"):
+        await shadows.seal(generation, replace(inspection, checksums_verified=0), lease=lease)
+
+    await shadows.seal(generation, inspection, lease=lease)
 
 
 async def test_inspection_pages_are_stably_keyset_bounded(data_dir: Path) -> None:

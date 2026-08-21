@@ -231,6 +231,7 @@ def _installation(backend: FakeBackend) -> FakeBackend:
     # itself writes nothing — that is what this test is checking, and the recorder cannot be
     # the thing that fails it.
     copied.maintenance_.vector_index_builds.clear()
+    copied.maintenance_.vector_checksum_backfills.clear()
     return copied
 
 
@@ -291,6 +292,7 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
         "snapshot_verify": {"snapshot_id": "read-snapshot"},
         "rebuild_plan": {"snapshot_id": "read-snapshot"},
         "rebuild_status": {"generation_id": "read-generation"},
+        "vector_checksum": {},
         "vector_index_build": {},
         "config_get": {},
         "workspace_list": {},

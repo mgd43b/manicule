@@ -521,6 +521,17 @@ class StorageSettings(Section):
         "permanently and leaves any index already built alone.",
     )
 
+    checksum_backfill_batch: int = Field(
+        default=512,
+        ge=1,
+        le=10_000,
+        description="Vector rows one pass of `manicule vector-checksum --yes` reads and "
+        "rewrites. The bound on both its memory and the work a crash can lose: the pass "
+        "selects rows that record no checksum, so an interruption costs at most this many rows "
+        "and the next pass resumes without a cursor. Larger is fewer Lance commits over a big "
+        "corpus; smaller is a shorter interval in which a rewrite is in flight.",
+    )
+
     @field_validator("ann_index_threshold")
     @classmethod
     def _threshold_can_be_honored(cls, value: int) -> int:

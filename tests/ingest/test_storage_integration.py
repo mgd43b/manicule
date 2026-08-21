@@ -1994,7 +1994,7 @@ async def test_durable_enumeration_finishes_before_slow_indexing_can_age_a_curso
     assert reembedded.state is ReembedState.PUBLISHED
     assert reembedded.chunks_completed == 1_000
     assert len(second_rows) == 1_000
-    assert len({stored.chunk.id for stored, _ in second_rows.values()}) == 1_000
+    assert len({stored.chunk.id for stored, _, _ in second_rows.values()}) == 1_000
     assert set(authority.live_during_upsert) == {"live-old"}
     assert authority.live.generation_id == reembedded.shadow_generation_id
     assert parser.calls == parser_calls_before_reembed

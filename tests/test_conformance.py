@@ -29,6 +29,7 @@ from manicule.testing import (
     assert_refuses_oversized_chunks,
     assert_retrieval_stage_contract,
     assert_vector_store_is_dimension_agnostic,
+    assert_vector_store_records_vector_checksums,
     assert_vector_store_rejects_foreign_vectors,
     assert_vector_store_reuses_by_embedding_input,
     closing,
@@ -51,6 +52,7 @@ from tests.fakes import (
     MemoryVectorStore,
     MutatingStage,
     PassThroughMiddleware,
+    PrehashingVectorStore,
     RawVectorStage,
     RedactingMiddleware,
     SilentParser,
@@ -229,6 +231,24 @@ async def test_a_store_that_guards_its_fingerprint_passes() -> None:
 async def test_a_store_that_answers_reuse_on_the_embedding_input_passes() -> None:
     chunks = make_chunks(make_document())
     await assert_vector_store_reuses_by_embedding_input(MemoryVectorStore, chunks)
+
+
+async def test_a_store_that_records_a_checksum_over_what_it_persists_passes() -> None:
+    chunks = make_chunks(make_document())
+    await assert_vector_store_records_vector_checksums(MemoryVectorStore, chunks)
+
+
+async def test_a_store_that_hashes_the_argument_rather_than_the_stored_vector_is_caught() -> None:
+    """The plausible wrong implementation, and it passes every other check in this file.
+
+    Hashing what the caller handed over is one line shorter than hashing what gets written, and
+    it works perfectly for a vector that is already unit length — which every fixture in this
+    suite happens to be. It fails the moment a real embedder returns something a hair off, and
+    then every row in the corpus reads as corrupt.
+    """
+    chunks = make_chunks(make_document())
+    with pytest.raises(AssertionError, match="rescaled"):
+        await assert_vector_store_records_vector_checksums(PrehashingVectorStore, chunks)
 
 
 async def test_a_store_that_answers_reuse_on_the_chunk_id_is_caught() -> None:

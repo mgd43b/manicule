@@ -1620,6 +1620,108 @@ class VectorIndexState(Payload):
     )
 
 
+class VectorChecksumCoverageReport(Payload):
+    """How much of the vector store's numerical integrity is established, in counts only.
+
+    ``docs/storage.md`` §6.2.5 is the contract behind these numbers, and the distinction it
+    turns on is the one this payload is shaped to keep: a *checksum* proves the stored numbers
+    are the numbers that were written, and proves nothing whatsoever about whether the model
+    produced the right vector or about an actor able to rewrite both halves.
+
+    **Nothing private is here and nothing private can be added.** No checksum value, no vector
+    component, no chunk text, no document identifier and no source metadata — every field is an
+    integer, a boolean, or a fixed vocabulary of failure names. That is what makes it safe on a
+    surface an assistant can call and in output a shell pipeline redirects.
+    """
+
+    rows: int = Field(default=0, ge=0, description="Vectors in the live generation's table.")
+    recorded: int = Field(
+        default=0,
+        ge=0,
+        description="Rows carrying a checksum. Equal to ``rows`` once the backfill has "
+        "finished, and the number an upgrade watches climb.",
+    )
+    unverified: int = Field(
+        default=0,
+        ge=0,
+        description="Rows recording no checksum. Readable, and reported rather than hidden: "
+        "these are not damaged, they are unchecked. `manicule vector-checksum --yes` clears "
+        "them, and only a rebuild can make them checksum-verifiable retroactively.",
+    )
+    verified: int = Field(
+        default=0,
+        ge=0,
+        description="Rows whose checksum was recomputed from the stored vector and matched. "
+        "``0`` unless ``recomputed``, because counting a column is not verifying it.",
+    )
+    failed: int = Field(
+        default=0,
+        ge=0,
+        description="Rows a recomputed checksum refused. Non-zero means stored numbers "
+        "changed without their checksum changing with them.",
+    )
+    failures: dict[str, int] = Field(
+        default_factory=dict,
+        description="Refusal kind to count — ``mismatched``, ``malformed``, "
+        "``unknown_version``, ``non_finite``, ``wrong_dimension``, ``unreadable``. Bounded by "
+        "the vocabulary, so the worst this can print is which kinds of damage exist and how "
+        "much of each.",
+    )
+    recomputed: bool = Field(
+        default=False,
+        description="Whether the digests were recomputed or the rows carrying one were merely "
+        "counted. Counting is what ``status`` can afford; recomputing is a bounded scan an "
+        "operator asks for. Saying which is what stops a cheap count reading as a clean bill "
+        "of health.",
+    )
+    scanned: bool = Field(
+        default=True,
+        description="Whether there was a vector table to look at. ``False`` is 'nothing was "
+        "examined', which is a different claim from every count being zero.",
+    )
+    complete: bool = Field(
+        default=False,
+        description="Whether every row carries a checksum and no recorded one was refused.",
+    )
+
+
+class VectorChecksumReport(Payload):
+    """What one pass of the vector-checksum boundary did, or would do.
+
+    ``coverage`` is the same shape ``status`` reports, so a plan, a run and the status read a
+    minute later are read the same way rather than being three vocabularies for one subject.
+    """
+
+    coverage: VectorChecksumCoverageReport = Field(
+        default_factory=VectorChecksumCoverageReport,
+        description="Coverage after the pass, or as it stands for a plan.",
+    )
+    scanned: int = Field(default=0, ge=0, description="Rows without a checksum this pass read.")
+    written: int = Field(
+        default=0, ge=0, description="Rows this pass gave a checksum. Never more than ``scanned``."
+    )
+    unhashable: int = Field(
+        default=0,
+        ge=0,
+        description="Rows whose stored vector could not be checksummed — non-finite, or "
+        "unreadable — and were therefore left exactly as they were. A checksum over an "
+        "already-damaged vector would certify the damage.",
+    )
+    remaining: int = Field(
+        default=0,
+        ge=0,
+        description="Rows still recording no checksum. Run the command again until it is zero; "
+        "each pass is bounded and resumes where the last one stopped.",
+    )
+    dry_run: bool = False
+    supported: bool = Field(
+        default=True,
+        description="Whether the configured vector store keeps checksums at all. ``False`` is "
+        "a backend with no numerical-integrity lifecycle, not a corpus with no coverage.",
+    )
+    detail: str = Field(default="", description="What happened, or why nothing did.")
+
+
 class IndexStatus(Payload):
     """What is in the index, and whether it is coherent.
 
@@ -1671,6 +1773,13 @@ class IndexStatus(Payload):
         description="Whether dense search is exhaustive, indexed or stale. ``None`` means the "
         "configured vector store has no ANN lifecycle to report on — a different claim from "
         "``exhaustive``, which is a store that has one and is deliberately not using it.",
+    )
+    vector_checksums: VectorChecksumCoverageReport | None = Field(
+        default=None,
+        description="How much of the stored vectors' numerical integrity is established. "
+        "Counted rather than recomputed here, because ``status`` is read often and a scan of "
+        "the corpus is not free; `manicule vector-checksum --verify` is what recomputes. "
+        "``None`` means the configured vector store keeps no checksums at all.",
     )
     schema_revision: str | None = None
     data_dir: str = ""

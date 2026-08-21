@@ -59,6 +59,7 @@ from manicule.storage.vectors import (
 from manicule.testing import (
     assert_protocol_signatures,
     assert_vector_store_is_dimension_agnostic,
+    assert_vector_store_records_vector_checksums,
     assert_vector_store_rejects_foreign_vectors,
     assert_vector_store_reuses_by_embedding_input,
 )
@@ -763,6 +764,23 @@ async def test_the_store_answers_reuse_on_the_embedding_input(tmp_path: Path) ->
 
     chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
     await assert_vector_store_reuses_by_embedding_input(make_store, chunks)
+
+
+async def test_the_store_records_a_checksum_over_the_numbers_it_persists(tmp_path: Path) -> None:
+    """The numerical-integrity contract, against the backend that ships.
+
+    The Lance column is ``fixed_size_list<float32, d>`` and the store normalizes on the way in,
+    so the values it writes are not the values it was handed. A checksum taken anywhere but
+    after that conversion is one no readback can match.
+    """
+    made: list[LanceVectorStore] = []
+
+    def make_store() -> VectorStore:
+        store = LanceVectorStore(tmp_path / f"vectors-{len(made)}")
+        made.append(store)
+        return store
+
+    await assert_vector_store_records_vector_checksums(make_store, [chunk("chunk-0")])
 
 
 async def test_publications_keep_two_vectors_for_one_stable_chunk_id(tmp_path: Path) -> None:

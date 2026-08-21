@@ -2392,6 +2392,7 @@ MINIMAL: dict[str, list[str]] = {
     "restore": ["backup", "--restore", "backup.tar.gz"],
     "snapshot_status": ["connector", "snapshot", "handbook"],
     "upgrade": ["upgrade"],
+    "vector_checksum": ["vector-checksum", "--yes"],
     "vector_index_build": ["build-vector-index", "--yes"],
     "vector_sweep": ["sweep-vectors"],
     "workspace_switch": ["workspace", "switch", "other"],

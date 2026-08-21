@@ -1096,7 +1096,7 @@ generation, so two status reads at identical coverage can still be told apart.
 #### 6.2.4 Why publication does not build
 
 The build is an operator's action, reached through `manicule build-vector-index` and reported
-by `manicule status`. It is deliberately *not* scheduled by the publication that crosses the
+by `manicule index` with no path. It is deliberately *not* scheduled by the publication that
 threshold: an IVF_PQ build over a six-figure corpus is minutes of CPU, and the boundary that
 would otherwise own it is a document commit with a person waiting on it. The publication makes
 the build **due**; it does not perform it.
@@ -1114,6 +1114,136 @@ and cleared after it, and a crash in between leaves a marker that outlives the w
 needs a lease to resolve for rebuilds. Nothing here is worth that machinery, because there is
 nothing to resume. A build that dies has changed nothing, and the state it left behind is the
 state it started in — still `pending`, still `stale`, still due for the same reason.
+
+#### 6.2.5 Numerical integrity: the corruption every other check waves through
+
+Every guard described above compares a row against **metadata**. §6.2 checks the recorded
+embedding-input identity against the chunk stored beside it; §6.3 checks the fingerprint; the
+publication fence checks the dimension, the finiteness of every component, and that the row
+belongs to the generation being published.
+
+Now change one finite component of a stored vector into another finite component — a bit flip
+in a page cache, a partial write, a storage layer that rewrote a block. Every one of those
+checks still passes. The row is the right chunk's, under the right model, of the right length,
+in the right generation, and every number in it is perfectly rankable. Nothing in the row
+disagrees with anything else in it, so the damaged vector is reused, ranked and cited for as
+long as the corpus lives.
+
+Re-running the model would catch it. That costs a forward pass per row, which is the price this
+whole subsystem exists to avoid paying, so it cannot be the routine check. What is affordable
+is a hash: `tests/benchmarks/vector_checksum.py` measures roughly **18,000 rows per second**
+at `D = 1024` on an M-series laptop for creation and for verification alike — about 76 MB/s of
+persisted vector — against a real embedder's tens to low hundreds of texts per second. Two
+orders of magnitude is what makes one of these a thing you can do on every read and the other a
+thing you do once.
+
+##### The contract
+
+`manicule.core.embedding.vector_checksum` is the only implementation, shared by every backend
+and every write, reuse, read, copy, rebuild and publication-validation path. It is versioned as
+`VECTOR_CHECKSUM_VERSION`, currently `"1"`, and that version is stored in its own column beside
+every digest — so changing the rule is a migration somebody executes rather than a silent
+reinterpretation of everything already written. A row recording a version this build does not
+implement is refused, not recomputed under the current rule.
+
+Version `1` hashes, with SHA-256:
+
+| Part | Value | Why |
+|---|---|---|
+| domain | `manicule/vector-checksum/1\x1f` | A digest is meaningless outside the domain it was taken for. The terminator cannot begin a length field, so one version's separator is not a prefix of another's |
+| dimension | 8 bytes, big-endian, unsigned | Fixed-width and first, so no two shapes share a preimage. Without it the empty vector collides with anything |
+| components | IEEE-754 `binary32`, big-endian, index order | `binary32` because that *is* the persisted dtype — the column is `fixed_size_list<float32, d>`, so hashing `float64` would hash a representation that does not exist on disk. Big-endian because the preimage is a defined serialization rather than a memory image, so the digest is identical on a little-endian and a big-endian host |
+
+`-0.0` is hashed as `+0.0`: the two are numerically equal, rank identically, and differ in a
+sign bit that an Arrow round trip or a copy is entitled to drop. Hashing them apart would make a
+*representation* change report as numerical corruption, which is the false positive that teaches
+an operator to ignore the check. Non-finite components are refused rather than hashed, so a
+checksum can never certify a vector that cannot participate in cosine distance.
+
+**The preimage contains no fingerprint and no vector identity, deliberately.** Provenance is
+already checked separately and mandatorily; a digest that mixed the two would report one failure
+for two unrelated causes, and would make the same bytes checksum differently in two publications
+so that a copy could not be verified without rehashing it under a new scope. Numerical integrity
+is about the numbers.
+
+**The checksum is taken after canonicalization, never before.** `canonical_stored_vector` is
+what a write actually persists — normalized, rounded to float32 — and hashing the caller's
+argument instead would produce a digest that no readback could ever match, turning the entire
+corpus corrupt on the first search after a deploy. `assert_vector_store_records_vector_checksums`
+in `manicule.testing` holds every backend, including plugin ones, to that; it is the check a
+plausible one-line-shorter implementation fails.
+
+##### What it establishes, and the two things it does not
+
+A match means **the numbers on disk are the numbers that were written**. That is the whole
+claim, and the two exclusions are as important as the claim:
+
+- **It is not semantic correctness.** Nothing here says the model produced the right vector for
+  the text. Only re-embedding says that.
+- **It is not tamper resistance.** The digest is unkeyed and stored beside what it describes, so
+  anything able to rewrite the vector can rewrite the checksum. Defending against that needs a
+  keyed or externally anchored design, and it is out of scope rather than quietly implied.
+
+Four kinds of integrity get confused with each other, and an operator has to be able to tell
+them apart:
+
+| Kind | Answered by | Cost |
+|---|---|---|
+| Numerical — are the stored numbers what was written | the checksum | a hash per row |
+| Provenance — is this vector this chunk's, under this model | embedding-input identity + fingerprint (§6.2, §6.3) | a comparison per row |
+| Semantic — did the model produce the right vector | re-embedding, and nothing else | a forward pass per row |
+| Adversarial — could somebody have changed it undetectably | nothing here | out of scope |
+
+##### Where it is enforced
+
+- Every row written records `vector_checksum` and `vector_checksum_version`.
+- `classify_stored_vector` recomputes and refuses a mismatch, after the dimension and finiteness
+  checks and before the row is called readable. A refused row is `CORRUPT`, and `VectorIntegrity`
+  names *which* check failed: `mismatched`, `malformed`, `unknown_version`, `wrong_dimension`,
+  `non_finite`, `unreadable`, `missing`.
+- Search drops a mismatched row rather than ranking it, so a query can return fewer than `k`
+  candidates over a damaged directory. That is the honest outcome; the alternative is filling the
+  gap with rows that ranked *behind* the ones being refused.
+- Shadow-generation inspection verifies every checksum during the pass it was already making
+  over those rows, and the seal refuses a generation whose verified count is short.
+- The publication fence requires a checksum. The same row that reads as `unverified` to ordinary
+  reuse reads as `missing` here, because "we have not checked it yet" is not a thing to publish.
+
+##### Compatibility: what happens to a directory written before this existed
+
+**Legacy rows stay readable and are reported as unverified.** The columns are added by the same
+`add_columns` migration that added `embed_identity` (§6.5) — no row rewritten, no vector read, no
+forward pass — and every existing row then holds an empty checksum.
+
+The alternative was to treat an absent checksum as corruption, and it is worth saying why that
+is wrong. It would declare a working corpus damaged on the strength of a column that had just
+been added, and the operator's only recovery would be the corpus-wide re-embed this subsystem
+exists to avoid. So the policy is *unverified until backfilled*, and the reporting is built so
+that "unverified" can never be mistaken for "verified":
+
+- `status` and `doctor` report `recorded` and `unverified` as separate counts, and `doctor`
+  reads `degraded` while any remain.
+- A checksum-required publication refuses an unverified row outright, so a new generation is
+  never reported as covered when its coverage is incomplete.
+- `VectorChecksumCoverage.recomputed` says whether the digests were *recomputed* or the rows
+  carrying one were merely *counted*, because both get called "coverage" and only one of them is
+  affordable on a status page.
+
+`manicule vector-checksum --yes` runs the backfill: one bounded page per pass, hashing vectors
+already on disk, contacting nothing and re-embedding nothing. It is resumable and idempotent by
+construction rather than by bookkeeping — the page is selected by "records no checksum", so a row
+a pass finished is not a row the next pass can see. There is no cursor to persist and none to
+lose; an interruption costs at most the page in flight, and a pass after the last one reads
+nothing. A row whose stored vector cannot be hashed at all is left exactly as it was and counted,
+because a checksum over an already-damaged vector would certify the damage.
+
+**A backfill fixes the numbers as they are, not as they were.** Hashing a row that was corrupted
+*before* the backfill records a digest over the corrupted bytes, and that row then verifies
+forever. This is not fixable from inside — nothing on disk records what the vector used to be —
+and it is why the coverage report distinguishes "carries a checksum" from "was verified", and why
+the answer to *suspected* past corruption is a rebuild from retained source bytes rather than a
+backfill. A rebuild is the only operation that can establish integrity retroactively, and §7 is
+what makes it available without a re-crawl.
 
 ### 6.3 Fingerprints, and the refusal
 
@@ -1804,6 +1934,7 @@ rung on the ladder.
 | Chunks with no vector | Interrupted ingest — rung 2 |
 | Vectors with no chunk | Unswept tombstones or an interrupted delete |
 | Fingerprint agreement across config / `index_state` / `_manicule_meta` | A swapped or half-restored vector directory |
+| Vector-checksum coverage — rows carrying one, counted, never recomputed (§6.2.5) | An unfinished backfill after an upgrade (**degraded**), or a recorded refusal (**failing**). Counted rather than recomputed because `doctor` is what somebody runs when a machine is already misbehaving; `manicule vector-checksum --verify` is the scan |
 | `alembic current` vs `head` | An un-migrated database |
 | Dangling `original_ref` | The one rung-4 case |
 | Blobs on disk absent from `blobs` | A leaked GC sweep — reports reclaimable bytes |

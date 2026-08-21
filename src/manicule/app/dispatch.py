@@ -234,6 +234,14 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         # than no lock. It reads; `--fix` writes grammars and vocabularies into the *cache*
         # directory rather than the data directory, so even that stays on this side.
         "doctor",
+        # The second diagnostic, on the same rule and for a sharper version of the same reason:
+        # reporting vector-checksum coverage — including the setting that recomputes every
+        # digest — reads rows and writes nothing, and it is what somebody runs *because* they
+        # suspect a directory. Requiring the writer's exclusion would make it unavailable
+        # exactly when a running sync is the thing they suspect. Backfilling those checksums is
+        # the other invocation of the same operation and does take the lock; `Command.writes` is
+        # where that split lives, on the same terms as `collection_orphans --confirm`.
+        "vector_checksum",
         # Setting the machine up, on the same rule `doctor --fix` is here for: it writes the
         # configuration file and pre-seeds the cache, and touches no data directory at all.
         # Classifying it as a writer was harmless while a writer meant "takes a lock nobody

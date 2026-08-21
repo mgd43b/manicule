@@ -11,6 +11,7 @@ Deliberately kept honest. Where an implementation would be wrong, there is a mat
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import override
 
@@ -25,15 +26,20 @@ from manicule.core.content import (
     RawDocument,
 )
 from manicule.core.embedding import (
+    UNRECORDED_CHECKSUM,
     UNRECORDED_IDENTITY,
+    VECTOR_CHECKSUM_VERSION,
     EmbedFingerprint,
     Pooling,
     StoredVector,
     Vector,
     VectorState,
+    canonical_stored_vector,
     choose_stored_vector,
     classify_stored_vector,
     embedding_input_identity,
+    vector_checksum,
+    verify_stored_checksum,
 )
 from manicule.core.errors import FingerprintMismatchError
 from manicule.core.fingerprints import ChunkFingerprint
@@ -207,19 +213,31 @@ class TruncatingEmbedder(HashEmbedder):
         return [vector[:-1] for vector in vectors]
 
 
+@dataclass(frozen=True, slots=True)
+class _Row:
+    """One stored row, named so a test reading this file can see what a Lance row holds."""
+
+    chunk: Chunk
+    vector: tuple[float, ...]
+    identity: str
+    checksum: str
+
+
 class MemoryVectorStore:
     """A vector store with no assumptions about dimension.
 
-    Holds the same three things per row a Lance row holds — the chunk, the vector, and the
-    embedding-input identity — and classifies them with the same shared rule, so a pipeline
-    test run against this store measures the reuse behavior the real one has rather than a
-    convenient approximation of it.
+    Holds the same four things per row a Lance row holds — the chunk, the vector, the
+    embedding-input identity and the vector checksum — and classifies them with the same shared
+    rule, so a pipeline test run against this store measures the reuse behavior the real one has
+    rather than a convenient approximation of it. In particular it stores the *canonical* vector
+    and hashes that, because a fake that hashed what it was handed would accept a row the real
+    store rejects and hide the one bug this pair exists to catch.
     """
 
     def __init__(self) -> None:
         self._fingerprint: EmbedFingerprint | None = None
         self._middleware: tuple[str, ...] = ()
-        self._rows: dict[str, tuple[Chunk, Vector, str]] = {}
+        self._rows: dict[str, _Row] = {}
 
     async def ensure_ready(
         self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
@@ -248,14 +266,21 @@ class MemoryVectorStore:
                 raise ValueError(msg)
             # A tuple whatever the caller handed over; see `MemoryVectors` for why the
             # container type must not survive a write.
-            self._rows[chunk.id] = (chunk, tuple(vector), self._identity_of(chunk))
+            stored = canonical_stored_vector(vector)
+            self._rows[chunk.id] = _Row(
+                chunk, stored, self._identity_of(chunk), vector_checksum(stored)
+            )
 
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
         verdicts: dict[str, StoredVector] = {}
         for chunk in chunks:
             wanted = self._identity_of(chunk)
             elsewhere = next(
-                (row for row in self._rows.values() if row[2] == wanted != UNRECORDED_IDENTITY),
+                (
+                    row
+                    for row in self._rows.values()
+                    if row.identity == wanted != UNRECORDED_IDENTITY
+                ),
                 None,
             )
             verdicts[chunk.id] = choose_stored_vector(
@@ -264,17 +289,20 @@ class MemoryVectorStore:
             )
         return verdicts
 
-    def _classify(self, chunk: Chunk, row: tuple[Chunk, Vector, str] | None) -> StoredVector:
+    def _classify(self, chunk: Chunk, row: _Row | None) -> StoredVector:
         if row is None or self._fingerprint is None:
             return StoredVector(state=VectorState.ABSENT)
-        stored_chunk, vector, identity = row
         return classify_stored_vector(
             chunk,
-            recorded_identity=identity,
-            stored_embed_text=stored_chunk.embed_text,
-            stored_vector=list(vector),
+            recorded_identity=row.identity,
+            stored_embed_text=row.chunk.embed_text,
+            stored_vector=list(row.vector),
             embed=self._fingerprint,
             middleware=self._middleware,
+            recorded_checksum=row.checksum,
+            recorded_checksum_version=(
+                VECTOR_CHECKSUM_VERSION if row.checksum else UNRECORDED_CHECKSUM
+            ),
         )
 
     def _identity_of(self, chunk: Chunk) -> str:
@@ -294,19 +322,28 @@ class MemoryVectorStore:
         )
 
     def corrupt(
-        self, chunk_id: str, *, vector: Vector | None = None, identity: str | None = None
+        self,
+        chunk_id: str,
+        *,
+        vector: Vector | None = None,
+        identity: str | None = None,
+        checksum: str | None = None,
     ) -> None:
         """Damage one row the way a half-written directory or an edited table would.
 
-        ``vector`` replaces the stored vector — pass a wrong-length one for a row that cannot
-        be read at the index's dimension. ``identity`` replaces the recorded identity, for a
-        row whose metadata claims something the chunk beside it contradicts.
+        ``vector`` replaces the stored vector **without touching the checksum**, which is what
+        a bit flip in the numbers looks like — pass a wrong-length one for a row that cannot be
+        read at the index's dimension. ``identity`` replaces the recorded identity, for a row
+        whose metadata claims something the chunk beside it contradicts. ``checksum`` replaces
+        the checksum without touching the vector, which is the same corruption arriving from
+        the other side.
         """
-        stored_chunk, stored_vector, stored_identity = self._rows[chunk_id]
-        self._rows[chunk_id] = (
-            stored_chunk,
-            stored_vector if vector is None else vector,
-            stored_identity if identity is None else identity,
+        row = self._rows[chunk_id]
+        self._rows[chunk_id] = _Row(
+            row.chunk,
+            row.vector if vector is None else tuple(vector),
+            row.identity if identity is None else identity,
+            row.checksum if checksum is None else checksum,
         )
 
     def forget_vector(self, chunk_id: str) -> None:
@@ -316,7 +353,7 @@ class MemoryVectorStore:
     def vector_of(self, chunk_id: str) -> Vector | None:
         """The stored vector, for a test that has to compare one against itself later."""
         row = self._rows.get(chunk_id)
-        return None if row is None else row[1]
+        return None if row is None else row.vector
 
     async def search(
         self,
@@ -326,16 +363,20 @@ class MemoryVectorStore:
     ) -> list[Candidate]:
         del filter
         scored = [
-            Candidate(chunk=chunk, score=-_distance(vector, stored), scores={"dense": 1.0})
-            for chunk, stored, _ in self._rows.values()
+            Candidate(chunk=row.chunk, score=-_distance(vector, row.vector), scores={"dense": 1.0})
+            for row in self._rows.values()
+            if verify_stored_checksum(
+                row.vector,
+                recorded=row.checksum,
+                version=VECTOR_CHECKSUM_VERSION if row.checksum else UNRECORDED_CHECKSUM,
+                required=False,
+            ).accepts
         ]
         scored.sort(key=lambda candidate: candidate.score, reverse=True)
         return scored[:k]
 
     async def delete_document(self, document_id: str) -> None:
-        stale = [
-            key for key, (chunk, _, _) in self._rows.items() if chunk.document_id == document_id
-        ]
+        stale = [key for key, row in self._rows.items() if row.chunk.document_id == document_id]
         for key in stale:
             del self._rows[key]
 
@@ -371,12 +412,37 @@ class IdKeyedVectorStore(MemoryVectorStore):
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
         return {
             chunk.id: (
-                StoredVector(state=VectorState.READABLE, vector=tuple(row[1]))
+                StoredVector(state=VectorState.READABLE, vector=tuple(row.vector))
                 if (row := self._rows.get(chunk.id)) is not None
                 else StoredVector(state=VectorState.ABSENT)
             )
             for chunk in chunks
         }
+
+
+class PrehashingVectorStore(MemoryVectorStore):
+    """A store that checksums the vector it was handed instead of the one it stores.
+
+    One line shorter than the right thing and indistinguishable from it for any vector that is
+    already unit length — which is every vector in these fixtures and no vector a real embedder
+    returns. What it produces is a digest no readback can match, so the whole corpus reads as
+    corrupt on the first search after a deploy.
+    """
+
+    @override
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        await super().upsert(chunks, vectors, publication_id=publication_id)
+        for chunk, vector in zip(chunks, vectors, strict=True):
+            row = self._rows[chunk.id]
+            self._rows[chunk.id] = _Row(
+                row.chunk, row.vector, row.identity, vector_checksum(vector)
+            )
 
 
 class ForgetfulVectorStore(MemoryVectorStore):

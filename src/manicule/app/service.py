@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.ann import AnnIndexState
     from manicule.core.content import Chunk, Document
+    from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
     from manicule.core.organization import Collection, CollectionRule, Tag
     from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Confidence
@@ -1948,6 +1949,13 @@ class ApplicationService:
             # is one question: a corpus that has quietly grown past the point where every
             # query scans every vector is not visible in any of the counts above it.
             vector_index=_reported_vector_index(await maintenance.vector_index_state()),
+            # Whether the vectors' *numbers* are still the numbers that were written, on the
+            # cheap setting: two predicates over a string column, no vector read. The expensive
+            # setting recomputes every digest and belongs to a command somebody runs, not to a
+            # status page something polls.
+            vector_checksums=_reported_vector_checksums(
+                await maintenance.vector_checksum_coverage()
+            ),
             schema_revision=await maintenance.schema_revision(),
             data_dir=str(self.settings.data_dir),
         )
@@ -2018,6 +2026,75 @@ class ApplicationService:
             detail=build.detail,
         )
 
+    async def vector_checksum(
+        self, *, verify: bool = False, dry_run: bool = True
+    ) -> r.VectorChecksumReport:
+        """Report vector-checksum coverage, and optionally backfill one bounded page of it.
+
+        The operator's boundary for the contract in ``docs/storage.md`` §6.2.5. Three
+        behaviors, and the default is the one that writes nothing:
+
+        *Plan* — count how many stored vectors carry a checksum and how many a pass would
+        write. Two predicates and one bounded read; it is what ``--json`` gives a script.
+
+        *Verify* (``verify``) — recompute every recorded checksum from the stored vector and
+        report the typed refusals. A bounded scan of the corpus that reads no chunk text,
+        contacts nothing, and — this is the point of the whole design — never calls the
+        embedder. It is the affordable substitute for re-embedding, not a weaker version of it:
+        it establishes that the numbers on disk are the numbers that were written and makes no
+        claim about whether the model produced the right ones.
+
+        *Backfill* (``dry_run=False``) — give one bounded page of pre-checksum rows the checksum
+        their stored vector implies, in place, under the live generation's own pin. Resumable
+        and idempotent: run it until ``remaining`` reaches zero, and running it once more after
+        that reads nothing and writes nothing.
+
+        The two are deliberately not combined in one call. A backfill hashes what is on disk
+        *now*, so running it over rows that were never verified would settle a checksum on
+        whatever those bytes currently are; an operator who wants both should verify what is
+        already covered first and read the answer before writing anything.
+
+        Args:
+            verify: Recompute every recorded checksum rather than counting the column.
+            dry_run: Write nothing. The default, like every other boundary here.
+
+        Returns:
+            Coverage, and what the pass did or would do.
+        """
+        maintenance = await self._backend.maintenance()
+        coverage = await maintenance.vector_checksum_coverage(recompute=verify)
+        if coverage is None:
+            return r.VectorChecksumReport(
+                supported=False,
+                detail=(
+                    f"the configured vector store ({self.settings.storage.vector_db}) does not "
+                    f"record vector checksums, so there is no numerical-integrity coverage to "
+                    f"report on and nothing here to backfill."
+                ),
+            )
+        pass_ = await maintenance.backfill_vector_checksums(
+            limit=self.settings.storage.checksum_backfill_batch, dry_run=dry_run
+        )
+        if pass_ is None:  # pragma: no cover - the two capabilities arrive together
+            return r.VectorChecksumReport(
+                coverage=_vector_checksum_coverage(coverage), supported=False
+            )
+        if not dry_run:
+            # Re-read, because the pass just moved the numbers the plan was taken against and a
+            # report that showed the before-coverage beside the after-write counts would be two
+            # moments presented as one.
+            recounted = await maintenance.vector_checksum_coverage(recompute=verify)
+            coverage = recounted if recounted is not None else coverage
+        return r.VectorChecksumReport(
+            coverage=_vector_checksum_coverage(coverage),
+            scanned=pass_.scanned,
+            written=pass_.written,
+            unhashable=pass_.unhashable,
+            remaining=pass_.remaining,
+            dry_run=pass_.dry_run,
+            detail=_checksum_detail(coverage, pass_),
+        )
+
     async def ready(self) -> bool:
         """Whether this installation can actually serve a question.
 
@@ -2080,6 +2157,10 @@ class ApplicationService:
         # "not created" on every first run, which reads as a fault and is not one.
         checks.append(await self._permissions_check())
         checks.append(await self._index_check())
+        # After the index check, which is what reports the fingerprints these vectors were
+        # made with. Numerical integrity is the next question down: not whether the right
+        # model produced them, but whether what it produced is still on disk unchanged.
+        checks.append(await self._vector_integrity_check())
         checks.append(await self._glossary_check())
         checks.append(await self._connectors_check())
         checks.append(await self._sessions_check())
@@ -2896,6 +2977,103 @@ class ApplicationService:
                 },
             ),
             remedy=f"resync {affected[0]} in full — see docs/connectors/confluence.md §2.2",
+        )
+
+    async def _vector_integrity_check(self) -> r.Check:
+        """Whether the stored vectors are still the numbers that were written.
+
+        **Counted, never recomputed.** ``doctor`` is what somebody runs when a machine is
+        misbehaving, and a check that hashed every vector in the corpus would make the
+        diagnostic itself the slowest thing on the machine. What this reports is coverage — how
+        many rows carry a checksum — which is the question an upgrade is asking, and it names
+        the command that recomputes for the operator who wants the stronger answer.
+
+        Three states, and the middle one is the reason this check exists at all:
+
+        ``ok``
+            Every row carries a checksum, or the backend keeps none and says so.
+
+        ``degraded``
+            Rows predating the contract remain. They are readable and correct as far as anything
+            here knows; what is true is that nothing has vouched for their numbers. That is a
+            thing to finish rather than a fault to repair, which is the same reading the
+            connector check applies to a rename that has not happened yet.
+
+        ``failing``
+            A recorded checksum was refused somewhere. This one is only reachable when a caller
+            has already recomputed — ``status`` and this check do not — so it is here to make
+            sure a stored failure is never rendered as a coverage percentage.
+        """
+        try:
+            maintenance = await self._backend.maintenance()
+            coverage = await maintenance.vector_checksum_coverage()
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="vector_integrity",
+                state="unknown",
+                detail=f"the vector store could not be examined: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        if coverage is None:
+            return r.Check(
+                name="vector_integrity",
+                state="ok",
+                detail=(
+                    f"the configured vector store ({self.settings.storage.vector_db}) records "
+                    f"no vector checksums, so there is no numerical-integrity coverage to keep"
+                ),
+                facts={"supported": False},
+            )
+        # Counts only, on this surface as on every other. No checksum value, no vector
+        # component, no chunk id: `doctor --json` is what somebody pastes into an issue.
+        facts: dict[str, JsonValue] = {
+            "supported": True,
+            "rows": coverage.rows,
+            "recorded": coverage.recorded,
+            "unverified": coverage.unverified,
+            "failed": coverage.failed,
+            "recomputed": coverage.recomputed,
+        }
+        if coverage.failed:
+            return r.Check(
+                name="vector_integrity",
+                state="failing",
+                detail=(
+                    f"{coverage.failed} stored vector(s) no longer match the checksum written "
+                    f"beside them. The numbers on disk changed without their checksum changing "
+                    f"with them, which no identity or fingerprint check can see."
+                ),
+                facts=facts,
+                remedy="manicule vector-checksum --verify",
+            )
+        if coverage.unverified:
+            return r.Check(
+                name="vector_integrity",
+                state="degraded",
+                detail=(
+                    f"{coverage.unverified} of {coverage.rows} stored vector(s) predate vector "
+                    f"checksums and carry none. They are readable; nothing has established "
+                    f"that their numbers are what was written, and nothing retroactively can. "
+                    f"A bounded backfill gives them a checksum from here forward."
+                ),
+                facts=facts,
+                remedy="manicule vector-checksum --yes",
+            )
+        if not coverage.scanned:
+            return r.Check(
+                name="vector_integrity",
+                state="ok",
+                detail="no vectors are stored yet, so there is nothing to cover",
+                facts=facts,
+            )
+        return r.Check(
+            name="vector_integrity",
+            state="ok",
+            detail=(
+                f"all {coverage.rows} stored vector(s) carry a checksum. "
+                f"`manicule vector-checksum --verify` recomputes them; this counts them."
+            ),
+            facts=facts,
         )
 
     async def _index_check(self) -> r.Check:
@@ -6158,6 +6336,71 @@ def _vector_index_state(state: AnnIndexState) -> r.VectorIndexState:
         coverage=index.coverage if index else 1.0,
         detail=state.detail,
     )
+
+
+def _checksum_detail(coverage: VectorChecksumCoverage, pass_: VectorChecksumBackfill) -> str:
+    """One sentence naming what an operator should do next, or that nothing is owed.
+
+    Ordered worst first: refused rows are a damaged directory and outrank an unfinished
+    backfill, which outranks a corpus that is simply fine.
+    """
+    if coverage.failed:
+        listed = ", ".join(f"{count} {kind}" for kind, count in sorted(coverage.failures.items()))
+        return (
+            f"{coverage.failed} row(s) failed numerical integrity ({listed}). The stored "
+            f"numbers are not the numbers their checksum was taken from; rebuild the affected "
+            f"generation from retained source bytes rather than trusting these vectors."
+        )
+    if pass_.unhashable:
+        return (
+            f"{pass_.unhashable} row(s) hold a vector that cannot be checksummed at all and "
+            f"were left untouched. They are already unusable for ranking; a rebuild is what "
+            f"replaces them."
+        )
+    if pass_.remaining:
+        wrote = "would write" if pass_.dry_run else "wrote"
+        return (
+            f"{wrote} {pass_.written} checksum(s); {pass_.remaining} row(s) predate the "
+            f"contract and still record none. Run this again until none remain."
+        )
+    if not coverage.scanned:
+        return "there is no vector table here yet, so there is nothing to cover."
+    if coverage.recomputed:
+        return (
+            f"every one of {coverage.rows} stored vector(s) still matches the checksum written "
+            f"beside it. That establishes the numbers on disk are the numbers that were "
+            f"written; it does not establish that the model produced the right ones."
+        )
+    return f"every one of {coverage.rows} stored vector(s) carries a checksum."
+
+
+def _vector_checksum_coverage(
+    coverage: VectorChecksumCoverage,
+) -> r.VectorChecksumCoverageReport:
+    """Flatten the store's coverage into the payload every surface reports.
+
+    ``unverified`` and ``complete`` are derived on the core value and copied here rather than
+    recomputed, so a surface cannot arrive at a different answer from the store's own by
+    subtracting two numbers slightly differently.
+    """
+    return r.VectorChecksumCoverageReport(
+        rows=coverage.rows,
+        recorded=coverage.recorded,
+        unverified=coverage.unverified,
+        verified=coverage.verified,
+        failed=coverage.failed,
+        failures=dict(coverage.failures),
+        recomputed=coverage.recomputed,
+        scanned=coverage.scanned,
+        complete=coverage.complete,
+    )
+
+
+def _reported_vector_checksums(
+    coverage: VectorChecksumCoverage | None,
+) -> r.VectorChecksumCoverageReport | None:
+    """The same conversion for a backend that keeps no checksums at all."""
+    return None if coverage is None else _vector_checksum_coverage(coverage)
 
 
 def _reported_vector_index(state: AnnIndexState | None) -> r.VectorIndexState | None:

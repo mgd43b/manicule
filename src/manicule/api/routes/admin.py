@@ -145,6 +145,27 @@ async def vector_index_build(service: Service, caller: AdminPrincipal) -> Respon
     )
 
 
+@router.get(
+    "/vector-checksum",
+    name="vector_checksum",
+    summary="Aggregate numerical-integrity coverage for the stored vectors.",
+)
+async def vector_checksum(service: Service, caller: AdminPrincipal) -> Response:
+    """Verification only, and aggregate only.
+
+    Recomputes every recorded checksum from the stored vector and reports counts. It writes
+    nothing — the backfill for rows predating checksums stays a local operator action, on the
+    same terms as the index build — and it exposes no checksum value, vector component, chunk
+    text or document identifier.
+    """
+    del caller
+    return await respond(
+        "vector_checksum",
+        service,
+        lambda: service.vector_checksum(verify=True, dry_run=True),
+    )
+
+
 @router.get("/lifecycle/reset-derived", name="lifecycle_reset_derived")
 async def lifecycle_reset_derived(service: Service, caller: AdminPrincipal) -> Response:
     """Aggregate dry run only; destructive lifecycle actions remain local operator actions."""

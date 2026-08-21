@@ -108,12 +108,12 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_forty_one_tools(service: ApplicationService) -> None:
-    """Forty-one, named, and matching the declared surface."""
+def test_the_server_offers_exactly_forty_two_tools(service: ApplicationService) -> None:
+    """Forty-two, named, and matching the declared surface."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 41
+    assert len(offered) == 42
 
 
 def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
@@ -181,7 +181,7 @@ def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
     }.isdisjoint(TOOL_NAMES)
 
 
-def test_the_command_line_offers_exactly_thirty_commands() -> None:
+def test_the_command_line_offers_exactly_thirty_one_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
@@ -232,9 +232,10 @@ def test_the_command_line_offers_exactly_thirty_commands() -> None:
         "stop",
         "sweep-vectors",
         "upgrade",
+        "vector-checksum",
         "workspace",
     ]
-    assert len(names) == 30
+    assert len(names) == 31
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(
@@ -414,6 +415,16 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
         {},
         ["build-vector-index"],
         ("GET", "/api/v1/admin/vector-index", {}),
+        None,
+    ),
+    (
+        "vector_checksum",
+        {},
+        # `--verify` rather than the bare command, because that is the setting the tool and the
+        # route both take: a row that compared the cheap count against the full verification
+        # would be comparing two different questions and would pass while they diverged.
+        ["vector-checksum", "--verify"],
+        ("GET", "/api/v1/admin/vector-checksum", {}),
         None,
     ),
     (

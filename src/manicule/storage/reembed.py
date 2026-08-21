@@ -26,7 +26,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from manicule.core.content import Chunk
-from manicule.core.embedding import EmbedFingerprint, Vector, embedding_input_identity
+from manicule.core.embedding import (
+    EmbedFingerprint,
+    Vector,
+    VectorIntegrity,
+    embedding_input_identity,
+    verify_stored_checksum,
+)
 from manicule.core.errors import StorageBusyError
 from manicule.ingest.reembed import (
     ChunkKey,
@@ -50,7 +56,12 @@ from manicule.storage import models
 from manicule.storage.engine import sqlite_busy
 from manicule.storage.rows import to_chunk, to_document
 from manicule.storage.types import utcnow
-from manicule.storage.vectors import LanceVectorStore, generation_pin
+from manicule.storage.vectors import (
+    CHECKSUM_COLUMN,
+    CHECKSUM_VERSION_COLUMN,
+    LanceVectorStore,
+    generation_pin,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -1230,7 +1241,8 @@ class LanceShadowGenerations:
             await store.ensure_ready(await self._fingerprint(connection, generation))
         revision = await store.storage_revision()
         fingerprint = await store.fingerprint()
-        rows_count = valid_rows = 0
+        rows_count = valid_rows = checksums_verified = 0
+        checksum_failures: dict[str, int] = {}
         dimensions: set[int] = set()
         finite = True
         lineage_valid = True
@@ -1274,6 +1286,21 @@ class LanceShadowGenerations:
                 lineage_valid = lineage_valid and self._row_lineage(
                     row, generation, stored, fingerprint
                 )
+                # The vector is already in hand, so the numerical check is a SHA-256 rather
+                # than a second read — and never a forward pass. A shadow generation is
+                # checksum-required: every row in it was written by this build.
+                integrity = verify_stored_checksum(
+                    vector,
+                    recorded=str(row.get(CHECKSUM_COLUMN) or ""),
+                    version=str(row.get(CHECKSUM_VERSION_COLUMN) or ""),
+                    required=True,
+                )
+                if integrity is VectorIntegrity.VERIFIED:
+                    checksums_verified += 1
+                else:
+                    checksum_failures[integrity.value] = (
+                        checksum_failures.get(integrity.value, 0) + 1
+                    )
         physical_rows = await store.count()
         if physical_rows != rows_count:
             # The keyset columns are validated data, not a trusted primary key. Corruption can
@@ -1295,6 +1322,8 @@ class LanceShadowGenerations:
             lineage_valid=lineage_valid,
             retrieval_ready=fingerprint is not None,
             storage_revision=revision,
+            checksums_verified=checksums_verified if lineage_valid else 0,
+            checksum_failures=dict(sorted(checksum_failures.items())),
         )
 
     async def seal(
@@ -1335,6 +1364,8 @@ class LanceShadowGenerations:
                 or not inspection.lineage_valid
                 or not inspection.retrieval_ready
                 or not inspection.storage_revision
+                or inspection.checksum_failures
+                or inspection.checksums_verified != commitment.execution_plan.chunks
             ):
                 raise ReembedError("only an exact validated shadow generation can be sealed")
             store = self._store(generation.id)

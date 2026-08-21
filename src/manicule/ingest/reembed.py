@@ -272,6 +272,12 @@ class ShadowInspection:
     ``inventory_digest`` covers every persisted :class:`SnapshotChunk` field. ``lineage_valid``
     additionally verifies backend-specific physical keys point at the target generation and
     logical chunk they claim.
+
+    ``checksums_verified`` is the numerical leg, and it is taken during the same pass over the
+    same rows: the inspection is already holding every vector it needs, so establishing that
+    each one still matches the checksum written beside it costs a SHA-256 and never a forward
+    pass. It is a *count* rather than a flag so that a seal can require it to equal the planned
+    chunk count — a boolean would be satisfied by an inspection that verified nothing.
     """
 
     rows: int
@@ -283,6 +289,20 @@ class ShadowInspection:
     lineage_valid: bool
     retrieval_ready: bool
     storage_revision: str = ""
+    checksums_verified: int = 0
+    """Rows whose recorded checksum was recomputed from the stored vector and matched.
+
+    Defaults to zero, which is what makes an inspection taken by a build without this contract
+    fail the seal rather than pass it: an unverified generation is not published as a verified
+    one because the field that would have said so was absent.
+    """
+
+    checksum_failures: Mapping[str, int] = field(default_factory=dict[str, int])
+    """``VectorIntegrity`` value to count, for the rows the checksum refused.
+
+    Bounded — at most one entry per enum member — and carries no row identity, so a failed
+    inspection can say *what* went wrong without naming a chunk or printing a digest.
+    """
 
 
 class ReembedError(ManiculeError):
@@ -824,6 +844,20 @@ async def _validate(
         failures.append("one or more rows have invalid chunk or embedding lineage")
     if not inspection.retrieval_ready:
         failures.append("the shadow failed its retrieval-readiness probe")
+    if inspection.checksum_failures:
+        # Counts by kind, never a row id or a digest: this string reaches an operator, a log
+        # and an envelope. `mismatched` is stored numbers that changed after they were written;
+        # `missing` is a generation staged by a build that did not record checksums at all, and
+        # it is a rebuild rather than a repair.
+        listed = ", ".join(
+            f"{count} {kind}" for kind, count in sorted(inspection.checksum_failures.items())
+        )
+        failures.append(f"one or more vectors failed numerical integrity ({listed})")
+    elif inspection.checksums_verified != expected_chunks:
+        failures.append(
+            f"expected {expected_chunks} verified vector checksum(s), found "
+            f"{inspection.checksums_verified}"
+        )
     if failures:
         raise ReembedValidationError("; ".join(failures))
     return inspection

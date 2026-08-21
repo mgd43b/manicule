@@ -76,6 +76,25 @@ manicule config set rag.profile precise</pre>
       {% if vectors.detail %}<br><span class="muted">{{ vectors.detail }}</span>{% endif %}
     </dd>
     {% endif %}
+    {#
+      Counted, not recomputed — `status` says which, because both get called "coverage" and a
+      cheap count rendered as verification is a clean bill of health nobody earned. Counts only:
+      no checksum value and no chunk id reaches a page.
+    #}
+    {% if panels.index.data.vector_checksums and panels.index.data.vector_checksums.scanned %}
+    {% set integrity = panels.index.data.vector_checksums %}
+    <dt>Vector integrity</dt>
+    <dd>
+      {{ integrity.recorded }} of {{ integrity.rows }} row(s) checksummed
+      {% if integrity.recomputed %}· {{ integrity.verified }} verified{% endif %}
+      {% if integrity.failed %}
+      <br><span class="muted">{{ integrity.failed }} row(s) failed numerical integrity</span>
+      {% elif integrity.unverified %}
+      <br><span class="muted">{{ integrity.unverified }} row(s) predate checksums ·
+      <code>manicule vector-checksum --yes</code></span>
+      {% endif %}
+    </dd>
+    {% endif %}
   </dl>
   <p class="muted">
     The fingerprints are shown in their canonical form. A prettied identity is one nobody can

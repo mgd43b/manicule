@@ -218,6 +218,12 @@ class Command:
             return Arguments(self.op, self.arguments).flag("delete")
         if self.op.startswith("lifecycle_") and Arguments(self.op, self.arguments).flag("dry_run"):
             return False
+        if self.op == "vector_checksum":
+            # The same invocation boundary once more. Reporting coverage — even the setting that
+            # recomputes every digest — reads rows and writes nothing, and is a diagnostic
+            # somebody wants available *while* a sync is running. Only the backfill rewrites
+            # rows, and only it needs the lock.
+            return not Arguments(self.op, self.arguments).flag("dry_run")
         return writes_by_name(self.op)
 
     def invoke(self, workspace: str) -> control.Invoke:
@@ -362,6 +368,9 @@ BINDERS: Mapping[str, Binder] = {
     "snapshot_status": lambda service, args, report: service.snapshot_status(args.text("name")),
     "upgrade": lambda service, args, report: service.upgrade(
         version=args.optional_text("version"), skip_backup=args.flag("skip_backup")
+    ),
+    "vector_checksum": lambda service, args, report: service.vector_checksum(
+        verify=args.flag("verify"), dry_run=args.flag("dry_run")
     ),
     "vector_sweep": lambda service, args, report: service.sweep_vectors(),
     "vector_index_build": lambda service, args, report: service.vector_index_build(

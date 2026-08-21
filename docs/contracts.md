@@ -211,6 +211,14 @@ for joins and transactional updates. See `PLAN.md` §2.
 a constant. The vector table is created at first ingest, and ingest must refuse to start
 if the fingerprint does not match what the index was built with.
 
+**A fingerprint is provenance, and provenance is not integrity.** Every check named above
+compares a stored row against *metadata*, and a bit flip that turns one finite vector component
+into another finite one leaves all of that metadata true. So every stored vector also carries a
+versioned SHA-256 over the exact `float32` values that reach disk, recomputed on read;
+[`storage.md`](storage.md) §6.2.5 is the contract and is explicit that it detects accidental
+corruption, says nothing about whether the model produced the right vector, and does not defend
+against an actor able to rewrite the vector and its checksum together.
+
 **There are three fingerprints, and they are compared at three scopes.** `EmbedFingerprint`
 and `ChunkFingerprint` describe one process applied to a whole corpus, so both are compared
 once per run and a mismatch refuses the run. `ParseFingerprint` describes one parser applied

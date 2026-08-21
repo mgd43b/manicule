@@ -13,16 +13,16 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | Area | Items | Ticket |
 |---|---:|---|
 | CLI capability items | 48 | #8 — **built** |
-| MCP capability items | 42 | #8 — **built** |
-| HTTP endpoints | 61 | #11 — **built** |
+| MCP capability items | 43 | #8 — **built** |
+| HTTP endpoints | 62 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **209** | |
+| **Total** | **211** | |
 
 ## CLI — 48
 
 Ticket: #8 — **built.** The 48 rows below are upstream capability items, not the current command
-count. Manicule exposes 29 top-level commands; `manicule --help` and the asserted inventory in
+count. Manicule exposes 31 top-level commands; `manicule --help` and the asserted inventory in
 [`docs/surfaces.md`](docs/surfaces.md) are authoritative. Several bare verbs below are subcommands,
 so the mapping is noted where it is not obvious. The output shape is also a contract there.
 
@@ -104,9 +104,9 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
   connector-free derived publication with no separate settlement command.
 
-## MCP tools — 42
+## MCP tools — 43
 
-Ticket: #8 — **built.** Forty-one implemented tools over the same application service the command
+Ticket: #8 — **built.** Forty-two implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
@@ -157,6 +157,7 @@ than assume it.
 - [x] `snapshot_status`
 - [x] `snapshot_verify`
 - [x] `stats`
+- [x] `vector_checksum`
 - [x] `vector_index_build`
 - [x] `workspace_list`
 - [x] `workspace_switch`
@@ -173,7 +174,7 @@ a served installation already runs it on a schedule.
 `collection orphans` moves every document outside every collection into the trash, which in a
 corpus where collections are optional is most of it.
 
-## HTTP endpoints — 61
+## HTTP endpoints — 62
 
 Ticket: #11 — **built.** Twelve route groups over the same application service the CLI and the
 MCP server use: health · documents · chat · conversations · collections · tags · admin ·
@@ -205,6 +206,7 @@ name — an absence with no test is an absence that comes back.
 - [x] `GET    /api/v1/admin/query-logs`
 - [x] `GET    /api/v1/admin/search-quality`
 - [x] `GET    /api/v1/admin/stats`
+- [x] `GET    /api/v1/admin/vector-checksum` — aggregate vector numerical-integrity coverage
 - [x] `GET    /api/v1/admin/vector-index` — aggregate ANN index dry run only
 - [x] `GET    /api/v1/collections/:id/counts`
 - [x] `GET    /api/v1/collections/:id/documents`
@@ -362,6 +364,9 @@ is a feature list entry, not a feature.
   and hoped for.
 - `storage.retain_source_bytes` — keeps fetched bytes so re-parsing never means re-fetching,
   and so an anchor can be verified against the document it was made from.
+- `storage.checksum_backfill_batch` — rows one pass of the vector-checksum backfill rewrites.
+  It is the bound on both the memory the pass holds and the work a crash can lose, and it
+  exists as a setting because the right value depends on corpus size rather than on manicule.
 - `rag.chunker`, `rag.pipeline`, `rag.reranker` — a retrieval pipeline is a declared list of
   stages, so two pipelines can be compared by configuration rather than by editing code.
 - `rag.glossary.*` — glossary-aware acronym retrieval: whether ingest reads definitions out of

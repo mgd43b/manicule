@@ -89,14 +89,22 @@ from manicule.core.ann import (
 from manicule.core.content import LEGACY_PUBLICATION, Chunk
 from manicule.core.embedding import (
     FLOAT32_EPSILON,
+    UNRECORDED_CHECKSUM,
     UNRECORDED_IDENTITY,
+    VECTOR_CHECKSUM_VERSION,
     EmbedFingerprint,
     StoredVector,
+    VectorChecksumBackfill,
+    VectorChecksumCoverage,
+    VectorIntegrity,
     VectorState,
     canonical_stored_vector,
     choose_stored_vector,
     classify_stored_vector,
     embedding_input_identity,
+    is_finite_vector,
+    vector_checksum,
+    verify_stored_checksum,
 )
 from manicule.core.errors import ManiculeError
 from manicule.core.ids import vector_id
@@ -127,6 +135,8 @@ PUBLICATION_COLUMN: Final = "publication_id"
 VECTOR_COLUMN: Final = "vector"
 CHUNK_COLUMN: Final = "chunk_json"
 IDENTITY_COLUMN: Final = "embed_identity"
+CHECKSUM_COLUMN: Final = "vector_checksum"
+CHECKSUM_VERSION_COLUMN: Final = "vector_checksum_version"
 SOURCE_VECTOR_ID_COLUMN: Final = "source_vector_id"
 SOURCE_PUBLICATION_COLUMN: Final = "source_publication_id"
 SOURCE_SEQUENCE_COLUMN: Final = "source_sequence"
@@ -145,6 +155,14 @@ L2-normalized on the way in, so ``1 - distance`` is a real cosine similarity.
 
 IDENTITY_QUERY_PAGE: Final = 512
 """Chunk ids per ``IN`` predicate when reading rows back. See :meth:`LanceVectorStore._rows_for`."""
+
+INTEGRITY_SCAN_PAGE: Final = 512
+"""Rows per page for the checksum scan and the checksum backfill.
+
+The bound that keeps both operations constant-memory over a corpus of any size. A page holds
+``page_size`` vectors — at 1024 float32 components that is about two megabytes — and nothing
+accumulates across pages except integers.
+"""
 
 _VECTOR_STATE_PRIORITY: Final = {
     VectorState.ABSENT: 0,
@@ -343,6 +361,47 @@ def _embed_text_of(record: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _checksum_of(record: dict[str, Any]) -> tuple[str, str]:
+    """The numerical-integrity pair a row carries, as two strings.
+
+    ``get`` rather than indexing, because a table that predates the columns does not have them
+    and a row read before :meth:`LanceVectorStore._ensure_generation_columns` has run therefore
+    answers nothing at all. Absent, ``NULL`` and empty all mean the same thing here — no
+    checksum was recorded — and :func:`~manicule.core.embedding.verify_stored_checksum` decides
+    whether that is a refusal.
+    """
+    return (
+        str(record.get(CHECKSUM_COLUMN) or UNRECORDED_CHECKSUM),
+        str(record.get(CHECKSUM_VERSION_COLUMN) or UNRECORDED_CHECKSUM),
+    )
+
+
+def _row_integrity(record: dict[str, Any]) -> VectorIntegrity:
+    """The numerical verdict on one row read straight from the table.
+
+    The read-path half of :meth:`LanceVectorStore._verdict`, for the queries that have a vector
+    and its checksum but no chunk to classify against — search results and the coverage scan.
+    Provenance is not its business and it does not pretend otherwise: a row can be
+    :attr:`~manicule.core.embedding.VectorIntegrity.VERIFIED` here and still be stale, which is
+    what makes the two checks two checks.
+
+    A record with no checksum column at all came from a table that predates them, and reads as
+    unverified. That is a different absence from a row whose *vector* is null, which is a row
+    nothing can be established about, and conflating the two would drop every result a
+    pre-upgrade directory returns.
+    """
+    if CHECKSUM_COLUMN not in record:
+        return VectorIntegrity.UNVERIFIED
+    stored = record.get(VECTOR_COLUMN)
+    if stored is None:
+        return VectorIntegrity.UNREADABLE
+    values = [float(value) for value in stored]
+    if not is_finite_vector(values):
+        return VectorIntegrity.NON_FINITE
+    checksum, version = _checksum_of(record)
+    return verify_stored_checksum(values, recorded=checksum, version=version, required=False)
+
+
 def unit(vector: Vector) -> list[float]:
     """``vector`` scaled to length one, so that cosine distance is ``1 - similarity``.
 
@@ -387,6 +446,12 @@ def _row_model(dimension: int) -> type[LanceModel]:
     ``vector`` becomes ``fixed_size_list<float32, dimension>``. The promoted columns are
     duplicated out of the chunk so a predicate can be pushed down without decoding
     ``chunk_json``; they are derived at write time from the same object, so they cannot drift.
+
+    ``vector_checksum`` and ``vector_checksum_version`` are the numerical-integrity pair, and
+    they are two columns rather than one string because the version decides how the checksum is
+    read: a build that meets a format it does not implement has to refuse the row rather than
+    parse a prefix out of it. ``float32`` above is why the checksum is defined over ``binary32``
+    — the preimage is the persisted representation, not the ``float64`` a caller handed in.
     """
     fields: dict[str, Any] = {
         ID_COLUMN: (str, ...),
@@ -399,6 +464,8 @@ def _row_model(dimension: int) -> type[LanceModel]:
         "position": (int, ...),
         CHUNK_COLUMN: (str, ...),
         IDENTITY_COLUMN: (str, ...),
+        CHECKSUM_COLUMN: (str, ...),
+        CHECKSUM_VERSION_COLUMN: (str, ...),
         SOURCE_VECTOR_ID_COLUMN: (str | None, None),
         SOURCE_PUBLICATION_COLUMN: (str | None, None),
         SOURCE_SEQUENCE_COLUMN: (int | None, None),
@@ -430,6 +497,7 @@ class LanceVectorStore:
         self._connection: AsyncConnection | None = None
         self._fingerprint: EmbedFingerprint | None = None
         self._table: AsyncTable | None = None
+        self._columns: frozenset[str] | None = None
         self._middleware: tuple[str, ...] = ()
 
     # --- lifecycle -----------------------------------------------------------------------
@@ -468,6 +536,7 @@ class LanceVectorStore:
             else:
                 stored.require_match(fingerprint)
             self._table = await self._ensure_table(connection, fingerprint)
+            self._columns = None
             self._fingerprint = fingerprint
             self._middleware = tuple(embed_text_middleware)
 
@@ -477,6 +546,7 @@ class LanceVectorStore:
             self._connection.close()
             self._connection = None
         self._table = None
+        self._columns = None
 
     async def open_existing(self, expected: EmbedFingerprint | None = None) -> EmbedFingerprint:
         """Open an already published directory; never create metadata or an empty table."""
@@ -499,6 +569,7 @@ class LanceVectorStore:
                     f"published vector generation {self._directory} is missing {name}"
                 )
             self._table = await connection.open_table(name)
+            self._columns = None
             self._fingerprint = stored
             return stored
 
@@ -600,6 +671,8 @@ class LanceVectorStore:
                     "lang",
                     "position",
                     IDENTITY_COLUMN,
+                    CHECKSUM_COLUMN,
+                    CHECKSUM_VERSION_COLUMN,
                     SOURCE_VECTOR_ID_COLUMN,
                     SOURCE_PUBLICATION_COLUMN,
                     SOURCE_SEQUENCE_COLUMN,
@@ -627,6 +700,8 @@ class LanceVectorStore:
             "lang",
             "position",
             IDENTITY_COLUMN,
+            CHECKSUM_COLUMN,
+            CHECKSUM_VERSION_COLUMN,
             SOURCE_VECTOR_ID_COLUMN,
             SOURCE_PUBLICATION_COLUMN,
             SOURCE_SEQUENCE_COLUMN,
@@ -720,6 +795,15 @@ class LanceVectorStore:
         a distance that happens to rank the same way. It is clamped to that interval, which
         float error can otherwise exceed by an ulp or two.
 
+        **A row whose numbers do not match its checksum is dropped rather than ranked.** A
+        candidate is a chunk plus a score, and the score is a distance to the stored vector — so
+        returning one computed against corrupted numbers would put a result in a ranked list on
+        the strength of bytes nothing vouches for. The cost is one SHA-256 over the ``k`` rows a
+        query actually returns, not over the corpus, and rows written before the contract are
+        unverified rather than dropped. A search can therefore return fewer than ``k``
+        candidates over a damaged directory, which is the honest outcome: the alternative is
+        backfilling the shortfall with rows that were ranked behind the ones being refused.
+
         **A query with no direction.** The zero vector is not near anything; cosine
         similarity against it is undefined for every row, and Lance drops the resulting
         undefined distances, so a plain vector search would return an empty list — which
@@ -751,11 +835,9 @@ class LanceVectorStore:
         search = table.vector_search(query).distance_type(DISTANCE_METRIC)
         if predicate is not None:
             search = search.where(predicate)
-        records = (
-            await search.select([ID_COLUMN, PUBLICATION_COLUMN, CHUNK_COLUMN, DISTANCE_COLUMN])
-            .limit(k)
-            .to_list()
-        )
+        columns = [ID_COLUMN, PUBLICATION_COLUMN, CHUNK_COLUMN, DISTANCE_COLUMN]
+        columns.extend(await self._integrity_columns(table))
+        records = await search.select(columns).limit(k).to_list()
         return [
             Candidate(
                 chunk=Chunk.model_validate_json(str(record[CHUNK_COLUMN])),
@@ -763,6 +845,7 @@ class LanceVectorStore:
                 score=min(1.0, max(-1.0, 1.0 - float(record[DISTANCE_COLUMN]))),
             )
             for record in records
+            if _row_integrity(record).accepts
         ]
 
     async def count(self) -> int:
@@ -948,6 +1031,166 @@ class LanceVectorStore:
             if VECTOR_COLUMN in [str(column) for column in config.columns]:
                 await table.drop_index(name)
 
+    # --- numerical integrity -------------------------------------------------------------
+
+    async def checksum_coverage(
+        self, *, recompute: bool = False, page_size: int = INTEGRITY_SCAN_PAGE
+    ) -> VectorChecksumCoverage:
+        """How many stored vectors carry a checksum, and — on request — how many still match.
+
+        Two modes, because two different questions get called "coverage" and only one of them
+        is affordable on a status page.
+
+        **Counting** is two ``count_rows`` predicates over an indexed-by-nothing string column
+        and touches no vector. It answers "has the backfill finished", which is the question an
+        upgrade is actually asking, and it is what ``status`` and ``doctor`` call.
+
+        **Recomputing** reads every row's vector in bounded pages and hashes it. It answers
+        "are the numbers still what they were", costs a scan of the corpus, and is what the
+        checksum command performs when an operator asks for it. It never calls the embedder,
+        never touches a source system, and never holds more than one page.
+
+        Args:
+            recompute: Verify each recorded checksum rather than only counting it.
+            page_size: Rows per page while recomputing. The scan is bounded by this and by
+                nothing else, so a corpus of any size costs one page of memory.
+
+        Returns:
+            Aggregate counts and a typed failure split. Never a checksum value, a vector
+            component or a chunk identifier.
+        """
+        if page_size < 1:
+            raise ValueError("integrity scan page size must be positive")
+        table = await self._existing_table()
+        if table is None:
+            return VectorChecksumCoverage(scanned=False)
+        available = frozenset(str(field.name) for field in await table.schema())
+        rows = await table.count_rows()
+        if not {CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN} <= available:
+            # A table that predates the columns records no checksums, which is exactly what
+            # `recorded = 0` says. Reporting it as unscanned would hide a corpus that is owed a
+            # backfill behind the same value a store without the capability returns.
+            return VectorChecksumCoverage(rows=rows, recomputed=recompute)
+        recorded = rows - await table.count_rows(f"{CHECKSUM_COLUMN} = {quote('')}")
+        if not recompute:
+            return VectorChecksumCoverage(rows=rows, recorded=recorded)
+        verified = 0
+        failures: dict[str, int] = {}
+        async for page in self._integrity_pages(table, page_size=page_size):
+            for record in page:
+                integrity = _row_integrity(record)
+                if integrity is VectorIntegrity.VERIFIED:
+                    verified += 1
+                elif integrity is not VectorIntegrity.UNVERIFIED:
+                    failures[integrity.value] = failures.get(integrity.value, 0) + 1
+        return VectorChecksumCoverage(
+            rows=rows,
+            recorded=recorded,
+            verified=verified,
+            failed=sum(failures.values()),
+            failures=dict(sorted(failures.items())),
+            recomputed=True,
+        )
+
+    async def backfill_checksums(
+        self, *, limit: int = INTEGRITY_SCAN_PAGE, dry_run: bool = False
+    ) -> VectorChecksumBackfill:
+        """Give a bounded page of pre-checksum rows the checksum their stored vector implies.
+
+        **It hashes what is on disk and nothing else.** No embedder, no parser, no connector,
+        no source system, no retained snapshot. That is what makes it affordable, and it is
+        also the limit of what it can claim: a row damaged *before* this ran gets a checksum
+        over the damaged bytes, so the backfill establishes integrity from here forward rather
+        than retroactively. ``docs/storage.md`` §6.2.5 states that in the operator's terms, and
+        it is why a legacy table is reported as unverified rather than as verified-on-upgrade.
+
+        **Resumable and idempotent by construction.** The page is selected by "records no
+        checksum", so a row this pass finished is not a row the next pass can see. There is no
+        cursor to persist and none to lose: an interruption costs at most the page in flight,
+        and running it again after it finishes reads zero rows and writes nothing.
+
+        **Rows whose vector cannot be hashed are left alone**, counted as
+        :attr:`~manicule.core.embedding.VectorChecksumBackfill.unhashable`. Writing a checksum
+        over a non-finite vector would certify a row that can never be ranked.
+
+        Args:
+            limit: Rows to consider in this pass. The bound on both the query and the memory.
+            dry_run: Report what a pass would do and write nothing.
+
+        Returns:
+            What the pass did, and how many rows still record no checksum.
+
+        Raises:
+            VectorStoreStateError: :meth:`ensure_ready` has not run, so the schema this writes
+                into may not have the columns yet.
+        """
+        if limit < 1:
+            raise ValueError("checksum backfill limit must be positive")
+        table, _ = self._ready()
+        # This command *is* the migration boundary for a published generation, which
+        # `open_existing` deliberately is not: a read must never evolve the schema of a
+        # generation somebody is searching. Idempotent, so a resumed pass costs nothing.
+        await self._ensure_generation_columns(table)
+        predicate = f"{CHECKSUM_COLUMN} = {quote('')}"
+        outstanding = await table.count_rows(predicate)
+        if outstanding == 0:
+            return VectorChecksumBackfill(dry_run=dry_run)
+        rows = await table.query().where(predicate).limit(limit).to_list()
+        written: list[dict[str, Any]] = []
+        unhashable = 0
+        for record in rows:
+            stored = record.get(VECTOR_COLUMN)
+            values = None if stored is None else [float(value) for value in stored]
+            if values is None or not is_finite_vector(values):
+                unhashable += 1
+                continue
+            record[CHECKSUM_COLUMN] = vector_checksum(values)
+            record[CHECKSUM_VERSION_COLUMN] = VECTOR_CHECKSUM_VERSION
+            written.append(record)
+        if written and not dry_run:
+            # A whole-row merge on the physical id rather than a per-row `UPDATE`: one Lance
+            # commit for the page, so a crash lands either before or after it and never inside.
+            #
+            # **`when_matched_update_all` and nothing else.** Without that restriction a row
+            # deleted between the read above and the merge would be *re-inserted* by it — a
+            # maintenance pass resurrecting a vector the tombstone sweep had just removed, which
+            # is a worse failure than the one it exists to prevent. Unmatched rows are dropped,
+            # so a concurrent delete wins and the next pass simply finds nothing there.
+            await table.merge_insert(ID_COLUMN).when_matched_update_all().execute(written)
+        return VectorChecksumBackfill(
+            scanned=len(rows),
+            written=len(written),
+            unhashable=unhashable,
+            remaining=outstanding if dry_run else await table.count_rows(predicate),
+            dry_run=dry_run,
+        )
+
+    async def _integrity_pages(
+        self, table: AsyncTable, *, page_size: int
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        """Every row's vector and checksum pair, in bounded pages ordered by physical id.
+
+        Ordered by :data:`ID_COLUMN` because it is the merge key and therefore unique, so the
+        keyset cannot collapse two rows onto one cursor and skip a suffix. Four columns are
+        selected and no more: this is a numerical check and it has no business reading chunk
+        text, a document id or a publication.
+        """
+        after: str | None = None
+        while True:
+            query = (
+                table.query()
+                .select([ID_COLUMN, VECTOR_COLUMN, CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN])
+                .order_by([ColumnOrdering(column_name=ID_COLUMN)])
+                .limit(page_size)
+            )
+            if after is not None:
+                query = query.where(f"{ID_COLUMN} > {quote(after)}")
+            page = await query.to_list()
+            if not page:
+                return
+            yield page
+            after = str(page[-1][ID_COLUMN])
+
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> Mapping[str, StoredVector]:
         """What this store holds for each of ``chunks``, and whether it can still be used.
 
@@ -990,17 +1233,16 @@ class LanceVectorStore:
         fingerprint = await self.fingerprint()
         if table is None or fingerprint is None:
             return verdicts
-        schema = await table.schema()
-        columns = {str(field.name) for field in schema}
-        has_identity = IDENTITY_COLUMN in columns
-        logical_id_column = CHUNK_ID_COLUMN if CHUNK_ID_COLUMN in columns else ID_COLUMN
+        available = frozenset(str(field.name) for field in await table.schema())
+        has_identity = IDENTITY_COLUMN in available
+        logical_id_column = CHUNK_ID_COLUMN if CHUNK_ID_COLUMN in available else ID_COLUMN
 
         by_id = {chunk.id: chunk for chunk in chunks}
         for record in await self._rows_for(
             table,
             sorted(by_id),
             logical_id_column=logical_id_column,
-            has_identity=has_identity,
+            available=available,
         ):
             chunk = by_id.get(str(record[logical_id_column]))
             if chunk is None:  # pragma: no cover - the predicate asked for these ids only
@@ -1017,7 +1259,9 @@ class LanceVectorStore:
         }
         if not (wanted and has_identity):
             return verdicts
-        found = await self._rows_by_identity(table, sorted(set(wanted.values())))
+        found = await self._rows_by_identity(
+            table, sorted(set(wanted.values())), available=available
+        )
         for chunk_id, identity in wanted.items():
             record = found.get(identity)
             if record is None:
@@ -1082,7 +1326,16 @@ class LanceVectorStore:
         *,
         embedding_fingerprint: str,
     ) -> bool:
-        """Validate one bounded chunk page without accepting rows from another publication."""
+        """Validate one bounded chunk page without accepting rows from another publication.
+
+        **Checksums are required here and nowhere else on the read path.** This is the fence
+        immediately before a generation becomes live, and every row in a generation this build
+        staged was written by :meth:`_row`, which records one. So a row that carries none is
+        either from a generation staged by an older build or a row this one did not write, and
+        publishing either as verified would make the coverage number a lie at the exact moment
+        it starts being relied on. A pre-checksum generation left half-built across an upgrade
+        is therefore refused rather than adopted; ``docs/storage.md`` §6.2.5 says what to run.
+        """
         if len(chunks) > IDENTITY_QUERY_PAGE:
             raise ValueError("vector validation page exceeds the fixed bound")
         fingerprint = await self.fingerprint()
@@ -1093,6 +1346,11 @@ class LanceVectorStore:
             return False
         if not chunks:
             return True
+        available = frozenset(str(field.name) for field in await table.schema())
+        if not {CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN} <= available:
+            # The table predates the contract, so no row in it can carry a checksum and no
+            # publication out of it can be checksum-required. Refused rather than exempted.
+            return False
         chunk_ids = ", ".join(quote(chunk.id) for chunk in chunks)
         records = await (
             table.query()
@@ -1100,14 +1358,24 @@ class LanceVectorStore:
                 f"{PUBLICATION_COLUMN} = {quote(publication_id)} "
                 f"AND {CHUNK_ID_COLUMN} IN ({chunk_ids})"
             )
-            .select([CHUNK_ID_COLUMN, IDENTITY_COLUMN, CHUNK_COLUMN, VECTOR_COLUMN])
+            .select(
+                [
+                    CHUNK_ID_COLUMN,
+                    IDENTITY_COLUMN,
+                    CHUNK_COLUMN,
+                    VECTOR_COLUMN,
+                    CHECKSUM_COLUMN,
+                    CHECKSUM_VERSION_COLUMN,
+                ]
+            )
             .limit(len(chunks) + 1)
             .to_list()
         )
         by_id = {str(record[CHUNK_ID_COLUMN]): record for record in records}
         return len(records) == len(chunks) == len(by_id) and all(
             chunk.id in by_id
-            and self._verdict(chunk, by_id[chunk.id], fingerprint).state is VectorState.READABLE
+            and self._verdict(chunk, by_id[chunk.id], fingerprint, require_checksum=True).state
+            is VectorState.READABLE
             for chunk in chunks
         )
 
@@ -1117,7 +1385,12 @@ class LanceVectorStore:
         target_publication_id: str,
         chunks: Sequence[Chunk],
     ) -> None:
-        """Copy one bounded, identity-verified checkpoint page for lease takeover."""
+        """Copy one bounded checkpoint page for lease takeover, identity and integrity verified.
+
+        Three separate refusals, in order: the page must be complete and current under the
+        source publication, every row's checksum must still describe its vector, and the target
+        rows are then written with checksums re-derived from the values actually stored.
+        """
         if not chunks:
             return
         if len(chunks) > IDENTITY_QUERY_PAGE:
@@ -1139,14 +1412,31 @@ class LanceVectorStore:
                 f"{PUBLICATION_COLUMN} = {quote(source_publication_id)} "
                 f"AND {CHUNK_ID_COLUMN} IN ({listed})"
             )
-            .select([CHUNK_ID_COLUMN, VECTOR_COLUMN])
+            .select([CHUNK_ID_COLUMN, VECTOR_COLUMN, CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN])
             .limit(len(chunks) + 1)
             .to_list()
         )
-        vectors_by_id = {
-            str(record[CHUNK_ID_COLUMN]): tuple(float(value) for value in record[VECTOR_COLUMN])
-            for record in records
-        }
+        vectors_by_id: dict[str, tuple[float, ...]] = {}
+        for record in records:
+            values = tuple(float(value) for value in record[VECTOR_COLUMN])
+            checksum, version = _checksum_of(record)
+            integrity = verify_stored_checksum(
+                values, recorded=checksum, version=version, required=True
+            )
+            if integrity is not VectorIntegrity.VERIFIED:
+                # The page passed `publication_page_is_complete` a moment ago, so reaching here
+                # means the source changed underneath the copy. Refusing is the only answer that
+                # does not propagate whatever it changed into a second publication.
+                msg = (
+                    f"a checkpoint vector failed numerical integrity ({integrity.value}) while "
+                    f"being copied for takeover; the source publication is not fit to replay"
+                )
+                raise VectorStoreStateError(msg)
+            vectors_by_id[str(record[CHUNK_ID_COLUMN])] = values
+        # Copied through `upsert`, which re-derives the checksum from the canonical values it is
+        # about to write rather than carrying the source row's string across. Carrying it would
+        # let one digest end up attached to bytes it was never taken from — the one failure a
+        # copy is in a position to introduce.
         await self.upsert(
             chunks,
             [vectors_by_id[chunk.id] for chunk in chunks],
@@ -1159,7 +1449,7 @@ class LanceVectorStore:
         chunk_ids: Sequence[str],
         *,
         logical_id_column: str,
-        has_identity: bool,
+        available: frozenset[str],
     ) -> list[dict[str, Any]]:
         """Every stored row among ``chunk_ids``, read in bounded pages.
 
@@ -1171,30 +1461,34 @@ class LanceVectorStore:
         A logical chunk id may match several publication rows, so this query has no row limit.
         Every match is classified and the strongest usable evidence wins.
 
-        A row from a table without the identity column reads as
-        :data:`~manicule.core.embedding.UNRECORDED_IDENTITY`, which is what it is.
+        ``available`` is the table's actual column set, so this asks a table that predates a
+        column for what it has rather than for what the current schema declares. A row from a
+        table without the identity column reads as
+        :data:`~manicule.core.embedding.UNRECORDED_IDENTITY`, and one from a table without the
+        checksum columns as :data:`~manicule.core.embedding.UNRECORDED_CHECKSUM` — which is in
+        both cases what it is.
         """
         columns = [logical_id_column, VECTOR_COLUMN, CHUNK_COLUMN]
-        if has_identity:
-            columns.append(IDENTITY_COLUMN)
+        columns.extend(
+            column
+            for column in (IDENTITY_COLUMN, CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN)
+            if column in available
+        )
 
         rows: list[dict[str, Any]] = []
         for start in range(0, len(chunk_ids), IDENTITY_QUERY_PAGE):
             page = chunk_ids[start : start + IDENTITY_QUERY_PAGE]
             listed = ", ".join(quote(chunk_id) for chunk_id in page)
-            found = (
+            rows.extend(
                 await table.query()
                 .where(f"{logical_id_column} IN ({listed})")
                 .select(columns)
                 .to_list()
             )
-            for record in found:
-                record.setdefault(IDENTITY_COLUMN, UNRECORDED_IDENTITY)
-            rows.extend(found)
         return rows
 
     async def _rows_by_identity(
-        self, table: AsyncTable, identities: Sequence[str]
+        self, table: AsyncTable, identities: Sequence[str], *, available: frozenset[str]
     ) -> dict[str, dict[str, Any]]:
         """One row per embedding-input identity, for the identities that have one.
 
@@ -1210,6 +1504,10 @@ class LanceVectorStore:
         rows happen to be laid out. The ``IN`` predicate is the bound, and what it bounds is
         the duplicate density of the corpus.
         """
+        columns = [VECTOR_COLUMN, CHUNK_COLUMN, IDENTITY_COLUMN]
+        columns.extend(
+            column for column in (CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN) if column in available
+        )
         rows: dict[str, dict[str, Any]] = {}
         for start in range(0, len(identities), IDENTITY_QUERY_PAGE):
             page = identities[start : start + IDENTITY_QUERY_PAGE]
@@ -1217,7 +1515,7 @@ class LanceVectorStore:
             found = (
                 await table.query()
                 .where(f"{IDENTITY_COLUMN} IN ({listed})")
-                .select([VECTOR_COLUMN, CHUNK_COLUMN, IDENTITY_COLUMN])
+                .select(columns)
                 .to_list()
             )
             for record in found:
@@ -1225,32 +1523,52 @@ class LanceVectorStore:
         return rows
 
     def _verdict(
-        self, chunk: Chunk, record: dict[str, Any], fingerprint: EmbedFingerprint
+        self,
+        chunk: Chunk,
+        record: dict[str, Any],
+        fingerprint: EmbedFingerprint,
+        *,
+        require_checksum: bool = False,
     ) -> StoredVector:
         """Classify one stored row against the chunk it is being offered for.
 
-        The three things a Lance row knows are read here; what they *mean* is decided by
+        The five things a Lance row knows are read here — its recorded identity, the chunk
+        beside it, the vector, and the checksum pair — and what they *mean* is decided by
         :func:`~manicule.core.embedding.classify_stored_vector`, which every backend shares so
         that two of them cannot answer one question two ways.
+
+        ``require_checksum`` is the caller's policy rather than the row's property: the same
+        row is unverified-but-readable to reuse and a refusal to a publication fence. See
+        :meth:`publication_page_is_complete`.
         """
         stored = record.get(VECTOR_COLUMN)
+        checksum, version = _checksum_of(record)
         return classify_stored_vector(
             chunk,
-            recorded_identity=str(record[IDENTITY_COLUMN] or UNRECORDED_IDENTITY),
+            recorded_identity=str(record.get(IDENTITY_COLUMN) or UNRECORDED_IDENTITY),
             stored_embed_text=_embed_text_of(record),
             stored_vector=None if stored is None else [float(value) for value in stored],
             embed=fingerprint,
             middleware=self._middleware,
+            recorded_checksum=checksum,
+            recorded_checksum_version=version,
+            require_checksum=require_checksum,
         )
 
     async def _unranked(self, table: AsyncTable, k: int, predicate: str | None) -> list[Candidate]:
-        """Candidates for a query the store cannot rank. See :meth:`search`."""
+        """Candidates for a query the store cannot rank. See :meth:`search`.
+
+        Checksums are verified here too. These rows are not ranked against anything, but they
+        are still returned as the corpus's answer, and a read path that let a mismatched row
+        through when the query happened to have no direction would be a hole in the rule shaped
+        exactly like a rarely exercised branch.
+        """
         query = table.query()
         if predicate is not None:
             query = query.where(predicate)
-        records = (
-            await query.select([ID_COLUMN, PUBLICATION_COLUMN, CHUNK_COLUMN]).limit(k).to_list()
-        )
+        columns = [ID_COLUMN, PUBLICATION_COLUMN, CHUNK_COLUMN]
+        columns.extend(await self._integrity_columns(table))
+        records = await query.select(columns).limit(k).to_list()
         return [
             Candidate(
                 chunk=Chunk.model_validate_json(str(record[CHUNK_COLUMN])),
@@ -1258,6 +1576,7 @@ class LanceVectorStore:
                 score=0.0,
             )
             for record in records
+            if _row_integrity(record).accepts
         ]
 
     def _row(
@@ -1267,7 +1586,13 @@ class LanceVectorStore:
         fingerprint: EmbedFingerprint,
         publication_id: str,
     ) -> dict[str, object]:
-        """One Lance row: the normalized vector, the promoted columns, the chunk, its identity."""
+        """One Lance row: the normalized vector, the promoted columns, the chunk, its identity.
+
+        The checksum is taken from ``values`` — the output of
+        :func:`~manicule.core.embedding.canonical_stored_vector`, which is the exact tuple this
+        row stores — rather than from ``vector``. Hashing the argument would hash a
+        representation that never reaches disk, and every readback would then disagree with it.
+        """
         backend = fingerprint.backend or "an unspecified backend"
         try:
             values = canonical_stored_vector(vector)
@@ -1297,6 +1622,8 @@ class LanceVectorStore:
             "position": chunk.position,
             CHUNK_COLUMN: chunk.model_dump_json(),
             IDENTITY_COLUMN: self._identity_of(chunk, fingerprint),
+            CHECKSUM_COLUMN: vector_checksum(values),
+            CHECKSUM_VERSION_COLUMN: VECTOR_CHECKSUM_VERSION,
         }
 
     def _identity_of(self, chunk: Chunk, fingerprint: EmbedFingerprint) -> str:
@@ -1375,14 +1702,25 @@ class LanceVectorStore:
         return await connection.create_table(name, schema=_row_model(fingerprint.dimension))
 
     async def _ensure_generation_columns(self, table: AsyncTable) -> None:
-        """Add :data:`IDENTITY_COLUMN` to a table created before it existed.
+        """Add the columns a table created before them does not have.
 
-        The whole migration for an existing ``vectors/`` directory, and it is deliberately the
-        cheapest one available: a column of empty strings, no row rewritten, no vector read and
-        no forward pass. Every existing row is then :data:`UNRECORDED_IDENTITY`, which
-        :meth:`stored_vectors` reconstructs from the chunk the row already carries — so the
-        upgrade costs an ``add_columns`` and nothing else, and an existing corpus keeps every
-        vector it has. Idempotent, because :meth:`ensure_ready` runs on every process start.
+        The whole schema migration for an existing ``vectors/`` directory, and it is
+        deliberately the cheapest one available: columns of empty strings, no row rewritten, no
+        vector read and no forward pass. Every existing row is then
+        :data:`UNRECORDED_IDENTITY`, which :meth:`stored_vectors` reconstructs from the chunk
+        the row already carries, and :data:`UNRECORDED_CHECKSUM`, which reads as
+        :attr:`~manicule.core.embedding.VectorIntegrity.UNVERIFIED` rather than as damage — so
+        the upgrade costs an ``add_columns`` and nothing else, and an existing corpus keeps
+        every vector it has. Idempotent, because :meth:`ensure_ready` runs on every process
+        start.
+
+        **The identity column and the checksum columns migrate on opposite terms**, and the
+        difference is the whole compatibility policy. An unrecorded identity can be
+        *reconstructed*, exactly, from the chunk stored beside the vector, so nothing is owed.
+        An unrecorded checksum cannot be reconstructed from anything — hashing the stored
+        vector now records what the bytes are today, not what they were when written — so the
+        backfill in :meth:`backfill_checksums` establishes coverage going forward and says so,
+        and until it has run those rows are reported as unverified rather than verified.
         """
         schema = await table.schema()
         names = {str(field.name) for field in schema}
@@ -1393,8 +1731,39 @@ class LanceVectorStore:
             additions[CHUNK_ID_COLUMN] = ID_COLUMN
         if PUBLICATION_COLUMN not in names:
             additions[PUBLICATION_COLUMN] = quote(LEGACY_PUBLICATION)
+        if CHECKSUM_COLUMN not in names:
+            additions[CHECKSUM_COLUMN] = quote(UNRECORDED_CHECKSUM)
+        if CHECKSUM_VERSION_COLUMN not in names:
+            additions[CHECKSUM_VERSION_COLUMN] = quote(UNRECORDED_CHECKSUM)
         if additions:
             await table.add_columns(additions)
+            self._columns = None
+
+    async def _integrity_columns(self, table: AsyncTable) -> list[str]:
+        """The columns a read needs to verify a row's numbers, for the tables that have them.
+
+        Empty for a table written before the contract: it records no checksums, so selecting
+        the columns would be a query error and verifying is not a thing that can be done. Those
+        rows read as :attr:`~manicule.core.embedding.VectorIntegrity.UNVERIFIED` — see
+        :meth:`backfill_checksums` for what clears that.
+        """
+        available = await self._available_columns(table)
+        if not {CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN} <= available:
+            return []
+        return [VECTOR_COLUMN, CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN]
+
+    async def _available_columns(self, table: AsyncTable) -> frozenset[str]:
+        """Which columns this table actually has, read once per open handle.
+
+        Every read path that touches a column added by a migration has to ask, because a
+        directory written by an older build does not have it and selecting it is a query error
+        rather than a null. Cached because ``search`` asks on every query and the answer can
+        only change where this instance opens the table or adds a column — the four places that
+        clear it.
+        """
+        if self._columns is None:
+            self._columns = frozenset(str(field.name) for field in await table.schema())
+        return self._columns
 
     async def _existing_table(self) -> AsyncTable | None:
         """The vector table if the directory has one, without requiring :meth:`ensure_ready`.
@@ -1530,6 +1899,36 @@ class PublishedLanceVectorStore:
     async def count(self) -> int:
         async with self._operation() as store:
             return await store.count()
+
+    async def checksum_coverage(
+        self, *, recompute: bool = False, page_size: int = INTEGRITY_SCAN_PAGE
+    ) -> VectorChecksumCoverage:
+        """The live generation's checksum coverage.
+
+        The vector root is checked before an operation is opened, on the same terms as
+        :meth:`ann_index_state`: opening one takes a generation pin and creates directories,
+        and this is a read behind ``status``. No root means nothing was looked at, which is
+        :attr:`~manicule.core.embedding.VectorChecksumCoverage.scanned` rather than a zero.
+        """
+        if not await asyncio.to_thread(self._directory.exists):
+            return VectorChecksumCoverage(scanned=False)
+        async with self._operation() as store:
+            return await store.checksum_coverage(recompute=recompute, page_size=page_size)
+
+    async def backfill_checksums(
+        self, *, limit: int = INTEGRITY_SCAN_PAGE, dry_run: bool = False
+    ) -> VectorChecksumBackfill:
+        """Run one bounded backfill pass against the live generation.
+
+        Scoped to the published generation this handle follows and to nothing else. A workspace
+        has its own vector root, and a retired generation is a different directory, so a pass
+        can neither reach another tenant's rows nor rewrite a generation that is no longer
+        live — the two boundaries this is the first operation to rewrite rows across.
+        """
+        if not await asyncio.to_thread(self._directory.exists):
+            return VectorChecksumBackfill(dry_run=dry_run)
+        async with self._operation() as store:
+            return await store.backfill_checksums(limit=limit, dry_run=dry_run)
 
     async def ann_index_state(self, *, threshold: int) -> AnnIndexState:
         """The live generation's index state, named with the generation it describes.
@@ -1838,10 +2237,13 @@ async def reset_vector_directory(directory: Path, *, legacy_root: bool) -> bool:
 
 
 __all__ = [
+    "CHECKSUM_COLUMN",
+    "CHECKSUM_VERSION_COLUMN",
     "EXEMPT_FILTER_FIELDS",
     "FILTERABLE_COLUMNS",
     "FLOAT32_EPSILON",
     "IDENTITY_COLUMN",
+    "INTEGRITY_SCAN_PAGE",
     "META_TABLE",
     "PUSHED_DOWN_FILTER_FIELDS",
     "SOURCE_CREATED_AT_COLUMN",

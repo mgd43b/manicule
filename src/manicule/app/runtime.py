@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from manicule.config.settings import Settings
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.ann import AnnIndexBuild, AnnIndexState
+    from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.protocols import Connector, Embedder, Parser, VectorStore
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
@@ -2195,6 +2196,39 @@ class _Maintenance:
     @property
     def _ann_index_threshold(self) -> int:
         return self._runtime.settings.storage.ann_index_threshold
+
+    async def vector_checksum_coverage(
+        self, *, recompute: bool = False
+    ) -> VectorChecksumCoverage | None:
+        """Report coverage through the plain vector handle, for the same reason a build does.
+
+        ``prepared_vectors`` constructs the embedder to read its fingerprint. Numerical
+        integrity is a property of bytes already on disk, so needing a model runtime to report
+        on it would make this the one diagnostic unavailable on a machine whose embedder is
+        broken — which is exactly the machine somebody is diagnosing.
+        """
+        from manicule.core.protocols import VectorIntegrityMaintenance  # noqa: PLC0415
+
+        vectors = await self._runtime.vectors()
+        if not isinstance(vectors, VectorIntegrityMaintenance):
+            return None
+        return await vectors.checksum_coverage(recompute=recompute)
+
+    async def backfill_vector_checksums(
+        self, *, limit: int, dry_run: bool = False
+    ) -> VectorChecksumBackfill | None:
+        """Run one bounded backfill pass through the plain vector handle.
+
+        No embedder here either, and that is load-bearing rather than incidental: a backfill
+        that could reach a model would be a backfill somebody could accidentally turn into a
+        re-embed of the corpus.
+        """
+        from manicule.core.protocols import VectorIntegrityMaintenance  # noqa: PLC0415
+
+        vectors = await self._runtime.vectors()
+        if not isinstance(vectors, VectorIntegrityMaintenance):
+            return None
+        return await vectors.backfill_checksums(limit=limit, dry_run=dry_run)
 
     async def plan_reset_derived(self) -> LifecyclePlan:
         return await self._source_lifecycle(await self._runtime.documents()).plan_reset_derived()
