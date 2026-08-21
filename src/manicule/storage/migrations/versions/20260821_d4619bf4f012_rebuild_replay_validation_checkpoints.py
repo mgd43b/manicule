@@ -26,9 +26,7 @@ def upgrade() -> None:
         # alive, not that a page of replay or validation actually completed. NULL until the
         # first durable page commit.
         batch.add_column(
-            sa.Column(
-                "last_progress_at", manicule.storage.types.UtcDateTime(), nullable=True
-            )
+            sa.Column("last_progress_at", manicule.storage.types.UtcDateTime(), nullable=True)
         )
         # Replay checkpoint. `replay_lease_generation` is what makes the cursor trustworthy: it
         # names the lease generation whose physical vector namespace the cursor was verified
@@ -38,9 +36,7 @@ def upgrade() -> None:
         batch.add_column(sa.Column("replay_lease_generation", sa.Integer(), nullable=True))
         batch.add_column(sa.Column("replay_checkpoint_sequence", sa.Integer(), nullable=True))
         batch.add_column(
-            sa.Column(
-                "replayed_vector_count", sa.Integer(), nullable=False, server_default="0"
-            )
+            sa.Column("replayed_vector_count", sa.Integer(), nullable=False, server_default="0")
         )
         # Validation checkpoint, same shape and the same reason: staged items are sealed once
         # `VALIDATING` begins, so a checkpoint recorded under the lease generation that is still
@@ -48,9 +44,7 @@ def upgrade() -> None:
         batch.add_column(sa.Column("validation_lease_generation", sa.Integer(), nullable=True))
         batch.add_column(sa.Column("validation_checkpoint_sequence", sa.Integer(), nullable=True))
         batch.add_column(
-            sa.Column(
-                "validated_vector_count", sa.Integer(), nullable=False, server_default="0"
-            )
+            sa.Column("validated_vector_count", sa.Integer(), nullable=False, server_default="0")
         )
     with op.batch_alter_table("derived_generations") as batch:
         batch.alter_column(
@@ -65,9 +59,7 @@ def upgrade() -> None:
             existing_nullable=False,
             server_default=None,
         )
-        batch.drop_constraint(
-            "derived_generation_counts_are_not_negative", type_="check"
-        )
+        batch.drop_constraint("derived_generation_counts_are_not_negative", type_="check")
         batch.create_check_constraint(
             "derived_generation_counts_are_not_negative",
             "expected_item_count >= 0 AND next_sequence >= 0 AND documents_built >= 0 "
@@ -85,9 +77,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     with op.batch_alter_table("derived_generations") as batch:
-        batch.drop_constraint(
-            "derived_generation_counts_are_not_negative", type_="check"
-        )
+        batch.drop_constraint("derived_generation_counts_are_not_negative", type_="check")
         batch.create_check_constraint(
             "derived_generation_counts_are_not_negative",
             "expected_item_count >= 0 AND next_sequence >= 0 AND documents_built >= 0 "
