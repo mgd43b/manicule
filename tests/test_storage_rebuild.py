@@ -585,7 +585,11 @@ async def publish_one_replacement(
         estimate_id,
         owner,
         now=NOW,
-        expires_at=NOW + timedelta(minutes=5),
+        # Comfortably past any real elapsed time this suite could ever run under: validation's
+        # per-page checkpoint commit fences against a live clock (`utcnow()`), not `NOW`, so the
+        # claimed lease has to stay valid against real wall-clock time, not just the fixed `NOW`
+        # this fixture otherwise reasons about.
+        expires_at=NOW + timedelta(days=36500),
     )
     replacement_document = document.model_copy(
         update={
@@ -711,7 +715,9 @@ async def staged_glossary_generation(
         plan.generation_id,
         "glossary-publisher",
         now=NOW,
-        expires_at=NOW + timedelta(minutes=5),
+        # See `publish_one_replacement`: validation's checkpoint commit fences against a live
+        # clock, so this has to stay valid against real wall-clock time, not just `NOW`.
+        expires_at=NOW + timedelta(days=36500),
     )
     replacements: list[tuple[int, DerivedReplacement]] = []
     documents: list[Document] = []
@@ -972,7 +978,7 @@ async def test_allowed_partial_publication_derives_only_evidence_and_keeps_omiss
         plan.generation_id,
         "partial-publisher",
         now=NOW,
-        expires_at=NOW + timedelta(minutes=5),
+        expires_at=NOW + timedelta(days=36500),
     )
     replacements: list[tuple[int, DerivedReplacement]] = []
     for sequence, (raw, blob_ref) in enumerate(zip(raws, blob_refs, strict=True)):
@@ -1141,11 +1147,14 @@ async def test_releasing_a_generation_another_owner_holds_is_refused(
 ) -> None:
     """Giving up a generation is still a write, and a lost lease is the loss of that right."""
     rebuilds, claimed, _ = await staged_glossary_generation(store, engine, data_dir)
+    # Past `staged_glossary_generation`'s own (real-time-safe) claim expiry, so this simulates
+    # "the original lease has now expired" the same way the pre-existing 5-minute-window
+    # version of this test did against its shorter expiry.
     await rebuilds.claim_generation(
         claimed.generation_id,
         "successor",
-        now=NOW + timedelta(minutes=10),
-        expires_at=NOW + timedelta(minutes=15),
+        now=NOW + timedelta(days=36500, minutes=10),
+        expires_at=NOW + timedelta(days=36500, minutes=15),
     )
 
     with pytest.raises(RebuildLeaseConflictError):
@@ -1154,7 +1163,7 @@ async def test_releasing_a_generation_another_owner_holds_is_refused(
             RebuildRefusalCode.STORAGE_FAILED,
             owner="glossary-publisher",
             lease_generation=claimed.lease_generation,
-            now=NOW + timedelta(minutes=11),
+            now=NOW + timedelta(days=36500, minutes=11),
         )
 
 
@@ -1528,11 +1537,13 @@ async def test_successor_takeover_fences_slow_stale_evidence_verifier(
         workspace_id=store.workspace_id,
         blobs=BlobStore(engine, data_dir),
     )
+    # Past `staged_glossary_generation`'s own (real-time-safe) claim expiry — see
+    # `test_releasing_a_generation_another_owner_holds_is_refused`.
     claimed = await successor.claim_generation(
         generation_id,
         "successor-verifier",
-        now=NOW + timedelta(minutes=10),
-        expires_at=NOW + timedelta(minutes=20),
+        now=NOW + timedelta(days=36500, minutes=10),
+        expires_at=NOW + timedelta(days=36500, minutes=20),
     )
     blobs.verification_release.set()
 
@@ -2555,7 +2566,8 @@ async def test_shadow_generation_is_invisible_until_one_atomic_publication(  # n
         estimate.generation_id,
         "worker",
         now=NOW,
-        expires_at=NOW + timedelta(minutes=5),
+        # Real-time-safe: validation's per-page checkpoint commit fences against a live clock.
+        expires_at=NOW + timedelta(days=36500),
     )
     replacement_document = old.model_copy(
         update={
@@ -3143,8 +3155,13 @@ async def _two_document_generation(
         engine, workspace_id=store.workspace_id, blobs=BlobStore(engine, data_dir), vectors=vectors
     )
     plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    # Real time, not the fixed `NOW`: validation's per-page checkpoint commit fences against a
+    # live clock, and some callers of this fixture take the generation over via a later,
+    # real-time-anchored claim — a claim expiry fixed to `NOW` would already read as expired to
+    # both.
+    claim_now = datetime.now(UTC)
     claimed = await rebuilds.claim_generation(
-        plan.generation_id, owner, now=NOW, expires_at=NOW + timedelta(minutes=5)
+        plan.generation_id, owner, now=claim_now, expires_at=claim_now + timedelta(minutes=5)
     )
     replacements: list[tuple[int, DerivedReplacement]] = []
     documents: list[Document] = []
@@ -3291,7 +3308,9 @@ async def test_takeover_invalidates_a_stale_validation_checkpoint(
         assert before.validation_lease_generation == claimed.lease_generation
         assert before.validation_checkpoint_sequence == 1
 
-    takeover_now = datetime.now(UTC)
+    # Past `_two_document_generation`'s own claim expiry (real time plus five minutes), so this
+    # is a genuine takeover rather than a live-owner conflict.
+    takeover_now = datetime.now(UTC) + timedelta(minutes=10)
     taken_over = await rebuilds.claim_generation(
         claimed.generation_id,
         "new-worker",
@@ -3355,7 +3374,9 @@ async def test_replay_resumes_past_an_already_copied_page_under_the_same_lease(
         store, engine, data_dir, owner="replay-worker"
     )
 
-    takeover_now = datetime.now(UTC)
+    # Past `_two_document_generation`'s own claim expiry (real time plus five minutes), so this
+    # is a genuine takeover rather than a live-owner conflict.
+    takeover_now = datetime.now(UTC) + timedelta(minutes=10)
     taken_over = await rebuilds.claim_generation(
         claimed.generation_id,
         "replay-two",

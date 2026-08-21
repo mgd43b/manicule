@@ -953,7 +953,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 lease_generation,
                 checkpoint_sequence=after,
                 replayed_vectors=expected_vectors,
-                now=now,
+                now=utcnow(),
             )
         if await self._publication_row_count(target_publication) != expected_vectors:
             raise RebuildPublicationValidationError
@@ -1253,7 +1253,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     lease_generation,
                     checkpoint_sequence=after,
                     validated_vectors=expected_vectors,
-                    now=now,
+                    now=utcnow(),
                 )
         if await self._publication_row_count(physical_publication) != expected_vectors:
             raise RebuildPublicationValidationError

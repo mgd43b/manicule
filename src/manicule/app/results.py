@@ -903,9 +903,11 @@ class RebuildRunReport(Payload):
     validated_vectors: int = Field(default=0, ge=0)
     last_progress_at: str | None = Field(
         default=None,
-        description="When a durable replay/validation page, staged batch, evidence "
-        "verification or publication last committed — distinct from lease renewal, which "
-        "proves only that a worker is alive, not that work advanced.",
+        description="When a durable replay page, validation page, staged batch, or "
+        "publication last committed — distinct from lease renewal, which proves only that a "
+        "worker is alive, not that work advanced. Retained-source evidence verification does "
+        "not move it: it also runs as a read-only repair pass over an already-published, "
+        "immutable generation, where nothing should read as new progress.",
     )
     diagnostic_code: str | None = None
     lifecycle: LifecycleProgress
