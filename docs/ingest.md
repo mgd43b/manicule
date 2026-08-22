@@ -1845,29 +1845,35 @@ heartbeat alone, so a healthy renewal against a stalled cursor cannot read as co
 counters, all workspace-scoped aggregates with no document, chunk, vector, or source identity in
 them.
 
-**A storage failure anywhere between the claim and publication settles the same way, and that
-settlement is a release rather than an ending.** The refusals the build anticipates each mark
-their own generation failed, which is right for a diagnosis — a corrupt manifest, a replacement
-that does not validate — because retrying that work would fail the same way. A driver or
-filesystem failure is not a diagnosis of the work: a writer held SQLite past the busy timeout, a
-disk was briefly full, and the documents already committed are still correct. Ending the
-generation over one of those would discard every one of them, since `fail_generation` is terminal
-and a failed generation can never be claimed again.
+**Storage failures carry one bounded, versioned diagnostic rather than a driver message.**
+`rebuild status` returns its `schema_version`, operation `stage`, conservative `cause`,
+`retryable` and `namespace_usable` flags, aggregate replay/validation checkpoints, occurrence
+time, opaque correlation id, retry count, next eligible retry time, and a safe operator hint.
+The vocabulary is deliberately closed: stages include validation evidence/vector/checkpoint/final
+count, lease renewal/assertion, publication, and release; causes are `busy`, `capacity`,
+`permission`, `io`, `database_integrity`, `vector_storage`, or `unknown`. It never contains the
+driver message, SQL, bind values, filesystem path, URL, document data, vector, credential, or
+lease-owner token. Local structured logging emits exactly that reviewed record for the original
+failure and, if settlement itself fails, a second `release` record with the same correlation id.
 
-So one settlement sits at the durable boundary, and it records `storage_failed`, drops the lease,
-and leaves the state where it was. The next run's claim is then a takeover that resumes from the
-committed checkpoint, and `diagnostic_count` accumulates across attempts — one storage failure is
-contention, the same one on the fourth attempt is a machine that needs an operator. It is best
-effort by construction: if the store is what broke, or the lease lapsed and another owner holds
-the generation, the attempt is dropped rather than chained, because that owner alone may write the
-row. Either way the caller receives `RebuildStorageError` and no exception text.
+Only fixed transient signals are retried: SQLite `busy`/`locked` and a small set of explicit
+interrupted/temporary connection I/O errno values. The retry budget is three attempts, bounded by
+five seconds, with exponential backoff and jitter. It remains inside the current lease heartbeat,
+is cancellation-aware, and reasserts the same owner, generation, and fence before retrying.
+Validation re-enters from its durable page checkpoint, so it never restarts the rebuild or replays
+already-committed validation pages. A commit that reports an error after its transaction commits
+is equally safe: the retry rereads the checkpoint and continues from the exact durable boundary.
 
-That leaves one honest state rather than two, because **`rebuild status` derives
-`lifecycle.outcome` from the lease exactly as `snapshot_status` does** (§13.4). A generation
-nobody owns reads `incomplete` — unfinished, inactive, and resumable from its committed
-checkpoint — never `running`. A takeover replaying its predecessor's vectors before it claims is
-covered by the same rule, and so is a settlement that could not be written: an operator can tell
-active work from work waiting to be resumed without being told the owner token.
+Capacity, permission, database-integrity, vector-store, and unknown failures are
+operator-required: no retry is scheduled and a process supervisor must not hot-restart them.
+The generation is released rather than failed, preserving its staged work for a later resume; the
+next claim takes over according to the existing immutable evidence and fencing rules. If the
+worker still owns a live lease during a transient retry, its physical namespace remains usable.
+If settlement cannot be written because the store is unavailable or a successor owns the row, the
+original safe failure remains the reported result and no stale worker mutates the generation.
+Status therefore distinguishes `retrying`, `takeover_replay`, `validation`, normal rebuilding, and
+`operator_required`; a release without a durable diagnostic remains the older honest
+`incomplete` state rather than falsely reporting active work.
 
 ### 10.5 Source and derived lifecycle boundaries
 

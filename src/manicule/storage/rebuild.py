@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from pydantic import TypeAdapter
 from sqlalchemy import delete, func, literal, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import SQLAlchemyError
 
 from manicule.core.acquisition import (
     AcquiredSource,
@@ -34,6 +35,10 @@ from manicule.core.rebuild import (
     RebuildPublicationValidationError,
     RebuildRefusalCode,
     RebuildState,
+    RebuildStorageBackendError,
+    RebuildStorageDiagnostic,
+    RebuildStorageOperationError,
+    RebuildStorageStage,
     RebuildTarget,
     RebuildTerminalGenerationError,
     SnapshotRebuildInput,
@@ -58,6 +63,7 @@ from manicule.storage.fts import (
 from manicule.storage.rows import apply_document, from_chunk, to_chunk
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
+from manicule.storage.vectors import VectorStoreStateError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator, Sequence
@@ -251,6 +257,11 @@ def _checkpoint(
     # so that count is not this generation's progress and must read as zero rather than stale.
     replay_current = row.replay_lease_generation == row.lease_generation
     validation_current = row.validation_lease_generation == row.lease_generation
+    current_publication = (
+        vector_publication_id(row.id, row.lease_owner, row.lease_generation)
+        if row.lease_owner is not None and row.lease_generation > 0
+        else None
+    )
     return RebuildCheckpoint(
         generation_id=row.id,
         state=row.state,
@@ -270,6 +281,11 @@ def _checkpoint(
             else 0
         ),
         replayed_vectors=row.replayed_vector_count if replay_current else 0,
+        takeover_replay=(
+            row.state is RebuildState.BUILDING
+            and row.vector_publication_id is not None
+            and row.vector_publication_id != current_publication
+        ),
         validated_items=(
             row.validation_checkpoint_sequence + 1
             if validation_current and row.validation_checkpoint_sequence is not None
@@ -281,6 +297,11 @@ def _checkpoint(
             RebuildRefusalCode(row.diagnostic_code) if row.diagnostic_code is not None else None
         ),
         diagnostic_count=row.diagnostic_count,
+        storage_diagnostic=(
+            RebuildStorageDiagnostic.model_validate(row.storage_diagnostic)
+            if row.storage_diagnostic is not None
+            else None
+        ),
         predecessor_vector_publication_id=predecessor_vector_publication_id,
     )
 
@@ -317,6 +338,8 @@ class SqliteRebuildStore(WorkspaceScoped):
     async def _publication_row_count(self, publication_id: str) -> int:
         try:
             return await self._required_vectors().publication_row_count(publication_id)
+        except VectorStoreStateError as exc:
+            raise RebuildStorageBackendError from exc
         except (ManiculeError, ValueError) as exc:
             raise RebuildPublicationValidationError from exc
 
@@ -333,6 +356,8 @@ class SqliteRebuildStore(WorkspaceScoped):
                 chunks,
                 embedding_fingerprint=embedding_fingerprint,
             )
+        except VectorStoreStateError as exc:
+            raise RebuildStorageBackendError from exc
         except (ManiculeError, ValueError) as exc:
             raise RebuildPublicationValidationError from exc
 
@@ -943,6 +968,8 @@ class SqliteRebuildStore(WorkspaceScoped):
                             page,
                             embedding_fingerprint=target.embedding_fingerprint,
                         )
+                    except VectorStoreStateError as exc:
+                        raise RebuildStorageBackendError from exc
                     except (ManiculeError, ValueError) as exc:
                         raise RebuildPublicationValidationError from exc
                     if not page_complete:
@@ -1189,7 +1216,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation.updated_at = now
             return _checkpoint(generation)
 
-    async def validate_generation(
+    async def validate_generation(  # noqa: PLR0912, PLR0915 - durable page boundaries
         self,
         generation_id: str,
         *,
@@ -1215,38 +1242,50 @@ class SqliteRebuildStore(WorkspaceScoped):
         than a bare ``utcnow()``.
         """
         live_clock = clock or utcnow
-        async with self._sessions() as session:
-            generation = await self._required_generation(session, generation_id)
-            if generation.state not in {RebuildState.VALIDATING, RebuildState.PUBLISHED}:
-                raise RebuildPublicationValidationError
-            validating = generation.state is RebuildState.VALIDATING
-            if validating:
-                self._require_lease(generation, owner, lease_generation, now)
-            effective_owner = owner if validating else (generation.lease_owner or "")
-            effective_lease_generation = (
-                lease_generation if validating else generation.lease_generation
-            )
-            await self._verify_complete_header(session, generation)
-            target = RebuildTarget.model_validate(generation.target)
-            expected_item_count = generation.expected_item_count
-            resumable = validating and generation.validation_lease_generation == lease_generation
-            after = (
-                generation.validation_checkpoint_sequence
-                if resumable and generation.validation_checkpoint_sequence is not None
-                else -1
-            )
-            expected_vectors = generation.validated_vector_count if resumable else 0
+        try:
+            async with self._sessions() as session:
+                generation = await self._required_generation(session, generation_id)
+                if generation.state not in {RebuildState.VALIDATING, RebuildState.PUBLISHED}:
+                    raise RebuildPublicationValidationError
+                validating = generation.state is RebuildState.VALIDATING
+                if validating:
+                    self._require_lease(generation, owner, lease_generation, now)
+                effective_owner = owner if validating else (generation.lease_owner or "")
+                effective_lease_generation = (
+                    lease_generation if validating else generation.lease_generation
+                )
+                await self._verify_complete_header(session, generation)
+                target = RebuildTarget.model_validate(generation.target)
+                expected_item_count = generation.expected_item_count
+                resumable = (
+                    validating and generation.validation_lease_generation == lease_generation
+                )
+                after = (
+                    generation.validation_checkpoint_sequence
+                    if resumable and generation.validation_checkpoint_sequence is not None
+                    else -1
+                )
+                expected_vectors = generation.validated_vector_count if resumable else 0
+        except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+            raise RebuildStorageOperationError(
+                RebuildStorageStage.VALIDATION_EVIDENCE_READ
+            ) from exc
         physical_publication = vector_publication_id(
             generation_id, effective_owner, effective_lease_generation
         )
         while after + 1 < expected_item_count:
             if cancel is not None and cancel.is_set():
                 raise asyncio.CancelledError
-            async with self._sessions() as session:
-                generation = await self._required_generation(session, generation_id)
-                if validating:
-                    self._require_lease(generation, owner, lease_generation, now)
-                pairs = await self._evidence_page(session, generation, after=after)
+            try:
+                async with self._sessions() as session:
+                    generation = await self._required_generation(session, generation_id)
+                    if validating:
+                        self._require_lease(generation, owner, lease_generation, now)
+                    pairs = await self._evidence_page(session, generation, after=after)
+            except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                raise RebuildStorageOperationError(
+                    RebuildStorageStage.VALIDATION_EVIDENCE_READ
+                ) from exc
             for row, snapshot in pairs:
                 replacement = self._validated_replacement(row, snapshot)
                 chunks = replacement.flattened_chunks()
@@ -1254,25 +1293,43 @@ class SqliteRebuildStore(WorkspaceScoped):
                 for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
                     if cancel is not None and cancel.is_set():
                         raise asyncio.CancelledError
-                    if not await self._publication_page_is_complete(
-                        physical_publication,
-                        page,
-                        embedding_fingerprint=target.embedding_fingerprint,
-                    ):
+                    try:
+                        page_complete = await self._publication_page_is_complete(
+                            physical_publication,
+                            page,
+                            embedding_fingerprint=target.embedding_fingerprint,
+                        )
+                    except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                        raise RebuildStorageOperationError(
+                            RebuildStorageStage.VALIDATION_VECTOR_READ
+                        ) from exc
+                    if not page_complete:
                         raise RebuildPublicationValidationError
             after = pairs[-1][0].sequence
             if validating:
-                await self._commit_validation_checkpoint(
-                    generation_id,
-                    owner,
-                    lease_generation,
-                    checkpoint_sequence=after,
-                    validated_vectors=expected_vectors,
-                    now=live_clock(),
-                )
-        if await self._publication_row_count(physical_publication) != expected_vectors:
+                try:
+                    await self._commit_validation_checkpoint(
+                        generation_id,
+                        owner,
+                        lease_generation,
+                        checkpoint_sequence=after,
+                        validated_vectors=expected_vectors,
+                        now=live_clock(),
+                    )
+                except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                    raise RebuildStorageOperationError(
+                        RebuildStorageStage.VALIDATION_CHECKPOINT
+                    ) from exc
+        try:
+            final_vector_count = await self._publication_row_count(physical_publication)
+        except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+            raise RebuildStorageOperationError(RebuildStorageStage.VALIDATION_FINAL_COUNT) from exc
+        if final_vector_count != expected_vectors:
             raise RebuildPublicationValidationError
-        await self._record_evidence_verification(generation_id)
+        try:
+            await self._record_evidence_verification(generation_id)
+        except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+            raise RebuildStorageOperationError(RebuildStorageStage.VALIDATION_FINAL_COUNT) from exc
 
     async def _commit_validation_checkpoint(
         self,
@@ -2459,6 +2516,25 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation.lease_expires_at = None
             generation.updated_at = now
             return _checkpoint(generation)
+
+    async def record_storage_diagnostic(
+        self,
+        generation_id: str,
+        diagnostic: RebuildStorageDiagnostic,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> None:
+        """Store one safe failure record while preserving the owned generation and progress."""
+        async with self._sessions.begin() as session:
+            generation = await self._required_generation(session, generation_id)
+            self._require_lease(generation, owner, lease_generation, now)
+            generation.diagnostic_code = RebuildRefusalCode.STORAGE_FAILED.value
+            generation.storage_diagnostic = diagnostic.model_dump(mode="json")
+            # This is observability, not content progress.  `last_progress_at` must remain the
+            # last committed replay/validation/staging boundary, even while a retry is active.
+            generation.updated_at = now
 
     async def _required_generation(
         self, session: AsyncSession, generation_id: str

@@ -122,6 +122,10 @@ written for it rather than inheriting one written for its parent.
 
 def error_info(exc: Exception) -> ErrorInfo:
     """Describe a failure in the shape the contract promises."""
+    if isinstance(exc, RebuildStorageError) and exc.diagnostic is not None:
+        return ErrorInfo(
+            type=type(exc).__name__, message=str(exc), hint=exc.diagnostic.operator_hint
+        )
     return ErrorInfo(
         type=type(exc).__name__,
         message=str(exc),

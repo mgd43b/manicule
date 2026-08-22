@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
@@ -37,6 +38,70 @@ class RebuildRefusalCode(StrEnum):
     DERIVATION_FAILED = "derivation_failed"
     STORAGE_FAILED = "storage_failed"
     PUBLICATION_CONFLICT = "publication_conflict"
+
+
+class RebuildStorageStage(StrEnum):
+    """Bounded locations at which durable rebuild storage can fail.
+
+    These are deliberately operation boundaries rather than implementation details.  In
+    particular, a driver statement, table name, filename, and vector key never become part of
+    this vocabulary: this model crosses the CLI, HTTP, MCP, and UI contracts.
+    """
+
+    PLAN = "plan"
+    CLAIM = "claim"
+    TAKEOVER_REPLAY_READ = "takeover_replay_read"
+    TAKEOVER_REPLAY_WRITE = "takeover_replay_write"
+    TAKEOVER_REPLAY_CHECKPOINT = "takeover_replay_checkpoint"
+    BUILD_CHECKPOINT = "build_checkpoint"
+    VALIDATION_EVIDENCE_READ = "validation_evidence_read"
+    VALIDATION_VECTOR_READ = "validation_vector_read"
+    VALIDATION_CHECKPOINT = "validation_checkpoint"
+    VALIDATION_FINAL_COUNT = "validation_final_count"
+    LEASE_RENEWAL = "lease_renewal"
+    LEASE_ASSERTION = "lease_assertion"
+    PUBLICATION = "publication"
+    RELEASE = "release"
+
+
+class RebuildStorageCause(StrEnum):
+    """Conservative, backend-independent classification of a storage failure."""
+
+    BUSY = "busy"
+    CAPACITY = "capacity"
+    PERMISSION = "permission"
+    IO = "io"
+    DATABASE_INTEGRITY = "database_integrity"
+    VECTOR_STORAGE = "vector_storage"
+    UNKNOWN = "unknown"
+
+
+class RebuildStorageDiagnostic(BaseModel):
+    """Versioned, aggregate-only evidence for a rebuild storage failure.
+
+    The record is intentionally small enough to retain on the generation row.  It names the
+    operation and safe category, not the exception or the storage object which produced it.
+    Counters describe only already-committed replay/validation work; retry bookkeeping never
+    changes them and therefore cannot impersonate useful progress.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    event: Literal["primary", "settlement"] = "primary"
+    stage: RebuildStorageStage
+    cause: RebuildStorageCause
+    retryable: bool
+    namespace_usable: bool
+    replayed_items: int = Field(default=0, ge=0)
+    replayed_vectors: int = Field(default=0, ge=0)
+    validated_items: int = Field(default=0, ge=0)
+    validated_vectors: int = Field(default=0, ge=0)
+    occurred_at: AwareDatetime
+    correlation_id: str = Field(min_length=16, max_length=64)
+    retry_count: int = Field(default=0, ge=0)
+    next_retry_at: AwareDatetime | None = None
+    operator_hint: str = Field(min_length=1, max_length=160)
 
 
 class RebuildTarget(BaseModel):
@@ -186,11 +251,13 @@ class RebuildCheckpoint(BaseModel):
     last_progress_at: AwareDatetime | None = None
     replayed_items: int = Field(default=0, ge=0)
     replayed_vectors: int = Field(default=0, ge=0)
+    takeover_replay: bool = False
     validated_items: int = Field(default=0, ge=0)
     validated_vectors: int = Field(default=0, ge=0)
     fence_generation: int | None = Field(default=None, ge=1)
     diagnostic_code: RebuildRefusalCode | None = None
     diagnostic_count: int = Field(default=0, ge=0)
+    storage_diagnostic: RebuildStorageDiagnostic | None = None
     predecessor_vector_publication_id: str | None = None
 
     @property
@@ -242,6 +309,22 @@ class RebuildPublicationValidationError(RuntimeError):
         self.code = code
 
 
+class RebuildStorageBackendError(RebuildPublicationValidationError):
+    """Private marker for an unavailable or malformed vector-storage backend.
+
+    This carries no rendered detail.  Its cause remains available to local exception tooling,
+    while the rebuild boundary turns it into a bounded ``vector_storage`` diagnostic.
+    """
+
+
+class RebuildStorageOperationError(RuntimeError):
+    """Private stage marker preserving a safe operation boundary across storage layers."""
+
+    def __init__(self, stage: RebuildStorageStage) -> None:
+        super().__init__(stage.value)
+        self.stage = stage
+
+
 class RebuildOperationError(ManiculeError):
     """A private-safe expected failure of durable rebuild work.
 
@@ -255,8 +338,9 @@ class RebuildOperationError(ManiculeError):
 class RebuildStorageError(RebuildOperationError):
     """Durable rebuild storage could not complete an expected operation."""
 
-    def __init__(self) -> None:
+    def __init__(self, diagnostic: RebuildStorageDiagnostic | None = None) -> None:
         super().__init__("offline rebuild storage failed")
+        self.diagnostic = diagnostic
 
 
 class RebuildDerivationError(RebuildOperationError):
@@ -301,7 +385,12 @@ __all__ = [
     "RebuildRefusalCode",
     "RebuildRefusedError",
     "RebuildState",
+    "RebuildStorageBackendError",
+    "RebuildStorageCause",
+    "RebuildStorageDiagnostic",
     "RebuildStorageError",
+    "RebuildStorageOperationError",
+    "RebuildStorageStage",
     "RebuildTarget",
     "RebuildTerminalError",
     "RebuildTerminalGenerationError",
