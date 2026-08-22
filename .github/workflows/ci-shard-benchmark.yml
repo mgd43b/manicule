@@ -1,0 +1,104 @@
+name: CI shard benchmark
+
+# This is intentionally manual: the 21 jobs below measure candidate test-matrix widths on the
+# same GitHub runners as CI, but are not routine pull-request work. Run it after refreshing
+# `.test_durations`, then compare the slowest job and aggregate runner minutes in the Actions UI.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-shard-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  test:
+    name: test (3.13, ${{ matrix.width }} shards, shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { width: 3, shard: 1 }
+          - { width: 3, shard: 2 }
+          - { width: 3, shard: 3 }
+          - { width: 4, shard: 1 }
+          - { width: 4, shard: 2 }
+          - { width: 4, shard: 3 }
+          - { width: 4, shard: 4 }
+          - { width: 6, shard: 1 }
+          - { width: 6, shard: 2 }
+          - { width: 6, shard: 3 }
+          - { width: 6, shard: 4 }
+          - { width: 6, shard: 5 }
+          - { width: 6, shard: 6 }
+          - { width: 8, shard: 1 }
+          - { width: 8, shard: 2 }
+          - { width: 8, shard: 3 }
+          - { width: 8, shard: 4 }
+          - { width: 8, shard: 5 }
+          - { width: 8, shard: 6 }
+          - { width: 8, shard: 7 }
+          - { width: 8, shard: 8 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --all-extras --python 3.13
+      - name: cache tree-sitter grammars
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: grammars-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: pre-seed grammars
+        run: >-
+          uv run --python 3.13 python -c
+          "from manicule.parsers import grammars;
+          print('fetched:', grammars.prefetch(grammars.DECLARED_LANGUAGES));
+          missing = grammars.missing_grammars(grammars.DECLARED_LANGUAGES);
+          assert not missing, f'grammars still missing after pre-seed: {missing}'"
+      - name: cache tiktoken vocabularies
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/tiktoken
+          key: vocabularies-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: pre-seed tiktoken vocabularies
+        env:
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
+        run: >-
+          uv run --python 3.13 python -c
+          "from manicule import vocabularies;
+          wanted = vocabularies.required_encodings();
+          print('seeded:', vocabularies.prefetch(wanted));
+          missing = vocabularies.missing_vocabularies(wanted);
+          assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
+      - name: pytest
+        id: pytest
+        env:
+          REQUIRE_GRAMMAR_BUNDLE: "1"
+          REQUIRE_VOCABULARY_BUNDLE: "1"
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
+        run: |
+          started=$(date +%s)
+          uv run --python 3.13 pytest \
+            --splits ${{ matrix.width }} --group ${{ matrix.shard }} \
+            --splitting-algorithm least_duration \
+            --cov --cov-report=term-missing --durations=25
+          elapsed=$(( $(date +%s) - started ))
+          echo "seconds=${elapsed}" >> "$GITHUB_OUTPUT"
+      - name: record benchmark result
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## 3.13 shard benchmark"
+            echo
+            echo "- Width: ${{ matrix.width }}"
+            echo "- Shard: ${{ matrix.shard }}"
+            echo "- Pytest elapsed seconds: ${{ steps.pytest.outputs.seconds || 'failed' }}"
+          } >> "$GITHUB_STEP_SUMMARY"

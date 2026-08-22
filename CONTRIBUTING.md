@@ -111,6 +111,21 @@ the runner's. `tests/test_ci_test_sharding.py` holds the shard count in the work
 matrix to the same number, because a `--splits` raised without the matrix runs part of the
 suite and reports green.
 
+### Measuring candidate CI shard widths
+
+Refreshing `.test_durations` tells `pytest-split` how to balance the suite; it does not tell us
+how many GitHub runners make the pull-request critical path shortest. Run the manual **CI shard
+benchmark** workflow after a refresh to measure the complete Python 3.13 test job at widths 3,
+4, 6, and 8. It uses the same dependency sync, grammar/vocabulary pre-seeding, coverage, and
+least-duration split as ordinary CI, so its job durations are comparable rather than optimistic
+local stopwatches.
+
+For each width, compare the slowest job's total time (the PR wait) and the sum of all job times
+(the runner cost). Each job summary also records pytest-only seconds, which separates test work
+from setup and collection. The workflow is manual because one benchmark dispatch launches 21
+jobs; it must not make routine pull requests more expensive. Only after choosing a width should
+the regular matrix and `--splits` value move together.
+
 ## Nothing is deferred
 
 **Everything in scope happens in this change.** Adjacent bugs, dead code, stale
