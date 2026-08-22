@@ -324,6 +324,7 @@ class SqliteReembedCorpus:
             )
             if not page:
                 break
+            snapshot_documents: list[dict[str, str]] = []
             for row in page:
                 stored_document = SnapshotDocument(
                     workspace_id=row.workspace_id,
@@ -339,13 +340,13 @@ class SqliteReembedCorpus:
                 )
                 document_json = _json(_SNAPSHOT_DOCUMENT, stored_document)
                 inventory.add_document(_SNAPSHOT_DOCUMENT.validate_json(document_json))
-                await connection.execute(
-                    insert(models.ReembedSnapshotDocument).values(
-                        workspace_id=self.workspace_id,
-                        snapshot_id=snapshot_id,
-                        document_id=row.id,
-                        payload_json=document_json,
-                    )
+                snapshot_documents.append(
+                    {
+                        "workspace_id": self.workspace_id,
+                        "snapshot_id": snapshot_id,
+                        "document_id": row.id,
+                        "payload_json": document_json,
+                    }
                 )
                 chunk_after: tuple[int, str] | None = None
                 while True:
@@ -369,6 +370,7 @@ class SqliteReembedCorpus:
                     )
                     if not chunk_page:
                         break
+                    snapshot_chunks: list[dict[str, str | int]] = []
                     for chunk_row in chunk_page:
                         stored_chunk = SnapshotChunk(
                             chunk=to_chunk(chunk_row),
@@ -381,20 +383,22 @@ class SqliteReembedCorpus:
                         persisted_chunk = _SNAPSHOT_CHUNK.validate_json(chunk_json)
                         inventory.add_chunk(persisted_chunk)
                         chunk_digest.add(persisted_chunk)
-                        await connection.execute(
-                            insert(models.ReembedSnapshotChunk).values(
-                                workspace_id=self.workspace_id,
-                                snapshot_id=snapshot_id,
-                                document_id=row.id,
-                                position=chunk_row.position,
-                                chunk_id=chunk_row.id,
-                                payload_json=chunk_json,
-                            )
+                        snapshot_chunks.append(
+                            {
+                                "workspace_id": self.workspace_id,
+                                "snapshot_id": snapshot_id,
+                                "document_id": row.id,
+                                "position": chunk_row.position,
+                                "chunk_id": chunk_row.id,
+                                "payload_json": chunk_json,
+                            }
                         )
                         chunks_count += 1
+                    await connection.execute(insert(models.ReembedSnapshotChunk), snapshot_chunks)
                     last = chunk_page[-1]
                     chunk_after = (last.position, last.id)
                 documents_count += 1
+            await connection.execute(insert(models.ReembedSnapshotDocument), snapshot_documents)
             document_after = page[-1].id
         return (
             documents_count,

@@ -28,12 +28,13 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
+from manicule.chunking.tokens import SupportsTokenCount
 from manicule.core.content import Chunk, Document
-from manicule.core.embedding import EmbedFingerprint, Vector
+from manicule.core.embedding import EmbedFingerprint, Vector, require_within_context
 from manicule.core.errors import ManiculeError, PolicyError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.protocols import Embedder
-from manicule.ingest.embedding import batch_size, embed_chunks
+from manicule.ingest.embedding import MAX_BATCH, batch_size, embed_checked_chunks, embed_chunks
 
 DEFAULT_DOCUMENT_PAGE = 32
 DEFAULT_TARGET_BATCH_TOKENS = 16_384
@@ -469,6 +470,7 @@ async def plan_reembed(
     *,
     document_page: int = DEFAULT_DOCUMENT_PAGE,
     target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
+    max_embed_batch: int = MAX_BATCH,
     chunks_per_second: float = DEFAULT_CHUNKS_PER_SECOND,
 ) -> ReembedPlan:
     """Price a rebuild without connectors, parsing, embedding, or live-publication mutation.
@@ -481,6 +483,7 @@ async def plan_reembed(
         target,
         document_page=document_page,
         target_batch_tokens=target_batch_tokens,
+        max_embed_batch=max_embed_batch,
         chunks_per_second=chunks_per_second,
     )
     return commitment.plan
@@ -492,10 +495,11 @@ async def plan_reembed_commitment(
     *,
     document_page: int = DEFAULT_DOCUMENT_PAGE,
     target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
+    max_embed_batch: int = MAX_BATCH,
     chunks_per_second: float = DEFAULT_CHUNKS_PER_SECOND,
 ) -> ReembedCommitment:
     """Build the private durable commitment behind a public aggregate plan."""
-    _validate_knobs(document_page, target_batch_tokens, chunks_per_second)
+    _validate_knobs(document_page, target_batch_tokens, chunks_per_second, max_embed_batch)
     snapshot = await corpus.begin_snapshot()
     try:
         return await _plan_snapshot(
@@ -504,6 +508,7 @@ async def plan_reembed_commitment(
             target,
             document_page=document_page,
             target_batch_tokens=target_batch_tokens,
+            max_embed_batch=max_embed_batch,
             chunks_per_second=chunks_per_second,
         )
     except BaseException as error:
@@ -520,6 +525,7 @@ async def start_reembed(
     journal: ReembedJournal,
     document_page: int = DEFAULT_DOCUMENT_PAGE,
     target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
+    max_embed_batch: int = MAX_BATCH,
     chunks_per_second: float = DEFAULT_CHUNKS_PER_SECOND,
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS,
     commitment: ReembedCommitment | None = None,
@@ -532,6 +538,7 @@ async def start_reembed(
             target,
             document_page=document_page,
             target_batch_tokens=target_batch_tokens,
+            max_embed_batch=max_embed_batch,
             chunks_per_second=chunks_per_second,
         )
     elif commitment.target_fingerprint != target.canonical():
@@ -563,11 +570,12 @@ async def resume_reembed(
     publisher: ReembedPublisher,
     document_page: int = DEFAULT_DOCUMENT_PAGE,
     target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
+    max_embed_batch: int = MAX_BATCH,
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS,
 ) -> ReembedRun:
     """Resume one run under an explicit fenced lease."""
     _validate_owner(owner_token, lease_ttl_seconds)
-    _validate_knobs(document_page, target_batch_tokens, DEFAULT_CHUNKS_PER_SECOND)
+    _validate_knobs(document_page, target_batch_tokens, DEFAULT_CHUNKS_PER_SECOND, max_embed_batch)
     run = await journal.get(run_id)
     if run is None:
         raise ReembedError(f"no re-embedding run {run_id!r} exists")
@@ -593,6 +601,7 @@ async def resume_reembed(
             publisher=publisher,
             document_page=document_page,
             target_batch_tokens=target_batch_tokens,
+            max_embed_batch=max_embed_batch,
             lease_ttl_seconds=lease_ttl_seconds,
         )
     except BaseException as error:
@@ -613,6 +622,7 @@ async def _resume_owned(
     publisher: ReembedPublisher,
     document_page: int,
     target_batch_tokens: int,
+    max_embed_batch: int,
     lease_ttl_seconds: float,
 ) -> ReembedRun:
     generation = await shadow.open_or_create(
@@ -646,6 +656,7 @@ async def _resume_owned(
             shadow=shadow,
             document_page=document_page,
             target_batch_tokens=target_batch_tokens,
+            max_embed_batch=max_embed_batch,
             lease=lease,
             lease_ttl_seconds=lease_ttl_seconds,
         )
@@ -658,6 +669,7 @@ async def _resume_owned(
                 shadow=shadow,
                 document_page=document_page,
                 target_batch_tokens=target_batch_tokens,
+                max_embed_batch=max_embed_batch,
                 lease=lease,
             )
             await shadow.seal(generation, inspection, lease=lease)
@@ -699,7 +711,7 @@ async def _resume_owned(
     return run
 
 
-async def _build(
+async def _build(  # noqa: PLR0912, PLR0915 - bounded resume state machine
     run: ReembedRun,
     *,
     generation: ShadowGeneration,
@@ -709,10 +721,11 @@ async def _build(
     shadow: ShadowVectorGeneration,
     document_page: int,
     target_batch_tokens: int,
+    max_embed_batch: int,
     lease: ReembedLease,
     lease_ttl_seconds: float,
 ) -> tuple[ReembedRun, ReembedLease]:
-    chunk_limit = _chunk_limit(embedder.fingerprint, target_batch_tokens)
+    chunk_limit = _chunk_limit(embedder.fingerprint, target_batch_tokens, max_embed_batch)
     while True:
         if run.active_document_id is None:
             documents = await corpus.documents(
@@ -725,6 +738,90 @@ async def _build(
                     lease,
                     lease_ttl_seconds,
                 )
+            # Most sources have far fewer chunks per document than one model batch.  Do not
+            # make the serialized accelerator pay one forward pass (and one Lance merge) per
+            # small document: pack complete documents into one bounded batch.  A document that
+            # fills a page stays on the original resumable path below, where `chunk_after`
+            # remains its durable recovery point.
+            packed: list[
+                tuple[SnapshotDocument, Sequence[SnapshotChunk], ChunkFingerprint | None]
+            ] = []
+            packed_chunks = 0
+            for candidate in documents:
+                fingerprint = _chunk_fingerprint(candidate)
+                candidate_chunks = await corpus.chunks(
+                    run.commitment.snapshot,
+                    candidate.document.id,
+                    after=None,
+                    limit=chunk_limit,
+                )
+                if not candidate_chunks and candidate.document.expects_chunks:
+                    raise ReembedError(
+                        "a document expected stored chunks but the snapshot has none"
+                    )
+                # A full read might be a larger document.  Keep it out of a cross-document
+                # group so the existing chunk-key checkpoint can resume it exactly.
+                if len(candidate_chunks) >= chunk_limit:
+                    break
+                if packed and packed_chunks + len(candidate_chunks) > chunk_limit:
+                    break
+                packed.append((candidate, candidate_chunks, fingerprint))
+                packed_chunks += len(candidate_chunks)
+                if packed_chunks == chunk_limit:
+                    break
+            if packed:
+                flattened = [stored for _, stored_chunks, _ in packed for stored in stored_chunks]
+                # Each stored document retains its own chunker budget.  Validate those before
+                # sending the combined model batch, rather than weakening the context contract
+                # merely to improve throughput.
+                checked: list[Chunk] = []
+                for _, stored_chunks, fingerprint in packed:
+                    document_chunks = [stored.chunk for stored in stored_chunks]
+                    if isinstance(embedder, SupportsTokenCount):
+                        document_chunks = [
+                            chunk.model_copy(
+                                update={"token_count": embedder.count_tokens(chunk.embed_text)}
+                            )
+                            for chunk in document_chunks
+                        ]
+                    require_within_context(document_chunks, embedder.fingerprint, fingerprint)
+                    checked.extend(document_chunks)
+                vectors = await embed_checked_chunks(
+                    embedder,
+                    checked,
+                    target_batch_tokens=target_batch_tokens,
+                    maximum=max_embed_batch,
+                )
+                lease = await journal.renew(run.id, lease, ttl_seconds=lease_ttl_seconds)
+                if flattened:
+                    await shadow.upsert(generation, flattened, vectors, lease=lease)
+                completed_documents = len(packed)
+                workspace_documents = sum(
+                    document.workspace_id == run.workspace_id for document, _, _ in packed
+                )
+                workspace_chunks = sum(
+                    len(stored_chunks)
+                    for document, stored_chunks, _ in packed
+                    if document.workspace_id == run.workspace_id
+                )
+                run, lease = await _save(
+                    journal,
+                    replace(
+                        run,
+                        document_after=packed[-1][0].document.id,
+                        chunks_completed=run.chunks_completed + len(flattened),
+                        documents_completed=run.documents_completed + completed_documents,
+                        workspace_documents_completed=(
+                            run.workspace_documents_completed + workspace_documents
+                        ),
+                        workspace_chunks_completed=(
+                            run.workspace_chunks_completed + workspace_chunks
+                        ),
+                    ),
+                    lease,
+                    lease_ttl_seconds,
+                )
+                continue
             run, lease = await _save(
                 journal,
                 replace(run, active_document_id=documents[0].document.id, chunk_after=None),
@@ -737,14 +834,7 @@ async def _build(
         document = await corpus.document(run.commitment.snapshot, active_document_id)
         if document is None:
             raise ReembedError("the immutable snapshot lost a document during resume")
-        chunk_fingerprint = None
-        if document.chunk_fingerprint is not None:
-            try:
-                chunk_fingerprint = ChunkFingerprint.model_validate_json(document.chunk_fingerprint)
-            except ValueError as exc:
-                raise ReembedError(
-                    "the immutable snapshot has an invalid chunk fingerprint"
-                ) from exc
+        chunk_fingerprint = _chunk_fingerprint(document)
         stored_chunks = await corpus.chunks(
             run.commitment.snapshot,
             document.document.id,
@@ -760,6 +850,7 @@ async def _build(
                 chunks,
                 chunk_fingerprint=chunk_fingerprint,
                 target_batch_tokens=target_batch_tokens,
+                maximum=max_embed_batch,
             )
             lease = await journal.renew(run.id, lease, ttl_seconds=lease_ttl_seconds)
             await shadow.upsert(generation, stored_chunks, vectors, lease=lease)
@@ -808,6 +899,7 @@ async def _validate(
     shadow: ShadowVectorGeneration,
     document_page: int,
     target_batch_tokens: int,
+    max_embed_batch: int,
     lease: ReembedLease,
 ) -> ShadowInspection:
     target = EmbedFingerprint.model_validate_json(run.commitment.target_config)
@@ -817,6 +909,7 @@ async def _validate(
         target,
         document_page=document_page,
         target_batch_tokens=target_batch_tokens,
+        max_embed_batch=max_embed_batch,
         chunks_per_second=DEFAULT_CHUNKS_PER_SECOND,
     )
     inspection = await shadow.inspect(generation, lease=lease)
@@ -870,6 +963,7 @@ async def _plan_snapshot(
     *,
     document_page: int,
     target_batch_tokens: int,
+    max_embed_batch: int,
     chunks_per_second: float,
 ) -> ReembedCommitment:
     digest = SnapshotInventoryDigester(snapshot.revision)
@@ -879,7 +973,7 @@ async def _plan_snapshot(
     peak_memory = 0
     public_peak_memory = 0
     after: str | None = None
-    chunk_limit = _chunk_limit(target, target_batch_tokens)
+    chunk_limit = _chunk_limit(target, target_batch_tokens, max_embed_batch)
     while True:
         documents = await corpus.documents(snapshot, after=after, limit=document_page)
         if not documents:
@@ -1040,9 +1134,13 @@ async def _release_after_operation(
         failure.add_note(f"releasing the re-embedding lease also failed: {release_error}")
 
 
-def _validate_knobs(document_page: int, target_batch_tokens: int, rate: float) -> None:
-    if document_page < 1 or target_batch_tokens < 1:
-        raise ValueError("document_page and target_batch_tokens must be at least 1")
+def _validate_knobs(
+    document_page: int, target_batch_tokens: int, rate: float, max_embed_batch: int
+) -> None:
+    if document_page < 1 or target_batch_tokens < 1 or max_embed_batch < 1:
+        raise ValueError(
+            "document_page, target_batch_tokens, and max_embed_batch must be at least 1"
+        )
     if not math.isfinite(rate) or rate <= 0:
         raise ValueError("chunks_per_second must be a positive finite number")
 
@@ -1054,11 +1152,21 @@ def _validate_owner(owner_token: str, ttl_seconds: float) -> None:
         raise ValueError("lease_ttl_seconds must be a positive finite number")
 
 
-def _chunk_limit(target: EmbedFingerprint, target_batch_tokens: int) -> int:
+def _chunk_limit(target: EmbedFingerprint, target_batch_tokens: int, max_embed_batch: int) -> int:
     return batch_size(
         budget_tokens=target.max_sequence_length,
         target_batch_tokens=target_batch_tokens,
+        maximum=max_embed_batch,
     )
+
+
+def _chunk_fingerprint(document: SnapshotDocument) -> ChunkFingerprint | None:
+    if document.chunk_fingerprint is None:
+        return None
+    try:
+        return ChunkFingerprint.model_validate_json(document.chunk_fingerprint)
+    except ValueError as exc:
+        raise ReembedError("the immutable snapshot has an invalid chunk fingerprint") from exc
 
 
 def _canonical_document(stored: SnapshotDocument) -> bytes:

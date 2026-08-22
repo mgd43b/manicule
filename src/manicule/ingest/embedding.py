@@ -1,8 +1,10 @@
 """The one path by which chunks reach an embedder.
 
 Every route that embeds stored chunks goes through :func:`embed_chunks` — first ingest,
-``reindex --repair`` and ``reindex --re-embed`` alike. One function rather than three call
-sites, because the check it performs is the sort that gets omitted from exactly one of them.
+``reindex --repair`` and ``reindex --re-embed`` alike.  Whole-index shadow re-embedding is the
+one exception at the call boundary: it validates each document's stored chunk fingerprint, then
+uses :func:`embed_checked_chunks` to combine those already-validated documents into one model
+batch.  Keeping the unchecked model call here makes that exception explicit and auditable.
 
 **Re-embed is the route this exists for.** It reads stored ``embed_text`` and does not
 re-chunk, so the chunker's own budget refusal never runs; and
@@ -106,10 +108,42 @@ async def embed_chunks(
         if chunk_fingerprint
         else embedder.fingerprint.max_sequence_length
     )
-    size = batch_size(
-        budget_tokens=budget, target_batch_tokens=target_batch_tokens, maximum=maximum
+    return await embed_checked_chunks(
+        embedder,
+        measured,
+        target_batch_tokens=target_batch_tokens,
+        maximum=maximum,
+        batch_budget_tokens=budget,
+        on_batch=on_batch,
     )
 
+
+async def embed_checked_chunks(
+    embedder: Embedder,
+    chunks: Sequence[Chunk],
+    *,
+    target_batch_tokens: int = 16_384,
+    maximum: int = MAX_BATCH,
+    batch_budget_tokens: int | None = None,
+    on_batch: Callable[[Sequence[Chunk]], None] | None = None,
+) -> list[Vector]:
+    """Embed chunks whose context and tokenizer policy have already been verified.
+
+    This is the narrow seam for a caller that combines chunks from documents with different
+    stored chunk fingerprints.  It intentionally performs no policy checks itself; callers
+    must validate every offered group with :func:`require_within_context` first.
+    """
+    if not chunks:
+        return []
+    size = batch_size(
+        budget_tokens=(
+            embedder.fingerprint.max_sequence_length
+            if batch_budget_tokens is None
+            else batch_budget_tokens
+        ),
+        target_batch_tokens=target_batch_tokens,
+        maximum=maximum,
+    )
     vectors: list[Vector] = []
     for start in range(0, len(chunks), size):
         batch = chunks[start : start + size]
@@ -412,6 +446,7 @@ __all__ = [
     "MAX_BATCH",
     "EmbeddingWork",
     "batch_size",
+    "embed_checked_chunks",
     "embed_chunks",
     "embed_or_reuse",
 ]

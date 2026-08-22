@@ -194,7 +194,7 @@ class Authority:
         current = self.runs[run.id]
         if current.revision != expected_revision:
             raise ReembedError("stale journal revision")
-        if self.fail_chunk_checkpoint_once and run.chunk_after is not None:
+        if self.fail_chunk_checkpoint_once and run.chunks_completed > current.chunks_completed:
             self.fail_chunk_checkpoint_once = False
             raise OSError("synthetic chunk checkpoint crash")
         saved = replace(run, revision=run.revision + 1)
@@ -602,6 +602,32 @@ async def test_protocol_keyset_pages_huge_document_and_keeps_old_winner_until_sw
     assert [len(call) for call in embedder.calls] == [32, 32, 32, 32, 2]
     assert set(authority.live_during_upsert) == {"live-old"}
     assert authority.live.generation_id == completed.shadow_generation_id
+
+
+async def test_small_documents_share_one_bounded_model_and_shadow_batch() -> None:
+    authority = Authority()
+    documents: list[tuple[Document, Sequence[Chunk]]] = []
+    for index in range(4):
+        document = make_document().model_copy(
+            update={
+                "id": f"document-{index}",
+                "source_id": f"document-{index}",
+                "uri": f"fake://document-{index}",
+                "title": f"Document {index}",
+            }
+        )
+        documents.append((document, make_chunks(document, count=8)))
+    corpus = Corpus(authority, documents)
+    embedder = CountingEmbedder(dimension=5)
+    run = await prepare_run(authority, corpus, embedder)
+
+    completed = await execute(run, authority, corpus, embedder)
+
+    assert completed.state is ReembedState.PUBLISHED
+    assert completed.documents_completed == 4
+    assert completed.chunks_completed == 32
+    assert [len(call) for call in embedder.calls] == [32]
+    assert authority.max_upsert_batch == 32
 
 
 async def test_private_commitment_hides_snapshot_model_path_and_digests_from_repr() -> None:
