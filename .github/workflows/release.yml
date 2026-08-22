@@ -66,7 +66,7 @@ jobs:
           # Pinned rather than left to the runner's default, so the interpreter that builds a
           # release is a decision rather than whatever ubuntu-latest moved to this month. Both
           # wheels are `py3-none-any`, so this does not restrict what they install onto.
-          python-version: "3.12"
+          python-version: "3.14"
 
       # Each package named explicitly. `packages/` also holds two plugin distributions that
       # exist to be test fixtures, one of which hangs and allocates without bound on purpose,
@@ -100,7 +100,7 @@ jobs:
       - name: the wheels install clean and the console script runs
         run: |
           set -euo pipefail
-          uv venv --python 3.12 /tmp/smoke
+          uv venv --python 3.14 /tmp/smoke
           uv pip install --python /tmp/smoke/bin/python \
             "$(echo dist/manicule/*.whl)[all]" "$(echo dist/manicule-mlx/*.whl)"
           /tmp/smoke/bin/manicule --version

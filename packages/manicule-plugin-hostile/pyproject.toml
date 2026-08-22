@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Parsers that hang and allocate without bound, so isolation can be proven."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = ["manicule"]
 
 # Registered through the same public entry-point group every plugin uses. That is the point:

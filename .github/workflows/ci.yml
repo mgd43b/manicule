@@ -87,7 +87,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.12", "3.13"]
+        python: ["3.14"]
         shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v7
@@ -597,7 +597,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          python-version: "3.12"
+          python-version: "3.14"
 
       # `--package manicule`: this is a uv workspace and `packages/*` holds two plugin
       # distributions that are test fixtures. Naming the package is what keeps them out of the
@@ -689,7 +689,7 @@ jobs:
       - name: a bare install explains itself instead of raising
         run: |
           set -euo pipefail
-          uv venv --python 3.12 /tmp/bare
+          uv venv --python 3.14 /tmp/bare
           uv pip install --python /tmp/bare/bin/python dist/*.whl
           set +e
           output=$(/tmp/bare/bin/manicule --version 2>&1)
@@ -708,7 +708,7 @@ jobs:
       - name: the documented install produces a working command
         run: |
           set -euo pipefail
-          uv venv --python 3.12 /tmp/all
+          uv venv --python 3.14 /tmp/all
           uv pip install --python /tmp/all/bin/python "$(echo dist/*.whl)[all]"
           /tmp/all/bin/manicule --version
           /tmp/all/bin/manicule --help > /dev/null
@@ -720,7 +720,7 @@ jobs:
       - name: the Apple silicon install registers the mlx backend
         run: |
           set -euo pipefail
-          uv venv --python 3.12 /tmp/pair
+          uv venv --python 3.14 /tmp/pair
           uv pip install --python /tmp/pair/bin/python \
             "$(echo dist/*.whl)[all]" "$(echo dist-mlx/*.whl)"
           /tmp/pair/bin/manicule --version

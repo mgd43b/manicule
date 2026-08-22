@@ -115,7 +115,7 @@ suite and reports green.
 
 Refreshing `.test_durations` tells `pytest-split` how to balance the suite; it does not tell us
 how many GitHub runners make the pull-request critical path shortest. Run the manual **CI shard
-benchmark** workflow after a refresh to measure the complete Python 3.13 test job at widths 3,
+benchmark** workflow after a refresh to measure the complete Python 3.14 test job at widths 3,
 4, 6, and 8. It uses the same dependency sync, grammar/vocabulary pre-seeding, coverage, and
 least-duration split as ordinary CI, so its job durations are comparable rather than optimistic
 local stopwatches.
@@ -304,7 +304,7 @@ relicense.
 
 ## Style
 
-- Python 3.12+, 100-column lines, `ruff format`.
+- Python 3.14+, 100-column lines, `ruff format`.
 - Type everything. `Any` needs a reason on the same line.
 - Errors are actionable: name what was wrong, what was expected, and what to do about it.
   `f"no parser for {media_type!r}. Installed: {available}"` beats `"parser not found"`.

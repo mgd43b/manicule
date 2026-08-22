@@ -28,7 +28,7 @@ OpenDocuments got it right. Where it does not, the reason is stated.
 
 | Layer | Choice |
 |---|---|
-| Language / tooling | Python 3.12+ · uv · ruff · pyright strict · pytest |
+| Language / tooling | Python 3.14+ · uv · ruff · pyright strict · pytest |
 | Config & models | Pydantic v2 · pydantic-settings |
 | Vectors | LanceDB |
 | Metadata | SQLite · SQLAlchemy 2.0 async · Alembic |
@@ -50,7 +50,7 @@ OpenDocuments got it right. Where it does not, the reason is stated.
 
 | | OpenDocuments | manicule | |
 |---|---|---|---|
-| Runtime | Node 20, TypeScript, ESM | Python 3.12+ | |
+| Runtime | Node 20, TypeScript, ESM | Python 3.14+ | |
 | Packaging | npm + Turborepo monorepo | **uv** workspace | `uv tool install manicule` — one command, no container |
 | Lint/format | none configured | **ruff** | |
 | Types | tsc strict | **pyright** strict | |
