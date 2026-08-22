@@ -49,6 +49,7 @@ from manicule.connectors.errors import (
     BodyUnavailableError,
     ConnectorError,
     NotFoundError,
+    PermissionDeniedError,
     RequestTimeoutError,
 )
 from manicule.connectors.macros import (
@@ -1200,7 +1201,7 @@ class ConfluenceConnector:
         """
         url = _str(ref.metadata.get(DOWNLOAD)) or ref.uri
         downloaded = await self._client.download(url, max_bytes=self._config.max_attachment_bytes)
-        declared = _str(ref.metadata.get("media_type"))
+        declared = _specific_media_type(_str(ref.metadata.get("media_type")))
         metadata = dict(ref.metadata)
         version = _int(ref.metadata.get(VERSION))
         if version is not None:
@@ -1209,7 +1210,7 @@ class ConfluenceConnector:
         # may reach the record. `metadata.mediaType` is Confluence's own declaration and the
         # download's `Content-Type` is the response's; the filename extension is manicule's
         # inference, sound enough to route bytes by and not something the publisher said.
-        stated = declared or downloaded.media_type
+        stated = declared or _specific_media_type(downloaded.media_type)
         media_type = stated or _from_name(_str(metadata.get("title")))
         metadata[PROVENANCE_KEY] = _record(
             what=f"attachment {ref.source_id}",
@@ -1221,7 +1222,7 @@ class ConfluenceConnector:
             # second response to ask. Absent rather than borrowed from the page holding it.
             created_at=None,
             modified_at=cql.parse_when(metadata.get(MODIFIED_AT)),
-            content_type=stated,
+            content_type=stated or "",
             # Space and the page holding it. The attachment's own filename is left off for the
             # same reason a page's own title is: the chunker appends it.
             section_path=_str_values(ref, ANCESTORS),
@@ -1425,11 +1426,23 @@ class ConfluenceConnector:
         if not self._is_cloud:
             return (), (), True
         url = f"{self._client.url(_V2_PAGE_PATH)}/{page_id}/ancestors"
+        entries: list[Mapping[str, object]] = []
         try:
-            payload = await self._client.get_json(url, [("limit", "25")])
+            async for payload in self._client.paginate(url, [("limit", "25")]):
+                entries.extend(_results(payload))
         except NotFoundError:
-            return (), (), True
-        entries = _results(payload)
+            return (), (), False
+        except ConnectorError:
+            # A partial breadcrumb remains useful context, but a continuation failure must
+            # never be represented as complete. This includes repeated continuations and an
+            # expired cursor after one or more valid ancestor pages.
+            titles = tuple(_str(entry.get("title")) for entry in entries)
+            found = tuple(_str(entry.get("id")) for entry in entries)
+            return (
+                tuple(title for title in titles if title),
+                tuple(entry for entry in found if entry),
+                False,
+            )
         titles = tuple(_str(entry.get("title")) for entry in entries)
         found = tuple(_str(entry.get("id")) for entry in entries)
         return (
@@ -1521,7 +1534,7 @@ class ConfluenceConnector:
                 if body_format == ADF_BODY
                 else await self._storage_body(page_id)
             )
-        except (NotFoundError, BodyUnavailableError):
+        except (NotFoundError, PermissionDeniedError, BodyUnavailableError):
             # An include whose target cannot be read is recorded as unresolved, with the reason,
             # rather than failing the page that includes it: the rest of that page is content
             # somebody is looking for, and the gap is already reported where it happened.
@@ -1774,7 +1787,18 @@ def _attachment_media_type(result: Mapping[str, object]) -> str | None:
     declared = _str(_obj(result.get("metadata")).get("mediaType")) or _str(
         _obj(result.get("extensions")).get("mediaType")
     )
-    return declared or None
+    return _specific_media_type(declared)
+
+
+def _specific_media_type(value: str) -> str | None:
+    """A stated media type, excluding Confluence's generic placeholder.
+
+    ``application/octet-stream`` says only that Confluence did not classify the attachment, so
+    it must follow the same path as an absent declaration: a specific download response type,
+    then a filename inference. Parameters and case do not change that meaning.
+    """
+    media_type = value.split(";", 1)[0].strip().lower()
+    return media_type if media_type and media_type != "application/octet-stream" else None
 
 
 def _from_name(name: str) -> str:

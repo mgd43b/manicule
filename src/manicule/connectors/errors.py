@@ -22,6 +22,7 @@ __all__ = [
     "ConnectorError",
     "CursorExpiredError",
     "NotFoundError",
+    "PermissionDeniedError",
     "ProviderRefusedError",
     "RateLimitedError",
     "RemoteError",
@@ -53,6 +54,13 @@ class NotFoundError(RemoteError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, status_code=404)
+
+
+class PermissionDeniedError(RemoteError):
+    """The authenticated account cannot read a specific Confluence resource."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=403)
 
 
 class RateLimitedError(RemoteError):

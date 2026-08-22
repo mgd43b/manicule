@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 EXPECTED_TABLES = frozenset(models.Base.metadata.tables)
-DOCUMENTED_RELATIONAL_TABLES = 40
+DOCUMENTED_RELATIONAL_TABLES = 41
 
 
 def test_the_documented_relational_table_count_matches_the_models() -> None:

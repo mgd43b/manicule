@@ -198,6 +198,40 @@ def test_a_base_url_that_is_not_a_url_is_refused_at_validation() -> None:
         ConfluenceConfig(base_url="example.atlassian.net")
 
 
+@pytest.mark.parametrize(
+    ("base_url", "reason"),
+    [
+        ("https://", "hostname"),
+        ("https://sync.user:sentinel@wiki.example.test/wiki", "credentials"),
+        ("https://wiki.example.test/wiki?token=sentinel", "query string"),
+        ("https://wiki.example.test/wiki#sentinel", "fragment"),
+    ],
+    ids=["hostless", "userinfo", "query", "fragment"],
+)
+def test_a_confluence_base_url_is_a_secret_free_site_root(base_url: str, reason: str) -> None:
+    """These components are not a site root, and none may be reflected into configuration errors."""
+    with pytest.raises(ValidationError, match=reason) as raised:
+        ConfluenceConfig(base_url=base_url)
+
+    assert "sentinel" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://wiki.example.test/wiki/",
+        "https://[2001:db8::10]:8443/wiki/",
+        "https://bücher.example/wiki/",
+        "https://xn--bcher-kva.example/wiki/",
+    ],
+)
+def test_a_confluence_base_url_keeps_valid_context_paths_in_one_spelling(base_url: str) -> None:
+    """IPv6, ports, and host spellings remain valid while a trailing slash cannot fork scope."""
+    config = ConfluenceConfig(base_url=base_url)
+
+    assert not config.base_url.endswith("/")
+
+
 def test_a_setting_nobody_declared_is_rejected_rather_than_ignored() -> None:
     """A setting that appears to be in force and silently is not is worse than one that fails."""
     with pytest.raises(ValidationError):

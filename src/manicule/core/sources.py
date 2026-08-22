@@ -76,6 +76,13 @@ class DiscoveredDoc(BaseModel):
     media_type: str | None = None
     size_bytes: int | None = Field(default=None, ge=0)
     metadata: Metadata = Field(default_factory=dict)
+    force_fetch: bool = False
+    """Bypass token equality for a source dependency whose expanded content may have changed.
+
+    The source token remains the source's actual revision. Replacing it with ``None`` would
+    force one fetch but also erase the stored token, making every later sync fetch the page
+    again. This narrow flag carries the scheduling decision without changing source evidence.
+    """
 
     @property
     def source_id(self) -> SourceId:

@@ -762,6 +762,31 @@ class Document(Base):
     )
 
 
+class SourceDependency(Base):
+    """One document's expanded dependency on another source identity.
+
+    The target need not have a live row: an include whose target was deleted is precisely the
+    relationship that must survive long enough to re-fetch its parents. The parent document owns
+    the edge, so a successful publication replaces its complete dependency set atomically.
+    """
+
+    __tablename__ = "source_dependencies"
+
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    source: Mapped[str] = mapped_column(Text, primary_key=True)
+    parent_document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    target_source_id: Mapped[str] = mapped_column(Text, primary_key=True)
+
+    __table_args__ = (
+        Index("ix_source_dependencies_target", "workspace_id", "source", "target_source_id"),
+        WITHOUT_ROWID,
+    )
+
+
 class Chunk(Base):
     """A retrievable unit of text, with everything needed to cite it.
 

@@ -12,10 +12,12 @@ against fixtures that would not terminate without them.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import pytest
 
 from manicule.connectors.macros import excerpt_of_storage, storage_macros
+from manicule.ingest.reconcile import reconcile
 from tests.connectors.fake_confluence import (
     SERVER_BASE,
     FakeConfluence,
@@ -25,6 +27,7 @@ from tests.connectors.fake_confluence import (
     with_include,
 )
 from tests.connectors.support import cloud_config, connected, drain, server_config
+from tests.ingest.test_pipeline import build
 
 
 async def _body(
@@ -61,6 +64,173 @@ async def test_an_included_page_becomes_part_of_the_body() -> None:
     assert "the rotation interval" in text
     assert included == ["2"]
     assert unresolved == []
+
+
+async def test_changed_include_forces_an_unchanged_parent_outside_the_overlap() -> None:
+    """A child edit re-renders its parent even when CQL only returns the child.
+
+    The assertion is intentionally through the full connector and pipeline: persisted edges,
+    forced token bypass, macro expansion, and replacement publication must agree or the old
+    included text remains retrievable despite a clean-looking incremental sync.
+    """
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="Overview",
+                space="ENG",
+                when="2026-08-01T14:30:00.000+01:00",
+                adf=with_include("see", title="Detail"),
+            ),
+            FakePage(id="2", title="Detail", space="ENG", adf=paragraph("before rotation")),
+        ]
+    )
+    connector = await connected(
+        instance,
+        cloud_config(base_url=instance.base_url, watermark_overlap_minutes=0),
+    )
+    pipeline, store, _ = build()
+    try:
+        await pipeline.run(connector)
+        parent = await store.find_document(connector.name, "1")
+        assert parent is not None
+        assert store.source_dependencies[parent.id] == ("2",)
+
+        instance.pages["2"] = replace(
+            instance.pages["2"],
+            version=2,
+            when="2026-08-20T14:30:00.000+01:00",
+            adf=paragraph("after rotation"),
+        )
+        instance.body_calls.clear()
+        report = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    refreshed = await store.find_document(connector.name, "1")
+    assert refreshed is not None
+    assert report.discovered == 2
+    assert instance.body_calls["1"] == 1
+    assert refreshed.version_token == "1"  # noqa: S105 - a source revision, not a credential
+    text = "\n".join(chunk.text for chunk in store.chunks[refreshed.id])
+    assert "after rotation" in text
+    assert "before rotation" not in text
+
+
+async def test_reconciled_deleted_include_forces_parent_and_removes_its_edge() -> None:
+    """A removed child cannot strand stale expanded text or a permanent retry edge."""
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="Overview",
+                space="ENG",
+                when="2026-08-01T14:30:00.000+01:00",
+                adf=with_include("see", title="Detail"),
+            ),
+            FakePage(id="2", title="Detail", space="ENG", adf=paragraph("retired procedure")),
+        ]
+    )
+    connector = await connected(
+        instance,
+        cloud_config(base_url=instance.base_url, watermark_overlap_minutes=0),
+    )
+    pipeline, store, _ = build()
+    try:
+        await pipeline.run(connector)
+        instance.delete("2")
+        result = await reconcile(connector, store, max_delete_fraction=1)
+        assert result.deleted == ("2",)
+
+        instance.body_calls.clear()
+        report = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    parent = await store.find_document(connector.name, "1")
+    assert parent is not None
+    assert report.discovered == 1
+    assert instance.body_calls["1"] == 1
+    assert store.source_dependencies[parent.id] == ()
+    text = "\n".join(chunk.text for chunk in store.chunks[parent.id])
+    assert "retired procedure" not in text
+
+
+async def test_inaccessible_include_forces_parent_and_removes_stale_text() -> None:
+    """A 403 child is an invalidation event even though its old row remains servable."""
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="Overview",
+                space="ENG",
+                when="2026-08-01T14:30:00.000+01:00",
+                adf=with_include("see", title="Restricted detail"),
+            ),
+            FakePage(
+                id="2",
+                title="Restricted detail",
+                space="ENG",
+                adf=paragraph("confidential rotation"),
+            ),
+        ]
+    )
+    connector = await connected(
+        instance,
+        cloud_config(base_url=instance.base_url, watermark_overlap_minutes=0),
+    )
+    pipeline, store, _ = build()
+    try:
+        await pipeline.run(connector)
+        instance.pages["2"] = replace(
+            instance.pages["2"],
+            version=2,
+            when="2026-08-20T14:30:00.000+01:00",
+        )
+        instance.forbidden_pages.add("2")
+        instance.body_calls.clear()
+        await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    parent = await store.find_document(connector.name, "1")
+    assert parent is not None
+    assert instance.body_calls["1"] == 1
+    assert store.source_dependencies[parent.id] == ()
+    text = "\n".join(chunk.text for chunk in store.chunks[parent.id])
+    assert "confidential rotation" not in text
+
+
+async def test_reverse_include_cycle_is_bounded_and_forces_each_parent_once() -> None:
+    """Persisted reverse edges stop at a cycle instead of repeatedly re-enqueueing it."""
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="A",
+                space="ENG",
+                when="2026-08-01T14:30:00.000+01:00",
+                adf=with_include("from A", title="B"),
+            ),
+            FakePage(id="2", title="B", space="ENG", adf=with_include("from B", title="A")),
+        ]
+    )
+    connector = await connected(
+        instance,
+        cloud_config(base_url=instance.base_url, watermark_overlap_minutes=0),
+    )
+    pipeline, _, _ = build()
+    try:
+        await pipeline.run(connector)
+        instance.pages["2"] = replace(
+            instance.pages["2"], version=2, when="2026-08-20T14:30:00.000+01:00"
+        )
+        instance.body_calls.clear()
+        report = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    assert report.discovered == 2
 
 
 async def test_two_pages_that_include_each_other_do_not_expand_forever() -> None:

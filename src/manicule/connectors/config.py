@@ -25,6 +25,7 @@ import os
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Self
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
@@ -62,6 +63,32 @@ together would mean a config model where over half the fields are refused depend
 another field's value. It also keeps the credential refusal honest — a connector that
 reaches no network cannot be misconfigured into trying.
 """
+
+
+def _normalized_base_url(value: str) -> str:
+    """Validate one site root without reflecting its possibly secret input into errors."""
+    try:
+        parsed = urlsplit(value)
+        # ``urlsplit`` delays this validation until the property is read. Do it while validating
+        # configuration so a malformed port cannot first fail while building an endpoint later.
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("base_url must use a valid host and optional port") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        msg = (
+            "base_url must be an absolute http(s) URL with a hostname. Give the site root "
+            "including any context path, e.g. 'https://example.atlassian.net/wiki'"
+        )
+        raise ValueError(msg)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(
+            "base_url must not contain credentials; configure authentication separately"
+        )
+    if parsed.query:
+        raise ValueError("base_url must not contain a query string; configure the site root only")
+    if parsed.fragment:
+        raise ValueError("base_url must not contain a fragment; configure the site root only")
+    return f"{parsed.scheme.lower()}://{parsed.netloc}{parsed.path.rstrip('/')}"
 
 
 class ConfluenceSnapshotConfig(BaseModel):
@@ -198,7 +225,7 @@ class ConfluenceConfig(BaseModel):
     Set under ``plugins.config."connector.confluence"``.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     base_url: str = Field(
         min_length=1,
@@ -470,13 +497,7 @@ class ConfluenceConfig(BaseModel):
 
     @model_validator(mode="after")
     def _checkable_settings(self) -> Self:
-        if not self.base_url.startswith(("http://", "https://")):
-            msg = (
-                f"base_url must be an absolute http(s) URL, got {self.base_url!r}. Give the "
-                f"site root including any context path, e.g. "
-                f"'https://example.atlassian.net/wiki'"
-            )
-            raise ValueError(msg)
+        self.base_url = _normalized_base_url(self.base_url)
         for space in self.spaces:
             if not space.strip():
                 msg = "spaces contains an empty key; remove it rather than syncing everything"

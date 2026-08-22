@@ -1748,6 +1748,40 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             return _record(row)
 
     @translate_storage_capacity_errors
+    async def mark_acquisition_force_fetch(
+        self,
+        run_id: str,
+        source_id: str,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> AcquisitionRecord:
+        """Persist the narrow scheduling override without changing source evidence.
+
+        Enumeration has finished discovering the current source snapshot before this is called,
+        so an already admitted record may retain its fresher URI, title and revision token. The
+        boolean only prevents the later token-equality shortcut from skipping macro expansion.
+        """
+        async with self._sessions.begin() as session:
+            run = await self._required_run_row(session, run_id)
+            self._require_live_lease(run, lease_owner, lease_generation, now)
+            row = await _source_record(session, self._workspace_id, run_id, source_id)
+            if row is None:
+                msg = "acquisition source record was not found"
+                raise AcquisitionConflictError(msg)
+            if row.state is not AcquisitionRecordState.DISCOVERED:
+                msg = "acquisition source record is no longer awaiting fetch"
+                raise AcquisitionConflictError(msg)
+            source = _SOURCE.validate_python(row.source_record)
+            if not source.force_fetch:
+                row.source_record = cast(
+                    "Any", source.model_copy(update={"force_fetch": True}).model_dump(mode="json")
+                )
+                row.updated_at = utcnow()
+            return _record(row)
+
+    @translate_storage_capacity_errors
     async def append_acquisition_records(  # noqa: PLR0912, PLR0915 - one atomic admission fence
         self,
         run_id: str,

@@ -189,6 +189,7 @@ class MemoryIngestStore:
         self.connector_meta: dict[str, Metadata] = {}
         self.state = IndexFingerprints()
         self.staged_publications: list[tuple[str, tuple[str, ...]]] = []
+        self.source_dependencies: dict[str, tuple[str, ...]] = {}
 
     # documents
 
@@ -209,6 +210,37 @@ class MemoryIngestStore:
             ):
                 return self._with_lineage(document)
         return None
+
+    async def dependent_documents(
+        self, source: str, source_ids: Collection[SourceId]
+    ) -> Sequence[Document]:
+        targets = set(source_ids)
+        return tuple(
+            self._with_lineage(document)
+            for document in sorted(
+                self.documents.values(), key=lambda item: (item.source_id, item.id)
+            )
+            if document.source == source
+            and document.id not in self.deleted_at
+            and targets.intersection(self.source_dependencies.get(document.id, ()))
+        )
+
+    async def deleted_dependency_targets(self, source: str, *, limit: int) -> Sequence[SourceId]:
+        deleted = {
+            document.source_id
+            for document in self.documents.values()
+            if document.source == source and document.id in self.deleted_at
+        }
+        targets = {
+            target
+            for document_id, dependencies in self.source_dependencies.items()
+            if (document := self.documents.get(document_id)) is not None
+            and document.source == source
+            and document.id not in self.deleted_at
+            for target in dependencies
+            if target in deleted
+        }
+        return tuple(sorted(targets)[:limit])
 
     async def upsert_document(self, document: Document) -> Document:
         self.documents[document.id] = document
@@ -267,6 +299,7 @@ class MemoryIngestStore:
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        source_dependencies: Sequence[SourceId] | None = None,
         expected_reset_epoch: int | None = None,
     ) -> Commit:
         current = await self.get_document(document.id)
@@ -292,6 +325,8 @@ class MemoryIngestStore:
         if glossary_fp is not None:
             self.glossary_lineage_by_id[document.id] = glossary_fp
         self.originals[document.id] = (document.original_ref, original_omitted_reason)
+        if source_dependencies is not None:
+            self.source_dependencies[document.id] = tuple(dict.fromkeys(source_dependencies))
         return Commit(committed=True, stored=self._with_lineage(self.documents[document.id]))
 
     async def set_status(self, document_id: str, status: DocumentStatus, detail: str = "") -> None:

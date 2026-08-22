@@ -30,6 +30,13 @@ configuration keeps working without naming it.
 Config: base URL, credentials, and an optional space allowlist. Everything is fetched as the
 credential's user — see §9.
 
+`base_url` is parsed before the connector is constructed: it must be an `http` or `https` URL
+with a hostname (including a valid IPv6 literal or port), and it may carry a context path such
+as `/confluence`. Userinfo, query strings and fragments are refused rather than being silently
+ignored. The stored form lower-cases the scheme, preserves the context path, and removes its
+trailing slash, so every request and origin comparison has one deterministic base without
+putting a credential-bearing input into an error message.
+
 **There is no OAuth 2.0 3LO.** An earlier version of this table listed a "Cloud (multi-user) ·
 OAuth 2.0 3LO · Bearer" row that nothing implemented. 3LO is the multi-user arrangement — a
 registered Atlassian app, a client secret, a redirect URI and a token exchange, so that each
@@ -671,6 +678,15 @@ Five things about that query are load-bearing.
   version comparison the pipeline was going to make anyway, and missing a page costs a
   document that stays wrong until something unrelated touches it.
 
+**Expanded includes add a reverse dependency path beside the watermark.** A successful parent
+publication atomically records every page id whose content the macro resolver spliced into it.
+When a child is changed, disappears in reconciliation, or becomes inaccessible, its direct and
+transitive live parents are forced through fetch even if their own version tokens still match and
+they fall outside the CQL overlap. The traversal is stable, cycle-safe and capped; exceeding its
+bound fails the run rather than silently leaving old rendered text. A successful re-fetch replaces
+the parent's complete edge set, so a vanished or unresolved include removes its obsolete edge;
+a failed re-fetch retains the prior edge and therefore remains retryable next sync.
+
 **The space list is checked each run, and the two cases ask the source two different questions.**
 
 - **No allowlist** — every visible space is enumerated through the paginated
@@ -1105,7 +1121,10 @@ the deployment, and this paragraph used to name only the first of them.
   second call there either, and there never was.
 - **The Cloud ancestors endpoint**, asked only for a ref built somewhere else (a re-fetch, a
   targeted single-page sync) on a deployment whose body endpoint carries no ancestors. An
-  ancestor whose title it omits is skipped rather than filled in with an id.
+  ancestor whose title it omits is skipped rather than filled in with an id. Its cursor pages
+  are followed only through origin-checked links and accumulated in source order; a repeated or
+  invalid next link, cancellation, expiry or later-page failure leaves `breadcrumb_complete`
+  false rather than claiming a partial breadcrumb is complete.
 
 **A breadcrumb starts at the space key, and on that last path there may be no way to learn it.**
 The Cloud body endpoint reports a numeric space id rather than the key, so a ref carrying
@@ -1195,6 +1214,10 @@ Six things the implementation settled:
   document with the reason. Substituting manicule's own words would be worse than the gap: it
   would put them inside a quotation attributed to the source.
 
+The `included_pages` metadata is also the durable reverse-edge input described in §2. It is
+replaced only with the parent document's successful publication, never after an optimistic fetch:
+otherwise a parse failure could erase the only evidence needed to retry an invalidated parent.
+
 Included content is spliced at the macro's position, which is where Confluence renders it.
 That matters for citations as well as for text: a heading arriving through an include is a
 heading on the *rendering* page, and Confluence derives its anchor there — so the deep link in
@@ -1220,9 +1243,11 @@ Two details worth stating:
 - **The size ceiling is enforced against the bytes that arrive**, never against the declared
   `Content-Length`. The declared length is the source's claim about the response, and the
   point of a ceiling is to survive a claim that turns out to be wrong.
-- **The media type is the source's, then the download's, then the filename's.** Confluence's
-  `metadata.mediaType` first, the response's `Content-Type` next, and the filename extension
-  last; nothing is guessed ahead of what was actually said.
+- **The media type is the source's, then the download's, then the filename's.** A blank value
+  and `application/octet-stream` (case- and parameter-insensitive) are *unstated*, so they do
+  not block a specific download response or filename routing. The record's `content_type` keeps
+  only a specific value the source or download actually declared; a filename inference routes
+  bytes but never becomes provenance.
 
 Attachments are documents. A connector that indexed only page bodies would leave the diagram,
 the spreadsheet and the specification PDF unsearchable while reporting that the space was synced.
@@ -1464,6 +1489,12 @@ id and the directory travels in `DocRef.metadata`, which is what that field is f
 
 `parsers/expansion.py`'s `member_source_id` settled the same question for archive members:
 identity comes from a stable key, never from a position.
+
+That also means a snapshot with the same page id in two directories is refused before either
+discovery or reconciliation yields a document. The diagnostic names the shared id and both
+root-relative snapshot paths in deterministic order; choosing one path would be a silent
+overwrite. The same validation pass serves both operations, while `unidentified:` fallback
+identities retain their existing local behavior.
 
 ### 12.4 Three disciplines carried over from the sidecar unchanged
 

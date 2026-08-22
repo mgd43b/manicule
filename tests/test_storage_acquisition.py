@@ -204,6 +204,33 @@ async def test_append_is_durable_idempotent_and_run_scoped(store: SqliteDocStore
         )
 
 
+async def test_dependency_force_marks_an_admitted_record_without_rewriting_its_evidence(
+    store: SqliteDocStore,
+) -> None:
+    """An include invalidation bypasses token skipping without losing the actual source token."""
+    run = await _claimed_run(store, "dependency-force")
+    appended = await store.append_acquisition_record(
+        run.id,
+        0,
+        _source(version_token="v7"),  # noqa: S106 - a source revision, not a credential
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+
+    forced = await store.mark_acquisition_force_fetch(
+        run.id,
+        appended.source.source_id,
+        lease_owner="worker",
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+
+    assert forced.source.force_fetch
+    assert forced.source.version_token == "v7"  # noqa: S105 - source revision, not a credential
+    assert forced.source.ref == appended.source.ref
+
+
 async def test_batch_append_is_atomic_contiguous_and_replay_safe(store: SqliteDocStore) -> None:
     run = await _claimed_run(store, "batch-run")
     first_page = tuple(_source(f"page-{number}") for number in range(3))

@@ -385,6 +385,14 @@ avoids a parse, chunk and embed cycle — which is the expensive part, not the f
 **Level 1 exists because level 2 requires a fetch.** Over a rate-limited API across ten
 thousand pages, that difference is the whole sync.
 
+**A dependency invalidation is the narrow exception to level 1.** A connector may publish
+persisted reverse source-content edges (for example, Confluence's expanded includes). A changed,
+deleted or newly inaccessible target schedules its live direct and transitive parents with a
+`force_fetch` marker. That bypasses token equality only; it preserves the parent’s actual token,
+so the forced fetch does not turn into a perpetual refresh. The parent’s edge replacement shares
+its successful document publication transaction. Failed parses retain the prior edges and retry
+on a later sync rather than making stale expanded content permanently invisible to invalidation.
+
 **A connector that supplies no `version_token` falls straight to level 2**, which means every
 sync fetches every document and the saving comes only from skipping parse, chunk and embed.
 That is correct rather than degraded — it is the best available behavior when the source
@@ -2093,6 +2101,12 @@ A crash after the completion transaction does not contact the source again: the 
 finds and applies that completed inventory. A partial or canceled run has no such handle and is
 permanently ineligible. Incremental acquisition uses a different journal, so authentication,
 capacity and cursor failures there cannot accidentally become reconciliation evidence.
+
+After an applied clean reconciliation soft-deletes an include target, its persisted reverse edge
+is deliberately retained until a parent re-fetch publishes its new resolved include set. The next
+sync therefore queues that parent even though the target no longer appears in incremental
+discovery; a partial inventory or a deletion proposal does neither. This is source-content
+invalidation, not a second deletion mechanism.
 
 ### 11.1 The safety rule: never mass-delete on a partial enumeration
 

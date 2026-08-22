@@ -163,6 +163,7 @@ class AcquisitionSource(BaseModel):
     source_modified_at: datetime | None = None
     metadata: Metadata = Field(default_factory=dict)
     provenance: Metadata = Field(default_factory=dict)
+    force_fetch: bool = False
 
     @model_validator(mode="after")
     def _source_modified_at_is_aware(self) -> Self:
@@ -193,6 +194,7 @@ class AcquisitionSource(BaseModel):
             source_modified_at=source_modified_at,
             metadata=discovered.metadata,
             provenance=provenance or {},
+            force_fetch=discovered.force_fetch,
         )
 
     @property

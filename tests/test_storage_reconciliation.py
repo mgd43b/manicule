@@ -37,9 +37,48 @@ _CONNECTOR = "wiki"
 _SCOPE = "spaces=ENG roots=all"
 
 
+async def _publish_with_dependencies(
+    store: SqliteDocStore, source_id: str, dependencies: tuple[str, ...] = ()
+) -> None:
+    """Publish a synthetic document through the atomic dependency-writing boundary."""
+    document = make_document(_CONNECTOR, source_id)
+    committed = await store.publish_document(
+        document,
+        [],
+        expected=None,
+        chunk_fp=None,
+        embed_fp=None,
+        parse_fp=None,
+        glossary_entries=None,
+        glossary_fp=None,
+        original_omitted_reason=None,
+        source_dependencies=dependencies,
+    )
+    assert committed.committed
+
+
 async def _documents(store: SqliteDocStore, count: int) -> None:
     for number in range(count):
         await store.upsert_document(make_document(_CONNECTOR, f"page-{number}"))
+
+
+async def test_reverse_include_edges_survive_child_deletion_until_parent_republishes(
+    store: SqliteDocStore,
+) -> None:
+    """A real SQLite transaction retains and then removes invalidation evidence atomically."""
+    await _publish_with_dependencies(store, "child")
+    await _publish_with_dependencies(store, "parent", ("child", "child"))
+
+    parents = await store.dependent_documents(_CONNECTOR, ("child",))
+    assert [document.source_id for document in parents] == ["parent"]
+
+    child = await store.find_document(_CONNECTOR, "child")
+    assert child is not None
+    await store.soft_delete_document(child.id)
+    assert await store.deleted_dependency_targets(_CONNECTOR, limit=10) == ("child",)
+
+    await _publish_with_dependencies(store, "parent")
+    assert await store.deleted_dependency_targets(_CONNECTOR, limit=10) == ()
 
 
 async def _complete(
