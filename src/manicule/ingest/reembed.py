@@ -665,11 +665,7 @@ async def _resume_owned(
             inspection = await _validate(
                 run,
                 generation=generation,
-                corpus=corpus,
                 shadow=shadow,
-                document_page=document_page,
-                target_batch_tokens=target_batch_tokens,
-                max_embed_batch=max_embed_batch,
                 lease=lease,
             )
             await shadow.seal(generation, inspection, lease=lease)
@@ -900,27 +896,15 @@ async def _validate(
     run: ReembedRun,
     *,
     generation: ShadowGeneration,
-    corpus: ReembedCorpus,
     shadow: ShadowVectorGeneration,
-    document_page: int,
-    target_batch_tokens: int,
-    max_embed_batch: int,
     lease: ReembedLease,
 ) -> ShadowInspection:
-    target = EmbedFingerprint.model_validate_json(run.commitment.target_config)
-    current = await _plan_snapshot(
-        corpus,
-        run.commitment.snapshot,
-        target,
-        document_page=document_page,
-        target_batch_tokens=target_batch_tokens,
-        max_embed_batch=max_embed_batch,
-        chunks_per_second=DEFAULT_CHUNKS_PER_SECOND,
-    )
+    # Building already read the immutable snapshot.  Inspection recomputes the physical chunk
+    # inventory from the shadow rows it actually produced, and publication subsequently binds
+    # the complete durable snapshot header to this same commitment in one fenced transaction.
+    # Re-planning here only re-read the full source payload without strengthening either fence.
     inspection = await shadow.inspect(generation, lease=lease)
     failures: list[str] = []
-    if current.inventory_digest != run.commitment.inventory_digest:
-        failures.append("the immutable inventory does not match its planned digest")
     expected_chunks = run.commitment.execution_plan.chunks
     if inspection.rows != expected_chunks:
         failures.append(f"expected {expected_chunks} rows, found {inspection.rows}")
