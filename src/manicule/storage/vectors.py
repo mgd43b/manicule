@@ -722,7 +722,13 @@ class LanceVectorStore:
     async def inspection_pages(
         self, *, page_size: int = 256
     ) -> AsyncIterator[list[dict[str, Any]]]:
-        """Read physical validation rows in bounded, stable keyset pages."""
+        """Stream physical validation rows in bounded, stable ordered batches.
+
+        This is one ordered Lance query rather than a keyset query per page.  Shadow
+        inspection is deliberately a full read, so resubmitting an increasingly selective sort
+        for every batch adds latency without adding an isolation property; the before/after
+        storage revision fence in the caller detects a concurrent shadow mutation.
+        """
         if page_size < 1:
             raise ValueError("inspection page size must be positive")
         table, _ = self._ready()
@@ -750,31 +756,16 @@ class LanceVectorStore:
             ColumnOrdering(column_name=CHUNK_ID_COLUMN),
             ColumnOrdering(column_name=ID_COLUMN),
         ]
-        after: tuple[str, int, str, str] | None = None
-        while True:
-            query = table.query().select(columns).order_by(ordering).limit(page_size)
-            if after is not None:
-                document_id, position, chunk_id, physical_id = after
-                query = query.where(
-                    f"document_id > {quote(document_id)} OR "
-                    f"(document_id = {quote(document_id)} AND "
-                    f"(position > {position} OR "
-                    f"(position = {position} AND "
-                    f"({CHUNK_ID_COLUMN} > {quote(chunk_id)} OR "
-                    f"({CHUNK_ID_COLUMN} = {quote(chunk_id)} AND "
-                    f"{ID_COLUMN} > {quote(physical_id)})))))"
-                )
-            page = await query.to_list()
-            if not page:
-                return
-            yield page
-            last = page[-1]
-            after = (
-                str(last["document_id"]),
-                int(str(last["position"])),
-                str(last[CHUNK_ID_COLUMN]),
-                str(last[ID_COLUMN]),
-            )
+        reader = (
+            await table.query()
+            .select(columns)
+            .order_by(ordering)
+            .to_batches(max_batch_length=page_size)
+        )
+        async for batch in reader:
+            page = batch.to_pylist()
+            if page:
+                yield page
 
     async def storage_revision(self) -> str:
         """The immutable Lance commit version currently visible through this handle."""
