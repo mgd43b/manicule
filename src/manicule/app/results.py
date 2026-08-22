@@ -58,6 +58,10 @@ type LifecyclePhase = Literal[
     "acquiring",
     "verifying",
     "rebuilding",
+    "takeover_replay",
+    "validation",
+    "retrying",
+    "operator_required",
     "reembedding",
     "resetting",
     "deleting",
@@ -66,7 +70,15 @@ type LifecyclePhase = Literal[
     "canceled",
 ]
 type LifecycleOutcome = Literal[
-    "running", "complete", "bounded", "deferred", "incomplete", "refused", "failed", "canceled"
+    "running",
+    "complete",
+    "bounded",
+    "deferred",
+    "incomplete",
+    "operator_required",
+    "refused",
+    "failed",
+    "canceled",
 ]
 type InventoryRecovery = Literal["", "reenumeration_required", "reenumerating", "reconciled"]
 type FullInventoryAuthority = Literal["", "search", "direct_current_content"]
@@ -876,6 +888,26 @@ class RebuildPlanReport(Payload):
     lifecycle: LifecycleProgress
 
 
+class RebuildStorageDiagnosticReport(Payload):
+    """The safe, versioned subset of a rebuild storage-failure observation."""
+
+    schema_version: int = Field(ge=1)
+    event: Literal["primary", "settlement"]
+    stage: str
+    cause: str
+    retryable: bool
+    namespace_usable: bool
+    replayed_items: int = Field(ge=0)
+    replayed_vectors: int = Field(ge=0)
+    validated_items: int = Field(ge=0)
+    validated_vectors: int = Field(ge=0)
+    occurred_at: str
+    correlation_id: str
+    retry_count: int = Field(ge=0)
+    next_retry_at: str | None = None
+    operator_hint: str
+
+
 class RebuildRunReport(Payload):
     """Durable aggregate checkpoint for an offline replacement generation."""
 
@@ -910,6 +942,7 @@ class RebuildRunReport(Payload):
         "immutable generation, where nothing should read as new progress.",
     )
     diagnostic_code: str | None = None
+    storage_diagnostic: RebuildStorageDiagnosticReport | None = None
     lifecycle: LifecycleProgress
 
 

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Any, Protocol, cast, override
 
 import pytest
 from manicule_plugin_hostile import HangingMiddleware, HostileConfig
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from manicule.core.acquisition import AcquiredSource
 from manicule.core.anchors import Unlocated
@@ -27,7 +29,10 @@ from manicule.core.rebuild import (
     RebuildRefusalCode,
     RebuildRefusedError,
     RebuildState,
+    RebuildStorageCause,
+    RebuildStorageDiagnostic,
     RebuildStorageError,
+    RebuildStorageStage,
     RebuildTarget,
     RebuildTerminalError,
     RebuildTerminalGenerationError,
@@ -52,6 +57,10 @@ from tests.ingest.fakes import BlockChunker, PassThrough
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Sequence
     from pathlib import Path
+
+
+class _RebuildDiagnosticLogRecord(Protocol):
+    rebuild_storage: dict[str, Any]
 
 
 class OneMemberContainer:
@@ -729,6 +738,75 @@ class UnsettleableStore(MidBuildStorageFailureStore):
         raise RebuildLeaseConflictError("generation lease changed or expired")
 
 
+class _BusySqliteError(sqlite3.OperationalError):
+    sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+
+@dataclass
+class RetryableValidationStore(FakeStore):
+    validation_attempts: int = 0
+    storage_diagnostics: list[RebuildStorageDiagnostic] = field(
+        default_factory=list[RebuildStorageDiagnostic]
+    )
+
+    @override
+    async def validate_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+        cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
+    ) -> None:
+        await super().validate_generation(
+            generation_id,
+            owner=owner,
+            lease_generation=lease_generation,
+            now=now,
+            cancel=cancel,
+            clock=clock,
+        )
+        self.validation_attempts += 1
+        if self.validation_attempts == 1:
+            raise OperationalError(
+                "SELECT private_body FROM private_table WHERE credential = ?",
+                ("https://example.test/private?token=secret",),
+                _BusySqliteError("database is locked at /private/storage.sqlite"),
+            )
+
+    async def record_storage_diagnostic(
+        self,
+        generation_id: str,
+        diagnostic: RebuildStorageDiagnostic,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+    ) -> None:
+        del generation_id, owner, lease_generation, now
+        self.storage_diagnostics.append(diagnostic)
+
+
+@dataclass
+class CapacityValidationStore(RetryableValidationStore):
+    @override
+    async def validate_generation(
+        self,
+        generation_id: str,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: object,
+        cancel: asyncio.Event | None = None,
+        clock: Callable[[], object] | None = None,
+    ) -> None:
+        del generation_id, owner, lease_generation, now, cancel, clock
+        self.validation_attempts += 1
+        raise OSError(errno.ENOSPC, "no space at /private/storage.sqlite token=secret")
+
+
 @pytest.mark.asyncio
 async def test_a_storage_failure_mid_build_gives_the_generation_up_without_ending_it() -> None:
     """What the run leaves behind is the whole point, not what it raises.
@@ -768,7 +846,9 @@ async def test_a_storage_failure_mid_build_gives_the_generation_up_without_endin
 
 
 @pytest.mark.asyncio
-async def test_a_settlement_the_lease_no_longer_permits_does_not_rewrite_the_failure() -> None:
+async def test_a_settlement_the_lease_no_longer_permits_does_not_rewrite_the_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Losing the lease is exactly the loss of the right to write the row.
 
     If the lease lapsed while this worker was inside the failing call, another owner may hold
@@ -790,6 +870,18 @@ async def test_a_settlement_the_lease_no_longer_permits_does_not_rewrite_the_fai
     assert store.released_code is None, "the store refused the settlement, so nothing recorded it"
     assert store.failed_code is None
     assert store.published is False
+    diagnostics: list[dict[str, Any]] = [
+        cast("_RebuildDiagnosticLogRecord", record).rebuild_storage
+        for record in caplog.records
+        if hasattr(record, "rebuild_storage")
+    ]
+    assert [diagnostic["event"] for diagnostic in diagnostics] == ["primary", "settlement"]
+    assert diagnostics[0]["correlation_id"] == diagnostics[1]["correlation_id"]
+    assert diagnostics[1]["stage"] == RebuildStorageStage.RELEASE.value
+    assert not any(
+        marker in str(diagnostics).lower()
+        for marker in ("private", "secret", "sqlite", "example.test")
+    )
 
 
 @pytest.mark.asyncio
@@ -1032,6 +1124,56 @@ async def test_validation_storage_failure_is_bounded_and_gives_the_generation_up
     assert store.released_code is RebuildRefusalCode.STORAGE_FAILED
     assert store.failed_code is None
     assert store.published is False
+
+
+@pytest.mark.asyncio
+async def test_busy_validation_retries_under_the_same_lease_without_rebuilding() -> None:
+    item, body = source(0, "body")
+    store = RetryableValidationStore([item])
+
+    result = await OfflineGenerationRebuilder(
+        store=store,
+        blobs=FakeBlobs({item.blob_ref: body}),
+        deriver=FakeDeriver(),
+    ).run("promoted-run", target())
+
+    assert result.state is RebuildState.PUBLISHED
+    assert store.validation_attempts == 2
+    assert store.stage_calls == 1, "the retry must start from durable validation evidence"
+    assert store.released_code is None
+    assert len(store.storage_diagnostics) == 1
+    diagnostic = store.storage_diagnostics[0]
+    assert diagnostic.stage is RebuildStorageStage.VALIDATION_EVIDENCE_READ
+    assert diagnostic.cause is RebuildStorageCause.BUSY
+    assert diagnostic.retryable is True
+    assert diagnostic.namespace_usable is True
+    assert diagnostic.next_retry_at is not None
+    rendered = str(diagnostic.model_dump(mode="json")).lower()
+    assert not any(value in rendered for value in ("private", "secret", "sqlite", "example.test"))
+
+
+@pytest.mark.asyncio
+async def test_capacity_failure_never_enters_an_automatic_restart_loop() -> None:
+    item, body = source(0, "body")
+    store = CapacityValidationStore([item])
+
+    with pytest.raises(RebuildStorageError) as caught:
+        await OfflineGenerationRebuilder(
+            store=store,
+            blobs=FakeBlobs({item.blob_ref: body}),
+            deriver=FakeDeriver(),
+        ).run("promoted-run", target())
+
+    assert store.validation_attempts == 1
+    assert store.released_code is RebuildRefusalCode.STORAGE_FAILED
+    diagnostic = caught.value.diagnostic
+    assert diagnostic is not None
+    assert diagnostic.stage is RebuildStorageStage.VALIDATION_EVIDENCE_READ
+    assert diagnostic.cause is RebuildStorageCause.CAPACITY
+    assert diagnostic.retryable is False
+    assert diagnostic.next_retry_at is None
+    rendered = str(caught.value).lower()
+    assert not any(value in rendered for value in ("private", "secret", "sqlite", "example.test"))
 
 
 @pytest.mark.asyncio
@@ -1620,21 +1762,25 @@ async def test_a_takeover_during_replay_stops_the_superseded_worker() -> None:
 
 
 async def test_a_renewal_failure_is_reported_safely_and_leaves_the_generation_resumable() -> None:
-    """A storage failure under the heartbeat says the lease is gone, and nothing else.
+    """A storage failure under the heartbeat is diagnosable without leaking its driver text.
 
-    The driver's own message never reaches the caller: what comes out is the bounded lease
-    vocabulary the surface already maps, and the generation is left where it was rather than
-    failed or canceled, so the next worker resumes from the same checkpoint.
+    The failed renewal is distinct from an actual successor takeover.  It releases the still
+    resumable generation with a bounded `lease_renewal` storage diagnosis; only a true ownership
+    conflict crosses as `RebuildLeaseError`.
     """
     store, rebuilder = _replaying(renewals_wanted=99)
     store.renewal_error = OSError("/private/data/manicule.db is unreadable")
 
-    with pytest.raises(RebuildLeaseError) as caught:
+    with pytest.raises(RebuildStorageError) as caught:
         await rebuilder.run("promoted-run", target(), lease_seconds=1)
 
     assert "/private" not in str(caught.value)
     assert "manicule.db" not in str(caught.value)
-    assert store.failed_code is None, "a lost lease is not this generation's failure to record"
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.stage is RebuildStorageStage.LEASE_RENEWAL
+    assert caught.value.diagnostic.cause is RebuildStorageCause.IO
+    assert store.released_code is RebuildRefusalCode.STORAGE_FAILED
+    assert store.failed_code is None
     assert not store.published
 
 

@@ -8,14 +8,26 @@ impossible rather than a convention a caller may accidentally bypass.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+import errno
+import logging
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Final, NoReturn, Protocol, cast, override, runtime_checkable
+from secrets import randbelow
+from typing import (
+    TYPE_CHECKING,
+    Final,
+    Literal,
+    NoReturn,
+    Protocol,
+    cast,
+    override,
+    runtime_checkable,
+)
 from uuid import uuid4
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from manicule.core.content import (
     Chunk,
@@ -40,7 +52,12 @@ from manicule.core.rebuild import (
     RebuildRefusalCode,
     RebuildRefusedError,
     RebuildState,
+    RebuildStorageBackendError,
+    RebuildStorageCause,
+    RebuildStorageDiagnostic,
     RebuildStorageError,
+    RebuildStorageOperationError,
+    RebuildStorageStage,
     RebuildTarget,
     RebuildTerminalError,
     RebuildTerminalGenerationError,
@@ -62,6 +79,12 @@ from manicule.parsers.versions import parse_fingerprint
 
 MAX_MISSING_DETAILS = 1000
 
+_LOG = logging.getLogger(__name__)
+_STORAGE_RETRY_ATTEMPTS: Final = 3
+_STORAGE_RETRY_BASE_SECONDS: Final = 0.05
+_STORAGE_RETRY_MAX_SECONDS: Final = 1.0
+_STORAGE_RETRY_MAX_ELAPSED_SECONDS: Final = 5.0
+
 
 @dataclass(slots=True)
 class _LeaseHeartbeat:
@@ -74,6 +97,95 @@ class _LeaseHeartbeat:
 
     lost: bool = False
     renewals: int = 0
+    storage_error: BaseException | None = None
+
+
+class _StagedStorageError(RuntimeError):
+    """Private transport for a raw storage failure plus its bounded operation stage."""
+
+    def __init__(
+        self,
+        stage: RebuildStorageStage,
+        error: BaseException,
+        diagnostic: RebuildStorageDiagnostic | None = None,
+    ) -> None:
+        super().__init__(stage.value)
+        self.stage = stage
+        self.error = error
+        self.diagnostic = diagnostic
+
+
+def _storage_root(error: BaseException) -> BaseException:
+    """Unwrap SQLAlchemy's DBAPI wrapper without ever rendering its message."""
+    if isinstance(error, SQLAlchemyError):
+        original = getattr(error, "orig", None)
+        if isinstance(original, BaseException):
+            return original
+    return error
+
+
+def _classify_storage_failure(error: BaseException) -> tuple[RebuildStorageCause, bool]:
+    """Return a safe cause and a deliberately narrow retry decision.
+
+    Driver messages are intentionally not consulted except for SQLite's fixed busy/locked
+    signals.  A word such as ``timeout`` in arbitrary SQL or a path is not a contract and must
+    never turn an unknown failure into an unattended retry loop.
+    """
+    cause = RebuildStorageCause.UNKNOWN
+    retryable = False
+    if isinstance(error, RebuildStorageBackendError):
+        return RebuildStorageCause.VECTOR_STORAGE, retryable
+    if isinstance(error, IntegrityError):
+        return RebuildStorageCause.DATABASE_INTEGRITY, retryable
+    root = _storage_root(error)
+    if isinstance(root, RebuildStorageBackendError):
+        cause = RebuildStorageCause.VECTOR_STORAGE
+    elif isinstance(root, OSError):
+        if root.errno == errno.ENOSPC:
+            cause = RebuildStorageCause.CAPACITY
+        elif root.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+            cause = RebuildStorageCause.PERMISSION
+        else:
+            cause = RebuildStorageCause.IO
+            retryable = root.errno in {
+                errno.EAGAIN,
+                errno.EINTR,
+                errno.ETIMEDOUT,
+                errno.ECONNABORTED,
+                errno.ECONNRESET,
+                errno.ENETDOWN,
+                errno.ENETUNREACH,
+            }
+    elif isinstance(error, SQLAlchemyError):
+        # sqlite3 exposes numeric result codes without needing its unbounded diagnostic text.
+        code = getattr(root, "sqlite_errorcode", None)
+        if isinstance(code, int) and (code & 0xFF) in {5, 6}:  # SQLITE_BUSY / SQLITE_LOCKED
+            cause = RebuildStorageCause.BUSY
+            retryable = True
+    return cause, retryable
+
+
+def _storage_hint(cause: RebuildStorageCause, *, retryable: bool) -> str:
+    if retryable:
+        return "Retry is delayed; the live lease and staged namespace remain in use."
+    if cause is RebuildStorageCause.BUSY:
+        return "Automatic retry was not scheduled; wait for storage contention to clear."
+    return {
+        RebuildStorageCause.CAPACITY: "Free durable storage, then resume the same generation.",
+        RebuildStorageCause.PERMISSION: (
+            "Restore storage permissions, then resume the same generation."
+        ),
+        RebuildStorageCause.DATABASE_INTEGRITY: (
+            "Inspect durable storage integrity before resuming this generation."
+        ),
+        RebuildStorageCause.VECTOR_STORAGE: (
+            "Repair the vector-store backend before resuming this generation."
+        ),
+        RebuildStorageCause.IO: "Check durable storage and I/O health before resuming.",
+        RebuildStorageCause.UNKNOWN: (
+            "Inspect storage health before resuming; no retry was scheduled."
+        ),
+    }[cause]
 
 
 LEASE_RENEWALS_PER_LEASE: Final = 3
@@ -255,6 +367,21 @@ class RebuildBlobSource(Protocol):
     """Read-only access to retained bytes; deliberately has no retain or fetch method."""
 
     async def get_bounded(self, digest: str, *, max_bytes: int) -> bytes | None: ...
+
+
+@runtime_checkable
+class RebuildStorageDiagnosticRecorder(Protocol):
+    """Optional capability for a store that can persist safe retry observations."""
+
+    async def record_storage_diagnostic(
+        self,
+        generation_id: str,
+        diagnostic: RebuildStorageDiagnostic,
+        *,
+        owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -789,6 +916,201 @@ class OfflineGenerationRebuilder:
         self._deriver = deriver
         self._clock = clock or (lambda: datetime.now(UTC))
 
+    def _storage_diagnostic(
+        self,
+        checkpoint: RebuildCheckpoint | None,
+        *,
+        stage: RebuildStorageStage,
+        error: BaseException,
+        correlation_id: str,
+        retry_count: int,
+        next_retry_at: datetime | None = None,
+        event: Literal["primary", "settlement"] = "primary",
+        retryable_override: bool | None = None,
+    ) -> RebuildStorageDiagnostic:
+        cause, classified_retryable = _classify_storage_failure(error)
+        retryable = classified_retryable if retryable_override is None else retryable_override
+        return RebuildStorageDiagnostic(
+            event=event,
+            stage=stage,
+            cause=cause,
+            retryable=retryable and event == "primary",
+            namespace_usable=retryable and event == "primary",
+            replayed_items=0 if checkpoint is None else checkpoint.replayed_items,
+            replayed_vectors=0 if checkpoint is None else checkpoint.replayed_vectors,
+            validated_items=0 if checkpoint is None else checkpoint.validated_items,
+            validated_vectors=0 if checkpoint is None else checkpoint.validated_vectors,
+            occurred_at=self._clock(),
+            correlation_id=correlation_id,
+            retry_count=retry_count,
+            next_retry_at=next_retry_at,
+            operator_hint=_storage_hint(cause, retryable=retryable and event == "primary"),
+        )
+
+    @staticmethod
+    def _emit_storage_diagnostic(diagnostic: RebuildStorageDiagnostic) -> None:
+        """Log only the reviewed model, never a driver exception or its formatted traceback."""
+        _LOG.warning(
+            "rebuild storage diagnostic",
+            extra={"rebuild_storage": diagnostic.model_dump(mode="json")},
+        )
+
+    async def _record_storage_diagnostic(
+        self,
+        checkpoint: RebuildCheckpoint,
+        owner: str,
+        diagnostic: RebuildStorageDiagnostic,
+    ) -> None:
+        """Best-effort durable evidence; unsupported alternate stores retain log evidence."""
+        if not isinstance(self._store, RebuildStorageDiagnosticRecorder):
+            return
+        try:
+            await self._store.record_storage_diagnostic(
+                checkpoint.generation_id,
+                diagnostic,
+                owner=owner,
+                lease_generation=checkpoint.lease_generation,
+                now=self._clock(),
+            )
+        except (
+            SQLAlchemyError,
+            OSError,
+            RebuildStorageBackendError,
+            RebuildLeaseConflictError,
+            KeyError,
+        ) as exc:
+            settlement = self._storage_diagnostic(
+                checkpoint,
+                stage=RebuildStorageStage.RELEASE,
+                error=exc,
+                correlation_id=diagnostic.correlation_id,
+                retry_count=diagnostic.retry_count,
+                event="settlement",
+            )
+            self._emit_storage_diagnostic(settlement)
+
+    async def _renew_generation(
+        self, checkpoint: RebuildCheckpoint, owner: str, *, lease_seconds: int
+    ) -> RebuildCheckpoint:
+        renewed_at = self._clock()
+        try:
+            return await self._store.renew_generation(
+                checkpoint.generation_id,
+                owner,
+                checkpoint.lease_generation,
+                now=renewed_at,
+                expires_at=renewed_at + timedelta(seconds=lease_seconds),
+            )
+        except (SQLAlchemyError, OSError) as exc:
+            raise _StagedStorageError(RebuildStorageStage.LEASE_RENEWAL, exc) from exc
+
+    async def _assert_generation_lease(self, checkpoint: RebuildCheckpoint, owner: str) -> None:
+        try:
+            await self._store.assert_generation_lease(
+                checkpoint.generation_id,
+                owner,
+                checkpoint.lease_generation,
+                now=self._clock(),
+            )
+        except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+            raise _StagedStorageError(RebuildStorageStage.LEASE_ASSERTION, exc) from exc
+
+    async def _checkpoint_for_diagnostic(self, checkpoint: RebuildCheckpoint) -> RebuildCheckpoint:
+        """Prefer the most recently committed aggregate evidence without masking the failure."""
+        try:
+            return await self._store.checkpoint(checkpoint.generation_id)
+        except (
+            SQLAlchemyError,
+            OSError,
+            RebuildStorageBackendError,
+            RebuildLeaseConflictError,
+            KeyError,
+        ):
+            return checkpoint
+
+    async def _retry_storage_operation(
+        self,
+        checkpoint: RebuildCheckpoint,
+        owner: str,
+        *,
+        stage: RebuildStorageStage,
+        operation: Callable[[], Awaitable[None]],
+        cancel: asyncio.Event | None,
+    ) -> None:
+        """Retry only a classified transient, fenced operation under this unchanged lease."""
+        correlation_id = uuid4().hex
+        attempts = 0
+        started = asyncio.get_running_loop().time()
+        while True:
+            try:
+                await operation()
+            except RebuildStorageOperationError as failure:
+                failed_stage = failure.stage
+                error = (
+                    failure.__cause__ if isinstance(failure.__cause__, BaseException) else failure
+                )
+            except _StagedStorageError as failure:
+                failed_stage = failure.stage
+                error = failure.error
+            except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                failed_stage = stage
+                error = exc
+            else:
+                return
+
+            _, retryable = _classify_storage_failure(error)
+            attempts += 1
+            remaining = _STORAGE_RETRY_MAX_ELAPSED_SECONDS - (
+                asyncio.get_running_loop().time() - started
+            )
+            can_retry = (
+                retryable
+                and attempts < _STORAGE_RETRY_ATTEMPTS
+                and remaining > 0
+                and (cancel is None or not cancel.is_set())
+            )
+            delay = 0.0
+            next_retry_at: datetime | None = None
+            if can_retry:
+                nominal = min(
+                    _STORAGE_RETRY_BASE_SECONDS * (2 ** (attempts - 1)),
+                    _STORAGE_RETRY_MAX_SECONDS,
+                    remaining,
+                )
+                # Jitter is intentionally generated without reusing the process-global PRNG:
+                # retry timing is operational metadata, but no deterministic test should make
+                # coincident writers march in lockstep.
+                jitter = 0.75 + randbelow(501) / 1000
+                delay = min(nominal * jitter, remaining)
+                next_retry_at = self._clock() + timedelta(seconds=delay)
+            diagnostic_checkpoint = await self._checkpoint_for_diagnostic(checkpoint)
+            diagnostic = self._storage_diagnostic(
+                diagnostic_checkpoint,
+                stage=failed_stage,
+                error=error,
+                correlation_id=correlation_id,
+                retry_count=attempts,
+                next_retry_at=next_retry_at,
+                retryable_override=can_retry,
+            )
+            self._emit_storage_diagnostic(diagnostic)
+            await self._record_storage_diagnostic(checkpoint, owner, diagnostic)
+            if not can_retry:
+                raise _StagedStorageError(failed_stage, error, diagnostic) from error
+
+            if cancel is not None:
+                try:
+                    await asyncio.wait_for(cancel.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+                else:
+                    raise asyncio.CancelledError
+            else:
+                await asyncio.sleep(delay)
+            # Retrying a page is only safe if this worker still owns exactly the same fenced
+            # generation.  The heartbeat remains active throughout the delay.
+            await self._assert_generation_lease(checkpoint, owner)
+
     @staticmethod
     async def _join_irreversible[T](work: asyncio.Task[T]) -> T:
         """Join an atomic publication before propagating task cancellation."""
@@ -869,14 +1191,54 @@ class OfflineGenerationRebuilder:
             raise RebuildTerminalError from exc
         except RebuildLeaseConflictError as exc:
             raise RebuildLeaseError from exc
+        except RebuildStorageBackendError as exc:
+            diagnostic = self._storage_diagnostic(
+                None,
+                stage=RebuildStorageStage.PLAN,
+                error=exc,
+                correlation_id=uuid4().hex,
+                retry_count=0,
+            )
+            self._emit_storage_diagnostic(diagnostic)
+            raise RebuildStorageError(diagnostic) from exc
         except RebuildPublicationValidationError as exc:
             raise RebuildValidationError from exc
+        except RebuildStorageOperationError as exc:
+            error = exc.__cause__ if isinstance(exc.__cause__, BaseException) else exc
+            diagnostic = self._storage_diagnostic(
+                None,
+                stage=exc.stage,
+                error=error,
+                correlation_id=uuid4().hex,
+                retry_count=0,
+            )
+            self._emit_storage_diagnostic(diagnostic)
+            raise RebuildStorageError(diagnostic) from exc
+        except _StagedStorageError as exc:
+            diagnostic = exc.diagnostic or self._storage_diagnostic(
+                None,
+                stage=exc.stage,
+                error=exc.error,
+                correlation_id=uuid4().hex,
+                retry_count=0,
+            )
+            if exc.diagnostic is None:
+                self._emit_storage_diagnostic(diagnostic)
+            raise RebuildStorageError(diagnostic) from exc.error
         except (SQLAlchemyError, OSError) as exc:
             # Driver messages can contain statement text and bound parameter values. The cause
             # is retained for server diagnostics but can never cross the application boundary.
-            raise RebuildStorageError from exc
+            diagnostic = self._storage_diagnostic(
+                None,
+                stage=RebuildStorageStage.PLAN,
+                error=exc,
+                correlation_id=uuid4().hex,
+                retry_count=0,
+            )
+            self._emit_storage_diagnostic(diagnostic)
+            raise RebuildStorageError(diagnostic) from exc
 
-    async def _run(
+    async def _run(  # noqa: PLR0912 - explicit lifecycle/error boundary
         self,
         snapshot_run_id: str,
         target: RebuildTarget,
@@ -902,12 +1264,15 @@ class OfflineGenerationRebuilder:
             raise RebuildRefusedError(RebuildRefusalCode.TEMP_DISK_BOUND, estimate)
 
         now = self._clock()
-        checkpoint = await self._store.claim_generation(
-            estimate.generation_id,
-            owner,
-            now=now,
-            expires_at=now + timedelta(seconds=lease_seconds),
-        )
+        try:
+            checkpoint = await self._store.claim_generation(
+                estimate.generation_id,
+                owner,
+                now=now,
+                expires_at=now + timedelta(seconds=lease_seconds),
+            )
+        except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+            raise _StagedStorageError(RebuildStorageStage.CLAIM, exc) from exc
         if checkpoint.state is RebuildState.PUBLISHED:
             return checkpoint
         if checkpoint.state in {RebuildState.FAILED, RebuildState.CANCELED}:
@@ -944,19 +1309,60 @@ class OfflineGenerationRebuilder:
                     current = asyncio.current_task()
                     if current is not None:
                         current.uncancel()
+                    if lease.storage_error is not None:
+                        raise _StagedStorageError(
+                            RebuildStorageStage.LEASE_RENEWAL, lease.storage_error
+                        ) from lease.storage_error
                     raise RebuildLeaseConflictError(
                         "the generation lease could not be renewed while the rebuild ran"
                     ) from None
-        except (SQLAlchemyError, OSError):
+        except RebuildStorageOperationError as exc:
+            error = exc.__cause__ if isinstance(exc.__cause__, BaseException) else exc
+            diagnostic = self._storage_diagnostic(
+                checkpoint,
+                stage=exc.stage,
+                error=error,
+                correlation_id=uuid4().hex,
+                retry_count=0,
+            )
+            self._emit_storage_diagnostic(diagnostic)
+            await self._settle_storage_failure(checkpoint, owner, diagnostic)
+            raise RebuildStorageError(diagnostic) from exc
+        except _StagedStorageError as exc:
+            diagnostic = exc.diagnostic or self._storage_diagnostic(
+                checkpoint,
+                stage=exc.stage,
+                error=exc.error,
+                correlation_id=uuid4().hex,
+                retry_count=0,
+            )
+            if exc.diagnostic is None:
+                self._emit_storage_diagnostic(diagnostic)
+            await self._settle_storage_failure(checkpoint, owner, diagnostic)
+            raise RebuildStorageError(diagnostic) from exc.error
+        except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
             # Every refusal the build anticipates settles the generation itself. This catches
             # the ones nobody anticipated: a driver or filesystem failure from any store call
             # between the claim and publication, which used to unwind past every handler and
             # leave the row `building` with a lease that then quietly expired — work reported
             # as running with no worker, no diagnostic and nothing to resume from but a guess.
-            await self._settle_storage_failure(checkpoint, owner)
-            raise
+            diagnostic = self._storage_diagnostic(
+                checkpoint,
+                stage=RebuildStorageStage.BUILD_CHECKPOINT,
+                error=exc,
+                correlation_id=uuid4().hex,
+                retry_count=0,
+            )
+            self._emit_storage_diagnostic(diagnostic)
+            await self._settle_storage_failure(checkpoint, owner, diagnostic)
+            raise RebuildStorageError(diagnostic) from exc
 
-    async def _settle_storage_failure(self, checkpoint: RebuildCheckpoint, owner: str) -> None:
+    async def _settle_storage_failure(
+        self,
+        checkpoint: RebuildCheckpoint,
+        owner: str,
+        diagnostic: RebuildStorageDiagnostic,
+    ) -> None:
         """Record ``storage_failed`` and give the generation up, best effort, before re-raising.
 
         Released rather than failed, because a storage error is the one class of failure that
@@ -974,7 +1380,8 @@ class OfflineGenerationRebuilder:
         run reports :class:`RebuildStorageError` either way, and a row this worker could not
         settle is left to lease recovery rather than to a stale owner.
         """
-        with suppress(SQLAlchemyError, OSError, RebuildLeaseConflictError, KeyError):
+        await self._record_storage_diagnostic(checkpoint, owner, diagnostic)
+        try:
             await self._store.release_generation(
                 checkpoint.generation_id,
                 RebuildRefusalCode.STORAGE_FAILED,
@@ -982,6 +1389,29 @@ class OfflineGenerationRebuilder:
                 lease_generation=checkpoint.lease_generation,
                 now=self._clock(),
             )
+        except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+            settlement = self._storage_diagnostic(
+                checkpoint,
+                stage=RebuildStorageStage.RELEASE,
+                error=exc,
+                correlation_id=diagnostic.correlation_id,
+                retry_count=diagnostic.retry_count,
+                event="settlement",
+            )
+            self._emit_storage_diagnostic(settlement)
+        except (RebuildLeaseConflictError, KeyError) as exc:
+            # A successor alone owns this row.  The primary record survives in local evidence;
+            # deliberately do not turn a lost settlement right into a stale write.
+            settlement = self._storage_diagnostic(
+                checkpoint,
+                stage=RebuildStorageStage.RELEASE,
+                error=exc,
+                correlation_id=diagnostic.correlation_id,
+                retry_count=diagnostic.retry_count,
+                event="settlement",
+            )
+            self._emit_storage_diagnostic(settlement)
+            return
 
     @asynccontextmanager
     async def _renewing_lease(
@@ -1033,7 +1463,14 @@ class OfflineGenerationRebuilder:
                         now=renewed_at,
                         expires_at=renewed_at + timedelta(seconds=lease_seconds),
                     )
-                except Exception:  # noqa: BLE001 - every failure here means the same thing
+                except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                    # Preserve the private cause for the outer storage boundary.  A real lease
+                    # conflict remains distinct: only the latter says another worker won.
+                    state.storage_error = exc
+                    state.lost = True
+                    work.cancel()
+                    return
+                except Exception:  # noqa: BLE001 - a conflict or plugin failure loses the lease
                     # Broad on purpose, and the one place in this file where that is right. A
                     # refused renewal is a real takeover and arrives as
                     # `RebuildLeaseConflictError`, a `RuntimeError` subclass that a list of
@@ -1089,8 +1526,12 @@ class OfflineGenerationRebuilder:
                 )
             except RebuildPublicationConflictError as exc:
                 await self._fail_build_conflict(checkpoint, owner, exc)
+            except RebuildStorageBackendError as exc:
+                raise _StagedStorageError(RebuildStorageStage.TAKEOVER_REPLAY_WRITE, exc) from exc
             except RebuildPublicationValidationError as exc:
                 await self._fail_build_validation(checkpoint, owner, exc)
+            except (SQLAlchemyError, OSError) as exc:
+                raise _StagedStorageError(RebuildStorageStage.TAKEOVER_REPLAY_READ, exc) from exc
 
         while checkpoint.next_sequence < estimate.documents:
             if cancel is not None and cancel.is_set():
@@ -1224,27 +1665,12 @@ class OfflineGenerationRebuilder:
                         now=self._clock(),
                     )
                     raise RebuildRefusedError(RebuildRefusalCode.TEMP_DISK_BOUND, estimate) from exc
-                renewed_at = self._clock()
-                checkpoint = await self._store.renew_generation(
-                    checkpoint.generation_id,
-                    owner,
-                    checkpoint.lease_generation,
-                    now=renewed_at,
-                    expires_at=renewed_at + timedelta(seconds=lease_seconds),
+                checkpoint = await self._renew_generation(
+                    checkpoint, owner, lease_seconds=lease_seconds
                 )
-                await self._store.assert_generation_lease(
-                    checkpoint.generation_id,
-                    owner,
-                    checkpoint.lease_generation,
-                    now=self._clock(),
-                )
+                await self._assert_generation_lease(checkpoint, owner)
                 await self._deriver.stage(prepared, publication_id=checkpoint.vector_publication_id)
-                await self._store.assert_generation_lease(
-                    checkpoint.generation_id,
-                    owner,
-                    checkpoint.lease_generation,
-                    now=self._clock(),
-                )
+                await self._assert_generation_lease(checkpoint, owner)
                 try:
                     checkpoint = await self._store.stage_replacements(
                         checkpoint.generation_id,
@@ -1258,13 +1684,8 @@ class OfflineGenerationRebuilder:
                     await self._fail_build_conflict(checkpoint, owner, exc)
                 except RebuildPublicationValidationError as exc:
                     await self._fail_build_validation(checkpoint, owner, exc)
-                renewed_at = self._clock()
-                checkpoint = await self._store.renew_generation(
-                    checkpoint.generation_id,
-                    owner,
-                    checkpoint.lease_generation,
-                    now=renewed_at,
-                    expires_at=renewed_at + timedelta(seconds=lease_seconds),
+                checkpoint = await self._renew_generation(
+                    checkpoint, owner, lease_seconds=lease_seconds
                 )
 
         if cancel is not None and cancel.is_set():
@@ -1293,22 +1714,23 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
         try:
-            await self._store.assert_generation_lease(
-                checkpoint.generation_id,
-                owner,
-                checkpoint.lease_generation,
-                now=self._clock(),
-            )
+            await self._assert_generation_lease(checkpoint, owner)
         except RebuildPublicationConflictError as exc:
             await self._fail_build_conflict(checkpoint, owner, exc)
         try:
-            await self._store.validate_generation(
-                checkpoint.generation_id,
-                owner=owner,
-                lease_generation=checkpoint.lease_generation,
-                now=self._clock(),
+            await self._retry_storage_operation(
+                checkpoint,
+                owner,
+                stage=RebuildStorageStage.VALIDATION_EVIDENCE_READ,
+                operation=lambda: self._store.validate_generation(
+                    checkpoint.generation_id,
+                    owner=owner,
+                    lease_generation=checkpoint.lease_generation,
+                    now=self._clock(),
+                    cancel=cancel,
+                    clock=self._clock,
+                ),
                 cancel=cancel,
-                clock=self._clock,
             )
         except RebuildPublicationConflictError as exc:
             await self._fail_build_conflict(checkpoint, owner, exc)
@@ -1321,6 +1743,8 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
             raise RebuildValidationError from exc
+        except (RebuildStorageOperationError, _StagedStorageError):
+            raise
         except (RuntimeError, ValueError) as exc:
             await self._store.fail_generation(
                 checkpoint.generation_id,
@@ -1331,12 +1755,7 @@ class OfflineGenerationRebuilder:
             )
             raise RebuildValidationError from exc
         try:
-            await self._store.assert_generation_lease(
-                checkpoint.generation_id,
-                owner,
-                checkpoint.lease_generation,
-                now=self._clock(),
-            )
+            await self._assert_generation_lease(checkpoint, owner)
         except RebuildPublicationConflictError as exc:
             await self._fail_build_conflict(checkpoint, owner, exc)
         if cancel is not None and cancel.is_set():
@@ -1369,6 +1788,8 @@ class OfflineGenerationRebuilder:
             # The publication transaction can discover that this worker no longer owns the
             # lease. The new owner alone may mutate the durable generation from here.
             raise
+        except RebuildStorageBackendError as exc:
+            raise _StagedStorageError(RebuildStorageStage.PUBLICATION, exc) from exc
         except RebuildPublicationValidationError as exc:
             await self._store.fail_generation(
                 checkpoint.generation_id,
@@ -1378,6 +1799,10 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
             raise RebuildValidationError from exc
+        except (RebuildStorageOperationError, _StagedStorageError):
+            raise
+        except (SQLAlchemyError, OSError) as exc:
+            raise _StagedStorageError(RebuildStorageStage.PUBLICATION, exc) from exc
         except (RuntimeError, ValueError) as exc:
             # The store's publication protocol reports bounded invariant failures as its typed
             # validation error. RuntimeError remains a compatibility boundary for third-party

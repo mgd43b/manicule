@@ -1276,6 +1276,14 @@ def render_rebuild_run(out: Console, payload: r.RebuildRunReport) -> None:
         out.print(f"last progress: {escape(payload.last_progress_at)}")
     if payload.diagnostic_code:
         out.print(f"[red]diagnostic: {escape(payload.diagnostic_code)}[/red]")
+    if payload.storage_diagnostic is not None:
+        diagnostic = payload.storage_diagnostic
+        out.print(
+            "storage: "
+            f"{escape(diagnostic.stage)} / {escape(diagnostic.cause)}; "
+            f"retryable: {diagnostic.retryable}; retry count: {diagnostic.retry_count}"
+        )
+        out.print(escape(diagnostic.operator_hint))
 
 
 RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {

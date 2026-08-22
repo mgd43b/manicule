@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,16 +17,24 @@ from manicule.app import control
 from manicule.app.dispatch import error_info, run_op
 from manicule.app.results import failed
 from manicule.app.served import ControlHandler
-from manicule.app.service import ApplicationService
+from manicule.app.service import (
+    ApplicationService,
+    _rebuild_run_report,  # pyright: ignore[reportPrivateUsage]
+)
 from manicule.cli import main as cli
 from manicule.connectors.sessions import SessionVault
 from manicule.core.rebuild import (
+    RebuildCheckpoint,
     RebuildDerivationError,
     RebuildLeaseError,
     RebuildPublicationConflictError,
     RebuildPublicationValidationError,
     RebuildRefusalCode,
+    RebuildState,
+    RebuildStorageCause,
+    RebuildStorageDiagnostic,
     RebuildStorageError,
+    RebuildStorageStage,
     RebuildTerminalError,
     RebuildTerminalGenerationError,
     RebuildValidationError,
@@ -71,6 +80,62 @@ async def test_expected_rebuild_failures_have_stable_status_and_recovery_guidanc
     assert status_for(envelope) == expected_status
     rendered = str(envelope.as_json()).lower()
     assert not any(marker in rendered for marker in PRIVATE_MARKERS)
+
+
+def test_rebuild_status_exposes_only_the_safe_storage_diagnostic() -> None:
+    diagnostic = RebuildStorageDiagnostic(
+        stage=RebuildStorageStage.VALIDATION_CHECKPOINT,
+        cause=RebuildStorageCause.CAPACITY,
+        retryable=False,
+        namespace_usable=False,
+        occurred_at=datetime.now(UTC),
+        correlation_id="4f" * 16,
+        operator_hint="Free durable storage, then resume the same generation.",
+    )
+    report = _rebuild_run_report(
+        RebuildCheckpoint(
+            generation_id="generation-public",
+            state=RebuildState.VALIDATING,
+            next_sequence=3,
+            documents_built=3,
+            chunks_built=6,
+            vectors_reused=2,
+            vectors_embedded=4,
+            diagnostic_code=RebuildRefusalCode.STORAGE_FAILED,
+            storage_diagnostic=diagnostic,
+        )
+    )
+
+    assert report.lifecycle.phase == "operator_required"
+    assert report.lifecycle.outcome == "operator_required"
+    assert report.lifecycle.can_continue_offline is False
+    assert report.storage_diagnostic is not None
+    assert report.storage_diagnostic.stage == "validation_checkpoint"
+    assert report.storage_diagnostic.cause == "capacity"
+    assert report.storage_diagnostic.operator_hint == diagnostic.operator_hint
+    rendered = str(report.model_dump(mode="json")).lower()
+    assert not any(marker in rendered for marker in PRIVATE_MARKERS)
+
+
+def test_rebuild_status_labels_an_active_takeover_replay() -> None:
+    report = _rebuild_run_report(
+        RebuildCheckpoint(
+            generation_id="generation-public",
+            state=RebuildState.BUILDING,
+            next_sequence=3,
+            documents_built=3,
+            chunks_built=6,
+            vectors_reused=2,
+            vectors_embedded=4,
+            lease_owner="private-owner-token",
+            lease_generation=2,
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            takeover_replay=True,
+        )
+    )
+
+    assert report.lifecycle.phase == "takeover_replay"
+    assert report.lifecycle.outcome == "running"
 
 
 @pytest.mark.parametrize(

@@ -447,6 +447,16 @@ def _rebuild_run_report(checkpoint: RebuildCheckpoint) -> r.RebuildRunReport:
         and checkpoint.lease_expires_at is not None
         and checkpoint.lease_expires_at > datetime.now(UTC)
     )
+    storage = checkpoint.storage_diagnostic
+    operator_required = storage is not None and not storage.retryable and not held and not terminal
+    active_retry = (
+        storage is not None
+        and storage.retryable
+        and storage.next_retry_at is not None
+        and storage.next_retry_at > datetime.now(UTC)
+        and held
+        and not terminal
+    )
     outcome: r.LifecycleOutcome = (
         "failed"
         if failed
@@ -454,12 +464,28 @@ def _rebuild_run_report(checkpoint: RebuildCheckpoint) -> r.RebuildRunReport:
         if canceled
         else "complete"
         if terminal
+        else "operator_required"
+        if operator_required
         else "running"
         if held
         else "incomplete"
     )
     phase: r.LifecyclePhase = (
-        "failed" if failed else "canceled" if canceled else "complete" if terminal else "rebuilding"
+        "failed"
+        if failed
+        else "canceled"
+        if canceled
+        else "complete"
+        if terminal
+        else "operator_required"
+        if operator_required
+        else "retrying"
+        if active_retry
+        else "takeover_replay"
+        if checkpoint.takeover_replay and held
+        else "validation"
+        if checkpoint.state.value == "validating"
+        else "rebuilding"
     )
     pending = 0 if terminal else max(0, checkpoint.expected_items - checkpoint.documents_built)
     return r.RebuildRunReport(
@@ -481,6 +507,29 @@ def _rebuild_run_report(checkpoint: RebuildCheckpoint) -> r.RebuildRunReport:
         diagnostic_code=(
             checkpoint.diagnostic_code.value if checkpoint.diagnostic_code is not None else None
         ),
+        storage_diagnostic=(
+            None
+            if storage is None
+            else r.RebuildStorageDiagnosticReport(
+                schema_version=storage.schema_version,
+                event=storage.event,
+                stage=storage.stage.value,
+                cause=storage.cause.value,
+                retryable=storage.retryable,
+                namespace_usable=storage.namespace_usable,
+                replayed_items=storage.replayed_items,
+                replayed_vectors=storage.replayed_vectors,
+                validated_items=storage.validated_items,
+                validated_vectors=storage.validated_vectors,
+                occurred_at=storage.occurred_at.isoformat(),
+                correlation_id=storage.correlation_id,
+                retry_count=storage.retry_count,
+                next_retry_at=(
+                    storage.next_retry_at.isoformat() if storage.next_retry_at is not None else None
+                ),
+                operator_hint=storage.operator_hint,
+            )
+        ),
         lifecycle=r.LifecycleProgress(
             phase=phase,
             outcome=outcome,
@@ -488,7 +537,7 @@ def _rebuild_run_report(checkpoint: RebuildCheckpoint) -> r.RebuildRunReport:
             reused_items=checkpoint.vectors_reused,
             pending_items=pending,
             derived_generation_identity=checkpoint.generation_id,
-            can_continue_offline=not terminal,
+            can_continue_offline=not terminal and not operator_required,
             estimated_remaining_items=pending,
         ),
     )

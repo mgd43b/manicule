@@ -1490,6 +1490,9 @@ class DerivedGeneration(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     diagnostic_code: Mapped[str | None] = mapped_column(Text)
     diagnostic_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Only the current bounded storage-failure diagnostic is retained.  Raw driver details and
+    # an unbounded event history belong in neither a generation row nor a public status read.
+    storage_diagnostic: Mapped[JsonValue | None] = mapped_column(JSON)
     published_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
