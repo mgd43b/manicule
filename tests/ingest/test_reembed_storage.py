@@ -1185,7 +1185,7 @@ async def test_an_inspection_that_verified_no_checksums_cannot_seal_a_generation
     await shadows.seal(generation, inspection, lease=lease)
 
 
-async def test_inspection_pages_are_stably_keyset_bounded(data_dir: Path) -> None:
+async def test_inspection_pages_are_stably_streamed_and_bounded(data_dir: Path) -> None:
     document = make_document(source_id="large-shadow").model_copy(
         update={"publication_id": "source-publication"}
     )
