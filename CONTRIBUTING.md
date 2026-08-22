@@ -91,7 +91,7 @@ whole namespace before each test, so a switch living inside it is deleted before
 
 ### `.test_durations`, and when it needs regenerating
 
-CI runs the suite in three shards per Python version, balanced on the committed
+CI runs the Python 3.14 suite in three shards, balanced on the committed
 `.test_durations`. **You do not need it to run the tests** — `uv run pytest` ignores it
 entirely, and it is read only when `--splits` is passed.
 
