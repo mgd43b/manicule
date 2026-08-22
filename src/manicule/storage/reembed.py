@@ -113,6 +113,8 @@ class SqliteReembedCorpus:
     def __init__(self, engine: AsyncEngine, workspace_id: str = "default") -> None:
         self._engine = engine
         self.workspace_id = workspace_id
+        self._verified_snapshots: set[CorpusSnapshot] = set()
+        """Complete immutable snapshots this short-lived corpus handle has already verified."""
 
     async def discard_snapshot(self, snapshot_id: str) -> None:
         """Remove an unreferenced planning snapshot and its cascaded rows."""
@@ -136,6 +138,9 @@ class SqliteReembedCorpus:
                     models.ReembedCorpusSnapshot.id == snapshot_id,
                 )
             )
+        self._verified_snapshots = {
+            snapshot for snapshot in self._verified_snapshots if snapshot.id != snapshot_id
+        }
 
     async def begin_snapshot(self) -> CorpusSnapshot:
         snapshot_id = f"snapshot-{uuid.uuid4().hex}"
@@ -212,7 +217,9 @@ class SqliteReembedCorpus:
                 )
             )
             await connection.commit()
-            return CorpusSnapshot(snapshot_id, revision, live, self.workspace_id)
+            snapshot = CorpusSnapshot(snapshot_id, revision, live, self.workspace_id)
+            self._verified_snapshots.add(snapshot)
+            return snapshot  # noqa: TRY300 - rollback belongs to this transaction scope
         except BaseException:
             await connection.rollback()
             raise
@@ -408,6 +415,8 @@ class SqliteReembedCorpus:
         )
 
     async def _require_snapshot(self, snapshot: CorpusSnapshot) -> None:
+        if snapshot in self._verified_snapshots:
+            return
         async with self._engine.connect() as connection:
             row = (
                 (
@@ -429,6 +438,11 @@ class SqliteReembedCorpus:
             or _LIVE.validate_json(row.live_json) != snapshot.live
         ):
             raise ReembedError("the durable complete-corpus snapshot is missing or mismatched")
+        # Snapshot rows are materialized in one transaction and are never mutated afterward.
+        # Publication independently rechecks the durable header against the run commitment, so
+        # this per-handle cache removes repeated header round trips without weakening either
+        # the payload scan in `_validate` or the publication fence.
+        self._verified_snapshots.add(snapshot)
 
 
 class SqliteReembedStore:

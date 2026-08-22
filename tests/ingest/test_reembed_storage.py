@@ -18,6 +18,7 @@ from manicule.core.content import Chunk
 from manicule.core.embedding import IndexFingerprints, Vector
 from manicule.core.errors import StorageBusyError
 from manicule.ingest.reembed import (
+    ChunkKey,
     CorpusSnapshot,
     PublishOutcome,
     ReembedError,
@@ -973,6 +974,39 @@ async def test_ordinary_corpus_mutation_invalidates_then_snapshot_bootstraps_inv
             )
         ).scalar_one()
     assert bootstrapped == rebuilt.live.inventory_digest
+
+
+async def test_complete_snapshot_header_is_read_once_across_bounded_pages(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    clock = Clock()
+    _, _, run, _, _, source, _, _ = await seeded_run(
+        engine, store, data_dir, clock, run_id="snapshot-header-cache"
+    )
+    corpus = SqliteReembedCorpus(engine)
+    header_reads = 0
+
+    def count_snapshot_headers(*args: object) -> None:
+        nonlocal header_reads
+        statement = args[2]
+        if isinstance(statement, str) and "FROM reembed_corpus_snapshots" in statement:
+            header_reads += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_snapshot_headers)
+    try:
+        await corpus.documents(run.commitment.snapshot, after=None, limit=1)
+        await corpus.document(run.commitment.snapshot, source.chunk.document_id)
+        await corpus.chunks(run.commitment.snapshot, source.chunk.document_id, after=None, limit=1)
+        await corpus.chunks(
+            run.commitment.snapshot,
+            source.chunk.document_id,
+            after=ChunkKey(source.chunk.position, source.chunk.id),
+            limit=1,
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_snapshot_headers)
+
+    assert header_reads == 1
 
 
 async def test_missing_published_generation_is_fatal_and_is_not_recreated(
