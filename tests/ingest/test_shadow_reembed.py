@@ -892,6 +892,23 @@ async def test_shadow_reembed_refuses_actual_text_beyond_the_stored_chunk_policy
     assert authority.live.generation_id == "live-old"
 
 
+async def test_packed_shadow_reembed_keeps_the_conservative_stored_context_guard() -> None:
+    authority = Authority()
+    document = make_document()
+    chunk = make_chunks(document, count=1)[0].model_copy(
+        update={"embed_text": "x", "token_count": 1_025}
+    )
+    corpus = Corpus(authority, [(document, (chunk,))])
+    embedder = ExactCountingEmbedder(dimension=4)
+    run = await prepare_run(authority, corpus, embedder, "stored-context-refusal")
+
+    with pytest.raises(ContextOverflowError, match="exceed the 1024-token limit"):
+        await execute(run, authority, corpus, embedder)
+
+    assert embedder.calls == []
+    assert authority.upsert_attempts == 0
+
+
 @pytest.mark.parametrize(
     ("corruption", "message"),
     [

@@ -778,6 +778,11 @@ async def _build(  # noqa: PLR0912, PLR0915 - bounded resume state machine
                 for _, stored_chunks, fingerprint in packed:
                     document_chunks = [stored.chunk for stored in stored_chunks]
                     if isinstance(embedder, SupportsTokenCount):
+                        # Preserve the conservative stored-count guard before replacing it
+                        # with the embedder's exact measurement.  A stale-low stored count is
+                        # caught by the exact check below; a stale-high count must still refuse
+                        # rather than becoming an unnoticed context-policy relaxation.
+                        require_within_context(document_chunks, embedder.fingerprint)
                         document_chunks = [
                             chunk.model_copy(
                                 update={"token_count": embedder.count_tokens(chunk.embed_text)}
