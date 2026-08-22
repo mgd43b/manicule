@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
+import httpx
 import pytest
 
 from manicule.connectors import (
@@ -21,11 +22,13 @@ from manicule.connectors import (
     RateLimitedError,
     UntrustedLinkError,
 )
+from manicule.connectors.client import ConfluenceClient
 from manicule.connectors.confluence import (
     ANCESTOR_IDS,
     ANCESTORS,
     STORAGE_MEDIA_TYPE,
     VERSION_TOKEN,
+    ConfluenceConnector,
 )
 from manicule.core.content import DocumentStatus
 from manicule.core.sources import DocRef
@@ -418,6 +421,148 @@ async def test_an_attachment_is_downloaded_and_keeps_its_page() -> None:
     assert raw.as_bytes() == b"%PDF-1.4 diagram"
     assert raw.metadata["parent_page_id"] == "1"
     assert raw.metadata[ANCESTORS] == ["ENG", "Token Refresh"]
+
+
+@pytest.mark.parametrize(
+    ("declared", "downloaded", "name", "expected"),
+    [
+        (
+            "application/octet-stream",
+            "application/octet-stream",
+            "REPORT.PDF",
+            "application/pdf",
+        ),
+        (
+            "Application/Octet-Stream; charset=binary",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "report.pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        ("application/msword", "application/pdf", "report.pdf", "application/msword"),
+        (
+            "application/octet-stream",
+            "application/octet-stream",
+            "opaque.unknown",
+            "application/octet-stream",
+        ),
+    ],
+    ids=[
+        "pdf-from-name",
+        "download-beats-name",
+        "specific-declaration-wins",
+        "unknown-binary",
+    ],
+)
+async def test_a_generic_attachment_declaration_does_not_block_media_type_routing(
+    declared: str, downloaded: str, name: str, expected: str
+) -> None:
+    """Only a specific source type outranks a specific download response or a filename inference."""
+    instance = FakeConfluence(
+        pages=[FakePage(id="1", title="Page", space="ENG")],
+        attachments=[
+            FakeAttachment(
+                id="att-9",
+                title=name,
+                space="ENG",
+                page_id="1",
+                page_title="Page",
+                media_type=declared,
+                download_media_type=downloaded,
+            )
+        ],
+    )
+
+    raw = await _fetched(instance, "att-9")
+
+    assert raw.media_type == expected
+
+
+async def test_paginated_ancestor_recovery_keeps_source_order() -> None:
+    """A direct re-fetch receives every v2 ancestor page, not only Confluence's first 25 rows."""
+    config = cloud_config(base_url="https://docs.example.test/wiki")
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("cursor") == "next":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [{"id": "2", "title": "Parent"}],
+                    "_links": {"base": config.base_url},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "results": [{"id": "1", "title": "Root"}],
+                "_links": {
+                    "base": config.base_url,
+                    "next": "/api/v2/pages/42/ancestors?cursor=next",
+                },
+            },
+        )
+
+    connector = ConfluenceConnector(
+        config, ConfluenceClient(config, transport=httpx.MockTransport(answer))
+    )
+    await connector.setup()
+    try:
+        titles, identifiers, complete = await connector._ancestors_of("42")  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await connector.teardown()
+
+    assert titles == ("Root", "Parent")
+    assert identifiers == ("1", "2")
+    assert complete
+
+
+@pytest.mark.parametrize(
+    "failure", ["repeated", "untrusted", "second-page"], ids=lambda value: value
+)
+async def test_partial_cloud_ancestor_recovery_never_claims_completeness(failure: str) -> None:
+    """A bad continuation preserves the valid prefix but marks its breadcrumb incomplete."""
+    config = cloud_config(base_url="https://docs.example.test/wiki", max_retries=0)
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("cursor") == "next":
+            if failure == "second-page":
+                return httpx.Response(503, json={})
+            return httpx.Response(
+                200,
+                json={
+                    "results": [{"id": "2", "title": "Parent"}],
+                    "_links": {
+                        "base": config.base_url,
+                        "next": "/api/v2/pages/42/ancestors?cursor=next",
+                    },
+                },
+            )
+        next_link = (
+            "https://untrusted.example/api/v2/pages/42/ancestors?cursor=next"
+            if failure == "untrusted"
+            else "/api/v2/pages/42/ancestors?cursor=next"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [{"id": "1", "title": "Root"}],
+                "_links": {"base": config.base_url, "next": next_link},
+            },
+        )
+
+    connector = ConfluenceConnector(
+        config, ConfluenceClient(config, transport=httpx.MockTransport(answer))
+    )
+    await connector.setup()
+    try:
+        titles, identifiers, complete = await connector._ancestors_of("42")  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await connector.teardown()
+
+    assert (titles, identifiers, complete) == (
+        ("Root", "Parent") if failure == "repeated" else ("Root",),
+        ("1", "2") if failure == "repeated" else ("1",),
+        False,
+    )
 
 
 async def test_an_attachment_over_the_ceiling_is_refused_by_name() -> None:

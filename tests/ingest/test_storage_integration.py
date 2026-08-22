@@ -81,7 +81,13 @@ from manicule.storage.models import FTS_TOKENIZER
 from manicule.storage.rebuild import SqliteRebuildStore
 from manicule.storage.vectors import LanceVectorStore
 from tests.app.fakes import FakeBackend, FakeIngestion
-from tests.connectors.fake_confluence import FakeConfluence, FakePage, SlowOffset
+from tests.connectors.fake_confluence import (
+    FakeConfluence,
+    FakePage,
+    SlowOffset,
+    paragraph,
+    with_include,
+)
 from tests.connectors.support import Clock as ConfluenceClock
 from tests.connectors.support import client_for, cloud_config, connected, server_config
 from tests.fakes import HashEmbedder
@@ -5045,6 +5051,83 @@ async def test_direct_native_pages_restart_from_an_exact_durable_prefix(  # noqa
         request for request in instance.requests if "/rest/api/content/" in request.url.path
     ]
     assert len(body_requests) == 3, "the exact four-record durable prefix was fetched twice"
+
+
+async def test_durable_journal_refetches_a_stored_macro_parent_outside_incremental_overlap(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """A durable source record keeps a forced parent fetch without changing its version token.
+
+    The journal path is where an ordinary incremental result and a reconstructed parent identity
+    could otherwise race as conflicting source evidence. This makes the child the only page CQL
+    returns on the second run, then verifies the real durable store admits and re-fetches the
+    parent from its saved identity, replaces its indexed content, and preserves the parent's
+    source revision for future ordinary skips.
+    """
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="250001",
+                title="Overview",
+                space="ENG",
+                when="2026-08-01T14:30:00.000+01:00",
+                adf=with_include("See the detail.", title="Detail"),
+            ),
+            FakePage(
+                id="250002",
+                title="Detail",
+                space="ENG",
+                adf=paragraph("before durable refresh"),
+            ),
+        ]
+    )
+    connector = await connected(
+        instance,
+        cloud_config(base_url=instance.base_url, watermark_overlap_minutes=0),
+    )
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+    try:
+        first = await pipeline.run(connector)
+        parent = await store.find_document(connector.name, "250001")
+        assert parent is not None
+
+        instance.pages["250002"] = FakePage(
+            id="250002",
+            title="Detail",
+            space="ENG",
+            version=2,
+            when="2026-08-20T14:30:00.000+01:00",
+            adf=paragraph("after durable refresh"),
+        )
+        instance.body_calls.clear()
+        second = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    refreshed = await store.find_document(connector.name, "250001")
+    assert first.snapshot_completeness == "complete"
+    assert second.snapshot_completeness == "complete"
+    assert refreshed is not None
+    assert refreshed.version_token == parent.version_token
+    assert instance.body_calls["250001"] == 1
+    text = "\n".join(chunk.text for chunk in await store.document_chunks(refreshed.id))
+    assert "after durable refresh" in text
+    assert "before durable refresh" not in text
 
 
 @pytest.mark.parametrize(

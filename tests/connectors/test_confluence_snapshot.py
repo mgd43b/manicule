@@ -35,7 +35,7 @@ from manicule.connectors.confluence_snapshot import (
     UNRECOVERABLE_MACRO_BODY,
     ConfluenceSnapshotConnector,
 )
-from manicule.connectors.errors import NotFoundError
+from manicule.connectors.errors import ConnectorError, NotFoundError
 from manicule.core.lifecycle import SupportsTeardown
 from manicule.core.protocols import Connector, read_blocks
 from manicule.core.provenance import Provenance
@@ -185,6 +185,25 @@ async def test_moving_a_page_between_directories_does_not_change_its_identity(
     assert record.snapshot.path.startswith("by-tree/"), (
         "the snapshot location did follow the move, which is the half that is supposed to change"
     )
+
+
+@pytest.mark.parametrize("method", ["discover", "reconcile"])
+async def test_duplicate_snapshot_page_ids_are_refused_before_either_walk_emits_a_page(
+    tmp_path: Path, method: str
+) -> None:
+    """Both walks must reject the same ambiguous identity before storage can see either body."""
+    snapshot(tmp_path, at="ENG/first")
+    snapshot(tmp_path, at="OPS/second")
+    connector = ConfluenceSnapshotConnector(tmp_path)
+
+    stream = connector.discover(None) if method == "discover" else connector.reconcile()
+    with pytest.raises(ConnectorError) as raised:
+        _ = [item async for item in stream]
+
+    message = str(raised.value)
+    assert "123456" in message
+    assert "ENG/first" in message
+    assert "OPS/second" in message
 
 
 async def test_a_page_whose_id_cannot_be_read_is_still_ingested_under_a_marked_identity(

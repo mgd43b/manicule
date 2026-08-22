@@ -69,7 +69,7 @@ from typing import TYPE_CHECKING, Final, cast
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from manicule.connectors.confluence import SPACE_KEY, STORAGE_MEDIA_TYPE
-from manicule.connectors.errors import NotFoundError
+from manicule.connectors.errors import ConnectorError, NotFoundError
 from manicule.connectors.macros import storage_macros
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.ids import content_hash
@@ -344,7 +344,7 @@ class ConfluenceSnapshotConnector:
         """
         del watermark  # the token does the skipping, not the clock
         started = datetime.now(UTC)
-        for snapshot in self._walk():
+        for snapshot in self._validated_walk():
             yield self._discovered(snapshot)
         # Only after the walk has run to the end. A watermark stored for a partial enumeration is
         # how documents go missing permanently.
@@ -407,7 +407,7 @@ class ConfluenceSnapshotConnector:
         and not the other would be reported deleted on every sync, or indexed and never
         reconciled.
         """
-        for snapshot in self._walk():
+        for snapshot in self._validated_walk():
             yield snapshot.identity(root=self._root)
 
     # --- walking ----------------------------------------------------------------------------
@@ -420,6 +420,30 @@ class ConfluenceSnapshotConnector:
         twice.
         """
         yield from self._walk_directory(self._root)
+
+    def _validated_walk(self) -> Iterator[_Snapshot]:
+        """The complete walk after refusing an ambiguous Confluence page identity.
+
+        A streaming walk cannot withdraw the first page after a later directory claims the same
+        page id: the pipeline may already have indexed it.  The descriptors are small and bounded
+        by the snapshot corpus; bodies remain unread until fetch, so materializing this walk does
+        not turn discovery into loading the corpus.
+        """
+        snapshots = list(self._walk())
+        claims: dict[SourceId, list[_Snapshot]] = {}
+        for snapshot in snapshots:
+            claims.setdefault(snapshot.identity(root=self._root), []).append(snapshot)
+        for identity, owners in claims.items():
+            if len(owners) == 1:
+                continue
+            paths = ", ".join(str(owner.directory.relative_to(self._root)) for owner in owners)
+            msg = (
+                f"snapshot page identity {identity!r} is claimed by multiple directories: "
+                f"{paths}. A Confluence page id must name exactly one snapshot, because two "
+                "bodies under it would overwrite one indexed document."
+            )
+            raise ConnectorError(msg)
+        yield from snapshots
 
     def _walk_directory(self, directory: Path) -> Iterator[_Snapshot]:
         snapshot = self._read(directory)

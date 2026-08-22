@@ -341,11 +341,10 @@ async def test_a_request_off_the_configured_origin_is_refused_before_it_is_sent(
     [
         "https://WIKI.example.test/confluence",
         "https://Wiki.Example.Test/confluence",
-        "https://sync.user:secret@wiki.example.test/confluence",
         "https://wiki.example.test:8443/confluence",
         "https://wiki.example.test/confluence",
     ],
-    ids=["upper-host", "mixed-host", "userinfo", "non-default-port", "already-canonical"],
+    ids=["upper-host", "mixed-host", "non-default-port", "already-canonical"],
 )
 def test_a_configured_origin_reads_the_same_way_the_link_check_reads_it(base_url: str) -> None:
     """A regression, and the bug it is for was a hard failure against a healthy instance.

@@ -105,7 +105,7 @@ from manicule.core.errors import (
 from manicule.core.ids import content_hash, document_id
 from manicule.core.protocols import BatchedDiscoveryConnector, EnumerationProgressConnector
 from manicule.core.provenance import Provenance
-from manicule.core.sources import DiscoveredDoc, EnumerationProgress
+from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, SourceId
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError
 from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
@@ -113,6 +113,7 @@ from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.ports import (
     AcquisitionStore,
     BatchedAcquisitionStore,
+    DependencyStore,
     EnumerationProgressStore,
     FencedIngestStore,
     GlossaryWriter,
@@ -153,6 +154,15 @@ not block and must not raise. The one implementation appends a string to a list;
 turns that into a frame on its own tick, which is what keeps a slow reader from becoming
 backpressure on the pipeline.
 """
+
+_MAX_SOURCE_DEPENDENCY_TRAVERSAL = 1_000
+"""Hard bound for one changed include's reverse-parent traversal."""
+
+
+def _source_id_set() -> set[SourceId]:
+    """Construct a typed empty dependency set for one sync run."""
+    return set()
+
 
 type _PublicationFence = Callable[[], Awaitable[AcquisitionFence]]
 type FullInventoryAuthority = Literal["", "search", "direct_current_content"]
@@ -913,6 +923,20 @@ class _Sync:
 
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     """Set on cancellation so discovery or journal reading stops admitting new work."""
+
+    dependency_requeued: set[SourceId] = field(default_factory=_source_id_set)
+    """Parent identities already forced by this run's dependency walks.
+
+    A page can include itself indirectly, and the same changed include can arrive in several
+    discovery pages. Keeping this per run avoids duplicate forced fetches while each individual
+    walk retains its own cycle detection and hard bound.
+    """
+
+    dependency_changed_sources: set[SourceId] = field(default_factory=_source_id_set)
+    """Every ordinary source identity admitted to a durable discovery snapshot."""
+
+    dependency_discovered_sources: set[SourceId] = field(default_factory=_source_id_set)
+    """Ordinary durable records, used to force their fresher source evidence in place."""
 
 
 class IngestPipeline:
@@ -1776,6 +1800,116 @@ class IngestPipeline:
             for worker in range(self._ingest_workers):
                 stages.create_task(self._ingest_from(run, bodies), name=f"ingest-{worker}")
 
+    async def _dependency_refetches(
+        self, run: _Sync, source_ids: Sequence[SourceId]
+    ) -> tuple[DiscoveredDoc, ...]:
+        """Return live parents that must re-expand changed included content.
+
+        Include macros make a document's rendered bytes depend on page ids other than its own.
+        The source's incremental query reports the changed child, not every page that embedded
+        it, so token equality is deliberately bypassed for those parents. The traversal follows
+        persisted reverse edges until it reaches a fixed point: nested includes require it, and
+        a cycle must be harmless. ``1,000`` is a safety boundary rather than a best-effort
+        truncation; silently dropping a parent would leave stale indexed text behind.
+        """
+        if not isinstance(self._store, DependencyStore):
+            return ()
+        frontier = tuple(sorted(set(source_ids)))
+        if not frontier:
+            return ()
+        visited = set(frontier)
+        forced: list[DiscoveredDoc] = []
+        while frontier:
+            parents = await self._store.dependent_documents(run.connector.name, frontier)
+            next_frontier: list[SourceId] = []
+            for parent in parents:
+                parent_id = parent.source_id
+                if parent_id in visited:
+                    continue
+                visited.add(parent_id)
+                if len(visited) > _MAX_SOURCE_DEPENDENCY_TRAVERSAL:
+                    msg = "source dependency traversal exceeded its 1,000-document safety bound"
+                    raise RuntimeError(msg)
+                next_frontier.append(parent_id)
+                if parent_id in run.dependency_requeued:
+                    continue
+                run.dependency_requeued.add(parent_id)
+                forced.append(
+                    DiscoveredDoc(
+                        ref=DocRef(
+                            source_id=parent_id,
+                            uri=parent.uri,
+                            metadata=parent.metadata,
+                        ),
+                        version_token=parent.version_token,
+                        title=parent.title,
+                        media_type=parent.media_type,
+                        force_fetch=True,
+                    )
+                )
+            frontier = tuple(next_frontier)
+        return tuple(forced)
+
+    async def _deleted_dependency_refetches(self, run: _Sync) -> tuple[DiscoveredDoc, ...]:
+        """Schedule parents of targets reconciliation has already soft-deleted.
+
+        Edges belong to the parent and are replaced only when that parent publishes again. A
+        reconciliation therefore leaves the edge in place long enough for the next sync to
+        remove stale expanded text, while a failed parent re-fetch leaves it available to retry.
+        """
+        if not isinstance(self._store, DependencyStore):
+            return ()
+        targets = await self._store.deleted_dependency_targets(
+            run.connector.name, limit=_MAX_SOURCE_DEPENDENCY_TRAVERSAL + 1
+        )
+        if len(targets) > _MAX_SOURCE_DEPENDENCY_TRAVERSAL:
+            msg = "more than 1,000 deleted include targets await dependency invalidation"
+            raise RuntimeError(msg)
+        return await self._dependency_refetches(run, targets)
+
+    async def _append_durable_dependency_refetches(
+        self, run: _Sync, acquisitions: AcquisitionStore
+    ) -> None:
+        """Append or force the parents known only after durable discovery has completed.
+
+        A parent within the current source response keeps that fresh discovery record and is
+        marked in place. A parent outside the incremental overlap is appended from its stored
+        fetchable identity. Deferring this work until enumeration reaches its end avoids a
+        conflict between those two forms of the same identity and keeps the journal's source
+        evidence authoritative.
+        """
+        targets = set(run.dependency_changed_sources)
+        if isinstance(self._store, DependencyStore):
+            deleted = await self._store.deleted_dependency_targets(
+                run.connector.name, limit=_MAX_SOURCE_DEPENDENCY_TRAVERSAL + 1
+            )
+            if len(deleted) > _MAX_SOURCE_DEPENDENCY_TRAVERSAL:
+                msg = "more than 1,000 deleted include targets await dependency invalidation"
+                raise RuntimeError(msg)
+            targets.update(deleted)
+        for dependent in await self._dependency_refetches(run, tuple(targets)):
+            now = self._acquisition_clock()
+            await self._keep_acquisition_lease_live(run, acquisitions, now)
+            if dependent.source_id in run.dependency_discovered_sources:
+                await acquisitions.mark_acquisition_force_fetch(
+                    run.acquisition_run_id,
+                    dependent.source_id,
+                    lease_owner=run.lease_owner,
+                    lease_generation=run.lease_generation,
+                    now=now,
+                )
+                continue
+            record = await acquisitions.append_acquisition_record(
+                run.acquisition_run_id,
+                run.accepted,
+                AcquisitionSource.from_discovered(dependent),
+                lease_owner=run.lease_owner,
+                lease_generation=run.lease_generation,
+                now=now,
+            )
+            if record.sequence == run.accepted:
+                run.accepted += 1
+
     async def _heartbeat_acquisition_until_done(self, run: _Sync, work: asyncio.Task[None]) -> None:
         """Renew independently of document mutations and stop all work if ownership is lost."""
         acquisitions = run.acquisitions
@@ -1805,6 +1939,9 @@ class IngestPipeline:
             return
         stream = run.connector.discover(run.watermark)
         try:
+            for dependent in await self._deleted_dependency_refetches(run):
+                await refs.put(dependent)
+                run.accepted += 1
             async for discovered in stream:
                 if run.stop.is_set():
                     break
@@ -1812,6 +1949,9 @@ class IngestPipeline:
                 # somewhere a worker will find it. The wait inside `put` is the backpressure.
                 await refs.put(discovered)
                 run.accepted += 1
+                for dependent in await self._dependency_refetches(run, (discovered.source_id,)):
+                    await refs.put(dependent)
+                    run.accepted += 1
                 if run.limit is not None and run.accepted >= run.limit:
                     run.report.limited = True
                     break
@@ -1975,6 +2115,12 @@ class IngestPipeline:
                     continue
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now)
+                run.dependency_changed_sources.update(
+                    discovered.source_id for discovered in discovered_batch
+                )
+                run.dependency_discovered_sources.update(
+                    discovered.source_id for discovered in discovered_batch
+                )
                 sources = tuple(
                     AcquisitionSource.from_discovered(found) for found in discovered_batch
                 )
@@ -2020,6 +2166,7 @@ class IngestPipeline:
             if not run.stop.is_set() and not run.report.limited:
                 now = self._acquisition_clock()
                 await self._keep_acquisition_lease_live(run, acquisitions, now)
+                await self._append_durable_dependency_refetches(run, acquisitions)
                 # The source iterator is exhausted, so the connector's progress now carries
                 # its completion claim — for the authoritative direct walk, that every stream
                 # ended at a validated explicit empty page.
@@ -2387,6 +2534,7 @@ class IngestPipeline:
             media_type=source.media_type,
             size_bytes=source.size_bytes,
             metadata=source.metadata,
+            force_fetch=source.force_fetch,
         )
 
     async def _retain_acquisition(
@@ -2559,6 +2707,7 @@ class IngestPipeline:
                             media_type=raw.media_type,
                             size_bytes=len(raw.as_bytes()),
                             metadata=record.source.metadata,
+                            force_fetch=record.source.force_fetch,
                         ),
                         existing=existing,
                         acquisition_record=record,
@@ -2650,6 +2799,7 @@ class IngestPipeline:
                         media_type=source.media_type,
                         size_bytes=source.size_bytes,
                         metadata=source.metadata,
+                        force_fetch=source.force_fetch,
                     )
                     if run.acquisitions is None:  # pragma: no cover - journal records imply it
                         return
@@ -3598,6 +3748,7 @@ class IngestPipeline:
                 glossary_entries=entries,
                 glossary_fp=glossary_fp,
                 original_omitted_reason=retention.omitted_reason,
+                source_dependencies=_source_dependencies(settled),
                 expected_reset_epoch=self._expected_reset_epoch,
             )
         else:
@@ -3611,6 +3762,7 @@ class IngestPipeline:
                 glossary_entries=entries,
                 glossary_fp=glossary_fp,
                 original_omitted_reason=retention.omitted_reason,
+                source_dependencies=_source_dependencies(settled),
                 expected_reset_epoch=self._expected_reset_epoch,
             )
         if not committed.committed or committed.stored is None:
@@ -3683,6 +3835,7 @@ class IngestPipeline:
                     glossary_entries=entries,
                     glossary_fp=glossary_fp,
                     original_omitted_reason=retention.omitted_reason,
+                    source_dependencies=_source_dependencies(indexed_document),
                     expected_reset_epoch=self._expected_reset_epoch,
                 )
             else:
@@ -3696,6 +3849,7 @@ class IngestPipeline:
                     glossary_entries=entries,
                     glossary_fp=glossary_fp,
                     original_omitted_reason=retention.omitted_reason,
+                    source_dependencies=_source_dependencies(indexed_document),
                     expected_reset_epoch=self._expected_reset_epoch,
                 )
         except (AcquisitionLeaseLostError, DerivedResetFenceLostError):
@@ -3835,7 +3989,8 @@ class IngestPipeline:
         already carries the declared media type, so this costs no fetch to answer.
         """
         return (
-            existing is not None
+            not discovered.force_fetch
+            and existing is not None
             and existing.status in SETTLED
             and discovered.version_token is not None
             and existing.version_token == discovered.version_token
@@ -4393,6 +4548,20 @@ def _writer_of(store: object) -> GlossaryWriter | None:
     workspace, so taking the writer from it makes the two agree by construction.
     """
     return store if isinstance(store, GlossaryWriter) else None
+
+
+def _source_dependencies(document: Document) -> tuple[SourceId, ...] | None:
+    """Read the connector-declared include identities without inventing dependencies.
+
+    ``included_pages`` is render provenance emitted by the Confluence macro resolver. Its
+    absence means this publication did not make an edge claim and leaves existing edge state
+    alone; an empty list is the explicit claim that removes every old edge. Only strings are
+    source identities, and preserving first-seen order makes writes deterministic.
+    """
+    raw = document.metadata.get("included_pages")
+    if not isinstance(raw, list):
+        return None
+    return tuple(dict.fromkeys(item for item in raw if isinstance(item, str) and item))
 
 
 def _raise_lost_acquisition_lease(run_id: str) -> None:

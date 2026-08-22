@@ -231,12 +231,12 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **40 relational tables**. The 28 that predate durable
-re-embedding are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
+The authoritative SQLAlchemy model has **41 relational tables**. The 29 outside the durable
+re-embedding snapshot set are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
 `acquisition_markers`, `chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
 `conversations`, `document_tags`, `document_versions`, `documents`, `glossary_aliases`,
 `glossary_entries`, `index_state`, `messages`, `plugins`, `query_logs`, `reconciliation_candidates`,
-`reconciliation_inventory_items`, `reconciliation_runs`, `tags`,
+`reconciliation_inventory_items`, `reconciliation_runs`, `source_dependencies`, `tags`,
 `vector_tombstones`, `workspace_members` and `workspaces`. Seven more make a re-embedding run
 durable without changing live reads until publication: `corpus_revision`,
 `reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
@@ -249,12 +249,12 @@ Two content-addressed acquisition ledgers keep exact global backlog admission co
 `acquisition_blob_backlog` stores unfinished-record refcounts by hash, and
 `acquisition_backlog_capacity` stores their deduplicated byte total.
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 40.
+included in the 41.
 
 ### 4.1 The pre-#187 additions
 
-These twelve supporting tables predate durable re-embedding. Each has a job the earlier proposal
-could not do.
+These thirteen supporting tables sit outside durable re-embedding. Each has a job the earlier
+proposal could not do.
 
 | Table | Why it must exist |
 |---|---|
@@ -268,6 +268,7 @@ could not do.
 | `reconciliation_runs` | Durable full-inventory lifecycle and scope binding for explicit deletion reconciliation, separate from ordinary incremental acquisition. |
 | `reconciliation_inventory_items` | Bounded, deduplicated source identities for one completed reconciliation inventory. |
 | `reconciliation_candidates` | Revision-fenced deletion proposals whose later confirmation cannot act on a document observed since proposal. |
+| `source_dependencies` | Reverse include edges keyed by workspace, connector, parent document and target source id. The target intentionally has no document foreign key, so an edge survives its target's soft deletion until the parent successfully republishes without it. The target index makes direct and transitive parent invalidation bounded and deterministic. |
 | `glossary_entries` | Definitions detected in document chunks, with their display form, expansion, location and confidence. The document/chunk foreign keys keep citations authoritative. |
 | `glossary_aliases` | Normalized alternate lookup keys for glossary entries. A composite key prevents duplicate aliases and cascading deletion keeps them tied to their definition. |
 
@@ -731,6 +732,10 @@ models — and helpfully emits `op.drop_table` for all of them. Exclude anything
 **`alembic check` runs in CI** to catch a model edited without a migration. The repo has no
 CI yet — [#1](https://github.com/mgd43b/manicule/issues/1) is building it — so this is filed
 rather than wired up.
+
+`source_dependencies` is an additive migration with a `WITHOUT ROWID` composite key and an
+indexed `(workspace_id, source, target_source_id)` reverse lookup. Its downgrade drops the index
+and table; the normal head → downgrade → head equivalence test covers the lifecycle.
 
 ---
 

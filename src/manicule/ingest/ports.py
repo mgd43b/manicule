@@ -127,6 +127,7 @@ class IngestStore(Protocol):
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        source_dependencies: Sequence[SourceId] | None = None,
         expected_reset_epoch: int | None = None,
     ) -> Commit:
         """Atomically publish one document and all relational derived state."""
@@ -352,6 +353,19 @@ class IngestStore(Protocol):
 
 
 @runtime_checkable
+class DependencyStore(Protocol):
+    """Persisted source-content dependencies used to schedule forced parent re-fetches."""
+
+    async def dependent_documents(
+        self, source: str, source_ids: Collection[SourceId]
+    ) -> Sequence[Document]: ...
+
+    async def deleted_dependency_targets(
+        self, source: str, *, limit: int
+    ) -> Sequence[SourceId]: ...
+
+
+@runtime_checkable
 class AcquisitionStore(Protocol):
     """The durable source boundary, separate from the legacy publication store."""
 
@@ -394,6 +408,16 @@ class AcquisitionStore(Protocol):
         run_id: str,
         sequence: int,
         source: AcquisitionSource,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        now: datetime,
+    ) -> AcquisitionRecord: ...
+
+    async def mark_acquisition_force_fetch(
+        self,
+        run_id: str,
+        source_id: SourceId,
         *,
         lease_owner: str,
         lease_generation: int,
@@ -685,6 +709,7 @@ class FencedIngestStore(Protocol):
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        source_dependencies: Sequence[SourceId] | None = None,
         expected_reset_epoch: int | None = None,
     ) -> Commit: ...
 

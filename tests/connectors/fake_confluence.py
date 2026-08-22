@@ -197,6 +197,8 @@ class FakeAttachment:
     page_title: str
     content: bytes = b"%PDF-1.4 fake"
     media_type: str = "application/pdf"
+    download_media_type: str | None = None
+    """The download response's type when it differs from Confluence's list declaration."""
     version: int = 1
     when: str = "2026-08-09T14:31:00.000+01:00"
 
@@ -673,6 +675,8 @@ class FakeConfluence:
     def _v2_page(self, path: str) -> httpx.Response:
         rest = path.removeprefix("/api/v2/pages/")
         page_id, _, tail = rest.partition("/")
+        if page_id in self.forbidden_pages:
+            return httpx.Response(403, json={"message": "no access"})
         page = self.pages.get(page_id)
         if page is None:
             return httpx.Response(404, json={"message": "no such page"})
@@ -758,7 +762,9 @@ class FakeConfluence:
         for item in self.attachments.values():
             if item.title == name:
                 return httpx.Response(
-                    200, content=item.content, headers={"content-type": item.media_type}
+                    200,
+                    content=item.content,
+                    headers={"content-type": item.download_media_type or item.media_type},
                 )
         return httpx.Response(404, json={"message": "no such attachment"})
 

@@ -452,6 +452,7 @@ async def test_every_chunkless_conclusion_loses_its_cas_without_erasing_the_winn
             glossary_entries: Sequence[GlossaryEntry] | None,
             glossary_fp: str | None,
             original_omitted_reason: str | None,
+            source_dependencies: Sequence[str] | None = None,
             expected_reset_epoch: int | None = None,
         ) -> Commit:
             if self.armed:
@@ -470,6 +471,7 @@ async def test_every_chunkless_conclusion_loses_its_cas_without_erasing_the_winn
                 glossary_entries=glossary_entries,
                 glossary_fp=glossary_fp,
                 original_omitted_reason=original_omitted_reason,
+                source_dependencies=source_dependencies,
                 expected_reset_epoch=expected_reset_epoch,
             )
 

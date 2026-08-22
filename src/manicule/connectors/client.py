@@ -43,6 +43,7 @@ from manicule.connectors.errors import (
     ConnectorError,
     CursorExpiredError,
     NotFoundError,
+    PermissionDeniedError,
     RateLimitedError,
     RemoteError,
     RequestTimeoutError,
@@ -590,7 +591,9 @@ class ConfluenceClient:
         if status == HTTPStatus.NOT_FOUND:
             msg = f"{url} does not exist, or this account cannot see it"
             raise NotFoundError(msg)
-        if status in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}:
+        if status == HTTPStatus.FORBIDDEN:
+            raise PermissionDeniedError(self._credential_message(status, url, headers))
+        if status == HTTPStatus.UNAUTHORIZED:
             raise ConnectorError(self._credential_message(status, url, headers))
         msg = f"{url} answered {status}"
         raise RemoteError(msg, status_code=status)

@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import bindparam, delete, func, select, update
+from sqlalchemy import and_, bindparam, delete, func, select, update
 from sqlalchemy import text as sql
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -167,6 +167,72 @@ class SqliteDocStore(
                 )
             ).scalar_one_or_none()
             return None if row is None else to_document(row)
+
+    async def dependent_documents(
+        self, source: str, source_ids: Collection[SourceId]
+    ) -> Sequence[Document]:
+        """Live parent documents whose rendered content includes one of ``source_ids``."""
+        targets = tuple(sorted(set(source_ids)))
+        if not targets:
+            return ()
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.Document)
+                    .distinct()
+                    .join(
+                        models.SourceDependency,
+                        models.SourceDependency.parent_document_id == models.Document.id,
+                    )
+                    .where(
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.source == source,
+                        models.Document.deleted_at.is_(None),
+                        models.SourceDependency.workspace_id == self._workspace_id,
+                        models.SourceDependency.source == source,
+                        models.SourceDependency.target_source_id.in_(targets),
+                    )
+                    .order_by(models.Document.source_id, models.Document.id)
+                )
+            ).scalars()
+            return tuple(to_document(row) for row in rows)
+
+    async def deleted_dependency_targets(self, source: str, *, limit: int) -> Sequence[SourceId]:
+        """Dependency targets removed by reconciliation but still named by a live parent."""
+        if limit < 1:
+            return ()
+        target = models.Document.__table__.alias("dependency_target")
+        parent = models.Document.__table__.alias("dependency_parent")
+        async with self._sessions() as session:
+            rows = await session.execute(
+                select(models.SourceDependency.target_source_id)
+                .select_from(models.SourceDependency)
+                .join(
+                    parent,
+                    and_(
+                        parent.c.workspace_id == models.SourceDependency.workspace_id,
+                        parent.c.id == models.SourceDependency.parent_document_id,
+                        parent.c.deleted_at.is_(None),
+                    ),
+                )
+                .join(
+                    target,
+                    and_(
+                        target.c.workspace_id == models.SourceDependency.workspace_id,
+                        target.c.source == models.SourceDependency.source,
+                        target.c.source_id == models.SourceDependency.target_source_id,
+                        target.c.deleted_at.is_not(None),
+                    ),
+                )
+                .where(
+                    models.SourceDependency.workspace_id == self._workspace_id,
+                    models.SourceDependency.source == source,
+                )
+                .distinct()
+                .order_by(models.SourceDependency.target_source_id)
+                .limit(limit)
+            )
+            return tuple(rows.scalars())
 
     async def upsert_document(self, document: Document) -> Document:
         async with self._sessions.begin() as session:
@@ -355,6 +421,7 @@ class SqliteDocStore(
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        source_dependencies: Sequence[SourceId] | None = None,
         expected_reset_epoch: int | None = None,
     ) -> Commit:
         """Flip the active publication and every relational derivative in one transaction."""
@@ -371,6 +438,7 @@ class SqliteDocStore(
                 glossary_entries=glossary_entries,
                 glossary_fp=glossary_fp,
                 original_omitted_reason=original_omitted_reason,
+                source_dependencies=source_dependencies,
             )
 
     async def fenced_publish_document(
@@ -386,6 +454,7 @@ class SqliteDocStore(
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        source_dependencies: Sequence[SourceId] | None = None,
         expected_reset_epoch: int | None = None,
     ) -> Commit:
         async with self._sessions.begin() as session:
@@ -402,6 +471,7 @@ class SqliteDocStore(
                 glossary_entries=glossary_entries,
                 glossary_fp=glossary_fp,
                 original_omitted_reason=original_omitted_reason,
+                source_dependencies=source_dependencies,
             )
 
     async def _publish_document_in(
@@ -417,6 +487,7 @@ class SqliteDocStore(
         glossary_entries: Sequence[GlossaryEntry] | None,
         glossary_fp: str | None,
         original_omitted_reason: str | None,
+        source_dependencies: Sequence[SourceId] | None,
     ) -> Commit:
         row, refused = await self._publication_target(session, document, expected)
         if refused is not None:
@@ -427,6 +498,8 @@ class SqliteDocStore(
             msg = f"document {document.id!r} vanished inside its publication transaction"
             raise RuntimeError(msg)
         row.original_omitted_reason = original_omitted_reason
+        if source_dependencies is not None:
+            await self._replace_source_dependencies(session, document, source_dependencies)
         await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
         await session.flush()
         for chunk in chunks:
@@ -450,6 +523,26 @@ class SqliteDocStore(
         row.parse_fp = parse_fp
         await session.flush()
         return Commit(committed=True, stored=to_document(row))
+
+    async def _replace_source_dependencies(
+        self, session: AsyncSession, document: Document, targets: Sequence[SourceId]
+    ) -> None:
+        """Replace a page's include edges within the document's publication transaction."""
+        await session.execute(
+            delete(models.SourceDependency).where(
+                models.SourceDependency.workspace_id == self._workspace_id,
+                models.SourceDependency.parent_document_id == document.id,
+            )
+        )
+        for target in dict.fromkeys(item for item in targets if item):
+            session.add(
+                models.SourceDependency(
+                    workspace_id=self._workspace_id,
+                    source=document.source,
+                    parent_document_id=document.id,
+                    target_source_id=target,
+                )
+            )
 
     async def publish_failure(
         self,
