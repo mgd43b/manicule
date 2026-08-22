@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/mgd43b/manicule/compare/v0.1.6...v0.1.7) (2026-08-22)
+
+
+### Performance Improvements
+
+* batch whole-index re-embedding ([#276](https://github.com/mgd43b/manicule/issues/276)) ([cf6a6c8](https://github.com/mgd43b/manicule/commit/cf6a6c8233c0c1f9c44b09191e55b14a63e38f7b))
+
 ## [0.1.6](https://github.com/mgd43b/manicule/compare/v0.1.5...v0.1.6) (2026-08-21)
 
 
