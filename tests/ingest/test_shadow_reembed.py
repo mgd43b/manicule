@@ -401,6 +401,8 @@ class Corpus:
         self.next_view = 2
         self.max_document_page = 0
         self.max_chunk_page = 0
+        self.document_reads = 0
+        self.chunk_reads = 0
 
     async def begin_snapshot(self) -> CorpusSnapshot:
         return CorpusSnapshot(
@@ -417,6 +419,7 @@ class Corpus:
     async def documents(
         self, snapshot: CorpusSnapshot, *, after: str | None, limit: int
     ) -> list[SnapshotDocument]:
+        self.document_reads += 1
         documents = [
             self._stored_document(snapshot, value[0])
             for key, value in sorted(self.versions[snapshot.id].items())
@@ -437,6 +440,7 @@ class Corpus:
         after: ChunkKey | None,
         limit: int,
     ) -> list[SnapshotChunk]:
+        self.chunk_reads += 1
         chunks = sorted(
             self.versions[snapshot.id][document_id][1],
             key=lambda chunk: (chunk.position, chunk.id),
@@ -957,6 +961,27 @@ async def test_inspection_recomputes_actual_physical_rows_and_rejects_corruption
     with pytest.raises(ReembedValidationError, match=message):
         await asyncio.wait_for(rebuilding, timeout=1.0)
     assert authority.live.generation_id == "live-old"
+
+
+async def test_validation_uses_shadow_evidence_without_rereading_the_snapshot() -> None:
+    authority = Authority()
+    corpus = synthetic_corpus(authority, 2)
+    embedder = CountingEmbedder(dimension=4)
+    run = await prepare_run(authority, corpus, embedder, "no-validation-snapshot-rescan")
+    corpus.document_reads = corpus.chunk_reads = 0
+    authority.pause_inspection = True
+
+    rebuilding = asyncio.create_task(execute(run, authority, corpus, embedder))
+    await asyncio.wait_for(authority.inspection_entered.wait(), timeout=1.0)
+
+    # One complete small document needs a document page, its chunk page, then the empty
+    # successor page to move BUILDING to VALIDATING.  Validation must inspect the completed
+    # shadow rather than planning that immutable input a second time.
+    assert corpus.document_reads == 2
+    assert corpus.chunk_reads == 1
+
+    authority.release_inspection.set()
+    assert (await rebuilding).state is ReembedState.PUBLISHED
 
 
 @pytest.mark.parametrize(
