@@ -194,7 +194,7 @@ class Authority:
         current = self.runs[run.id]
         if current.revision != expected_revision:
             raise ReembedError("stale journal revision")
-        if self.fail_chunk_checkpoint_once and run.chunk_after is not None:
+        if self.fail_chunk_checkpoint_once and run.chunks_completed > current.chunks_completed:
             self.fail_chunk_checkpoint_once = False
             raise OSError("synthetic chunk checkpoint crash")
         saved = replace(run, revision=run.revision + 1)
@@ -604,6 +604,32 @@ async def test_protocol_keyset_pages_huge_document_and_keeps_old_winner_until_sw
     assert authority.live.generation_id == completed.shadow_generation_id
 
 
+async def test_small_documents_share_one_bounded_model_and_shadow_batch() -> None:
+    authority = Authority()
+    documents: list[tuple[Document, Sequence[Chunk]]] = []
+    for index in range(4):
+        document = make_document().model_copy(
+            update={
+                "id": f"document-{index}",
+                "source_id": f"document-{index}",
+                "uri": f"fake://document-{index}",
+                "title": f"Document {index}",
+            }
+        )
+        documents.append((document, make_chunks(document, count=8)))
+    corpus = Corpus(authority, documents)
+    embedder = CountingEmbedder(dimension=5)
+    run = await prepare_run(authority, corpus, embedder)
+
+    completed = await execute(run, authority, corpus, embedder)
+
+    assert completed.state is ReembedState.PUBLISHED
+    assert completed.documents_completed == 4
+    assert completed.chunks_completed == 32
+    assert [len(call) for call in embedder.calls] == [32]
+    assert authority.max_upsert_batch == 32
+
+
 async def test_private_commitment_hides_snapshot_model_path_and_digests_from_repr() -> None:
     authority = Authority()
     corpus = synthetic_corpus(authority, 1, secret_uri=True)
@@ -864,6 +890,23 @@ async def test_shadow_reembed_refuses_actual_text_beyond_the_stored_chunk_policy
     assert embedder.calls == []
     assert authority.upsert_attempts == 0
     assert authority.live.generation_id == "live-old"
+
+
+async def test_packed_shadow_reembed_keeps_the_conservative_stored_context_guard() -> None:
+    authority = Authority()
+    document = make_document()
+    chunk = make_chunks(document, count=1)[0].model_copy(
+        update={"embed_text": "x", "token_count": 1_025}
+    )
+    corpus = Corpus(authority, [(document, (chunk,))])
+    embedder = ExactCountingEmbedder(dimension=4)
+    run = await prepare_run(authority, corpus, embedder, "stored-context-refusal")
+
+    with pytest.raises(ContextOverflowError, match="exceed the 1024-token limit"):
+        await execute(run, authority, corpus, embedder)
+
+    assert embedder.calls == []
+    assert authority.upsert_attempts == 0
 
 
 @pytest.mark.parametrize(

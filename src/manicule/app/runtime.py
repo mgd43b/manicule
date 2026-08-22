@@ -1389,7 +1389,12 @@ class _Ingestion:
         await self._runtime.documents()
         corpus = SqliteReembedCorpus(self._runtime.require_engine(), self._runtime.workspace)
         embedder = await self._runtime.embedder()
-        commitment = await plan_reembed_commitment(corpus, embedder.fingerprint)
+        commitment = await plan_reembed_commitment(
+            corpus,
+            embedder.fingerprint,
+            target_batch_tokens=self._runtime.settings.ingest.target_batch_tokens,
+            max_embed_batch=self._runtime.settings.ingest.max_embed_batch,
+        )
         try:
             return (
                 commitment.plan,
@@ -1419,7 +1424,12 @@ class _Ingestion:
         if existing is not None:
             return existing
         corpus, authority, _shadows, embedder = await self._reembed_components()
-        commitment = await plan_reembed_commitment(corpus, embedder.fingerprint)
+        commitment = await plan_reembed_commitment(
+            corpus,
+            embedder.fingerprint,
+            target_batch_tokens=self._runtime.settings.ingest.target_batch_tokens,
+            max_embed_batch=self._runtime.settings.ingest.max_embed_batch,
+        )
         if not commitment.execution_plan.runnable:
             error = PolicyError(
                 "one or more stored documents have no chunks. "
@@ -1603,6 +1613,8 @@ class _Ingestion:
             journal=authority,
             shadow=shadows,
             publisher=authority,
+            target_batch_tokens=self._runtime.settings.ingest.target_batch_tokens,
+            max_embed_batch=self._runtime.settings.ingest.max_embed_batch,
         )
         if run.state is ReembedState.PUBLISHED:
             vectors = await self._runtime.vectors()
