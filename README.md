@@ -10,7 +10,7 @@ to a real location in a real document — a page, a heading, a line, a cell.
 [![CI](https://github.com/mgd43b/manicule/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mgd43b/manicule/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/manicule.svg)](https://pypi.org/project/manicule/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14%2B-blue.svg)](pyproject.toml)
 [![packaged with uv](https://img.shields.io/badge/packaged%20with-uv-de5fe9.svg)](https://docs.astral.sh/uv/)
 
 [Install](#install) · [First run](#first-run) · [The four surfaces](#the-four-surfaces) ·
@@ -66,7 +66,7 @@ down in [`docs/surfaces.md`](docs/surfaces.md).
 
 ## Install
 
-> Requires Python 3.12 or newer. With [uv](https://docs.astral.sh/uv/):
+> Requires Python 3.14 or newer. With [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uv tool install "manicule[all]"
@@ -596,7 +596,7 @@ done.
 
 ## Development
 
-> Requires [uv](https://docs.astral.sh/uv/) and Python 3.12+.
+> Requires [uv](https://docs.astral.sh/uv/) and Python 3.14+.
 
 ```bash
 uv sync --all-groups

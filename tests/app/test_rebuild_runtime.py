@@ -32,7 +32,7 @@ from manicule.core.source_lifecycle import LifecycleRefusalError
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.reembed import ReembedState
 from manicule.plugins.manifest import ComponentKind
-from manicule.plugins.registry import discover
+from manicule.plugins.registry import ComponentRecord, discover
 from manicule.storage import models
 from manicule.storage.docstore import SqliteDocStore
 from tests.app.test_reembed_runtime import CountingEmbedder
@@ -120,17 +120,17 @@ def _planning_runtime(
     found = discover()
     registry = found.registry.bind("metadata-only-plan-test")
     embedder = found.registry.record(keys.EMBEDDER.named("onnx"))
-    found.registry._records[(ComponentKind.EMBEDDER, "onnx")] = replace(  # pyright: ignore[reportPrivateUsage]
-        embedder, factory=forbidden_embedder
+    found.registry._records[(ComponentKind.EMBEDDER, "onnx")] = cast(  # pyright: ignore[reportPrivateUsage]
+        "ComponentRecord[object]", replace(embedder, factory=forbidden_embedder)
     )
     chunker = found.registry.record(keys.CHUNKER.named("structural"))
-    found.registry._records[(ComponentKind.CHUNKER, "structural")] = replace(  # pyright: ignore[reportPrivateUsage]
-        chunker, factory=forbidden_chunker
+    found.registry._records[(ComponentKind.CHUNKER, "structural")] = cast(  # pyright: ignore[reportPrivateUsage]
+        "ComponentRecord[object]", replace(chunker, factory=forbidden_chunker)
     )
     registry.add(keys.CONNECTOR.named("network-trap"), forbidden_connector)
     vector = found.registry.record(keys.VECTOR_STORE.named("lancedb"))
-    found.registry._records[(ComponentKind.VECTOR_STORE, "lancedb")] = replace(  # pyright: ignore[reportPrivateUsage]
-        vector, factory=forbidden_vectors
+    found.registry._records[(ComponentKind.VECTOR_STORE, "lancedb")] = cast(  # pyright: ignore[reportPrivateUsage]
+        "ComponentRecord[object]", replace(vector, factory=forbidden_vectors)
     )
     cached_card = write_model(
         data_dir / "cached-card", max_seq_length=1024, max_position_embeddings=2048

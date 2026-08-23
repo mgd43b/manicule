@@ -91,7 +91,7 @@ whole namespace before each test, so a switch living inside it is deleted before
 
 ### `.test_durations`, and when it needs regenerating
 
-CI runs the suite in three shards per Python version, balanced on the committed
+CI runs the Python 3.14 suite in three shards, balanced on the committed
 `.test_durations`. **You do not need it to run the tests** — `uv run pytest` ignores it
 entirely, and it is read only when `--splits` is passed.
 
@@ -110,6 +110,21 @@ Relative cost is what balances the shards, so a laptop's numbers are fine; they 
 the runner's. `tests/test_ci_test_sharding.py` holds the shard count in the workflow and its
 matrix to the same number, because a `--splits` raised without the matrix runs part of the
 suite and reports green.
+
+### Measuring candidate CI shard widths
+
+Refreshing `.test_durations` tells `pytest-split` how to balance the suite; it does not tell us
+how many GitHub runners make the pull-request critical path shortest. Run the manual **CI shard
+benchmark** workflow after a refresh to measure the complete Python 3.14 test job at widths 3,
+4, 6, and 8. It uses the same dependency sync, grammar/vocabulary pre-seeding, coverage, and
+least-duration split as ordinary CI, so its job durations are comparable rather than optimistic
+local stopwatches.
+
+For each width, compare the slowest job's total time (the PR wait) and the sum of all job times
+(the runner cost). Each job summary also records pytest-only seconds, which separates test work
+from setup and collection. The workflow is manual because one benchmark dispatch launches 21
+jobs; it must not make routine pull requests more expensive. Only after choosing a width should
+the regular matrix and `--splits` value move together.
 
 ## Nothing is deferred
 
@@ -289,7 +304,7 @@ relicense.
 
 ## Style
 
-- Python 3.12+, 100-column lines, `ruff format`.
+- Python 3.14+, 100-column lines, `ruff format`.
 - Type everything. `Any` needs a reason on the same line.
 - Errors are actionable: name what was wrong, what was expected, and what to do about it.
   `f"no parser for {media_type!r}. Installed: {available}"` beats `"parser not found"`.

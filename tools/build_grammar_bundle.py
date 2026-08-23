@@ -86,7 +86,7 @@ name = "{distribution}"
 version = "{version}"
 description = "{description}"
 license = "{license}"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 
 # No dependencies, deliberately. This is data — compiled grammar libraries and a manifest —
 # and a dependency on manicule would make the two version-locked in the one direction that

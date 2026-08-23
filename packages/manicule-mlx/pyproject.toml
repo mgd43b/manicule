@@ -11,15 +11,14 @@ readme = "README.md"
 # manicule itself is MIT — so the backend that links it lives here rather than there. See
 # README.md; the split is the whole reason this distribution exists.
 license = "GPL-3.0-or-later"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 authors = [{ name = "manicule contributors" }]
 keywords = ["manicule", "embeddings", "mlx", "apple-silicon"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Typing :: Typed",
 ]
 
