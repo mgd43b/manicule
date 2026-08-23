@@ -107,7 +107,7 @@ from manicule.core.protocols import BatchedDiscoveryConnector, EnumerationProgre
 from manicule.core.provenance import Provenance
 from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, SourceId
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError
-from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
+from manicule.ingest.embedding import DEFAULT_TARGET_BATCH_TOKENS, EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.ports import (
@@ -960,7 +960,7 @@ class IngestPipeline:
         queue_depth_factor: int = 2,
         shutdown_grace_s: float = 30.0,
         max_fetch_bytes: int = 256 * 1024 * 1024,
-        target_batch_tokens: int = 16_384,
+        target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
         max_embed_batch: int = 64,
         parse_fingerprints: Callable[[str], ParseFingerprint | None] = parse_fingerprint,
         glossary: GlossaryWriter | None = None,

@@ -36,7 +36,12 @@ from typing import TYPE_CHECKING
 
 from manicule.core.content import DocumentStatus, RawDocument, Retention
 from manicule.core.errors import ContextOverflowError, PolicyError
-from manicule.ingest.embedding import EmbeddingWork, embed_chunks, embed_or_reuse
+from manicule.ingest.embedding import (
+    DEFAULT_TARGET_BATCH_TOKENS,
+    EmbeddingWork,
+    embed_chunks,
+    embed_or_reuse,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
@@ -198,7 +203,7 @@ async def re_embed(
     embedder: Embedder,
     vectors: VectorStore,
     chunk_fingerprint: ChunkFingerprint,
-    target_batch_tokens: int = 16_384,
+    target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
 ) -> ReindexReport:
     """Rebuild vectors from stored ``embed_text``. Rung 2: no parser, no network.
 
@@ -275,7 +280,7 @@ async def repair(
     embedder: Embedder,
     vectors: VectorStore,
     chunk_fingerprint: ChunkFingerprint,
-    target_batch_tokens: int = 16_384,
+    target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
 ) -> ReindexReport:
     """Finish documents an interrupted run left half-written. Rungs 1-2.
 
