@@ -642,8 +642,9 @@ class IngestSettings(Section):
         default=32_768,
         ge=1,
         description="Tokens per embedding coordinator batch. The batch *size* is derived from "
-        "this and the chunk budget; 32K feeds one 32-row forward pass for 1,024-token chunks. "
-        "Lower it when the model is memory-bound.",
+        "this and the chunk budget; 32K yields 32 coordinator rows for 1,024-token chunks. "
+        "The embedder can split those rows into smaller forward passes. Lower it when the "
+        "coordinator is memory-bound.",
     )
     max_embed_batch: int = Field(default=64, ge=1, description="Upper clamp on the derived size.")
     queue_depth_factor: int = Field(
