@@ -639,10 +639,11 @@ class IngestSettings(Section):
         "record is acknowledged.",
     )
     target_batch_tokens: int = Field(
-        default=16_384,
+        default=32_768,
         ge=1,
-        description="Tokens per embedding batch. The batch *size* is derived from this and "
-        "the chunk budget, because the quantity that maps to memory is tokens, not chunks.",
+        description="Tokens per embedding coordinator batch. The batch *size* is derived from "
+        "this and the chunk budget; 32K feeds one 32-row forward pass for 1,024-token chunks. "
+        "Lower it when the model is memory-bound.",
     )
     max_embed_batch: int = Field(default=64, ge=1, description="Upper clamp on the derived size.")
     queue_depth_factor: int = Field(

@@ -45,6 +45,9 @@ if TYPE_CHECKING:
 MAX_BATCH = 64
 """Upper clamp on a derived batch size, so a tiny budget cannot ask for a huge batch."""
 
+DEFAULT_TARGET_BATCH_TOKENS = 32_768
+"""Default coordinator budget: one 32-row forward pass for 1,024-token chunks."""
+
 
 def batch_size(*, budget_tokens: int, target_batch_tokens: int, maximum: int = MAX_BATCH) -> int:
     """How many chunks to embed at once, derived rather than constant.
@@ -65,7 +68,7 @@ async def embed_chunks(
     chunks: Sequence[Chunk],
     *,
     chunk_fingerprint: ChunkFingerprint | None = None,
-    target_batch_tokens: int = 16_384,
+    target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
     maximum: int = MAX_BATCH,
     on_batch: Callable[[Sequence[Chunk]], None] | None = None,
 ) -> list[Vector]:
@@ -122,7 +125,7 @@ async def embed_checked_chunks(
     embedder: Embedder,
     chunks: Sequence[Chunk],
     *,
-    target_batch_tokens: int = 16_384,
+    target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
     maximum: int = MAX_BATCH,
     batch_budget_tokens: int | None = None,
     on_batch: Callable[[Sequence[Chunk]], None] | None = None,
@@ -294,7 +297,7 @@ async def embed_or_reuse(
     vectors: VectorStore,
     chunk_fingerprint: ChunkFingerprint | None = None,
     previous: Mapping[str, str] | None = None,
-    target_batch_tokens: int = 16_384,
+    target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
     maximum: int = MAX_BATCH,
     lock: AbstractAsyncContextManager[object] | None = None,
 ) -> tuple[list[Vector], EmbeddingWork]:
@@ -443,6 +446,7 @@ def _cache_hits(embedder: Embedder) -> int:
 
 __all__ = [
     "CACHE_HIT_METRIC",
+    "DEFAULT_TARGET_BATCH_TOKENS",
     "MAX_BATCH",
     "EmbeddingWork",
     "batch_size",

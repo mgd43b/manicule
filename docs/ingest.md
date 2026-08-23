@@ -746,7 +746,10 @@ directions: 32 chunks of 512 tokens is a very different allocation from 32 chunk
 the second is where an in-process embedder runs the machine out of memory.
 
 `target_batch_tokens` is the one tunable, and it is the honest place to put the knob because it
-is the quantity that actually maps to memory.
+is the quantity that actually maps to memory. Its 32K default makes a 32-chunk coordinator batch
+for the default 1,024-token chunk policy. `embedding.batch_size` then bounds each model forward
+pass inside that coordinator batch, so it can be tuned independently when an accelerator has a
+smaller practical limit.
 
 ### 8.3 The stage topology, as built
 
@@ -1088,8 +1091,9 @@ for local fetch capacity. It no longer describes source discovery, which has alr
 ### 8.3.3 Tuning it on a local Apple Silicon machine
 
 The in-process MLX embedder is the bottleneck by construction, and everything upstream exists to
-keep it fed. So the tuning order is: leave `target_batch_tokens` alone unless memory is the
-problem, and change the widths only when a measurement says which stage is idle.
+keep it fed. Start with the 32K `target_batch_tokens` default and `embedding.batch_size = 32`;
+lower either only when memory is the problem, and change the widths only when a measurement says
+which stage is idle.
 
 | Symptom | Read | Change |
 |---|---|---|

@@ -603,7 +603,7 @@ async def test_protocol_keyset_pages_huge_document_and_keeps_old_winner_until_sw
     assert completed.chunks_completed == 130
     assert corpus.max_chunk_page == 64
     assert authority.max_upsert_batch == 64
-    assert [len(call) for call in embedder.calls] == [32, 32, 32, 32, 2]
+    assert [len(call) for call in embedder.calls] == [64, 64, 2]
     assert set(authority.live_during_upsert) == {"live-old"}
     assert authority.live.generation_id == completed.shadow_generation_id
 
@@ -630,6 +630,47 @@ async def test_small_documents_share_one_bounded_model_and_shadow_batch() -> Non
     assert completed.state is ReembedState.PUBLISHED
     assert completed.documents_completed == 4
     assert completed.chunks_completed == 32
+    assert [len(call) for call in embedder.calls] == [32]
+    assert authority.max_upsert_batch == 32
+
+
+async def test_long_context_model_batches_retained_short_chunks_to_the_chunk_budget() -> None:
+    """A long model context must not reduce 1,024-token stored chunks to two at a time.
+
+    Each model call also causes a fenced shadow write, so deriving this from the 8K model
+    context would turn these 32 chunks into sixteen forward-pass/write pairs instead of one.
+    """
+    authority = Authority()
+    documents: list[tuple[Document, Sequence[Chunk]]] = []
+    for index in range(4):
+        document = make_document().model_copy(
+            update={
+                "id": f"long-context-document-{index}",
+                "source_id": f"long-context-document-{index}",
+                "uri": f"fake://long-context-document-{index}",
+                "title": f"Long context document {index}",
+            }
+        )
+        documents.append((document, make_chunks(document, count=8)))
+    corpus = Corpus(authority, documents)
+    chunk_fingerprint = ChunkFingerprint(
+        chunker="synthetic",
+        version="1",
+        max_tokens=1024,
+        overlap_tokens=0,
+        tokenizer_id="whitespace",
+    ).canonical()
+    corpus.lineage_versions[corpus.current_view] = dict.fromkeys(
+        corpus.lineage_versions[corpus.current_view],
+        (chunk_fingerprint, "embed-fingerprint", "glossary-fingerprint"),
+    )
+    embedder = CountingEmbedder(dimension=5)
+    embedder.fingerprint = embedder.fingerprint.model_copy(update={"max_sequence_length": 8192})
+    run = await prepare_run(authority, corpus, embedder, "long-context-batches")
+
+    completed = await execute(run, authority, corpus, embedder)
+
+    assert completed.state is ReembedState.PUBLISHED
     assert [len(call) for call in embedder.calls] == [32]
     assert authority.max_upsert_batch == 32
 

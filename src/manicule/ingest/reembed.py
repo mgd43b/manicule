@@ -34,10 +34,15 @@ from manicule.core.embedding import EmbedFingerprint, Vector, require_within_con
 from manicule.core.errors import ManiculeError, PolicyError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.protocols import Embedder
-from manicule.ingest.embedding import MAX_BATCH, batch_size, embed_checked_chunks, embed_chunks
+from manicule.ingest.embedding import (
+    DEFAULT_TARGET_BATCH_TOKENS,
+    MAX_BATCH,
+    batch_size,
+    embed_checked_chunks,
+    embed_chunks,
+)
 
 DEFAULT_DOCUMENT_PAGE = 32
-DEFAULT_TARGET_BATCH_TOKENS = 16_384
 DEFAULT_CHUNKS_PER_SECOND = 20.0
 DEFAULT_LEASE_TTL_SECONDS = 30.0
 _FLOAT32_BYTES = 4
@@ -721,7 +726,6 @@ async def _build(  # noqa: PLR0912, PLR0915 - bounded resume state machine
     lease: ReembedLease,
     lease_ttl_seconds: float,
 ) -> tuple[ReembedRun, ReembedLease]:
-    chunk_limit = _chunk_limit(embedder.fingerprint, target_batch_tokens, max_embed_batch)
     while True:
         if run.active_document_id is None:
             documents = await corpus.documents(
@@ -743,13 +747,21 @@ async def _build(  # noqa: PLR0912, PLR0915 - bounded resume state machine
                 tuple[SnapshotDocument, Sequence[SnapshotChunk], ChunkFingerprint | None]
             ] = []
             packed_chunks = 0
+            packed_budget: int | None = None
             for candidate in documents:
                 fingerprint = _chunk_fingerprint(candidate)
+                candidate_budget = _batch_budget(embedder.fingerprint, fingerprint)
+                candidate_limit = _chunk_limit(
+                    embedder.fingerprint,
+                    target_batch_tokens,
+                    max_embed_batch,
+                    chunk_fingerprint=fingerprint,
+                )
                 candidate_chunks = await corpus.chunks(
                     run.commitment.snapshot,
                     candidate.document.id,
                     after=None,
-                    limit=chunk_limit,
+                    limit=candidate_limit,
                 )
                 if not candidate_chunks and candidate.document.expects_chunks:
                     raise ReembedError(
@@ -757,13 +769,20 @@ async def _build(  # noqa: PLR0912, PLR0915 - bounded resume state machine
                     )
                 # A full read might be a larger document.  Keep it out of a cross-document
                 # group so the existing chunk-key checkpoint can resume it exactly.
-                if len(candidate_chunks) >= chunk_limit:
+                if len(candidate_chunks) >= candidate_limit:
                     break
-                if packed and packed_chunks + len(candidate_chunks) > chunk_limit:
+                shared_budget = max(packed_budget or 0, candidate_budget)
+                shared_limit = batch_size(
+                    budget_tokens=shared_budget,
+                    target_batch_tokens=target_batch_tokens,
+                    maximum=max_embed_batch,
+                )
+                if packed and packed_chunks + len(candidate_chunks) > shared_limit:
                     break
                 packed.append((candidate, candidate_chunks, fingerprint))
                 packed_chunks += len(candidate_chunks)
-                if packed_chunks == chunk_limit:
+                packed_budget = shared_budget
+                if packed_chunks == shared_limit:
                     break
             if packed:
                 flattened = [stored for _, stored_chunks, _ in packed for stored in stored_chunks]
@@ -792,6 +811,7 @@ async def _build(  # noqa: PLR0912, PLR0915 - bounded resume state machine
                     checked,
                     target_batch_tokens=target_batch_tokens,
                     maximum=max_embed_batch,
+                    batch_budget_tokens=packed_budget,
                 )
                 lease = await journal.renew(run.id, lease, ttl_seconds=lease_ttl_seconds)
                 if flattened:
@@ -836,6 +856,12 @@ async def _build(  # noqa: PLR0912, PLR0915 - bounded resume state machine
         if document is None:
             raise ReembedError("the immutable snapshot lost a document during resume")
         chunk_fingerprint = _chunk_fingerprint(document)
+        chunk_limit = _chunk_limit(
+            embedder.fingerprint,
+            target_batch_tokens,
+            max_embed_batch,
+            chunk_fingerprint=chunk_fingerprint,
+        )
         stored_chunks = await corpus.chunks(
             run.commitment.snapshot,
             document.document.id,
@@ -962,7 +988,6 @@ async def _plan_snapshot(
     peak_memory = 0
     public_peak_memory = 0
     after: str | None = None
-    chunk_limit = _chunk_limit(target, target_batch_tokens, max_embed_batch)
     while True:
         documents = await corpus.documents(snapshot, after=after, limit=document_page)
         if not documents:
@@ -970,6 +995,12 @@ async def _plan_snapshot(
         document_page_bytes = sum(len(_canonical_document(document)) for document in documents)
         peak_memory = max(peak_memory, document_page_bytes)
         for document in documents:
+            chunk_limit = _chunk_limit(
+                target,
+                target_batch_tokens,
+                max_embed_batch,
+                chunk_fingerprint=_chunk_fingerprint(document),
+            )
             digest.add_document(document)
             domain_document = document.document
             owned = not snapshot.workspace_id or document.workspace_id == snapshot.workspace_id
@@ -1141,9 +1172,27 @@ def _validate_owner(owner_token: str, ttl_seconds: float) -> None:
         raise ValueError("lease_ttl_seconds must be a positive finite number")
 
 
-def _chunk_limit(target: EmbedFingerprint, target_batch_tokens: int, max_embed_batch: int) -> int:
+def _batch_budget(target: EmbedFingerprint, chunk_fingerprint: ChunkFingerprint | None) -> int:
+    """A safe per-batch token budget for one document's retained chunks.
+
+    The model's context limit protects each individual chunk, not the amount of padding an
+    embedding batch needs. Retained chunk lineage supplies that tighter bound whenever it is
+    available; old rows with no lineage remain conservatively limited by the model context.
+    """
+    if chunk_fingerprint is None:
+        return target.max_sequence_length
+    return min(target.max_sequence_length, chunk_fingerprint.max_tokens)
+
+
+def _chunk_limit(
+    target: EmbedFingerprint,
+    target_batch_tokens: int,
+    max_embed_batch: int,
+    *,
+    chunk_fingerprint: ChunkFingerprint | None = None,
+) -> int:
     return batch_size(
-        budget_tokens=target.max_sequence_length,
+        budget_tokens=_batch_budget(target, chunk_fingerprint),
         target_batch_tokens=target_batch_tokens,
         maximum=max_embed_batch,
     )
