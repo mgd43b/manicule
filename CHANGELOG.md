@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.8](https://github.com/mgd43b/manicule/compare/v0.1.7...v0.1.8) (2026-08-22)
+
+
+### Bug Fixes
+
+* **connectors:** harden Confluence sync consistency ([#281](https://github.com/mgd43b/manicule/issues/281)) ([01be99f](https://github.com/mgd43b/manicule/commit/01be99fef87db986336d9f3acbdcba1ce6d5fe9e))
+
+
+### Performance Improvements
+
+* avoid re-planning immutable re-embed snapshots ([#282](https://github.com/mgd43b/manicule/issues/282)) ([e453978](https://github.com/mgd43b/manicule/commit/e45397823736a044194b98aed403e3672e74dcf7))
+* reuse verified re-embed snapshots ([#278](https://github.com/mgd43b/manicule/issues/278)) ([6ad6379](https://github.com/mgd43b/manicule/commit/6ad63793c55f7ce6d8854d5134c280761ba9a7bc))
+* stream re-embed shadow inspection ([#280](https://github.com/mgd43b/manicule/issues/280)) ([e0071ed](https://github.com/mgd43b/manicule/commit/e0071edbe1c033222e0b741e79c68e59cc23f395))
+
 ## [0.1.7](https://github.com/mgd43b/manicule/compare/v0.1.6...v0.1.7) (2026-08-22)
 
 
