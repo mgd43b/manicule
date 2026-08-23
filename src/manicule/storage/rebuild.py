@@ -978,7 +978,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 chunks = replacement.flattened_chunks()
                 expected_vectors += len(chunks)
                 for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                    checked_at = utcnow()
+                    checked_at = live_clock()
                     await self.assert_generation_lease_current(
                         generation_id,
                         owner,
@@ -1008,7 +1008,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                         generation_id,
                         owner,
                         lease_generation,
-                        now=utcnow(),
+                        now=live_clock(),
                     )
             after = rows[-1].sequence
             await self._commit_replay_checkpoint(
@@ -1023,7 +1023,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             raise RebuildPublicationValidationError
         async with self._sessions.begin() as session:
             generation = await self._required_generation(session, generation_id)
-            self._require_lease(generation, owner, lease_generation, utcnow())
+            self._require_lease(generation, owner, lease_generation, live_clock())
             if generation.next_sequence != checkpoint_sequence:
                 raise RebuildLeaseConflictError("checkpoint advanced during vector replay")
             generation.vector_publication_id = target_publication
