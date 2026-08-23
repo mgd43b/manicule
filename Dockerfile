@@ -17,7 +17,7 @@
 # No port is exposed and none should be. manicule serves MCP over stdio, which opens no
 # socket at all.
 
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.14
 ARG UV_VERSION=0.9.7
 
 # --- the environment, the grammars and the weights ------------------------------------------

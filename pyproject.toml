@@ -12,14 +12,13 @@ description = "Self-hosted document search and answers, with citations that reso
 # rewritten. See `[tool.hatch.metadata.hooks.fancy-pypi-readme]`.
 dynamic = ["readme"]
 license = "MIT"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 authors = [{ name = "manicule contributors" }]
 keywords = ["rag", "search", "documents", "citations", "self-hosted"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Text Processing :: Indexing",
   "Typing :: Typed",
 ]
@@ -445,7 +444,7 @@ include = ["src", "tests", "packages"]
 # inside `packages/` and would otherwise be checked under strict mode by accident rather than
 # by decision. They are still linted by `ruff check .`.
 exclude = ["packages/*/tools"]
-pythonVersion = "3.12"
+pythonVersion = "3.14"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = "error"
 reportUnnecessaryTypeIgnoreComment = "error"

@@ -224,7 +224,7 @@ class Container:
         }
         return chosen.get(kind)
 
-    def _context(self, record: ComponentRecord[object]) -> BuildContext:
+    def _context[T](self, record: ComponentRecord[T]) -> BuildContext:
         return BuildContext(
             settings=self.settings,
             config=self._config_for(record),
@@ -233,14 +233,14 @@ class Container:
             components=self,
         )
 
-    def _config_for(self, record: ComponentRecord[object]) -> BaseModel:
+    def _config_for[T](self, record: ComponentRecord[T]) -> BaseModel:
         raw = self.settings.component_config(record.kind.value, record.name)
         where = f"plugins.config[{f'{record.kind.value}.{record.name}'!r}]"
         return self._validated_config(record, raw, where)
 
-    def _validated_config(
+    def _validated_config[T](
         self,
-        record: ComponentRecord[object],
+        record: ComponentRecord[T],
         raw: Mapping[str, object],
         where: str,
     ) -> BaseModel:
@@ -406,9 +406,9 @@ class Container:
         await self._setup_pending()
         return built
 
-    def _connector_config(
+    def _connector_config[T](
         self,
-        record: ComponentRecord[object],
+        record: ComponentRecord[T],
         configured: ConnectorSettings,
         instance: str,
     ) -> BaseModel:
