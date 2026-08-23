@@ -1445,12 +1445,6 @@ class LanceVectorStore:
         table = await self._existing_table()
         if fingerprint is None or table is None:
             raise VectorStoreStateError("checkpoint vectors are unavailable for takeover")
-        if not await self.publication_page_is_complete(
-            source_publication_id,
-            chunks,
-            embedding_fingerprint=fingerprint.canonical(),
-        ):
-            raise VectorStoreStateError("checkpoint vector page is incomplete or stale")
         listed = ", ".join(quote(chunk.id) for chunk in chunks)
         records = await (
             table.query()
@@ -1458,12 +1452,34 @@ class LanceVectorStore:
                 f"{PUBLICATION_COLUMN} = {quote(source_publication_id)} "
                 f"AND {CHUNK_ID_COLUMN} IN ({listed})"
             )
-            .select([CHUNK_ID_COLUMN, VECTOR_COLUMN, CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN])
+            .select(
+                [
+                    CHUNK_ID_COLUMN,
+                    IDENTITY_COLUMN,
+                    CHUNK_COLUMN,
+                    VECTOR_COLUMN,
+                    CHECKSUM_COLUMN,
+                    CHECKSUM_VERSION_COLUMN,
+                ]
+            )
             .limit(len(chunks) + 1)
             .to_list()
         )
+        by_id = {str(record[CHUNK_ID_COLUMN]): record for record in records}
+        if (
+            len(records) != len(chunks)
+            or len(by_id) != len(chunks)
+            or any(
+                chunk.id not in by_id
+                or self._verdict(chunk, by_id[chunk.id], fingerprint, require_checksum=True).state
+                is not VectorState.READABLE
+                for chunk in chunks
+            )
+        ):
+            raise VectorStoreStateError("checkpoint vector page is incomplete or stale")
         vectors_by_id: dict[str, tuple[float, ...]] = {}
-        for record in records:
+        for chunk in chunks:
+            record = by_id[chunk.id]
             values = tuple(float(value) for value in record[VECTOR_COLUMN])
             checksum, version = _checksum_of(record)
             integrity = verify_stored_checksum(

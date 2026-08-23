@@ -639,14 +639,27 @@ class IngestSettings(Section):
         "record is acknowledged.",
     )
     target_batch_tokens: int = Field(
-        default=32_768,
+        default=65_536,
         ge=1,
         description="Tokens per embedding coordinator batch. The batch *size* is derived from "
-        "this and the chunk budget; 32K yields 32 coordinator rows for 1,024-token chunks. "
+        "this and the chunk budget; 64K yields 64 coordinator rows for 1,024-token chunks. "
         "The embedder can split those rows into smaller forward passes. Lower it when the "
         "coordinator is memory-bound.",
     )
     max_embed_batch: int = Field(default=64, ge=1, description="Upper clamp on the derived size.")
+    reembed_validation_page: int = Field(
+        default=1024,
+        ge=1,
+        description="Physical shadow rows checked per validation page. Larger pages reduce Lance "
+        "reader overhead; lower this when validation memory is constrained.",
+    )
+    rebuild_replay_page: int = Field(
+        default=256,
+        ge=1,
+        description="Staged documents per replay checkpoint. Vector copies remain independently "
+        "bounded by bytes and 512 rows; lower this only when retained replacement payloads are "
+        "memory-bound.",
+    )
     queue_depth_factor: int = Field(
         default=2,
         ge=1,

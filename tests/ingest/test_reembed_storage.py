@@ -1009,6 +1009,35 @@ async def test_complete_snapshot_header_is_read_once_across_bounded_pages(
     assert header_reads == 1
 
 
+async def test_snapshot_streams_chunks_once_per_document_page(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    """Snapshot creation must not turn one short document into one chunk query."""
+    clock = Clock()
+    await seeded_run(engine, store, data_dir, clock, run_id="bulk-snapshot-stream")
+    for index in range(300):
+        document = make_document(source_id=f"bulk-snapshot-{index}")
+        await store.upsert_document(document)
+        await store.replace_chunks(document.id, [make_chunk(document, 0, "local input")])
+
+    chunk_streams = 0
+
+    def count_chunk_streams(*args: object) -> None:
+        nonlocal chunk_streams
+        statement = args[2]
+        if isinstance(statement, str) and "LEFT OUTER JOIN chunks" in statement:
+            chunk_streams += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_chunk_streams)
+    try:
+        snapshot = await SqliteReembedCorpus(engine).begin_snapshot()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_chunk_streams)
+
+    assert snapshot.id
+    assert chunk_streams == 2
+
+
 async def test_missing_published_generation_is_fatal_and_is_not_recreated(
     engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
 ) -> None:

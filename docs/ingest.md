@@ -746,7 +746,7 @@ directions: 32 chunks of 512 tokens is a very different allocation from 32 chunk
 the second is where an in-process embedder runs the machine out of memory.
 
 `target_batch_tokens` is the one tunable, and it is the honest place to put the knob because it
-is the quantity that actually maps to memory. Its 32K default makes a 32-chunk coordinator batch
+is the quantity that actually maps to memory. Its 64K default makes a 64-chunk coordinator batch
 for the default 1,024-token chunk policy. `embedding.batch_size` then bounds each model forward
 pass inside that coordinator batch, so it can be tuned independently when an accelerator has a
 smaller practical limit.
@@ -1091,7 +1091,7 @@ for local fetch capacity. It no longer describes source discovery, which has alr
 ### 8.3.3 Tuning it on a local Apple Silicon machine
 
 The in-process MLX embedder is the bottleneck by construction, and everything upstream exists to
-keep it fed. Start with the 32K `target_batch_tokens` default and `embedding.batch_size = 32`;
+keep it fed. Start with the 64K `target_batch_tokens` default and `embedding.batch_size = 32`;
 lower either only when memory is the problem, and change the widths only when a measurement says
 which stage is idle.
 
@@ -1831,10 +1831,11 @@ same bounded validation/conflict envelopes and failed cleanup state. An unexpect
 is different: it keeps the checkpoint resumable and does not manufacture a validation diagnosis.
 
 **Replay and validation read relational evidence a bounded page at a time, not one document
-per round trip**, and durably checkpoint after each page. `_EVIDENCE_PAGE` bounds both the
-`derived_generation_items` page a replay or validation pass reads and the single bounded join
-that resolves that whole page's retained-snapshot rows — one relational lookup per page rather
-than one per document. Every completed page commits a fenced checkpoint
+per round trip**, and durably checkpoint after each page. `ingest.rebuild_replay_page` controls
+the replay page (256 documents by default); validation retains its conservative fixed page.
+Vector copies remain separately bounded by both bytes and 512 rows, so increasing the replay
+page reduces SQLite round trips without widening a Lance mutation. Every completed page commits
+a fenced checkpoint
 (`replay_lease_generation`/`replay_checkpoint_sequence`/`replayed_vector_count` for replay,
 `validation_lease_generation`/`validation_checkpoint_sequence`/`validated_vector_count` for
 validation) alongside `last_progress_at`. A worker that crashes and retries under the *same*

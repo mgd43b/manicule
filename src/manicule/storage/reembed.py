@@ -110,9 +110,18 @@ async def _begin_immediate(connection: AsyncConnection, *, reassurance: str) -> 
 class SqliteReembedCorpus:
     """Complete, durable, connector-free corpus snapshots over authoritative SQLite rows."""
 
-    def __init__(self, engine: AsyncEngine, workspace_id: str = "default") -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        workspace_id: str = "default",
+        *,
+        snapshot_page: int = SNAPSHOT_PAGE,
+    ) -> None:
+        if snapshot_page < 1:
+            raise ValueError("snapshot_page must be positive")
         self._engine = engine
         self.workspace_id = workspace_id
+        self._snapshot_page = snapshot_page
         self._verified_snapshots: set[CorpusSnapshot] = set()
         """Complete immutable snapshots this short-lived corpus handle has already verified."""
 
@@ -318,95 +327,93 @@ class SqliteReembedCorpus:
         )
         chunk_digest = SnapshotChunkDigester()
         while True:
-            statement = select(models.Document).where(
+            statement = select(models.Document.id).where(
                 models.Document.workspace_id == self.workspace_id,
                 models.Document.deleted_at.is_(None),
             )
             if document_after is not None:
                 statement = statement.where(models.Document.id > document_after)
             page = (
-                (await session.execute(statement.order_by(models.Document.id).limit(SNAPSHOT_PAGE)))
+                (
+                    await session.execute(
+                        statement.order_by(models.Document.id).limit(self._snapshot_page)
+                    )
+                )
                 .scalars()
                 .all()
             )
             if not page:
                 break
             snapshot_documents: list[dict[str, str]] = []
-            for row in page:
-                stored_document = SnapshotDocument(
-                    workspace_id=row.workspace_id,
-                    document=to_document(row),
-                    original_omitted_reason=row.original_omitted_reason,
-                    chunk_fingerprint=row.chunk_fp,
-                    embed_fingerprint=row.embed_fp,
-                    glossary_fingerprint=row.glossary_fp,
-                    created_at=row.created_at,
-                    updated_at=row.updated_at,
-                    last_seen_at=row.last_seen_at,
-                    deleted_at=row.deleted_at,
+            snapshot_chunks: list[dict[str, str | int]] = []
+            active_document_id: str | None = None
+            rows = await session.stream(
+                select(models.Document, models.Chunk)
+                .outerjoin(models.Chunk, models.Chunk.document_id == models.Document.id)
+                .where(models.Document.id.in_(page))
+                .order_by(models.Document.id, models.Chunk.position, models.Chunk.id)
+                .execution_options(yield_per=self._snapshot_page)
+            )
+            async for row, chunk_row in rows:
+                if row.id != active_document_id:
+                    active_document_id = row.id
+                    stored_document = SnapshotDocument(
+                        workspace_id=row.workspace_id,
+                        document=to_document(row),
+                        original_omitted_reason=row.original_omitted_reason,
+                        chunk_fingerprint=row.chunk_fp,
+                        embed_fingerprint=row.embed_fp,
+                        glossary_fingerprint=row.glossary_fp,
+                        created_at=row.created_at,
+                        updated_at=row.updated_at,
+                        last_seen_at=row.last_seen_at,
+                        deleted_at=row.deleted_at,
+                    )
+                    document_json = _json(_SNAPSHOT_DOCUMENT, stored_document)
+                    # Document serialization canonicalizes a few nested JSON fields.  Hash the
+                    # exact value that the snapshot reader will reconstruct; chunks are already
+                    # canonical at this boundary and avoid that extra round trip below.
+                    inventory.add_document(_SNAPSHOT_DOCUMENT.validate_json(document_json))
+                    snapshot_documents.append(
+                        {
+                            "workspace_id": self.workspace_id,
+                            "snapshot_id": snapshot_id,
+                            "document_id": row.id,
+                            "payload_json": document_json,
+                        }
+                    )
+                    documents_count += 1
+                if chunk_row is None:
+                    continue
+                stored_chunk = SnapshotChunk(
+                    chunk=to_chunk(chunk_row),
+                    vector_id=chunk_row.vector_id,
+                    publication_id=row.publication_id,
+                    sequence=chunk_row.seq,
+                    created_at=chunk_row.created_at,
                 )
-                document_json = _json(_SNAPSHOT_DOCUMENT, stored_document)
-                inventory.add_document(_SNAPSHOT_DOCUMENT.validate_json(document_json))
-                snapshot_documents.append(
+                chunk_json = _json(_SNAPSHOT_CHUNK, stored_chunk)
+                inventory.add_chunk(stored_chunk)
+                chunk_digest.add(stored_chunk)
+                snapshot_chunks.append(
                     {
                         "workspace_id": self.workspace_id,
                         "snapshot_id": snapshot_id,
                         "document_id": row.id,
-                        "payload_json": document_json,
+                        "position": chunk_row.position,
+                        "chunk_id": chunk_row.id,
+                        "payload_json": chunk_json,
                     }
                 )
-                chunk_after: tuple[int, str] | None = None
-                while True:
-                    chunks = select(models.Chunk).where(models.Chunk.document_id == row.id)
-                    if chunk_after is not None:
-                        position, chunk_id = chunk_after
-                        chunks = chunks.where(
-                            (models.Chunk.position > position)
-                            | ((models.Chunk.position == position) & (models.Chunk.id > chunk_id))
-                        )
-                    chunk_page = (
-                        (
-                            await session.execute(
-                                chunks.order_by(models.Chunk.position, models.Chunk.id).limit(
-                                    SNAPSHOT_PAGE
-                                )
-                            )
-                        )
-                        .scalars()
-                        .all()
-                    )
-                    if not chunk_page:
-                        break
-                    snapshot_chunks: list[dict[str, str | int]] = []
-                    for chunk_row in chunk_page:
-                        stored_chunk = SnapshotChunk(
-                            chunk=to_chunk(chunk_row),
-                            vector_id=chunk_row.vector_id,
-                            publication_id=row.publication_id,
-                            sequence=chunk_row.seq,
-                            created_at=chunk_row.created_at,
-                        )
-                        chunk_json = _json(_SNAPSHOT_CHUNK, stored_chunk)
-                        persisted_chunk = _SNAPSHOT_CHUNK.validate_json(chunk_json)
-                        inventory.add_chunk(persisted_chunk)
-                        chunk_digest.add(persisted_chunk)
-                        snapshot_chunks.append(
-                            {
-                                "workspace_id": self.workspace_id,
-                                "snapshot_id": snapshot_id,
-                                "document_id": row.id,
-                                "position": chunk_row.position,
-                                "chunk_id": chunk_row.id,
-                                "payload_json": chunk_json,
-                            }
-                        )
-                        chunks_count += 1
+                chunks_count += 1
+                if len(snapshot_chunks) == self._snapshot_page:
                     await connection.execute(insert(models.ReembedSnapshotChunk), snapshot_chunks)
-                    last = chunk_page[-1]
-                    chunk_after = (last.position, last.id)
-                documents_count += 1
+                    snapshot_chunks.clear()
+            await rows.close()
+            if snapshot_chunks:
+                await connection.execute(insert(models.ReembedSnapshotChunk), snapshot_chunks)
             await connection.execute(insert(models.ReembedSnapshotDocument), snapshot_documents)
-            document_after = page[-1].id
+            document_after = page[-1]
         return (
             documents_count,
             chunks_count,
@@ -1126,11 +1133,15 @@ class LanceShadowGenerations:
         authority: SqliteReembedStore,
         *,
         mutation_hook: Callable[[], Awaitable[None]] | None = None,
+        inspection_page: int = 1024,
     ) -> None:
+        if inspection_page < 1:
+            raise ValueError("inspection_page must be positive")
         self._root = directory / GENERATIONS_DIRNAME
         self._authority = authority
         self._stores: dict[str, LanceVectorStore] = {}
         self._mutation_hook = mutation_hook
+        self._inspection_page = inspection_page
 
     def directory(self, generation_id: str) -> Path:
         return self._root / generation_id
@@ -1265,7 +1276,7 @@ class LanceShadowGenerations:
         finite = True
         lineage_valid = True
         digest = SnapshotChunkDigester()
-        async for page in store.inspection_pages():
+        async for page in store.inspection_pages(page_size=self._inspection_page):
             for row in page:
                 rows_count += 1
                 try:

@@ -322,10 +322,14 @@ class SqliteRebuildStore(WorkspaceScoped):
         blobs: BlobInventory,
         vectors: GenerationVectorInventory | None = None,
         sessions: async_sessionmaker[AsyncSession] | None = None,
+        replay_page: int = _EVIDENCE_PAGE,
     ) -> None:
+        if replay_page < 1:
+            raise ValueError("replay_page must be positive")
         super().__init__(engine, workspace_id=workspace_id, sessions=sessions)
         self._blobs = blobs
         self._vectors = vectors
+        self._replay_page = replay_page
         self._acquisition = AcquisitionJournalMixin(
             engine, workspace_id=workspace_id, sessions=sessions
         )
@@ -879,6 +883,27 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildPublicationConflictError(RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED)
             await self._require_live_vector_binding(session, generation)
 
+    async def assert_generation_lease_current(
+        self,
+        generation_id: str,
+        owner: str,
+        lease_generation: int,
+        *,
+        now: datetime,
+    ) -> None:
+        """Fence one external page without repeating immutable scope evidence.
+
+        The complete scope and live-binding proof is performed at each durable replay-page
+        boundary.  Around every individual Lance mutation, only ownership of the same fenced
+        generation can change; keeping that check narrow avoids replay spending most of its
+        time re-reading unrelated snapshot evidence.
+        """
+        async with self._sessions() as session:
+            generation = await self._required_generation(session, generation_id)
+            self._require_lease(generation, owner, lease_generation, now)
+            if generation.state not in {RebuildState.BUILDING, RebuildState.VALIDATING}:
+                raise RebuildLeaseConflictError("generation is not accepting fenced work")
+
     async def copy_checkpointed_vectors(  # noqa: PLR0912, PLR0915 - explicit replay validation stages
         self,
         generation_id: str,
@@ -936,12 +961,15 @@ class SqliteRebuildStore(WorkspaceScoped):
                                 models.DerivedGenerationItem.sequence < generation.next_sequence,
                             )
                             .order_by(models.DerivedGenerationItem.sequence)
-                            .limit(_EVIDENCE_PAGE)
+                            .limit(self._replay_page)
                         )
                     ).scalars()
                 )
             if not rows:
                 break
+            await self.assert_generation_lease(
+                generation_id, owner, lease_generation, now=live_clock()
+            )
             for row in rows:
                 try:
                     replacement = _REPLACEMENT.validate_python(row.payload)
@@ -951,7 +979,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 expected_vectors += len(chunks)
                 for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
                     checked_at = utcnow()
-                    await self.assert_generation_lease(
+                    await self.assert_generation_lease_current(
                         generation_id,
                         owner,
                         lease_generation,
@@ -976,7 +1004,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                         raise RebuildPublicationValidationError
                     if cancel is not None and cancel.is_set():
                         raise asyncio.CancelledError
-                    await self.assert_generation_lease(
+                    await self.assert_generation_lease_current(
                         generation_id,
                         owner,
                         lease_generation,
