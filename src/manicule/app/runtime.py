@@ -2300,10 +2300,18 @@ class _Maintenance:
         released = 0
         async for page in lifecycle.obsolete_generation_publications():
             for generation in page:
-                if generation.vector_publication_id is not None:
+                publication_ids = {
+                    publication_id
+                    for publication_id in (
+                        generation.vector_publication_id,
+                        generation.replay_target_publication_id,
+                    )
+                    if publication_id is not None
+                }
+                for publication_id in publication_ids:
                     await remover(
                         generation.expected_vector_table,
-                        generation.vector_publication_id,
+                        publication_id,
                     )
                 count, bytes_ = await lifecycle.cleanup_obsolete_generation(
                     generation.generation_id

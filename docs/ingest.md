@@ -1834,19 +1834,23 @@ is different: it keeps the checkpoint resumable and does not manufacture a valid
 per round trip**, and durably checkpoint after each page. `ingest.rebuild_replay_page` defaults
 to 256 documents; `ingest.rebuild_validation_page` defaults to the more conservative 100
 because validation deserializes every staged chunk in its document page. Vector copies and
-validation queries remain separately bounded by both bytes and 512 rows, so increasing either
-document page reduces SQLite round trips without widening a Lance operation. Every completed page commits
+validation queries remain separately bounded by both bytes and 512 rows. Replay fills those
+vector pages across document boundaries, so thousands of modest documents do not cause thousands
+of tiny Lance read/upsert/verification cycles; increasing the document page reduces SQLite round
+trips without widening a Lance operation. Every completed page commits
 a fenced checkpoint
-(`replay_lease_generation`/`replay_checkpoint_sequence`/`replayed_vector_count` for replay,
+(`replay_source_publication_id`/`replay_target_publication_id` plus
+`replay_lease_generation`/`replay_checkpoint_sequence`/`replayed_vector_count` for replay,
 `validation_lease_generation`/`validation_checkpoint_sequence`/`validated_vector_count` for
-validation) alongside `last_progress_at`. A worker that crashes and retries under the *same*
-still-held lease generation resumes after its last committed page instead of redoing the whole
-phase; a checkpoint recorded under a superseded lease generation is not trusted directly. A real
-takeover initially copies from the beginning because it names a fresh physical vector namespace
-the old checkpoint's evidence does not describe. Once replay has copied and verified every page
-from the generation's certified predecessor and proved the exact final row count, it rebinds the
-prior validation prefix to the new lease; validation then resumes after that prefix. A failed or
-incomplete replay leaves the old checkpoint superseded and unusable. `last_progress_at` moves only
+validation) alongside `last_progress_at`. The explicit replay source/target binding survives a
+process restart and lease takeover: the successor first bounds the target's physical row count,
+then resumes after the last committed page rather than starting a multi-hour replay again.
+Rebuild publications are content-addressed, insert-only rows; a stale writer cannot overwrite the
+successor's target or make it live, while the relational lease and final exact inventory still
+fence publication. Legacy unbound cursors perform one fresh replay before gaining this behavior.
+Once replay has copied and verified every page from the generation's certified predecessor and
+proved the exact final row count, it also rebinds the prior validation prefix to the new lease;
+validation then resumes after that prefix. `last_progress_at` moves only
 on a durable page, staged batch, or publication commit — never on the timer-driven lease
 heartbeat alone, so a healthy renewal against a stalled cursor cannot read as content progress.
 Publication uses the same evidence-page boundary: it fetches the page's existing documents once,

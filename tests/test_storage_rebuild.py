@@ -3011,14 +3011,24 @@ async def test_expired_owner_is_fenced_after_takeover(  # noqa: PLR0915 - one ta
     assert "/private" not in str(invalid.value)
     assert await certified_publication() == first.vector_publication_id
 
-    # The scenarios above all held "second"'s own lease generation, and the last of them —
-    # `unavailable_replay_inventory` — copied and verified the single staged page before its
-    # invented total-count mismatch raised, durably checkpointing that page under this exact
-    # lease generation. A resumable replay is supposed to trust that: rather than proving a
-    # worker crash mid-copy, reusing "second" here would prove only that an already-checkpointed
-    # page is not recopied. So this scenario claims its own fresh takeover, like the ones after
-    # it, to give the crash something in-flight to crash on.
+    # The scenarios above durably bound a complete replay page. A successor now reuses that
+    # target even under a new lease, so it would correctly have no copy left on which to inject
+    # the remaining crash/cancellation fences. Clear the binding to model an upgraded legacy
+    # checkpoint; legacy rows deliberately perform one fresh replay before gaining the durable
+    # source/target contract.
     monkeypatch.setattr(vectors, "publication_row_count", original_row_count)
+    async with session_factory(engine).begin() as session:
+        await session.execute(
+            update(models.DerivedGeneration)
+            .where(models.DerivedGeneration.id == plan.generation_id)
+            .values(
+                replay_lease_generation=None,
+                replay_source_publication_id=None,
+                replay_target_publication_id=None,
+                replay_checkpoint_sequence=None,
+                replayed_vector_count=0,
+            )
+        )
     second_crash = await rebuilds.claim_generation(
         plan.generation_id,
         "second-crash",
@@ -3311,6 +3321,47 @@ async def test_validation_coalesces_vector_checks_for_one_evidence_page(
     )
 
     assert checked == [tuple(document.id for document in documents)]
+
+
+async def test_replay_coalesces_vector_copies_across_documents(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One bounded Lance copy covers modest chunks from all documents in the replay page."""
+    monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 2)
+    rebuilds, vectors, claimed, documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="coalesced-replay-worker"
+    )
+    takeover_now = datetime.now(UTC) + timedelta(minutes=10)
+    taken_over = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "coalesced-replay-takeover",
+        now=takeover_now,
+        expires_at=takeover_now + timedelta(minutes=5),
+    )
+    original_copy = vectors.copy_publication
+    copied: list[tuple[str, ...]] = []
+
+    async def tracking_copy(
+        source_publication_id: str,
+        target_publication_id: str,
+        chunks: Sequence[Chunk],
+    ) -> None:
+        copied.append(tuple(chunk.document_id for chunk in chunks))
+        await original_copy(source_publication_id, target_publication_id, chunks)
+
+    monkeypatch.setattr(vectors, "copy_publication", tracking_copy)
+    await rebuilds.copy_checkpointed_vectors(
+        claimed.generation_id,
+        claimed.vector_publication_id,
+        owner="coalesced-replay-takeover",
+        lease_generation=taken_over.lease_generation,
+        now=takeover_now,
+    )
+
+    assert copied == [tuple(document.id for document in documents)]
 
 
 async def test_publication_batches_relational_deletes_for_one_evidence_page(
@@ -3640,17 +3691,18 @@ async def test_takeover_replay_prepares_source_lookup_index_once(
     assert prepared == [claimed.vector_publication_id]
 
 
-async def test_replay_resumes_past_an_already_copied_page_under_the_same_lease(
+async def test_replay_checkpoint_and_target_survive_a_new_lease(
     store: SqliteDocStore,
     engine: AsyncEngine,
     data_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A worker that crashes and retries under its own still-valid lease does not recopy.
+    """A worker that crashes and is replaced by a new process does not recopy its prefix.
 
     Two documents replay one page at a time. The first attempt is made to crash while copying
     the second page, after the first has already copied, verified and durably checkpointed. The
-    retry, still holding the same lease, must copy only the second.
+    successor claims a new lease generation and must copy only the second into the same durable
+    target. Once complete, another lease can continue using that target without replay at all.
     """
     monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 1)
     rebuilds, vectors, claimed, documents, _ = await _two_document_generation(
@@ -3694,8 +3746,24 @@ async def test_replay_resumes_past_an_already_copied_page_under_the_same_lease(
     async with sessions() as session:
         row = (await session.execute(select(models.DerivedGeneration))).scalar_one()
         assert row.replay_lease_generation == taken_over.lease_generation
+        assert row.replay_source_publication_id == claimed.vector_publication_id
+        assert row.replay_target_publication_id == taken_over.vector_publication_id
         assert row.replay_checkpoint_sequence == 0
         assert row.replayed_vector_count == 1
+        replay_target = row.replay_target_publication_id
+
+    successor_now = takeover_now + timedelta(minutes=6)
+    successor = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "replay-three",
+        now=successor_now,
+        expires_at=successor_now + timedelta(minutes=5),
+    )
+    assert successor.lease_generation == taken_over.lease_generation + 1
+    assert successor.predecessor_vector_publication_id == claimed.vector_publication_id
+    assert successor.replayed_items == 1
+    assert successor.replayed_vectors == 1
+    assert successor.vector_publication_id == replay_target
 
     copied.clear()
     monkeypatch.setattr(vectors, "copy_publication", original_copy)
@@ -3711,11 +3779,24 @@ async def test_replay_resumes_past_an_already_copied_page_under_the_same_lease(
     await rebuilds.copy_checkpointed_vectors(
         claimed.generation_id,
         claimed.vector_publication_id,
-        owner="replay-two",
-        lease_generation=taken_over.lease_generation,
-        now=takeover_now,
+        owner="replay-three",
+        lease_generation=successor.lease_generation,
+        now=successor_now,
     )
     assert resumed_copies == [documents[1].id], "resume must not recopy the checkpointed page"
+
+    completed = await rebuilds.checkpoint(claimed.generation_id)
+    assert completed.vector_publication_id == replay_target
+    final_owner_now = successor_now + timedelta(minutes=6)
+    final_owner = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "replay-four",
+        now=final_owner_now,
+        expires_at=final_owner_now + timedelta(minutes=5),
+    )
+    assert final_owner.predecessor_vector_publication_id is None
+    assert not final_owner.takeover_replay
+    assert final_owner.vector_publication_id == replay_target
 
 
 async def test_last_progress_at_is_distinct_from_lease_renewal(
@@ -3795,9 +3876,8 @@ async def _replayable_takeover(
 ) -> tuple[SqliteRebuildStore, LanceVectorStore, RebuildCheckpoint, RebuildCheckpoint, str]:
     """A generation with ``items`` staged replacements and a fresh short-leased takeover.
 
-    Several items rather than one because replay pages per item: a single-item checkpoint
-    replays in one bounded copy and can never outlive any lease, which is exactly the shape
-    the existing takeover coverage already has and the shape this defect hides behind.
+    Several items let lease tests force several one-vector pages without constructing one
+    artificial giant document.
     """
     run_id, blob_ref, raw = await promoted_snapshot(store, engine, data_dir)
     embed = EmbedFingerprint(
@@ -3912,6 +3992,7 @@ async def test_replay_enforces_the_lease_it_was_handed_rather_than_extending_it(
     same replay with a heartbeat over it, and
     ``tests/ingest/test_generation_rebuild.py`` covers the worker that now provides one.
     """
+    monkeypatch.setattr(rebuild_storage, "_VECTOR_VALIDATION_PAGE", 1)
     rebuilds, vectors, first, second, generation_id = await _replayable_takeover(
         store, engine, data_dir, items=6, lease_seconds=5
     )
@@ -3956,6 +4037,7 @@ async def test_replay_across_several_leases_completes_when_the_lease_is_renewed(
     scheduling luck, but a genuine second task writing to SQLite while replay is mid-page, which
     is the contention an inline renewal would quietly avoid testing.
     """
+    monkeypatch.setattr(rebuild_storage, "_VECTOR_VALIDATION_PAGE", 1)
     lease_seconds = 5
     rebuilds, vectors, first, second, generation_id = await _replayable_takeover(
         store, engine, data_dir, items=6, lease_seconds=lease_seconds

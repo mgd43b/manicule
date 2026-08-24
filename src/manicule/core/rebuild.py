@@ -259,10 +259,17 @@ class RebuildCheckpoint(BaseModel):
     diagnostic_count: int = Field(default=0, ge=0)
     storage_diagnostic: RebuildStorageDiagnostic | None = None
     predecessor_vector_publication_id: str | None = None
+    # A takeover replay may deliberately retain its insert-only physical namespace across
+    # lease generations.  Keep the namespace selected by durable storage on the checkpoint;
+    # deriving it from the latest lease would send resumed staging into a different table
+    # partition than the replay cursor describes.
+    staging_vector_publication_id: str | None = None
 
     @property
     def vector_publication_id(self) -> str:
-        """Lease-fenced physical namespace for this invocation's vector mutations."""
+        """Physical namespace selected for this invocation's vector mutations."""
+        if self.staging_vector_publication_id is not None:
+            return self.staging_vector_publication_id
         if self.lease_owner is None or self.lease_generation <= 0:
             raise ValueError("generation has no claimed vector publication")
         return vector_publication_id(self.generation_id, self.lease_owner, self.lease_generation)

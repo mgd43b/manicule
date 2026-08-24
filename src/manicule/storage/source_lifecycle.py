@@ -46,6 +46,7 @@ class GenerationPublication:
 
     generation_id: str
     vector_publication_id: str | None
+    replay_target_publication_id: str | None
     expected_vector_table: str | None
 
 
@@ -467,6 +468,7 @@ class SourceLifecycleMixin(WorkspaceScoped):
                         select(
                             models.DerivedGeneration.id,
                             models.DerivedGeneration.vector_publication_id,
+                            models.DerivedGeneration.replay_target_publication_id,
                             models.DerivedGeneration.expected_vector_table,
                         )
                         .where(
