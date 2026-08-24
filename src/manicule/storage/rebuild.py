@@ -968,16 +968,16 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildStorageBackendError from exc
             except (ManiculeError, ValueError) as exc:
                 raise RebuildPublicationValidationError from exc
-        checkpoint_sequence: int | None = None
+        expected_next_sequence: int | None = None
         while True:
             if cancel is not None and cancel.is_set():
                 raise asyncio.CancelledError
             async with self._sessions() as session:
                 generation = await self._required_generation(session, generation_id)
                 self._require_lease(generation, owner, lease_generation, now)
-                if checkpoint_sequence is None:
-                    checkpoint_sequence = generation.next_sequence
-                elif generation.next_sequence != checkpoint_sequence:
+                if expected_next_sequence is None:
+                    expected_next_sequence = generation.next_sequence
+                elif generation.next_sequence != expected_next_sequence:
                     raise RebuildLeaseConflictError("checkpoint advanced during vector replay")
                 target = RebuildTarget.model_validate(generation.target)
                 rows = list(
@@ -1054,7 +1054,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         async with self._sessions.begin() as session:
             generation = await self._required_generation(session, generation_id)
             self._require_lease(generation, owner, lease_generation, live_clock())
-            if generation.next_sequence != checkpoint_sequence:
+            if generation.next_sequence != expected_next_sequence:
                 raise RebuildLeaseConflictError("checkpoint advanced during vector replay")
             generation.vector_publication_id = target_publication
             if (
