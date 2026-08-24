@@ -862,7 +862,9 @@ class _Sync:
     report: RunReport
     limit: int | None
     acquire_only: bool
+    retain_source_bytes: bool
     watermark: Watermark | None
+    blobs: BlobSink
     refs: Conveyor[DiscoveredDoc | AcquisitionRecord]
     """Journal reader to fetch. Carries references, so depth costs metadata rather than bodies."""
 
@@ -966,6 +968,7 @@ class IngestPipeline:
         glossary: GlossaryWriter | None = None,
         detect_glossary: bool = True,
         acquisitions: AcquisitionStore | None = None,
+        retain_source_bytes: bool | None = None,
         acquisition_lease_s: float = 300.0,
         acquisition_clock: Callable[[], datetime] | None = None,
         acquisition_history_s: float = 30 * 24 * 3600.0,
@@ -993,6 +996,11 @@ class IngestPipeline:
         # stores and unit tests. Production wires the SQLite acquisition store here, making the
         # blob-backed snapshot path the normal connector topology rather than structural guesswork.
         self._acquisitions = acquisitions
+        self._retain_source_bytes = (
+            blobs is not None or acquisitions is not None
+            if retain_source_bytes is None
+            else retain_source_bytes
+        )
         self._fenced_store = (
             store if acquisitions is not None and isinstance(store, FencedIngestStore) else None
         )
@@ -1183,9 +1191,11 @@ class IngestPipeline:
     # --- a run: three stages, two bounded hand-offs -----------------------------------------
 
     async def _start_acquisition(
-        self, connector: Connector, watermark: Watermark | None
+        self,
+        connector: Connector,
+        watermark: Watermark | None,
+        acquisitions: AcquisitionStore | None,
     ) -> _AcquisitionStart:
-        acquisitions = self._acquisitions
         if acquisitions is None:
             return _AcquisitionStart(watermark=watermark)
         source_scope, scope_fingerprint = snapshot_scope(connector)
@@ -1248,6 +1258,7 @@ class IngestPipeline:
         limit: int | None = None,
         watching: Watching | None = None,
         acquire_only: bool = False,
+        retain_source_bytes: bool | None = None,
     ) -> RunReport:
         """Run one complete sync under the runtime-wide reset/publication barrier."""
         async with self._mutation_guard():
@@ -1257,6 +1268,7 @@ class IngestPipeline:
                 limit=limit,
                 watching=watching,
                 acquire_only=acquire_only,
+                retain_source_bytes=retain_source_bytes,
             )
 
     async def _run_guarded(  # noqa: PLR0912, PLR0915 - orchestrates durable recovery stages
@@ -1266,6 +1278,7 @@ class IngestPipeline:
         limit: int | None = None,
         watching: Watching | None = None,
         acquire_only: bool = False,
+        retain_source_bytes: bool | None = None,
     ) -> RunReport:
         """Ingest everything a connector reports as changed since its watermark.
 
@@ -1317,32 +1330,43 @@ class IngestPipeline:
         if not acquire_only and not self._derivation_enabled:
             msg = "this runtime was assembled for source acquisition only"
             raise RuntimeError(msg)
-        if acquire_only and self._acquisitions is None:
+        retain = self._retain_source_bytes if retain_source_bytes is None else retain_source_bytes
+        if acquire_only and (not retain or self._acquisitions is None):
             msg = "acquire-only requires durable source-byte retention"
             raise RuntimeError(msg)
-        if self._acquisitions is not None:
+        acquisitions = self._acquisitions if retain else None
+        if acquisitions is None and self._acquisitions is not None:
+            # A durable run owns its retention policy until it settles. This is what lets an
+            # interrupted run resume safely after configuration changes; the new policy takes
+            # effect when the next run starts, not halfway through the old snapshot.
+            active = await self._acquisitions.latest_unsettled_acquisition_run(connector.name)
+            if active is not None:
+                acquisitions = self._acquisitions
+        run_retention = retain or acquisitions is not None
+        blobs: BlobSink = self._blobs if run_retention else NoRetention()
+        if acquisitions is not None:
             # Settled journal rows are diagnostic history, not recovery input. Bound this pass
             # so starting one connector cannot monopolize the workspace writer. Active work on
             # the authoritative run never ages out; superseded work may, because its incremented
             # generation makes it impossible to resume. Blob collection remains its own
             # mark-and-sweep operation.
             now = self._acquisition_clock()
-            if await self._blobs.reconcile_acquisition_markers():
-                await self._acquisitions.cleanup_acquisition_history(
+            if await blobs.reconcile_acquisition_markers():
+                await acquisitions.cleanup_acquisition_history(
                     now - timedelta(seconds=self._acquisition_history_s),
                     limit=self._acquisition_cleanup_batch,
                 )
         report = RunReport(connector=connector.name)
         report.full_inventory_authority = snapshot_full_inventory_authority(connector)
-        if self._acquisitions is not None:
+        if acquisitions is not None:
             _, scope_fingerprint = snapshot_scope(connector)
-            watermark = await self._acquisitions.get_acquisition_watermark(
+            watermark = await acquisitions.get_acquisition_watermark(
                 connector.name, scope_fingerprint
             )
         else:
             watermark = await self._store.get_watermark(connector.name)
         try:
-            acquisition = await self._start_acquisition(connector, watermark)
+            acquisition = await self._start_acquisition(connector, watermark, acquisitions)
         except CapacityRefusedError as error:
             report.enumeration_completed = False
             report.refuse_capacity(error)
@@ -1355,8 +1379,10 @@ class IngestPipeline:
             report=report,
             limit=limit,
             acquire_only=acquire_only,
+            retain_source_bytes=run_retention,
             watching=watching,
             watermark=acquisition.watermark,
+            blobs=blobs,
             refs=Conveyor(
                 name="fetch",
                 capacity=ref_capacity,
@@ -1368,7 +1394,7 @@ class IngestPipeline:
                 consumers=self._ingest_workers,
                 producers=self._fetch_workers,
             ),
-            acquisitions=self._acquisitions,
+            acquisitions=acquisitions,
             acquisition_run_id=acquisition.run_id,
             lease_owner=acquisition.owner,
             lease_generation=acquisition.generation,
@@ -2345,7 +2371,7 @@ class IngestPipeline:
 
             existing = await self._store.find_document(run.connector.name, record.source.source_id)
             discovered = self._discovered(record)
-            if self._unchanged_by_token(existing, discovered):
+            if self._unchanged_by_token(existing, discovered, require_original=True):
                 reusable = await self._validated_reusable_snapshot(run, record)
                 if reusable is not None:
                     await self._keep_acquisition_lease_live(
@@ -2375,18 +2401,18 @@ class IngestPipeline:
 
             try:
                 stage_key = f"{run.acquisition_run_id}\0{record.source.source_id}"
-                staged = await self._blobs.resume_acquisition(stage_key)
+                staged = await run.blobs.resume_acquisition(stage_key)
                 if staged is None:
                     raw = await self._fetch(run.connector, record.source.ref)
                     fetched_version = self._validated_fetched_version(
                         run.connector, record.source, raw
                     )
                     retained, acquired_source = await self._retain_acquisition(
-                        stage_key, raw, record.source.source_id
+                        run, stage_key, raw, record.source.source_id
                     )
                 else:
                     retained, acquired_source = staged
-                    data = await self._blobs.get(retained.ref or "")
+                    data = await run.blobs.get(retained.ref or "")
                     raw = self._staged_raw(acquired_source, data)
                     fetched_version = self._validated_fetched_version(
                         run.connector, record.source, raw
@@ -2435,7 +2461,7 @@ class IngestPipeline:
                 acquired_source=acquired_source,
                 fetched_version_token=fetched_version,
             )
-            await self._blobs.complete_acquisition(stage_key)
+            await run.blobs.complete_acquisition(stage_key)
 
     async def _validated_reusable_snapshot(
         self, run: _Sync, record: AcquisitionRecord
@@ -2464,7 +2490,7 @@ class IngestPipeline:
         if reusable is None or reusable.acquired_source is None:
             return None
         try:
-            reused_data = await self._blobs.get(reusable.blob_ref or "")
+            reused_data = await run.blobs.get(reusable.blob_ref or "")
             if reused_data is None:
                 return None
             reusable.acquired_source.raw(reused_data)
@@ -2492,7 +2518,7 @@ class IngestPipeline:
         if reusable is None or reusable.acquired_source is None:
             return None
         try:
-            reused_data = await self._blobs.get(reusable.blob_ref or "")
+            reused_data = await run.blobs.get(reusable.blob_ref or "")
             if reused_data is None:
                 return None
             reusable.acquired_source.raw(reused_data)
@@ -2538,13 +2564,13 @@ class IngestPipeline:
         )
 
     async def _retain_acquisition(
-        self, key: str, raw: RawDocument, expected_source_id: str
+        self, run: _Sync, key: str, raw: RawDocument, expected_source_id: str
     ) -> tuple[Retention, AcquiredSource]:
         """Validate identity, durably retain bytes, and bind the returned digest."""
         if raw.source_id != expected_source_id:
             msg = "the fetched source identity did not match its journal record"
             raise ValueError(msg)
-        retained, acquired_source = await self._blobs.retain_acquisition(key, raw)
+        retained, acquired_source = await run.blobs.retain_acquisition(key, raw)
         if retained.ref is None:
             msg = "source bytes were not retained"
             raise _AcquisitionRetentionError(msg)
@@ -2679,7 +2705,7 @@ class IngestPipeline:
                         now=now,
                     )
                 try:
-                    raw = await self._raw_from_acquisition(record)
+                    raw = await self._raw_from_acquisition(run, record)
                 except Exception as exc:  # noqa: BLE001 - safe typed retry outcome
                     diagnostic = _snapshot_diagnostic(exc)
                     await acquisitions.transition_acquisition_record(
@@ -2712,19 +2738,24 @@ class IngestPipeline:
                         existing=existing,
                         acquisition_record=record,
                         retention=Retention(ref=record.blob_ref),
-                        force=retrying,
+                        force=(
+                            retrying
+                            or (existing is not None and existing.original_ref is None)
+                        ),
                     )
                 )
         finally:
             bodies.finish()
 
-    async def _raw_from_acquisition(self, record: AcquisitionRecord) -> RawDocument:
+    async def _raw_from_acquisition(
+        self, run: _Sync, record: AcquisitionRecord
+    ) -> RawDocument:
         """Load and verify a journal-owned blob before local derivation sees it."""
         if record.blob_ref is None or record.acquired_source is None:
             msg = "the acquired source snapshot is unavailable"
             raise _MissingAcquisitionSnapshotError(msg)
         try:
-            data = await self._blobs.get(record.blob_ref)
+            data = await run.blobs.get(record.blob_ref)
         except Exception as exc:
             msg = "the acquired source snapshot could not be read"
             raise _CorruptAcquisitionSnapshotError(msg) from exc
@@ -2826,7 +2857,11 @@ class IngestPipeline:
                     else None
                 )
                 try:
-                    accepted = await self._accept(run.connector, discovered)
+                    accepted = await self._accept(
+                        run.connector,
+                        discovered,
+                        require_original=run.retain_source_bytes,
+                    )
                 finally:
                     if fence_token is not None:
                         _publication_fence.reset(fence_token)
@@ -2918,6 +2953,7 @@ class IngestPipeline:
                     retention=fetched.retention,
                     force=fetched.force,
                     force_members=fetched.force,
+                    blobs=run.blobs,
                 )
             finally:
                 if fence_token is not None:
@@ -3097,7 +3133,11 @@ class IngestPipeline:
         )
 
     async def _accept(
-        self, connector: Connector, discovered: DiscoveredDoc
+        self,
+        connector: Connector,
+        discovered: DiscoveredDoc,
+        *,
+        require_original: bool = False,
     ) -> DocumentOutcome | _Fetched:
         """Decide whether a discovered document is worth fetching, and fetch it if it is.
 
@@ -3114,7 +3154,9 @@ class IngestPipeline:
         source_id = discovered.source_id
         existing = await self._store.find_document(source, source_id)
 
-        if self._unchanged_by_token(existing, discovered):
+        if self._unchanged_by_token(
+            existing, discovered, require_original=require_original
+        ):
             await self._record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
             return DocumentOutcome(
                 source_id=source_id,
@@ -3135,7 +3177,12 @@ class IngestPipeline:
                 f"{type(exc).__name__}: source fetch failed",
             )
 
-        return _Fetched(raw=raw, discovered=discovered, existing=existing)
+        return _Fetched(
+            raw=raw,
+            discovered=discovered,
+            existing=existing,
+            force=(require_original and existing is not None and existing.original_ref is None),
+        )
 
     async def ingest_raw(
         self,
@@ -3149,6 +3196,7 @@ class IngestPipeline:
         expected: DocumentRevision | None = None,
         retention: Retention | None = None,
         force_members: bool = False,
+        blobs: BlobSink | None = None,
     ) -> list[DocumentOutcome]:
         """Publish fetched bytes under the runtime-wide reset/publication barrier."""
         async with self._mutation_guard():
@@ -3163,6 +3211,7 @@ class IngestPipeline:
                 expected=expected,
                 retention=retention,
                 force_members=force_members,
+                blobs=blobs,
             )
 
     async def _assert_current_reset_epoch(self) -> None:
@@ -3185,6 +3234,7 @@ class IngestPipeline:
         expected: DocumentRevision | None = None,
         retention: Retention | None = None,
         force_members: bool = False,
+        blobs: BlobSink | None = None,
     ) -> list[DocumentOutcome]:
         """Everything from fetched bytes onwards, including anything found inside.
 
@@ -3227,6 +3277,7 @@ class IngestPipeline:
             force=force,
             expected=expected,
             retention=retention,
+            blobs=blobs,
         )
         outcomes = [outcome]
         queue: list[MemberOutcome] = list(members)
@@ -3246,6 +3297,7 @@ class IngestPipeline:
                 title=_member_title(member),
                 existing=member_existing,
                 force=retry_member,
+                blobs=blobs,
             )
             outcomes.append(inner)
             queue.extend(deeper)
@@ -3262,6 +3314,7 @@ class IngestPipeline:
         force: bool = False,
         expected: DocumentRevision | None = None,
         retention: Retention | None = None,
+        blobs: BlobSink | None = None,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """One document, and whatever it turned out to contain."""
         source_bytes = raw.as_bytes()
@@ -3305,6 +3358,7 @@ class IngestPipeline:
                     existing=existing,
                     expected=expected,
                     retention=retention,
+                    blobs=blobs,
                 )
             except _SupersededError as moved:
                 # Nothing was written, by construction: the guard fires on the first write this
@@ -3334,6 +3388,7 @@ class IngestPipeline:
         existing: Document | None,
         expected: DocumentRevision | None,
         retention: Retention | None,
+        blobs: BlobSink | None,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """The part of one document's ingest that writes, under the lock and the guard.
 
@@ -3351,7 +3406,7 @@ class IngestPipeline:
         # `before_parse` twice, and a hook that is not idempotent would compound on every
         # repair. What is kept is the original, exactly as fetched.
         if retention is None:
-            retention = await self._retain(raw, source_bytes)
+            retention = await self._retain(raw, source_bytes, blobs=blobs)
 
         try:
             transformed = await self._middleware.before_parse(raw)
@@ -3972,7 +4027,13 @@ class IngestPipeline:
 
     # --- change detection ------------------------------------------------------------------
 
-    def _unchanged_by_token(self, existing: Document | None, discovered: DiscoveredDoc) -> bool:
+    def _unchanged_by_token(
+        self,
+        existing: Document | None,
+        discovered: DiscoveredDoc,
+        *,
+        require_original: bool = False,
+    ) -> bool:
         """Level 1: the source says nothing changed, and we believe it without fetching.
 
         The token is opaque and connector-defined — a git blob SHA, a Confluence version
@@ -3994,6 +4055,7 @@ class IngestPipeline:
             and existing.status in SETTLED
             and discovered.version_token is not None
             and existing.version_token == discovered.version_token
+            and (not require_original or existing.original_ref is not None)
             and self._parse_lineage_is_current(existing)
             and self._routing_is_current(existing, discovered.media_type)
         )
@@ -4155,7 +4217,9 @@ class IngestPipeline:
 
     # --- records ---------------------------------------------------------------------------
 
-    async def _retain(self, raw: RawDocument, source_bytes: bytes) -> Retention:
+    async def _retain(
+        self, raw: RawDocument, source_bytes: bytes, *, blobs: BlobSink | None = None
+    ) -> Retention:
         """Keep the connector's bytes, or record why they were not kept.
 
         Ordinary backend failures remain a per-document omission: the document is still
@@ -4164,7 +4228,7 @@ class IngestPipeline:
         aborts the run so a successful report cannot acknowledge bytes that were not retained.
         """
         try:
-            return await self._blobs.retain(source_bytes, raw.media_type)
+            return await (blobs or self._blobs).retain(source_bytes, raw.media_type)
         except CapacityRefusedError:
             # Capacity is an operator-actionable run refusal, not a document retention policy.
             # Turning it into an omission would let direct ingest report success while durable

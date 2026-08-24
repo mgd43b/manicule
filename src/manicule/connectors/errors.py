@@ -20,6 +20,17 @@ __all__ = [
     "AttachmentTooLargeError",
     "BodyUnavailableError",
     "ConnectorError",
+    "CrawlerAddressError",
+    "CrawlerChallengeError",
+    "CrawlerMediaTypeError",
+    "CrawlerPolicyError",
+    "CrawlerRedirectError",
+    "CrawlerResponseTooLargeError",
+    "CrawlerRobotsError",
+    "CrawlerScopeError",
+    "CrawlerThrottleError",
+    "CrawlerTimeoutError",
+    "CrawlerTransportError",
     "CursorExpiredError",
     "NotFoundError",
     "PermissionDeniedError",
@@ -35,6 +46,50 @@ __all__ = [
 
 class ConnectorError(ManiculeError):
     """A connector could not do what it was asked."""
+
+
+class CrawlerPolicyError(ConnectorError):
+    """A crawler input or response violated its closed outbound-request policy."""
+
+
+class CrawlerScopeError(CrawlerPolicyError):
+    """A normalized URL is outside the connector's declared publication scope."""
+
+
+class CrawlerAddressError(CrawlerPolicyError):
+    """A destination or connected peer is not a globally routable approved address."""
+
+
+class CrawlerRedirectError(CrawlerPolicyError):
+    """A redirect would weaken transport security or exceed its bounded policy."""
+
+
+class CrawlerTransportError(CrawlerPolicyError):
+    """A bounded crawler request could not produce a usable response."""
+
+
+class CrawlerTimeoutError(CrawlerTransportError):
+    """A crawler request exhausted its bounded timeout and retry budget."""
+
+
+class CrawlerThrottleError(CrawlerTransportError):
+    """A source throttle was malformed, excessive, or remained after bounded retries."""
+
+
+class CrawlerResponseTooLargeError(CrawlerTransportError):
+    """A response crossed its wire, decoded, header, or run-wide byte ceiling."""
+
+
+class CrawlerRobotsError(CrawlerTransportError):
+    """Robots policy refused a page or could not be established safely."""
+
+
+class CrawlerChallengeError(CrawlerTransportError):
+    """A login, challenge, or error template answered where page content was expected."""
+
+
+class CrawlerMediaTypeError(CrawlerTransportError):
+    """A response media type is outside the crawler's textual allowlist."""
 
 
 class RemoteError(ConnectorError):

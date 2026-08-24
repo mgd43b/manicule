@@ -172,7 +172,7 @@ Only GitHub has a real change token. Each connector below gets proper incrementa
 | **Confluence** | full space walk, `body.storage`, **regex tag strip** | **CQL watermark** (`lastmodified > …`); **ADF** (`atlas_doc_format`) on Cloud, `body.storage` on Server/DC; ingest attachments through the parser chain | httpx against REST v2 |
 | **S3 / GCS** | listing + pageToken | `list_objects_v2` with prefix + continuation; **ETag + LastModified** as change token | `aioboto3`; `obstore`/`fsspec` for one interface over both |
 | **Swagger** | fetch, no change signal | Fetch and hash the spec; chunk **per endpoint** with parameters and schemas | httpx + `openapi-spec-validator` |
-| **Web crawler** | content hash | **Conditional GET** (ETag / If-Modified-Since) plus content hash; honor `robots.txt` | httpx + **protego** + selectolax |
+| **Web crawler** | content hash | **[Git-backed site first, then HTTP](docs/connectors/web-crawler.md)**; Conditional GET (ETag / If-Modified-Since) plus content hash; honor `robots.txt` | httpx + **protego** + selectolax |
 | **Web search** | Tavily, query time | unchanged — no sync | httpx |
 
 Plus local filesystem with watch mode (**watchfiles**, Rust-backed) and web upload.

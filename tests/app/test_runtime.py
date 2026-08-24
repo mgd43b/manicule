@@ -16,7 +16,7 @@ import asyncio
 import os
 import stat
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
 
@@ -973,9 +973,111 @@ async def test_retention_disabled_runtime_uses_the_supported_live_derivation_pat
         connector.media_types["public-no-retention"] = "text/plain"
 
         report = await pipeline.run(connector)
-        assert pipeline._acquisitions is None  # pyright: ignore[reportPrivateUsage]
         assert report.indexed == 1
         assert not report.retry_required
+        store = cast("Any", await opened.documents())
+        stored = await store.find_document(connector.name, "public-no-retention")
+        assert stored is not None
+        assert stored.original_ref is None
+
+
+async def test_connector_retention_transitions_apply_at_run_boundaries(
+    manicule_environment: Path,
+) -> None:
+    """Enabling fills a missing original; disabling leaves prior blobs uncollected."""
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        pipeline = await opened.pipeline()
+        store = cast("Any", await opened.documents())
+        connector = DictConnector({"page": "first body"}, name="policy-transition")
+        connector.media_types["page"] = "text/plain"
+
+        first = await pipeline.run(connector, retain_source_bytes=False)
+        without_original = await store.find_document(connector.name, "page")
+        assert first.indexed == 1
+        assert without_original is not None
+        assert without_original.original_ref is None
+
+        enabled = await pipeline.run(connector, retain_source_bytes=True)
+        with_original = await store.find_document(connector.name, "page")
+        assert enabled.indexed == 1
+        assert with_original is not None
+        assert with_original.original_ref is not None
+        assert connector.fetches == ["page", "page"], (
+            "missing retained bytes must defeat token skip"
+        )
+
+        retained_ref = with_original.original_ref
+        connector.documents["page"] = "second body"
+        disabled = await pipeline.run(connector, retain_source_bytes=False)
+        newest = await store.find_document(connector.name, "page")
+        assert disabled.indexed == 1
+        assert newest is not None
+        assert newest.original_ref is None
+        assert await (await opened.blobs()).get(retained_ref) == b"first body"
+
+
+async def test_acquire_only_refuses_a_connector_run_with_retention_disabled(
+    manicule_environment: Path,
+) -> None:
+    from tests.ingest.fakes import DictConnector  # noqa: PLC0415
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        with pytest.raises(RuntimeError, match="acquire-only requires"):
+            await (await opened.acquisition_pipeline()).run(
+                DictConnector({"page": "body"}, name="no-acquire"),
+                acquire_only=True,
+                retain_source_bytes=False,
+            )
+
+
+async def test_concurrent_connector_runs_keep_their_own_retention_policy(
+    manicule_environment: Path,
+) -> None:
+    """A shared pipeline may retain one site while directly indexing another."""
+    from manicule.ingest.pipeline import (  # noqa: PLC0415
+        _unlocked_derived_mutation,  # pyright: ignore[reportPrivateUsage]
+    )
+    from tests.ingest import fakes  # noqa: PLC0415
+
+    gate = fakes.Gate()
+
+    class GatedConnector(fakes.DictConnector):
+        @override
+        async def fetch(self, ref: Any) -> Any:
+            raw = await super().fetch(ref)
+            await gate.pass_through()
+            return raw
+
+    async with _runtime_with_a_buildable_pipeline(manicule_environment) as opened:
+        pipeline = await opened.pipeline()
+        store = cast("Any", await opened.documents())
+        # The runtime's reset/publication barrier is orthogonal to this pipeline-level test;
+        # served syncs share the pipeline beneath that barrier, as the concurrency suite proves.
+        pipeline._mutation_guard = _unlocked_derived_mutation  # pyright: ignore[reportPrivateUsage]
+        retained = GatedConnector({"retained": "private body"}, name="private-site")
+        direct = GatedConnector({"direct": "public body"}, name="public-site")
+        retained.media_types["retained"] = "text/plain"
+        direct.media_types["direct"] = "text/plain"
+
+        retained_task = asyncio.create_task(
+            pipeline.run(retained, retain_source_bytes=True)
+        )
+        direct_task = asyncio.create_task(pipeline.run(direct, retain_source_bytes=False))
+        try:
+            await gate.wait_for(2)
+        finally:
+            gate.open()
+        reports = await asyncio.gather(retained_task, direct_task)
+
+        private_document = await store.find_document(retained.name, "retained")
+        public_document = await store.find_document(direct.name, "direct")
+        assert all(report.indexed == 1 for report in reports)
+        assert private_document is not None
+        assert private_document.original_ref is not None
+        assert public_document is not None
+        assert public_document.original_ref is None
 
 
 async def test_turning_detection_off_in_configuration_reaches_the_pipeline(

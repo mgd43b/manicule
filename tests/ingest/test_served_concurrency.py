@@ -98,12 +98,14 @@ class PipelineIngestion:
         limit: int | None = None,
         watching: Watching | None = None,
         acquire_only: bool = False,
+        retain_source_bytes: bool | None = None,
     ) -> RunReport:
         return await self.pipeline.run(
             self.connectors[connector],
             limit=limit,
             watching=watching,
             acquire_only=acquire_only,
+            retain_source_bytes=retain_source_bytes,
         )
 
     async def connector(self, name: str) -> Connector:
@@ -146,6 +148,9 @@ def served(
     backend = FakeBackend()
     backend.ingestion_ = ingestion  # type: ignore[assignment]
     service = ApplicationService(backend)
+    # This harness deliberately has no BlobSink. Match its service-level policy to that
+    # capability so a direct warm-up sync and a proxied sync exercise the same retention mode.
+    service.settings.storage.retain_source_bytes = False
     service.settings.connectors.clear()
     for name in connectors:
         service.settings.connectors[name] = ConnectorSettings.model_validate(

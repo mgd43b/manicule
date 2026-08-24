@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING
 from manicule.connectors.config import (
     CONNECTOR_NAME,
     FILESYSTEM_CONNECTOR_NAME,
+    GIT_SITE_CONNECTOR_NAME,
     SNAPSHOT_CONNECTOR_NAME,
     ConfluenceConfig,
     ConfluenceSnapshotConfig,
     FilesystemConfig,
+    GitSiteConfig,
     resolve_credentials,
 )
 from manicule.container import keys
@@ -37,6 +39,7 @@ __all__ = [
     "build_confluence",
     "build_confluence_snapshot",
     "build_filesystem",
+    "build_git_site",
 ]
 
 
@@ -206,6 +209,20 @@ def build_confluence_snapshot(context: BuildContext) -> Connector:
     )
 
 
+def build_git_site(context: BuildContext) -> Connector:
+    """Construct the local Git-backed website connector without importing it at discovery."""
+    from manicule.connectors.git_site import GitSiteConnector  # noqa: PLC0415
+
+    settings = context.config
+    if not isinstance(settings, GitSiteConfig):
+        msg = (
+            f"connector {GIT_SITE_CONNECTOR_NAME!r} was built with "
+            f"{type(settings).__name__} where it declares GitSiteConfig."
+        )
+        raise ConfigError(msg)
+    return GitSiteConnector(settings, name=_source_name(context, GIT_SITE_CONNECTOR_NAME))
+
+
 class ConnectorsPlugin:
     """The plugin object the ``connectors`` entry point resolves to."""
 
@@ -213,7 +230,7 @@ class ConnectorsPlugin:
         name="connectors",
         version="0.1.0",
         core_version=">=0.1,<0.2",
-        summary="Sources manicule ingests from. A local directory, and Confluence for v1.",
+        summary="Sources manicule ingests from: local files, pinned Git sites, and Confluence.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:
@@ -234,6 +251,12 @@ class ConnectorsPlugin:
             build_confluence_snapshot,
             config_model=ConfluenceSnapshotConfig,
             summary="Mirrored Confluence pages from disk, keyed on page id, with no network.",
+        )
+        registry.add(
+            keys.CONNECTOR.named(GIT_SITE_CONNECTOR_NAME),
+            build_git_site,
+            config_model=GitSiteConfig,
+            summary="Pages from one pinned local Git commit, cited by their public site routes.",
         )
 
 

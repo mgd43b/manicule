@@ -164,12 +164,14 @@ class Ingesting(Protocol):
         limit: int | None = None,
         watching: Watching | None = None,
         acquire_only: bool = False,
+        retain_source_bytes: bool | None = None,
     ) -> RunReport:
         """Run one configured connector.
 
         ``watching`` is called with one sentence per document reaching a terminal outcome, so a
         caller streaming to a person can show a long sync moving. It is called from inside the
-        pipeline and must neither block nor raise.
+        pipeline and must neither block nor raise. ``retain_source_bytes`` is resolved from the
+        connector configuration at the service boundary and remains fixed for this run.
         """
         ...
 

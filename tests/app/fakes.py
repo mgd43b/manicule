@@ -798,6 +798,7 @@ class FakeIngestion:
     paths: list[Path] = field(default_factory=list[Path])
     synced: list[str] = field(default_factory=list[str])
     sync_acquire_only: list[bool] = field(default_factory=list[bool])
+    sync_retention: list[bool | None] = field(default_factory=list[bool | None])
     reindexed: list[str] = field(default_factory=list[str])
     reembed_runs: dict[str, ReembedRun] = field(default_factory=dict[str, ReembedRun])
     reembed_recoveries: int = 0
@@ -889,10 +890,12 @@ class FakeIngestion:
         limit: int | None = None,
         watching: Watching | None = None,
         acquire_only: bool = False,
+        retain_source_bytes: bool | None = None,
     ) -> RunReport:
         del limit
         self.synced.append(connector)
         self.sync_acquire_only.append(acquire_only)
+        self.sync_retention.append(retain_source_bytes)
         if self.failure is not None:
             raise self.failure
         if watching is not None:

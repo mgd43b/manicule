@@ -6,9 +6,9 @@ A connector answers three questions about a source: what has changed since last 
 out: incremental sync cannot detect a deletion, because a deleted document simply stops
 appearing, so without a reconciliation pass the index serves removed documents forever.
 
-Confluence is the source for v1. Everything specific to it — Atlassian Document Format, macro
-expansion, CQL — lives behind those three methods rather than in the protocol, so the sources
-that follow are additions rather than a rewrite.
+Everything source-specific — Git object reads, Atlassian Document Format, macro expansion, CQL —
+lives behind those three methods rather than in the protocol, so sources are additions rather
+than rewrites.
 
 Only the light half is importable from here. The connector and its HTTP client are imported by
 the factory in :mod:`manicule.connectors.plugin`, so plugin discovery — which runs in every

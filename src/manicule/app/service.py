@@ -1145,8 +1145,15 @@ class ApplicationService:
             )
             raise PolicyError(msg)
         ingestion = await self._backend.ingestion()
+        retain_source_bytes = configured.retain_source_bytes
+        if retain_source_bytes is None:
+            retain_source_bytes = self.settings.storage.retain_source_bytes
         report = await ingestion.sync(
-            name, limit=limit, watching=watching, acquire_only=acquire_only
+            name,
+            limit=limit,
+            watching=watching,
+            acquire_only=acquire_only,
+            retain_source_bytes=retain_source_bytes,
         )
         return _ingest_payload(report, started)
 
@@ -1435,6 +1442,12 @@ class ApplicationService:
                     type=configured.type,
                     enabled=configured.enabled,
                     installed=configured.type in installed if discovery else True,
+                    retain_source_bytes=configured.retain_source_bytes,
+                    effective_retain_source_bytes=(
+                        self.settings.storage.retain_source_bytes
+                        if configured.retain_source_bytes is None
+                        else configured.retain_source_bytes
+                    ),
                     last_synced_at=_text_or_none(metadata.get("last_synced_at")),
                     status=_text(metadata.get("status")),
                     documents=await store.count_documents(source=name),

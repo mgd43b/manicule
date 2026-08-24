@@ -4246,8 +4246,9 @@ async def test_served_source_deletion_recovery_reuses_exact_evidence_and_keeps_s
             limit: int | None = None,
             watching: Watching | None = None,
             acquire_only: bool = False,
+            retain_source_bytes: bool | None = None,
         ) -> RunReport:
-            del watching
+            del watching, retain_source_bytes
             selected = (
                 recovery_connector if connector == recovery_connector.name else next_connector
             )
