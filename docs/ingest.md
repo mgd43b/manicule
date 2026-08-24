@@ -1831,10 +1831,11 @@ same bounded validation/conflict envelopes and failed cleanup state. An unexpect
 is different: it keeps the checkpoint resumable and does not manufacture a validation diagnosis.
 
 **Replay and validation read relational evidence a bounded page at a time, not one document
-per round trip**, and durably checkpoint after each page. `ingest.rebuild_replay_page` and
-`ingest.rebuild_validation_page` each default to 256 documents. Vector copies and validation
-queries remain separately bounded by both bytes and 512 rows, so increasing either document page
-reduces SQLite round trips without widening a Lance operation. Every completed page commits
+per round trip**, and durably checkpoint after each page. `ingest.rebuild_replay_page` defaults
+to 256 documents; `ingest.rebuild_validation_page` defaults to the more conservative 100
+because validation deserializes every staged chunk in its document page. Vector copies and
+validation queries remain separately bounded by both bytes and 512 rows, so increasing either
+document page reduces SQLite round trips without widening a Lance operation. Every completed page commits
 a fenced checkpoint
 (`replay_lease_generation`/`replay_checkpoint_sequence`/`replayed_vector_count` for replay,
 `validation_lease_generation`/`validation_checkpoint_sequence`/`validated_vector_count` for
