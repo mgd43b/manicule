@@ -3400,33 +3400,42 @@ async def test_live_chunk_inventory_digest_streams_beyond_one_page(
     assert statements == 1
 
 
-async def test_takeover_invalidates_a_stale_validation_checkpoint(
+async def test_takeover_reuses_validation_checkpoint_after_verified_replay(
     store: SqliteDocStore,
     engine: AsyncEngine,
     data_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A checkpoint recorded under a superseded lease generation is never resumed from.
-
-    Trusting it would mean trusting page evidence checked against a physical vector namespace
-    the new owner may not even share — the same reasoning :meth:`copy_checkpointed_vectors`
-    applies to its own replay checkpoint.
-    """
+    """Verified replay transfers a durable validation prefix into the takeover namespace."""
     monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 1)
     rebuilds, vectors, claimed, documents, _ = await _two_document_generation(
         store, engine, data_dir, owner="stale-worker"
     )
-    await rebuilds.validate_generation(
-        claimed.generation_id,
-        owner="stale-worker",
-        lease_generation=claimed.lease_generation,
-        now=NOW,
-    )
+    original_page_complete = vectors.publication_page_is_complete
+
+    async def fail_on_second_validation_page(
+        publication_id: str, chunks: Sequence[Chunk], *, embedding_fingerprint: str
+    ) -> bool:
+        if chunks[0].document_id == documents[1].id:
+            return False
+        return await original_page_complete(
+            publication_id, chunks, embedding_fingerprint=embedding_fingerprint
+        )
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", fail_on_second_validation_page)
+    with pytest.raises(RebuildPublicationValidationError):
+        await rebuilds.validate_generation(
+            claimed.generation_id,
+            owner="stale-worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
     sessions = session_factory(engine)
     async with sessions() as session:
         before = (await session.execute(select(models.DerivedGeneration))).scalar_one()
         assert before.validation_lease_generation == claimed.lease_generation
-        assert before.validation_checkpoint_sequence == 1
+        assert before.validation_checkpoint_sequence == 0
+        assert before.validated_vector_count == 1
 
     # Past `_two_document_generation`'s own claim expiry (real time plus five minutes), so this
     # is a genuine takeover rather than a live-owner conflict.
@@ -3438,6 +3447,32 @@ async def test_takeover_invalidates_a_stale_validation_checkpoint(
         expires_at=takeover_now + timedelta(minutes=5),
     )
     assert taken_over.lease_generation == claimed.lease_generation + 1
+    assert taken_over.validated_items == 0
+
+    original_copy = vectors.copy_publication
+
+    async def fail_replay(
+        source_publication_id: str, target_publication_id: str, chunks: Sequence[Chunk]
+    ) -> None:
+        if chunks[0].document_id == documents[1].id:
+            raise VectorStoreStateError("private replay failure /private/path")
+        await original_copy(source_publication_id, target_publication_id, chunks)
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", original_page_complete)
+    monkeypatch.setattr(vectors, "copy_publication", fail_replay)
+    with pytest.raises(RebuildPublicationValidationError):
+        await rebuilds.copy_checkpointed_vectors(
+            claimed.generation_id,
+            claimed.vector_publication_id,
+            owner="new-worker",
+            lease_generation=taken_over.lease_generation,
+            now=takeover_now,
+        )
+    assert (await rebuilds.checkpoint(claimed.generation_id)).validated_items == 0, (
+        "an incomplete replay must not promote superseded validation evidence"
+    )
+
+    monkeypatch.setattr(vectors, "copy_publication", original_copy)
     await rebuilds.copy_checkpointed_vectors(
         claimed.generation_id,
         claimed.vector_publication_id,
@@ -3445,6 +3480,9 @@ async def test_takeover_invalidates_a_stale_validation_checkpoint(
         lease_generation=taken_over.lease_generation,
         now=takeover_now,
     )
+    replayed = await rebuilds.checkpoint(claimed.generation_id)
+    assert replayed.validated_items == 1
+    assert replayed.validated_vectors == 1
     # A takeover's claim resets state to `BUILDING`, exactly as it does the document loop's own
     # checkpoint — replay is one more thing a new owner must redo before it may re-enter
     # validation.
@@ -3454,7 +3492,6 @@ async def test_takeover_invalidates_a_stale_validation_checkpoint(
         lease_generation=taken_over.lease_generation,
         now=takeover_now,
     )
-    original_page_complete = vectors.publication_page_is_complete
     seen: list[str] = []
 
     async def tracking_page_complete(
@@ -3472,9 +3509,7 @@ async def test_takeover_invalidates_a_stale_validation_checkpoint(
         lease_generation=taken_over.lease_generation,
         now=takeover_now,
     )
-    assert seen == [documents[0].id, documents[1].id], (
-        "a stale checkpoint from a superseded lease generation must not be trusted"
-    )
+    assert seen == [documents[1].id], "validation must resume after the replayed durable prefix"
 
 
 async def test_replay_resumes_past_an_already_copied_page_under_the_same_lease(

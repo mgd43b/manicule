@@ -261,9 +261,9 @@ def _vector_pages(chunks: Sequence[Chunk], *, max_bytes: int) -> Iterator[tuple[
 def _checkpoint(
     row: models.DerivedGeneration, *, predecessor_vector_publication_id: str | None = None
 ) -> RebuildCheckpoint:
-    # A checkpoint recorded under a lease generation other than the row's current one belongs
-    # to a superseded attempt — a takeover replays or validates into a fresh physical namespace,
-    # so that count is not this generation's progress and must read as zero rather than stale.
+    # Only a checkpoint bound to the current lease is reportable. A takeover initially names a
+    # fresh, empty physical namespace, so superseded validation progress reads as zero until a
+    # complete verified replay explicitly promotes it to the new lease.
     replay_current = row.replay_lease_generation == row.lease_generation
     validation_current = row.validation_lease_generation == row.lease_generation
     current_publication = (
@@ -945,6 +945,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         async with self._sessions() as session:
             generation = await self._required_generation(session, generation_id)
             self._require_lease(generation, owner, lease_generation, now)
+            source_is_certified = generation.vector_publication_id == source_publication_id
             # A checkpoint is only trustworthy under the lease generation that wrote it: that
             # is what named `target_publication` above, so a matching record means this call is
             # resuming the same in-progress copy into the same physical namespace rather than
@@ -1044,6 +1045,19 @@ class SqliteRebuildStore(WorkspaceScoped):
             if generation.next_sequence != checkpoint_sequence:
                 raise RebuildLeaseConflictError("checkpoint advanced during vector replay")
             generation.vector_publication_id = target_publication
+            if (
+                source_is_certified
+                and generation.validation_lease_generation is not None
+                and generation.validation_checkpoint_sequence is not None
+                and generation.validation_checkpoint_sequence < generation.next_sequence
+                and generation.validated_vector_count <= expected_vectors
+            ):
+                # The checkpoint's evidence describes immutable staged items. Replay has now
+                # copied those items from the generation's certified predecessor, proved every
+                # target page readable, and proved the target's exact final row count. That is
+                # the missing physical-namespace proof, so the logical validation prefix can be
+                # rebound without querying it from Lance a second time.
+                generation.validation_lease_generation = lease_generation
             generation.updated_at = live_clock()
 
     async def _commit_replay_checkpoint(
