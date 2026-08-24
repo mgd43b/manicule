@@ -3512,6 +3512,134 @@ async def test_takeover_reuses_validation_checkpoint_after_verified_replay(
     assert seen == [documents[1].id], "validation must resume after the replayed durable prefix"
 
 
+async def test_takeover_replay_refuses_mutated_staged_validation_evidence(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """Replay cannot promote a checkpoint after its staged payload proof has changed."""
+    rebuilds, _vectors, claimed, _documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="payload-proof-worker"
+    )
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="payload-proof-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    async with session_factory(engine).begin() as session:
+        await session.execute(
+            update(models.DerivedGenerationItem)
+            .where(
+                models.DerivedGenerationItem.generation_id == claimed.generation_id,
+                models.DerivedGenerationItem.sequence == 0,
+            )
+            .values(payload_digest="corrupt-staged-payload-proof")
+        )
+
+    takeover_now = datetime.now(UTC) + timedelta(minutes=10)
+    taken_over = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "payload-proof-takeover",
+        now=takeover_now,
+        expires_at=takeover_now + timedelta(minutes=5),
+    )
+    with pytest.raises(RebuildPublicationValidationError):
+        await rebuilds.copy_checkpointed_vectors(
+            claimed.generation_id,
+            claimed.vector_publication_id,
+            owner="payload-proof-takeover",
+            lease_generation=taken_over.lease_generation,
+            now=takeover_now,
+        )
+    assert (await rebuilds.checkpoint(claimed.generation_id)).validated_items == 0
+
+
+async def test_fully_replayed_validation_checkpoint_skips_lance_index_setup(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fully promoted validation checkpoint needs only the final exact row count."""
+    rebuilds, vectors, claimed, _documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="complete-validation-worker"
+    )
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="complete-validation-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    takeover_now = datetime.now(UTC) + timedelta(minutes=10)
+    taken_over = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "complete-validation-takeover",
+        now=takeover_now,
+        expires_at=takeover_now + timedelta(minutes=5),
+    )
+    await rebuilds.copy_checkpointed_vectors(
+        claimed.generation_id,
+        claimed.vector_publication_id,
+        owner="complete-validation-takeover",
+        lease_generation=taken_over.lease_generation,
+        now=takeover_now,
+    )
+    await rebuilds.begin_validation(
+        claimed.generation_id,
+        owner="complete-validation-takeover",
+        lease_generation=taken_over.lease_generation,
+        now=takeover_now,
+    )
+
+    async def unexpected_index_setup(_publication_id: str) -> None:
+        pytest.fail("fully checkpointed validation must not rebuild the Lance lookup index")
+
+    monkeypatch.setattr(vectors, "prepare_publication_validation", unexpected_index_setup)
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="complete-validation-takeover",
+        lease_generation=taken_over.lease_generation,
+        now=takeover_now,
+    )
+
+
+async def test_takeover_replay_prepares_source_lookup_index_once(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exact-ID replay probes prepare the sealed source index, but a completed retry does not."""
+    monkeypatch.setattr(rebuild_storage, "_VECTOR_VALIDATION_PAGE", 1)
+    rebuilds, vectors, claimed, _documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="indexed-replay-worker"
+    )
+    takeover_now = datetime.now(UTC) + timedelta(minutes=10)
+    taken_over = await rebuilds.claim_generation(
+        claimed.generation_id,
+        "indexed-replay-takeover",
+        now=takeover_now,
+        expires_at=takeover_now + timedelta(minutes=5),
+    )
+    prepared: list[str] = []
+
+    async def track_index(publication_id: str) -> None:
+        prepared.append(publication_id)
+
+    monkeypatch.setattr(vectors, "prepare_publication_validation", track_index)
+    for _ in range(2):
+        await rebuilds.copy_checkpointed_vectors(
+            claimed.generation_id,
+            claimed.vector_publication_id,
+            owner="indexed-replay-takeover",
+            lease_generation=taken_over.lease_generation,
+            now=takeover_now,
+        )
+
+    assert prepared == [claimed.vector_publication_id]
+
+
 async def test_replay_resumes_past_an_already_copied_page_under_the_same_lease(
     store: SqliteDocStore,
     engine: AsyncEngine,

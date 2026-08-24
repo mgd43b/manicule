@@ -957,6 +957,17 @@ class SqliteRebuildStore(WorkspaceScoped):
                 else -1
             )
             expected_vectors = generation.replayed_vector_count if resumable else 0
+            replay_has_rows = after + 1 < generation.next_sequence
+            replay_needs_index = (
+                replay_has_rows and generation.chunks_built > _VECTOR_VALIDATION_PAGE
+            )
+        if replay_needs_index:
+            try:
+                await self._required_vectors().prepare_publication_validation(source_publication_id)
+            except VectorStoreStateError as exc:
+                raise RebuildStorageBackendError from exc
+            except (ManiculeError, ValueError) as exc:
+                raise RebuildPublicationValidationError from exc
         checkpoint_sequence: int | None = None
         while True:
             if cancel is not None and cancel.is_set():
@@ -993,6 +1004,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                     replacement = _REPLACEMENT.validate_python(row.payload)
                 except (RuntimeError, ValueError) as exc:
                     raise RebuildPublicationValidationError from exc
+                self._validate_staged_replacement(row, replacement)
                 chunks = replacement.flattened_chunks()
                 expected_vectors += len(chunks)
                 for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
@@ -1332,7 +1344,11 @@ class SqliteRebuildStore(WorkspaceScoped):
         physical_publication = vector_publication_id(
             generation_id, effective_owner, effective_lease_generation
         )
-        if validating:
+        if (
+            validating
+            and after + 1 < expected_item_count
+            and generation.chunks_built > _VECTOR_VALIDATION_PAGE
+        ):
             try:
                 await self._required_vectors().prepare_publication_validation(physical_publication)
             except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
@@ -2466,12 +2482,24 @@ class SqliteRebuildStore(WorkspaceScoped):
         snapshot: models.AcquisitionRecord,
         replacement: DerivedReplacement,
     ) -> None:
+        self._validate_staged_replacement(row, replacement)
+        try:
+            self._require_snapshot_match(replacement, snapshot)
+        except RebuildPublicationValidationError:
+            raise
+        except (RuntimeError, ValueError) as exc:
+            raise RebuildPublicationValidationError from exc
+
+    @staticmethod
+    def _validate_staged_replacement(
+        row: models.DerivedGenerationItem, replacement: DerivedReplacement
+    ) -> None:
+        """Verify immutable staged evidence before replay or validation trusts its chunks."""
         digest = hashlib.sha256(_canonical(row.payload)).hexdigest()
         if digest != row.payload_digest:
             raise RebuildPublicationValidationError
         try:
             replacement.validate_identity()
-            self._require_snapshot_match(replacement, snapshot)
         except RebuildPublicationValidationError:
             raise
         except (RuntimeError, ValueError) as exc:
