@@ -3357,6 +3357,47 @@ async def test_publication_batches_relational_deletes_for_one_evidence_page(
     assert deletes == {"chunks": 1, "glossary_entries": 1}
 
 
+async def test_live_chunk_inventory_digest_streams_beyond_one_page(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The final publication inventory uses one cursor, rather than keyset-querying each page."""
+    for index in range(101):
+        document = make_document(
+            source="wiki",
+            source_id=f"inventory-stream-{index:03d}",
+            body=f"inventory document {index}".encode(),
+            uri=f"https://wiki.example.test/inventory/{index}",
+            media_type="text/plain",
+        )
+        await store.upsert_document(document)
+        await store.replace_chunks(
+            document.id, [make_chunk(document, 0, f"inventory document {index}")]
+        )
+    rebuilds = SqliteRebuildStore(
+        engine, workspace_id=store.workspace_id, blobs=BlobStore(engine, data_dir)
+    )
+    statements = 0
+
+    def count_statements(*args: object) -> None:
+        nonlocal statements
+        if isinstance(args[2], str):
+            statements += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_statements)
+    try:
+        async with session_factory(engine)() as session:
+            digest = await rebuilds._live_chunk_inventory_digest(  # pyright: ignore[reportPrivateUsage]
+                session
+            )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_statements)
+
+    assert digest
+    assert statements == 1
+
+
 async def test_takeover_invalidates_a_stale_validation_checkpoint(
     store: SqliteDocStore,
     engine: AsyncEngine,

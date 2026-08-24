@@ -1849,7 +1849,8 @@ heartbeat alone, so a healthy renewal against a stalled cursor cannot read as co
 Publication uses the same evidence-page boundary: it fetches the page's existing documents once,
 then applies the document, chunk and glossary replacement in set-wise phases. This avoids a
 SQLite lookup/delete/flush cycle per document while preserving the single all-or-nothing
-publication transaction and its FTS triggers.
+publication transaction and its FTS triggers. The resulting active-vector inventory is then
+hashed in order through one bounded streaming cursor, rather than one SQLite query per chunk page.
 
 Before a sealed rebuild enters validation, Manicule builds its managed B-tree over physical
 `chunk_id` values. Validation's 512-row exact-id probes can then seek the staged rows instead of

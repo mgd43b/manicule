@@ -1791,51 +1791,31 @@ class SqliteRebuildStore(WorkspaceScoped):
     async def _live_chunk_inventory_digest(self, session: AsyncSession) -> str:
         """Recompute #187's exact active-corpus vector inventory after relational mutation."""
         digest = SnapshotChunkDigester()
-        after: tuple[str, int, str] | None = None
-        while True:
-            statement = (
-                select(models.Chunk, models.Document.publication_id)
-                .join(models.Document, models.Document.id == models.Chunk.document_id)
-                .where(
-                    models.Document.workspace_id == self._workspace_id,
-                    models.Document.deleted_at.is_(None),
+        rows = await session.stream(
+            select(models.Chunk, models.Document.publication_id)
+            .join(models.Document, models.Document.id == models.Chunk.document_id)
+            .where(
+                models.Document.workspace_id == self._workspace_id,
+                models.Document.deleted_at.is_(None),
+            )
+            .order_by(
+                models.Chunk.document_id,
+                models.Chunk.position,
+                models.Chunk.id,
+            )
+            .execution_options(yield_per=_INVENTORY_PAGE)
+        )
+        async for row, publication_id in rows:
+            digest.add(
+                SnapshotChunk(
+                    chunk=to_chunk(row),
+                    vector_id=row.vector_id,
+                    publication_id=publication_id,
+                    sequence=row.seq,
+                    created_at=row.created_at,
                 )
             )
-            if after is not None:
-                document, position, chunk = after
-                statement = statement.where(
-                    (models.Chunk.document_id > document)
-                    | (
-                        (models.Chunk.document_id == document)
-                        & (
-                            (models.Chunk.position > position)
-                            | ((models.Chunk.position == position) & (models.Chunk.id > chunk))
-                        )
-                    )
-                )
-            rows = (
-                await session.execute(
-                    statement.order_by(
-                        models.Chunk.document_id,
-                        models.Chunk.position,
-                        models.Chunk.id,
-                    ).limit(_INVENTORY_PAGE)
-                )
-            ).all()
-            if not rows:
-                return digest.hexdigest()
-            for row, publication_id in rows:
-                digest.add(
-                    SnapshotChunk(
-                        chunk=to_chunk(row),
-                        vector_id=row.vector_id,
-                        publication_id=publication_id,
-                        sequence=row.seq,
-                        created_at=row.created_at,
-                    )
-                )
-            last = rows[-1][0]
-            after = (last.document_id, last.position, last.id)
+        return digest.hexdigest()
 
     async def _publish_item(
         self,
