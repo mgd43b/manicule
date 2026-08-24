@@ -1339,8 +1339,8 @@ class SqliteRebuildStore(WorkspaceScoped):
                     RebuildStorageStage.VALIDATION_EVIDENCE_READ
                 ) from exc
             page_chunks: list[Chunk] = []
-            for row, snapshot in pairs:
-                replacement = self._validated_replacement(row, snapshot)
+            for row, snapshot, replacement in pairs:
+                self._validate_replacement(row, snapshot, replacement)
                 chunks = replacement.flattened_chunks()
                 expected_vectors += len(chunks)
                 page_chunks.extend(chunks)
@@ -1533,8 +1533,8 @@ class SqliteRebuildStore(WorkspaceScoped):
                 pairs = await self._evidence_page(session, generation, after=after)
                 replacements: list[tuple[DerivedReplacement, models.AcquisitionRecord]] = []
                 page_chunks: list[Chunk] = []
-                for row, snapshot in pairs:
-                    replacement = self._validated_replacement(row, snapshot)
+                for row, snapshot, replacement in pairs:
+                    self._validate_replacement(row, snapshot, replacement)
                     chunks = replacement.flattened_chunks()
                     expected_vectors += len(chunks)
                     replacements.append((replacement, snapshot))
@@ -2366,7 +2366,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         generation: models.DerivedGeneration,
         *,
         after: int,
-    ) -> list[tuple[models.DerivedGenerationItem, models.AcquisitionRecord]]:
+    ) -> list[tuple[models.DerivedGenerationItem, models.AcquisitionRecord, DerivedReplacement]]:
         items = list(
             (
                 await session.execute(
@@ -2380,12 +2380,15 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
             ).scalars()
         )
+        replacements: list[DerivedReplacement] = []
         documents: list[Document] = []
         for item in items:
             try:
-                documents.append(_REPLACEMENT.validate_python(item.payload).document)
+                replacement = _REPLACEMENT.validate_python(item.payload)
             except ValueError as exc:
                 raise RebuildPublicationValidationError from exc
+            replacements.append(replacement)
+            documents.append(replacement.document)
         # One bounded join per page rather than one round trip per document: the page is
         # already capped at `self._validation_page`, so the `IN` predicates below stay bounded by
         # same constant regardless of how large the generation is.
@@ -2428,25 +2431,24 @@ class SqliteRebuildStore(WorkspaceScoped):
             or len(snapshots) != len(items)
         ):
             raise RebuildPublicationValidationError
-        return list(zip(items, snapshots, strict=True))
+        return list(zip(items, snapshots, replacements, strict=True))
 
-    def _validated_replacement(
+    def _validate_replacement(
         self,
         row: models.DerivedGenerationItem,
         snapshot: models.AcquisitionRecord,
-    ) -> DerivedReplacement:
+        replacement: DerivedReplacement,
+    ) -> None:
         digest = hashlib.sha256(_canonical(row.payload)).hexdigest()
         if digest != row.payload_digest:
             raise RebuildPublicationValidationError
         try:
-            replacement = _REPLACEMENT.validate_python(row.payload)
             replacement.validate_identity()
             self._require_snapshot_match(replacement, snapshot)
         except RebuildPublicationValidationError:
             raise
         except (RuntimeError, ValueError) as exc:
             raise RebuildPublicationValidationError from exc
-        return replacement
 
     @staticmethod
     def _require_snapshot_match(
