@@ -66,7 +66,14 @@ from manicule.storage.types import utcnow
 from manicule.storage.vectors import VectorStoreStateError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator, Sequence
+    from collections.abc import (
+        AsyncGenerator,
+        AsyncIterator,
+        Callable,
+        Iterable,
+        Iterator,
+        Sequence,
+    )
     from contextlib import AbstractAsyncContextManager
     from datetime import datetime
 
@@ -239,7 +246,7 @@ def _payload(replacement: DerivedReplacement) -> dict[str, Any]:
     return dumped
 
 
-def _vector_pages(chunks: Sequence[Chunk], *, max_bytes: int) -> Iterator[tuple[Chunk, ...]]:
+def _vector_pages(chunks: Iterable[Chunk], *, max_bytes: int) -> Iterator[tuple[Chunk, ...]]:
     """Build bounded vector work pages by encoded bytes, never merely row count."""
     budget = max(1, min(max_bytes // 4, 1024 * 1024))
     page: list[Chunk] = []
@@ -258,19 +265,35 @@ def _vector_pages(chunks: Sequence[Chunk], *, max_bytes: int) -> Iterator[tuple[
         yield tuple(page)
 
 
-def _checkpoint(
-    row: models.DerivedGeneration, *, predecessor_vector_publication_id: str | None = None
-) -> RebuildCheckpoint:
-    # Only a checkpoint bound to the current lease is reportable. A takeover initially names a
-    # fresh, empty physical namespace, so superseded validation progress reads as zero until a
-    # complete verified replay explicitly promotes it to the new lease.
-    replay_current = row.replay_lease_generation == row.lease_generation
-    validation_current = row.validation_lease_generation == row.lease_generation
-    current_publication = (
+def _staging_publication(row: models.DerivedGeneration) -> str | None:
+    """Return the durable physical target selected for this claimed generation."""
+    lease_publication = (
         vector_publication_id(row.id, row.lease_owner, row.lease_generation)
         if row.lease_owner is not None and row.lease_generation > 0
         else None
     )
+    replay_bound = row.replay_target_publication_id is not None and row.vector_publication_id in {
+        row.replay_source_publication_id,
+        row.replay_target_publication_id,
+    }
+    return row.replay_target_publication_id if replay_bound else lease_publication
+
+
+def _checkpoint(
+    row: models.DerivedGeneration, *, predecessor_vector_publication_id: str | None = None
+) -> RebuildCheckpoint:
+    # Replay progress is bound to an explicit immutable source/target pair, not merely to the
+    # lease that last advanced it.  That physical binding is what lets a new process resume a
+    # long insert-only replay after claiming a fresh lease generation.
+    replay_current = (
+        row.replay_source_publication_id is not None
+        and row.replay_target_publication_id is not None
+        and row.replay_checkpoint_sequence is not None
+        and row.vector_publication_id
+        in {row.replay_source_publication_id, row.replay_target_publication_id}
+    )
+    validation_current = row.validation_lease_generation == row.lease_generation
+    staging_publication = _staging_publication(row)
     return RebuildCheckpoint(
         generation_id=row.id,
         state=row.state,
@@ -293,7 +316,7 @@ def _checkpoint(
         takeover_replay=(
             row.state is RebuildState.BUILDING
             and row.vector_publication_id is not None
-            and row.vector_publication_id != current_publication
+            and row.vector_publication_id != staging_publication
         ),
         validated_items=(
             row.validation_checkpoint_sequence + 1
@@ -312,6 +335,7 @@ def _checkpoint(
             else None
         ),
         predecessor_vector_publication_id=predecessor_vector_publication_id,
+        staging_vector_publication_id=staging_publication,
     )
 
 
@@ -822,7 +846,17 @@ class SqliteRebuildStore(WorkspaceScoped):
                 if generation.lease_owner != owner:
                     raise RebuildLeaseConflictError("generation has another live owner")
                 return _checkpoint(generation)
-            predecessor = generation.vector_publication_id
+            # Once a replay target has been certified as the generation's current physical
+            # publication, later leases keep using it. Rebuild rows are immutable inserts keyed
+            # by publication plus chunk id, so a stale worker can neither overwrite the target
+            # nor make it live; the relational lease and final exact inventory remain the
+            # publication fences. Replaying that same corpus into another lease-local namespace
+            # would only discard a durable checkpoint.
+            replay_target_is_current = (
+                generation.replay_target_publication_id is not None
+                and generation.vector_publication_id == generation.replay_target_publication_id
+            )
+            predecessor = None if replay_target_is_current else generation.vector_publication_id
             if generation.fence_generation is None:
                 highest = cast(
                     "int",
@@ -841,6 +875,12 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation.lease_generation += 1
             generation.lease_expires_at = expires_at
             generation.state = RebuildState.BUILDING
+            if replay_target_is_current:
+                generation.replay_lease_generation = generation.lease_generation
+                # Validation evidence describes sealed relational items and the exact same
+                # physical target. Rebind it just as a completed verified replay would.
+                if generation.validation_checkpoint_sequence is not None:
+                    generation.validation_lease_generation = generation.lease_generation
             generation.updated_at = now
             await session.flush()
             return _checkpoint(generation, predecessor_vector_publication_id=predecessor)
@@ -932,7 +972,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         cancel: asyncio.Event | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        """Replay only durable item vectors into a takeover's fresh physical namespace.
+        """Replay durable item vectors into a restart-resumable physical namespace.
 
         ``clock``, not bare ``utcnow()``, supplies each checkpoint commit's live timestamp:
         callers that inject a deterministic clock everywhere else (tests, and the offline
@@ -941,16 +981,24 @@ class SqliteRebuildStore(WorkspaceScoped):
         refuse a lease the caller believes is still held.
         """
         live_clock = clock or utcnow
-        target_publication = vector_publication_id(generation_id, owner, lease_generation)
         async with self._sessions() as session:
             generation = await self._required_generation(session, generation_id)
             self._require_lease(generation, owner, lease_generation, now)
             source_is_certified = generation.vector_publication_id == source_publication_id
-            # A checkpoint is only trustworthy under the lease generation that wrote it: that
-            # is what named `target_publication` above, so a matching record means this call is
-            # resuming the same in-progress copy into the same physical namespace rather than
-            # replaying after a takeover into a fresh, empty one.
-            resumable = generation.replay_lease_generation == lease_generation
+            # The cursor is trustworthy across a lease change only when it names the exact
+            # immutable source and insert-only target it was verified against. A legacy
+            # checkpoint has no such binding and correctly starts in this lease's fresh target.
+            resumable = (
+                generation.replay_source_publication_id == source_publication_id
+                and generation.replay_target_publication_id is not None
+                and generation.replay_checkpoint_sequence is not None
+            )
+            if resumable:
+                target_publication = generation.replay_target_publication_id
+                if target_publication is None:  # pragma: no cover - included in `resumable`
+                    raise RebuildPublicationValidationError
+            else:
+                target_publication = vector_publication_id(generation_id, owner, lease_generation)
             after = (
                 generation.replay_checkpoint_sequence
                 if resumable and generation.replay_checkpoint_sequence is not None
@@ -961,6 +1009,26 @@ class SqliteRebuildStore(WorkspaceScoped):
             replay_needs_index = (
                 replay_has_rows and generation.chunks_built > _VECTOR_VALIDATION_PAGE
             )
+            maximum_vectors = generation.chunks_built
+        if resumable:
+            try:
+                durable_rows = await self._publication_row_count(target_publication)
+            except VectorStoreStateError as exc:
+                raise RebuildStorageBackendError from exc
+            except (ManiculeError, ValueError) as exc:
+                raise RebuildPublicationValidationError from exc
+            # More than the generation could ever contain is not an in-flight suffix. Fewer
+            # than the checkpoint proves means its physical prefix was lost, so replay from the
+            # beginning into the same target and repair it rather than skipping missing rows.
+            if durable_rows > maximum_vectors:
+                raise RebuildPublicationValidationError
+            if durable_rows < expected_vectors:
+                after = -1
+                expected_vectors = 0
+                replay_has_rows = generation.next_sequence > 0
+                replay_needs_index = (
+                    replay_has_rows and generation.chunks_built > _VECTOR_VALIDATION_PAGE
+                )
         if replay_needs_index:
             try:
                 await self._required_vectors().prepare_publication_validation(source_publication_id)
@@ -999,52 +1067,68 @@ class SqliteRebuildStore(WorkspaceScoped):
             await self.assert_generation_lease(
                 generation_id, owner, lease_generation, now=live_clock()
             )
-            for row in rows:
-                try:
-                    replacement = _REPLACEMENT.validate_python(row.payload)
-                except (RuntimeError, ValueError) as exc:
-                    raise RebuildPublicationValidationError from exc
-                self._validate_staged_replacement(row, replacement)
-                chunks = replacement.flattened_chunks()
-                expected_vectors += len(chunks)
-                for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                    checked_at = live_clock()
-                    await self.assert_generation_lease_current(
-                        generation_id,
-                        owner,
-                        lease_generation,
-                        now=checked_at,
-                    )
+            page_vector_count = 0
+
+            def replay_chunks(
+                staged_rows: tuple[models.DerivedGenerationItem, ...] = tuple(rows),
+            ) -> Iterator[Chunk]:
+                """Validate relational rows lazily while filling cross-document pages."""
+                nonlocal page_vector_count
+                for row in staged_rows:
                     try:
-                        await self._required_vectors().copy_publication(
-                            source_publication_id,
-                            target_publication,
-                            page,
-                        )
-                        page_complete = await self._publication_page_is_complete(
-                            target_publication,
-                            page,
-                            embedding_fingerprint=target.embedding_fingerprint,
-                        )
-                    except VectorStoreStateError as exc:
-                        raise RebuildStorageBackendError from exc
-                    except (ManiculeError, ValueError) as exc:
+                        replacement = _REPLACEMENT.validate_python(row.payload)
+                    except (RuntimeError, ValueError) as exc:
                         raise RebuildPublicationValidationError from exc
-                    if not page_complete:
-                        raise RebuildPublicationValidationError
-                    if cancel is not None and cancel.is_set():
-                        raise asyncio.CancelledError
-                    await self.assert_generation_lease_current(
-                        generation_id,
-                        owner,
-                        lease_generation,
-                        now=live_clock(),
+                    self._validate_staged_replacement(row, replacement)
+                    chunks = replacement.flattened_chunks()
+                    page_vector_count += len(chunks)
+                    yield from chunks
+
+            # The relational checkpoint page is a durability boundary, not a Lance batch
+            # boundary. Fill byte/row-bounded vector pages across its documents so a corpus of
+            # many modest documents does hundreds of vector round trips rather than tens of
+            # thousands. The iterator keeps peak memory bounded to one vector page.
+            for page in _vector_pages(replay_chunks(), max_bytes=target.max_memory_bytes):
+                checked_at = live_clock()
+                await self.assert_generation_lease_current(
+                    generation_id,
+                    owner,
+                    lease_generation,
+                    now=checked_at,
+                )
+                try:
+                    await self._required_vectors().copy_publication(
+                        source_publication_id,
+                        target_publication,
+                        page,
                     )
+                    page_complete = await self._publication_page_is_complete(
+                        target_publication,
+                        page,
+                        embedding_fingerprint=target.embedding_fingerprint,
+                    )
+                except VectorStoreStateError as exc:
+                    raise RebuildStorageBackendError from exc
+                except (ManiculeError, ValueError) as exc:
+                    raise RebuildPublicationValidationError from exc
+                if not page_complete:
+                    raise RebuildPublicationValidationError
+                if cancel is not None and cancel.is_set():
+                    raise asyncio.CancelledError
+                await self.assert_generation_lease_current(
+                    generation_id,
+                    owner,
+                    lease_generation,
+                    now=live_clock(),
+                )
+            expected_vectors += page_vector_count
             after = rows[-1].sequence
             await self._commit_replay_checkpoint(
                 generation_id,
                 owner,
                 lease_generation,
+                source_publication_id=source_publication_id,
+                target_publication_id=target_publication,
                 checkpoint_sequence=after,
                 replayed_vectors=expected_vectors,
                 now=live_clock(),
@@ -1078,6 +1162,8 @@ class SqliteRebuildStore(WorkspaceScoped):
         owner: str,
         lease_generation: int,
         *,
+        source_publication_id: str,
+        target_publication_id: str,
         checkpoint_sequence: int,
         replayed_vectors: int,
         now: datetime,
@@ -1092,6 +1178,8 @@ class SqliteRebuildStore(WorkspaceScoped):
             generation = await self._required_generation(session, generation_id)
             self._require_lease(generation, owner, lease_generation, now)
             generation.replay_lease_generation = lease_generation
+            generation.replay_source_publication_id = source_publication_id
+            generation.replay_target_publication_id = target_publication_id
             generation.replay_checkpoint_sequence = checkpoint_sequence
             generation.replayed_vector_count = replayed_vectors
             generation.last_progress_at = now
@@ -1206,9 +1294,9 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
             if generation.next_sequence != expected_next_sequence:
                 raise RebuildPublicationConflictError(RebuildRefusalCode.PUBLICATION_CONFLICT)
-            current_vector_publication = vector_publication_id(
-                generation_id, owner, lease_generation
-            )
+            current_vector_publication = _staging_publication(generation)
+            if current_vector_publication is None:  # pragma: no cover - live lease proves this
+                raise RebuildLeaseConflictError("generation has no vector staging publication")
             if generation.next_sequence > 0 and (
                 generation.vector_publication_id != current_vector_publication
             ):
@@ -1321,10 +1409,13 @@ class SqliteRebuildStore(WorkspaceScoped):
                 validating = generation.state is RebuildState.VALIDATING
                 if validating:
                     self._require_lease(generation, owner, lease_generation, now)
-                effective_owner = owner if validating else (generation.lease_owner or "")
-                effective_lease_generation = (
-                    lease_generation if validating else generation.lease_generation
+                physical_publication = (
+                    _staging_publication(generation)
+                    if validating
+                    else generation.vector_publication_id
                 )
+                if physical_publication is None:
+                    raise RebuildPublicationValidationError
                 await self._verify_complete_header(session, generation)
                 target = RebuildTarget.model_validate(generation.target)
                 expected_item_count = generation.expected_item_count
@@ -1341,9 +1432,6 @@ class SqliteRebuildStore(WorkspaceScoped):
             raise RebuildStorageOperationError(
                 RebuildStorageStage.VALIDATION_EVIDENCE_READ
             ) from exc
-        physical_publication = vector_publication_id(
-            generation_id, effective_owner, effective_lease_generation
-        )
         if (
             validating
             and after + 1 < expected_item_count
@@ -1549,7 +1637,9 @@ class SqliteRebuildStore(WorkspaceScoped):
 
             await self._verify_complete_header(session, generation)
             target = RebuildTarget.model_validate(generation.target)
-            physical_publication = vector_publication_id(generation_id, owner, lease_generation)
+            physical_publication = _staging_publication(generation)
+            if physical_publication is None:
+                raise RebuildPublicationValidationError
             # Ask SQLite to parse the tokenizer mini-language before deleting a single live row.
             probe = "__manicule_rebuild_fts_probe"
             probe_sql = create_fts(target.fts_tokenizer).replace(FTS_TABLE, probe)

@@ -1485,6 +1485,8 @@ class DerivedGeneration(Base):
     # useful progress. See `RebuildCheckpoint.last_progress_at`.
     last_progress_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     replay_lease_generation: Mapped[int | None] = mapped_column(Integer)
+    replay_source_publication_id: Mapped[str | None] = mapped_column(Text)
+    replay_target_publication_id: Mapped[str | None] = mapped_column(Text)
     replay_checkpoint_sequence: Mapped[int | None] = mapped_column(Integer)
     replayed_vector_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     validation_lease_generation: Mapped[int | None] = mapped_column(Integer)

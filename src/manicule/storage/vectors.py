@@ -1500,7 +1500,7 @@ class LanceVectorStore:
             )
         ):
             raise VectorStoreStateError("checkpoint vector page is incomplete or stale")
-        vectors_by_id: dict[str, tuple[float, ...]] = {}
+        copied_rows: list[dict[str, object]] = []
         for chunk in chunks:
             record = by_id[chunk.id]
             values = tuple(float(value) for value in record[VECTOR_COLUMN])
@@ -1517,16 +1517,30 @@ class LanceVectorStore:
                     f"being copied for takeover; the source publication is not fit to replay"
                 )
                 raise VectorStoreStateError(msg)
-            vectors_by_id[str(record[CHUNK_ID_COLUMN])] = values
-        # Copied through `upsert`, which re-derives the checksum from the canonical values it is
-        # about to write rather than carrying the source row's string across. Carrying it would
-        # let one digest end up attached to bytes it was never taken from — the one failure a
-        # copy is in a position to introduce.
-        await self.upsert(
-            chunks,
-            [vectors_by_id[chunk.id] for chunk in chunks],
-            publication_id=target_publication_id,
-        )
+            # The source verdict already proved the serialized chunk and embedding identity.
+            # Preserve those immutable fields instead of routing replay through `_row`, which
+            # would serialize 1024-token chunk JSON and hash its embedding input all over again.
+            # The checksum is deliberately re-derived from the canonical values being written;
+            # it is the one field a physical copy must not merely carry across.
+            copied_rows.append(
+                {
+                    ID_COLUMN: vector_id(target_publication_id, chunk.id),
+                    CHUNK_ID_COLUMN: chunk.id,
+                    PUBLICATION_COLUMN: target_publication_id,
+                    VECTOR_COLUMN: values,
+                    "document_id": chunk.document_id,
+                    "kind": chunk.kind.value,
+                    "lang": chunk.lang,
+                    "position": chunk.position,
+                    CHUNK_COLUMN: str(record[CHUNK_COLUMN]),
+                    IDENTITY_COLUMN: str(record[IDENTITY_COLUMN]),
+                    CHECKSUM_COLUMN: vector_checksum(values),
+                    CHECKSUM_VERSION_COLUMN: VECTOR_CHECKSUM_VERSION,
+                }
+            )
+        # Replay targets are immutable insert-only publications. A retry or stale worker may
+        # offer the same row again, but can never replace the verified row already present.
+        await table.merge_insert(ID_COLUMN).when_not_matched_insert_all().execute(copied_rows)
 
     async def _rows_for(
         self,
