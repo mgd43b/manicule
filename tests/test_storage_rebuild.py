@@ -3633,7 +3633,6 @@ async def test_replay_enforces_the_lease_it_was_handed_rather_than_extending_it(
         store, engine, data_dir, items=6, lease_seconds=5
     )
     clock = ReplayClock(NOW + timedelta(minutes=20), per_page=timedelta(seconds=3))
-    monkeypatch.setattr(rebuild_storage, "utcnow", clock)
     original_copy = vectors.copy_publication
 
     async def slow_copy(*args: object, **kwargs: object) -> None:
@@ -3649,6 +3648,7 @@ async def test_replay_enforces_the_lease_it_was_handed_rather_than_extending_it(
             owner="second",
             lease_generation=second.lease_generation,
             now=clock.now,
+            clock=clock,
         )
 
     assert clock.pages >= 2, "replay must get far enough to outlive the lease"

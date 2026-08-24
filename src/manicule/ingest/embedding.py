@@ -45,8 +45,8 @@ if TYPE_CHECKING:
 MAX_BATCH = 64
 """Upper clamp on a derived batch size, so a tiny budget cannot ask for a huge batch."""
 
-DEFAULT_TARGET_BATCH_TOKENS = 32_768
-"""Default coordinator budget: 32 1,024-token chunks before the outer batch clamp."""
+DEFAULT_TARGET_BATCH_TOKENS = 65_536
+"""Default coordinator budget: 64 1,024-token chunks before the outer batch clamp."""
 
 
 def batch_size(*, budget_tokens: int, target_batch_tokens: int, maximum: int = MAX_BATCH) -> int:

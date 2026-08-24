@@ -750,6 +750,12 @@ class Document(Base):
         Index("ix_documents_embed_fp", "embed_fp"),
         Index("ix_documents_glossary_fp", "glossary_fp"),
         Index(
+            "ix_documents_workspace_live_id",
+            "workspace_id",
+            "id",
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+        Index(
             "ix_documents_deleted_at",
             "workspace_id",
             "deleted_at",
