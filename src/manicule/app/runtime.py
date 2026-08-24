@@ -1276,6 +1276,7 @@ class _Ingestion:
             blobs=blobs,
             vectors=vectors,  # pyright: ignore[reportArgumentType]
             replay_page=self._runtime.settings.ingest.rebuild_replay_page,
+            validation_page=self._runtime.settings.ingest.rebuild_validation_page,
         )
         chunker = await self._runtime.container.aget(keys.CHUNKER)
         embedder = await self._runtime.container.aget(keys.EMBEDDER)

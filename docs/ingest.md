@@ -1831,10 +1831,11 @@ same bounded validation/conflict envelopes and failed cleanup state. An unexpect
 is different: it keeps the checkpoint resumable and does not manufacture a validation diagnosis.
 
 **Replay and validation read relational evidence a bounded page at a time, not one document
-per round trip**, and durably checkpoint after each page. `ingest.rebuild_replay_page` controls
-the replay page (256 documents by default); validation retains its conservative fixed page.
-Vector copies remain separately bounded by both bytes and 512 rows, so increasing the replay
-page reduces SQLite round trips without widening a Lance mutation. Every completed page commits
+per round trip**, and durably checkpoint after each page. `ingest.rebuild_replay_page` defaults
+to 256 documents; `ingest.rebuild_validation_page` defaults to the more conservative 100
+because validation deserializes every staged chunk in its document page. Vector copies and
+validation queries remain separately bounded by both bytes and 512 rows, so increasing either
+document page reduces SQLite round trips without widening a Lance operation. Every completed page commits
 a fenced checkpoint
 (`replay_lease_generation`/`replay_checkpoint_sequence`/`replayed_vector_count` for replay,
 `validation_lease_generation`/`validation_checkpoint_sequence`/`validated_vector_count` for
@@ -1845,6 +1846,17 @@ takeover always copies or validates from the beginning, because it names a fresh
 vector namespace the old checkpoint's evidence does not describe. `last_progress_at` moves only
 on a durable page, staged batch, or publication commit — never on the timer-driven lease
 heartbeat alone, so a healthy renewal against a stalled cursor cannot read as content progress.
+Publication uses the same evidence-page boundary: it fetches the page's existing documents once,
+then applies the document replacement and chunk/glossary writes in set-wise driver batches. This
+avoids a SQLite lookup/delete/flush and individual-insert cycle per document while preserving
+the single all-or-nothing publication transaction and its FTS triggers. The resulting
+active-vector inventory is then hashed in order through one bounded streaming cursor, rather
+than one SQLite query per chunk page.
+
+Before a sealed rebuild enters validation, Manicule builds its managed B-tree over physical
+`chunk_id` values. Validation's 512-row exact-id probes can then seek the staged rows instead of
+repeatedly scanning the whole vector table. The index is rebuilt only at that sealed boundary,
+never while embedding is writing rows.
 `rebuild status` and the dashboard expose `replayed_items`/`replayed_vectors`,
 `validated_items`/`validated_vectors`, and `last_progress_at` alongside the existing build
 counters, all workspace-scoped aggregates with no document, chunk, vector, or source identity in

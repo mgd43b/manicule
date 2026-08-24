@@ -1012,7 +1012,7 @@ async def test_complete_snapshot_header_is_read_once_across_bounded_pages(
 async def test_snapshot_streams_chunks_once_per_document_page(
     engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
 ) -> None:
-    """Snapshot creation must not turn one short document into one chunk query."""
+    """Snapshot creation streams chunks once per document page, not once per document."""
     clock = Clock()
     await seeded_run(engine, store, data_dir, clock, run_id="bulk-snapshot-stream")
     for index in range(300):

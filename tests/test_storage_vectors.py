@@ -47,6 +47,7 @@ from manicule.storage.vectors import (
     IDENTITY_COLUMN,
     META_TABLE,
     PUBLICATION_COLUMN,
+    VALIDATION_CHUNK_INDEX,
     VECTOR_COLUMN,
     LanceVectorStore,
     PublishedLanceVectorStore,
@@ -127,6 +128,20 @@ async def prepared(directory: Path, dimension: int = 4) -> LanceVectorStore:
     store = LanceVectorStore(directory)
     await store.ensure_ready(fingerprint(dimension))
     return store
+
+
+async def test_preparing_rebuild_validation_creates_a_chunk_lookup_index(tmp_path: Path) -> None:
+    """A sealed rebuild gets an index for its bounded chunk-id validation queries."""
+    store = await prepared(tmp_path / "vectors")
+    await store.upsert([chunk("one"), chunk("two", position=1)], [spread(4, 0), spread(4, 1)])
+
+    await store.prepare_publication_validation("rebuild-publication")
+
+    assert store._table is not None  # pyright: ignore[reportPrivateUsage]
+    assert any(
+        config.name == VALIDATION_CHUNK_INDEX and list(config.columns) == [CHUNK_ID_COLUMN]
+        for config in await store._table.list_indices()  # pyright: ignore[reportPrivateUsage]
+    )
 
 
 def spread(dimension: int, index: int) -> list[float]:

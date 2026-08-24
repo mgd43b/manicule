@@ -24,7 +24,7 @@ from manicule.core.acquisition import (
 )
 from manicule.core.errors import ManiculeError
 from manicule.core.fingerprints import ChunkFingerprint
-from manicule.core.ids import document_id, glossary_entry_id
+from manicule.core.ids import document_id, glossary_entry_id, vector_id
 from manicule.core.rebuild import (
     DerivedReplacement,
     MissingSnapshotInput,
@@ -60,7 +60,7 @@ from manicule.storage.fts import (
     REBUILD_FTS,
     create_fts,
 )
-from manicule.storage.rows import apply_document, from_chunk, to_chunk
+from manicule.storage.rows import apply_document, to_chunk
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
 from manicule.storage.vectors import VectorStoreStateError
@@ -85,6 +85,13 @@ at a time, turning a corpus of any size into that many serial SQLite queries. Ma
 relational page and an operator reasoning about one should not have to learn a second number.
 """
 _INVENTORY_PAGE = 100
+_VECTOR_VALIDATION_PAGE = 512
+"""Maximum chunk identities submitted to one Lance validation query.
+
+This mirrors the vector store's fixed ``IDENTITY_QUERY_PAGE`` bound without coupling this
+storage protocol to its concrete implementation.  A relational evidence page can span many
+documents, but its vector proof must remain a bounded ``IN`` query.
+"""
 
 
 class BlobInventory(Protocol):
@@ -184,6 +191,8 @@ class GenerationVectorInventory(Protocol):
 
     async def publication_row_count(self, publication_id: str) -> int: ...
 
+    async def prepare_publication_validation(self, publication_id: str) -> None: ...
+
     async def publication_page_is_complete(
         self,
         publication_id: str,
@@ -239,7 +248,7 @@ def _vector_pages(chunks: Sequence[Chunk], *, max_bytes: int) -> Iterator[tuple[
         cost = len(chunk.model_dump_json().encode())
         if cost > budget:
             raise RebuildPublicationValidationError(RebuildRefusalCode.MEMORY_BOUND)
-        if page and held + cost > budget:
+        if page and (len(page) >= _VECTOR_VALIDATION_PAGE or held + cost > budget):
             yield tuple(page)
             page = []
             held = 0
@@ -323,15 +332,21 @@ class SqliteRebuildStore(WorkspaceScoped):
         vectors: GenerationVectorInventory | None = None,
         sessions: async_sessionmaker[AsyncSession] | None = None,
         replay_page: int | None = None,
+        validation_page: int | None = None,
     ) -> None:
         if replay_page is None:
             replay_page = _EVIDENCE_PAGE
+        if validation_page is None:
+            validation_page = _EVIDENCE_PAGE
         if replay_page < 1:
             raise ValueError("replay_page must be positive")
+        if validation_page < 1:
+            raise ValueError("validation_page must be positive")
         super().__init__(engine, workspace_id=workspace_id, sessions=sessions)
         self._blobs = blobs
         self._vectors = vectors
         self._replay_page = replay_page
+        self._validation_page = validation_page
         self._acquisition = AcquisitionJournalMixin(
             engine, workspace_id=workspace_id, sessions=sessions
         )
@@ -1029,7 +1044,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             if generation.next_sequence != checkpoint_sequence:
                 raise RebuildLeaseConflictError("checkpoint advanced during vector replay")
             generation.vector_publication_id = target_publication
-            generation.updated_at = utcnow()
+            generation.updated_at = live_clock()
 
     async def _commit_replay_checkpoint(
         self,
@@ -1303,6 +1318,13 @@ class SqliteRebuildStore(WorkspaceScoped):
         physical_publication = vector_publication_id(
             generation_id, effective_owner, effective_lease_generation
         )
+        if validating:
+            try:
+                await self._required_vectors().prepare_publication_validation(physical_publication)
+            except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                raise RebuildStorageOperationError(
+                    RebuildStorageStage.VALIDATION_VECTOR_READ
+                ) from exc
         while after + 1 < expected_item_count:
             if cancel is not None and cancel.is_set():
                 raise asyncio.CancelledError
@@ -1316,25 +1338,27 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildStorageOperationError(
                     RebuildStorageStage.VALIDATION_EVIDENCE_READ
                 ) from exc
-            for row, snapshot in pairs:
-                replacement = self._validated_replacement(row, snapshot)
+            page_chunks: list[Chunk] = []
+            for row, snapshot, replacement in pairs:
+                self._validate_replacement(row, snapshot, replacement)
                 chunks = replacement.flattened_chunks()
                 expected_vectors += len(chunks)
-                for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                    if cancel is not None and cancel.is_set():
-                        raise asyncio.CancelledError
-                    try:
-                        page_complete = await self._publication_page_is_complete(
-                            physical_publication,
-                            page,
-                            embedding_fingerprint=target.embedding_fingerprint,
-                        )
-                    except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
-                        raise RebuildStorageOperationError(
-                            RebuildStorageStage.VALIDATION_VECTOR_READ
-                        ) from exc
-                    if not page_complete:
-                        raise RebuildPublicationValidationError
+                page_chunks.extend(chunks)
+            for page in _vector_pages(page_chunks, max_bytes=target.max_memory_bytes):
+                if cancel is not None and cancel.is_set():
+                    raise asyncio.CancelledError
+                try:
+                    page_complete = await self._publication_page_is_complete(
+                        physical_publication,
+                        page,
+                        embedding_fingerprint=target.embedding_fingerprint,
+                    )
+                except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                    raise RebuildStorageOperationError(
+                        RebuildStorageStage.VALIDATION_VECTOR_READ
+                    ) from exc
+                if not page_complete:
+                    raise RebuildPublicationValidationError
             after = pairs[-1][0].sequence
             if validating:
                 try:
@@ -1507,19 +1531,24 @@ class SqliteRebuildStore(WorkspaceScoped):
             after = -1
             while after + 1 < generation.expected_item_count:
                 pairs = await self._evidence_page(session, generation, after=after)
-                for row, snapshot in pairs:
-                    replacement = self._validated_replacement(row, snapshot)
+                replacements: list[tuple[DerivedReplacement, models.AcquisitionRecord]] = []
+                page_chunks: list[Chunk] = []
+                for row, snapshot, replacement in pairs:
+                    self._validate_replacement(row, snapshot, replacement)
                     chunks = replacement.flattened_chunks()
                     expected_vectors += len(chunks)
-                    for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                        if not await self._publication_page_is_complete(
-                            physical_publication,
-                            page,
-                            embedding_fingerprint=target.embedding_fingerprint,
-                        ):
-                            raise RebuildPublicationValidationError
+                    replacements.append((replacement, snapshot))
+                    page_chunks.extend(chunks)
+                for page in _vector_pages(page_chunks, max_bytes=target.max_memory_bytes):
+                    if not await self._publication_page_is_complete(
+                        physical_publication,
+                        page,
+                        embedding_fingerprint=target.embedding_fingerprint,
+                    ):
+                        raise RebuildPublicationValidationError
+                for replacement, snapshot in replacements:
                     await self._publish_item(
-                        session,
+                        session=session,
                         replacement=replacement,
                         generation_id=generation_id,
                         vector_publication=physical_publication,
@@ -1527,6 +1556,12 @@ class SqliteRebuildStore(WorkspaceScoped):
                         target=target,
                         snapshot=snapshot,
                     )
+                await self._publish_page(
+                    session,
+                    replacements=replacements,
+                    vector_publication=physical_publication,
+                    target=target,
+                )
                 after = pairs[-1][0].sequence
             if await self._publication_row_count(physical_publication) != expected_vectors:
                 raise RebuildPublicationValidationError
@@ -1756,56 +1791,36 @@ class SqliteRebuildStore(WorkspaceScoped):
     async def _live_chunk_inventory_digest(self, session: AsyncSession) -> str:
         """Recompute #187's exact active-corpus vector inventory after relational mutation."""
         digest = SnapshotChunkDigester()
-        after: tuple[str, int, str] | None = None
-        while True:
-            statement = (
-                select(models.Chunk, models.Document.publication_id)
-                .join(models.Document, models.Document.id == models.Chunk.document_id)
-                .where(
-                    models.Document.workspace_id == self._workspace_id,
-                    models.Document.deleted_at.is_(None),
+        rows = await session.stream(
+            select(models.Chunk, models.Document.publication_id)
+            .join(models.Document, models.Document.id == models.Chunk.document_id)
+            .where(
+                models.Document.workspace_id == self._workspace_id,
+                models.Document.deleted_at.is_(None),
+            )
+            .order_by(
+                models.Chunk.document_id,
+                models.Chunk.position,
+                models.Chunk.id,
+            )
+            .execution_options(yield_per=_INVENTORY_PAGE)
+        )
+        async for row, publication_id in rows:
+            digest.add(
+                SnapshotChunk(
+                    chunk=to_chunk(row),
+                    vector_id=row.vector_id,
+                    publication_id=publication_id,
+                    sequence=row.seq,
+                    created_at=row.created_at,
                 )
             )
-            if after is not None:
-                document, position, chunk = after
-                statement = statement.where(
-                    (models.Chunk.document_id > document)
-                    | (
-                        (models.Chunk.document_id == document)
-                        & (
-                            (models.Chunk.position > position)
-                            | ((models.Chunk.position == position) & (models.Chunk.id > chunk))
-                        )
-                    )
-                )
-            rows = (
-                await session.execute(
-                    statement.order_by(
-                        models.Chunk.document_id,
-                        models.Chunk.position,
-                        models.Chunk.id,
-                    ).limit(_INVENTORY_PAGE)
-                )
-            ).all()
-            if not rows:
-                return digest.hexdigest()
-            for row, publication_id in rows:
-                digest.add(
-                    SnapshotChunk(
-                        chunk=to_chunk(row),
-                        vector_id=row.vector_id,
-                        publication_id=publication_id,
-                        sequence=row.seq,
-                        created_at=row.created_at,
-                    )
-                )
-            last = rows[-1][0]
-            after = (last.document_id, last.position, last.id)
+        return digest.hexdigest()
 
     async def _publish_item(
         self,
-        session: AsyncSession,
         *,
+        session: AsyncSession,
         replacement: DerivedReplacement,
         generation_id: str,
         vector_publication: str,
@@ -1813,92 +1828,119 @@ class SqliteRebuildStore(WorkspaceScoped):
         target: RebuildTarget,
         snapshot: models.AcquisitionRecord,
     ) -> str:
+        """Preserve the per-item publication hook while page-level mutation stays batched."""
+        del session, generation_id, vector_publication, target
         document = replacement.document
         expected_id = document_id(self._workspace_id, connector_name, document.source_id)
         if document.id != expected_id or document.source != connector_name:
             raise RebuildPublicationValidationError
         self._require_snapshot_match(replacement, snapshot)
-        return await self._publish_member(
-            session,
-            replacement=replacement,
-            vector_publication=vector_publication,
-            connector_name=connector_name,
-            target=target,
-        )
+        return document.id
 
-    async def _publish_member(
+    async def _publish_page(
         self,
         session: AsyncSession,
         *,
-        replacement: DerivedReplacement,
+        replacements: Sequence[tuple[DerivedReplacement, models.AcquisitionRecord]],
         vector_publication: str,
-        connector_name: str,
         target: RebuildTarget,
-    ) -> str:
-        document = replacement.document
-        expected_id = document_id(self._workspace_id, connector_name, document.source_id)
-        if document.id != expected_id or document.source != connector_name:
+    ) -> None:
+        """Apply one validated evidence page with bounded ORM state and set-based deletes."""
+        members: list[DerivedReplacement] = []
+
+        def append_members(replacement: DerivedReplacement, connector_name: str) -> None:
+            document = replacement.document
+            expected_id = document_id(self._workspace_id, connector_name, document.source_id)
+            if document.id != expected_id or document.source != connector_name:
+                raise RebuildPublicationValidationError
+            for child in replacement.members:
+                append_members(child, connector_name)
+            members.append(replacement)
+
+        for replacement, _snapshot in replacements:
+            append_members(replacement, replacement.document.source)
+        document_ids = [replacement.document.id for replacement in members]
+        if len(document_ids) != len(set(document_ids)):
             raise RebuildPublicationValidationError
-        for member in replacement.members:
-            await self._publish_member(
-                session,
-                replacement=member,
-                vector_publication=vector_publication,
-                connector_name=connector_name,
-                target=target,
-            )
-        stored = await session.get(models.Document, document.id)
-        if stored is None:
-            stored = models.Document(id=document.id, workspace_id=self._workspace_id)
-            session.add(stored)
-        elif (
-            stored.workspace_id != self._workspace_id or stored.publication_id == vector_publication
-        ):
-            raise RebuildPublicationValidationError
-        # Populate every non-null document field before the following deletes trigger ORM
-        # autoflush. A replacement published into an empty corpus creates this row; leaving it
-        # as only id/workspace until after a query makes SQLite correctly refuse the transient
-        # invalid shape before ``apply_document`` ever runs.
-        apply_document(stored, document)
-        stored.publication_id = vector_publication
-        stored.parse_fp = replacement.parse_fingerprint
-        stored.chunk_fp = target.chunk_fingerprint
-        stored.embed_fp = target.embedding_fingerprint
-        stored.glossary_fp = target.glossary_fingerprint
-        await session.execute(
-            delete(models.GlossaryEntry).where(models.GlossaryEntry.document_id == document.id)
-        )
-        await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
-        await session.flush()
-        for chunk in replacement.chunks:
-            session.add(from_chunk(chunk, document.id, vector_publication))
-        await session.flush()
-        aliases: list[tuple[str, str]] = []
-        for entry in replacement.glossary:
-            entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
-            session.add(
-                models.GlossaryEntry(
-                    id=entry_id,
-                    document_id=document.id,
-                    chunk_id=entry.chunk_id,
-                    acronym=entry.acronym,
-                    display=entry.display,
-                    expansion=entry.expansion,
-                    location=entry.location,
-                    form=entry.form.value,
-                    confidence=entry.confidence,
+        existing = {
+            row.id: row
+            for row in (
+                await session.execute(
+                    select(models.Document).where(models.Document.id.in_(document_ids))
                 )
-            )
-            aliases.extend((entry_id, alias) for alias in dict.fromkeys(entry.aliases))
-        # SQLAlchemy cannot infer an insert dependency between these independently-created ORM
-        # rows because the models deliberately expose no relationship collection. Flush every
-        # glossary parent before making any alias pending. This is also the evidence-page
-        # boundary: the next page query autoflushes, so merely delaying the aliases until the
-        # end of this method would still leave SQLite free to see a child before its parent.
+            ).scalars()
+        }
+        for replacement in members:
+            document = replacement.document
+            stored = existing.get(document.id)
+            if stored is None:
+                stored = models.Document(id=document.id, workspace_id=self._workspace_id)
+                session.add(stored)
+            elif (
+                stored.workspace_id != self._workspace_id
+                or stored.publication_id == vector_publication
+            ):
+                raise RebuildPublicationValidationError
+            apply_document(stored, document)
+            stored.publication_id = vector_publication
+            stored.parse_fp = replacement.parse_fingerprint
+            stored.chunk_fp = target.chunk_fingerprint
+            stored.embed_fp = target.embedding_fingerprint
+            stored.glossary_fp = target.glossary_fingerprint
         await session.flush()
-        for entry_id, alias in aliases:
-            session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
-        return document.id
+        await session.execute(
+            delete(models.GlossaryEntry).where(models.GlossaryEntry.document_id.in_(document_ids))
+        )
+        await session.execute(
+            delete(models.Chunk).where(models.Chunk.document_id.in_(document_ids))
+        )
+        await session.flush()
+        chunk_rows = [
+            {
+                "id": chunk.id,
+                "vector_id": vector_id(vector_publication, chunk.id),
+                "document_id": replacement.document.id,
+                "text": chunk.text,
+                "embed_text": chunk.embed_text,
+                "heading_text": " > ".join(chunk.heading_path),
+                "heading_path": list(chunk.heading_path),
+                "kind": chunk.kind,
+                "lang": chunk.lang,
+                "position": chunk.position,
+                "token_count": chunk.token_count,
+                "anchor": chunk.anchor.model_dump(mode="json"),
+                "chunk_metadata": dict(chunk.metadata),
+            }
+            for replacement in members
+            for chunk in replacement.chunks
+        ]
+        if chunk_rows:
+            await session.execute(sqlite_insert(models.Chunk), chunk_rows)
+        entry_rows: list[dict[str, Any]] = []
+        alias_rows: list[dict[str, str]] = []
+        for replacement in members:
+            for entry in replacement.glossary:
+                entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
+                entry_rows.append(
+                    {
+                        "id": entry_id,
+                        "document_id": replacement.document.id,
+                        "chunk_id": entry.chunk_id,
+                        "acronym": entry.acronym,
+                        "display": entry.display,
+                        "expansion": entry.expansion,
+                        "location": entry.location,
+                        "form": entry.form.value,
+                        "confidence": entry.confidence,
+                    }
+                )
+                alias_rows.extend(
+                    {"entry_id": entry_id, "key": alias} for alias in dict.fromkeys(entry.aliases)
+                )
+        if entry_rows:
+            await session.execute(sqlite_insert(models.GlossaryEntry), entry_rows)
+        if alias_rows:
+            await session.execute(sqlite_insert(models.GlossaryAlias), alias_rows)
 
     @staticmethod
     def _digest_part(hasher: _DigestHasher, value: object) -> None:
@@ -2337,7 +2379,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         generation: models.DerivedGeneration,
         *,
         after: int,
-    ) -> list[tuple[models.DerivedGenerationItem, models.AcquisitionRecord]]:
+    ) -> list[tuple[models.DerivedGenerationItem, models.AcquisitionRecord, DerivedReplacement]]:
         items = list(
             (
                 await session.execute(
@@ -2347,18 +2389,21 @@ class SqliteRebuildStore(WorkspaceScoped):
                         models.DerivedGenerationItem.sequence > after,
                     )
                     .order_by(models.DerivedGenerationItem.sequence)
-                    .limit(_EVIDENCE_PAGE)
+                    .limit(self._validation_page)
                 )
             ).scalars()
         )
+        replacements: list[DerivedReplacement] = []
         documents: list[Document] = []
         for item in items:
             try:
-                documents.append(_REPLACEMENT.validate_python(item.payload).document)
+                replacement = _REPLACEMENT.validate_python(item.payload)
             except ValueError as exc:
                 raise RebuildPublicationValidationError from exc
+            replacements.append(replacement)
+            documents.append(replacement.document)
         # One bounded join per page rather than one round trip per document: the page is
-        # already capped at `_EVIDENCE_PAGE`, so the `IN` predicates below stay bounded by the
+        # already capped at `self._validation_page`, so the `IN` predicates below stay bounded by
         # same constant regardless of how large the generation is.
         by_key: dict[tuple[str, str], models.AcquisitionRecord] = {}
         if documents:
@@ -2399,25 +2444,24 @@ class SqliteRebuildStore(WorkspaceScoped):
             or len(snapshots) != len(items)
         ):
             raise RebuildPublicationValidationError
-        return list(zip(items, snapshots, strict=True))
+        return list(zip(items, snapshots, replacements, strict=True))
 
-    def _validated_replacement(
+    def _validate_replacement(
         self,
         row: models.DerivedGenerationItem,
         snapshot: models.AcquisitionRecord,
-    ) -> DerivedReplacement:
+        replacement: DerivedReplacement,
+    ) -> None:
         digest = hashlib.sha256(_canonical(row.payload)).hexdigest()
         if digest != row.payload_digest:
             raise RebuildPublicationValidationError
         try:
-            replacement = _REPLACEMENT.validate_python(row.payload)
             replacement.validate_identity()
             self._require_snapshot_match(replacement, snapshot)
         except RebuildPublicationValidationError:
             raise
         except (RuntimeError, ValueError) as exc:
             raise RebuildPublicationValidationError from exc
-        return replacement
 
     @staticmethod
     def _require_snapshot_match(
