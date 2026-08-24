@@ -139,6 +139,9 @@ class PublicationMemoryVectors(fakes.MemoryVectors):
     async def publication_row_count(self, publication_id: str) -> int:
         return len(self.publications.get(publication_id, {}))
 
+    async def prepare_publication_validation(self, publication_id: str) -> None:
+        del publication_id
+
     async def publication_page_is_complete(
         self,
         publication_id: str,

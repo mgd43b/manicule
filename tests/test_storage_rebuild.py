@@ -229,7 +229,7 @@ class FailingGlossaryPublicationStore(SqliteRebuildStore):
 
     @override
     async def _publish_item(self, *args: object, **kwargs: object) -> str:
-        result = await super()._publish_item(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        result = await super()._publish_item(*args, **kwargs)
         self.published_items += 1
         if self.published_items == 2:
             raise RuntimeError("synthetic glossary publication failure")
@@ -3278,6 +3278,126 @@ async def test_validation_resumes_past_a_durably_checkpointed_page(
         now=NOW,
     )
     assert published.state is RebuildState.PUBLISHED
+
+
+async def test_validation_coalesces_vector_checks_for_one_evidence_page(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One bounded Lance proof covers all staged documents in the relational page."""
+    monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 2)
+    rebuilds, vectors, claimed, documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="coalesced-validation-worker"
+    )
+    original_page_complete = vectors.publication_page_is_complete
+    checked: list[tuple[str, ...]] = []
+
+    async def tracking_page_complete(
+        publication_id: str, chunks: Sequence[Chunk], *, embedding_fingerprint: str
+    ) -> bool:
+        checked.append(tuple(chunk.document_id for chunk in chunks))
+        return await original_page_complete(
+            publication_id, chunks, embedding_fingerprint=embedding_fingerprint
+        )
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", tracking_page_complete)
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="coalesced-validation-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+    assert checked == [tuple(document.id for document in documents)]
+
+
+async def test_publication_batches_relational_deletes_for_one_evidence_page(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publishing a page must not issue one delete cycle for every document it contains."""
+    monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 2)
+    rebuilds, _vectors, claimed, _documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="batched-publication-worker"
+    )
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="batched-publication-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    statements = {"chunk_deletes": 0, "glossary_deletes": 0, "chunk_inserts": 0}
+
+    def count_deletes(*args: object) -> None:
+        statement = args[2]
+        if not isinstance(statement, str):
+            return
+        normalized = statement.upper()
+        if "DELETE FROM CHUNKS" in normalized:
+            statements["chunk_deletes"] += 1
+        if "DELETE FROM GLOSSARY_ENTRIES" in normalized:
+            statements["glossary_deletes"] += 1
+        if "INSERT INTO CHUNKS (" in normalized:
+            statements["chunk_inserts"] += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_deletes)
+    try:
+        published = await rebuilds.publish_generation(
+            claimed.generation_id,
+            owner="batched-publication-worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_deletes)
+
+    assert published.state is RebuildState.PUBLISHED
+    assert statements == {"chunk_deletes": 1, "glossary_deletes": 1, "chunk_inserts": 1}
+
+
+async def test_live_chunk_inventory_digest_streams_beyond_one_page(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The final publication inventory uses one cursor, rather than keyset-querying each page."""
+    for index in range(101):
+        document = make_document(
+            source="wiki",
+            source_id=f"inventory-stream-{index:03d}",
+            body=f"inventory document {index}".encode(),
+            uri=f"https://wiki.example.test/inventory/{index}",
+            media_type="text/plain",
+        )
+        await store.upsert_document(document)
+        await store.replace_chunks(
+            document.id, [make_chunk(document, 0, f"inventory document {index}")]
+        )
+    rebuilds = SqliteRebuildStore(
+        engine, workspace_id=store.workspace_id, blobs=BlobStore(engine, data_dir)
+    )
+    statements = 0
+
+    def count_statements(*args: object) -> None:
+        nonlocal statements
+        if isinstance(args[2], str):
+            statements += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_statements)
+    try:
+        async with session_factory(engine)() as session:
+            digest = await rebuilds._live_chunk_inventory_digest(  # pyright: ignore[reportPrivateUsage]
+                session
+            )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_statements)
+
+    assert digest
+    assert statements == 1
 
 
 async def test_takeover_invalidates_a_stale_validation_checkpoint(
