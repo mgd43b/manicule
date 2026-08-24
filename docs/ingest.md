@@ -1846,6 +1846,11 @@ takeover always copies or validates from the beginning, because it names a fresh
 vector namespace the old checkpoint's evidence does not describe. `last_progress_at` moves only
 on a durable page, staged batch, or publication commit — never on the timer-driven lease
 heartbeat alone, so a healthy renewal against a stalled cursor cannot read as content progress.
+
+Before a sealed rebuild enters validation, Manicule builds its managed B-tree over physical
+`chunk_id` values. Validation's 512-row exact-id probes can then seek the staged rows instead of
+repeatedly scanning the whole vector table. The index is rebuilt only at that sealed boundary,
+never while embedding is writing rows.
 `rebuild status` and the dashboard expose `replayed_items`/`replayed_vectors`,
 `validated_items`/`validated_vectors`, and `last_progress_at` alongside the existing build
 counters, all workspace-scoped aggregates with no document, chunk, vector, or source identity in

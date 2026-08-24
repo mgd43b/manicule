@@ -69,7 +69,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final
 
 import lancedb
-from lancedb.index import IvfPq
+from lancedb.index import BTree, IvfPq
 from lancedb.pydantic import LanceModel
 from lancedb.pydantic import Vector as FixedSizeVector
 from lancedb.query import ColumnOrdering
@@ -155,6 +155,9 @@ L2-normalized on the way in, so ``1 - distance`` is a real cosine similarity.
 
 IDENTITY_QUERY_PAGE: Final = 512
 """Chunk ids per ``IN`` predicate when reading rows back. See :meth:`LanceVectorStore._rows_for`."""
+
+VALIDATION_CHUNK_INDEX: Final = "manicule_validation_chunk_id"
+"""The managed B-tree used by rebuild validation's highly selective chunk-id lookups."""
 
 INTEGRITY_SCAN_PAGE: Final = 512
 """Rows per page for the checksum scan and the checksum backfill.
@@ -536,6 +539,7 @@ class LanceVectorStore:
         self._table: AsyncTable | None = None
         self._columns: frozenset[str] | None = None
         self._middleware: tuple[str, ...] = ()
+        self._validation_index_publication: str | None = None
 
     # --- lifecycle -----------------------------------------------------------------------
 
@@ -1354,6 +1358,25 @@ class LanceVectorStore:
             return 0
         return await table.count_rows(f"{PUBLICATION_COLUMN} = {quote(publication_id)}")
 
+    async def prepare_publication_validation(self, publication_id: str) -> None:
+        """Index immutable staged rows before their many bounded identity checks.
+
+        Rebuild validation queries at most 512 known chunk ids at a time. A B-tree turns that
+        highly selective ``IN`` predicate into targeted reads rather than a scan of the vector
+        corpus. The caller invokes this only after staging is sealed, so one index build covers
+        every newly staged row without rebuilding while the embedder is still writing.
+        """
+        table = await self._existing_table()
+        if table is None or self._validation_index_publication == publication_id:
+            return
+        await table.create_index(
+            CHUNK_ID_COLUMN,
+            config=BTree(),
+            name=VALIDATION_CHUNK_INDEX,
+            replace=True,
+        )
+        self._validation_index_publication = publication_id
+
     async def delete_publication(self, publication_id: str) -> int:
         """Delete one non-live physical publication and return its prior row count."""
         table = await self._existing_table()
@@ -2093,6 +2116,11 @@ class PublishedLanceVectorStore:
                 chunks,
                 embedding_fingerprint=embedding_fingerprint,
             )
+
+    async def prepare_publication_validation(self, publication_id: str) -> None:
+        """Build the current generation's chunk-id lookup index under one pointer pin."""
+        async with self._operation() as store:
+            await store.prepare_publication_validation(publication_id)
 
     async def publication_is_complete(
         self,

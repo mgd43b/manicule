@@ -191,6 +191,8 @@ class GenerationVectorInventory(Protocol):
 
     async def publication_row_count(self, publication_id: str) -> int: ...
 
+    async def prepare_publication_validation(self, publication_id: str) -> None: ...
+
     async def publication_page_is_complete(
         self,
         publication_id: str,
@@ -1316,6 +1318,13 @@ class SqliteRebuildStore(WorkspaceScoped):
         physical_publication = vector_publication_id(
             generation_id, effective_owner, effective_lease_generation
         )
+        if validating:
+            try:
+                await self._required_vectors().prepare_publication_validation(physical_publication)
+            except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                raise RebuildStorageOperationError(
+                    RebuildStorageStage.VALIDATION_VECTOR_READ
+                ) from exc
         while after + 1 < expected_item_count:
             if cancel is not None and cancel.is_set():
                 raise asyncio.CancelledError
