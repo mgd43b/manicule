@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/mgd43b/manicule/compare/v0.1.9...v0.1.10) (2026-08-24)
+
+
+### Performance Improvements
+
+* make rebuild replay fast and restartable ([#309](https://github.com/mgd43b/manicule/issues/309)) ([2f90e5a](https://github.com/mgd43b/manicule/commit/2f90e5ac8dba0f775232bf2554646e5fc5624307))
+
 ## [0.1.9](https://github.com/mgd43b/manicule/compare/v0.1.8...v0.1.9) (2026-08-24)
 
 
