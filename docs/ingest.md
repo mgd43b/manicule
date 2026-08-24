@@ -1841,9 +1841,12 @@ a fenced checkpoint
 `validation_lease_generation`/`validation_checkpoint_sequence`/`validated_vector_count` for
 validation) alongside `last_progress_at`. A worker that crashes and retries under the *same*
 still-held lease generation resumes after its last committed page instead of redoing the whole
-phase; a checkpoint recorded under a superseded lease generation is never trusted; a real
-takeover always copies or validates from the beginning, because it names a fresh physical
-vector namespace the old checkpoint's evidence does not describe. `last_progress_at` moves only
+phase; a checkpoint recorded under a superseded lease generation is not trusted directly. A real
+takeover initially copies from the beginning because it names a fresh physical vector namespace
+the old checkpoint's evidence does not describe. Once replay has copied and verified every page
+from the generation's certified predecessor and proved the exact final row count, it rebinds the
+prior validation prefix to the new lease; validation then resumes after that prefix. A failed or
+incomplete replay leaves the old checkpoint superseded and unusable. `last_progress_at` moves only
 on a durable page, staged batch, or publication commit — never on the timer-driven lease
 heartbeat alone, so a healthy renewal against a stalled cursor cannot read as content progress.
 Publication uses the same evidence-page boundary: it fetches the page's existing documents once,
@@ -1853,10 +1856,13 @@ the single all-or-nothing publication transaction and its FTS triggers. The resu
 active-vector inventory is then hashed in order through one bounded streaming cursor, rather
 than one SQLite query per chunk page.
 
-Before a sealed rebuild enters validation, Manicule builds its managed B-tree over physical
-`chunk_id` values. Validation's 512-row exact-id probes can then seek the staged rows instead of
-repeatedly scanning the whole vector table. The index is rebuilt only at that sealed boundary,
-never while embedding is writing rows.
+Before takeover replay reads its sealed source, and before a sealed rebuild enters validation,
+Manicule builds its managed B-tree over physical `chunk_id` values when the corpus exceeds one
+512-row exact-id page. Replay and validation can then seek the staged rows instead of repeatedly
+scanning the whole vector table; a one-page corpus skips the index because its single scan is
+cheaper than a build. The index is rebuilt only at those sealed read boundaries, never while
+embedding is writing rows; a fully replayed or validated checkpoint with no remaining identity
+probes also skips the build.
 `rebuild status` and the dashboard expose `replayed_items`/`replayed_vectors`,
 `validated_items`/`validated_vectors`, and `last_progress_at` alongside the existing build
 counters, all workspace-scoped aggregates with no document, chunk, vector, or source identity in
