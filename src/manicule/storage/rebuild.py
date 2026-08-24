@@ -24,7 +24,7 @@ from manicule.core.acquisition import (
 )
 from manicule.core.errors import ManiculeError
 from manicule.core.fingerprints import ChunkFingerprint
-from manicule.core.ids import document_id, glossary_entry_id
+from manicule.core.ids import document_id, glossary_entry_id, vector_id
 from manicule.core.rebuild import (
     DerivedReplacement,
     MissingSnapshotInput,
@@ -60,7 +60,7 @@ from manicule.storage.fts import (
     REBUILD_FTS,
     create_fts,
 )
-from manicule.storage.rows import apply_document, from_chunk, to_chunk
+from manicule.storage.rows import apply_document, to_chunk
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
 from manicule.storage.vectors import VectorStoreStateError
@@ -1895,32 +1895,52 @@ class SqliteRebuildStore(WorkspaceScoped):
             delete(models.Chunk).where(models.Chunk.document_id.in_(document_ids))
         )
         await session.flush()
-        for replacement in members:
-            for chunk in replacement.chunks:
-                session.add(from_chunk(chunk, replacement.document.id, vector_publication))
-        await session.flush()
-        aliases: list[tuple[str, str]] = []
+        chunk_rows = [
+            {
+                "id": chunk.id,
+                "vector_id": vector_id(vector_publication, chunk.id),
+                "document_id": replacement.document.id,
+                "text": chunk.text,
+                "embed_text": chunk.embed_text,
+                "heading_text": " > ".join(chunk.heading_path),
+                "heading_path": list(chunk.heading_path),
+                "kind": chunk.kind,
+                "lang": chunk.lang,
+                "position": chunk.position,
+                "token_count": chunk.token_count,
+                "anchor": chunk.anchor.model_dump(mode="json"),
+                "chunk_metadata": dict(chunk.metadata),
+            }
+            for replacement in members
+            for chunk in replacement.chunks
+        ]
+        if chunk_rows:
+            await session.execute(sqlite_insert(models.Chunk), chunk_rows)
+        entry_rows: list[dict[str, Any]] = []
+        alias_rows: list[dict[str, str]] = []
         for replacement in members:
             for entry in replacement.glossary:
                 entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
-                session.add(
-                    models.GlossaryEntry(
-                        id=entry_id,
-                        document_id=replacement.document.id,
-                        chunk_id=entry.chunk_id,
-                        acronym=entry.acronym,
-                        display=entry.display,
-                        expansion=entry.expansion,
-                        location=entry.location,
-                        form=entry.form.value,
-                        confidence=entry.confidence,
-                    )
+                entry_rows.append(
+                    {
+                        "id": entry_id,
+                        "document_id": replacement.document.id,
+                        "chunk_id": entry.chunk_id,
+                        "acronym": entry.acronym,
+                        "display": entry.display,
+                        "expansion": entry.expansion,
+                        "location": entry.location,
+                        "form": entry.form.value,
+                        "confidence": entry.confidence,
+                    }
                 )
-                aliases.extend((entry_id, alias) for alias in dict.fromkeys(entry.aliases))
-        await session.flush()
-        for entry_id, alias in aliases:
-            session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
-        await session.flush()
+                alias_rows.extend(
+                    {"entry_id": entry_id, "key": alias} for alias in dict.fromkeys(entry.aliases)
+                )
+        if entry_rows:
+            await session.execute(sqlite_insert(models.GlossaryEntry), entry_rows)
+        if alias_rows:
+            await session.execute(sqlite_insert(models.GlossaryAlias), alias_rows)
 
     @staticmethod
     def _digest_part(hasher: _DigestHasher, value: object) -> None:

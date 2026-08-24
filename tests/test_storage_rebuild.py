@@ -3330,7 +3330,7 @@ async def test_publication_batches_relational_deletes_for_one_evidence_page(
         lease_generation=claimed.lease_generation,
         now=NOW,
     )
-    deletes = {"chunks": 0, "glossary_entries": 0}
+    statements = {"chunk_deletes": 0, "glossary_deletes": 0, "chunk_inserts": 0}
 
     def count_deletes(*args: object) -> None:
         statement = args[2]
@@ -3338,9 +3338,11 @@ async def test_publication_batches_relational_deletes_for_one_evidence_page(
             return
         normalized = statement.upper()
         if "DELETE FROM CHUNKS" in normalized:
-            deletes["chunks"] += 1
+            statements["chunk_deletes"] += 1
         if "DELETE FROM GLOSSARY_ENTRIES" in normalized:
-            deletes["glossary_entries"] += 1
+            statements["glossary_deletes"] += 1
+        if "INSERT INTO CHUNKS (" in normalized:
+            statements["chunk_inserts"] += 1
 
     event.listen(engine.sync_engine, "before_cursor_execute", count_deletes)
     try:
@@ -3354,7 +3356,7 @@ async def test_publication_batches_relational_deletes_for_one_evidence_page(
         event.remove(engine.sync_engine, "before_cursor_execute", count_deletes)
 
     assert published.state is RebuildState.PUBLISHED
-    assert deletes == {"chunks": 1, "glossary_entries": 1}
+    assert statements == {"chunk_deletes": 1, "glossary_deletes": 1, "chunk_inserts": 1}
 
 
 async def test_live_chunk_inventory_digest_streams_beyond_one_page(
