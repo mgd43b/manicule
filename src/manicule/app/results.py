@@ -1971,6 +1971,10 @@ class ConnectorSummary(Payload):
     type: str
     enabled: bool = True
     installed: bool = True
+    retain_source_bytes: bool | None = Field(
+        default=None, description="Configured override; None inherits the storage default."
+    )
+    effective_retain_source_bytes: bool = True
     last_synced_at: str | None = None
     status: str = ""
     documents: int | None = Field(default=None, ge=0)

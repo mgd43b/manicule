@@ -791,7 +791,7 @@ class Runtime:
         return _Keys(self)
 
     async def blobs(self) -> BlobSink:
-        """Where retained source bytes live, or the sink that keeps none.
+        """The blob capability used by runs whose resolved policy retains source bytes.
 
         Public because two collaborators need the *same* one: re-parse reads bytes back
         through it and export copies them out of it, and a second blob store over the same
@@ -800,12 +800,9 @@ class Runtime:
         return await self._once("blobs", self._build_blobs)
 
     async def _build_blobs(self) -> BlobSink:
-        from manicule.ingest.pipeline import NoRetention  # noqa: PLC0415
         from manicule.storage.blobs import BlobStore  # noqa: PLC0415
 
         await self.documents()
-        if not self._settings.storage.retain_source_bytes:
-            return NoRetention()
         return BlobStore(
             self.require_engine(),
             self._settings.data_dir,
@@ -828,8 +825,6 @@ class Runtime:
         from manicule.ingest.ports import FencedIngestStore  # noqa: PLC0415
 
         settings = self._settings
-        if not settings.storage.retain_source_bytes:
-            raise AssemblyError("acquire-only requires retained source bytes")
         store = await self.documents()
         if not isinstance(store, AcquisitionSurface) or not isinstance(store, FencedIngestStore):
             msg = (
@@ -840,6 +835,7 @@ class Runtime:
         return IngestPipeline(
             store=store,  # pyright: ignore[reportArgumentType] - checked surfaces above
             acquisitions=store,
+            retain_source_bytes=True,
             workspace=settings.workspace,
             blobs=await self.blobs(),
             fetch_concurrency=settings.ingest.fetch_concurrency,
@@ -868,21 +864,21 @@ class Runtime:
             else None
         )
         acquisitions: AcquisitionSurface | None = None
-        if settings.storage.retain_source_bytes:
+        if isinstance(store, AcquisitionSurface) and isinstance(store, FencedIngestStore):
+            acquisitions = store
+        elif settings.storage.retain_source_bytes or any(
+            connector.retain_source_bytes is True for connector in settings.connectors.values()
+        ):
             # Retention enables the durable journal path. Third-party document stores may
             # satisfy the application surfaces without implementing that separate protocol;
             # refuse them at assembly rather than failing inside a live ingest with an
             # AttributeError after source work has begun.
-            if not isinstance(store, AcquisitionSurface) or not isinstance(
-                store, FencedIngestStore
-            ):
-                msg = (
-                    f"the configured document store {type(store).__name__} does not provide "
-                    "durable source acquisition; disable source-byte retention or configure "
-                    "a store that implements AcquisitionStore and FencedIngestStore"
-                )
-                raise AssemblyError(msg)
-            acquisitions = store
+            msg = (
+                f"the configured document store {type(store).__name__} does not provide "
+                "durable source acquisition; disable source-byte retention or configure "
+                "a store that implements AcquisitionStore and FencedIngestStore"
+            )
+            raise AssemblyError(msg)
         chunker = await self._container.aget(keys.CHUNKER)
         embedder = await self._container.aget(keys.EMBEDDER)
         vectors = await self.prepared_vectors()
@@ -923,6 +919,7 @@ class Runtime:
         return IngestPipeline(
             store=store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
             acquisitions=acquisitions,
+            retain_source_bytes=settings.storage.retain_source_bytes,
             chunker=chunker,
             embedder=embedder,
             vectors=vectors,
@@ -1129,6 +1126,7 @@ class _Ingestion:
         limit: int | None = None,
         watching: Watching | None = None,
         acquire_only: bool = False,
+        retain_source_bytes: bool | None = None,
     ) -> RunReport:
         pipeline = (
             await self._runtime.acquisition_pipeline()
@@ -1140,6 +1138,7 @@ class _Ingestion:
             limit=limit,
             watching=watching,
             acquire_only=acquire_only,
+            retain_source_bytes=retain_source_bytes,
         )
 
     async def connector(self, name: str) -> Connector:

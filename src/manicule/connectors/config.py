@@ -21,22 +21,25 @@ which spaces to point it at.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from manicule.connectors.cql import is_page_id
 from manicule.connectors.enriched import DEFAULT_PROFILE, EnrichedProfile
 from manicule.connectors.pagination import origin_of
+from manicule.connectors.site_routes import normalize_base_url, normalize_repository_path
 from manicule.core.errors import ConfigError
 
 __all__ = [
     "CONNECTOR_NAME",
     "FILESYSTEM_CONNECTOR_NAME",
+    "GIT_SITE_CONNECTOR_NAME",
     "SNAPSHOT_CONNECTOR_NAME",
     "AuthMethod",
     "ConfluenceConfig",
@@ -45,6 +48,7 @@ __all__ = [
     "EnrichedProfile",
     "FilesystemConfig",
     "FullInventoryAuthority",
+    "GitSiteConfig",
     "resolve_credentials",
 ]
 
@@ -63,6 +67,77 @@ together would mean a config model where over half the fields are refused depend
 another field's value. It also keeps the credential refusal honest — a connector that
 reaches no network cannot be misconfigured into trying.
 """
+
+GIT_SITE_CONNECTOR_NAME = "git-site"
+"""The registered name of the commit-pinned local website connector."""
+
+_MAX_SITE_GLOB_LENGTH = 1_024
+
+
+def _site_glob(value: str) -> str:
+    if not value or len(value) > _MAX_SITE_GLOB_LENGTH or value != value.strip():
+        raise ValueError("site path patterns must contain 1 to 1024 unpadded characters")
+    if "\\" in value or value.startswith("/") or "\0" in value:
+        raise ValueError("site path patterns must be repository-relative POSIX globs")
+    if any(segment in {".", ".."} for segment in value.split("/")):
+        raise ValueError("site path patterns must not contain dot or traversal segments")
+    return value
+
+
+class GitSiteConfig(BaseModel):
+    """One public website whose page inputs live in a local Git repository."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    repository: str = Field(min_length=1, max_length=4_096)
+    revision: str = Field(default="HEAD", min_length=1, max_length=1_024)
+    content_root: str = Field(default=".", min_length=1, max_length=4_096)
+    base_url: str = Field(min_length=1, max_length=4_096)
+    include: tuple[str, ...] = Field(
+        default=("**/*.md", "**/*.mdx", "**/*.html"), min_length=1, max_length=256
+    )
+    exclude: tuple[str, ...] = Field(default=("**/_partials/**", "**/drafts/**"), max_length=256)
+    route_manifest: str | None = Field(default=None, min_length=1, max_length=4_096)
+    max_bytes: int | None = Field(default=None, ge=1)
+
+    @field_validator("repository", "revision")
+    @classmethod
+    def _one_argument(cls, value: str) -> str:
+        if value != value.strip() or "\0" in value or "\n" in value:
+            raise ValueError("Git repository and revision must each be one command argument")
+        return value
+
+    @field_validator("content_root")
+    @classmethod
+    def _content_root(cls, value: str) -> str:
+        return normalize_repository_path(value, allow_root=True)
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url(cls, value: str) -> str:
+        return normalize_base_url(value)
+
+    @field_validator("include", "exclude")
+    @classmethod
+    def _patterns(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(_site_glob(value) for value in values))
+
+    @field_validator("route_manifest")
+    @classmethod
+    def _route_manifest(cls, value: str | None) -> str | None:
+        return None if value is None else normalize_repository_path(value)
+
+    def scope_fingerprint(self, source_scope: str) -> str:
+        material = json.dumps(
+            {
+                "source_scope": source_scope,
+                "route_policy": "git-site-v1",
+                **self.model_dump(mode="json"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.blake2b(material.encode(), digest_size=20).hexdigest()
 
 
 def _normalized_base_url(value: str) -> str:

@@ -2183,6 +2183,41 @@ async def test_an_enabled_connector_is_not_refused(backend: FakeBackend) -> None
     assert report.connector
 
 
+@pytest.mark.parametrize(
+    ("global_retention", "connector_retention", "expected"),
+    [
+        (True, None, True),
+        (True, False, False),
+        (False, True, True),
+    ],
+)
+async def test_connector_retention_is_resolved_once_at_the_service_boundary(
+    backend: FakeBackend,
+    *,
+    global_retention: bool,
+    connector_retention: bool | None,
+    expected: bool,
+) -> None:
+    """A connector override is independent of options and None inherits the global default."""
+    backend.settings = Settings(
+        storage={"retain_source_bytes": global_retention}  # pyright: ignore[reportArgumentType]
+    )
+    service = _with_connectors(
+        backend,
+        docs={
+            "type": "filesystem",
+            "retain_source_bytes": connector_retention,
+        },
+    )
+
+    await service.connector_sync("docs")
+
+    assert backend.ingestion_.sync_retention == [expected]
+    summary = (await service.connector_list()).connectors[0]
+    assert summary.retain_source_bytes is connector_retention
+    assert summary.effective_retain_source_bytes is expected
+
+
 async def test_schedule_s_is_accepted_now_that_something_reads_it() -> None:
     """#98 deleted this field because it configured a scheduler that did not exist.
 

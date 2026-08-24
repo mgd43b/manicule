@@ -21,7 +21,8 @@ from manicule.connectors import (
     Deployment,
     resolve_credentials,
 )
-from manicule.connectors.plugin import PLUGIN, build_confluence
+from manicule.connectors.config import GitSiteConfig
+from manicule.connectors.plugin import PLUGIN, build_confluence, build_git_site
 from manicule.container import keys
 from manicule.core.errors import ConfigError
 from manicule.core.protocols import Connector
@@ -85,6 +86,9 @@ def test_discovery_finds_the_connector_with_its_configuration_model() -> None:
     assert record.config_model is ConfluenceConfig
     assert "confluence" in registry.names(ComponentKind.CONNECTOR)
 
+    git_site = registry.record(keys.CONNECTOR.named("git-site"))
+    assert git_site.config_model is GitSiteConfig
+
 
 @pytest.mark.contract
 def test_registering_the_connector_loads_no_http_client() -> None:
@@ -106,6 +110,8 @@ def test_registering_the_connector_loads_no_http_client() -> None:
     loaded: list[str] = json.loads(completed.stdout)
 
     assert not [name for name in loaded if name == "httpx" or name.startswith("httpx.")]
+    assert "manicule.connectors.git_reader" not in loaded
+    assert "manicule.connectors.git_site" not in loaded
 
 
 def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
@@ -123,6 +129,8 @@ def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
     )
     with pytest.raises(ConfigError, match="ConfluenceConfig"):
         build_confluence(context)
+    with pytest.raises(ConfigError, match="GitSiteConfig"):
+        build_git_site(context)
 
 
 def test_the_plugin_registers_the_sources_this_build_ships() -> None:
@@ -143,6 +151,7 @@ def test_the_plugin_registers_the_sources_this_build_ships() -> None:
         "confluence",
         "confluence-snapshot",
         "filesystem",
+        "git-site",
     ]
 
 

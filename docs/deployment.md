@@ -44,8 +44,10 @@ backup handling, the same answer to "may this leave the building".
 Two exceptions, both narrow and both recorded rather than silent. A document above 256 MiB is
 not retained — `manicule.storage.blobs.MAX_ORIGINAL_BYTES`, a constant rather than a setting —
 and its `original_ref` is `NULL` with `original_omitted_reason` saying why. And
-`storage.retain_source_bytes = false` turns retention off entirely, at the cost of making every
-re-parse a re-fetch.
+`storage.retain_source_bytes = false` changes the installation default, at the cost of making
+every re-parse a re-fetch. A connector may set `retain_source_bytes = true` or `false` beside
+`enabled`; omitting it inherits the storage default. This is useful when remote sites need an
+offline copy but a durable local Git checkout should remain the only copy of its own bytes.
 
 ### 1.2 The index is not permission-aware
 
@@ -461,6 +463,7 @@ schedule_s = 3600          # sync this source hourly
 [connectors.runbooks]
 type = "filesystem"
 schedule_s = 600           # and this one every ten minutes
+retain_source_bytes = false # use the durable local tree instead of copying its bytes
 ```
 
 Four things about it, each of which is a decision rather than an accident:

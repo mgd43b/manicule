@@ -1099,6 +1099,11 @@ class ConnectorSettings(Section):
     re-taken, and therefore something an operator does deliberately and often — into a full
     corpus sync nobody asked for.
     """
+    retain_source_bytes: bool | None = Field(
+        default=None,
+        description="Override storage.retain_source_bytes for this connector. None inherits "
+        "the installation-wide default.",
+    )
     options: dict[str, JsonValue] = Field(
         default_factory=dict, description="Validated against the connector's own config model."
     )

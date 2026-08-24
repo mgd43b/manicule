@@ -475,6 +475,28 @@ type = "confluence"
 schedule_s = 3600      # a served manicule syncs this hourly, with nothing typed
 ```
 
+A website whose source pages already live in a local Git repository can be indexed without
+copying those source bytes into Manicule's blob store:
+
+```toml
+[connectors.product-docs]
+type = "git-site"
+schedule_s = 300
+retain_source_bytes = false
+
+[connectors.product-docs.options]
+repository = "/srv/product-docs"
+revision = "HEAD"
+content_root = "docs"
+base_url = "https://docs.example.com/"
+```
+
+Each sync resolves one commit, inventories only committed page blobs, and keeps using that commit
+even if `HEAD` moves before fetching finishes. Markdown, MDX and HTML routes are inferred from
+their paths by default; sites with custom permalinks can commit an authoritative route manifest.
+See [`docs/connectors/web-crawler.md`](docs/connectors/web-crawler.md) for the manifest format,
+include/exclude rules and the operational tradeoff of disabled source-byte retention.
+
 An admin may also start one already-configured connector through
 `POST /api/v1/admin/connectors/{name}/sync`. The route cannot declare or reconfigure a source:
 connectors hold credentials and reach remote systems, so the complete set remains in
