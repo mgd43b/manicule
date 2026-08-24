@@ -62,9 +62,7 @@ _LOGIN = re.compile(
 _ERROR_TITLE = re.compile(
     rb"<title[^>]*>\s*(?:404|not found|server error|service unavailable)", re.IGNORECASE
 )
-_CHALLENGE_PATH_SEGMENTS = frozenset(
-    {"auth", "captcha", "challenge", "login", "signin", "sso"}
-)
+_CHALLENGE_PATH_SEGMENTS = frozenset({"auth", "captcha", "challenge", "login", "signin", "sso"})
 
 
 class _BodyStream(Protocol):
@@ -384,15 +382,10 @@ class CrawlerHttpClient:
                         response.headers, max_bytes=self.config.max_header_bytes
                     )
                     media_type = (
-                        normalized_headers.get("content-type", "")
-                        .split(";", 1)[0]
-                        .strip()
-                        .lower()
+                        normalized_headers.get("content-type", "").split(";", 1)[0].strip().lower()
                     )
                     if media_type and media_type not in allowed_media_types:
-                        raise CrawlerMediaTypeError(
-                            "crawler response media type is not allowed"
-                        )
+                        raise CrawlerMediaTypeError("crawler response media type is not allowed")
                     body = await _read_body(
                         response.body,
                         normalized_headers,

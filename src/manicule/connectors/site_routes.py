@@ -183,9 +183,7 @@ class SiteManifestPage(BaseModel):
     @classmethod
     def _title(cls, value: str | None) -> str | None:
         return (
-            None
-            if value is None
-            else _plain_text(value, field="title", maximum=MAX_TITLE_LENGTH)
+            None if value is None else _plain_text(value, field="title", maximum=MAX_TITLE_LENGTH)
         )
 
     @field_validator("media_type")
@@ -241,9 +239,7 @@ class SiteRouteRecord(SiteManifestPage):
         return hashlib.blake2b(canonical, digest_size=16).hexdigest()
 
 
-def _require_unique[T](
-    items: Iterable[T], field: str, value_of: Callable[[T], str | None]
-) -> None:
+def _require_unique[T](items: Iterable[T], field: str, value_of: Callable[[T], str | None]) -> None:
     seen: set[str] = set()
     for item in items:
         value = value_of(item)

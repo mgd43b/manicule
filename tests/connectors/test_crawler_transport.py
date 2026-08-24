@@ -213,9 +213,7 @@ async def test_a_missing_robots_file_explicitly_allows_pages() -> None:
 async def test_robots_redirects_use_the_same_origin_address_and_header_policy() -> None:
     policy_url = "https://docs.example.test/policy.txt"
     dialer = Dialer()
-    dialer.add(
-        robots(), Answer(status=302, headers=(("Location", policy_url),), chunks=())
-    )
+    dialer.add(robots(), Answer(status=302, headers=(("Location", policy_url),), chunks=()))
     dialer.add(
         policy_url,
         Answer(headers=(("Content-Type", "text/plain"),), chunks=(b"User-agent: *\n",)),
@@ -235,9 +233,7 @@ async def test_every_page_redirect_is_checked_against_robots() -> None:
             chunks=(b"User-agent: *\nDisallow: /docs/private\n",),
         ),
     )
-    dialer.add(
-        page(), Answer(status=302, headers=(("Location", "/docs/private"),), chunks=())
-    )
+    dialer.add(page(), Answer(status=302, headers=(("Location", "/docs/private"),), chunks=()))
 
     with pytest.raises(CrawlerRobotsError, match="redirect"):
         await client(dialer).run().get(page())
@@ -296,16 +292,12 @@ async def test_retry_after_is_bounded_and_only_retryable_statuses_retry() -> Non
     assert dated_clock.waits == [5.0]
 
     malformed = Dialer()
-    malformed.add(
-        page(), Answer(status=503, headers=(("Retry-After", "later"),), chunks=())
-    )
+    malformed.add(page(), Answer(status=503, headers=(("Retry-After", "later"),), chunks=()))
     with pytest.raises(CrawlerThrottleError, match="malformed"):
         await client(malformed).run().get(page())
 
     non_finite = Dialer()
-    non_finite.add(
-        page(), Answer(status=429, headers=(("Retry-After", "nan"),), chunks=())
-    )
+    non_finite.add(page(), Answer(status=429, headers=(("Retry-After", "nan"),), chunks=()))
     with pytest.raises(CrawlerThrottleError, match="malformed"):
         await client(non_finite).run().get(page())
 
@@ -399,9 +391,7 @@ async def test_total_run_bytes_are_enforced_across_pages() -> None:
 
 async def test_non_text_media_is_refused_before_body_streaming() -> None:
     dialer = Dialer()
-    dialer.add(
-        page(), Answer(headers=(("Content-Type", "application/pdf"),), chunks=(b"pdf",))
-    )
+    dialer.add(page(), Answer(headers=(("Content-Type", "application/pdf"),), chunks=(b"pdf",)))
     with pytest.raises(CrawlerMediaTypeError):
         await client(dialer).run().get(page())
     assert dialer.streams[-1].reads == 0
@@ -426,9 +416,7 @@ async def test_login_challenge_and_error_pages_are_never_content(answer: Answer)
 
 async def test_a_login_redirect_is_a_typed_challenge_not_indexable_content() -> None:
     dialer = Dialer()
-    dialer.add(
-        page(), Answer(status=302, headers=(("Location", "/login"),), chunks=())
-    )
+    dialer.add(page(), Answer(status=302, headers=(("Location", "/login"),), chunks=()))
     with pytest.raises(CrawlerChallengeError, match="redirected"):
         await client(dialer).run().get(page())
 
@@ -441,9 +429,7 @@ async def test_redirects_revalidate_scope_peer_and_strip_cross_origin_secrets() 
         Answer(status=302, headers=(("Location", cdn),), chunks=()),
     )
     dialer.add(cdn, Answer())
-    crawler = client(
-        dialer, origins=("https://docs.example.test", "https://cdn.example.test")
-    )
+    crawler = client(dialer, origins=("https://docs.example.test", "https://cdn.example.test"))
 
     assert (await crawler.run().get(page())).url.url == cdn
     assert len(dialer.requests) == 4
@@ -481,13 +467,8 @@ class BlockingDialer(Dialer):
 
 async def test_global_and_per_origin_concurrency_are_both_enforced() -> None:
     same = BlockingDialer()
-    same_client = client(
-        same, config=CrawlerHttpConfig(concurrency=2, per_origin_concurrency=1)
-    )
-    tasks = [
-        asyncio.create_task(same_client.run().get(page(name)))
-        for name in ("a", "b")
-    ]
+    same_client = client(same, config=CrawlerHttpConfig(concurrency=2, per_origin_concurrency=1))
+    tasks = [asyncio.create_task(same_client.run().get(page(name))) for name in ("a", "b")]
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert same.entered == 1
@@ -501,9 +482,7 @@ async def test_global_and_per_origin_concurrency_are_both_enforced() -> None:
         origins=("https://docs.example.test", "https://other.example.test"),
     )
     tasks = [
-        asyncio.create_task(
-            different_client.run().get(url)
-        )
+        asyncio.create_task(different_client.run().get(url))
         for url in (page("a"), "https://other.example.test/docs/b")
     ]
     await asyncio.wait_for(different.two_entered.wait(), timeout=1)

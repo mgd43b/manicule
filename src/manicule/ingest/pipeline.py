@@ -2739,17 +2739,14 @@ class IngestPipeline:
                         acquisition_record=record,
                         retention=Retention(ref=record.blob_ref),
                         force=(
-                            retrying
-                            or (existing is not None and existing.original_ref is None)
+                            retrying or (existing is not None and existing.original_ref is None)
                         ),
                     )
                 )
         finally:
             bodies.finish()
 
-    async def _raw_from_acquisition(
-        self, run: _Sync, record: AcquisitionRecord
-    ) -> RawDocument:
+    async def _raw_from_acquisition(self, run: _Sync, record: AcquisitionRecord) -> RawDocument:
         """Load and verify a journal-owned blob before local derivation sees it."""
         if record.blob_ref is None or record.acquired_source is None:
             msg = "the acquired source snapshot is unavailable"
@@ -3154,9 +3151,7 @@ class IngestPipeline:
         source_id = discovered.source_id
         existing = await self._store.find_document(source, source_id)
 
-        if self._unchanged_by_token(
-            existing, discovered, require_original=require_original
-        ):
+        if self._unchanged_by_token(existing, discovered, require_original=require_original):
             await self._record_seen(existing.id)  # pyright: ignore[reportOptionalMemberAccess]
             return DocumentOutcome(
                 source_id=source_id,

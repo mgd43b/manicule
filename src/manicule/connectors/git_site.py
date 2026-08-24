@@ -158,8 +158,7 @@ class GitSiteConnector:
     async def teardown(self) -> None:
         """Reap every lazily-created Git batch process."""
         readers = {
-            id(inventory.reader): inventory.reader
-            for inventory in self._inventories.values()
+            id(inventory.reader): inventory.reader for inventory in self._inventories.values()
         }
         if self._prepared is not None:
             readers[id(self._prepared.reader)] = self._prepared.reader

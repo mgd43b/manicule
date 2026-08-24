@@ -1061,9 +1061,7 @@ async def test_concurrent_connector_runs_keep_their_own_retention_policy(
         retained.media_types["retained"] = "text/plain"
         direct.media_types["direct"] = "text/plain"
 
-        retained_task = asyncio.create_task(
-            pipeline.run(retained, retain_source_bytes=True)
-        )
+        retained_task = asyncio.create_task(pipeline.run(retained, retain_source_bytes=True))
         direct_task = asyncio.create_task(pipeline.run(direct, retain_source_bytes=False))
         try:
             await gate.wait_for(2)

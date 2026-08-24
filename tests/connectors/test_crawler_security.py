@@ -92,9 +92,7 @@ def test_scope_is_checked_after_dot_segment_normalization() -> None:
 
 
 def test_encoded_separators_and_traversal_are_not_decoded_into_a_new_path() -> None:
-    found = policy().normalize(
-        "https://docs.example.test/docs/%2e%2e%2fadmin/%2Fliteral"
-    )
+    found = policy().normalize("https://docs.example.test/docs/%2e%2e%2fadmin/%2Fliteral")
 
     assert found.path == "/docs/%2E%2E%2Fadmin/%2Fliteral"
 
@@ -126,19 +124,16 @@ def test_path_prefix_comparison_uses_segment_boundaries() -> None:
         (TrailingSlashPolicy.STRIP, "/docs/page"),
     ],
 )
-def test_trailing_slash_policy_is_explicit(
-    trailing: TrailingSlashPolicy, expected: str
-) -> None:
-    assert policy(trailing_slash=trailing).normalize(
-        "https://docs.example.test/docs/page"
-    ).path == expected
+def test_trailing_slash_policy_is_explicit(trailing: TrailingSlashPolicy, expected: str) -> None:
+    assert (
+        policy(trailing_slash=trailing).normalize("https://docs.example.test/docs/page").path
+        == expected
+    )
 
 
 def test_declared_tracking_queries_drop_and_allowed_queries_remain_distinct() -> None:
     configured = policy(allowed_query_keys=("lang",))
-    english = configured.normalize(
-        "https://docs.example.test/docs/a?utm_medium=email&lang=en"
-    )
+    english = configured.normalize("https://docs.example.test/docs/a?utm_medium=email&lang=en")
     french = configured.normalize("https://docs.example.test/docs/a?lang=fr")
 
     assert english.url.endswith("?lang=en")
@@ -151,9 +146,7 @@ def test_declared_tracking_queries_drop_and_allowed_queries_remain_distinct() ->
 )
 def test_undeclared_query_keys_are_crawler_traps(query: str) -> None:
     with pytest.raises(CrawlerPolicyError):
-        policy(allowed_query_keys=("lang",)).normalize(
-            f"https://docs.example.test/docs/a?{query}"
-        )
+        policy(allowed_query_keys=("lang",)).normalize(f"https://docs.example.test/docs/a?{query}")
 
 
 def test_fragments_never_create_a_second_page_identity() -> None:
@@ -165,9 +158,10 @@ def test_fragments_never_create_a_second_page_identity() -> None:
 
 def test_relative_links_use_the_same_normalization_and_scope_path() -> None:
     configured = policy()
-    assert configured.normalize(
-        "../next", base="https://docs.example.test/docs/chapter/current"
-    ).url == "https://docs.example.test/docs/next"
+    assert (
+        configured.normalize("../next", base="https://docs.example.test/docs/chapter/current").url
+        == "https://docs.example.test/docs/next"
+    )
 
 
 def test_an_out_of_scope_canonical_is_diagnostic_evidence_not_authority() -> None:
@@ -182,9 +176,7 @@ def test_an_out_of_scope_canonical_is_diagnostic_evidence_not_authority() -> Non
 
 
 def test_an_in_scope_relative_canonical_is_accepted() -> None:
-    decision = policy().canonical(
-        "https://docs.example.test/docs/a", "/docs/canonical#section"
-    )
+    decision = policy().canonical("https://docs.example.test/docs/a", "/docs/canonical#section")
 
     assert decision.accepted
     assert decision.value is not None
@@ -192,9 +184,7 @@ def test_an_in_scope_relative_canonical_is_accepted() -> None:
 
 
 def test_https_downgrade_is_refused_even_when_both_origins_are_allowed() -> None:
-    configured = policy(
-        allowed_origins=("https://docs.example.test", "http://docs.example.test")
-    )
+    configured = policy(allowed_origins=("https://docs.example.test", "http://docs.example.test"))
     with pytest.raises(CrawlerRedirectError, match="downgrade"):
         configured.redirect(
             "https://docs.example.test/docs/a",
@@ -205,9 +195,7 @@ def test_https_downgrade_is_refused_even_when_both_origins_are_allowed() -> None
 
 def test_redirect_count_is_bounded_before_a_request_can_be_planned() -> None:
     with pytest.raises(CrawlerRedirectError, match="bound"):
-        policy(max_redirects=2).redirect(
-            "https://docs.example.test/docs/a", "/docs/b", hop=3
-        )
+        policy(max_redirects=2).redirect("https://docs.example.test/docs/a", "/docs/b", hop=3)
 
 
 def test_cross_origin_redirects_strip_secret_headers() -> None:
@@ -233,9 +221,7 @@ def test_cross_origin_redirects_strip_secret_headers() -> None:
 
 def test_same_origin_redirects_may_keep_origin_bound_headers() -> None:
     configured = policy()
-    decision = configured.redirect(
-        "https://docs.example.test/docs/a", "/docs/b", hop=1
-    )
+    decision = configured.redirect("https://docs.example.test/docs/a", "/docs/b", hop=1)
     headers = {"Authorization": "sentinel"}
     assert decision.forward_sensitive_headers
     assert configured.redirected_headers(headers, decision) == headers
@@ -290,9 +276,7 @@ async def test_all_dns_answers_must_be_safe_and_are_deduplicated() -> None:
 
 
 async def test_numeric_host_spellings_are_still_subject_to_address_policy() -> None:
-    configured = policy(
-        allowed_origins=("https://127.0.0.1",), allowed_path_prefixes=("/",)
-    )
+    configured = policy(allowed_origins=("https://127.0.0.1",), allowed_path_prefixes=("/",))
 
     async def unreachable(hostname: str, port: int) -> Sequence[str]:
         del hostname, port
@@ -316,9 +300,7 @@ async def test_rebinding_peer_must_equal_one_of_the_prevalidated_dial_targets() 
 
 
 async def test_legacy_numeric_hostname_cannot_bypass_resolution_checks() -> None:
-    configured = policy(
-        allowed_origins=("https://2130706433",), allowed_path_prefixes=("/",)
-    )
+    configured = policy(allowed_origins=("https://2130706433",), allowed_path_prefixes=("/",))
 
     async def resolve(hostname: str, port: int) -> Sequence[str]:
         assert (hostname, port) == ("2130706433", 443)

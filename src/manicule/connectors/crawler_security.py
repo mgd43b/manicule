@@ -37,9 +37,7 @@ _BAD_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _PERCENT = re.compile(r"%([0-9A-Fa-f]{2})")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_UNRESERVED = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-)
+_UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _MAX_URL_CHARS = 8_192
 _MAX_QUERY_FIELDS = 128
@@ -341,9 +339,7 @@ class CrawlerUrlPolicy:
         """Normalize an origin-scoped transport resource such as that origin's robots file."""
         return self._normalize(value, base=base, enforce_path=False)
 
-    def _normalize(
-        self, value: str, *, base: str | None, enforce_path: bool
-    ) -> NormalizedUrl:
+    def _normalize(self, value: str, *, base: str | None, enforce_path: bool) -> NormalizedUrl:
         raw = _plain(value, what="URL")
         if base is not None:
             normalized_base = self._normalize(base, base=None, enforce_path=enforce_path)

@@ -190,9 +190,7 @@ class PinnedGitReader:
     def ordinary_entries(self) -> tuple[GitTreeEntry, ...]:
         return tuple(entry for entry in self._entries if entry.ordinary_blob)
 
-    async def read_entry(
-        self, entry: GitTreeEntry, *, max_bytes: int | None = None
-    ) -> bytes:
+    async def read_entry(self, entry: GitTreeEntry, *, max_bytes: int | None = None) -> bytes:
         known = self._entries_by_path.get(entry.path)
         if known != entry or not entry.ordinary_blob:
             raise GitSourceError("requested path is not an ordinary blob in the pinned inventory")
@@ -284,9 +282,7 @@ class PinnedGitReader:
                     mode=mode.decode("ascii"),
                     object_type=object_type.decode("ascii"),
                     object_id=raw_id.decode("ascii"),
-                    size=(
-                        None if raw_size.strip() == b"-" else int(raw_size.strip())
-                    ),
+                    size=(None if raw_size.strip() == b"-" else int(raw_size.strip())),
                 )
                 self._validate_oid(entry.object_id)
             except (ValueError, UnicodeDecodeError, SiteRouteError) as exc:
@@ -348,9 +344,7 @@ class PinnedGitReader:
             with contextlib.suppress(asyncio.CancelledError):
                 await stderr_task
 
-    async def _run_git(
-        self, *arguments: str, stdout_limit: int
-    ) -> bytes:
+    async def _run_git(self, *arguments: str, stdout_limit: int) -> bytes:
         process = await asyncio.create_subprocess_exec(
             self._git(),
             "-C",

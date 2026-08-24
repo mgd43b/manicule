@@ -35,9 +35,7 @@ from manicule.connectors.site_routes import (
         ("/space%20here", "/space%20here/"),
     ],
 )
-def test_equivalent_route_spellings_have_one_canonical_form(
-    spelling: str, normalized: str
-) -> None:
+def test_equivalent_route_spellings_have_one_canonical_form(spelling: str, normalized: str) -> None:
     assert normalize_site_route(spelling) == normalized
 
 
@@ -120,9 +118,7 @@ def test_inferred_routes_follow_only_the_declared_index_and_suffix_convention() 
 
 def test_inferred_route_collisions_fail_the_complete_inventory() -> None:
     with pytest.raises(SiteRouteError, match="duplicate page route"):
-        infer_site_records(
-            ["docs/guide.md", "docs/guide/index.md"], content_root="docs"
-        )
+        infer_site_records(["docs/guide.md", "docs/guide/index.md"], content_root="docs")
 
 
 def _manifest(*pages: dict[str, object]) -> bytes:
@@ -175,9 +171,7 @@ def test_manifest_limits_are_enforced_before_connector_discovery() -> None:
         parse_site_manifest(b"{}" * 10, max_bytes=4)
     page = {"source": "docs/a.md", "route": "/a/"}
     with pytest.raises(ValidationError, match="at most"):
-        SiteManifest.model_validate(
-            {"version": 1, "pages": [page] * (MAX_MANIFEST_PAGES + 1)}
-        )
+        SiteManifest.model_validate({"version": 1, "pages": [page] * (MAX_MANIFEST_PAGES + 1)})
     with pytest.raises(ValidationError, match="at most 128 segments"):
         SiteManifestPage(source="docs/a.md", route="/" + "/".join(["a"] * 129))
 
@@ -188,9 +182,7 @@ def test_a_manifest_is_authoritative_over_the_admitted_inventory() -> None:
         pages=(SiteManifestPage(source="docs/one.md", route="/one/"),),
     )
     with pytest.raises(SiteRouteError, match="omitted admitted sources"):
-        records_from_manifest(
-            manifest, ["docs/one.md", "docs/unlisted.md"], content_root="docs"
-        )
+        records_from_manifest(manifest, ["docs/one.md", "docs/unlisted.md"], content_root="docs")
     with pytest.raises(SiteRouteError, match="declared non-admitted sources"):
         records_from_manifest(manifest, [], content_root="docs")
 

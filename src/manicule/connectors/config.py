@@ -96,9 +96,7 @@ class GitSiteConfig(BaseModel):
     include: tuple[str, ...] = Field(
         default=("**/*.md", "**/*.mdx", "**/*.html"), min_length=1, max_length=256
     )
-    exclude: tuple[str, ...] = Field(
-        default=("**/_partials/**", "**/drafts/**"), max_length=256
-    )
+    exclude: tuple[str, ...] = Field(default=("**/_partials/**", "**/drafts/**"), max_length=256)
     route_manifest: str | None = Field(default=None, min_length=1, max_length=4_096)
     max_bytes: int | None = Field(default=None, ge=1)
 
