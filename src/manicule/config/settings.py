@@ -660,6 +660,13 @@ class IngestSettings(Section):
         "bounded by bytes and 512 rows; lower this only when retained replacement payloads are "
         "memory-bound.",
     )
+    rebuild_validation_page: int = Field(
+        default=256,
+        ge=1,
+        description="Staged documents per rebuild validation checkpoint. Vector checks remain "
+        "independently bounded to 512 rows; lower this only when retained replacement payloads "
+        "are memory-bound.",
+    )
     queue_depth_factor: int = Field(
         default=2,
         ge=1,

@@ -3280,6 +3280,39 @@ async def test_validation_resumes_past_a_durably_checkpointed_page(
     assert published.state is RebuildState.PUBLISHED
 
 
+async def test_validation_coalesces_vector_checks_for_one_evidence_page(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One bounded Lance proof covers all staged documents in the relational page."""
+    monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 2)
+    rebuilds, vectors, claimed, documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="coalesced-validation-worker"
+    )
+    original_page_complete = vectors.publication_page_is_complete
+    checked: list[tuple[str, ...]] = []
+
+    async def tracking_page_complete(
+        publication_id: str, chunks: Sequence[Chunk], *, embedding_fingerprint: str
+    ) -> bool:
+        checked.append(tuple(chunk.document_id for chunk in chunks))
+        return await original_page_complete(
+            publication_id, chunks, embedding_fingerprint=embedding_fingerprint
+        )
+
+    monkeypatch.setattr(vectors, "publication_page_is_complete", tracking_page_complete)
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="coalesced-validation-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+    assert checked == [tuple(document.id for document in documents)]
+
+
 async def test_takeover_invalidates_a_stale_validation_checkpoint(
     store: SqliteDocStore,
     engine: AsyncEngine,

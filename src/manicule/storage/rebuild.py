@@ -85,6 +85,13 @@ at a time, turning a corpus of any size into that many serial SQLite queries. Ma
 relational page and an operator reasoning about one should not have to learn a second number.
 """
 _INVENTORY_PAGE = 100
+_VECTOR_VALIDATION_PAGE = 512
+"""Maximum chunk identities submitted to one Lance validation query.
+
+This mirrors the vector store's fixed ``IDENTITY_QUERY_PAGE`` bound without coupling this
+storage protocol to its concrete implementation.  A relational evidence page can span many
+documents, but its vector proof must remain a bounded ``IN`` query.
+"""
 
 
 class BlobInventory(Protocol):
@@ -239,7 +246,7 @@ def _vector_pages(chunks: Sequence[Chunk], *, max_bytes: int) -> Iterator[tuple[
         cost = len(chunk.model_dump_json().encode())
         if cost > budget:
             raise RebuildPublicationValidationError(RebuildRefusalCode.MEMORY_BOUND)
-        if page and held + cost > budget:
+        if page and (len(page) >= _VECTOR_VALIDATION_PAGE or held + cost > budget):
             yield tuple(page)
             page = []
             held = 0
@@ -323,15 +330,21 @@ class SqliteRebuildStore(WorkspaceScoped):
         vectors: GenerationVectorInventory | None = None,
         sessions: async_sessionmaker[AsyncSession] | None = None,
         replay_page: int | None = None,
+        validation_page: int | None = None,
     ) -> None:
         if replay_page is None:
             replay_page = _EVIDENCE_PAGE
+        if validation_page is None:
+            validation_page = _EVIDENCE_PAGE
         if replay_page < 1:
             raise ValueError("replay_page must be positive")
+        if validation_page < 1:
+            raise ValueError("validation_page must be positive")
         super().__init__(engine, workspace_id=workspace_id, sessions=sessions)
         self._blobs = blobs
         self._vectors = vectors
         self._replay_page = replay_page
+        self._validation_page = validation_page
         self._acquisition = AcquisitionJournalMixin(
             engine, workspace_id=workspace_id, sessions=sessions
         )
@@ -1316,25 +1329,27 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildStorageOperationError(
                     RebuildStorageStage.VALIDATION_EVIDENCE_READ
                 ) from exc
+            page_chunks: list[Chunk] = []
             for row, snapshot in pairs:
                 replacement = self._validated_replacement(row, snapshot)
                 chunks = replacement.flattened_chunks()
                 expected_vectors += len(chunks)
-                for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                    if cancel is not None and cancel.is_set():
-                        raise asyncio.CancelledError
-                    try:
-                        page_complete = await self._publication_page_is_complete(
-                            physical_publication,
-                            page,
-                            embedding_fingerprint=target.embedding_fingerprint,
-                        )
-                    except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
-                        raise RebuildStorageOperationError(
-                            RebuildStorageStage.VALIDATION_VECTOR_READ
-                        ) from exc
-                    if not page_complete:
-                        raise RebuildPublicationValidationError
+                page_chunks.extend(chunks)
+            for page in _vector_pages(page_chunks, max_bytes=target.max_memory_bytes):
+                if cancel is not None and cancel.is_set():
+                    raise asyncio.CancelledError
+                try:
+                    page_complete = await self._publication_page_is_complete(
+                        physical_publication,
+                        page,
+                        embedding_fingerprint=target.embedding_fingerprint,
+                    )
+                except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                    raise RebuildStorageOperationError(
+                        RebuildStorageStage.VALIDATION_VECTOR_READ
+                    ) from exc
+                if not page_complete:
+                    raise RebuildPublicationValidationError
             after = pairs[-1][0].sequence
             if validating:
                 try:
@@ -1507,17 +1522,22 @@ class SqliteRebuildStore(WorkspaceScoped):
             after = -1
             while after + 1 < generation.expected_item_count:
                 pairs = await self._evidence_page(session, generation, after=after)
+                replacements: list[tuple[DerivedReplacement, models.AcquisitionRecord]] = []
+                page_chunks: list[Chunk] = []
                 for row, snapshot in pairs:
                     replacement = self._validated_replacement(row, snapshot)
                     chunks = replacement.flattened_chunks()
                     expected_vectors += len(chunks)
-                    for page in _vector_pages(chunks, max_bytes=target.max_memory_bytes):
-                        if not await self._publication_page_is_complete(
-                            physical_publication,
-                            page,
-                            embedding_fingerprint=target.embedding_fingerprint,
-                        ):
-                            raise RebuildPublicationValidationError
+                    replacements.append((replacement, snapshot))
+                    page_chunks.extend(chunks)
+                for page in _vector_pages(page_chunks, max_bytes=target.max_memory_bytes):
+                    if not await self._publication_page_is_complete(
+                        physical_publication,
+                        page,
+                        embedding_fingerprint=target.embedding_fingerprint,
+                    ):
+                        raise RebuildPublicationValidationError
+                for replacement, snapshot in replacements:
                     await self._publish_item(
                         session,
                         replacement=replacement,
@@ -2347,7 +2367,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                         models.DerivedGenerationItem.sequence > after,
                     )
                     .order_by(models.DerivedGenerationItem.sequence)
-                    .limit(_EVIDENCE_PAGE)
+                    .limit(self._validation_page)
                 )
             ).scalars()
         )
@@ -2358,7 +2378,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             except ValueError as exc:
                 raise RebuildPublicationValidationError from exc
         # One bounded join per page rather than one round trip per document: the page is
-        # already capped at `_EVIDENCE_PAGE`, so the `IN` predicates below stay bounded by the
+        # already capped at `self._validation_page`, so the `IN` predicates below stay bounded by
         # same constant regardless of how large the generation is.
         by_key: dict[tuple[str, str], models.AcquisitionRecord] = {}
         if documents:
