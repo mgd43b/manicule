@@ -1044,7 +1044,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             if generation.next_sequence != checkpoint_sequence:
                 raise RebuildLeaseConflictError("checkpoint advanced during vector replay")
             generation.vector_publication_id = target_publication
-            generation.updated_at = utcnow()
+            generation.updated_at = live_clock()
 
     async def _commit_replay_checkpoint(
         self,
