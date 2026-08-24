@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.9](https://github.com/mgd43b/manicule/compare/v0.1.8...v0.1.9) (2026-08-24)
+
+
+### Performance Improvements
+
+* accelerate rebuild and re-embed replay ([#287](https://github.com/mgd43b/manicule/issues/287)) ([f0de4b0](https://github.com/mgd43b/manicule/commit/f0de4b0bb2751101905e68aebe72ca5fb7fed85c))
+* batch re-embedding by chunk budget ([#286](https://github.com/mgd43b/manicule/issues/286)) ([21ef18d](https://github.com/mgd43b/manicule/commit/21ef18d2ccdc40f18e7ba58446e2796b470f7808))
+* batch rebuild validation ([#288](https://github.com/mgd43b/manicule/issues/288)) ([e30053d](https://github.com/mgd43b/manicule/commit/e30053d4107493bf57df9899d4569e7c8d1e1abc))
+* reuse validation checkpoints after takeover replay ([#289](https://github.com/mgd43b/manicule/issues/289)) ([ac8e821](https://github.com/mgd43b/manicule/commit/ac8e821f099d3bbbbfdf1f0406295386bdaf5dd7))
+
 ## [0.1.8](https://github.com/mgd43b/manicule/compare/v0.1.7...v0.1.8) (2026-08-22)
 
 
