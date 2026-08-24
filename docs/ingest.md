@@ -1846,6 +1846,10 @@ takeover always copies or validates from the beginning, because it names a fresh
 vector namespace the old checkpoint's evidence does not describe. `last_progress_at` moves only
 on a durable page, staged batch, or publication commit — never on the timer-driven lease
 heartbeat alone, so a healthy renewal against a stalled cursor cannot read as content progress.
+Publication uses the same evidence-page boundary: it fetches the page's existing documents once,
+then applies the document, chunk and glossary replacement in set-wise phases. This avoids a
+SQLite lookup/delete/flush cycle per document while preserving the single all-or-nothing
+publication transaction and its FTS triggers.
 
 Before a sealed rebuild enters validation, Manicule builds its managed B-tree over physical
 `chunk_id` values. Validation's 512-row exact-id probes can then seek the staged rows instead of

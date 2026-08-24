@@ -229,7 +229,7 @@ class FailingGlossaryPublicationStore(SqliteRebuildStore):
 
     @override
     async def _publish_item(self, *args: object, **kwargs: object) -> str:
-        result = await super()._publish_item(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        result = await super()._publish_item(*args, **kwargs)
         self.published_items += 1
         if self.published_items == 2:
             raise RuntimeError("synthetic glossary publication failure")
@@ -3311,6 +3311,50 @@ async def test_validation_coalesces_vector_checks_for_one_evidence_page(
     )
 
     assert checked == [tuple(document.id for document in documents)]
+
+
+async def test_publication_batches_relational_deletes_for_one_evidence_page(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publishing a page must not issue one delete cycle for every document it contains."""
+    monkeypatch.setattr(rebuild_storage, "_EVIDENCE_PAGE", 2)
+    rebuilds, _vectors, claimed, _documents, _ = await _two_document_generation(
+        store, engine, data_dir, owner="batched-publication-worker"
+    )
+    await rebuilds.validate_generation(
+        claimed.generation_id,
+        owner="batched-publication-worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    deletes = {"chunks": 0, "glossary_entries": 0}
+
+    def count_deletes(*args: object) -> None:
+        statement = args[2]
+        if not isinstance(statement, str):
+            return
+        normalized = statement.upper()
+        if "DELETE FROM CHUNKS" in normalized:
+            deletes["chunks"] += 1
+        if "DELETE FROM GLOSSARY_ENTRIES" in normalized:
+            deletes["glossary_entries"] += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_deletes)
+    try:
+        published = await rebuilds.publish_generation(
+            claimed.generation_id,
+            owner="batched-publication-worker",
+            lease_generation=claimed.lease_generation,
+            now=NOW,
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_deletes)
+
+    assert published.state is RebuildState.PUBLISHED
+    assert deletes == {"chunks": 1, "glossary_entries": 1}
 
 
 async def test_takeover_invalidates_a_stale_validation_checkpoint(

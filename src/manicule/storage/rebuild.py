@@ -1548,7 +1548,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                         raise RebuildPublicationValidationError
                 for replacement, snapshot in replacements:
                     await self._publish_item(
-                        session,
+                        session=session,
                         replacement=replacement,
                         generation_id=generation_id,
                         vector_publication=physical_publication,
@@ -1556,6 +1556,12 @@ class SqliteRebuildStore(WorkspaceScoped):
                         target=target,
                         snapshot=snapshot,
                     )
+                await self._publish_page(
+                    session,
+                    replacements=replacements,
+                    vector_publication=physical_publication,
+                    target=target,
+                )
                 after = pairs[-1][0].sequence
             if await self._publication_row_count(physical_publication) != expected_vectors:
                 raise RebuildPublicationValidationError
@@ -1833,8 +1839,8 @@ class SqliteRebuildStore(WorkspaceScoped):
 
     async def _publish_item(
         self,
-        session: AsyncSession,
         *,
+        session: AsyncSession,
         replacement: DerivedReplacement,
         generation_id: str,
         vector_publication: str,
@@ -1842,92 +1848,99 @@ class SqliteRebuildStore(WorkspaceScoped):
         target: RebuildTarget,
         snapshot: models.AcquisitionRecord,
     ) -> str:
+        """Preserve the per-item publication hook while page-level mutation stays batched."""
+        del session, generation_id, vector_publication, target
         document = replacement.document
         expected_id = document_id(self._workspace_id, connector_name, document.source_id)
         if document.id != expected_id or document.source != connector_name:
             raise RebuildPublicationValidationError
         self._require_snapshot_match(replacement, snapshot)
-        return await self._publish_member(
-            session,
-            replacement=replacement,
-            vector_publication=vector_publication,
-            connector_name=connector_name,
-            target=target,
-        )
+        return document.id
 
-    async def _publish_member(
+    async def _publish_page(
         self,
         session: AsyncSession,
         *,
-        replacement: DerivedReplacement,
+        replacements: Sequence[tuple[DerivedReplacement, models.AcquisitionRecord]],
         vector_publication: str,
-        connector_name: str,
         target: RebuildTarget,
-    ) -> str:
-        document = replacement.document
-        expected_id = document_id(self._workspace_id, connector_name, document.source_id)
-        if document.id != expected_id or document.source != connector_name:
+    ) -> None:
+        """Apply one validated evidence page with bounded ORM state and set-based deletes."""
+        members: list[DerivedReplacement] = []
+
+        def append_members(replacement: DerivedReplacement, connector_name: str) -> None:
+            document = replacement.document
+            expected_id = document_id(self._workspace_id, connector_name, document.source_id)
+            if document.id != expected_id or document.source != connector_name:
+                raise RebuildPublicationValidationError
+            for child in replacement.members:
+                append_members(child, connector_name)
+            members.append(replacement)
+
+        for replacement, _snapshot in replacements:
+            append_members(replacement, replacement.document.source)
+        document_ids = [replacement.document.id for replacement in members]
+        if len(document_ids) != len(set(document_ids)):
             raise RebuildPublicationValidationError
-        for member in replacement.members:
-            await self._publish_member(
-                session,
-                replacement=member,
-                vector_publication=vector_publication,
-                connector_name=connector_name,
-                target=target,
-            )
-        stored = await session.get(models.Document, document.id)
-        if stored is None:
-            stored = models.Document(id=document.id, workspace_id=self._workspace_id)
-            session.add(stored)
-        elif (
-            stored.workspace_id != self._workspace_id or stored.publication_id == vector_publication
-        ):
-            raise RebuildPublicationValidationError
-        # Populate every non-null document field before the following deletes trigger ORM
-        # autoflush. A replacement published into an empty corpus creates this row; leaving it
-        # as only id/workspace until after a query makes SQLite correctly refuse the transient
-        # invalid shape before ``apply_document`` ever runs.
-        apply_document(stored, document)
-        stored.publication_id = vector_publication
-        stored.parse_fp = replacement.parse_fingerprint
-        stored.chunk_fp = target.chunk_fingerprint
-        stored.embed_fp = target.embedding_fingerprint
-        stored.glossary_fp = target.glossary_fingerprint
-        await session.execute(
-            delete(models.GlossaryEntry).where(models.GlossaryEntry.document_id == document.id)
-        )
-        await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
+        existing = {
+            row.id: row
+            for row in (
+                await session.execute(
+                    select(models.Document).where(models.Document.id.in_(document_ids))
+                )
+            ).scalars()
+        }
+        for replacement in members:
+            document = replacement.document
+            stored = existing.get(document.id)
+            if stored is None:
+                stored = models.Document(id=document.id, workspace_id=self._workspace_id)
+                session.add(stored)
+            elif (
+                stored.workspace_id != self._workspace_id
+                or stored.publication_id == vector_publication
+            ):
+                raise RebuildPublicationValidationError
+            apply_document(stored, document)
+            stored.publication_id = vector_publication
+            stored.parse_fp = replacement.parse_fingerprint
+            stored.chunk_fp = target.chunk_fingerprint
+            stored.embed_fp = target.embedding_fingerprint
+            stored.glossary_fp = target.glossary_fingerprint
         await session.flush()
-        for chunk in replacement.chunks:
-            session.add(from_chunk(chunk, document.id, vector_publication))
+        await session.execute(
+            delete(models.GlossaryEntry).where(models.GlossaryEntry.document_id.in_(document_ids))
+        )
+        await session.execute(
+            delete(models.Chunk).where(models.Chunk.document_id.in_(document_ids))
+        )
+        await session.flush()
+        for replacement in members:
+            for chunk in replacement.chunks:
+                session.add(from_chunk(chunk, replacement.document.id, vector_publication))
         await session.flush()
         aliases: list[tuple[str, str]] = []
-        for entry in replacement.glossary:
-            entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
-            session.add(
-                models.GlossaryEntry(
-                    id=entry_id,
-                    document_id=document.id,
-                    chunk_id=entry.chunk_id,
-                    acronym=entry.acronym,
-                    display=entry.display,
-                    expansion=entry.expansion,
-                    location=entry.location,
-                    form=entry.form.value,
-                    confidence=entry.confidence,
+        for replacement in members:
+            for entry in replacement.glossary:
+                entry_id = glossary_entry_id(entry.chunk_id, entry.acronym, entry.expansion)
+                session.add(
+                    models.GlossaryEntry(
+                        id=entry_id,
+                        document_id=replacement.document.id,
+                        chunk_id=entry.chunk_id,
+                        acronym=entry.acronym,
+                        display=entry.display,
+                        expansion=entry.expansion,
+                        location=entry.location,
+                        form=entry.form.value,
+                        confidence=entry.confidence,
+                    )
                 )
-            )
-            aliases.extend((entry_id, alias) for alias in dict.fromkeys(entry.aliases))
-        # SQLAlchemy cannot infer an insert dependency between these independently-created ORM
-        # rows because the models deliberately expose no relationship collection. Flush every
-        # glossary parent before making any alias pending. This is also the evidence-page
-        # boundary: the next page query autoflushes, so merely delaying the aliases until the
-        # end of this method would still leave SQLite free to see a child before its parent.
+                aliases.extend((entry_id, alias) for alias in dict.fromkeys(entry.aliases))
         await session.flush()
         for entry_id, alias in aliases:
             session.add(models.GlossaryAlias(entry_id=entry_id, key=alias))
-        return document.id
+        await session.flush()
 
     @staticmethod
     def _digest_part(hasher: _DigestHasher, value: object) -> None:
