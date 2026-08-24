@@ -105,7 +105,7 @@ jobs:
             "$(echo dist/manicule/*.whl)[all]" "$(echo dist/manicule-mlx/*.whl)"
           /tmp/smoke/bin/manicule --version
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: distributions
           path: dist/
@@ -139,7 +139,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: distributions
           path: dist
@@ -162,7 +162,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: distributions
           path: dist
@@ -198,7 +198,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: distributions
           path: dist
