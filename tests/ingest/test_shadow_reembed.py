@@ -635,14 +635,14 @@ async def test_small_documents_share_one_bounded_model_and_shadow_batch() -> Non
 
 
 async def test_long_context_model_batches_retained_short_chunks_to_the_chunk_budget() -> None:
-    """A long model context must not reduce 1,024-token stored chunks to four at a time.
+    """A long model context must not reduce 1,024-token stored chunks to eight at a time.
 
     Each model call also causes a fenced shadow write, so deriving this from the 8K model
-    context would turn these 32 chunks into eight forward-pass/write pairs instead of one.
+    context would turn these 64 chunks into eight forward-pass/write pairs instead of one.
     """
     authority = Authority()
     documents: list[tuple[Document, Sequence[Chunk]]] = []
-    for index in range(4):
+    for index in range(8):
         document = make_document().model_copy(
             update={
                 "id": f"long-context-document-{index}",
@@ -671,8 +671,8 @@ async def test_long_context_model_batches_retained_short_chunks_to_the_chunk_bud
     completed = await execute(run, authority, corpus, embedder)
 
     assert completed.state is ReembedState.PUBLISHED
-    assert [len(call) for call in embedder.calls] == [32]
-    assert authority.max_upsert_batch == 32
+    assert [len(call) for call in embedder.calls] == [64]
+    assert authority.max_upsert_batch == 64
 
 
 async def test_private_commitment_hides_snapshot_model_path_and_digests_from_repr() -> None:

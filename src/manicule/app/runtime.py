@@ -1275,6 +1275,7 @@ class _Ingestion:
             workspace_id=self._runtime.workspace,
             blobs=blobs,
             vectors=vectors,  # pyright: ignore[reportArgumentType]
+            replay_page=self._runtime.settings.ingest.rebuild_replay_page,
         )
         chunker = await self._runtime.container.aget(keys.CHUNKER)
         embedder = await self._runtime.container.aget(keys.EMBEDDER)
@@ -1480,7 +1481,11 @@ class _Ingestion:
         # Refuse for local disk before constructing a potentially multi-gigabyte model runtime.
         self._require_reembed_capacity(run)
         corpus = SqliteReembedCorpus(engine, self._runtime.workspace)
-        shadows = LanceShadowGenerations(await self._runtime.vector_directory(), authority)
+        shadows = LanceShadowGenerations(
+            await self._runtime.vector_directory(),
+            authority,
+            inspection_page=self._runtime.settings.ingest.reembed_validation_page,
+        )
         embedder = await self._runtime.embedder()
         return await self._resume_reembed(
             run_id=run_id,
@@ -1564,7 +1569,11 @@ class _Ingestion:
         return (
             SqliteReembedCorpus(engine, self._runtime.workspace),
             authority,
-            LanceShadowGenerations(await self._runtime.vector_directory(), authority),
+            LanceShadowGenerations(
+                await self._runtime.vector_directory(),
+                authority,
+                inspection_page=self._runtime.settings.ingest.reembed_validation_page,
+            ),
             await self._runtime.embedder(),
         )
 
