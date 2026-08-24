@@ -322,8 +322,10 @@ class SqliteRebuildStore(WorkspaceScoped):
         blobs: BlobInventory,
         vectors: GenerationVectorInventory | None = None,
         sessions: async_sessionmaker[AsyncSession] | None = None,
-        replay_page: int = _EVIDENCE_PAGE,
+        replay_page: int | None = None,
     ) -> None:
+        if replay_page is None:
+            replay_page = _EVIDENCE_PAGE
         if replay_page < 1:
             raise ValueError("replay_page must be positive")
         super().__init__(engine, workspace_id=workspace_id, sessions=sessions)
