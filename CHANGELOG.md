@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/mgd43b/manicule/compare/v0.1.11...v0.1.12) (2026-08-25)
+
+
+### Bug Fixes
+
+* harden publication leases and watermark clearing ([#314](https://github.com/mgd43b/manicule/issues/314)) ([a4acdc8](https://github.com/mgd43b/manicule/commit/a4acdc8272d4cfc5871f2f476cfc70b918a0220d))
+
 ## [0.1.11](https://github.com/mgd43b/manicule/compare/v0.1.10...v0.1.11) (2026-08-25)
 
 
