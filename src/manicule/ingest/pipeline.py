@@ -1951,9 +1951,17 @@ class IngestPipeline:
             try:
                 await asyncio.wait_for(asyncio.shield(work), timeout=interval)
             except TimeoutError:
-                await self._keep_acquisition_lease_live(
-                    run, acquisitions, self._acquisition_clock(), force=True
-                )
+                try:
+                    await self._keep_acquisition_lease_live(
+                        run, acquisitions, self._acquisition_clock(), force=True
+                    )
+                except StorageBusyError:
+                    # The sibling may be the exact fenced publication holding SQLite's writer
+                    # lock.  Its transaction refreshes the unchanged owner and generation
+                    # immediately before commit, so contention alone is not evidence that this
+                    # worker lost ownership.  Keep observing: once the lock clears, a refused
+                    # renewal still raises AcquisitionLeaseLostError and cancels stale work.
+                    continue
 
     async def _discover_into(
         self, run: _Sync, refs: Conveyor[DiscoveredDoc | AcquisitionRecord]

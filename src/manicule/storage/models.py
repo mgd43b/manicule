@@ -242,7 +242,7 @@ class Connector(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[str] = mapped_column(Text, nullable=False)
     config: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=dict)
-    watermark: Mapped[JsonValue] = mapped_column(JSON)
+    watermark: Mapped[JsonValue | None] = mapped_column(JSON(none_as_null=True))
     """Opaque, connector-defined. Stored and handed back, never interpreted.
 
     Separate from ``last_synced_at`` because a watermark is not always a timestamp — it may

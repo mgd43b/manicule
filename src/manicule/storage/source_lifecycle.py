@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, cast
 
-from sqlalchemy import delete, exists, func, or_, select, union, update
+from sqlalchemy import delete, exists, func, null, or_, select, union, update
 
 from manicule.core.acquisition import AcquisitionRunState
 from manicule.core.content import DocumentStatus
@@ -578,7 +578,10 @@ class SourceLifecycleMixin(WorkspaceScoped):
                     models.Connector.watermark == run.candidate_watermark,
                 )
                 .values(
-                    watermark=None,
+                    # SQLAlchemy's JSON type otherwise binds Python None as JSON `null`.  The
+                    # next snapshot promotion uses `IS NULL` for its base-watermark CAS, so the
+                    # lifecycle boundary must clear the column to SQL NULL explicitly.
+                    watermark=null(),
                     watermark_scope_fingerprint=None,
                     last_synced_at=None,
                 )

@@ -109,6 +109,69 @@ async def test_marker_name_index_upgrades_from_already_applied_inventory_revisio
 
 
 @pytest.mark.contract
+async def test_json_null_connector_watermarks_upgrade_to_sql_null(data_dir: Path) -> None:
+    """Repair the exact state emitted by snapshot deletion in v0.1.11."""
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="c6d4a1e8f209")
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces(id, name, mode, settings, created_at) VALUES "
+                    "('default', 'default', 'personal', '{}', :created_at)"
+                ),
+                {"created_at": _LEGACY_NOW},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO connectors("
+                    "id, workspace_id, name, type, config, watermark, sync_interval_seconds, "
+                    "status, metadata, created_at"
+                    ") VALUES "
+                    "('json-null', 'default', 'json-null', 'synthetic', '{}', 'null', 300, "
+                    "'active', '{}', :created_at), "
+                    "('string-null', 'default', 'string-null', 'synthetic', '{}', '\"null\"', "
+                    "300, 'active', '{}', :created_at)"
+                ),
+                {"created_at": _LEGACY_NOW},
+            )
+            before = (
+                await connection.execute(
+                    text("SELECT id, watermark IS NULL FROM connectors ORDER BY id")
+                )
+            ).all()
+        assert before == [("json-null", 0), ("string-null", 0)]
+
+        await upgrade(engine)
+
+        async with engine.connect() as connection:
+            after = (
+                await connection.execute(
+                    text("SELECT id, watermark, watermark IS NULL FROM connectors ORDER BY id")
+                )
+            ).all()
+        assert after == [("json-null", None, 1), ("string-null", '"null"', 0)]
+
+        async with session_factory(engine).begin() as session:
+            string_null = await session.get(models.Connector, "string-null")
+            assert string_null is not None
+            string_null.watermark = None
+        async with engine.connect() as connection:
+            assert (
+                await connection.scalar(
+                    text("SELECT watermark IS NULL FROM connectors WHERE id = 'string-null'")
+                )
+                == 1
+            ), "the connector JSON mapping must bind Python None as SQL NULL"
+        assert await current(engine) == head_revision()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.contract
 async def test_workspace_snapshot_downgrade_refuses_single_new_format_generation(
     data_dir: Path,
 ) -> None:

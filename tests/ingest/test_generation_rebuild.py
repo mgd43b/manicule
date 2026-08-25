@@ -1335,6 +1335,65 @@ async def test_task_cancellation_joins_an_in_flight_atomic_publication() -> None
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_storage_error_does_not_hide_committed_atomic_publication() -> None:
+    """A second SQLite connection can be busy behind the publication writer lock."""
+
+    @dataclass
+    class PublicationContentionStore(FakeStore):
+        renewal_attempted: asyncio.Event = field(default_factory=asyncio.Event)
+
+        @override
+        async def renew_generation(
+            self,
+            generation_id: str,
+            owner: str,
+            lease_generation: int,
+            *,
+            now: object,
+            expires_at: object,
+        ) -> RebuildCheckpoint:
+            if self.publish_started is not None and self.publish_started.is_set():
+                self.renewal_attempted.set()
+                raise OSError(errno.EAGAIN, "publication holds the writer lock")
+            return await super().renew_generation(
+                generation_id,
+                owner,
+                lease_generation,
+                now=now,
+                expires_at=expires_at,
+            )
+
+        @override
+        async def publish_generation(
+            self,
+            generation_id: str,
+            *,
+            owner: str,
+            lease_generation: int,
+            now: object,
+        ) -> RebuildCheckpoint:
+            if self.publish_started is not None:
+                self.publish_started.set()
+            await asyncio.wait_for(self.renewal_attempted.wait(), timeout=5)
+            return await super().publish_generation(
+                generation_id,
+                owner=owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+
+    item, body = source(0, "body")
+    store = PublicationContentionStore([item], publish_started=asyncio.Event())
+    result = await OfflineGenerationRebuilder(
+        store=store, blobs=FakeBlobs({item.blob_ref: body}), deriver=FakeDeriver()
+    ).run("promoted-run", target(), lease_seconds=1)
+
+    assert result.state is RebuildState.PUBLISHED
+    assert store.published
+    assert store.released_code is None
+
+
+@pytest.mark.asyncio
 async def test_dry_run_refuses_estimated_memory_before_claim_or_derivation() -> None:
     item, body = source(0, "body")
     deriver = FakeDeriver()
@@ -1723,6 +1782,45 @@ async def test_replay_renews_its_lease_for_as_long_as_replay_takes() -> None:
     assert store.replay_renewals >= 2, (
         "a replay spanning more than one lease has to renew more than once"
     )
+    assert checkpoint.state is RebuildState.PUBLISHED
+
+
+async def test_one_transient_busy_heartbeat_round_does_not_cancel_replay() -> None:
+    @dataclass
+    class TransientBusyStore(ReplayingStore):
+        busy_rounds: int = 1
+
+        @override
+        async def renew_generation(
+            self,
+            generation_id: str,
+            owner: str,
+            lease_generation: int,
+            *,
+            now: object,
+            expires_at: object,
+        ) -> RebuildCheckpoint:
+            if self.busy_rounds:
+                self.busy_rounds -= 1
+                raise OSError(errno.EAGAIN, "synthetic transient writer contention")
+            return await super().renew_generation(
+                generation_id,
+                owner,
+                lease_generation,
+                now=now,
+                expires_at=expires_at,
+            )
+
+    item, body = source(0, "alpha\nbeta")
+    store = TransientBusyStore(items=[item], renewals_wanted=1)
+    checkpoint = await OfflineGenerationRebuilder(
+        store=store,
+        blobs=FakeBlobs({item.blob_ref: body}),
+        deriver=FakeDeriver(),
+    ).run("promoted-run", target(), lease_seconds=1)
+
+    assert store.busy_rounds == 0
+    assert store.replay_finished
     assert checkpoint.state is RebuildState.PUBLISHED
 
 

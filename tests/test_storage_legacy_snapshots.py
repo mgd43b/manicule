@@ -24,6 +24,7 @@ from manicule.core.acquisition import (
     SnapshotPromotionPolicy,
 )
 from manicule.core.content import DocumentStatus
+from manicule.core.errors import StorageBusyError
 from manicule.core.sources import DocRef
 from manicule.storage import models
 from manicule.storage.blobs import BlobStore, StoredBlob
@@ -717,14 +718,38 @@ async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
     # Reaching a private static method is the point: it is the seam where the blocking read
     # happens, and a public wrapper would not be one.
     original_read_blob = BlobStore._read_blob  # pyright: ignore[reportPrivateUsage]
+    original_renew = store.renew_acquisition_lease
+    busy_injected = False
 
     def slow_read_blob(path: Path, compression: str) -> bytes:
         reads.append(path)
         time.sleep(read_seconds)
         return original_read_blob(path, compression)
 
+    async def transient_heartbeat_busy(
+        run_id: str,
+        owner: str,
+        generation: int,
+        *,
+        now: datetime,
+        expires_at: datetime,
+    ) -> bool:
+        nonlocal busy_injected
+        task = asyncio.current_task()
+        if task is not None and task.get_name().endswith("-lease-heartbeat") and not busy_injected:
+            busy_injected = True
+            raise StorageBusyError
+        return await original_renew(
+            run_id,
+            owner,
+            generation,
+            now=now,
+            expires_at=expires_at,
+        )
+
     monkeypatch.setattr(legacy_snapshots, "LEASE_DURATION", lease)
     monkeypatch.setattr(BlobStore, "_read_blob", staticmethod(slow_read_blob))
+    monkeypatch.setattr(store, "renew_acquisition_lease", transient_heartbeat_busy)
     migrated = await migrate_legacy_snapshots(store, blobs)
 
     # **The guard against this test going quiet again.** Everything below passes whether or not
@@ -735,6 +760,7 @@ async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
         "was not exercised — this test is asserting nothing. BlobStore's read path has moved "
         "again; re-point the patch at it rather than deleting this assertion."
     )
+    assert busy_injected, "the heartbeat contention fault was never exercised"
     assert (migrated.retained, migrated.promoted, migrated.deferred) == (1, 1, 0)
     assert await store.verify_snapshot_manifest((await _legacy_run(store, "wiki")).id)
 

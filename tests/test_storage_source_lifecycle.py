@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from manicule.core.acquisition import (
     AcquisitionRecordState,
@@ -601,6 +601,13 @@ async def test_snapshot_delete_clears_the_matching_legacy_unscoped_watermark(
         assert connector.watermark is None
         assert connector.watermark_scope_fingerprint is None
         assert connector.last_synced_at is None
+    async with engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                text("SELECT watermark IS NULL FROM connectors WHERE id = 'wiki'")
+            )
+            == 1
+        ), "the cleared JSON watermark must be SQL NULL rather than JSON null"
 
 
 @pytest.mark.asyncio
