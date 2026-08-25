@@ -915,8 +915,12 @@ class SqliteRebuildStore(WorkspaceScoped):
         async with self._sessions.begin() as session:
             generation = await self._required_generation(session, generation_id)
             self._require_lease(generation, owner, lease_generation, now)
-            generation.lease_expires_at = expires_at
-            generation.updated_at = now
+            current_expiry = cast("datetime", generation.lease_expires_at)
+            # A renewal may wait behind a long publication writer and arrive after a newer
+            # renewal. Never let that delayed request shorten the live lease or move its audit
+            # timestamp backwards.
+            generation.lease_expires_at = max(current_expiry, expires_at)
+            generation.updated_at = max(generation.updated_at, now)
             return _checkpoint(generation)
 
     async def assert_generation_lease(

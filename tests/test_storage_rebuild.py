@@ -3863,6 +3863,41 @@ async def test_last_progress_at_is_distinct_from_lease_renewal(
     assert staged.last_progress_at == staged_at, "a durable staged batch is real progress"
 
 
+async def test_delayed_renewal_cannot_shorten_rebuild_lease(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    run_id, _, _ = await promoted_snapshot(store, engine, data_dir)
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine, workspace_id=store.workspace_id, blobs=BlobStore(engine, data_dir), vectors=vectors
+    )
+    plan = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    claimed = await rebuilds.claim_generation(
+        plan.generation_id, "heartbeat-worker", now=NOW, expires_at=NOW + timedelta(minutes=5)
+    )
+    extended = await rebuilds.renew_generation(
+        plan.generation_id,
+        "heartbeat-worker",
+        claimed.lease_generation,
+        now=NOW + timedelta(minutes=1),
+        expires_at=NOW + timedelta(minutes=8),
+    )
+    assert extended.lease_expires_at == NOW + timedelta(minutes=8)
+
+    delayed = await rebuilds.renew_generation(
+        plan.generation_id,
+        "heartbeat-worker",
+        claimed.lease_generation,
+        now=NOW + timedelta(minutes=2),
+        expires_at=NOW + timedelta(minutes=6),
+    )
+    assert delayed.lease_expires_at == NOW + timedelta(minutes=8)
+
+
 # --- lease renewal during checkpoint replay ---------------------------------------------------
 
 

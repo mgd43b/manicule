@@ -34,6 +34,7 @@ from manicule.core.acquisition import (
     SnapshotPromotionPolicy,
 )
 from manicule.core.content import Metadata
+from manicule.core.errors import StorageBusyError
 from manicule.core.ids import content_hash
 from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DocRef
@@ -483,6 +484,11 @@ async def _migrate_connector(  # noqa: PLR0912, PLR0915 - resumable lifecycle di
                     now=heartbeat_at,
                     expires_at=heartbeat_at + LEASE_DURATION,
                 )
+            except StorageBusyError:
+                # A different connection can briefly own SQLite's writer lock. With three
+                # renewal opportunities per lease, one busy round is not evidence of takeover;
+                # the next fenced journal operation remains authoritative.
+                continue
             except Exception:
                 lease_lost.set()
                 work.cancel()

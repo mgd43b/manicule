@@ -58,6 +58,7 @@ from manicule.core.content import (
     Retention,
 )
 from manicule.core.embedding import IndexFingerprints, Vector
+from manicule.core.errors import StorageBusyError
 from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.rebuild import RebuildCheckpoint, RebuildState, RebuildTarget
 from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, Watermark
@@ -2510,6 +2511,87 @@ async def test_enumeration_renews_its_lease_while_the_source_cursor_is_blocked(
 
     assert report.indexed == 1
     assert report.error_type == ""
+
+
+async def test_heartbeat_contention_does_not_cancel_the_owned_publication(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """The publication holding SQLite's writer lock may make its own heartbeat busy.
+
+    That refusal is not evidence of takeover: the document transaction already fenced the
+    exact owner and generation before taking the lock, and refreshes that same lease before
+    commit.  Let the atomic publication finish; a later successful renewal or fenced mutation
+    remains responsible for detecting a real ownership change.
+    """
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    class BusyHeartbeatJournal(SqliteDocStore):
+        def __init__(self) -> None:
+            super().__init__(engine)
+            self.publication_entered = asyncio.Event()
+            self.busy_seen = asyncio.Event()
+            self.busy_injected = False
+
+        @override
+        async def renew_acquisition_lease(
+            self,
+            run_id: str,
+            owner: str,
+            generation: int,
+            *,
+            now: datetime,
+            expires_at: datetime,
+        ) -> bool:
+            if self.publication_entered.is_set() and not self.busy_injected:
+                self.busy_injected = True
+                self.busy_seen.set()
+                raise StorageBusyError
+            return await super().renew_acquisition_lease(
+                run_id, owner, generation, now=now, expires_at=expires_at
+            )
+
+        @override
+        async def _publish_document_in(self, *args: Any, **kwargs: Any) -> Commit:
+            # fenced_publish_document has already taken SQLite's writer lock before it enters
+            # this helper, matching the production contention boundary without wall-clock
+            # sleeps or a second uncontrolled writer.
+            self.publication_entered.set()
+            await asyncio.wait_for(self.busy_seen.wait(), timeout=2)
+            # Give TaskGroup's failure callback a deterministic chance to cancel this task if
+            # the heartbeat lets StorageBusyError escape.
+            await asyncio.sleep(0)
+            return await super()._publish_document_in(*args, **kwargs)
+
+    store = BusyHeartbeatJournal()
+    await store.ensure_workspace()
+    connector = fakes.DictConnector(
+        {"public-busy-publication": "public synthetic line"},
+        name="busy-publication-source",
+    )
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=1,
+        acquisition_clock=fakes.ManualLeaseClock(),
+        detect_glossary=False,
+    )
+
+    report = await asyncio.wait_for(pipeline.run(connector), timeout=10)
+
+    assert store.busy_injected
+    assert report.indexed == 1
+    assert report.error_type == ""
+    assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
 async def test_synchronous_document_preparation_does_not_block_lease_renewal(

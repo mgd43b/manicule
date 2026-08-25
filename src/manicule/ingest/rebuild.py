@@ -98,6 +98,7 @@ class _LeaseHeartbeat:
     lost: bool = False
     renewals: int = 0
     storage_error: BaseException | None = None
+    irreversible_publication: bool = False
 
 
 class _StagedStorageError(RuntimeError):
@@ -1286,6 +1287,7 @@ class OfflineGenerationRebuilder:
                         checkpoint,
                         estimate,
                         target,
+                        heartbeat=lease,
                         owner=owner,
                         snapshot_run_id=snapshot_run_id,
                         missing_limit=missing_limit,
@@ -1464,6 +1466,20 @@ class OfflineGenerationRebuilder:
                         expires_at=renewed_at + timedelta(seconds=lease_seconds),
                     )
                 except (SQLAlchemyError, OSError, RebuildStorageBackendError) as exc:
+                    if state.irreversible_publication:
+                        # Publication is one fenced atomic store operation. SQLite may hold its
+                        # writer lock on the publication connection long enough for this second
+                        # connection to report busy, or the renewal may resume after the row is
+                        # already terminal. In either case publication itself is the authority:
+                        # it must commit or reject its fence, and a heartbeat must not turn a
+                        # committed generation into a reported storage failure.
+                        return
+                    _, retryable = _classify_storage_failure(exc)
+                    if retryable:
+                        # Three attempts per lease deliberately leave room for one transient
+                        # busy/interrupt round. The next fenced store operation still rejects a
+                        # lease that truly expired or changed owners.
+                        continue
                     # Preserve the private cause for the outer storage boundary.  A real lease
                     # conflict remains distinct: only the latter says another worker won.
                     state.storage_error = exc
@@ -1471,6 +1487,11 @@ class OfflineGenerationRebuilder:
                     work.cancel()
                     return
                 except Exception:  # noqa: BLE001 - a conflict or plugin failure loses the lease
+                    if state.irreversible_publication:
+                        # The atomic publication's own fence also decides a real takeover. A
+                        # renewal refusal observed concurrently cannot safely overrule its
+                        # committed result.
+                        return
                     # Broad on purpose, and the one place in this file where that is right. A
                     # refused renewal is a real takeover and arrives as
                     # `RebuildLeaseConflictError`, a `RuntimeError` subclass that a list of
@@ -1506,6 +1527,7 @@ class OfflineGenerationRebuilder:
         estimate: RebuildEstimate,
         target: RebuildTarget,
         *,
+        heartbeat: _LeaseHeartbeat,
         owner: str,
         snapshot_run_id: str,
         missing_limit: int,
@@ -1765,6 +1787,7 @@ class OfflineGenerationRebuilder:
                 lease_generation=checkpoint.lease_generation,
                 now=self._clock(),
             )
+        heartbeat.irreversible_publication = True
         publish = asyncio.create_task(
             self._store.publish_generation(
                 checkpoint.generation_id,
@@ -1816,6 +1839,8 @@ class OfflineGenerationRebuilder:
                 now=self._clock(),
             )
             raise RebuildValidationError from exc
+        finally:
+            heartbeat.irreversible_publication = False
 
 
 def build_offline_rebuilder(
