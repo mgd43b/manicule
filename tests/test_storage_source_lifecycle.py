@@ -587,7 +587,7 @@ async def test_snapshot_delete_clears_the_matching_legacy_unscoped_watermark(
     async with sessions.begin() as session:
         connector = await session.get(models.Connector, "wiki")
         assert connector is not None
-        connector.watermark = cast("JsonValue", watermark)
+        connector.watermark = cast(JsonValue, watermark)
         connector.watermark_scope_fingerprint = None
         connector.last_synced_at = NOW
     plan = await store.plan_snapshot_deletion("delete-legacy-watermark")
