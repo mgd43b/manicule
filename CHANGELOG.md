@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.11](https://github.com/mgd43b/manicule/compare/v0.1.10...v0.1.11) (2026-08-25)
+
+
+### Features
+
+* **connectors:** add Git-backed site indexing ([#311](https://github.com/mgd43b/manicule/issues/311)) ([44e9438](https://github.com/mgd43b/manicule/commit/44e943877577de23eae00f05e685114c24af7aaf))
+
+
+### Bug Fixes
+
+* recover snapshot and publication retries ([#313](https://github.com/mgd43b/manicule/issues/313)) ([d3647bf](https://github.com/mgd43b/manicule/commit/d3647bfaec77aee754bcc5e9ecaefc9694925c73))
+
 ## [0.1.10](https://github.com/mgd43b/manicule/compare/v0.1.9...v0.1.10) (2026-08-24)
 
 
