@@ -28,6 +28,7 @@ import pytest
 from typer.testing import CliRunner
 
 import manicule.cli.main as cli
+from manicule.app import commands
 from manicule.app.commands import Command
 from manicule.app.dispatch import run_op
 from manicule.app.served import Scheduler
@@ -91,15 +92,24 @@ def _tool(service: ApplicationService, name: str, arguments: dict[str, Any]) -> 
 def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Sequence[str]) -> Any:
     """Run a command with the service already built, and parse its ``--json`` output.
 
-    One function is substituted — the one that would otherwise read configuration off the
-    machine running the suite. Argument parsing, dispatch, serialization and the exit status
-    are all the real thing, which is what makes the comparison below worth making.
+    The local and served execution seams are substituted because either can otherwise read
+    configuration off the machine running the suite. Argument parsing, command binding,
+    serialization and the exit status are all the real thing, which is what makes the
+    comparison below worth making.
     """
 
     async def execute(op: str, call: Any) -> Envelope:
         return await run_op(op, service.workspace, lambda: call(service))
 
+    async def dispatch(command: Command) -> Envelope:
+        return await run_op(
+            command.op,
+            service.workspace,
+            lambda: commands.run(service, command, commands.silent),
+        )
+
     monkeypatch.setattr(cli, "_execute", execute)
+    monkeypatch.setattr(cli, "_dispatch", dispatch)
     result = CliRunner().invoke(cli.app, ["--json", *argv])
     assert result.exit_code in {0, 1}, result.output
     return json.loads(result.stdout)
