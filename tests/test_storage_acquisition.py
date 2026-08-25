@@ -1074,6 +1074,38 @@ async def test_lifecycle_edges_and_lease_generation_are_compare_and_swap_guarded
     assert settled.state is AcquisitionRunState.SETTLED
 
 
+async def test_delayed_lease_renewal_cannot_move_expiry_backwards(
+    store: SqliteDocStore,
+) -> None:
+    now = datetime(2026, 8, 15, 13, tzinfo=UTC)
+    await store.create_acquisition_run("monotonic-lease", "wiki")
+    claimed = await store.claim_acquisition_run(
+        "monotonic-lease",
+        "worker",
+        now=now,
+        expires_at=now + timedelta(seconds=10),
+    )
+    assert claimed is not None
+    assert await store.renew_acquisition_lease(
+        claimed.id,
+        "worker",
+        claimed.lease_generation,
+        now=now + timedelta(seconds=1),
+        expires_at=now + timedelta(seconds=40),
+    )
+    assert await store.renew_acquisition_lease(
+        claimed.id,
+        "worker",
+        claimed.lease_generation,
+        now=now + timedelta(seconds=2),
+        expires_at=now + timedelta(seconds=20),
+    )
+
+    durable = await store.get_acquisition_run(claimed.id)
+    assert durable is not None
+    assert durable.lease_expires_at == now + timedelta(seconds=40)
+
+
 async def test_claim_or_create_serializes_repeated_sync_requests(
     store: SqliteDocStore,
 ) -> None:

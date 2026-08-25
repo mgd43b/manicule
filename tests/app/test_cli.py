@@ -125,6 +125,39 @@ async def test_rebuild_plan_uses_the_served_runtime_when_one_is_listening(
     assert forwarded == [Command("rebuild_plan", {"snapshot_id": "snapshot-1"})]
 
 
+async def test_snapshot_delete_plan_uses_the_served_runtime_when_one_is_listening(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    socket = tmp_path / "control.sock"
+    forwarded: list[Command] = []
+    answer = object()
+
+    async def forward(_path: Path, command: Command, *, workspace: str) -> Any:
+        assert workspace == "unknown"
+        forwarded.append(command)
+        return answer
+
+    async def forbidden_local(_command: Command) -> Any:
+        raise AssertionError("served snapshot planning must not assemble a caller-side runtime")
+
+    def listening(_overrides: Mapping[str, Any]) -> Path:
+        return socket
+
+    monkeypatch.setattr(cli.proxy, "listening", listening)
+    monkeypatch.setattr(cli.proxy, "forward", forward)
+    monkeypatch.setattr(cli, "_locally", forbidden_local)
+    cli.STATE.overrides = {}
+    cli.STATE.workspace = None
+    command = Command(
+        "lifecycle_delete_snapshot", {"run_id": "synthetic-snapshot", "dry_run": True}
+    )
+
+    result = await cli._dispatch(command)  # pyright: ignore[reportPrivateUsage]
+
+    assert result is answer
+    assert forwarded == [command]
+
+
 # --- --json ------------------------------------------------------------------------------------
 
 

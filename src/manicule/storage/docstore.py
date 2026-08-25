@@ -60,6 +60,13 @@ if TYPE_CHECKING:
 
 _WATERMARK: TypeAdapter[Watermark] = TypeAdapter(Watermark)
 
+_VECTOR_TOMBSTONE_BATCH: Final = 100
+"""Rows per cleanup-evidence insert, safely below SQLite's legacy 999-variable limit.
+
+Each row binds five values. Keeping the writes in the caller's existing transaction preserves
+atomic publication while bounding both the SQL statement and the temporary parameter list.
+"""
+
 
 def _cross_workspace(document_id: str, holder: str, asked: str) -> str:
     """Why an id that resolves to a row is still not this workspace's to touch.
@@ -392,22 +399,25 @@ class SqliteDocStore(
         state = await session.get(models.IndexState, self._workspace_id)
         namespace = "workspace" if state is None else state.vector_namespace
         vector_table = None if state is None else state.vector_table
-        await session.execute(
-            sqlite_insert(models.VectorTombstone)
-            .values(
-                [
-                    {
-                        "chunk_id": vector_id(publication_id, chunk.id),
-                        "workspace_id": self._workspace_id,
-                        "vector_namespace": namespace,
-                        "vector_table": vector_table,
-                        "deleted_at": utcnow(),
-                    }
-                    for chunk in chunks
-                ]
+        deleted_at = utcnow()
+        for start in range(0, len(chunks), _VECTOR_TOMBSTONE_BATCH):
+            page = chunks[start : start + _VECTOR_TOMBSTONE_BATCH]
+            await session.execute(
+                sqlite_insert(models.VectorTombstone)
+                .values(
+                    [
+                        {
+                            "chunk_id": vector_id(publication_id, chunk.id),
+                            "workspace_id": self._workspace_id,
+                            "vector_namespace": namespace,
+                            "vector_table": vector_table,
+                            "deleted_at": deleted_at,
+                        }
+                        for chunk in page
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
             )
-            .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
-        )
 
     async def publish_document(
         self,
@@ -460,7 +470,7 @@ class SqliteDocStore(
         async with self._sessions.begin() as session:
             await self._fence_derived_reset(session, expected_reset_epoch)
             await self._fence_acquisition_mutation(session, fence)
-            return await self._publish_document_in(
+            committed = await self._publish_document_in(
                 session,
                 document,
                 chunks,
@@ -473,6 +483,8 @@ class SqliteDocStore(
                 original_omitted_reason=original_omitted_reason,
                 source_dependencies=source_dependencies,
             )
+            await self._refresh_acquisition_fence(session, fence)
+            return committed
 
     async def _publish_document_in(
         self,
@@ -506,14 +518,16 @@ class SqliteDocStore(
             session.add(from_chunk(chunk, document.id, document.publication_id))
         await session.flush()
         if chunks:
-            await session.execute(
-                delete(models.VectorTombstone).where(
-                    models.VectorTombstone.workspace_id == self._workspace_id,
-                    models.VectorTombstone.chunk_id.in_(
-                        [vector_id(document.publication_id, chunk.id) for chunk in chunks]
-                    ),
+            for start in range(0, len(chunks), _VECTOR_TOMBSTONE_BATCH):
+                page = chunks[start : start + _VECTOR_TOMBSTONE_BATCH]
+                await session.execute(
+                    delete(models.VectorTombstone).where(
+                        models.VectorTombstone.workspace_id == self._workspace_id,
+                        models.VectorTombstone.chunk_id.in_(
+                            [vector_id(document.publication_id, chunk.id) for chunk in page]
+                        ),
+                    )
                 )
-            )
         if glossary_entries is not None:
             await self._replace_entries(session, document.id, glossary_entries)
         if glossary_fp is not None:

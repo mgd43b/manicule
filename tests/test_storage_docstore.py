@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
+from sqlalchemy import event, func, select
 
+from manicule.core.acquisition import AcquisitionFence
 from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
 from manicule.core.protocols import DocStore
 from manicule.core.retrieval import Filter
 from manicule.core.sources import Watermark
+from manicule.storage import models
 from manicule.storage.docstore import (
     DEFAULT_WORKSPACE,
     CrossWorkspaceCollisionError,
@@ -65,6 +68,86 @@ async def test_a_document_round_trips_through_storage_unchanged(store: SqliteDoc
         "storage stamps indexed_at for an indexed document, and a citation reports it as the one "
         "of a mirrored document's three timestamps that describes this installation"
     )
+
+
+@pytest.mark.parametrize(("chunks", "writes"), [(100, 1), (101, 2)])
+async def test_vector_cleanup_evidence_is_staged_in_bounded_transactional_batches(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    chunks: int,
+    writes: int,
+) -> None:
+    document = make_document()
+    statements: list[str] = []
+
+    def observe(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if "INSERT INTO vector_tombstones" in statement:
+            statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", observe)
+    try:
+        await store.stage_vectors(
+            "synthetic-publication",
+            [make_chunk(document, position, f"generated {position}") for position in range(chunks)],
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", observe)
+
+    assert len(statements) == writes
+    async with engine.connect() as connection:
+        count = await connection.scalar(select(func.count(models.VectorTombstone.chunk_id)))
+    assert count == chunks
+
+
+async def test_fenced_publication_refreshes_an_expired_lease_before_commit(
+    store: SqliteDocStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_start = datetime(2026, 8, 15, 12, tzinfo=UTC)
+    await store.create_acquisition_run("long-publication", "wiki")
+    claimed = await store.claim_acquisition_run(
+        "long-publication",
+        "worker",
+        now=lease_start,
+        expires_at=lease_start + timedelta(seconds=1),
+    )
+    assert claimed is not None
+    commit_time = lease_start + timedelta(seconds=5)
+    monkeypatch.setattr("manicule.storage.acquisition.utcnow", lambda: commit_time)
+    document = make_document(source="wiki", source_id="synthetic-long-publication")
+
+    committed = await store.fenced_publish_document(
+        AcquisitionFence(
+            run_id=claimed.id,
+            owner="worker",
+            generation=claimed.lease_generation,
+            now=lease_start,
+            lease_ttl_seconds=30,
+        ),
+        document,
+        [],
+        expected=None,
+        chunk_fp=None,
+        embed_fp=None,
+        parse_fp=None,
+        glossary_entries=None,
+        glossary_fp=None,
+        original_omitted_reason=None,
+    )
+
+    assert committed.committed
+    durable = await store.get_acquisition_run(claimed.id)
+    assert durable is not None
+    assert durable.lease_owner == "worker"
+    assert durable.lease_generation == claimed.lease_generation
+    assert durable.lease_expires_at == commit_time + timedelta(seconds=30)
 
 
 async def test_a_document_is_found_by_source_identity_not_by_uri(
