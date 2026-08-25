@@ -10,6 +10,7 @@ import shutil
 import threading
 import weakref
 from dataclasses import dataclass, field
+from datetime import timedelta
 from functools import wraps
 from typing import TYPE_CHECKING, Any, cast
 
@@ -2114,7 +2115,12 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         now: datetime,
         expires_at: datetime,
     ) -> bool:
-        """Renew only the live lease named by its owner and fencing generation."""
+        """Renew only the live lease named by its owner and fencing generation.
+
+        Expiry is monotonic. A heartbeat may begin before a long publication takes SQLite's
+        writer lock and resume only after that publication commits; its requested expiry is
+        stale by then and must not shorten the newer in-transaction renewal.
+        """
         if expires_at <= now:
             msg = "lease expiry must be after now"
             raise ValueError(msg)
@@ -2132,7 +2138,16 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                         models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
                         models.AcquisitionRun.superseded_at.is_(None),
                     )
-                    .values(lease_expires_at=expires_at, updated_at=utcnow())
+                    .values(
+                        lease_expires_at=case(
+                            (
+                                models.AcquisitionRun.lease_expires_at < expires_at,
+                                expires_at,
+                            ),
+                            else_=models.AcquisitionRun.lease_expires_at,
+                        ),
+                        updated_at=utcnow(),
+                    )
                 ),
             )
             return result.rowcount == 1
@@ -3176,6 +3191,49 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         )
         if result.rowcount != 1:
             msg = f"acquisition run {fence.run_id!r} lease changed or expired"
+            raise AcquisitionLeaseLostError(msg)
+
+    async def _refresh_acquisition_fence(
+        self, session: AsyncSession, fence: AcquisitionFence
+    ) -> None:
+        """Extend a still-owned fence immediately before a long transaction commits.
+
+        The transaction already took SQLite's writer lock in
+        :meth:`_fence_acquisition_mutation`, so no successor can take over while the expensive
+        relational replacement runs. The original expiry may nevertheless pass. Refreshing
+        here preserves the same owner and generation through settlement; omitting the expiry
+        predicate is intentional only at this lock-held boundary.
+        """
+        if fence.lease_ttl_seconds is None:
+            return
+        now = utcnow()
+        expires_at = now + timedelta(seconds=fence.lease_ttl_seconds)
+        result = cast(
+            "CursorResult[Any]",
+            await session.execute(
+                update(models.AcquisitionRun)
+                .where(
+                    models.AcquisitionRun.id == fence.run_id,
+                    models.AcquisitionRun.workspace_id == self._workspace_id,
+                    models.AcquisitionRun.lease_owner == fence.owner,
+                    models.AcquisitionRun.lease_generation == fence.generation,
+                    models.AcquisitionRun.state != AcquisitionRunState.SETTLED,
+                    models.AcquisitionRun.superseded_at.is_(None),
+                )
+                .values(
+                    lease_expires_at=case(
+                        (
+                            models.AcquisitionRun.lease_expires_at < expires_at,
+                            expires_at,
+                        ),
+                        else_=models.AcquisitionRun.lease_expires_at,
+                    ),
+                    updated_at=now,
+                )
+            ),
+        )
+        if result.rowcount != 1:
+            msg = f"acquisition run {fence.run_id!r} lease changed before publication committed"
             raise AcquisitionLeaseLostError(msg)
 
     async def _ensure_connector(

@@ -561,12 +561,20 @@ class SourceLifecycleMixin(WorkspaceScoped):
                     updated_at=utcnow(),
                 )
             )
+            watermark_scope_matches: ColumnElement[bool] = (
+                models.Connector.watermark_scope_fingerprint == run.scope_fingerprint
+            )
+            if run.candidate_watermark is not None:
+                watermark_scope_matches = or_(
+                    watermark_scope_matches,
+                    models.Connector.watermark_scope_fingerprint.is_(None),
+                )
             await session.execute(
                 update(models.Connector)
                 .where(
                     models.Connector.id == run.connector_id,
                     models.Connector.workspace_id == self._workspace_id,
-                    models.Connector.watermark_scope_fingerprint == run.scope_fingerprint,
+                    watermark_scope_matches,
                     models.Connector.watermark == run.candidate_watermark,
                 )
                 .values(

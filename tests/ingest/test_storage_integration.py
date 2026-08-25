@@ -3395,6 +3395,8 @@ async def test_failed_local_derivation_retries_from_blob_without_source_access(
     assert record.diagnostic.code.value == "embed_failed"
     assert first.pending_derivation
     assert first.retry_required
+    assert first.durable_pending == 1
+    assert first.lifecycle_metadata()["pending_items"] == 1
     preserved = await store.find_document(connector.name, "public-retry-document")
     assert preserved is not None
     assert preserved.status is DocumentStatus.INDEXED

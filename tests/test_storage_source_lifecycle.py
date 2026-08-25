@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from sqlalchemy import select
@@ -14,7 +14,7 @@ from manicule.core.acquisition import (
     SnapshotCompleteness,
     SnapshotItemOutcome,
 )
-from manicule.core.content import DocumentStatus
+from manicule.core.content import DocumentStatus, JsonValue
 from manicule.core.rebuild import RebuildState
 from manicule.core.source_lifecycle import LifecycleRefusalError
 from manicule.storage import models
@@ -565,6 +565,42 @@ async def test_snapshot_delete_preserves_a_connector_watermark_that_advanced_aft
         assert connector.watermark == {"value": "new"}
         assert connector.watermark_scope_fingerprint == "scope-v2"
         assert connector.last_synced_at == NOW + timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_delete_clears_the_matching_legacy_unscoped_watermark(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    watermark = {"value": "legacy-position"}
+    await _snapshot(
+        engine,
+        data_dir,
+        run_id="delete-legacy-watermark",
+        body=b"synthetic legacy snapshot",
+        source_id="legacy-page",
+        candidate_watermark=watermark,
+        watermark_committed_at=NOW,
+    )
+    sessions = session_factory(engine)
+    async with sessions.begin() as session:
+        connector = await session.get(models.Connector, "wiki")
+        assert connector is not None
+        connector.watermark = cast("JsonValue", watermark)
+        connector.watermark_scope_fingerprint = None
+        connector.last_synced_at = NOW
+    plan = await store.plan_snapshot_deletion("delete-legacy-watermark")
+    assert plan.confirmation is not None
+
+    await store.delete_snapshot("delete-legacy-watermark", confirmation=plan.confirmation)
+
+    async with sessions() as session:
+        connector = await session.get(models.Connector, "wiki")
+        assert connector is not None
+        assert connector.watermark is None
+        assert connector.watermark_scope_fingerprint is None
+        assert connector.last_synced_at is None
 
 
 @pytest.mark.asyncio

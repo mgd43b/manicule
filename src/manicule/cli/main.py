@@ -554,11 +554,11 @@ async def _dispatch(command: Command) -> Envelope:
     which is what keeps ``manicule init`` from requiring a server before there is anything for
     one to serve.
     """
-    # A rebuild plan is a read, but its target is the exact parser/chunker/embedder identity of
-    # the runtime that will execute it. When that runtime is already served, asking it avoids a
-    # second model/device construction and prevents two processes from disagreeing about the
-    # configured target. Other reads intentionally remain local and available during writes.
-    if not command.writes() and command.op != "rebuild_plan":
+    # These plans are reads of writer-owned state. A rebuild plan needs the served runtime's
+    # exact target identity; snapshot deletion planning must not open a second runtime while
+    # the server owns the workspace. Other reads intentionally remain local during writes.
+    served_plan_ops = {"rebuild_plan", "lifecycle_delete_snapshot"}
+    if not command.writes() and command.op not in served_plan_ops:
         return await _locally(command)
     served = proxy.listening(STATE.overrides)
     if not command.writes() and served is None:
@@ -1976,9 +1976,11 @@ def snapshot_delete(
 ) -> None:
     """Plan deletion by default; delete authoritative snapshot ownership only with its token."""
     if confirm is None:
-        emit(
-            "lifecycle_delete_snapshot",
-            lambda service: service.lifecycle_delete_snapshot(run_id, dry_run=True),
+        submit(
+            Command(
+                "lifecycle_delete_snapshot",
+                {"run_id": run_id, "dry_run": True},
+            )
         )
         return
     submit(

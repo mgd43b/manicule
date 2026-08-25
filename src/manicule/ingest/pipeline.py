@@ -1522,7 +1522,12 @@ class IngestPipeline:
         report.durable_acquired = durable.acquired_count
         report.durable_reused = durable.reused_count
         report.durable_failed = durable.retry_count
-        report.durable_pending = max(0, durable.acquired_count - durable.indexed_count)
+        # RETRY is excluded from ``acquired_count`` so source omissions remain distinct, but a
+        # retained indexing retry is still unfinished local work. Include retry debt here so a
+        # failed publication cannot report zero pending items while blocking settlement.
+        report.durable_pending = max(
+            0, durable.acquired_count + durable.retry_count - durable.indexed_count
+        )
         report.snapshot_omissions = durable.omission_count
         report.snapshot_omission_reasons = {
             code.value: count for code, count in durable.omission_reasons.items()
@@ -2268,6 +2273,7 @@ class IngestPipeline:
             owner=run.lease_owner,
             generation=run.lease_generation,
             now=now,
+            lease_ttl_seconds=self._acquisition_lease_s,
         )
 
     async def _acquire_journal(self, run: _Sync) -> bool:

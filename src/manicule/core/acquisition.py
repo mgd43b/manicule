@@ -141,6 +141,7 @@ class AcquisitionFence(BaseModel):
     owner: str = Field(min_length=1)
     generation: int = Field(ge=1)
     now: datetime
+    lease_ttl_seconds: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _now_is_aware(self) -> Self:
