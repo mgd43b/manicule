@@ -214,6 +214,14 @@ class SiteManifest(BaseModel):
             lambda page: page.id,
         )
         _require_unique(self.pages, "route", lambda page: page.route)
+        # **The namespace `identity` actually reads, which is neither of the two above.**
+        # `SiteRouteRecord.identity` is `self.id or self.route`, so ids and routes share one
+        # space — and checking each separately admits a collision between them. A page with
+        # `id: "/b/"` and a *different* page whose route is `/b/` both answer `/b/`, both checks
+        # pass, and the manifest is accepted. The two then collapse onto one document identity:
+        # the inventory keyed by identity keeps whichever was built last and the other page is
+        # silently not indexed, with nothing anywhere reporting a document it did not store.
+        _require_unique(self.pages, "identity", lambda page: page.id or page.route)
         return self
 
 
