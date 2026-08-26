@@ -541,10 +541,30 @@ class SqliteDocStore(
     async def _replace_source_dependencies(
         self, session: AsyncSession, document: Document, targets: Sequence[SourceId]
     ) -> None:
-        """Replace a page's include edges within the document's publication transaction."""
+        """Replace a page's include edges within the document's publication transaction.
+
+        ``source`` is in the predicate for the *index*, not for the result. The primary key is
+        ``(workspace_id, source, parent_document_id, target_source_id)`` and the table is
+        ``WITHOUT ROWID``, so naming the first two columns and skipping the second breaks the
+        prefix: the only usable seek left is ``workspace_id``, and the query plan says so —
+
+            SEARCH source_dependencies USING COVERING INDEX
+                ix_source_dependencies_target (workspace_id=?)
+
+        which is every dependency row in the workspace, scanned once per document published.
+        Over a space where a third of the pages carry an include that is quadratic in the size
+        of the run. With ``source`` present the plan seeks the key directly:
+
+            SEARCH source_dependencies USING PRIMARY KEY
+                (workspace_id=? AND source=? AND parent_document_id=?)
+
+        It cannot change *which* rows go: ``documents.id`` is a primary key in its own right, so
+        a parent document has exactly one source and every row already carries it.
+        """
         await session.execute(
             delete(models.SourceDependency).where(
                 models.SourceDependency.workspace_id == self._workspace_id,
+                models.SourceDependency.source == document.source,
                 models.SourceDependency.parent_document_id == document.id,
             )
         )
