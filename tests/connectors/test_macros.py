@@ -512,3 +512,36 @@ async def test_the_target_is_read_from_whichever_parameter_carries_it(parameter:
 
     assert "found it" in text
     assert included == ["2"]
+
+
+async def test_a_title_that_cannot_be_a_cql_literal_leaves_the_page_fetchable() -> None:
+    """An unusable macro title is an unresolved macro, not a failed page.
+
+    ``cql.quote`` refuses a line break or a NUL, and it is right to: escaping cannot save a
+    literal that would terminate and continue as query syntax. But the refusal reached
+    ``_page_id_of`` as a bare ``ValueError`` and failed the **whole page fetch**, not just the
+    macro — and ``_included`` calls ``_page_id_of`` *outside* its own ``try``, which catches only
+    the three body failures, so there was nowhere else for it to be caught.
+
+    It takes only ordinary content to produce one. ``_StorageScanner.handle_data`` only strips,
+    so an interior newline in a title parameter survives, and ``convert_charrefs`` turns a
+    ``&#10;`` into one. A wiki page whose include macro has its title split across two lines made
+    the page it sits on unfetchable — and the rest of that page is content somebody is looking
+    for, which is the whole argument the unresolved path already makes.
+    """
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="Overview",
+                space="ENG",
+                adf=with_include("see", title="Release\nNotes"),
+            )
+        ]
+    )
+
+    text, included, unresolved = await _body(instance)
+
+    assert "see" in text, "the page's own content still arrives"
+    assert included == []
+    assert unresolved, "the macro is reported as unresolved rather than disappearing silently"

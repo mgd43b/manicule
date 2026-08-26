@@ -1549,7 +1549,25 @@ class ConfluenceConnector:
         """The id of the page an include macro names by title, or ``""`` if there is none."""
         if not title or not space:
             return ""
-        query = cql.title_query(space, title, current_only=self._config.current_only)
+        try:
+            query = cql.title_query(space, title, current_only=self._config.current_only)
+        except ValueError:
+            # **A title that cannot be a CQL literal names nothing this connector can look up,
+            # which is the same answer as "no such page".** `cql.quote` refuses a line break or
+            # a NUL — correctly, since escaping cannot save a literal that would terminate and
+            # continue as query syntax — but the refusal arrived here as an unhandled
+            # `ValueError` that failed the *whole page fetch*, not just the macro.
+            #
+            # It takes only ordinary content to produce one. `_StorageScanner.handle_data` only
+            # strips, so an interior newline in a macro's title parameter survives, and
+            # `convert_charrefs` turns a `&#10;` into one. A wiki page whose include macro has
+            # its title split across two lines therefore made the page it is on unfetchable.
+            #
+            # `_included` calls this *outside* its own `try`, and that `try` catches only the
+            # three body failures, so there was nowhere else for this to be caught. Returning
+            # empty puts it on the existing unresolved path, where an include whose target
+            # cannot be read is already recorded with a reason rather than failing the page.
+            return ""
         params = [("cql", query), ("limit", "1")]
         payload = await self._client.get_json(self._client.url(SEARCH_PATH), params)
         results = _results(payload)
