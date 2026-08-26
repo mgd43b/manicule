@@ -578,6 +578,49 @@ def test_code_is_never_overlapped() -> None:
     assert not (first_lines & second_lines)
 
 
+def test_code_ending_a_mostly_prose_chunk_is_not_overlapped() -> None:
+    """The overlap guards ask the group's *dominant* kind, which is not each unit's kind.
+
+    ``test_code_is_never_overlapped`` above uses a document that is entirely code, so
+    ``_dominant_kind`` is CODE and the guard fires before the walk begins. The case it cannot
+    reach is the ordinary one: a section of prose that ends with a code sample. There the
+    dominant kind is PROSE, both guards pass, and the backwards walk took whatever unit sat at
+    the end of the previous chunk — the code block.
+
+    That is the defect the pure-code test was written to prevent, arriving through the door it
+    does not cover: the sample is emitted in two chunks, indexed twice, and can be cited from
+    the chunk that is not where it lives. Overlap exists so a *sentence* split across a boundary
+    stays searchable from both sides; a duplicated code block is not that.
+    """
+    sentences_before = " ".join(f"Sentence {index} covers the rollout." for index in range(120))
+    sample = "\n".join(f"call_{index}(argument)" for index in range(12))
+    blocks = [
+        prose(sentences_before, start=1, end=120),
+        ParsedBlock(
+            kind=BlockKind.CODE,
+            text=sample,
+            anchor=LineAnchor(start=121, end=132),
+            lang="python",
+        ),
+        prose(
+            " ".join(f"Sentence {index} covers the rollback." for index in range(120)),
+            start=133,
+            end=252,
+        ),
+    ]
+
+    chunks = make_chunker().chunk(document(), blocks)
+
+    assert len(chunks) > 1
+    lines = [line for line in sample.splitlines() if line]
+    for line in lines:
+        carrying = [index for index, chunk in enumerate(chunks) if line in chunk.text]
+        assert len(carrying) <= 1, (
+            f"{line!r} appears in chunks {carrying}: a code line was copied into an adjacent "
+            f"chunk as overlap"
+        )
+
+
 def test_the_overlap_window_is_capped_at_half_the_preceding_chunk() -> None:
     """The window and the minimum chunk size are the same number.
 

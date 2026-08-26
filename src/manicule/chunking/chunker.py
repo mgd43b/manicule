@@ -940,6 +940,20 @@ class StructuralChunker:
         taken: list[str] = []
         used: list[_Unit] = []
         for unit in reversed(previous):
+            # **Each unit's own kind, not the group's dominant one.** The two guards above ask
+            # `_dominant_kind`, which is a fact about the *majority* of a group — so a chunk of
+            # mostly prose that ends in a code block or a table passed them, and the backwards
+            # walk then copied that block into the next chunk as overlap. Overlap exists so a
+            # sentence split across a boundary is searchable from both sides; a duplicated code
+            # block or table row is not that, and it is indexed twice and can be cited from a
+            # chunk that is not where it lives.
+            #
+            # `break` rather than `continue`, and that is load-bearing: the window has to stay
+            # contiguous with the end of the previous chunk. Skipping over a code block would
+            # produce a discontiguous window *and* widen the next chunk's anchor across the
+            # block it skipped, via the anchor merge below.
+            if unit.kind not in OVERLAPPING_KINDS:
+                break
             # A unit the next chunk's anchor already covers may be cut into: taking part of it
             # widens nothing, because the anchor is the same one either way. That is the case
             # whenever an oversized block was split across chunks, which is where overlap
