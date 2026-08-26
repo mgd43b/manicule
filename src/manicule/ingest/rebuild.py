@@ -865,7 +865,29 @@ class EmbeddingOfflineDeriver:
             )
         else:
             self._embedder.fingerprint.require_match(stored)
-        staged_vectors: list[Vector] = []
+        # **Keyed by document, not accumulated positionally, because the two orders differ.**
+        # `stage()` below hands `flattened_chunks()` and these vectors to `VectorStore.upsert`,
+        # which pairs them by position. `flattened()` is breadth-first, by its own docstring.
+        # This walk is depth-first: appending before recursing into `members` is pre-order.
+        #
+        # The two agree only while the tree is one level deep, which is every tree the suites
+        # built. Give a member its own member and a following sibling — a zip inside a zip, a
+        # zipped mail attachment — and they diverge, while the *lengths* stay identical, so
+        # nothing raised. For root -> (A -> (A1,), B) the staged order is [A1, B] and the
+        # flattened order is [B, A1]: every chunk of B was stored against A1's vector and every
+        # chunk of A1 against B's.
+        #
+        # Nothing downstream could catch it. `validate_identity()` checks per-node counts and
+        # id uniqueness, never the pairing; `upsert` only compares lengths and derives the
+        # stored identity from the *chunk*, so the wrong vector is written under a
+        # right-looking identity; `validate_generation` counts rows. The generation validated
+        # and published, and dense retrieval then returned the wrong sibling document and cited
+        # text its vector never described.
+        #
+        # `validate_identity` guarantees distinct document ids across the flattened tree, so the
+        # key is safe — and ordering by `completed.flattened()` means the pairing is derived
+        # from the same traversal that consumes it rather than from a second one kept in sync.
+        staged: dict[str, tuple[Vector, ...]] = {}
 
         async def complete(item: DerivedReplacement) -> DerivedReplacement:
             vectors, work = await embed_or_reuse(
@@ -875,7 +897,7 @@ class EmbeddingOfflineDeriver:
                 chunk_fingerprint=self._chunk_fingerprint,
                 previous=self._previous_inputs,
             )
-            staged_vectors.extend(vectors)
+            staged[item.document.id] = tuple(vectors)
             members = tuple([await complete(member) for member in item.members])
             return item.model_copy(
                 update={
@@ -888,7 +910,9 @@ class EmbeddingOfflineDeriver:
         completed = await complete(replacement)
         return PreparedReplacement(
             replacement=completed,
-            vectors=tuple(staged_vectors),
+            vectors=tuple(
+                vector for node in completed.flattened() for vector in staged[node.document.id]
+            ),
             memory_bytes=memory_bytes,
             temporary_bytes=temporary_bytes,
         )
