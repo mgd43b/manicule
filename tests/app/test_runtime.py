@@ -1626,3 +1626,61 @@ def _runtime_with_a_buildable_pipeline(
         },
     )
     return Runtime(settings, discovery=found)
+
+
+async def test_a_forced_run_that_stops_at_the_limit_says_so() -> None:
+    """`--limit` on a forced run is a bounded ending, not a complete one.
+
+    `RunReport` defaults `enumeration_completed` to True and `limited` to False, and `_forced`
+    set neither: the limit was a bare `break`, and only the capacity arm ever touched
+    `enumeration_completed`. So a forced run that indexed the first five of five hundred
+    documents reported an enumeration that had finished and a run that was not limited — which
+    `_ingest_payload` turns into `outcome: "complete"`. A partial index, reported as a whole one,
+    on the command whose entire purpose is to bound the work.
+
+    `_discover_into` on the non-forced path states all three endings explicitly — False up
+    front, `limited` on the break, True only in the `for/else`. This asserts the forced path
+    now agrees with it, including the third ending: an *unlimited* forced run really did
+    enumerate to the end, and must still say so.
+    """
+
+    class _Discovered:
+        def __init__(self, number: int) -> None:
+            self.ref = f"doc-{number}"
+            self.source_id = f"doc-{number}"
+            self.version_token = None
+            self.title = f"Document {number}"
+
+    class _Connector:
+        name = "fake"
+
+        async def discover(self, _watermark: object) -> AsyncIterator[_Discovered]:
+            for number in range(10):
+                yield _Discovered(number)
+
+        async def fetch(self, ref: object) -> object:
+            return ref
+
+    class _Pipeline:
+        async def ingest_raw(self, *args: object, **kwargs: object) -> list[object]:
+            from manicule.core.content import DocumentStatus  # noqa: PLC0415
+            from manicule.ingest.pipeline import DocumentOutcome  # noqa: PLC0415
+
+            del args, kwargs
+            return [
+                DocumentOutcome(document_id="d", source_id="doc", status=DocumentStatus.INDEXED)
+            ]
+
+    ingestion = _Ingestion(cast("Runtime", object()))
+
+    bounded = await ingestion._forced(  # pyright: ignore[reportPrivateUsage]
+        cast("Any", _Connector()), cast("Any", _Pipeline()), limit=3
+    )
+    assert bounded.limited is True
+    assert bounded.enumeration_completed is False
+
+    whole = await ingestion._forced(  # pyright: ignore[reportPrivateUsage]
+        cast("Any", _Connector()), cast("Any", _Pipeline()), limit=None
+    )
+    assert whole.limited is False
+    assert whole.enumeration_completed is True, "an unlimited run still reaches the end"

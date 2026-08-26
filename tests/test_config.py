@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import tomli_w
 from pydantic import ValidationError
 
-from manicule.config.loader import load_settings, save_settings
+from manicule.config.loader import (
+    _strip,  # pyright: ignore[reportPrivateUsage] - the writer's half of the predicate
+    load_settings,
+    save_settings,
+)
 from manicule.config.profiles import PROFILES, profile_config
 from manicule.config.providers import (
     Egress,
@@ -20,7 +25,7 @@ from manicule.config.providers import (
     resolve_provider_keys,
     runs_in_process,
 )
-from manicule.config.settings import AuthMode, Mode, Settings, Theme
+from manicule.config.settings import REDACTED, AuthMode, Mode, Settings, Theme
 from manicule.core.errors import ConfigError, PolicyError
 from manicule.core.retrieval import RetrievalProfile
 
@@ -298,6 +303,130 @@ def test_reading_the_configuration_never_hands_out_a_credential(
     rendered = repr(settings.redacted())
     assert "sk-do-not-print-me" not in rendered
     assert "**********" in rendered
+
+
+def test_secrecy_is_decided_by_the_declared_type_and_not_by_the_name() -> None:
+    """A name is a bad proxy for a credential, and it was wrong in both directions.
+
+    The old rule matched substrings. Five ordinary settings contain "token" and are floats and
+    ints — `llm.first_token_timeout_s`, `llm.token_safety_factor`, `llm.token_drift_tolerance`,
+    `rag.context.system_prompt_tokens`, `ingest.target_batch_tokens` — so all five were masked
+    in `config show` *and* refused by `config set`, leaving an operator no way to inspect or
+    change them. The hand-maintained exception list (`maxtokens`, `overlaptokens`, `tokenizer`)
+    is the scar from the same problem, extended one name at a time.
+
+    The other direction is the serious one: `security.data_policy.auto_redact.hash_salt` is a
+    real `SecretStr` and matches none of the markers, so the one thing this machinery exists to
+    hide was printed in the clear and written to disk.
+
+    Both are now decided from the annotation. The exhaustive walk is the point — it holds every
+    field in `Settings` to its declared type, so a new `SecretStr` is covered on the day it is
+    added rather than when somebody notices its name does not match.
+    """
+    import typing  # noqa: PLC0415 - only this derivation reads annotations
+
+    from pydantic import BaseModel, SecretStr  # noqa: PLC0415 - only this derivation needs them
+
+    from manicule.config.settings import secret_setting  # noqa: PLC0415
+
+    seen: set[int] = set()
+    disagreements: list[str] = []
+
+    def walk(model: type[BaseModel], path: tuple[str, ...] = ()) -> None:
+        if id(model) in seen:
+            return
+        seen.add(id(model))
+        for name, field in model.model_fields.items():
+            here = (*path, name)
+            annotation = field.annotation
+            declared = annotation is SecretStr or SecretStr in typing.get_args(annotation)
+            if secret_setting(here) is not declared:
+                disagreements.append(f"{'.'.join(here)} declared={declared}")
+            for candidate in (annotation, *typing.get_args(annotation)):
+                if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                    walk(candidate, here)
+
+    walk(Settings)
+    assert not disagreements, (
+        f"these settings are classified against their declared type: {disagreements}. "
+        f"Secrecy is read from the annotation; a name that merely looks like a credential is "
+        f"not one, and a credential whose name does not is still one."
+    )
+
+    # And the two that motivated it, stated by name so the failure reads as the bug.
+    assert secret_setting(("security", "data_policy", "auto_redact", "hash_salt"))
+    assert not secret_setting(("llm", "token_safety_factor"))
+
+
+def test_a_secret_under_an_arbitrary_key_is_still_masked() -> None:
+    """`llm.providers` is a table keyed by a name somebody chose, not by declared fields.
+
+    The walk has to spend that segment on the key rather than looking it up as a field, or the
+    resolution stops at `providers` and every provider's `api_key` is handed out in the clear.
+    """
+    settings = Settings.model_validate(
+        {
+            "providers": {"openai": {"api_key": "sk-live-do-not-print"}},
+            "security": {"data_policy": {"auto_redact": {"hash_salt": "salt-do-not-print"}}},
+        }
+    )
+
+    rendered = repr(settings.redacted())
+
+    assert "sk-live-do-not-print" not in rendered
+    assert "salt-do-not-print" not in rendered
+    assert rendered.count("**********") >= 2
+
+
+def test_a_credential_under_an_untyped_subtree_is_still_redacted() -> None:
+    """`plugins.config` has no declared type, so the name rule is what must cover it.
+
+    Secrecy is read from the annotation wherever there is one — but `plugins.config` holds
+    arbitrary per-component options, validated against each component's own model rather than
+    against `Settings`, so the walk leaves the declared model there and `looks_secret` is the
+    only thing left.
+
+    The type-driven rewrite recursed into that subtree without judging anything, so a plugin's
+    `api_key` came back from `config show` in the clear while `save_settings` — which reaches
+    the same conclusion through `secret_setting` — correctly omitted it from the file. Display
+    and disk disagreeing about what is a credential is exactly what one predicate exists to
+    prevent, and the leak was on the side that hands the value to a caller.
+
+    Both halves are asserted together, because either alone would pass against a fix that made
+    them agree by leaking from both.
+    """
+    settings = Settings.model_validate(
+        {
+            "plugins": {
+                "config": {
+                    "connector.confluence": {
+                        "api_key": "sk-do-not-print",
+                        "batch_size": 50,
+                        "nested": {"client_secret": "also-do-not-print", "depth": 3},
+                    }
+                }
+            }
+        }
+    )
+
+    def component(tree: Any) -> dict[str, Any]:
+        plugins = cast("dict[str, Any]", tree["plugins"])
+        config = cast("dict[str, Any]", plugins["config"])
+        return cast("dict[str, Any]", config["connector.confluence"])
+
+    shown = component(settings.redacted())
+    nested = cast("dict[str, Any]", shown["nested"])
+    assert shown["api_key"] == REDACTED
+    # Nested, because an untyped subtree is arbitrarily deep and one level would look fixed.
+    assert nested["client_secret"] == REDACTED
+    # And nothing else is swept up: a component option that is not a credential stays readable,
+    # or `config show` becomes useless for the thing it is for.
+    assert shown["batch_size"] == 50
+    assert nested["depth"] == 3
+
+    written = component(_strip(settings.model_dump(mode="json")))
+    assert "api_key" not in written, "the writer already withheld it; the two must not disagree"
+    assert written["batch_size"] == 50
 
 
 def test_saving_the_configuration_never_writes_a_credential(

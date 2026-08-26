@@ -166,6 +166,35 @@ def test_duplicate_manifest_identity_fields_fail_atomically(duplicate: str) -> N
         parse_site_manifest(_manifest(first, second))
 
 
+def test_an_id_may_not_collide_with_another_page_s_route() -> None:
+    """`identity` is `id or route`, so ids and routes share one namespace.
+
+    The three checks above are per field, and per field they all pass here: the ids are unique
+    among the pages that have one, and the routes are unique. What collides is the *namespace*
+    `SiteRouteRecord.identity` actually reads — a page carrying `id: "/b/"` and a different page
+    whose route is `/b/` both answer `/b/`.
+
+    The consequence is silent and total for one of them: the inventory is keyed by identity, so
+    it keeps whichever was built last and the other page is simply not indexed, with nothing
+    reporting a document that was discovered and not stored.
+
+    The last case is the one that keeps this from being over-strict — a page whose `id` is its
+    own route collides with nothing and must stay legal.
+    """
+    collide = _manifest(
+        {"source": "docs/a.md", "route": "/a/", "id": "/b/"},
+        {"source": "docs/b.md", "route": "/b/"},
+    )
+    with pytest.raises(ValidationError, match="duplicate page identity"):
+        parse_site_manifest(collide)
+
+    own = _manifest(
+        {"source": "docs/a.md", "route": "/a/", "id": "/a/"},
+        {"source": "docs/b.md", "route": "/b/"},
+    )
+    assert len(parse_site_manifest(own).pages) == 2
+
+
 def test_manifest_limits_are_enforced_before_connector_discovery() -> None:
     with pytest.raises(SiteRouteError, match="byte limit"):
         parse_site_manifest(b"{}" * 10, max_bytes=4)

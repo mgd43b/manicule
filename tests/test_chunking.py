@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from itertools import pairwise
-from typing import cast
+from typing import cast, override
 
 import pytest
 
@@ -578,6 +578,49 @@ def test_code_is_never_overlapped() -> None:
     assert not (first_lines & second_lines)
 
 
+def test_code_ending_a_mostly_prose_chunk_is_not_overlapped() -> None:
+    """The overlap guards ask the group's *dominant* kind, which is not each unit's kind.
+
+    ``test_code_is_never_overlapped`` above uses a document that is entirely code, so
+    ``_dominant_kind`` is CODE and the guard fires before the walk begins. The case it cannot
+    reach is the ordinary one: a section of prose that ends with a code sample. There the
+    dominant kind is PROSE, both guards pass, and the backwards walk took whatever unit sat at
+    the end of the previous chunk — the code block.
+
+    That is the defect the pure-code test was written to prevent, arriving through the door it
+    does not cover: the sample is emitted in two chunks, indexed twice, and can be cited from
+    the chunk that is not where it lives. Overlap exists so a *sentence* split across a boundary
+    stays searchable from both sides; a duplicated code block is not that.
+    """
+    sentences_before = " ".join(f"Sentence {index} covers the rollout." for index in range(120))
+    sample = "\n".join(f"call_{index}(argument)" for index in range(12))
+    blocks = [
+        prose(sentences_before, start=1, end=120),
+        ParsedBlock(
+            kind=BlockKind.CODE,
+            text=sample,
+            anchor=LineAnchor(start=121, end=132),
+            lang="python",
+        ),
+        prose(
+            " ".join(f"Sentence {index} covers the rollback." for index in range(120)),
+            start=133,
+            end=252,
+        ),
+    ]
+
+    chunks = make_chunker().chunk(document(), blocks)
+
+    assert len(chunks) > 1
+    lines = [line for line in sample.splitlines() if line]
+    for line in lines:
+        carrying = [index for index, chunk in enumerate(chunks) if line in chunk.text]
+        assert len(carrying) <= 1, (
+            f"{line!r} appears in chunks {carrying}: a code line was copied into an adjacent "
+            f"chunk as overlap"
+        )
+
+
 def test_the_overlap_window_is_capped_at_half_the_preceding_chunk() -> None:
     """The window and the minimum chunk size are the same number.
 
@@ -912,3 +955,189 @@ def test_the_chunker_passes_the_shipped_contract() -> None:
     ]
     chunks = assert_chunker_contract(make_chunker(), document(), blocks, _Embedder(512))
     assert chunks
+
+
+# --- table metadata and cell anchors ------------------------------------------------------
+
+
+def test_adjacent_row_ranges_collapse_for_a_multi_column_table() -> None:
+    """`_adjacent` compared one edge of each area, so it could only ever be True at one column.
+
+    For `A1:C1` and `A2:C2` it took `left`'s *end* cell against `right`'s *start* cell — `C1`
+    against `A2`, whose columns are `C` and `A` — and answered False. Row ranges therefore never
+    collapsed for any table wider than one column: every row stayed its own area, and the
+    anchor `_collapse_areas` exists to compact grew one comma-separated range per row.
+
+    The negatives are the point of the parametrization: a gap in the rows, a shift in the
+    columns, and a widened right-hand area must all still refuse.
+    """
+    from manicule.chunking.chunker import (  # noqa: PLC0415
+        _adjacent,  # pyright: ignore[reportPrivateUsage] - the predicate under test
+        _collapse_areas,  # pyright: ignore[reportPrivateUsage] - its only caller
+    )
+
+    assert _adjacent("A1:C1", "A2:C2"), "the case that could never be True"
+    assert _adjacent("B3:D3", "B4:D4")
+    assert _adjacent("A1", "A2"), "the single-column case, which already worked"
+
+    assert not _adjacent("A1:C1", "A3:C3"), "a skipped row is not adjacent"
+    assert not _adjacent("A1:C1", "B2:D2"), "shifted columns are a different area"
+    assert not _adjacent("A1:C1", "A2:D2"), "a wider row is a different area"
+    assert not _adjacent("x", "y"), "an unreadable reference collapses nothing"
+
+    assert _collapse_areas(["A1:C1", "A2:C2", "A3:C3"]) == ["A1:C3"]
+
+
+def test_an_unsplit_table_does_not_carry_the_parsers_row_list_onto_the_chunk() -> None:
+    """`rows` on a chunk is the `[first, last]` pair, never the table's text.
+
+    A table small enough not to be split copied its block metadata straight onto the unit, and
+    `_group_metadata` then carried `rows` onto the chunk — so the chunk held the whole table a
+    second time, beside its own text. It also made `rows` mean two different things depending
+    on a size threshold: the pair that `_split_table` writes on a split part, and the list of
+    row strings on an unsplit one. One key, two types, decided by whether the table fit.
+    """
+    rows = [f"| r{index} | value {index} |" for index in range(6)]
+    block = ParsedBlock(
+        kind=BlockKind.TABLE,
+        text="\n".join(rows),
+        anchor=LineAnchor(start=1, end=6),
+        metadata=cast(
+            "Metadata",
+            {"rows": rows, "header_rows": 1, "row_refs": [f"A{i}:B{i}" for i in range(6)]},
+        ),
+    )
+
+    chunks = make_chunker().chunk(document(), [block])
+
+    assert len(chunks) == 1, "the fixture is meant to fit in one chunk"
+    assert "rows" not in chunks[0].metadata, "the parser's row list must not ride onto the chunk"
+
+    # And the contrast that makes `rows` mean one thing: split the same table and the key comes
+    # back — as the `[first, last]` pair, which is what a chunk's `rows` is for.
+    narrow = StructuralChunker(counter(), max_tokens=24, overlap_tokens=0, breadcrumb_tokens=4)
+    parts = narrow.chunk(document(), [block])
+    assert len(parts) > 1, "the fixture is meant to split at this budget"
+    pairs = [part.metadata["rows"] for part in parts if "rows" in part.metadata]
+    assert pairs, "a split part records which rows it holds"
+    assert all(isinstance(pair, list) and len(pair) == 2 for pair in pairs), (
+        f"`rows` on a chunk is a [first, last] pair, got {pairs}"
+    )
+
+
+def test_memoizing_the_token_counter_changes_no_chunk() -> None:
+    """The counter remembers answers, and that must be invisible in the output.
+
+    `TokenCounter` re-ran the tokenizer over the whole string every time it was asked, and the
+    chunker asks the same question many times: packing a group, checking whether a candidate
+    fits, computing an overlap cap and hard-splitting an oversized unit all measure overlapping
+    strings. Instrumented over one 40-block page — 478 calls for 81 distinct strings, 623,382
+    characters counted against 139,241 distinct — so 78% of the work was a question already
+    answered. With the real `cl100k_base` tokenizer a 60-block page chunks 1.9x faster.
+
+    **The speedup is worth nothing if a boundary moves**, because `CHUNKER_VERSION` would then
+    have to move with it and bill the corpus for a re-chunk and re-embed. So the property under
+    test is equality, over randomized documents across every block kind rather than one fixture:
+    a memo is only sound because a token count is a pure function of the text and the
+    vocabulary, and this is what holds that claim to the output.
+    """
+    import random  # noqa: PLC0415 - only this derivation needs it
+
+    from manicule.chunking.tokens import TokenCounter  # noqa: PLC0415
+
+    kinds = [BlockKind.PROSE, BlockKind.LIST, BlockKind.CODE, BlockKind.TABLE, BlockKind.HEADING]
+
+    def blocks(seed: int) -> list[ParsedBlock]:
+        rng = random.Random(seed)  # noqa: S311 - a seeded fixture generator, not a key
+        return [
+            ParsedBlock(
+                kind=rng.choice(kinds),
+                text=" ".join(f"w{rng.randrange(999)}" for _ in range(rng.randrange(1, 400))),
+                anchor=LineAnchor(start=index * 3 + 1, end=index * 3 + 3),
+            )
+            for index in range(rng.randrange(3, 30))
+        ]
+
+    class Unmemoized(TokenCounter):
+        """The counter with its memo defeated, for the comparison to mean anything.
+
+        Overriding `_remember` rather than poking `_memo_chars`: the budget check resets the
+        counter after it clears, so a doctored value disables one store and nothing more. The
+        first version of this test did exactly that and compared the memo against itself —
+        both arms measured 180 calls where the real difference is 658 against 180.
+        """
+
+        @override
+        def _remember(self, text: str, raw: int) -> None:
+            return
+
+    def chunked(seed: int, *, memo: bool) -> list[tuple[str, str, int, int]]:
+        counter = (TokenCounter if memo else Unmemoized)(
+            "whitespace", lambda text: max(1, len(text.split())), provisional=False
+        )
+        chunker = StructuralChunker(counter, max_tokens=128, overlap_tokens=16, breadcrumb_tokens=8)
+        return [
+            (chunk.id, chunk.text, chunk.position, chunk.token_count)
+            for chunk in chunker.chunk(document(), blocks(seed))
+        ]
+
+    for seed in range(200):
+        assert chunked(seed, memo=True) == chunked(seed, memo=False), (
+            f"document {seed} chunks differently with the counter's memo; the memo must be "
+            f"invisible in the output or CHUNKER_VERSION has to move with it"
+        )
+
+
+def test_packing_lines_does_not_grow_quadratically_with_the_budget() -> None:
+    """A code block must not hand the tokenizer work that squares with the chunk budget.
+
+    `_split_lines` rebuilt the whole accumulated prefix and counted it again for every line, so
+    the cost was quadratic in the number of lines that fit *one chunk* — which is set by
+    `max_tokens`. The block size only multiplies it.
+
+    That is the axis, and getting it wrong is why the first version of this test passed against
+    the defect. Measured over a 2,000-line file, tokenized characters as a multiple of the
+    block:
+
+        max_tokens   128     256     512    1024
+        before      24.0x   44.5x   87.1x  169.9x     <- doubles with the budget
+        after        8.7x    9.3x    9.6x   10.1x     <- flat
+
+    At the shipped budget of 512 that is nine times the tokenizer work, on the stage every
+    document of every ingest passes through.
+
+    Asserted as a ratio that does not grow, never as a time or an absolute count: a wall-clock
+    bound is not stable on a loaded runner, and an absolute would need editing whenever the
+    packing changed for a good reason. What must never come back is the shape.
+    """
+    from manicule.chunking.tokens import TokenCounter  # noqa: PLC0415
+
+    def tokenized_per_character(budget: int) -> float:
+        counted: list[int] = []
+
+        def count(text: str) -> int:
+            counted.append(len(text))
+            return max(1, len(text.split()))
+
+        block = ParsedBlock(
+            kind=BlockKind.CODE,
+            text="\n".join(f"line_{index} = compute({index})" for index in range(2000)),
+            anchor=LineAnchor(start=1, end=2000),
+            lang="python",
+        )
+        StructuralChunker(
+            TokenCounter("whitespace", count, provisional=False),
+            max_tokens=budget,
+            overlap_tokens=0,
+            breadcrumb_tokens=8,
+        ).chunk(document(), [block])
+        return sum(counted) / len(block.text)
+
+    narrow, wide = tokenized_per_character(128), tokenized_per_character(1024)
+
+    # Eight times the budget. Quadratic multiplies the ratio by about eight — it did, 24x to
+    # 170x. Bisection leaves it flat. Two is generous room for the search's own overhead.
+    assert wide < narrow * 2, (
+        f"tokenized {narrow:.1f}x the block at max_tokens=128 and {wide:.1f}x at 1024: the work "
+        f"per character is growing with the budget, which is the quadratic pack coming back"
+    )

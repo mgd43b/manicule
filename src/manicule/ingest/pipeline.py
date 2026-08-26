@@ -54,7 +54,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError
-from typing import TYPE_CHECKING, Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast, runtime_checkable
 from uuid import uuid4
 
 from manicule.chunking import finalize_chunks
@@ -939,6 +939,20 @@ class _Sync:
 
     dependency_discovered_sources: set[SourceId] = field(default_factory=_source_id_set)
     """Ordinary durable records, used to force their fresher source evidence in place."""
+
+
+JOURNAL_PAGE: Final = 64
+"""How many acquisition records a journal reader takes per query.
+
+The three readers walked the journal with ``limit=1``, so a durable run issued one SQL query
+and one round trip per record — the whole journal, one row at a time, on every stage that reads
+it. The page is bounded rather than large because the reader is upstream of ``Conveyor.put``,
+which is where the backpressure lives: a page is held in the reader's own memory until the
+stage downstream has room for it, so the number trades queries against exactly that.
+
+Sixty-four, and the ordering is unchanged: ``after_sequence`` still advances per record, so a
+page is the same sequence of records the one-at-a-time walk produced, read in fewer queries.
+"""
 
 
 class IngestPipeline:
@@ -2338,20 +2352,26 @@ class IngestPipeline:
                         AcquisitionRecordState.RETRY,
                     ),
                     after_sequence=after,
-                    limit=1,
+                    limit=JOURNAL_PAGE,
                 )
                 if not records:
                     return
-                if run.stop.is_set():
-                    return
-                record = records[0]
-                # A retry carrying a blob belongs to local indexing, never another source call.
-                if record.state is AcquisitionRecordState.RETRY and record.blob_ref is not None:
+                for record in records:
+                    if run.stop.is_set():
+                        return
                     after = record.sequence
-                    continue
-                run.discovery_records_held.enter()
-                await refs.put(record)
-                after = record.sequence
+                    # A retry carrying a blob belongs to local indexing, never another source
+                    # call.
+                    if record.state is AcquisitionRecordState.RETRY and record.blob_ref is not None:
+                        continue
+                    # Per record, not per page. The page batches the *queries*; admission is
+                    # still one at a time, or the reader waits inside `put` while holding a
+                    # record and the run's bound on held records rises by one.
+                    await refs.wait_for_room()
+                    if run.stop.is_set():
+                        return
+                    run.discovery_records_held.enter()
+                    await refs.put(record)
         finally:
             refs.finish()
 
@@ -2668,18 +2688,21 @@ class IngestPipeline:
                         AcquisitionRecordState.RETRY,
                     ),
                     after_sequence=after,
-                    limit=1,
+                    limit=JOURNAL_PAGE,
                 )
                 if not records:
                     return
-                if run.stop.is_set():
-                    return
-                record = records[0]
-                after = record.sequence
-                if record.blob_ref is None:
-                    continue
-                run.discovery_records_held.enter()
-                await refs.put(record)
+                for record in records:
+                    if run.stop.is_set():
+                        return
+                    after = record.sequence
+                    if record.blob_ref is None:
+                        continue
+                    await refs.wait_for_room()
+                    if run.stop.is_set():
+                        return
+                    run.discovery_records_held.enter()
+                    await refs.put(record)
         finally:
             refs.finish()
 
@@ -2801,16 +2824,19 @@ class IngestPipeline:
                         AcquisitionRecordState.RETRY,
                     ),
                     after_sequence=after,
-                    limit=1,
+                    limit=JOURNAL_PAGE,
                 )
                 if not records:
                     return
-                if run.stop.is_set():
-                    return
-                record = records[0]
-                run.discovery_records_held.enter()
-                await refs.put(record)
-                after = record.sequence
+                for record in records:
+                    if run.stop.is_set():
+                        return
+                    await refs.wait_for_room()
+                    if run.stop.is_set():
+                        return
+                    run.discovery_records_held.enter()
+                    await refs.put(record)
+                    after = record.sequence
         finally:
             refs.finish()
 
@@ -3044,6 +3070,21 @@ class IngestPipeline:
         is the documented behavior and the reason the impatient case is safe rather than
         different. Either way the recovery sweep is what finishes the story for a document left
         in flight, and no watermark is written.
+
+        **A stage that *fails* during the window is shutdown detail, not the run's outcome**,
+        and that is the third ending rather than an afterthought. `stages` is the `_drive` task,
+        whose durable arm runs bare `TaskGroup`s with nothing broad caught on the path, so a
+        store failure or a lost acquisition lease arriving mid-drain surfaces here as an
+        `ExceptionGroup`. `wait_for` re-raises it, and it is neither of the two types caught
+        above.
+
+        That mattered because of where this is called from. `_run_guarded` catches
+        `CancelledError`, calls this, and *then* releases the acquisition lease before
+        re-raising. An exception escaping here jumps out of that handler before the release —
+        and a sibling `except ExceptionGroup` on the same `try` cannot catch it, because it is
+        already inside the `CancelledError` arm. So the run lost its lease release and kept a
+        logical generation lease until wall-clock expiry, and the cancellation the caller asked
+        for arrived as a stage failure instead.
         """
         run.stop.set()
         try:
@@ -3052,6 +3093,18 @@ class IngestPipeline:
             stages.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await stages
+        except BaseExceptionGroup as failures:
+            # Recorded rather than dropped — this codebase does not swallow an exception it
+            # cannot name — but it must not become the run's ending. Only the first is kept: a
+            # teardown that fails after something was already recorded has nothing to add.
+            leaves = _leaves(cast("BaseExceptionGroup[Exception]", failures))
+            if leaves and not run.report.error_type:
+                run.report.error_type = type(leaves[0]).__name__
+                run.report.error_message = str(leaves[0])
+            # Deliberately no `stages.cancel()` and no second await. Reaching here means the
+            # task has already *finished* — by raising — so canceling is a no-op and awaiting
+            # it again would re-raise the group this arm exists to absorb. That is not
+            # hypothetical: it is what the first version of this handler did.
 
     def _stage_report(self, run: _Sync) -> StageReport:
         """What the stages did, read out of the gauges and the hand-offs once, at the end."""

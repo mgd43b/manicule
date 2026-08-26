@@ -40,6 +40,55 @@ jobs:
         with:
           token: ${{ github.token }}
 
+      # **release-please bumps two `pyproject.toml` files and knows nothing about `uv.lock`.**
+      # The lockfile records a `version` for `manicule` and `manicule-mlx` too, because both are
+      # editable members of this workspace — so every release left it a version behind. It went
+      # unnoticed for three of them, to 0.1.12 against a lockfile still saying 0.1.9, because
+      # `uv sync` repairs a stale lockfile in place rather than refusing it: CI rewrote the file
+      # on every job and reported nothing, and the only visible symptom was a contributor's
+      # working tree going dirty on their first `uv run`. That noise then rode into whichever
+      # pull request happened to be open, which is the wrong commit for a release to arrive in.
+      #
+      # Re-locking here puts it in the release pull request instead, so the bump and the lock are
+      # one reviewed change. `uv lock --check` in ci.yml is the other half — this keeps the
+      # lockfile current, that one refuses to let it drift again.
+      #
+      # Plain `uv lock`, never `--upgrade`: uv is conservative by default and rewrites only what
+      # the changed constraints require, so this moves the two version lines and leaves every
+      # resolved dependency alone. A release pull request must not quietly bump third-party pins.
+      - uses: actions/checkout@v7
+        if: ${{ steps.release.outputs.pr }}
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+
+      - uses: astral-sh/setup-uv@v7
+        if: ${{ steps.release.outputs.pr }}
+        with:
+          # Pinned for the same reason the build job pins it: the interpreter that resolves a
+          # release's lockfile is a decision, not whatever ubuntu-latest moved to this month.
+          python-version: "3.14"
+
+      - name: re-lock the release pull request
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          # `headBranchName` is the release branch release-please just wrote. Pushing anywhere
+          # else would put the lockfile in a commit the release does not contain.
+          BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+        run: |
+          set -euo pipefail
+          uv lock
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock already names the bumped version; nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock
+          git commit -m "chore: re-lock uv.lock for the release"
+          # A push authenticated with `github.token` deliberately does not trigger workflows,
+          # which is what stops this step from re-running itself on the commit it just made.
+          git push origin "HEAD:${BRANCH}"
+
   # One build, two publishes. The artifacts are built once and handed to the publish jobs,
   # rather than each rebuilding, so that what reaches PyPI under both names is demonstrably the
   # same set of files rather than two builds that ought to agree.

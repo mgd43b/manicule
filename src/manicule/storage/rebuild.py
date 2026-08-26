@@ -53,7 +53,7 @@ from manicule.storage.acquisition import (
     snapshot_manifest_matches,
 )
 from manicule.storage.fts import (
-    CREATE_TRIGGERS,
+    CURRENT_TRIGGERS,
     DROP_TRIGGERS,
     FTS_TABLE,
     INTEGRITY_CHECK_FTS,
@@ -1755,7 +1755,10 @@ class SqliteRebuildStore(WorkspaceScoped):
                     await session.execute(text(statement))
                 await session.execute(text(f"DROP TABLE IF EXISTS {FTS_TABLE}"))
                 await session.execute(text(create_fts(target.fts_tokenizer)))
-                for statement in CREATE_TRIGGERS:
+                # `CURRENT_TRIGGERS`, not `CREATE_TRIGGERS`: the latter is frozen at the
+                # revision that imports it, and recreating from it downgrades `chunks_ad` to
+                # the body that writes a tombstone with no workspace or vector table in it.
+                for statement in CURRENT_TRIGGERS:
                     await session.execute(text(statement))
                 await session.execute(text(REBUILD_FTS))
             await session.execute(text(INTEGRITY_CHECK_FTS))

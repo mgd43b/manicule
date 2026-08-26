@@ -16,6 +16,7 @@ from manicule.container import Container, build_container, check_wiring, keys
 from manicule.container import container as container_module
 from manicule.core.errors import (
     CircularDependencyError,
+    ComponentSetupError,
     ConfigError,
     PluginError,
     PolicyError,
@@ -249,6 +250,37 @@ async def test_a_component_resolved_after_startup_is_still_set_up(
     async with container:
         await container.aget(keys.MIDDLEWARE.named("first"))
         assert log == ["setup:first"]
+
+
+async def test_a_component_whose_setup_failed_is_never_handed_out(settings: Settings) -> None:
+    """A failed `setup()` is remembered, so the half-built instance cannot be resolved again.
+
+    `start()` wraps `_setup_pending` in a teardown that pops the instances, so a failed startup
+    is clean — that is the test below. But `aget` calls `_setup_pending` **directly**, with no
+    such wrapper. There the exception reached the caller while the half-built instance stayed in
+    `_instances` and its slot had already been popped from `_pending`, so the *next* `aget`
+    found it cached, found nothing pending, and returned it.
+
+    A component that never completed `setup` handed out as a working one — silently, for the
+    rest of the process's life. The second resolution below is the whole point: before the fix
+    it returned the `Recorder` with an empty setup log.
+
+    Re-raised rather than retried, because a component that failed to start has usually acquired
+    something already and `setup` is nowhere documented as idempotent. The original failure is
+    the `__cause__`, so the reason is not lost behind the container's own message.
+    """
+    log: list[str] = []
+    registry = ComponentRegistry().bind("test")
+    registry.add(keys.MIDDLEWARE.named("bad"), lambda _: Recorder("bad", log, fail_setup=True))
+    container = Container(settings, registry)
+
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        await container.aget(keys.MIDDLEWARE.named("bad"))
+
+    with pytest.raises(ComponentSetupError, match="failed to start") as raised:
+        await container.aget(keys.MIDDLEWARE.named("bad"))
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert log == [], "setup never completed, so nothing should claim it did"
 
 
 async def test_a_failed_startup_leaves_nothing_running(settings: Settings) -> None:

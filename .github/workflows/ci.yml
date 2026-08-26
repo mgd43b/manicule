@@ -27,6 +27,21 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+
+      # **Before the sync, and that ordering is the whole point.** `uv sync` and `uv run` repair
+      # a stale `uv.lock` in place and say nothing, so a lockfile that disagreed with
+      # `pyproject.toml` was rewritten by the first uv command of every job and never reported.
+      # That is how three releases shipped with the lockfile pinned at 0.1.9: release-please
+      # bumps `pyproject.toml` and `packages/manicule-mlx/pyproject.toml`, and nothing bumped the
+      # `version` the lockfile records for those same two editable members. The only symptom was
+      # a contributor's tree going dirty on their first command, in a file they had not touched.
+      #
+      # `--check` resolves and *refuses* rather than rewriting. Run after the sync it would check
+      # a file uv had just fixed and pass unconditionally, which is why
+      # tests/test_packaging.py asserts nothing in this file syncs above this line.
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --check
+
       - run: uv sync --all-groups --all-extras
       - name: ruff check
         run: uv run ruff check .
@@ -231,11 +246,28 @@ jobs:
       # Weights are fetched here rather than by the tests. A test that downloads on first run
       # is a test that fails when the network does, and one that downloads several hundred
       # megabytes per case is a test nobody runs twice.
+      # **The key hashes everything that decides which bytes land here, not just the script.**
+      # It used to hash `prefetch_embedding_models.py` alone, and that script names no commits:
+      # it asks `manicule.embedding.artifacts` for them, and asks `manicule.embedding.cards`
+      # which files to take. Re-qualifying a model — a new sha in `_BUILTIN_REVISIONS` or
+      # `_QUALIFIED_MODEL_REVISIONS` — therefore left the key unchanged, and an unchanged key is
+      # an exact hit. `actions/cache` restores the *old* snapshot and, because the primary key
+      # hit, skips the post-run save. So the pre-seed downloads the new revision, the job
+      # discards it, and the next run does it again: a job cached specifically to keep a
+      # third-party host off the critical path goes back to fetching from one on every run,
+      # permanently and silently.
+      #
+      # tests/test_ci_model_cache.py holds the key to the files the seeding actually reads.
       - name: cache model weights
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: models-${{ runner.os }}-${{ hashFiles('tools/prefetch_embedding_models.py') }}
+          key: >-
+            models-${{ runner.os }}-${{ hashFiles(
+              'tools/prefetch_embedding_models.py',
+              'src/manicule/embedding/artifacts.py',
+              'src/manicule/embedding/cards.py'
+            ) }}
       - name: pre-seed models
         run: uv run tools/prefetch_embedding_models.py --mlx
       # The whole point of the job is the assertion, not the fetch. The embedding suites skip

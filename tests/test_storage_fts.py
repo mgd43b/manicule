@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 import pytest
@@ -10,6 +11,8 @@ from sqlalchemy import text
 from manicule.core.content import DocumentStatus
 from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.fts import (
+    CREATE_TRIGGERS,
+    CURRENT_TRIGGERS,
     DROP_TRIGGERS,
     INTEGRITY_CHECK_FTS,
     REBUILD_FTS,
@@ -188,3 +191,128 @@ async def test_search_is_scoped_to_the_stores_workspace(engine: AsyncEngine) -> 
     await _seed(first, "s1", ["auth token rotation"])
     assert await first.search_lexical("auth", k=5)
     assert await second.search_lexical("auth", k=5) == []
+
+
+async def test_concurrent_searches_do_not_exhaust_the_connection_pool(
+    store: SqliteDocStore,
+) -> None:
+    """One search holds one connection, so searches cannot deadlock each other.
+
+    ``search_lexical`` ran its FTS statement and then, *still inside* its own session, called
+    ``get_chunks`` — which opens a session of its own. One search therefore held two of the
+    engine's connections at once, and the engine is built with no pool arguments: on
+    ``sqlite+aiosqlite`` over a file that is an ``AsyncAdaptedQueuePool`` of 5 with 10 overflow,
+    fifteen for the whole process. Hold-and-wait, with the usual consequence — a search waiting
+    for a connection only another search can release.
+
+    **The numbers here were measured rather than reasoned to, and the first attempt at this
+    test was wrong.** Twelve concurrent searches over one document do *not* deadlock: the loop
+    interleaves, each search finishes quickly, and the peak checkout stays under the pool. The
+    shape that fails is enough concurrent searches that a second connection is wanted while the
+    first is still held — forty, over a corpus whose hydration is not instant. At that point the
+    nested version never completes and the flat one answers in a quarter of a second.
+
+    So the corpus below is twenty documents of twenty-five chunks rather than one of three, and
+    the timeout is what makes this a test rather than a hang: the failure mode is *waiting*, so
+    an assertion that simply awaited the gather would report a stall as a slow test.
+    """
+    for source in range(20):
+        await _seed(
+            store,
+            f"s{source}",
+            ["the service handles authentication and token rotation " * 20 for _ in range(25)],
+        )
+
+    async def search() -> int:
+        return len(await store.search_lexical("authentication", k=50))
+
+    counts = await asyncio.wait_for(asyncio.gather(*(search() for _ in range(40))), timeout=25)
+
+    assert all(count > 0 for count in counts), "every concurrent search returns its own hits"
+
+
+async def test_the_rebuild_triggers_are_the_ones_the_head_revision_installs(
+    engine: AsyncEngine,
+) -> None:
+    """A lexical rebuild must not downgrade a trigger a migration replaced.
+
+    `CREATE_TRIGGERS` is imported by `20260814_6e31b7d592ac_atomic_publications`, so its bodies
+    describe the schema at *that* revision and may never change — editing them would
+    retroactively change what an already applied migration did.
+    `20260818_f3c18a9d72e1_workspace_index_identity` then replaced `chunks_ad` with a body that
+    resolves the deleted chunk's workspace and vector table into the tombstone.
+
+    The lexical rebuild drops all three triggers and recreates them, and it recreated them from
+    the frozen tuple. So publishing a rebuilt generation left the *pre-migration* trigger in
+    place, and every chunk deleted from then on wrote a tombstone with no workspace, namespace
+    or table — a row the sweep cannot attribute to the index it belongs to.
+
+    Silent in both directions: the rebuild succeeds, and `INTEGRITY_CHECK_FTS` compares
+    `chunks_fts` against `chunks` and has nothing to say about a trigger body.
+
+    Asserted against the database the migrations actually produce, not against a copy of the
+    SQL kept here — a second copy would drift from the migration exactly as the first one did.
+    """
+    async with engine.connect() as connection:
+        installed = (
+            await connection.execute(
+                text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='chunks_ad'")
+            )
+        ).scalar_one()
+
+    normalized = " ".join(str(installed).split())
+    assert " ".join(CURRENT_TRIGGERS[1].split()) == normalized, (
+        "CURRENT_TRIGGERS has drifted from the trigger the head revision installs; a lexical "
+        "rebuild would replace the live trigger with a different one"
+    )
+    assert "workspace_id" in normalized, "the fixture is meant to be migrated to head"
+    assert "workspace_id" not in " ".join(CREATE_TRIGGERS[1].split()), (
+        "CREATE_TRIGGERS is pinned to the revision that imports it and must not be updated"
+    )
+
+
+async def test_writing_a_document_s_chunks_is_one_statement(store: SqliteDocStore) -> None:
+    """Fifty chunks are one INSERT, and the triggers still fire for each of them.
+
+    `session.add` in a loop cannot batch this. `Chunk.seq` is a server-generated
+    `INTEGER PRIMARY KEY`, so the unit of work needs the generated keys back in parameter order
+    and asks for `RETURNING`; the SQLite dialect declares no insertmanyvalues sentinel, so it
+    falls back to one statement per row. A fifty-chunk document was fifty round trips inside the
+    publication transaction, on every document of every ingest — 50 statements became 1, and the
+    whole call went from 52 statements to 4.
+
+    **The trigger behavior is the half worth testing**, because it is what a bulk insert could
+    plausibly break: `chunks_fts` is external-content over this table and is maintained entirely
+    by `chunks_ai`. SQLite fires an `AFTER INSERT` trigger once per row rather than once per
+    statement, so the index is complete either way — asserted here rather than assumed, through
+    a search and the index's own integrity check.
+    """
+    from sqlalchemy import event  # noqa: PLC0415 - only this test counts statements
+
+    document = make_document(source_id="bulk")
+    await store.upsert_document(document)
+    chunks = [
+        make_chunk(document, index, f"authentication token rotation {index}") for index in range(50)
+    ]
+
+    inserts = 0
+
+    def spy(_conn: object, _cursor: object, statement: str, *_rest: object) -> None:
+        nonlocal inserts
+        if "INTO chunks" in statement and "chunks_fts" not in statement:
+            inserts += 1
+
+    engine = store._engine  # pyright: ignore[reportPrivateUsage]
+    event.listen(engine.sync_engine, "before_cursor_execute", spy)
+    try:
+        await store.replace_chunks(document.id, chunks)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", spy)
+
+    assert inserts == 1, f"{len(chunks)} chunks were written in {inserts} statements"
+    assert len(await store.document_chunks(document.id)) == len(chunks)
+    assert len(await store.search_lexical("authentication", k=100)) == len(chunks), (
+        "the FTS triggers fire per row, so a multi-row insert must still index every chunk"
+    )
+    async with engine.connect() as connection:
+        await connection.execute(text(INTEGRITY_CHECK_FTS))

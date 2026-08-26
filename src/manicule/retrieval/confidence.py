@@ -504,7 +504,13 @@ def score_confidence(
     # resembling the query should say the second: "we did not finish looking" matters far less
     # than "what we found is what this corpus returns for a question it cannot answer", and the
     # budget shortfall is still on the trace either way.
-    if band is not ConfidenceBand.NONE and reachable_band(ceiling) is band:
+    # `suppressed` is read, not just `ceiling`, so the code and the sentence say the same
+    # thing. The sentence is "this pipeline's *suppressed* components put a higher band out of
+    # reach"; on a full pipeline nothing is suppressed and the ceiling is 1.0, and the branch
+    # still fired whenever the band happened to sit at the top of its range — telling an
+    # operator that components they did not disable were limiting an answer that was not
+    # limited.
+    if suppressed and band is not ConfidenceBand.NONE and reachable_band(ceiling) is band:
         reason = UNREACHABLE_BAND
     if exhausted_budget and band is ConfidenceBand.HIGH:
         band = ConfidenceBand.MEDIUM

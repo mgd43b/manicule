@@ -14,6 +14,7 @@ from manicule.retrieval.confidence import (
     RERANK,
     SIMILARITY,
     STRONG_SIMILARITY,
+    UNREACHABLE_BAND,
     WEIGHTS,
     explain_confidence,
     rescale_similarity,
@@ -654,3 +655,30 @@ def test_the_weakest_answerable_passage_is_still_evidence() -> None:
 
     assert confidence.components[SIMILARITY] > 0.0
     assert confidence.band is not ConfidenceBand.NONE
+
+
+def test_a_full_pipeline_does_not_blame_components_it_did_not_suppress() -> None:
+    """The sentence names *suppressed* components, so the branch has to read `suppressed`.
+
+    It gated on `reachable_band(ceiling) is band` alone. On a full pipeline nothing is
+    suppressed and the ceiling is 1.0, so the branch still fired whenever the band happened to
+    land at the top of its range — telling an operator that components they had not disabled
+    were putting a higher band out of reach, about an answer that was not limited at all.
+
+    A reason that is sometimes untrue is worse than no reason: this field exists so a low score
+    can be acted on, and acting on this one means going to look for a suppression that is not
+    there.
+    """
+    passages = [
+        passage(FIRST, 0, dense=1.0, lexical=1.0, rerank=10.0),
+        passage(SECOND, 1, dense=1.0, lexical=1.0, rerank=10.0),
+        passage(THIRD, 2, dense=1.0, lexical=1.0, rerank=10.0),
+    ]
+
+    full = score_confidence(passages, rerank_stage="rerank")
+
+    assert full.band is ConfidenceBand.HIGH
+    assert not full.suppressed, "the fixture is meant to suppress nothing"
+    assert full.reason != UNREACHABLE_BAND, (
+        "nothing was suppressed, so nothing suppressed can be limiting the band"
+    )

@@ -50,7 +50,7 @@ from manicule.config.settings import (
     Role,
     Settings,
     config_file,
-    looks_secret,
+    secret_setting,
 )
 from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome
 from manicule.container import keys
@@ -1102,6 +1102,11 @@ class ApplicationService:
                 "ingested": indexed,
                 "skipped": skipped,
                 "failed": failed,
+                # Accumulated in the loop above and then dropped here, so a watch batch that
+                # expanded an archive reported the container and none of its members. The
+                # incomplete branch already carries both; this one is the same report.
+                "expanded": expanded,
+                "unrecorded": unrecorded,
                 "by_status": counts,
                 "elapsed_ms": _millis(started),
             }
@@ -3792,7 +3797,7 @@ class ApplicationService:
             value = value[part]
         return r.ConfigValue(key=key, value=value, source=str(config_file()))
 
-    async def config_set(self, key: str, value: str) -> r.ConfigChange:
+    async def config_set(self, key: str, value: str, *, as_text: bool = False) -> r.ConfigChange:
         """Write one setting to the config file, having validated the whole tree with it.
 
         ``value`` is parsed as JSON first and kept as a string when that fails, so
@@ -3810,14 +3815,30 @@ class ApplicationService:
             msg = "config set needs a dotted key, for example 'rag.profile'"
             raise ConfigError(msg)
         parts = _config_key_parts(key)
-        if looks_secret(parts[-1]):
+        # Resolved against the model rather than guessed from the last segment. The name
+        # rule refused five ordinary numeric settings — `llm.token_safety_factor` and
+        # friends — as credentials, and admitted `hash_salt`, which is a real one.
+        if secret_setting(parts):
             msg = (
                 f"{key!r} is a credential. Set it in the environment instead — the config "
                 f"file is copied into backups and exports, and a secret written here goes "
                 f"with them."
             )
             raise ConfigError(msg)
-        parsed = _parse_value(value)
+        # `as_text` for a caller that already knows the value is a string. `_parse_value`
+        # guesses, which is right at a terminal — `false` should mean the boolean — and wrong
+        # for a name: a workspace called `2024` came back as the integer 2024 and then failed
+        # validation, so a workspace that exists could not be switched to.
+        parsed: JsonValue = value if as_text else _parse_value(value)
+        if parsed is None:
+            # `null` parses as JSON and then reaches TOML, which has no null, and the writer
+            # raised an unhandled `TypeError` naming a type nobody typed. A refusal instead,
+            # saying the thing that actually restores a default.
+            msg = (
+                f"{key!r} cannot be set to null: the configuration file is TOML, which has no "
+                f"null. Remove the key from {config_file()} to restore its default."
+            )
+            raise ConfigError(msg)
         previous = await self._current_value(parts)
 
         path = config_file()
@@ -3893,7 +3914,7 @@ class ApplicationService:
             msg = f"no workspace named {wanted!r}. Known: {listed}. Pass create to make it."
             raise UnknownEntityError(msg)
         previous = self.workspace
-        change = await self.config_set("workspace", wanted)
+        change = await self.config_set("workspace", wanted, as_text=True)
         return r.WorkspaceSwitched(previous=previous, active=wanted, path=change.path)
 
     # --- plugins --------------------------------------------------------------------------

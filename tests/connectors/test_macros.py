@@ -512,3 +512,88 @@ async def test_the_target_is_read_from_whichever_parameter_carries_it(parameter:
 
     assert "found it" in text
     assert included == ["2"]
+
+
+async def test_a_title_that_cannot_be_a_cql_literal_leaves_the_page_fetchable() -> None:
+    """An unusable macro title is an unresolved macro, not a failed page.
+
+    ``cql.quote`` refuses a line break or a NUL, and it is right to: escaping cannot save a
+    literal that would terminate and continue as query syntax. But the refusal reached
+    ``_page_id_of`` as a bare ``ValueError`` and failed the **whole page fetch**, not just the
+    macro — and ``_included`` calls ``_page_id_of`` *outside* its own ``try``, which catches only
+    the three body failures, so there was nowhere else for it to be caught.
+
+    It takes only ordinary content to produce one. ``_StorageScanner.handle_data`` only strips,
+    so an interior newline in a title parameter survives, and ``convert_charrefs`` turns a
+    ``&#10;`` into one. A wiki page whose include macro has its title split across two lines made
+    the page it sits on unfetchable — and the rest of that page is content somebody is looking
+    for, which is the whole argument the unresolved path already makes.
+    """
+    instance = FakeConfluence(
+        pages=[
+            FakePage(
+                id="1",
+                title="Overview",
+                space="ENG",
+                adf=with_include("see", title="Release\nNotes"),
+            )
+        ]
+    )
+
+    text, included, unresolved = await _body(instance)
+
+    assert "see" in text, "the page's own content still arrives"
+    assert included == []
+    assert unresolved, "the macro is reported as unresolved rather than disappearing silently"
+
+
+async def test_one_shared_include_is_resolved_once_per_run_not_once_per_page() -> None:
+    """The memo is the connector's, not one page's, because an include target is shared.
+
+    `_lookup_for` built its cache as a local, and it is called once per page, so it
+    de-duplicated only *within* one document. An included page is shared by construction — a
+    standard notice, a definition, a status table — so a space where a share of the pages carry
+    the same include paid a CQL title search **and** a body GET for that one target on every one
+    of them.
+
+    Measured here rather than argued: 100 pages each including one shared page cost 300
+    fetch-stage requests instead of 102, with 100 identical title searches and 100 body GETs for
+    a single page. And because the two calls are awaited serially inside `fetch`, each page held
+    one of the pipeline's fetch slots for three dependent round trips rather than one, so the
+    effective fetch concurrency was a third of what was configured.
+
+    The assertion is on requests rather than on wall-clock, which is the only form that is
+    stable on a loaded runner and the only one that says what actually changed.
+    """
+    shared = FakePage(id="9000", title="Shared Notice", space="ENG", adf=paragraph("the notice"))
+    pages = [shared] + [
+        FakePage(
+            id=str(number),
+            title=f"Page {number}",
+            space="ENG",
+            adf=with_include(f"body {number}", title="Shared Notice"),
+        )
+        for number in range(1, 21)
+    ]
+    instance = FakeConfluence(pages=pages)
+    connector = await connected(instance, cloud_config(base_url=instance.base_url))
+    try:
+        found = await drain(connector.discover(None))
+        instance.body_calls.clear()
+        before = len(instance.requests)
+        for document in found:
+            if document.source_id != shared.id:
+                await connector.fetch(document.ref)
+        requests = len(instance.requests) - before
+    finally:
+        await connector.teardown()
+
+    including = len(pages) - 1
+    assert instance.body_calls.get(shared.id, 0) == 1, (
+        "the shared page's body is fetched once for the run, not once per including page"
+    )
+    assert sum(1 for query in instance.queries() if "Shared Notice" in query) == 1
+    assert requests <= including + 2, (
+        f"{requests} requests for {including} pages: an include should not cost a search and a "
+        f"body fetch on every page that carries it"
+    )

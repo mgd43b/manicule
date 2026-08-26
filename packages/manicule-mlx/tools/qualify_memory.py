@@ -417,16 +417,31 @@ def _say(arguments: argparse.Namespace, message: str) -> None:
 
 
 def weights_cached() -> bool:
-    """Whether the MLX conversion is already on disk. Never fetches."""
-    from huggingface_hub import snapshot_download  # noqa: PLC0415 - an embeddings extra
+    """Whether the MLX conversion is already on disk. Never fetches.
 
-    from manicule.embedding.artifacts import mlx_repo  # noqa: PLC0415 - an embeddings extra
+    Delegated rather than restated, because the restatement probed the wrong revision. It called
+    ``snapshot_download(mlx_repo(MODEL), ...)`` with no ``revision``, which defaults to ``"main"``
+    and — under ``local_files_only`` — is answered by reading ``<repo>/refs/main``. What the
+    backend then loads is not that: ``MlxEmbedder`` resolves ``builtin_revision(MODEL, "mlx")``,
+    the pinned ``a37eddde…``, and a 40-hex revision goes straight to ``snapshots/<that sha>``
+    without consulting ``refs/main`` at all.
 
-    try:
-        snapshot_download(mlx_repo(MODEL), allow_patterns=["*.safetensors"], local_files_only=True)
-    except Exception:  # noqa: BLE001 - hub raises several unrelated types for "not cached"
-        return False
-    return True
+    So this asked "is *some* revision of the conversion on disk" and reported it as "is the
+    revision we are about to load on disk". The two answers coincide only while upstream HEAD is
+    still the pinned commit, which it is today — this is latent rather than currently firing, and
+    it is latent in both directions. Once ``mlx-community/bge-m3-mlx-fp16`` moves, a cache holding
+    only the new HEAD answers ``True`` here and then ``setup()`` fetches 1.15 GB, which is exactly
+    the "Never fetches" guarantee this function exists to make; a cache holding only the pinned
+    snapshot answers ``False`` and fails the harness with a message telling you to run the seeding
+    command you had already run.
+
+    :func:`~manicule.testing.models.mlx_weights_available` is this probe against
+    ``builtin_revision(model_id, "mlx")`` — the commit the embedder actually loads — and is where
+    the pairing is kept, so there is no second copy here to drift from it.
+    """
+    from manicule.testing.models import mlx_weights_available  # noqa: PLC0415 - embeddings extra
+
+    return mlx_weights_available(MODEL)
 
 
 def main() -> int:

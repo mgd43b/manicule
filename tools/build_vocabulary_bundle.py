@@ -37,6 +37,7 @@ connection error naming a blob store.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -62,6 +63,91 @@ def bundle_root() -> Path:
     """The bundle directory carried by this distribution."""
     return Path(__file__).parent / "bundle"
 '''
+
+
+PACKAGE_METADATA = """\
+# Written by tools/build_vocabulary_bundle.py. Edit the builder, not this file: it is rewritten
+# every time a bundle is built, and a hand-edit here would describe a bundle nobody has.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "{distribution}"
+version = "{version}"
+description = "{description}"
+requires-python = ">=3.14"
+
+# No dependencies, deliberately, and for the same reason the grammar bundle has none: this is
+# data. A dependency on manicule would version-lock the two in the direction that does not
+# hold — a vocabulary bundle is valid for the BPE files its manifest names, which is not a
+# manicule version. `tiktoken` is not a dependency either; the bundle exists precisely so that
+# a machine can answer tiktoken's cache lookups without reaching the network for them.
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/{module}"]
+# The load-bearing line, and the pattern is the payload's real shape rather than a plausible
+# one. A vocabulary file is named by `cache_key(url)` — the SHA-1 of the blob URL, hex, with no
+# extension at all — because that is the name `tiktoken` looks it up by. There is no `*.tiktoken`
+# to match. So this includes the bundle directory wholesale, which is also the only pattern that
+# stays right when the manifest or the payload layout changes.
+#
+# Named explicitly because hatchling honors a `.gitignore` beside this file, and a bundle built
+# inside an ignored output directory is easy to produce. The grammar bundle learned the cost:
+# without an explicit `artifacts` the build still succeeds and still installs, and the wheel
+# carries a manifest describing files that are not in it — which surfaces on the air-gapped host
+# as a bundle that is present and empty.
+artifacts = ["/src/{module}/bundle/**"]
+"""
+"""The packaging metadata that makes ``--package`` output an installable distribution.
+
+Its absence is why this exists. ``--package`` wrote ``__init__.py`` and ``py.typed`` and no
+``pyproject.toml``, so the directory it produced was not a Python project at all: an operator
+following §5.1 option 3 of docs/deployment.md — which says in as many words that this "installs
+like any other dependency" — got ``does not appear to be a Python project, as neither
+pyproject.toml nor setup.py are present`` and had to hand-author the metadata on the host that
+could not see the bundle's facts. ``tools/build_grammar_bundle.py`` had exactly this defect and
+fixed it; the vocabulary builder kept it.
+
+Formatted from the bundle that was just written, so what ``pip show`` reports is what is in the
+directory rather than a constant that drifts from it.
+"""
+
+
+def package_version(bundle: bundles.VocabularyBundle) -> str:
+    """The distribution version for a bundle: the ``tiktoken`` release it was built against.
+
+    ``0.14.0+cl100k.base.o200k.base``. The encoding set goes in a PEP 440 **local version
+    segment** because those two facts are what decide whether an installed bundle answers the
+    lookups a given manicule will make, and a distribution reporting ``0.0.0`` makes an operator
+    open the manifest to find out what they have.
+
+    The tiktoken version is the release whose declared digests :func:`bundles.build` checked the
+    payload against — recorded rather than required at run time, which is why it is the release
+    part and the encodings are the local part: a bundle carrying the same encodings from a later
+    tiktoken is a newer build of the same thing, and sorts that way.
+
+    **Separators are normalized here rather than left to the installer.** PEP 440 folds both
+    ``-`` and ``_`` in a local segment to ``.``, so an encoding name with an underscore in it —
+    which every one of them has — would produce a file saying one version and an installed
+    distribution reporting another.
+    """
+    encodings = ".".join(re.sub(r"[-_]", ".", name) for name in bundle.encoding_names)
+    return f"{bundle.tiktoken_version}+{encodings}"
+
+
+def package_metadata(bundle: bundles.VocabularyBundle) -> str:
+    """``pyproject.toml`` for the distribution around ``bundle``."""
+    return PACKAGE_METADATA.format(
+        distribution=bundles.BUNDLE_MODULE.replace("_", "-"),
+        module=bundles.BUNDLE_MODULE,
+        version=package_version(bundle),
+        description=(
+            f"Offline tiktoken vocabularies for manicule: "
+            f"{len(bundle.encoding_names)} encodings, built against tiktoken "
+            f"{bundle.tiktoken_version}."
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -99,14 +185,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.prefetch:
             seeded = vocabularies.prefetch(encodings)
             print(f"seeded: {list(seeded)}")
-        destination = Path(args.output)
-        if args.package:
-            destination = destination / "src" / bundles.BUNDLE_MODULE / "bundle"
+        root = Path(args.output)
+        package = root / "src" / bundles.BUNDLE_MODULE / "bundle"
+        destination = package if args.package else root
         bundle = bundles.build(encodings, destination)
         if args.package:
             module = destination.parent
             (module / "__init__.py").write_text(PACKAGE_INIT, encoding="utf-8")
             (module / "py.typed").write_text("", encoding="utf-8")
+            # Written after the bundle rather than before it, and from the bundle that was read
+            # back off disk: the version and the description state a tiktoken release and an
+            # encoding set, and metadata written from the *arguments* would describe a build
+            # that had not happened yet.
+            (root / "pyproject.toml").write_text(package_metadata(bundle), encoding="utf-8")
     except ManiculeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

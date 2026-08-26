@@ -1096,3 +1096,93 @@ async def test_an_embedder_with_no_cache_reports_no_cache_hits() -> None:
 
     assert not isinstance(embedder, SupportsMetrics), "the fixture must publish no metrics"
     assert work.cache_hits == 0
+
+
+# --- batching ---------------------------------------------------------------------------------
+
+
+def _sized(index: int, tokens: int) -> Chunk:
+    """A chunk whose `embed_text` really is ``tokens`` whitespace tokens long."""
+    text = " ".join(f"w{index}-{position}" for position in range(tokens))
+    return Chunk(
+        id=chunk_id("doc", index, text),
+        document_id="doc",
+        text=text,
+        embed_text=text,
+        position=index,
+        token_count=tokens,
+        anchor=LineAnchor(start=index + 1, end=index + 1),
+    )
+
+
+async def test_batching_by_length_returns_vectors_in_the_callers_order() -> None:
+    """Batches are formed by length; the result is still positional with the input.
+
+    A batch is padded to its longest member, and the forward pass costs
+    `batch x padded_length` however well the padding is masked. So chunks are batched
+    longest-first, which puts a 480-token chunk with other long ones instead of with a heading
+    stub that then gets padded to 480.
+
+    **The order this returns is the contract**, and it is the one thing a reordering can break.
+    Every caller pairs these positionally with the chunks it passed, and the offline deriver has
+    already been bitten once by two orders that agreed on length and not on content — so this
+    asserts vector-by-vector against what each chunk's own text produces, rather than checking a
+    count.
+    """
+    from manicule.ingest.embedding import embed_checked_chunks  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    # Deliberately interleaved, so document order and length order disagree everywhere.
+    chunks = [_sized(index, tokens) for index, tokens in enumerate([400, 8, 220, 12, 480, 30] * 8)]
+    embedder = HashEmbedder()
+
+    produced = await embed_checked_chunks(embedder, chunks, batch_budget_tokens=512)
+    expected = await embedder.embed([chunk.embed_text for chunk in chunks])
+
+    assert produced == expected, "a vector must be the one its own chunk's text produces"
+
+
+async def test_batching_by_length_cuts_the_padding_a_batch_pays_for() -> None:
+    """The property the sort is for, measured against the order it replaced.
+
+    A batch is padded to its longest member, and the forward pass costs `batch x padded_length`
+    however well the padding is masked. In document order a full chunk beside a heading stub
+    pads the stub to the full chunk's length.
+
+    Compared against document order computed over the *same* lengths and the *same* batch size,
+    rather than against a fixed percentage: the absolute overhead depends entirely on the length
+    distribution in the fixture, and a hard threshold would be a number that passes or fails for
+    reasons that have nothing to do with the sort.
+    """
+    from manicule.ingest.embedding import (  # noqa: PLC0415
+        DEFAULT_TARGET_BATCH_TOKENS,
+        MAX_BATCH,
+        batch_size,
+        embed_checked_chunks,
+    )
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    lengths = [400, 8, 220, 12, 480, 30] * 16
+    chunks = [_sized(index, tokens) for index, tokens in enumerate(lengths)]
+    padded: list[int] = []
+
+    class Recording(HashEmbedder):
+        @override
+        async def embed(self, texts: Sequence[str]) -> list[Vector]:
+            padded.append(max(len(text.split()) for text in texts) * len(texts))
+            return await super().embed(texts)
+
+    await embed_checked_chunks(Recording(), chunks, batch_budget_tokens=512)
+
+    size = batch_size(
+        budget_tokens=512, target_batch_tokens=DEFAULT_TARGET_BATCH_TOKENS, maximum=MAX_BATCH
+    )
+    in_document_order = sum(
+        max(window) * len(window)
+        for window in (lengths[at : at + size] for at in range(0, len(lengths), size))
+    )
+
+    assert sum(padded) < in_document_order * 0.85, (
+        f"batches padded to {sum(padded):,} tokens against {in_document_order:,} in document "
+        f"order at batch {size}: the length sort is not reducing what the forward pass carries"
+    )

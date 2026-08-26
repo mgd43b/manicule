@@ -44,15 +44,26 @@ def run_repl(
     profile: str | None = None,
     limit: int | None = None,
     sources: Sequence[str] = (),
+    collections: Sequence[str] = (),
+    conversation_id: str | None = None,
     overrides: Mapping[str, Any] | None = None,
 ) -> int:
-    """Run the prompt until it is left. Returns the process's exit status."""
+    """Run the prompt until it is left. Returns the process's exit status.
+
+    ``collections`` and ``conversation_id`` are carried because ``ask --repl`` accepts
+    ``--collection`` and ``--conversation`` and the REPL used to take neither. Typer parsed
+    them, the caller dropped them, and the prompt answered over the whole workspace — a scoped
+    question silently answered from a wider corpus than the one that was asked for, which is the
+    one kind of wrong answer a scope flag exists to prevent.
+    """
     try:
         return asyncio.run(
             _loop(
                 profile=profile,
                 limit=limit,
                 sources=tuple(sources),
+                collections=tuple(collections),
+                conversation_id=conversation_id,
                 overrides=dict(overrides or {}),
             )
         )
@@ -65,6 +76,8 @@ async def _loop(
     profile: str | None,
     limit: int | None,
     sources: tuple[str, ...],
+    collections: tuple[str, ...],
+    conversation_id: str | None,
     overrides: dict[str, Any],
 ) -> int:
     out = render.console()
@@ -126,6 +139,8 @@ async def _loop(
                     profile=profile,
                     limit=limit,
                     sources=sources,
+                    collections=collections,
+                    conversation_id=conversation_id,
                     on_event=show,
                 ),
             )

@@ -104,6 +104,43 @@ cascaded deletes: verified directly on SQLite 3.51 at two cascade levels, with a
 holds it.
 """
 
+_CHUNKS_AD_CURRENT = """
+    CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, text, heading_text)
+        VALUES ('delete', old.seq, old.text, old.heading_text);
+        INSERT OR IGNORE INTO vector_tombstones(
+            chunk_id, workspace_id, vector_namespace, vector_table, deleted_at
+        )
+        SELECT old.vector_id, d.workspace_id, s.vector_namespace, s.vector_table,
+               datetime('now')
+          FROM documents AS d
+          LEFT JOIN index_state AS s ON s.workspace_id = d.workspace_id
+         WHERE d.id = old.document_id;
+    END
+    """
+"""The delete trigger as the **head** revision installs it, byte for byte."""
+
+CURRENT_TRIGGERS = (CREATE_TRIGGERS[0], _CHUNKS_AD_CURRENT, CREATE_TRIGGERS[2])
+"""What a live database's triggers must be, as opposed to what a migration once created.
+
+**Two tuples because a migration is frozen and a rebuild is not.** ``CREATE_TRIGGERS`` is
+imported by ``20260814_6e31b7d592ac_atomic_publications``, so its bodies describe the schema at
+*that* revision and may never change — editing them would retroactively change what an already
+applied migration did.
+
+``20260818_f3c18a9d72e1_workspace_index_identity`` then replaced ``chunks_ad`` with the body
+above, which resolves the deleted chunk's workspace and vector table and writes them into the
+tombstone. Anything recreating triggers from the frozen tuple therefore *downgrades* a
+migrated database: the lexical rebuild in ``SqliteRebuildStore`` drops all three and recreates
+them, so publishing a rebuilt generation left the pre-migration trigger in place, and every
+chunk deleted afterwards wrote a tombstone with no workspace, namespace or table in it — a row
+the sweep cannot attribute to the index it belongs to.
+
+Silent in both directions: the rebuild succeeds, the integrity check passes because it compares
+``chunks_fts`` against ``chunks`` and has nothing to say about a trigger body, and the
+tombstones only stop being attributable from that point on.
+"""
+
 DROP_TRIGGERS = (
     "DROP TRIGGER IF EXISTS chunks_au",
     "DROP TRIGGER IF EXISTS chunks_ad",
@@ -186,6 +223,7 @@ def escape_match_query(text: str) -> str:
 __all__ = [
     "CREATE_FTS",
     "CREATE_TRIGGERS",
+    "CURRENT_TRIGGERS",
     "DROP_TRIGGERS",
     "FTS_SHADOW_TABLES",
     "FTS_TABLE",

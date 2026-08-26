@@ -381,6 +381,37 @@ async def test_expansion_substitutes_the_token_and_leaves_the_sentence() -> None
     assert expanded_text("What is NOW?", ()) == "What is NOW?", "nothing fired, nothing changes"
 
 
+@pytest.mark.parametrize(
+    "expansion",
+    [
+        pytest.param(r"a regular expression like \d+", id="escape-that-does-not-exist"),
+        pytest.param(r"group \1 of the match", id="group-reference"),
+        pytest.param("a path like C:\\Users\\ops", id="windows-path"),
+        pytest.param("line\\nbreak", id="escape-that-silently-succeeds"),
+        pytest.param("trailing backslash \\", id="trailing-backslash"),
+    ],
+)
+async def test_a_backslash_in_a_definition_is_spliced_in_literally(expansion: str) -> None:
+    """An expansion is corpus text, so it must never be read as a substitution template.
+
+    ``re.sub`` parses a *string* replacement: ``\\1`` is a group reference, ``\\d`` is an error,
+    ``\\n`` is a newline. The expansion reaching it comes off an indexed page, and nothing in
+    between removes a backslash — ``core_expansion`` trims and cases, and
+    ``normalize_expansion`` only builds a comparison key. So an ordinary technical glossary
+    defining a term in terms of a regular expression or a Windows path raised
+    ``re.PatternError`` out of the retriever for **every query naming that term**, and the one
+    backslash that did not raise silently rewrote the query instead.
+
+    Parametrized across the three distinct behaviors because they fail differently and a fix
+    that only handled the loud ones would look complete: two shapes raise, ``\\n`` transforms
+    quietly, and a trailing backslash raises from a different branch of the template parser.
+    """
+    result, _ = await expand("Who owns NOW and when did it ship?", entry(expansion=expansion))
+
+    assert result.expanded == f"Who owns {expansion} and when did it ship?"
+    assert result.original == "Who owns NOW and when did it ship?"
+
+
 def test_the_homograph_list_holds_the_words_the_rule_is_about() -> None:
     """A list that had lost ``now`` would make every rule above it untested and still green."""
     assert "NOW" in COMMON_ENGLISH_WORDS

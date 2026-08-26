@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -595,3 +595,61 @@ async def test_a_cache_hit_still_honors_the_collection_filter(store: SqliteDocSt
     assert {candidate.chunk.document_id for candidate in second.context.passages} == {
         left[0].document_id
     }, "a cache hit returned a document outside the collection the query named"
+
+
+async def test_a_collection_scoped_utility_question_lists_that_collection(
+    store: SqliteDocStore,
+) -> None:
+    """A utility route resolves membership too, because `retrieve` returns before it does.
+
+    The resolution step above `retrieve`'s pipeline lists four readers of the filter — but a
+    utility query never reaches it: `bypasses_retrieval` returns into `_direct` several lines
+    earlier. So a scoped "what documents are indexed?" handed the store a filter naming a
+    collection, which no leg has a join for and every store refuses rather than drops. The
+    narrowest question a caller can ask, answered with an exception.
+
+    The comment block above these helpers records the same defect on the search path. This is
+    the door it did not close.
+    """
+    left, right = await _two_projects(store)
+    collection = await store.create_collection("alpha")
+    await store.add_to_collection(collection.id, [left[0].document_id])
+    router = QueryRouter(RagSettings().router, available=handlers_for(store))
+
+    scoped = Query(
+        text="list documents",
+        limit=3,
+        filter=Filter(workspace_ids=SCOPE, collection_ids=frozenset({collection.id})),
+    )
+    result = await _retriever(store, [*left, *right], router=router).retrieve(scoped)
+
+    assert result.utility is not None
+    listed = cast("list[dict[str, str]]", result.utility.data["documents"])
+    assert [entry["id"] for entry in listed] == [left[0].document_id], (
+        "the listing is the collection's, not the workspace's — both documents carry the same "
+        "text, so a resolution that was dropped rather than applied would list both"
+    )
+
+
+async def test_a_utility_question_naming_an_empty_collection_says_so(
+    store: SqliteDocStore,
+) -> None:
+    """An empty collection is a sentence, not an exception and not the whole workspace.
+
+    `_resolve_membership` returns `None` for "no document can match", and its docstring is
+    explicit about why that is not an empty `document_ids`: an empty set restricts nothing, so
+    the narrowest request would be answered with the widest possible result.
+    """
+    left, right = await _two_projects(store)
+    empty = await store.create_collection("empty")
+    router = QueryRouter(RagSettings().router, available=handlers_for(store))
+
+    scoped = Query(
+        text="list documents",
+        limit=3,
+        filter=Filter(workspace_ids=SCOPE, collection_ids=frozenset({empty.id})),
+    )
+    result = await _retriever(store, [*left, *right], router=router).retrieve(scoped)
+
+    assert result.utility is not None
+    assert result.utility.data["documents"] == []

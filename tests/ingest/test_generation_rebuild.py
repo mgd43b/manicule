@@ -42,6 +42,7 @@ from manicule.core.rebuild import (
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.rebuild import (
+    EmbeddingOfflineDeriver,
     OfflineGenerationRebuilder,
     ParserChunkerRelationalDeriver,
     PreparedReplacement,
@@ -52,7 +53,8 @@ from manicule.parsers.config import PlaintextConfig
 from manicule.parsers.expansion import ExpandedMember, MemberFailure
 from manicule.parsers.plaintext import PlaintextParser
 from manicule.parsers.versions import parse_fingerprint
-from tests.ingest.fakes import BlockChunker, PassThrough
+from tests.fakes import HashEmbedder
+from tests.ingest.fakes import BlockChunker, MemoryVectors, PassThrough
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Sequence
@@ -2005,3 +2007,123 @@ async def test_a_document_slower_than_its_lease_still_holds_it() -> None:
     assert store.renewals >= 2, "a document slower than its lease has to renew during preparation"
     assert checkpoint.state is RebuildState.PUBLISHED
     assert deriver.calls == ["page-0"], "and it must be prepared once, not retried"
+
+
+class _NestedTreeDeriver:
+    """A relational deriver that returns a container holding a container and a sibling.
+
+    The shape is the whole point: ``root -> (A -> (A1,), B)``. Every container fixture above is
+    one level deep — ``OneMemberContainer`` yields a single leaf, ``FailureContainer`` two —
+    and at one level a depth-first walk and a breadth-first one produce the same order, so the
+    defect below could not appear. A member that is itself a container *and* has a following
+    sibling is the smallest tree that separates them, and it is an ordinary corpus object: a
+    zip inside a zip, a zipped attachment on a mail item.
+    """
+
+    @staticmethod
+    def _node(name: str, chunk_count: int, members: tuple[DerivedReplacement, ...] = ()) -> Any:
+        document = Document(
+            id=name,
+            source="wiki",
+            source_id=name,
+            uri=f"zip:archive!/{name}",
+            title=name,
+            media_type="text/plain",
+            status=DocumentStatus.INDEXED,
+            content_hash=content_hash(name.encode()),
+        )
+        return DerivedReplacement(
+            document=document,
+            # Text distinct per chunk, because HashEmbedder derives the vector from it: two
+            # chunks with equal text would have equal vectors and the transposition below would
+            # be invisible.
+            chunks=tuple(
+                Chunk(
+                    id=f"{name}-c{index}",
+                    document_id=name,
+                    text=f"{name} block {index}",
+                    embed_text=f"{name} block {index}",
+                    position=index,
+                    token_count=3,
+                    anchor=Unlocated(reason="fixture"),
+                )
+                for index in range(chunk_count)
+            ),
+            members=members,
+        )
+
+    async def derive(self, raw: RawDocument, target: RebuildTarget, **_: Any) -> Any:
+        del raw, target
+        inner = self._node("a1", 2)
+        return self._node(
+            "root", 1, members=(self._node("a", 0, members=(inner,)), self._node("b", 3))
+        )
+
+
+async def test_a_nested_member_gets_its_own_vector_rather_than_its_sibling_s() -> None:
+    """Staged vectors are paired with the chunks they were computed from.
+
+    ``stage()`` hands ``flattened_chunks()`` and ``prepared.vectors`` to ``VectorStore.upsert``,
+    which pairs them **by position**. ``flattened()`` is breadth-first; the walk that produced
+    the vectors appended before recursing, which is depth-first pre-order. One level deep the
+    two orders coincide, which is why every existing fixture passed.
+
+    Two levels deep they do not. For ``root -> (A -> (A1,), B)`` the staged order was
+    ``[root, A1, B]`` and the flattened order ``[root, B, A1]``, so every chunk of ``B`` was
+    stored against ``A1``'s vector and every chunk of ``A1`` against ``B``'s — **with the
+    lengths identical**, so nothing raised. ``validate_identity`` checks per-node counts and id
+    uniqueness, ``upsert`` compares lengths and takes the stored identity from the *chunk*, and
+    ``validate_generation`` counts rows: none of them inspects the pairing. The generation
+    validated and published, and dense retrieval then returned the wrong sibling document and
+    cited text its vector never described.
+
+    Asserted against the embedder rather than against a recorded order, so the test states the
+    property — this vector is the one this chunk's text produces — rather than restating the
+    traversal and agreeing with itself.
+    """
+    embedder = HashEmbedder()
+    chunker = BlockChunker()
+    deriver = EmbeddingOfflineDeriver(
+        relational=cast("Any", _NestedTreeDeriver()),
+        embedder=cast("Any", embedder),
+        vectors=cast("Any", MemoryVectors()),
+        chunk_fingerprint=chunker.fingerprint,
+    )
+    prepared = await deriver.prepare(
+        RawDocument(
+            source_id="archive",
+            uri="https://snapshot.invalid/archive.zip",
+            media_type="application/zip",
+            content=b"container bytes",
+        ),
+        RebuildTarget(
+            parser_routing="container-routing-v1",
+            parser_set=(),
+            chunk_fingerprint=chunker.fingerprint.canonical(),
+            embedding_fingerprint=embedder.fingerprint.canonical(),
+            glossary_fingerprint=glossary_fingerprint().canonical(),
+            fts_tokenizer="unicode61",
+            batch_documents=1,
+            max_memory_bytes=10_000_000,
+            max_temporary_bytes=10_000_000,
+        ),
+        generation_id="generation-v2",
+        blob_ref="retained-container",
+        title="Archive",
+        version_token=None,
+    )
+
+    chunks = prepared.replacement.flattened_chunks()
+    assert len(prepared.vectors) == len(chunks), "lengths matched even when the order did not"
+
+    expected = await embedder.embed([chunk.embed_text for chunk in chunks])
+    mispaired = [
+        chunk.id
+        for chunk, staged, want in zip(chunks, prepared.vectors, expected, strict=True)
+        if list(staged) != list(want)
+    ]
+    assert not mispaired, (
+        f"{mispaired} were stored against a vector computed from another chunk's text. The "
+        f"staging walk and flattened_chunks() disagree about order; they must be derived from "
+        f"one traversal."
+    )

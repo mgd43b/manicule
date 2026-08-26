@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import cast
+from typing import Final, cast
 
 from manicule.chunking import breadcrumb
 from manicule.chunking.sentences import paragraphs, sentences
@@ -358,7 +358,7 @@ class StructuralChunker:
                     heading_path=block.heading_path,
                     tokens=tokens,
                     lang=block.lang,
-                    metadata=dict(block.metadata),
+                    metadata=_unit_metadata(block),
                     starts_section=True,
                 )
             ]
@@ -371,7 +371,7 @@ class StructuralChunker:
                     heading_path=block.heading_path,
                     tokens=tokens,
                     lang=block.lang,
-                    metadata=dict(block.metadata),
+                    metadata=_unit_metadata(block),
                 )
             ]
         if block.kind is BlockKind.TABLE:
@@ -553,17 +553,67 @@ class StructuralChunker:
 
         # Keep line endings on their source lines. Joining with a synthetic separator would
         # lose blank lines and make the non-overlap payload impossible to reconstruct exactly.
-        for offset, line in enumerate(source_lines):
-            candidate = "".join(value for _, value in (*current, (offset, line)))
-            if current and self._count_or_ceiling(candidate) > self._text_budget:
-                flush()
-            current.append((offset, line))
+        #
+        # **Packed by bisection rather than one line at a time.** The straightforward loop
+        # rebuilt the whole accumulated prefix and counted it again for every line, so a block
+        # of *n* lines handed the tokenizer O(n^2) characters: measured on one 2,000-line
+        # generated file, 1,407,859 characters counted for 49,779 characters of code — 28x the
+        # block — and 88.8 ms against 16.3 ms for a larger page of prose.
+        #
+        # The answer is identical because this is the same greedy pack, found a different way.
+        # It needs only that a count is non-decreasing over prefixes, which is the property the
+        # character-wise search above already depends on and `CHUNKER_VERSION` already records
+        # as the assumption bisection makes.
+        #
+        # An oversized line lands alone, which the old loop reached by accident and this reaches
+        # by construction: if a single line exceeds the budget then so does anything containing
+        # it, so the flush before it always fired.
+        index = 0
+        while index < len(source_lines):
+            line = source_lines[index]
             if self._count_or_ceiling(line) > self._text_budget:
-                oversized = materialize(current)
-                current.clear()
-                units.extend(self._hard_split(oversized, "line"))
+                flush()
+                units.extend(self._hard_split(materialize([(index, line)]), "line"))
+                index += 1
+                continue
+            taken = self._lines_that_fit(source_lines, index)
+            current.extend((index + step, source_lines[index + step]) for step in range(taken))
+            flush()
+            index += taken
         flush()
         return units or [self._unit(block, block.text)]
+
+    def _lines_that_fit(self, lines: Sequence[str], start: int) -> int:
+        """How many lines from ``start`` fit the text budget together. At least one.
+
+        Doubling then bisecting, the same shape as the character-wise probe: the count is
+        monotone over prefixes, so the largest satisfying prefix is found in O(log n) counts
+        instead of one count per line. The caller has already established that ``lines[start]``
+        fits on its own, which is what makes "at least one" true rather than hopeful.
+        """
+
+        def fits(count: int) -> bool:
+            return self._count_or_ceiling("".join(lines[start : start + count])) <= (
+                self._text_budget
+            )
+
+        remaining = len(lines) - start
+        if remaining <= 1:
+            return 1
+        # `window * 2 <= remaining`, not `window < remaining`: a probe wider than what is left
+        # measures fewer lines than it asks for and therefore always "fits", which would walk
+        # the window past the end of the block.
+        window = 1
+        while window * 2 <= remaining and fits(window * 2):
+            window *= 2
+        low, high = window, min(window * 2, remaining)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(middle):
+                low = middle
+            else:
+                high = middle - 1
+        return max(1, min(low, remaining))
 
     def _split_prose(self, block: ParsedBlock) -> list[_Unit]:
         """Paragraph, then sentence, then — only for a single oversized sentence — tokens."""
@@ -940,6 +990,20 @@ class StructuralChunker:
         taken: list[str] = []
         used: list[_Unit] = []
         for unit in reversed(previous):
+            # **Each unit's own kind, not the group's dominant one.** The two guards above ask
+            # `_dominant_kind`, which is a fact about the *majority* of a group — so a chunk of
+            # mostly prose that ends in a code block or a table passed them, and the backwards
+            # walk then copied that block into the next chunk as overlap. Overlap exists so a
+            # sentence split across a boundary is searchable from both sides; a duplicated code
+            # block or table row is not that, and it is indexed twice and can be cited from a
+            # chunk that is not where it lives.
+            #
+            # `break` rather than `continue`, and that is load-bearing: the window has to stay
+            # contiguous with the end of the previous chunk. Skipping over a code block would
+            # produce a discontiguous window *and* widen the next chunk's anchor across the
+            # block it skipped, via the anchor merge below.
+            if unit.kind not in OVERLAPPING_KINDS:
+                break
             # A unit the next chunk's anchor already covers may be cut into: taking part of it
             # widens nothing, because the anchor is the same one either way. That is the case
             # whenever an oversized block was split across chunks, which is where overlap
@@ -1181,13 +1245,37 @@ def _collapse_areas(areas: Sequence[str]) -> list[str]:
 
 
 def _adjacent(left: str, right: str) -> bool:
-    """Whether ``right`` is the row immediately after ``left`` over the same columns."""
-    left_end, right_start = left.rsplit(":", maxsplit=1)[-1], right.split(":", maxsplit=1)[0]
-    left_columns, left_row = _split_reference(left_end)
-    right_columns, right_row = _split_reference(right_start)
-    if left_columns != right_columns or left_row is None or right_row is None:
+    """Whether ``right`` is the row immediately after ``left`` over the same columns.
+
+    **Each area's whole column extent, not one edge of each.** This compared ``left``'s *end*
+    cell against ``right``'s *start* cell — for ``A1:C1`` and ``A2:C2`` that is ``C1`` against
+    ``A2``, whose columns are ``C`` and ``A``, so it answered False. The comparison could only
+    ever be True for a single-column area, which is to say row ranges never collapsed for any
+    table wider than one column: every row was recorded as its own area, and the metadata this
+    exists to compact grew linearly with the table.
+    """
+    left_bounds, right_bounds = _area_columns_and_rows(left), _area_columns_and_rows(right)
+    if left_bounds is None or right_bounds is None:
         return False
-    return right_row == left_row + 1
+    left_columns, _, left_last = left_bounds
+    right_columns, right_first, _ = right_bounds
+    if left_columns != right_columns:
+        return False
+    return right_first == left_last + 1
+
+
+def _area_columns_and_rows(area: str) -> tuple[tuple[str, str], int, int] | None:
+    """``((first column, last column), first row, last row)`` for an area, or ``None``.
+
+    ``None`` for anything this cannot read as a cell reference, which is the same answer
+    :func:`_adjacent` gave for an unparseable edge before.
+    """
+    start, _, end = area.partition(":")
+    first_columns, first_row = _split_reference(start)
+    last_columns, last_row = _split_reference(end or start)
+    if first_row is None or last_row is None:
+        return None
+    return (first_columns, last_columns), first_row, last_row
 
 
 def _split_reference(reference: str) -> tuple[str, int | None]:
@@ -1214,6 +1302,25 @@ def _promote_headings_when_that_is_all_there_is(blocks: list[ParsedBlock]) -> li
         )
         for block in blocks
     ]
+
+
+_BULK_BLOCK_KEYS: Final[frozenset[str]] = frozenset({"rows", "row_refs", "merged_ranges"})
+"""Parser detail about a whole table, which a chunk must not inherit verbatim.
+
+``rows`` is the table's rendered lines and ``row_refs`` their A1 ranges — for a spreadsheet
+region that is the entire sheet, index for index. A table small enough not to be split copied
+its block metadata straight onto the unit, and :func:`_group_metadata` then carried ``rows``
+onto the chunk, so the chunk's metadata held the table a second time beside its own text.
+
+It also made ``rows`` mean two different things depending on a size threshold: on a split part
+it is the ``[first, last]`` pair :meth:`_split_table` writes, and on an unsplit one it was the
+list of row strings. One key, two types, decided by whether the table happened to fit.
+"""
+
+
+def _unit_metadata(block: ParsedBlock) -> Metadata:
+    """A block's metadata as a unit carries it, without the parser's bulk table detail."""
+    return {key: value for key, value in block.metadata.items() if key not in _BULK_BLOCK_KEYS}
 
 
 def _dominant_kind(units: Sequence[_Unit]) -> BlockKind:

@@ -17,11 +17,11 @@ additionally follow the conventional ``<PROVIDER>_API_KEY`` names; see
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from ipaddress import ip_network
 from pathlib import Path
-from typing import Any, Literal, Self, override
+from typing import Any, Final, Literal, Self, cast, get_args, get_origin, override
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
@@ -1393,7 +1393,7 @@ class Settings(BaseSettings):
         key to anyone allowed to read configuration.
         """
         dumped: Any = self.model_dump(mode="json")
-        return _mask(dumped)
+        return _mask(dumped, type(self))
 
     # --- policy -------------------------------------------------------------------------
 
@@ -1566,33 +1566,153 @@ class Settings(BaseSettings):
 
 _SECRET_KEYS = ("api_key", "secret", "token", "password", "client_secret", "encryption_key")
 
+REDACTED: Final = "**********"
+"""What a credential is displayed as. One constant, so the masking and the tests agree."""
+
 
 def looks_secret(key: str) -> bool:
-    """Whether a field name identifies a credential.
+    """Whether a field *name* identifies a credential.
 
-    One rule, used both to mask configuration for display and to omit it when writing.
+    **The fallback, not the rule.** Secrecy is decided from the declared type wherever there is
+    one — see :func:`secret_setting` — because a name is a bad proxy for it in both directions,
+    and this codebase had both:
+
+    * ``llm.first_token_timeout_s``, ``llm.token_safety_factor``, ``llm.token_drift_tolerance``,
+      ``rag.context.system_prompt_tokens`` and ``ingest.target_batch_tokens`` are floats and
+      ints that contain "token". Masked, and refused by ``config set``, so five ordinary
+      settings could not be inspected or changed. The exception list below grew out of exactly
+      this, one name at a time, and could only ever cover the names somebody had already hit.
+    * ``security.data_policy.auto_redact.hash_salt`` is a real ``SecretStr`` and matches none of
+      the markers, so the one thing this function exists to hide was printed in the clear.
+
+    What is left for it is the subtree that has no declared type at all: ``plugins.config``
+    holds arbitrary per-component options, validated against each component's own model rather
+    than against :class:`Settings`, so a name is genuinely all there is to go on there.
     """
     normalized = key.replace("-", "").replace("_", "").lower()
     if normalized in {"maxtokens", "overlaptokens"} or "tokenizer" in normalized:
-        # Counts and tokenizer identities are public policy, not bearer tokens. Treating the
-        # substring alone as a credential made ``max_tokens`` impossible to inspect or set.
+        # Counts and tokenizer identities are public policy, not bearer tokens. Kept because
+        # `plugins.config` still reaches this, and a component option called `max_tokens` is at
+        # least as likely there as it was here.
         return False
     return any(marker.replace("_", "") in normalized for marker in _SECRET_KEYS)
 
 
-def _mask(value: JsonValue, key: str = "") -> Any:  # noqa: ANN401 - recursive over JSON
+def _declares_secret(annotation: object) -> bool:
+    """Whether a field's annotation is ``SecretStr``, including ``SecretStr | None``."""
+    return annotation is SecretStr or SecretStr in get_args(annotation)
+
+
+def _field_model(annotation: object) -> tuple[type[BaseModel] | None, bool]:
+    """The model behind a field, and whether it sits under arbitrary keys.
+
+    ``keyed`` is True for ``dict[str, SomeModel]`` — ``llm.providers``, the connector table —
+    where the next path segment is a name somebody chose rather than a declared field.
+    """
+    candidates = (annotation, *get_args(annotation))
+    for candidate in candidates:
+        if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+            return candidate, False
+    for candidate in candidates:
+        if get_origin(candidate) is not dict:
+            continue
+        for value in get_args(candidate):
+            if isinstance(value, type) and issubclass(value, BaseModel):
+                return value, True
+    return None, False
+
+
+def secret_setting(parts: Sequence[str]) -> bool:
+    """Whether a dotted configuration key names a credential.
+
+    Resolved against :class:`Settings` rather than guessed from the last segment, so a float
+    called ``token_safety_factor`` is settable and a ``SecretStr`` called ``hash_salt`` is not.
+    Falls back to :func:`looks_secret` the moment the path leaves the declared model, which is
+    what ``plugins.config`` does immediately.
+    """
+    model: type[BaseModel] | None = Settings
+    index = 0
+    while index < len(parts):
+        if model is None:
+            return looks_secret(parts[-1])
+        field = model.model_fields.get(parts[index])
+        if field is None:
+            return looks_secret(parts[-1])
+        if index == len(parts) - 1:
+            return _declares_secret(field.annotation)
+        inner, keyed = _field_model(field.annotation)
+        # A keyed table spends the next segment on the name, not on a field.
+        index += 2 if keyed else 1
+        model = inner
+    return False
+
+
+def _mask(
+    value: Any,  # noqa: ANN401 - recursive over decoded JSON
+    model: type[BaseModel] | None = None,
+    key: str = "",
+) -> Any:  # noqa: ANN401 - recursive over decoded JSON
+    """Replace every declared credential with :data:`REDACTED`, walking the model alongside.
+
+    The model is carried so secrecy is a fact about the *field* rather than about its name. It
+    goes ``None`` as soon as the walk leaves :class:`Settings` — inside ``plugins.config``,
+    whose contents are validated per component — and from there :func:`looks_secret` decides,
+    which is the best available answer for a subtree with no declared type.
+
+    **A dict with no model is that untyped subtree**, and it is judged by name. An earlier
+    version of this function recursed into one without judging anything, so a plugin's
+    ``api_key`` came back from ``config show`` in the clear while :func:`_strip` — which reaches
+    the same conclusion through :func:`secret_setting` — correctly omitted it from the file.
+    That is precisely the disagreement between what is hidden on display and what is withheld on
+    disk that one predicate exists to prevent.
+
+    The distinction the model alone cannot carry is that ``model is None`` means two different
+    things: a *declared* field whose annotation is a scalar, already settled by
+    :func:`_declares_secret` at its parent, and an *undeclared* subtree with nothing to settle
+    it. Only a dict reaches here in the second case, because a declared scalar is returned by
+    its parent and never recursed into.
+    """
     if isinstance(value, dict):
-        return {k: _mask(v, k) for k, v in value.items()}
+        entries = cast("dict[str, Any]", value)
+        if model is None:
+            return {name: _untyped(item, name) for name, item in entries.items()}
+        masked: dict[str, Any] = {}
+        for name, item in entries.items():
+            field = model.model_fields.get(name)
+            if field is None:
+                # A key the model does not declare. Same subtree, same rule.
+                masked[name] = _untyped(item, name)
+                continue
+            if item is not None and _declares_secret(field.annotation):
+                masked[name] = REDACTED
+                continue
+            inner, keyed = _field_model(field.annotation)
+            if keyed and isinstance(item, dict):
+                under = cast("dict[str, Any]", item)
+                masked[name] = {key_: _mask(value_, inner, key_) for key_, value_ in under.items()}
+            else:
+                masked[name] = _mask(item, inner, name)
+        return masked
     if isinstance(value, list):
-        return [_mask(v, key) for v in value]
-    if value is not None and looks_secret(key):
-        return "**********"
+        return [_mask(item, model, key) for item in cast("list[Any]", value)]
     return value
+
+
+def _untyped(value: Any, key: str) -> Any:  # noqa: ANN401 - recursive over decoded JSON
+    """Mask one entry of a subtree :class:`Settings` does not describe, by its name.
+
+    The fallback the module docstring promises and :func:`secret_setting` already applies on the
+    writing side, so ``config show`` and ``save_settings`` agree about a plugin's credentials.
+    """
+    if value is not None and looks_secret(key):
+        return REDACTED
+    return _mask(value, None, key)
 
 
 __all__ = [
     "APP_NAME",
     "ENV_PREFIX",
+    "REDACTED",
     "AtRestSettings",
     "AuditDestination",
     "AuditSettings",
@@ -1635,4 +1755,5 @@ __all__ = [
     "env_files",
     "looks_secret",
     "provider_environment",
+    "secret_setting",
 ]

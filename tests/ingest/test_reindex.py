@@ -75,6 +75,58 @@ async def test_re_embed_rebuilds_vectors_without_a_parser_or_the_network() -> No
     assert len(vectors.rows) == 3
 
 
+async def test_re_embed_refuses_a_content_addressed_publication() -> None:
+    """The write would be discarded and the lineage would move anyway.
+
+    `LanceVectorStore.upsert` calls `when_matched_update_all()` only for the legacy
+    publication. A content-addressed publication id is derived from the vectors themselves, so
+    its physical rows are immutable and the merge takes the `when_not_matched_insert_all` arm
+    alone — every row here already matches on `ID_COLUMN`, so nothing is written.
+
+    `set_lineage` then recorded the new embedding fingerprint regardless, which is the damaging
+    half: the document is marked re-embedded while the *old* vectors are still what search
+    reads, and no later `reindex` selects it because its lineage already claims to be current.
+    A corpus could be "re-embedded" onto a new model and keep answering from the old one.
+
+    Refused rather than made to work — minting a new generation and flipping the pointer under
+    a transaction fence is what the durable shadow-generation run already does. The refusal is
+    per document and reported, not raised, so a mixed sweep still repairs the legacy documents
+    in the same pass.
+    """
+    store = fakes.MemoryIngestStore()
+    vectors = fakes.MemoryVectors()
+    legacy = make_document()
+    published = make_document().model_copy(
+        update={
+            "id": f"{legacy.id}-published",
+            "source_id": "doc-2",
+            "publication_id": "pub-content-addressed",
+        }
+    )
+    for document in (legacy, published):
+        store.documents[document.id] = document
+        await store.replace_chunks(document.id, make_chunks(document, count=2))
+        await store.set_lineage(document.id, chunk_fp="chunker", embed_fp="old-model")
+
+    report = await re_embed(
+        [legacy, published],
+        store=store,
+        embedder=HashEmbedder(),
+        vectors=vectors,
+        chunk_fingerprint=fakes.BlockChunker.fingerprint,
+    )
+
+    assert report.documents == 1, "only the legacy document is re-embedded"
+    assert any(published.id in line for line in report.unrepairable)
+    assert any("reembed start" in line for line in report.unrepairable), (
+        "the refusal names the verb that can do it"
+    )
+    # The lineage of the refused document must not move: that is what would have hidden it
+    # from every later repair query.
+    assert store.lineage[published.id][1] == "old-model"
+    assert store.lineage[legacy.id][1] != "old-model"
+
+
 async def test_re_embed_does_not_claim_a_new_chunk_lineage() -> None:
     """It did not re-chunk, so saying otherwise makes a later repair query answer wrongly."""
     store = fakes.MemoryIngestStore()

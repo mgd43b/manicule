@@ -80,26 +80,45 @@ def apply_document(row: models.Document, document: Document) -> None:
         row.indexed_at = utcnow()
 
 
+def chunk_values(
+    chunk: Chunk, document_id: str, publication_id: str = LEGACY_PUBLICATION
+) -> dict[str, Any]:
+    """One chunk as column values, for a bulk insert.
+
+    The same mapping :func:`from_chunk` builds an ORM instance from, kept as the single
+    definition of what a chunk row *is* so the two cannot describe different columns.
+
+    It exists because the ORM cannot batch this insert. ``Chunk.seq`` is a server-generated
+    ``INTEGER PRIMARY KEY``, so the unit of work needs the generated keys back in parameter
+    order and asks for ``RETURNING``; the SQLite dialect declares no insertmanyvalues sentinel,
+    so it falls back to one statement per row. Measured: fifty ``session.add`` calls produce
+    fifty ``INSERT`` statements, each carrying ``RETURNING``, where one Core ``insert()`` over
+    the same rows produces one.
+    """
+    return {
+        "id": chunk.id,
+        "vector_id": vector_id(publication_id, chunk.id),
+        "document_id": document_id,
+        "text": chunk.text,
+        "embed_text": chunk.embed_text,
+        "heading_text": " > ".join(chunk.heading_path),
+        "heading_path": list(chunk.heading_path),
+        "kind": chunk.kind,
+        # Promoted into a column so the lexical leg can filter on it, through the one
+        # accessor the Lance row also uses (`docs/retrieval.md` §3.3).
+        "lang": chunk.lang,
+        "position": chunk.position,
+        "token_count": chunk.token_count,
+        "anchor": chunk.anchor.model_dump(mode="json"),
+        "chunk_metadata": cast("Any", dict(chunk.metadata)),
+    }
+
+
 def from_chunk(
     chunk: Chunk, document_id: str, publication_id: str = LEGACY_PUBLICATION
 ) -> models.Chunk:
-    return models.Chunk(
-        id=chunk.id,
-        vector_id=vector_id(publication_id, chunk.id),
-        document_id=document_id,
-        text=chunk.text,
-        embed_text=chunk.embed_text,
-        heading_text=" > ".join(chunk.heading_path),
-        heading_path=list(chunk.heading_path),
-        kind=chunk.kind,
-        # Promoted into a column so the lexical leg can filter on it, through the one
-        # accessor the Lance row also uses (`docs/retrieval.md` §3.3).
-        lang=chunk.lang,
-        position=chunk.position,
-        token_count=chunk.token_count,
-        anchor=chunk.anchor.model_dump(mode="json"),
-        chunk_metadata=cast("Any", dict(chunk.metadata)),
-    )
+    """One chunk as an ORM instance, for a caller that needs the mapped object."""
+    return models.Chunk(**chunk_values(chunk, document_id, publication_id))
 
 
 def to_chunk(row: models.Chunk) -> Chunk:
@@ -118,4 +137,4 @@ def to_chunk(row: models.Chunk) -> Chunk:
     )
 
 
-__all__ = ["apply_document", "from_chunk", "to_chunk", "to_document"]
+__all__ = ["apply_document", "chunk_values", "from_chunk", "to_chunk", "to_document"]

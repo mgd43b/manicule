@@ -792,6 +792,8 @@ def ask(
                 profile=profile,
                 limit=limit,
                 sources=tuple(source or ()),
+                collections=tuple(collection or ()),
+                conversation_id=conversation,
                 overrides=STATE.overrides,
             )
         )
@@ -895,7 +897,13 @@ def index(
         from manicule.cli.watch import watch_path  # noqa: PLC0415 - the only user of watchfiles
 
         raise typer.Exit(
-            watch_path(path, source=source, reindex=reindex, overrides=STATE.overrides)
+            watch_path(
+                path,
+                source=source,
+                reindex=reindex,
+                json_output=STATE.json_output,
+                overrides=STATE.overrides,
+            )
         )
     submit(
         Command(

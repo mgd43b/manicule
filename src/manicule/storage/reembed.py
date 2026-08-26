@@ -8,6 +8,7 @@ physical vector mutation.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 import shutil
@@ -1443,9 +1444,27 @@ class LanceShadowGenerations:
                 store = self._stores.pop(generation_id, None)
                 if store is not None:
                     await store.teardown()
-                removed = path.exists()
+                # **Off the event loop, the way `vectors.py` already does it.** Both calls were
+                # synchronous inside an `async def`, and what is being removed is a full shadow
+                # re-embedding of the corpus — a LanceDB tree, possibly with an IVF-PQ index —
+                # so this is seconds of filesystem work, not microseconds. Every other task in
+                # the process stopped for it: the HTTP surface, the MCP mount, every ingest
+                # worker.
+                #
+                # It is worse than an ordinary blocking call because of where it sits.
+                # `cleanup_guard` is built on `_immediate()`, so SQLite's RESERVED write lock is
+                # already held and is not released until the delete below commits. `busy_timeout`
+                # is 5000 ms, so a removal that outlasts five seconds turns every other writer's
+                # `BEGIN IMMEDIATE` into `StorageBusyError` — and a blocked event loop cannot
+                # even service the retries.
+                #
+                # The ordering is unchanged: bytes first, then the row, then the commit. That is
+                # already the recoverable direction — a row whose directory is missing is what
+                # `removed = path.exists()` is written to tolerate, whereas a row deleted before
+                # its bytes would leak them with nothing left to name them.
+                removed = await asyncio.to_thread(path.exists)
                 if removed:
-                    shutil.rmtree(path)
+                    await asyncio.to_thread(shutil.rmtree, path)
                 await connection.execute(
                     delete(models.ReembedShadowGeneration).where(
                         models.ReembedShadowGeneration.workspace_id == self._authority.workspace_id,

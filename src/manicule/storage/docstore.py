@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import and_, bindparam, delete, func, select, update
+from sqlalchemy import and_, bindparam, delete, func, insert, select, update
 from sqlalchemy import text as sql
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -37,7 +37,7 @@ from manicule.storage.history import TrashMixin, VersionsMixin
 from manicule.storage.organization import CollectionsMixin, TagsMixin
 from manicule.storage.reconciliation import ReconciliationJournalMixin
 from manicule.storage.relations import RelationsMixin
-from manicule.storage.rows import apply_document, from_chunk, to_chunk, to_document
+from manicule.storage.rows import apply_document, chunk_values, to_chunk, to_document
 from manicule.storage.scoped import (
     DEFAULT_WORKSPACE,
     CrossWorkspaceCollisionError,
@@ -514,8 +514,21 @@ class SqliteDocStore(
             await self._replace_source_dependencies(session, document, source_dependencies)
         await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
         await session.flush()
-        for chunk in chunks:
-            session.add(from_chunk(chunk, document.id, document.publication_id))
+        if chunks:
+            # **One statement, not one per chunk.** `session.add` in a loop cannot batch here:
+            # `Chunk.seq` is a server-generated INTEGER PRIMARY KEY, so the unit of work needs
+            # the generated keys back in parameter order and asks for RETURNING, and the SQLite
+            # dialect declares no insertmanyvalues sentinel — so it emits one INSERT per row.
+            # Measured at fifty chunks: fifty statements, each with RETURNING, against one for
+            # the Core insert. A document of fifty chunks was fifty round trips inside the
+            # publication transaction, on every document of every ingest.
+            #
+            # Nothing here reads `seq` afterwards. The FTS index is external-content over this
+            # table and is maintained by the triggers, which fire per row either way.
+            await session.execute(
+                insert(models.Chunk),
+                [chunk_values(chunk, document.id, document.publication_id) for chunk in chunks],
+            )
         await session.flush()
         if chunks:
             for start in range(0, len(chunks), _VECTOR_TOMBSTONE_BATCH):
@@ -541,10 +554,30 @@ class SqliteDocStore(
     async def _replace_source_dependencies(
         self, session: AsyncSession, document: Document, targets: Sequence[SourceId]
     ) -> None:
-        """Replace a page's include edges within the document's publication transaction."""
+        """Replace a page's include edges within the document's publication transaction.
+
+        ``source`` is in the predicate for the *index*, not for the result. The primary key is
+        ``(workspace_id, source, parent_document_id, target_source_id)`` and the table is
+        ``WITHOUT ROWID``, so naming the first two columns and skipping the second breaks the
+        prefix: the only usable seek left is ``workspace_id``, and the query plan says so —
+
+            SEARCH source_dependencies USING COVERING INDEX
+                ix_source_dependencies_target (workspace_id=?)
+
+        which is every dependency row in the workspace, scanned once per document published.
+        Over a space where a third of the pages carry an include that is quadratic in the size
+        of the run. With ``source`` present the plan seeks the key directly:
+
+            SEARCH source_dependencies USING PRIMARY KEY
+                (workspace_id=? AND source=? AND parent_document_id=?)
+
+        It cannot change *which* rows go: ``documents.id`` is a primary key in its own right, so
+        a parent document has exactly one source and every row already carries it.
+        """
         await session.execute(
             delete(models.SourceDependency).where(
                 models.SourceDependency.workspace_id == self._workspace_id,
+                models.SourceDependency.source == document.source,
                 models.SourceDependency.parent_document_id == document.id,
             )
         )
@@ -1199,13 +1232,14 @@ class SqliteDocStore(
             await session.execute(
                 delete(models.Chunk).where(models.Chunk.document_id == document_id)
             )
-            for chunk in chunks:
-                session.add(
-                    from_chunk(
-                        chunk,
-                        document_id,
-                        document.publication_id if document is not None else "legacy",
-                    )
+            if chunks:
+                # One statement rather than one per chunk, for the reason `_publish` gives:
+                # `Chunk.seq` is server-generated, so the ORM asks for RETURNING in parameter
+                # order and SQLite has no insertmanyvalues sentinel to satisfy it with.
+                publication = document.publication_id if document is not None else "legacy"
+                await session.execute(
+                    insert(models.Chunk),
+                    [chunk_values(chunk, document_id, publication) for chunk in chunks],
                 )
 
     async def get_chunks(self, chunk_ids: Sequence[str]) -> Sequence[Chunk]:
@@ -1352,10 +1386,22 @@ class SqliteDocStore(
             statement = statement.bindparams(
                 *(bindparam(name, type_=UtcDateTime()) for name in timestamps)
             )
+        # **The session closes before the hydration, and that is hold-and-wait rather than
+        # tidiness.** `get_chunks` opens a session of its own, so calling it inside this one
+        # meant a single search held two of the engine's connections at once. The engine is
+        # built with no pool arguments, which on `sqlite+aiosqlite` over a file gives an
+        # `AsyncAdaptedQueuePool` of 5 plus 10 overflow — fifteen for the whole process. Eight
+        # concurrent searches therefore each held one connection and queued for a second that
+        # only another holder could release, and every one of them blocked until the pool's
+        # 30-second timeout expired. A busy server deadlocked its own search.
+        #
+        # `.all()` has already materialized the rows, and a `Row` from a textual statement
+        # holds values rather than a live identity-map reference, so nothing here needs the
+        # session to stay open.
         async with self._sessions() as session:
             rows = (await session.execute(statement, params)).all()
-            chunk_ids = [str(row.chunk_id) for row in rows]
-            chunks = {chunk.id: chunk for chunk in await self.get_chunks(chunk_ids)}
+        chunk_ids = [str(row.chunk_id) for row in rows]
+        chunks = {chunk.id: chunk for chunk in await self.get_chunks(chunk_ids)}
 
         candidates: list[Candidate] = []
         for row in rows:
