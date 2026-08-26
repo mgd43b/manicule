@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 import pytest
@@ -188,3 +189,41 @@ async def test_search_is_scoped_to_the_stores_workspace(engine: AsyncEngine) -> 
     await _seed(first, "s1", ["auth token rotation"])
     assert await first.search_lexical("auth", k=5)
     assert await second.search_lexical("auth", k=5) == []
+
+
+async def test_concurrent_searches_do_not_exhaust_the_connection_pool(
+    store: SqliteDocStore,
+) -> None:
+    """One search holds one connection, so searches cannot deadlock each other.
+
+    ``search_lexical`` ran its FTS statement and then, *still inside* its own session, called
+    ``get_chunks`` — which opens a session of its own. One search therefore held two of the
+    engine's connections at once, and the engine is built with no pool arguments: on
+    ``sqlite+aiosqlite`` over a file that is an ``AsyncAdaptedQueuePool`` of 5 with 10 overflow,
+    fifteen for the whole process. Hold-and-wait, with the usual consequence — a search waiting
+    for a connection only another search can release.
+
+    **The numbers here were measured rather than reasoned to, and the first attempt at this
+    test was wrong.** Twelve concurrent searches over one document do *not* deadlock: the loop
+    interleaves, each search finishes quickly, and the peak checkout stays under the pool. The
+    shape that fails is enough concurrent searches that a second connection is wanted while the
+    first is still held — forty, over a corpus whose hydration is not instant. At that point the
+    nested version never completes and the flat one answers in a quarter of a second.
+
+    So the corpus below is twenty documents of twenty-five chunks rather than one of three, and
+    the timeout is what makes this a test rather than a hang: the failure mode is *waiting*, so
+    an assertion that simply awaited the gather would report a stall as a slow test.
+    """
+    for source in range(20):
+        await _seed(
+            store,
+            f"s{source}",
+            ["the service handles authentication and token rotation " * 20 for _ in range(25)],
+        )
+
+    async def search() -> int:
+        return len(await store.search_lexical("authentication", k=50))
+
+    counts = await asyncio.wait_for(asyncio.gather(*(search() for _ in range(40))), timeout=25)
+
+    assert all(count > 0 for count in counts), "every concurrent search returns its own hits"

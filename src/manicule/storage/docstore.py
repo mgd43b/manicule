@@ -1372,10 +1372,22 @@ class SqliteDocStore(
             statement = statement.bindparams(
                 *(bindparam(name, type_=UtcDateTime()) for name in timestamps)
             )
+        # **The session closes before the hydration, and that is hold-and-wait rather than
+        # tidiness.** `get_chunks` opens a session of its own, so calling it inside this one
+        # meant a single search held two of the engine's connections at once. The engine is
+        # built with no pool arguments, which on `sqlite+aiosqlite` over a file gives an
+        # `AsyncAdaptedQueuePool` of 5 plus 10 overflow — fifteen for the whole process. Eight
+        # concurrent searches therefore each held one connection and queued for a second that
+        # only another holder could release, and every one of them blocked until the pool's
+        # 30-second timeout expired. A busy server deadlocked its own search.
+        #
+        # `.all()` has already materialized the rows, and a `Row` from a textual statement
+        # holds values rather than a live identity-map reference, so nothing here needs the
+        # session to stay open.
         async with self._sessions() as session:
             rows = (await session.execute(statement, params)).all()
-            chunk_ids = [str(row.chunk_id) for row in rows]
-            chunks = {chunk.id: chunk for chunk in await self.get_chunks(chunk_ids)}
+        chunk_ids = [str(row.chunk_id) for row in rows]
+        chunks = {chunk.id: chunk for chunk in await self.get_chunks(chunk_ids)}
 
         candidates: list[Candidate] = []
         for row in rows:
