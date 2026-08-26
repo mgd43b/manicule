@@ -153,7 +153,7 @@ async def embed_checked_chunks(
     # forward pass, which is `batch x padded_length` whatever the mask does. In document order
     # a full 512-token chunk sitting beside a heading stub pads the stub to 512.
     #
-    # Modelled on a realistic wiki distribution — most chunks near the budget, a long tail of
+    # Modeled on a realistic wiki distribution — most chunks near the budget, a long tail of
     # stubs and tables — at batch 16: 1,992,736 padded tokens in document order against
     # 1,285,088 sorted by length, over 1,281,348 real ones. So document order pays 56% extra
     # and sorting pays under 1%: a third off the most expensive stage of an ingest.

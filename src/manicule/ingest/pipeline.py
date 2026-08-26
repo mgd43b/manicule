@@ -3102,7 +3102,7 @@ class IngestPipeline:
                 run.report.error_type = type(leaves[0]).__name__
                 run.report.error_message = str(leaves[0])
             # Deliberately no `stages.cancel()` and no second await. Reaching here means the
-            # task has already *finished* — by raising — so cancelling is a no-op and awaiting
+            # task has already *finished* — by raising — so canceling is a no-op and awaiting
             # it again would re-raise the group this arm exists to absorb. That is not
             # hypothetical: it is what the first version of this handler did.
 

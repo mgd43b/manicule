@@ -281,7 +281,7 @@ async def test_writing_a_document_s_chunks_is_one_statement(store: SqliteDocStor
     publication transaction, on every document of every ingest — 50 statements became 1, and the
     whole call went from 52 statements to 4.
 
-    **The trigger behaviour is the half worth testing**, because it is what a bulk insert could
+    **The trigger behavior is the half worth testing**, because it is what a bulk insert could
     plausibly break: `chunks_fts` is external-content over this table and is maintained entirely
     by `chunks_ai`. SQLite fires an `AFTER INSERT` trigger once per row rather than once per
     statement, so the index is complete either way — asserted here rather than assumed, through
