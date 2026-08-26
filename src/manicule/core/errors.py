@@ -68,6 +68,16 @@ class ContainerStateError(ContainerError):
     """The container was used outside the lifecycle window it supports."""
 
 
+class ComponentSetupError(ContainerError):
+    """A component's ``setup()`` raised, and it is being resolved again.
+
+    Distinct from the original failure, which is attached as ``__cause__``. The container does
+    not retry a failed ``setup`` — a component that failed to start has usually acquired
+    something already, and ``setup`` is nowhere documented as idempotent — so this is what every
+    later resolution of that slot gets, instead of the half-built instance.
+    """
+
+
 # --- pipeline --------------------------------------------------------------------------
 
 
@@ -304,6 +314,7 @@ __all__ = [
     "AcquisitionLeaseLostError",
     "ChunkingError",
     "CircularDependencyError",
+    "ComponentSetupError",
     "ConfigError",
     "ContainerError",
     "ContainerStateError",

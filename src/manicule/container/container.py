@@ -35,6 +35,7 @@ from manicule.config.settings import ConnectorSettings, Settings
 from manicule.container import keys
 from manicule.core.errors import (
     CircularDependencyError,
+    ComponentSetupError,
     ConfigError,
     PluginError,
     PolicyError,
@@ -115,6 +116,18 @@ class Container:
         self._order: list[tuple[ComponentKind, str]] = []
         self._pending: list[tuple[ComponentKind, str]] = []
         self._started: list[tuple[ComponentKind, str]] = []
+        self._failed: dict[tuple[ComponentKind, str], BaseException] = {}
+        """Slots whose ``setup()`` raised, and what it raised.
+
+        Kept because the instance is *not* discarded when setup fails, and it must never be
+        handed out as though it had started. ``start()`` wraps ``_setup_pending`` in a teardown
+        that pops the instances, so a failed startup is clean — but ``aget`` calls
+        ``_setup_pending`` directly, with no such wrapper. There the exception reached the
+        caller while the half-built instance stayed in ``_instances`` and its slot had already
+        been popped from ``_pending``, so the *next* ``aget`` found it cached, found nothing
+        pending, and returned it: a component that never completed ``setup`` handed out as a
+        working one, silently, for the rest of the process's life.
+        """
         self._resolving: list[str] = []
         self._metadata: dict[tuple[ComponentKind, str], object] = {}
         self._metadata_resolving: list[str] = []
@@ -130,6 +143,13 @@ class Container:
         """
         resolved = self._resolve_name(key)
         slot = (resolved.kind, resolved.name or "")
+        failure = self._failed.get(slot)
+        if failure is not None:
+            # Re-raised rather than retried. A component that failed to start has usually
+            # acquired something already, and `setup` is not documented as idempotent; the
+            # container's answer to a broken component is to keep saying so.
+            msg = f"{resolved} failed to start and cannot be resolved"
+            raise ComponentSetupError(msg) from failure
         existing = self._instances.get(slot)
         if existing is not None:
             return existing  # pyright: ignore[reportReturnType] - key's parameter is the contract
@@ -473,7 +493,11 @@ class Container:
             # never calls it.
             self._started.append(slot)
             if isinstance(instance, SupportsSetup):
-                await instance.setup()
+                try:
+                    await instance.setup()
+                except BaseException as exc:
+                    self._failed[slot] = exc
+                    raise
 
     async def aclose(self) -> None:
         """Tear everything down, in reverse setup order.
