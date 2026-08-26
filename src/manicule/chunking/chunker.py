@@ -553,17 +553,67 @@ class StructuralChunker:
 
         # Keep line endings on their source lines. Joining with a synthetic separator would
         # lose blank lines and make the non-overlap payload impossible to reconstruct exactly.
-        for offset, line in enumerate(source_lines):
-            candidate = "".join(value for _, value in (*current, (offset, line)))
-            if current and self._count_or_ceiling(candidate) > self._text_budget:
-                flush()
-            current.append((offset, line))
+        #
+        # **Packed by bisection rather than one line at a time.** The straightforward loop
+        # rebuilt the whole accumulated prefix and counted it again for every line, so a block
+        # of *n* lines handed the tokenizer O(n^2) characters: measured on one 2,000-line
+        # generated file, 1,407,859 characters counted for 49,779 characters of code — 28x the
+        # block — and 88.8 ms against 16.3 ms for a larger page of prose.
+        #
+        # The answer is identical because this is the same greedy pack, found a different way.
+        # It needs only that a count is non-decreasing over prefixes, which is the property the
+        # character-wise search above already depends on and `CHUNKER_VERSION` already records
+        # as the assumption bisection makes.
+        #
+        # An oversized line lands alone, which the old loop reached by accident and this reaches
+        # by construction: if a single line exceeds the budget then so does anything containing
+        # it, so the flush before it always fired.
+        index = 0
+        while index < len(source_lines):
+            line = source_lines[index]
             if self._count_or_ceiling(line) > self._text_budget:
-                oversized = materialize(current)
-                current.clear()
-                units.extend(self._hard_split(oversized, "line"))
+                flush()
+                units.extend(self._hard_split(materialize([(index, line)]), "line"))
+                index += 1
+                continue
+            taken = self._lines_that_fit(source_lines, index)
+            current.extend((index + step, source_lines[index + step]) for step in range(taken))
+            flush()
+            index += taken
         flush()
         return units or [self._unit(block, block.text)]
+
+    def _lines_that_fit(self, lines: Sequence[str], start: int) -> int:
+        """How many lines from ``start`` fit the text budget together. At least one.
+
+        Doubling then bisecting, the same shape as the character-wise probe: the count is
+        monotone over prefixes, so the largest satisfying prefix is found in O(log n) counts
+        instead of one count per line. The caller has already established that ``lines[start]``
+        fits on its own, which is what makes "at least one" true rather than hopeful.
+        """
+
+        def fits(count: int) -> bool:
+            return self._count_or_ceiling("".join(lines[start : start + count])) <= (
+                self._text_budget
+            )
+
+        remaining = len(lines) - start
+        if remaining <= 1:
+            return 1
+        # `window * 2 <= remaining`, not `window < remaining`: a probe wider than what is left
+        # measures fewer lines than it asks for and therefore always "fits", which would walk
+        # the window past the end of the block.
+        window = 1
+        while window * 2 <= remaining and fits(window * 2):
+            window *= 2
+        low, high = window, min(window * 2, remaining)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(middle):
+                low = middle
+            else:
+                high = middle - 1
+        return max(1, min(low, remaining))
 
     def _split_prose(self, block: ParsedBlock) -> list[_Unit]:
         """Paragraph, then sentence, then — only for a single oversized sentence — tokens."""

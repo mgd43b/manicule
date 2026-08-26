@@ -1076,3 +1076,58 @@ def test_memoizing_the_token_counter_changes_no_chunk() -> None:
             f"document {seed} chunks differently with the counter's memo; the memo must be "
             f"invisible in the output or CHUNKER_VERSION has to move with it"
         )
+
+
+def test_packing_lines_does_not_grow_quadratically_with_the_budget() -> None:
+    """A code block must not hand the tokenizer work that squares with the chunk budget.
+
+    `_split_lines` rebuilt the whole accumulated prefix and counted it again for every line, so
+    the cost was quadratic in the number of lines that fit *one chunk* — which is set by
+    `max_tokens`. The block size only multiplies it.
+
+    That is the axis, and getting it wrong is why the first version of this test passed against
+    the defect. Measured over a 2,000-line file, tokenized characters as a multiple of the
+    block:
+
+        max_tokens   128     256     512    1024
+        before      24.0x   44.5x   87.1x  169.9x     <- doubles with the budget
+        after        8.7x    9.3x    9.6x   10.1x     <- flat
+
+    At the shipped budget of 512 that is nine times the tokenizer work, on the stage every
+    document of every ingest passes through.
+
+    Asserted as a ratio that does not grow, never as a time or an absolute count: a wall-clock
+    bound is not stable on a loaded runner, and an absolute would need editing whenever the
+    packing changed for a good reason. What must never come back is the shape.
+    """
+    from manicule.chunking.tokens import TokenCounter  # noqa: PLC0415
+
+    def tokenized_per_character(budget: int) -> float:
+        counted: list[int] = []
+
+        def count(text: str) -> int:
+            counted.append(len(text))
+            return max(1, len(text.split()))
+
+        block = ParsedBlock(
+            kind=BlockKind.CODE,
+            text="\n".join(f"line_{index} = compute({index})" for index in range(2000)),
+            anchor=LineAnchor(start=1, end=2000),
+            lang="python",
+        )
+        StructuralChunker(
+            TokenCounter("whitespace", count, provisional=False),
+            max_tokens=budget,
+            overlap_tokens=0,
+            breadcrumb_tokens=8,
+        ).chunk(document(), [block])
+        return sum(counted) / len(block.text)
+
+    narrow, wide = tokenized_per_character(128), tokenized_per_character(1024)
+
+    # Eight times the budget. Quadratic multiplies the ratio by about eight — it did, 24x to
+    # 170x. Bisection leaves it flat. Two is generous room for the search's own overhead.
+    assert wide < narrow * 2, (
+        f"tokenized {narrow:.1f}x the block at max_tokens=128 and {wide:.1f}x at 1024: the work "
+        f"per character is growing with the budget, which is the quadratic pack coming back"
+    )
