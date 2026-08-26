@@ -14,6 +14,8 @@ events and that ingesting on the first indexes a half-written file.
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -27,27 +29,58 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
+    from manicule.app.dispatch import Envelope
+
 
 def watch_path(
     path: Path,
     *,
     source: str,
     reindex: bool = False,
+    json_output: bool = False,
     overrides: Mapping[str, Any] | None = None,
 ) -> int:
-    """Index ``path``, then keep it indexed. Returns the process's exit status."""
+    """Index ``path``, then keep it indexed. Returns the process's exit status.
+
+    ``json_output`` is carried because ``index --watch`` accepts ``--json`` and this ignored
+    it: every batch was rendered as Rich tables to stdout, so the one long-running indexing
+    command was the one place ``--json`` did not mean what ``docs/surfaces.md`` says it means.
+    A program watching a directory and parsing the stream got decorated text.
+    """
     try:
         return asyncio.run(
-            _watch(path, source=source, reindex=reindex, overrides=dict(overrides or {}))
+            _watch(
+                path,
+                source=source,
+                reindex=reindex,
+                json_output=json_output,
+                overrides=dict(overrides or {}),
+            )
         )
     except KeyboardInterrupt:  # pragma: no cover - a person pressing ^C
         return 130
 
 
-async def _watch(path: Path, *, source: str, reindex: bool, overrides: dict[str, Any]) -> int:
+async def _watch(
+    path: Path,
+    *,
+    source: str,
+    reindex: bool,
+    json_output: bool,
+    overrides: dict[str, Any],
+) -> int:
     from manicule.ingest.watch import Change, watch_directory  # noqa: PLC0415 - optional extra
 
-    out = render.console()
+    # Under `--json` stdout carries envelopes and nothing else, so the human console is moved
+    # to stderr rather than silenced: the "watching …" line and any progress still reach a
+    # person, and a consumer parsing stdout sees one envelope per line and no decoration.
+    out = render.console(stderr=json_output)
+
+    def emit_envelope(envelope: Envelope) -> None:
+        """One envelope on stdout, serialized exactly as `print_envelope` serializes one."""
+        sys.stdout.write(json.dumps(envelope.as_json(), indent=2, sort_keys=True) + "\n")
+        sys.stdout.flush()
+
     try:
         # Watch mode indexes whatever changes, indefinitely. It is a writer for its whole
         # life, and the refusal belongs on the way in rather than at the first change.
@@ -68,7 +101,9 @@ async def _watch(path: Path, *, source: str, reindex: bool, overrides: dict[str,
             if first.error is not None:
                 render.render_error(render.console(stderr=True), "index_path", first.error)
             return 1
-        if first.data is not None:
+        if json_output:
+            emit_envelope(first)
+        elif first.data is not None:
             from manicule.app.results import IngestReport  # noqa: PLC0415
 
             render.render_ingest(out, IngestReport.model_validate(first.data))
@@ -89,7 +124,12 @@ async def _watch(path: Path, *, source: str, reindex: bool, overrides: dict[str,
                     service.workspace,
                     partial(service.index_changes, changed, source=source, removed=removed),
                 )
-                if envelope.ok and envelope.data is not None:
+                if json_output:
+                    # A failed batch is an envelope too, and it goes to stdout with the rest:
+                    # the stream is the record of what the watch did, so a consumer must see
+                    # the failure in the same place and the same shape as the successes.
+                    emit_envelope(envelope)
+                elif envelope.ok and envelope.data is not None:
                     from manicule.app.results import IngestReport  # noqa: PLC0415
 
                     render.render_ingest(out, IngestReport.model_validate(envelope.data))

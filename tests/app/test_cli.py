@@ -2524,3 +2524,53 @@ def test_a_timeout_is_still_refused_against_a_provider_that_never_waits(
 
     assert result.exit_code != 0
     assert "--timeout" in _unwrapped(result.output)
+
+
+def test_the_long_running_hand_offs_carry_every_flag_their_command_accepts() -> None:
+    """A command that hands off must not drop the options it just parsed.
+
+    Four commands delegate to a runner in another module, and the hand-off is where an option
+    goes missing without anything failing: Typer parses it, the callback accepts it, and the
+    call that does the work simply never mentions it. Two had:
+
+    * ``ask --repl`` took ``--collection`` and ``--conversation`` and passed neither, so an
+      explicitly scoped question was answered over the whole workspace — the one kind of wrong
+      answer a scope flag exists to prevent, and silent, because a wider corpus still returns
+      plausible passages.
+    * ``index --watch`` took ``--json`` and passed it nowhere, so the one long-running indexing
+      command was the one place ``--json`` did not mean what ``docs/surfaces.md`` says. A
+      program watching a directory got Rich tables.
+
+    Read off the real call site rather than from a list kept here, and paired with the runner's
+    real signature, so neither half can drift: a parameter added to the runner and not passed,
+    or passed under a name the runner does not take, both fail.
+    """
+    import inspect  # noqa: PLC0415 - only this derivation reads a signature
+
+    from manicule.cli.repl import run_repl  # noqa: PLC0415 - a hand-off target
+    from manicule.cli.watch import watch_path  # noqa: PLC0415 - a hand-off target
+
+    tree = ast.parse((Path(cli.__file__).parent / "main.py").read_text(encoding="utf-8"))
+    passed: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.id if isinstance(node.func, ast.Name) else ""
+        if name in {"run_repl", "watch_path"}:
+            passed[name] = {keyword.arg for keyword in node.keywords if keyword.arg}
+
+    expected = {
+        "run_repl": ({"collections", "conversation_id"}, run_repl),
+        "watch_path": ({"json_output"}, watch_path),
+    }
+    for name, (required, runner) in expected.items():
+        assert name in passed, f"{name} is no longer called from main.py; this test is stale"
+        missing = sorted(required - passed[name])
+        assert not missing, (
+            f"main.py calls {name} without {missing}. The command parses those options and "
+            f"then discards them, which is silent: the operation still runs, on a wider scope "
+            f"or in the wrong output format than the one that was asked for."
+        )
+        accepted = set(inspect.signature(runner).parameters)
+        unknown = sorted(passed[name] - accepted)
+        assert not unknown, f"main.py passes {unknown} to {name}, which does not accept them"
