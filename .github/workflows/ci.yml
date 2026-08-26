@@ -27,6 +27,21 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+
+      # **Before the sync, and that ordering is the whole point.** `uv sync` and `uv run` repair
+      # a stale `uv.lock` in place and say nothing, so a lockfile that disagreed with
+      # `pyproject.toml` was rewritten by the first uv command of every job and never reported.
+      # That is how three releases shipped with the lockfile pinned at 0.1.9: release-please
+      # bumps `pyproject.toml` and `packages/manicule-mlx/pyproject.toml`, and nothing bumped the
+      # `version` the lockfile records for those same two editable members. The only symptom was
+      # a contributor's tree going dirty on their first command, in a file they had not touched.
+      #
+      # `--check` resolves and *refuses* rather than rewriting. Run after the sync it would check
+      # a file uv had just fixed and pass unconditionally, which is why
+      # tests/test_packaging.py asserts nothing in this file syncs above this line.
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --check
+
       - run: uv sync --all-groups --all-extras
       - name: ruff check
         run: uv run ruff check .

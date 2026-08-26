@@ -48,6 +48,7 @@ DOCKERFILE = REPO_ROOT / "Dockerfile"
 SRC = REPO_ROOT / "src" / "manicule"
 PACKAGES = REPO_ROOT / "packages"
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 # The workspace members that go to PyPI. `manicule` is MIT; `manicule-mlx` is
 # GPL-3.0-or-later because it links `mlx-embeddings`, which is the entire reason it is a
@@ -187,6 +188,113 @@ def test_every_plugin_admits_the_running_version() -> None:
         "The version bump moved past the range they declare. Widen the pins in the same commit "
         "as the bump — a release that ships without them loads no parsers, no storage and no "
         "embedder, and reports each one as an incompatible plugin."
+    )
+
+
+def test_the_lockfile_cannot_drift_from_the_version_being_released() -> None:
+    """Two guards keep `uv.lock` on the version being released, and both are read out of CI.
+
+    `uv.lock` records a `version` for both workspace members, because both are
+    `source = {editable = ...}`. release-please bumps `pyproject.toml` and, through
+    `extra-files`, `manicule-mlx`'s — and has never touched the lockfile. So every release left
+    it a version behind: `main` shipped 0.1.10, 0.1.11 and 0.1.12 with a lockfile still pinned
+    at 0.1.9.
+
+    **What made it invisible is the reason this is a workflow test and not a content one.**
+    `uv run` and `uv sync` *repair* a stale lockfile in place, silently, before doing anything
+    else. A test that read `uv.lock` and compared it to `pyproject.toml` would therefore pass
+    unconditionally under `uv run pytest` — uv rewrites the file on the way to starting pytest,
+    so the assertion never sees the state it exists to catch. The drift surfaced only as a
+    working tree that went dirty on a contributor's first command, in a file they had not
+    touched, which then rode into whatever pull request was open.
+
+    So the guards have to sit where uv has not already been:
+
+    * `uv lock --check` in ci.yml, which resolves and *refuses* instead of rewriting — and must
+      run before the job's first `uv sync`, or it checks a file that was just repaired.
+    * the re-lock step in release.yml, which puts the new lockfile in the release pull request
+      itself, so the bump and the lock move in one reviewed commit.
+
+    Losing either is silent, which is what makes them worth pinning here.
+    """
+    import yaml  # noqa: PLC0415 - a test-only dependency, kept out of this module's import cost
+
+    # Parsed, not grepped. The prose in these workflows discusses `uv sync` by name — this
+    # comment does too — and a regular expression over the raw file reads those sentences as
+    # commands, so the ordering assertion below failed on its own explanation. `run:` strings
+    # from the parsed job graph are the commands and nothing else.
+    ci = cast(dict[str, Any], yaml.safe_load(CI_WORKFLOW.read_text()))
+    commands = [
+        cast(str, step["run"])
+        for job in cast(dict[str, dict[str, Any]], ci["jobs"]).values()
+        for step in cast(list[dict[str, Any]], job.get("steps") or [])
+        if isinstance(step.get("run"), str)
+    ]
+
+    guards = [index for index, run in enumerate(commands) if "uv lock --check" in run]
+    assert guards, (
+        "no job in ci.yml runs `uv lock --check`. Without it a stale lockfile is repaired by "
+        "the next `uv sync` and never reported, which is how three releases shipped with "
+        "uv.lock pinned a version behind."
+    )
+
+    # Ordering is the whole of the check's value, so it is asserted rather than assumed. Steps
+    # are compared within the job that holds the guard: jobs run on their own runners with their
+    # own checkouts, so a sync in some other job cannot repair the file this one reads.
+    guard_job = next(
+        name
+        for name, job in cast(dict[str, dict[str, Any]], ci["jobs"]).items()
+        if any(
+            "uv lock --check" in cast(str, step["run"])
+            for step in cast(list[dict[str, Any]], job.get("steps") or [])
+            if isinstance(step.get("run"), str)
+        )
+    )
+    within = [
+        cast(str, step["run"])
+        for step in cast(list[dict[str, Any]], ci["jobs"][guard_job].get("steps") or [])
+        if isinstance(step.get("run"), str)
+    ]
+    before = within[: next(i for i, run in enumerate(within) if "uv lock --check" in run)]
+    repairs = [run for run in before if re.search(r"\buv (?:sync|run)\b", run)]
+    assert not repairs, (
+        f"job {guard_job!r} in ci.yml runs {repairs} before `uv lock --check`. uv repairs a "
+        "stale lockfile in place, so the check would resolve a file that had just been "
+        "rewritten and pass unconditionally. Move the check above the first sync."
+    )
+
+    release = cast(dict[str, Any], yaml.safe_load(RELEASE_WORKFLOW.read_text()))
+    steps = [
+        step
+        for job in cast(dict[str, dict[str, Any]], release["jobs"]).values()
+        for step in cast(list[dict[str, Any]], job.get("steps") or [])
+    ]
+    relocks = [
+        step
+        for step in steps
+        if isinstance(step.get("run"), str)
+        # `uv lock` and not `uv lock --check`: this step must *write* the lockfile. The check is
+        # ci.yml's job, and a `--check` here would fail the release rather than fix it.
+        and re.search(r"\buv lock\b(?! --check)", cast(str, step["run"]))
+    ]
+    assert relocks, (
+        "no step in release.yml runs `uv lock`. release-please bumps two pyproject.toml files "
+        "and knows nothing about uv.lock, so without this the release pull request ships a "
+        "lockfile naming the previous version."
+    )
+
+    # And it re-locks the release branch rather than whatever happened to be checked out. The
+    # branch comes from the action's `pr` output; re-locking anywhere else puts the lockfile in
+    # a commit the release does not contain.
+    guarded = [
+        step
+        for step in relocks
+        if "headBranchName" in str(step.get("env", "")) or "headBranchName" in str(step)
+    ]
+    assert guarded, (
+        "release.yml re-locks, but the step does not read `headBranchName` from the "
+        "release-please `pr` output. Re-locking off the release branch commits the lockfile "
+        "somewhere the release will not contain."
     )
 
 
