@@ -201,8 +201,20 @@ def expanded_text(original: str, matches: Sequence[GlossaryMatch]) -> str:
     """
     text = original
     for match in matches:
+        # **The replacement is a callable, and that is not a style choice.** `re.sub` parses a
+        # *string* replacement as a template — `\1` is a group reference, `\d` is an error, `\n`
+        # is a newline — and an expansion is corpus text. Nothing between a definition on an
+        # indexed page and here removes a backslash: `core_expansion` trims and cases, and
+        # `normalize_expansion` is only a comparison key. So a perfectly ordinary technical
+        # glossary — "RGX — a regular expression like \d+", a term defined in terms of a
+        # Windows path — made every query naming that term raise `re.PatternError` out of the
+        # retriever, and the one backslash that did not raise, `\n`, silently rewrote the
+        # query. A callable is handed the match and returns the string, so it is never parsed.
         text = re.sub(
-            rf"(?<!\w){re.escape(match.surface)}(?!\w)", match.entry.expansion, text, count=1
+            rf"(?<!\w){re.escape(match.surface)}(?!\w)",
+            lambda _match, expansion=match.entry.expansion: expansion,
+            text,
+            count=1,
         )
     return text
 
