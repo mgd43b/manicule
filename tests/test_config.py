@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import tomli_w
 from pydantic import ValidationError
 
-from manicule.config.loader import load_settings, save_settings
+from manicule.config.loader import (
+    _strip,  # pyright: ignore[reportPrivateUsage] - the writer's half of the predicate
+    load_settings,
+    save_settings,
+)
 from manicule.config.profiles import PROFILES, profile_config
 from manicule.config.providers import (
     Egress,
@@ -20,7 +25,7 @@ from manicule.config.providers import (
     resolve_provider_keys,
     runs_in_process,
 )
-from manicule.config.settings import AuthMode, Mode, Settings, Theme
+from manicule.config.settings import REDACTED, AuthMode, Mode, Settings, Theme
 from manicule.core.errors import ConfigError, PolicyError
 from manicule.core.retrieval import RetrievalProfile
 
@@ -371,6 +376,57 @@ def test_a_secret_under_an_arbitrary_key_is_still_masked() -> None:
     assert "sk-live-do-not-print" not in rendered
     assert "salt-do-not-print" not in rendered
     assert rendered.count("**********") >= 2
+
+
+def test_a_credential_under_an_untyped_subtree_is_still_redacted() -> None:
+    """`plugins.config` has no declared type, so the name rule is what must cover it.
+
+    Secrecy is read from the annotation wherever there is one — but `plugins.config` holds
+    arbitrary per-component options, validated against each component's own model rather than
+    against `Settings`, so the walk leaves the declared model there and `looks_secret` is the
+    only thing left.
+
+    The type-driven rewrite recursed into that subtree without judging anything, so a plugin's
+    `api_key` came back from `config show` in the clear while `save_settings` — which reaches
+    the same conclusion through `secret_setting` — correctly omitted it from the file. Display
+    and disk disagreeing about what is a credential is exactly what one predicate exists to
+    prevent, and the leak was on the side that hands the value to a caller.
+
+    Both halves are asserted together, because either alone would pass against a fix that made
+    them agree by leaking from both.
+    """
+    settings = Settings.model_validate(
+        {
+            "plugins": {
+                "config": {
+                    "connector.confluence": {
+                        "api_key": "sk-do-not-print",
+                        "batch_size": 50,
+                        "nested": {"client_secret": "also-do-not-print", "depth": 3},
+                    }
+                }
+            }
+        }
+    )
+
+    def component(tree: Any) -> dict[str, Any]:
+        plugins = cast("dict[str, Any]", tree["plugins"])
+        config = cast("dict[str, Any]", plugins["config"])
+        return cast("dict[str, Any]", config["connector.confluence"])
+
+    shown = component(settings.redacted())
+    nested = cast("dict[str, Any]", shown["nested"])
+    assert shown["api_key"] == REDACTED
+    # Nested, because an untyped subtree is arbitrarily deep and one level would look fixed.
+    assert nested["client_secret"] == REDACTED
+    # And nothing else is swept up: a component option that is not a credential stays readable,
+    # or `config show` becomes useless for the thing it is for.
+    assert shown["batch_size"] == 50
+    assert nested["depth"] == 3
+
+    written = component(_strip(settings.model_dump(mode="json")))
+    assert "api_key" not in written, "the writer already withheld it; the two must not disagree"
+    assert written["batch_size"] == 50
 
 
 def test_saving_the_configuration_never_writes_a_credential(

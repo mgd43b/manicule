@@ -1658,16 +1658,30 @@ def _mask(
     goes ``None`` as soon as the walk leaves :class:`Settings` — inside ``plugins.config``,
     whose contents are validated per component — and from there :func:`looks_secret` decides,
     which is the best available answer for a subtree with no declared type.
+
+    **A dict with no model is that untyped subtree**, and it is judged by name. An earlier
+    version of this function recursed into one without judging anything, so a plugin's
+    ``api_key`` came back from ``config show`` in the clear while :func:`_strip` — which reaches
+    the same conclusion through :func:`secret_setting` — correctly omitted it from the file.
+    That is precisely the disagreement between what is hidden on display and what is withheld on
+    disk that one predicate exists to prevent.
+
+    The distinction the model alone cannot carry is that ``model is None`` means two different
+    things: a *declared* field whose annotation is a scalar, already settled by
+    :func:`_declares_secret` at its parent, and an *undeclared* subtree with nothing to settle
+    it. Only a dict reaches here in the second case, because a declared scalar is returned by
+    its parent and never recursed into.
     """
     if isinstance(value, dict):
         entries = cast("dict[str, Any]", value)
         if model is None:
-            return {name: _mask(item, None, name) for name, item in entries.items()}
+            return {name: _untyped(item, name) for name, item in entries.items()}
         masked: dict[str, Any] = {}
         for name, item in entries.items():
             field = model.model_fields.get(name)
             if field is None:
-                masked[name] = _mask(item, None, name)
+                # A key the model does not declare. Same subtree, same rule.
+                masked[name] = _untyped(item, name)
                 continue
             if item is not None and _declares_secret(field.annotation):
                 masked[name] = REDACTED
@@ -1682,6 +1696,17 @@ def _mask(
     if isinstance(value, list):
         return [_mask(item, model, key) for item in cast("list[Any]", value)]
     return value
+
+
+def _untyped(value: Any, key: str) -> Any:  # noqa: ANN401 - recursive over decoded JSON
+    """Mask one entry of a subtree :class:`Settings` does not describe, by its name.
+
+    The fallback the module docstring promises and :func:`secret_setting` already applies on the
+    writing side, so ``config show`` and ``save_settings`` agree about a plugin's credentials.
+    """
+    if value is not None and looks_secret(key):
+        return REDACTED
+    return _mask(value, None, key)
 
 
 __all__ = [
