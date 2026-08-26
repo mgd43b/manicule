@@ -68,6 +68,30 @@ def test_marker_syntax_inside_a_passage_is_escaped_before_the_model_sees_it() ->
     assert "cite:3]]" in rendered, "the text is still legible, just not bindable"
 
 
+def test_marker_syntax_in_a_title_or_breadcrumb_is_escaped_too() -> None:
+    """The label is corpus text, and it was the half that was not escaped.
+
+    `chunk.text` goes through `escape_markers`; the title and the breadcrumb did not, and both
+    come off an indexed document. `escape_markers`'s own docstring names the risk exactly —
+    manicule's documentation describes this syntax and is the sort of thing somebody indexes —
+    so a document *titled* `[[cite:3]]`, or with a heading containing one, put a live marker
+    into the prompt. The model quotes it back, it binds to a real passage, and it even
+    *verifies*: a citation nobody asked for, pointing somewhere nobody chose.
+
+    Both halves are asserted, because escaping only the title would leave the heading path as an
+    identical door.
+    """
+    titled = render_passage(1, candidate(), document(title=f"{ATTEMPT_PREFIX}:3]] rollback guide"))
+    assert f"{ATTEMPT_PREFIX}:3]]" not in titled
+    assert "rollback guide" in titled, "the label is still legible, just not bindable"
+
+    headed = render_passage(
+        2, candidate(heading_path=("Operations", f"{ATTEMPT_PREFIX}:1]]")), document()
+    )
+    assert f"{ATTEMPT_PREFIX}:1]]" not in headed
+    assert "Operations" in headed
+
+
 def test_an_empty_context_says_so_rather_than_inviting_an_unsourced_answer() -> None:
     messages = build_messages(query_text="anything?", context=context(()), documents={})
 

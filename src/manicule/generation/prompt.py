@@ -112,9 +112,21 @@ def render_passage(slot: int, candidate: Candidate, document: Document | None) -
     the worst a leak can look like is a stray number.
     """
     chunk = candidate.chunk
-    title = (document.title if document else "") or (document.uri if document else "") or "untitled"
-    trail = " › ".join(chunk.heading_path)  # noqa: RUF001 - the breadcrumb separator, not a comparison
-    where = describe_location(chunk.anchor)
+    # **The label is corpus text too, and it was the half that was not escaped.** `chunk.text`
+    # goes through `escape_markers` below; the title, the breadcrumb and the location did not,
+    # and all three come off an indexed document. `escape_markers` names the risk exactly —
+    # manicule's own documentation describes this syntax and is the sort of thing somebody
+    # indexes — so a document *titled* `[[cite:3]]`, or with a heading containing one, put a
+    # live marker in the prompt. The model quotes it back, it binds to a real passage, and it
+    # even verifies: a citation nobody asked for, pointing somewhere nobody chose.
+    #
+    # A no-op on text with no marker attempt, since the substitution only separates the two
+    # opening brackets. The slot number is generated here and stays untouched.
+    title = escape_markers(
+        (document.title if document else "") or (document.uri if document else "") or "untitled"
+    )
+    trail = escape_markers(" › ".join(chunk.heading_path))  # noqa: RUF001 - breadcrumb separator
+    where = escape_markers(describe_location(chunk.anchor))
     label = f"[slot {slot}] {title!r}"
     if trail:
         label += f" — {trail}"
