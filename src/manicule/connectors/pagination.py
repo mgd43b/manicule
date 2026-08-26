@@ -84,12 +84,23 @@ def origin_of(url: str) -> str:
     session being offered to another.
     """
     parsed = urlsplit(url)
+    try:
+        port_number = parsed.port
+    except ValueError:
+        # **`urlsplit` defers the port; `.port` is where it refuses.** A response-supplied
+        # `Link:` header naming `https://host:99999/` or `https://host:notaport/` parses fine
+        # and then raises here — a bare `ValueError` out of a function whose docstring promises
+        # a total answer, bypassing the typed `UntrustedLinkError` every caller handles.
+        #
+        # A malformed authority names no server this can vouch for, which is the same answer as
+        # a missing host: the empty origin, which every caller already treats as a refusal.
+        return ""
     if not parsed.hostname:
         return ""
     host = parsed.hostname.lower()
     # A colon in a host is only ever an IPv6 literal; `urlsplit` has already taken the port off.
     host = f"[{host}]" if ":" in host else host
-    port = f":{parsed.port}" if parsed.port else ""
+    port = f":{port_number}" if port_number else ""
     return f"{parsed.scheme.lower()}://{host}{port}"
 
 

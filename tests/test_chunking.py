@@ -955,3 +955,71 @@ def test_the_chunker_passes_the_shipped_contract() -> None:
     ]
     chunks = assert_chunker_contract(make_chunker(), document(), blocks, _Embedder(512))
     assert chunks
+
+
+# --- table metadata and cell anchors ------------------------------------------------------
+
+
+def test_adjacent_row_ranges_collapse_for_a_multi_column_table() -> None:
+    """`_adjacent` compared one edge of each area, so it could only ever be True at one column.
+
+    For `A1:C1` and `A2:C2` it took `left`'s *end* cell against `right`'s *start* cell — `C1`
+    against `A2`, whose columns are `C` and `A` — and answered False. Row ranges therefore never
+    collapsed for any table wider than one column: every row stayed its own area, and the
+    anchor `_collapse_areas` exists to compact grew one comma-separated range per row.
+
+    The negatives are the point of the parametrization: a gap in the rows, a shift in the
+    columns, and a widened right-hand area must all still refuse.
+    """
+    from manicule.chunking.chunker import (  # noqa: PLC0415
+        _adjacent,  # pyright: ignore[reportPrivateUsage] - the predicate under test
+        _collapse_areas,  # pyright: ignore[reportPrivateUsage] - its only caller
+    )
+
+    assert _adjacent("A1:C1", "A2:C2"), "the case that could never be True"
+    assert _adjacent("B3:D3", "B4:D4")
+    assert _adjacent("A1", "A2"), "the single-column case, which already worked"
+
+    assert not _adjacent("A1:C1", "A3:C3"), "a skipped row is not adjacent"
+    assert not _adjacent("A1:C1", "B2:D2"), "shifted columns are a different area"
+    assert not _adjacent("A1:C1", "A2:D2"), "a wider row is a different area"
+    assert not _adjacent("x", "y"), "an unreadable reference collapses nothing"
+
+    assert _collapse_areas(["A1:C1", "A2:C2", "A3:C3"]) == ["A1:C3"]
+
+
+def test_an_unsplit_table_does_not_carry_the_parsers_row_list_onto_the_chunk() -> None:
+    """`rows` on a chunk is the `[first, last]` pair, never the table's text.
+
+    A table small enough not to be split copied its block metadata straight onto the unit, and
+    `_group_metadata` then carried `rows` onto the chunk — so the chunk held the whole table a
+    second time, beside its own text. It also made `rows` mean two different things depending
+    on a size threshold: the pair that `_split_table` writes on a split part, and the list of
+    row strings on an unsplit one. One key, two types, decided by whether the table fit.
+    """
+    rows = [f"| r{index} | value {index} |" for index in range(6)]
+    block = ParsedBlock(
+        kind=BlockKind.TABLE,
+        text="\n".join(rows),
+        anchor=LineAnchor(start=1, end=6),
+        metadata=cast(
+            "Metadata",
+            {"rows": rows, "header_rows": 1, "row_refs": [f"A{i}:B{i}" for i in range(6)]},
+        ),
+    )
+
+    chunks = make_chunker().chunk(document(), [block])
+
+    assert len(chunks) == 1, "the fixture is meant to fit in one chunk"
+    assert "rows" not in chunks[0].metadata, "the parser's row list must not ride onto the chunk"
+
+    # And the contrast that makes `rows` mean one thing: split the same table and the key comes
+    # back — as the `[first, last]` pair, which is what a chunk's `rows` is for.
+    narrow = StructuralChunker(counter(), max_tokens=24, overlap_tokens=0, breadcrumb_tokens=4)
+    parts = narrow.chunk(document(), [block])
+    assert len(parts) > 1, "the fixture is meant to split at this budget"
+    pairs = [part.metadata["rows"] for part in parts if "rows" in part.metadata]
+    assert pairs, "a split part records which rows it holds"
+    assert all(isinstance(pair, list) and len(pair) == 2 for pair in pairs), (
+        f"`rows` on a chunk is a [first, last] pair, got {pairs}"
+    )

@@ -375,3 +375,24 @@ def test_a_configured_origin_still_separates_instances_that_are_genuinely_differ
     assert configured != origin_of("https://wiki.example.test:8443/confluence")
     assert configured != origin_of("https://wiki.example.test.evil.test/confluence")
     assert configured != origin_of("https://evil.test/wiki.example.test")
+
+
+def test_origin_of_is_total_even_for_a_malformed_authority() -> None:
+    """`urlsplit` defers the port, and `.port` is where it refuses.
+
+    A response-supplied `Link:` header naming `https://host:99999/` or a non-numeric port
+    parses fine and then raises a bare `ValueError` out of `origin_of` — a function whose
+    docstring promises a total answer, and whose callers handle refusal as the typed
+    `UntrustedLinkError`. So a header from a server this connector does not control could
+    escape the refusal path entirely.
+
+    A malformed authority names no server this can vouch for, which is the same answer as a
+    missing host: the empty origin every caller already treats as a refusal.
+    """
+    assert origin_of("https://host:99999/x") == "", "a port out of range"
+    assert origin_of("https://host:notaport/x") == "", "a port that is not a number"
+    assert origin_of("not a url") == ""
+
+    # And a well-formed one still resolves, so "refuse everything" would not pass.
+    assert origin_of("https://host:8443/x") == "https://host:8443"
+    assert origin_of("https://HOST/x") == "https://host"

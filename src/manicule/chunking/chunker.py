@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import cast
+from typing import Final, cast
 
 from manicule.chunking import breadcrumb
 from manicule.chunking.sentences import paragraphs, sentences
@@ -358,7 +358,7 @@ class StructuralChunker:
                     heading_path=block.heading_path,
                     tokens=tokens,
                     lang=block.lang,
-                    metadata=dict(block.metadata),
+                    metadata=_unit_metadata(block),
                     starts_section=True,
                 )
             ]
@@ -371,7 +371,7 @@ class StructuralChunker:
                     heading_path=block.heading_path,
                     tokens=tokens,
                     lang=block.lang,
-                    metadata=dict(block.metadata),
+                    metadata=_unit_metadata(block),
                 )
             ]
         if block.kind is BlockKind.TABLE:
@@ -1195,13 +1195,37 @@ def _collapse_areas(areas: Sequence[str]) -> list[str]:
 
 
 def _adjacent(left: str, right: str) -> bool:
-    """Whether ``right`` is the row immediately after ``left`` over the same columns."""
-    left_end, right_start = left.rsplit(":", maxsplit=1)[-1], right.split(":", maxsplit=1)[0]
-    left_columns, left_row = _split_reference(left_end)
-    right_columns, right_row = _split_reference(right_start)
-    if left_columns != right_columns or left_row is None or right_row is None:
+    """Whether ``right`` is the row immediately after ``left`` over the same columns.
+
+    **Each area's whole column extent, not one edge of each.** This compared ``left``'s *end*
+    cell against ``right``'s *start* cell — for ``A1:C1`` and ``A2:C2`` that is ``C1`` against
+    ``A2``, whose columns are ``C`` and ``A``, so it answered False. The comparison could only
+    ever be True for a single-column area, which is to say row ranges never collapsed for any
+    table wider than one column: every row was recorded as its own area, and the metadata this
+    exists to compact grew linearly with the table.
+    """
+    left_bounds, right_bounds = _area_columns_and_rows(left), _area_columns_and_rows(right)
+    if left_bounds is None or right_bounds is None:
         return False
-    return right_row == left_row + 1
+    left_columns, _, left_last = left_bounds
+    right_columns, right_first, _ = right_bounds
+    if left_columns != right_columns:
+        return False
+    return right_first == left_last + 1
+
+
+def _area_columns_and_rows(area: str) -> tuple[tuple[str, str], int, int] | None:
+    """``((first column, last column), first row, last row)`` for an area, or ``None``.
+
+    ``None`` for anything this cannot read as a cell reference, which is the same answer
+    :func:`_adjacent` gave for an unparseable edge before.
+    """
+    start, _, end = area.partition(":")
+    first_columns, first_row = _split_reference(start)
+    last_columns, last_row = _split_reference(end or start)
+    if first_row is None or last_row is None:
+        return None
+    return (first_columns, last_columns), first_row, last_row
 
 
 def _split_reference(reference: str) -> tuple[str, int | None]:
@@ -1228,6 +1252,25 @@ def _promote_headings_when_that_is_all_there_is(blocks: list[ParsedBlock]) -> li
         )
         for block in blocks
     ]
+
+
+_BULK_BLOCK_KEYS: Final[frozenset[str]] = frozenset({"rows", "row_refs", "merged_ranges"})
+"""Parser detail about a whole table, which a chunk must not inherit verbatim.
+
+``rows`` is the table's rendered lines and ``row_refs`` their A1 ranges — for a spreadsheet
+region that is the entire sheet, index for index. A table small enough not to be split copied
+its block metadata straight onto the unit, and :func:`_group_metadata` then carried ``rows``
+onto the chunk, so the chunk's metadata held the table a second time beside its own text.
+
+It also made ``rows`` mean two different things depending on a size threshold: on a split part
+it is the ``[first, last]`` pair :meth:`_split_table` writes, and on an unsplit one it was the
+list of row strings. One key, two types, decided by whether the table happened to fit.
+"""
+
+
+def _unit_metadata(block: ParsedBlock) -> Metadata:
+    """A block's metadata as a unit carries it, without the parser's bulk table detail."""
+    return {key: value for key, value in block.metadata.items() if key not in _BULK_BLOCK_KEYS}
 
 
 def _dominant_kind(units: Sequence[_Unit]) -> BlockKind:
