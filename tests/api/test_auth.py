@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from mcp.types import TextContent
 
 from manicule.api.app import build_app
 from manicule.api.security import WEBSOCKET_SUBPROTOCOL_PREFIX
@@ -299,7 +300,9 @@ async def test_the_mcp_mount_admits_a_caller_the_routes_would_admit(
         result = await client.call_tool("search", {"query": "retry policy"})
 
     assert tools, "an authenticated caller must still see the tool surface"
-    assert json.loads(result.content[0].text)["ok"] is True
+    body = result.content[0]
+    assert isinstance(body, TextContent)
+    assert json.loads(body.text)["ok"] is True
 
 
 async def test_the_mcp_mount_is_open_when_nothing_is_configured() -> None:

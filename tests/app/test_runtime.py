@@ -1673,10 +1673,14 @@ async def test_a_forced_run_that_stops_at_the_limit_says_so() -> None:
 
     ingestion = _Ingestion(cast("Runtime", object()))
 
-    bounded = await ingestion._forced(cast("Any", _Connector()), cast("Any", _Pipeline()), limit=3)
+    bounded = await ingestion._forced(  # pyright: ignore[reportPrivateUsage]
+        cast("Any", _Connector()), cast("Any", _Pipeline()), limit=3
+    )
     assert bounded.limited is True
     assert bounded.enumeration_completed is False
 
-    whole = await ingestion._forced(cast("Any", _Connector()), cast("Any", _Pipeline()), limit=None)
+    whole = await ingestion._forced(  # pyright: ignore[reportPrivateUsage]
+        cast("Any", _Connector()), cast("Any", _Pipeline()), limit=None
+    )
     assert whole.limited is False
     assert whole.enumeration_completed is True, "an unlimited run still reaches the end"

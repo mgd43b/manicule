@@ -24,7 +24,11 @@ from manicule.connectors import CursorExpiredError
 from manicule.core.content import Chunk, Document, DocumentStatus, RawDocument
 from manicule.core.ids import content_hash
 from manicule.ingest.middleware import MiddlewareRunner
-from manicule.ingest.pipeline import IngestPipeline, RunReport, _Sync
+from manicule.ingest.pipeline import (
+    IngestPipeline,
+    RunReport,
+    _Sync,  # pyright: ignore[reportPrivateUsage] - the run state the unit under test takes
+)
 from manicule.ingest.stages import Conveyor
 from manicule.ingest.workers import InProcessRunner
 from tests.fakes import MEDIA_TYPE, HashEmbedder
@@ -1305,7 +1309,7 @@ async def test_a_stage_that_fails_while_draining_does_not_replace_the_cancellati
     stages = asyncio.create_task(failing())
 
     # Returns rather than raises. Before the fix this propagated the ExceptionGroup.
-    await pipeline._stop_within_grace(run, stages)
+    await pipeline._stop_within_grace(run, stages)  # pyright: ignore[reportPrivateUsage]
 
     assert run.report.error_type == "RuntimeError", "the failure is recorded, not dropped"
     assert "document store went away" in run.report.error_message
