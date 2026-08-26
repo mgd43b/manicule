@@ -269,3 +269,50 @@ async def test_the_rebuild_triggers_are_the_ones_the_head_revision_installs(
     assert "workspace_id" not in " ".join(CREATE_TRIGGERS[1].split()), (
         "CREATE_TRIGGERS is pinned to the revision that imports it and must not be updated"
     )
+
+
+async def test_writing_a_document_s_chunks_is_one_statement(store: SqliteDocStore) -> None:
+    """Fifty chunks are one INSERT, and the triggers still fire for each of them.
+
+    `session.add` in a loop cannot batch this. `Chunk.seq` is a server-generated
+    `INTEGER PRIMARY KEY`, so the unit of work needs the generated keys back in parameter order
+    and asks for `RETURNING`; the SQLite dialect declares no insertmanyvalues sentinel, so it
+    falls back to one statement per row. A fifty-chunk document was fifty round trips inside the
+    publication transaction, on every document of every ingest — 50 statements became 1, and the
+    whole call went from 52 statements to 4.
+
+    **The trigger behaviour is the half worth testing**, because it is what a bulk insert could
+    plausibly break: `chunks_fts` is external-content over this table and is maintained entirely
+    by `chunks_ai`. SQLite fires an `AFTER INSERT` trigger once per row rather than once per
+    statement, so the index is complete either way — asserted here rather than assumed, through
+    a search and the index's own integrity check.
+    """
+    from sqlalchemy import event  # noqa: PLC0415 - only this test counts statements
+
+    document = make_document(source_id="bulk")
+    await store.upsert_document(document)
+    chunks = [
+        make_chunk(document, index, f"authentication token rotation {index}") for index in range(50)
+    ]
+
+    inserts = 0
+
+    def spy(_conn: object, _cursor: object, statement: str, *_rest: object) -> None:
+        nonlocal inserts
+        if "INTO chunks" in statement and "chunks_fts" not in statement:
+            inserts += 1
+
+    engine = store._engine  # pyright: ignore[reportPrivateUsage]
+    event.listen(engine.sync_engine, "before_cursor_execute", spy)
+    try:
+        await store.replace_chunks(document.id, chunks)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", spy)
+
+    assert inserts == 1, f"{len(chunks)} chunks were written in {inserts} statements"
+    assert len(await store.document_chunks(document.id)) == len(chunks)
+    assert len(await store.search_lexical("authentication", k=100)) == len(chunks), (
+        "the FTS triggers fire per row, so a multi-row insert must still index every chunk"
+    )
+    async with engine.connect() as connection:
+        await connection.execute(text(INTEGRITY_CHECK_FTS))

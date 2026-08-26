@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import and_, bindparam, delete, func, select, update
+from sqlalchemy import and_, bindparam, delete, func, insert, select, update
 from sqlalchemy import text as sql
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -37,7 +37,7 @@ from manicule.storage.history import TrashMixin, VersionsMixin
 from manicule.storage.organization import CollectionsMixin, TagsMixin
 from manicule.storage.reconciliation import ReconciliationJournalMixin
 from manicule.storage.relations import RelationsMixin
-from manicule.storage.rows import apply_document, from_chunk, to_chunk, to_document
+from manicule.storage.rows import apply_document, chunk_values, to_chunk, to_document
 from manicule.storage.scoped import (
     DEFAULT_WORKSPACE,
     CrossWorkspaceCollisionError,
@@ -514,8 +514,21 @@ class SqliteDocStore(
             await self._replace_source_dependencies(session, document, source_dependencies)
         await session.execute(delete(models.Chunk).where(models.Chunk.document_id == document.id))
         await session.flush()
-        for chunk in chunks:
-            session.add(from_chunk(chunk, document.id, document.publication_id))
+        if chunks:
+            # **One statement, not one per chunk.** `session.add` in a loop cannot batch here:
+            # `Chunk.seq` is a server-generated INTEGER PRIMARY KEY, so the unit of work needs
+            # the generated keys back in parameter order and asks for RETURNING, and the SQLite
+            # dialect declares no insertmanyvalues sentinel — so it emits one INSERT per row.
+            # Measured at fifty chunks: fifty statements, each with RETURNING, against one for
+            # the Core insert. A document of fifty chunks was fifty round trips inside the
+            # publication transaction, on every document of every ingest.
+            #
+            # Nothing here reads `seq` afterwards. The FTS index is external-content over this
+            # table and is maintained by the triggers, which fire per row either way.
+            await session.execute(
+                insert(models.Chunk),
+                [chunk_values(chunk, document.id, document.publication_id) for chunk in chunks],
+            )
         await session.flush()
         if chunks:
             for start in range(0, len(chunks), _VECTOR_TOMBSTONE_BATCH):
@@ -1219,13 +1232,14 @@ class SqliteDocStore(
             await session.execute(
                 delete(models.Chunk).where(models.Chunk.document_id == document_id)
             )
-            for chunk in chunks:
-                session.add(
-                    from_chunk(
-                        chunk,
-                        document_id,
-                        document.publication_id if document is not None else "legacy",
-                    )
+            if chunks:
+                # One statement rather than one per chunk, for the reason `_publish` gives:
+                # `Chunk.seq` is server-generated, so the ORM asks for RETURNING in parameter
+                # order and SQLite has no insertmanyvalues sentinel to satisfy it with.
+                publication = document.publication_id if document is not None else "legacy"
+                await session.execute(
+                    insert(models.Chunk),
+                    [chunk_values(chunk, document_id, publication) for chunk in chunks],
                 )
 
     async def get_chunks(self, chunk_ids: Sequence[str]) -> Sequence[Chunk]:
