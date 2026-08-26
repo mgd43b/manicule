@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from itertools import pairwise
-from typing import cast
+from typing import cast, override
 
 import pytest
 
@@ -1058,13 +1058,23 @@ def test_memoizing_the_token_counter_changes_no_chunk() -> None:
             for index in range(rng.randrange(3, 30))
         ]
 
+    class Unmemoized(TokenCounter):
+        """The counter with its memo defeated, for the comparison to mean anything.
+
+        Overriding `_remember` rather than poking `_memo_chars`: the budget check resets the
+        counter after it clears, so a doctored value disables one store and nothing more. The
+        first version of this test did exactly that and compared the memo against itself —
+        both arms measured 180 calls where the real difference is 658 against 180.
+        """
+
+        @override
+        def _remember(self, text: str, raw: int) -> None:
+            return
+
     def chunked(seed: int, *, memo: bool) -> list[tuple[str, str, int, int]]:
-        counter = TokenCounter(
+        counter = (TokenCounter if memo else Unmemoized)(
             "whitespace", lambda text: max(1, len(text.split())), provisional=False
         )
-        if not memo:
-            # Overflow the budget on every store, so no call is ever a hit.
-            counter._memo_chars = -(10**18)  # pyright: ignore[reportPrivateUsage]
         chunker = StructuralChunker(counter, max_tokens=128, overlap_tokens=16, breadcrumb_tokens=8)
         return [
             (chunk.id, chunk.text, chunk.position, chunk.token_count)
