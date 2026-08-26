@@ -55,6 +55,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from manicule.api.envelopes import AUTH_ERRORS, malformed, refusal
 from manicule.api.origins import FETCH_SITE, ORIGIN, REFUSAL, permitted
@@ -71,11 +72,11 @@ from manicule.api.routes import (
     workbench,
 )
 from manicule.api.routes import health as health_routes
-from manicule.api.security import resolve
+from manicule.api.security import require, resolve
 from manicule.api.widget import router as widget_router
 from manicule.app import frontdoor
 from manicule.app.bind import is_loopback
-from manicule.config.settings import AuthMode
+from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import PolicyError
 from manicule.core.version import CORE_VERSION
 from manicule.mcp.serve import surface as mcp_surface
@@ -405,8 +406,59 @@ def build_app(
     # catch-all. A mount matches every path beneath its prefix, and the prefix is its own —
     # `/mcp` names no route group above and never will, because a group that collided with it
     # would be unreachable rather than merely confusing.
-    app.mount(MCP_PATH, mcp)
+    app.mount(MCP_PATH, _admits_only_a_caller_the_routes_would_admit(mcp, service))
     return app
+
+
+def _admits_only_a_caller_the_routes_would_admit(
+    mounted: ASGIApp, service: ApplicationService
+) -> ASGIApp:
+    """Apply this application's authentication decision to the sub-application it mounts.
+
+    **A mount is not a route, and the refusal lived in a route dependency.** ``identify``
+    resolves a principal for every request including this one — :func:`resolve` documents
+    itself as never raising for a bad credential, because the anonymous routes are reached
+    through the same resolution — and :func:`require` is what refuses. ``require`` was reached
+    only through ``_dependency``, which is a FastAPI ``Depends``. A Starlette ``Mount`` is an
+    opaque ASGI application, so no dependency of this application runs beneath it and nothing
+    in :mod:`manicule.mcp` performs an authorization check of its own.
+
+    The result was two surfaces on one port disagreeing about who is admitted. With
+    ``security.auth.mode = api_key``, ``GET /api/v1/documents`` answered 401 while an anonymous
+    ``tools/call`` on the mount answered ``{"ok": true}`` — the same corpus, the same process,
+    no credential. That configuration is not a corner: ``_require_auth_for_wide_bind`` below
+    *forces* a mode other than ``none`` for a non-loopback bind, so the exposed case is exactly
+    the case an operator is made to configure before publishing the port.
+
+    ``Role.VIEWER`` is the floor because that is what the read routes ask for, and this mount
+    carries the read surface: ``mcp_surface(..., transport="http")`` registers the reading and
+    dry-running tools only, so the writes are absent rather than merely unreachable. The floor
+    is the same question the routes answer — *is this caller admitted at all* — asked in the
+    one place a mount can be asked it.
+    """
+
+    async def guard(scope: Scope, receive: Receive, send: Send) -> None:
+        # Only HTTP is decided here. A lifespan scope never reaches a mount — Starlette does not
+        # run one for a sub-application, and the MCP session manager is started through
+        # `lifespan=mcp.lifespan` on the constructor above — but passing anything else straight
+        # through keeps this a guard rather than a second place that decides what a scope means.
+        if scope["type"] != "http":
+            await mounted(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        principal = getattr(request.state, "principal", None)
+        if principal is None:  # pragma: no cover - `identify` runs ahead of every mount
+            principal = await resolve(service, ProxyPolicy.of(service.settings), request)
+        try:
+            require(principal, Role.VIEWER)
+        except AUTH_ERRORS as exc:
+            # The ordinary envelope, with the status the table already assigns. A JSONResponse
+            # is itself an ASGI application, so the refusal needs no separate rendering path.
+            await refusal("mcp", service.workspace, exc)(scope, receive, send)
+            return
+        await mounted(scope, receive, send)
+
+    return guard
 
 
 def _refuse_cross_site(service: ApplicationService, request: Request) -> JSONResponse | None:

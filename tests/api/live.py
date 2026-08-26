@@ -38,7 +38,9 @@ if TYPE_CHECKING:
 
 
 @contextlib.asynccontextmanager
-async def mounted(backend: FakeBackend, *, web: bool = True) -> AsyncGenerator[Client[Any]]:
+async def mounted(
+    backend: FakeBackend, *, web: bool = True, credential: dict[str, str] | None = None
+) -> AsyncGenerator[Client[Any]]:
     """An MCP client speaking to the mount, through the application and not through a socket.
 
     For the assertions that are about *what the surface offers* rather than about connections:
@@ -50,6 +52,11 @@ async def mounted(backend: FakeBackend, *, web: bool = True) -> AsyncGenerator[C
     the same line uvicorn runs, reached the same way. Without it every request is answered with
     "session manager not initialized", which would make an absence assertion pass for the wrong
     reason.
+
+    ``credential`` is headers to send on every request, and it exists so that the mount can be
+    driven *as a caller* rather than only inspected. Without it the only reachable case was the
+    anonymous one, which is how an unauthenticated mount went unnoticed: every assertion here
+    passed against a surface that admitted everybody.
     """
     import httpx  # noqa: PLC0415 - what fastmcp's client is written against
 
@@ -66,7 +73,11 @@ async def mounted(backend: FakeBackend, *, web: bool = True) -> AsyncGenerator[C
         because supplying one is the entire point.
         """
         arguments.pop("transport", None)
-        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **arguments)
+        headers = dict(arguments.pop("headers", None) or {})
+        headers.update(credential or {})
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), headers=headers, **arguments
+        )
 
     async with app.router.lifespan_context(app):
         transport = StreamableHttpTransport(

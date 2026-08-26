@@ -17,6 +17,8 @@ those refusals are asserted here as well, because they are what this decision re
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from manicule.api.app import build_app
@@ -24,6 +26,7 @@ from manicule.api.security import WEBSOCKET_SUBPROTOCOL_PREFIX
 from manicule.app.bind import Bind
 from manicule.app.service import ApplicationService
 from manicule.core.errors import PolicyError
+from tests.api.live import mounted
 from tests.api.support import backend_with_a_document, client_for, envelope
 from tests.app.fakes import FakeBackend
 
@@ -250,3 +253,62 @@ def test_the_websocket_accepts_a_key_in_the_authorization_header(
     ):
         socket.send_text('{"question": "does the client retry"}')
         assert socket.receive_json()["event"]
+
+
+# --- the mounted MCP surface ------------------------------------------------------------------
+
+
+async def test_the_mcp_mount_refuses_a_caller_the_routes_would_refuse(
+    keyed: tuple[FakeBackend, dict[str, str]],
+) -> None:
+    """Two surfaces on one port cannot disagree about who is admitted.
+
+    **A mount is not a route, and that is the whole of how this was missed.** ``identify``
+    resolves a principal for every request, but :func:`~manicule.api.security.resolve` never
+    raises for a bad credential — the anonymous routes are reached through the same resolution
+    — and ``require`` was reached only through a FastAPI ``Depends``. A Starlette ``Mount`` is
+    an opaque ASGI application, so no dependency of this application ran beneath it, and
+    nothing in :mod:`manicule.mcp` checked for itself.
+
+    So with ``auth.mode = api_key``, ``GET /api/v1/documents`` answered 401 while an anonymous
+    ``tools/call`` on the same process answered ``{"ok": true}`` over the same corpus. Reads
+    only — the mount carries the reading and dry-running tools — but that is the whole corpus
+    and the whole configuration, including ``data_dir``, to anyone who can route a packet.
+
+    The configuration is not a corner: ``_require_auth_for_wide_bind`` *forces* a mode other
+    than ``none`` for a non-loopback bind, so the exposed case is exactly the one an operator
+    is made to configure before publishing the port.
+    """
+    backend, _ = keyed
+    with pytest.raises(BaseException, match=r"401|Unauthorized|TaskGroup"):
+        async with mounted(backend) as client:
+            await client.list_tools()
+
+
+async def test_the_mcp_mount_admits_a_caller_the_routes_would_admit(
+    keyed: tuple[FakeBackend, dict[str, str]],
+) -> None:
+    """The positive control. Without it, "refuses everything" would pass the test above.
+
+    A viewer key is the floor the read routes ask for, and the mount carries the read surface,
+    so the same key that reads a document over HTTP must drive a tool call here.
+    """
+    backend, secrets = keyed
+    async with mounted(backend, credential={"X-API-Key": secrets["viewer"]}) as client:
+        tools = await client.list_tools()
+        result = await client.call_tool("search", {"query": "retry policy"})
+
+    assert tools, "an authenticated caller must still see the tool surface"
+    assert json.loads(result.content[0].text)["ok"] is True
+
+
+async def test_the_mcp_mount_is_open_when_nothing_is_configured() -> None:
+    """The shipped posture is loopback with no credential, and it must stay reachable.
+
+    The guard asks :func:`~manicule.api.security.require`, which admits anybody when the mode is
+    ``none`` — so this is the assertion that the fix did not quietly make the default install
+    require a key nobody has issued.
+    """
+    backend, _ = backend_with_a_document()
+    async with mounted(backend) as client:
+        assert await client.list_tools()
