@@ -40,7 +40,9 @@ import shutil
 import stat
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Final
 
 import pytest
 from _pytest.outcomes import Failed, OutcomeException, Skipped
@@ -54,11 +56,24 @@ from manicule.retrieval.tokens import DEFAULT_ENCODING, ContextTokenCounter
 from manicule.vocabularies import bundle as bundles
 from tests.vocabulary_support import (
     BUNDLE_ENCODINGS,
+    BUNDLE_REQUIRED,
+    REQUIRE_BUNDLE_ENV,
     build_bundle,
     require_source_vocabularies,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+REAL_ENVIRONMENT: Final[Mapping[str, str]] = dict(os.environ)
+"""This machine's environment, captured at import — before any fixture has redirected it.
+
+For the one subprocess here that is *not* a manicule process: the installer. ``uv`` keeps its
+package cache under ``XDG_CACHE_HOME``, and the environment fixture moves that variable into a
+temporary directory for every test — correctly, for everything manicule writes, and fatally for
+a tool that would then find an empty cache and, being told ``--offline``, fail rather than reach
+an index. A cache is a machine resource, so the installer is given the real environment. The
+same reasoning and the same constant as ``tests/parsers/test_grammar_bundle.py``.
+"""
 
 TEXT = "authentication tokens rotate on a schedule"
 """Something to count, so that a test asserts an encoding *works* and not merely that it was
@@ -447,28 +462,72 @@ def test_the_same_install_without_the_bundle_refuses_loudly(tmp_path: Path) -> N
 def test_a_bundle_installed_as_a_distribution_needs_no_configuration(tmp_path: Path) -> None:
     """The bundle arrives through the install channel rather than as a directory to copy.
 
-    The builder's ``--package`` mode writes an importable distribution around the bundle, and
-    the child here is given nothing but that distribution on its path — no environment
-    variable, no configured directory. An air-gapped host that can install manicule at all can
-    therefore install its vocabularies, which is the only shape that does not depend on
-    somebody remembering to copy a directory to the right place.
+    **The output is installed rather than put on ``PYTHONPATH``**, and that is the whole design
+    of this test now. It used to point the child at ``package / "src"``, which imports the
+    directory the builder wrote — and passes just as well when that directory is not a Python
+    project at all. It was: ``--package`` wrote ``__init__.py`` and ``py.typed`` and no
+    ``pyproject.toml``, so ``uv pip install`` on it answered *does not appear to be a Python
+    project*, while docs/deployment.md §5.1 told an operator it "installs like any other
+    dependency". The same gap in ``tools/build_grammar_bundle.py`` was found by a deployment
+    for exactly this reason, and fixed there; here the source-path import kept hiding it.
+
+    The ``.gitignore`` written below is the second trap, and it is not hypothetical. Hatchling
+    honors one beside the project it builds, and a bundle is normally built into an output
+    directory a checkout ignores. Without a correct ``artifacts`` in the generated metadata the
+    wheel still builds and still installs — holding a manifest describing files that are not in
+    it. The install alone does not show that; seeding and searching out of what was installed
+    does. The pattern has to match what the payload actually *is*: a vocabulary file is named by
+    ``cache_key(url)``, a bare SHA-1 with no extension, so a plausible-looking ``*.tiktoken``
+    matches nothing and ships an empty bundle.
+
+    The child is given nothing but that distribution on its path — no environment variable, no
+    configured directory — so an air-gapped host that can install manicule at all can install
+    its vocabularies.
     """
     from tools.build_vocabulary_bundle import main  # noqa: PLC0415 - a build script
 
     require_source_vocabularies()
     package = tmp_path / "dist"
     assert main(["--output", str(package), "--package", "--encodings", *BUNDLE_ENCODINGS]) == 0
+    (package / ".gitignore").write_text("bundle/\nvocab/\n*.tiktoken\n", encoding="utf-8")
 
+    installed = _install(package, tmp_path / "installed")
     result = _air_gapped_child(
         tmp_path / "elsewhere",
         _SEED_AND_SEARCH,
-        extra={"PYTHONPATH": os.pathsep.join([str(package / "src"), str(REPO_ROOT)])},
+        extra={"PYTHONPATH": os.pathsep.join([str(installed), str(REPO_ROOT)])},
     )
 
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
     assert report["seeded"] == list(BUNDLE_ENCODINGS)
     assert report["passages"] > 0
+
+
+def test_the_packaging_metadata_describes_the_bundle_it_was_written_beside(
+    tmp_path: Path,
+) -> None:
+    """A bundle is valid for the encodings it carries, so its version says which.
+
+    ``0.0.0`` would install just as well and would leave the fact that decides whether the thing
+    is usable — does it answer the lookups this manicule will make — inside a JSON file nobody
+    reads. ``pip show`` is where somebody looks when an air-gapped host refuses to search.
+    """
+    from tools.build_vocabulary_bundle import main  # noqa: PLC0415 - a build script
+
+    require_source_vocabularies()
+    package = tmp_path / "dist"
+    assert main(["--output", str(package), "--package", "--encodings", *BUNDLE_ENCODINGS]) == 0
+    metadata = (package / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert f'name = "{bundles.BUNDLE_MODULE.replace("_", "-")}"' in metadata
+    assert f'version = "{vocabularies.tiktoken_version()}+' in metadata
+    # The encoding set, in the local segment, with PEP 440's separator folding already applied
+    # here rather than left to the installer — every encoding name has an underscore in it, so
+    # a version written raw would name one string and install as another.
+    for encoding in BUNDLE_ENCODINGS:
+        assert encoding.replace("_", ".") in metadata
+    assert f'packages = ["src/{bundles.BUNDLE_MODULE}"]' in metadata
 
 
 # --- what the bundle records ---------------------------------------------------------------
@@ -1105,6 +1164,51 @@ def _a_fetch_that_writes_nothing(encoding: str) -> str:
     unwritable cache looks like from the outside.
     """
     return encoding
+
+
+def _install(package: Path, target: Path) -> Path:
+    """Install ``package`` into ``target`` with uv, and return the directory to import from.
+
+    ``--offline`` deliberately. The build backend resolves from uv's cache, which every
+    environment that ran ``uv sync`` in this repository has — the workspace itself builds with
+    hatchling — so this proves the distribution installs without an index being reachable. A
+    packaging test that went red when PyPI did would be a packaging test nobody trusts.
+
+    ``--target`` rather than a fresh virtual environment, because the child still needs
+    ``manicule``, and that is in the interpreter running this suite. What is under test is the
+    distribution, and a built-then-unpacked wheel on the path is exactly that.
+    """
+    uv = shutil.which("uv")
+    if uv is None:
+        detail = "uv is not on PATH, so the packaged bundle cannot be installed to prove it is"
+        if BUNDLE_REQUIRED:
+            pytest.fail(f"{detail}, and {REQUIRE_BUNDLE_ENV} is set")
+        pytest.skip(detail)
+    completed = subprocess.run(  # noqa: S603 - a resolved absolute path and fixed arguments
+        [
+            uv,
+            "pip",
+            "install",
+            "--offline",
+            "--no-deps",
+            "--python",
+            sys.executable,
+            "--target",
+            str(target),
+            str(package),
+        ],
+        env=dict(REAL_ENVIRONMENT),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert completed.returncode == 0, (
+        f"the packaged bundle did not install: {completed.stderr}\n"
+        f"A build-backend resolution failure here means uv's cache has no hatchling; run "
+        f"`uv sync --all-groups` first."
+    )
+    return target
 
 
 def _air_gapped_child(

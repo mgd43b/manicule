@@ -129,16 +129,26 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # fetches, on a machine where nobody yet trusts the software. A build is where a long step
 # belongs, and the result is an image that needs no network at all.
 #
-# The file patterns are the union of what `manicule.embedding.artifacts` asks for from the
-# ONNX export and what `manicule.embedding.cards` reads to learn the model's pooling — the
-# latter imported rather than copied, because a card file added upstream must not become a
-# container that fetches at run time.
+# **Fetched through `tools/prefetch_embedding_models.py`, and the reason is the revision.**
+# This step used to call `snapshot_download('BAAI/bge-m3', ...)` inline with no `revision=`,
+# which resolves `main` and stores the result under `snapshots/<whatever-HEAD-is-today>`.
+# Everything that *reads* the cache asks for an exact commit instead: `embedding/plugin.py`
+# resolves `builtin_model_revision(...)`, which is `5617a9f6…`, and a 40-hex revision goes
+# straight to `snapshots/<that sha>` without consulting `refs/main`. The two agreed only for
+# as long as `5617a9f6…` stayed HEAD. Any push to the upstream repository — a README edit is
+# enough — would have baked the weights under a new sha, and the offline smoke test below,
+# which runs with `HF_HUB_OFFLINE=1` and `--network=none`, would fail to find the pinned one.
+# The `container` job runs on every pull request, so that is every merge blocked by an event
+# in somebody else's repository.
+#
+# `--backend onnx` fetches exactly what this image loads: the card files at
+# `builtin_model_revision`, and `onnx/*` at `builtin_revision(model, "onnx")`. Both are the
+# same commit for bge-m3, so the cache layout is what it always was — pinned rather than
+# whatever the day's HEAD happened to be. Calling the tool rather than restating its patterns
+# also keeps this from being a second copy of the file list that could drift from the first.
 ENV HF_HOME=/opt/manicule/models
 RUN --mount=type=cache,target=/tmp/hf \
-    HF_HOME=/tmp/hf python -c "\
-from huggingface_hub import snapshot_download; \
-from manicule.embedding.cards import CARD_FILES; \
-print(snapshot_download('BAAI/bge-m3', allow_patterns=['onnx/*', '*.json', *CARD_FILES]))" \
+    HF_HOME=/tmp/hf python tools/prefetch_embedding_models.py --backend onnx \
     && mkdir -p "${HF_HOME}" && cp -a /tmp/hf/. "${HF_HOME}/"
 
 # --- tiktoken vocabularies ---
