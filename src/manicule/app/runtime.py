@@ -1085,6 +1085,13 @@ class _Ingestion:
         from manicule.ingest.pipeline import RunReport  # noqa: PLC0415
 
         report = RunReport(connector=connector.name)
+        # **False up front, true only in the `else`, exactly as `_discover_into` does it.**
+        # `enumeration_completed` defaults to True and `limited` to False, so a forced run that
+        # stopped at `--limit` reported an enumeration that had finished and a run that was not
+        # limited — which is to say, a partial index reported as complete. Only the capacity arm
+        # below ever said otherwise. The non-forced path states all three endings explicitly;
+        # this one stated none of them.
+        report.enumeration_completed = False
         stream = connector.discover(None)
         try:
             async for discovered in stream:
@@ -1104,10 +1111,12 @@ class _Ingestion:
                         f"{report.discovered} discovered documents indexed"
                     )
                 if limit is not None and report.discovered >= limit:
+                    report.limited = True
                     break
+            else:
+                report.enumeration_completed = True
         except Exception as exc:  # noqa: BLE001 - an enumeration failure is not a crash
             if isinstance(exc, CapacityRefusedError):
-                report.enumeration_completed = False
                 report.refuse_capacity(exc)
             else:
                 report.error_type = type(exc).__name__
