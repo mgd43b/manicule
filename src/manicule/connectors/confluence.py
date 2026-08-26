@@ -32,7 +32,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import Any, Final, cast
 from urllib.parse import quote
 
 from pydantic import JsonValue
@@ -283,6 +283,16 @@ class _DirectProgress:
     completed: bool = False
 
 
+MAX_MEMOIZED_INCLUDES: Final = 4096
+"""How many resolved include targets one run keeps before starting over.
+
+A bound rather than a policy. Include targets are shared by construction — a notice, a
+definition, a status table — so a real space has tens of them, not thousands; the cap exists so
+a pathological corpus cannot turn a memo into unbounded memory, not because anybody expects to
+reach it.
+"""
+
+
 class ConfluenceConnector:
     """Discovers, fetches and reconciles Confluence pages and their attachments."""
 
@@ -315,6 +325,28 @@ class ConfluenceConnector:
         self._observed: dict[str, str] = {}
         self._carried: dict[str, str] = {}
         self._enumerated = False
+        self._included_pages: dict[tuple[str, str, str, str], IncludedPage | None] = {}
+        """Resolved include targets for the current run, keyed by identity *and* body format.
+
+        The memo used to be a local in :meth:`_lookup_for`, which is called once per page, so it
+        de-duplicated only *within* one document. An included page is by nature shared — a
+        standard notice, a definition, a status table — so a space where a share of the pages
+        carry one include paid a CQL title search and a body GET for the same target on every
+        one of them. Measured against the synthetic instance in ``tests/connectors``: 100 pages
+        each including one shared page cost 300 fetch requests rather than 100, with 100
+        identical title searches for one page. And because the two calls are awaited serially
+        inside ``fetch``, each page held one of the pipeline's fetch slots for three dependent
+        round trips instead of one.
+
+        ``body_format`` is in the key because :meth:`_page_body` can fall back from ADF to
+        storage per page, so one run legitimately mixes the two and :meth:`_included` builds a
+        different value for each.
+
+        ``None`` is cached like any other answer: it means the target could not be resolved, and
+        forgetting it would restore the round trip for every unresolved macro.
+        """
+        self._page_ids: dict[tuple[str, str], str] = {}
+        """``(title, space)`` to page id, so one title is searched for once per run."""
         self._direct_progress: _DirectProgress | None = None
 
     @property
@@ -521,6 +553,11 @@ class ConfluenceConnector:
         self._carried = dict(carried)
         self._enumerated = False
         self._direct_progress = self._fresh_direct_progress()
+        # Reset with the rest of the run's state. The connector is built through the container
+        # and can outlive one run in a served process, so a memo kept across runs would splice
+        # yesterday's revision of an included page into today's body.
+        self._included_pages = {}
+        self._page_ids = {}
 
         spaces = await self._spaces()
         scope = await self._scope(spaces)
@@ -1511,16 +1548,28 @@ class ConfluenceConnector:
         rather than read off the body: the Atlassian Document Format endpoint reports a numeric
         space id and not the key CQL compares against.
         """
-        cache: dict[tuple[str, str, str], IncludedPage | None] = {}
 
         async def lookup(target: MacroTarget) -> IncludedPage | None:
             space = target.space or space_key
-            key = (target.content_id, target.title, space)
-            if key not in cache:
-                cache[key] = await self._included(target, space, body.body_format)
-            return cache[key]
+            key = (target.content_id, target.title, space, body.body_format)
+            if key not in self._included_pages:
+                self._bound(self._included_pages)
+                self._included_pages[key] = await self._included(target, space, body.body_format)
+            return self._included_pages[key]
 
         return lookup
+
+    @staticmethod
+    def _bound(cache: dict[Any, Any]) -> None:
+        """Keep a run-scoped memo from growing without limit.
+
+        Cleared wholesale rather than evicted one entry at a time. An include target is shared
+        by construction, so a corpus with more distinct targets than this is one where the memo
+        was buying little anyway — and a correct LRU here would be machinery in service of a
+        case that does not arise.
+        """
+        if len(cache) >= MAX_MEMOIZED_INCLUDES:
+            cache.clear()
 
     async def _included(
         self, target: MacroTarget, space: str, body_format: str
@@ -1546,9 +1595,16 @@ class ConfluenceConnector:
         return IncludedPage(page_id=page_id, title=found.title, storage=found.body)
 
     async def _page_id_of(self, title: str, space: str) -> str:
-        """The id of the page an include macro names by title, or ``""`` if there is none."""
+        """The id of the page an include macro names by title, or ``""`` if there is none.
+
+        Memoized for the run: an include that names its target by title costs a CQL search, and
+        the same title is named by every page that carries the same standard include.
+        """
         if not title or not space:
             return ""
+        remembered = self._page_ids.get((title, space))
+        if remembered is not None:
+            return remembered
         try:
             query = cql.title_query(space, title, current_only=self._config.current_only)
         except ValueError:
@@ -1571,7 +1627,13 @@ class ConfluenceConnector:
         params = [("cql", query), ("limit", "1")]
         payload = await self._client.get_json(self._client.url(SEARCH_PATH), params)
         results = _results(payload)
-        return _str(results[0].get("id")) if results else ""
+        found = _str(results[0].get("id")) if results else ""
+        # The empty answer is remembered too: a macro naming a page that is not there is as
+        # repeatable as one naming a page that is, and re-searching for it on every page that
+        # carries it is the same round trip this exists to remove.
+        self._bound(self._page_ids)
+        self._page_ids[(title, space)] = found
+        return found
 
 
 # --- the authoritative record ----------------------------------------------------------------
