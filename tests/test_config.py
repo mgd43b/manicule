@@ -300,6 +300,79 @@ def test_reading_the_configuration_never_hands_out_a_credential(
     assert "**********" in rendered
 
 
+def test_secrecy_is_decided_by_the_declared_type_and_not_by_the_name() -> None:
+    """A name is a bad proxy for a credential, and it was wrong in both directions.
+
+    The old rule matched substrings. Five ordinary settings contain "token" and are floats and
+    ints — `llm.first_token_timeout_s`, `llm.token_safety_factor`, `llm.token_drift_tolerance`,
+    `rag.context.system_prompt_tokens`, `ingest.target_batch_tokens` — so all five were masked
+    in `config show` *and* refused by `config set`, leaving an operator no way to inspect or
+    change them. The hand-maintained exception list (`maxtokens`, `overlaptokens`, `tokenizer`)
+    is the scar from the same problem, extended one name at a time.
+
+    The other direction is the serious one: `security.data_policy.auto_redact.hash_salt` is a
+    real `SecretStr` and matches none of the markers, so the one thing this machinery exists to
+    hide was printed in the clear and written to disk.
+
+    Both are now decided from the annotation. The exhaustive walk is the point — it holds every
+    field in `Settings` to its declared type, so a new `SecretStr` is covered on the day it is
+    added rather than when somebody notices its name does not match.
+    """
+    import typing  # noqa: PLC0415 - only this derivation reads annotations
+
+    from pydantic import BaseModel, SecretStr  # noqa: PLC0415 - only this derivation needs them
+
+    from manicule.config.settings import secret_setting  # noqa: PLC0415
+
+    seen: set[int] = set()
+    disagreements: list[str] = []
+
+    def walk(model: type[BaseModel], path: tuple[str, ...] = ()) -> None:
+        if id(model) in seen:
+            return
+        seen.add(id(model))
+        for name, field in model.model_fields.items():
+            here = (*path, name)
+            annotation = field.annotation
+            declared = annotation is SecretStr or SecretStr in typing.get_args(annotation)
+            if secret_setting(here) is not declared:
+                disagreements.append(f"{'.'.join(here)} declared={declared}")
+            for candidate in (annotation, *typing.get_args(annotation)):
+                if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                    walk(candidate, here)
+
+    walk(Settings)
+    assert not disagreements, (
+        f"these settings are classified against their declared type: {disagreements}. "
+        f"Secrecy is read from the annotation; a name that merely looks like a credential is "
+        f"not one, and a credential whose name does not is still one."
+    )
+
+    # And the two that motivated it, stated by name so the failure reads as the bug.
+    assert secret_setting(("security", "data_policy", "auto_redact", "hash_salt"))
+    assert not secret_setting(("llm", "token_safety_factor"))
+
+
+def test_a_secret_under_an_arbitrary_key_is_still_masked() -> None:
+    """`llm.providers` is a table keyed by a name somebody chose, not by declared fields.
+
+    The walk has to spend that segment on the key rather than looking it up as a field, or the
+    resolution stops at `providers` and every provider's `api_key` is handed out in the clear.
+    """
+    settings = Settings.model_validate(
+        {
+            "providers": {"openai": {"api_key": "sk-live-do-not-print"}},
+            "security": {"data_policy": {"auto_redact": {"hash_salt": "salt-do-not-print"}}},
+        }
+    )
+
+    rendered = repr(settings.redacted())
+
+    assert "sk-live-do-not-print" not in rendered
+    assert "salt-do-not-print" not in rendered
+    assert rendered.count("**********") >= 2
+
+
 def test_saving_the_configuration_never_writes_a_credential(
     manicule_environment: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

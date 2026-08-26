@@ -50,7 +50,7 @@ from manicule.config.settings import (
     Role,
     Settings,
     config_file,
-    looks_secret,
+    secret_setting,
 )
 from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome
 from manicule.container import keys
@@ -3810,7 +3810,10 @@ class ApplicationService:
             msg = "config set needs a dotted key, for example 'rag.profile'"
             raise ConfigError(msg)
         parts = _config_key_parts(key)
-        if looks_secret(parts[-1]):
+        # Resolved against the model rather than guessed from the last segment. The name
+        # rule refused five ordinary numeric settings — `llm.token_safety_factor` and
+        # friends — as credentials, and admitted `hash_salt`, which is a real one.
+        if secret_setting(parts):
             msg = (
                 f"{key!r} is a credential. Set it in the environment instead — the config "
                 f"file is copied into backups and exports, and a secret written here goes "
