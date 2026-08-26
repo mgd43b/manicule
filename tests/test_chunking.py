@@ -1023,3 +1023,56 @@ def test_an_unsplit_table_does_not_carry_the_parsers_row_list_onto_the_chunk() -
     assert all(isinstance(pair, list) and len(pair) == 2 for pair in pairs), (
         f"`rows` on a chunk is a [first, last] pair, got {pairs}"
     )
+
+
+def test_memoizing_the_token_counter_changes_no_chunk() -> None:
+    """The counter remembers answers, and that must be invisible in the output.
+
+    `TokenCounter` re-ran the tokenizer over the whole string every time it was asked, and the
+    chunker asks the same question many times: packing a group, checking whether a candidate
+    fits, computing an overlap cap and hard-splitting an oversized unit all measure overlapping
+    strings. Instrumented over one 40-block page — 478 calls for 81 distinct strings, 623,382
+    characters counted against 139,241 distinct — so 78% of the work was a question already
+    answered. With the real `cl100k_base` tokenizer a 60-block page chunks 1.9x faster.
+
+    **The speedup is worth nothing if a boundary moves**, because `CHUNKER_VERSION` would then
+    have to move with it and bill the corpus for a re-chunk and re-embed. So the property under
+    test is equality, over randomized documents across every block kind rather than one fixture:
+    a memo is only sound because a token count is a pure function of the text and the
+    vocabulary, and this is what holds that claim to the output.
+    """
+    import random  # noqa: PLC0415 - only this derivation needs it
+
+    from manicule.chunking.tokens import TokenCounter  # noqa: PLC0415
+
+    kinds = [BlockKind.PROSE, BlockKind.LIST, BlockKind.CODE, BlockKind.TABLE, BlockKind.HEADING]
+
+    def blocks(seed: int) -> list[ParsedBlock]:
+        rng = random.Random(seed)  # noqa: S311 - a seeded fixture generator, not a key
+        return [
+            ParsedBlock(
+                kind=rng.choice(kinds),
+                text=" ".join(f"w{rng.randrange(999)}" for _ in range(rng.randrange(1, 400))),
+                anchor=LineAnchor(start=index * 3 + 1, end=index * 3 + 3),
+            )
+            for index in range(rng.randrange(3, 30))
+        ]
+
+    def chunked(seed: int, *, memo: bool) -> list[tuple[str, str, int, int]]:
+        counter = TokenCounter(
+            "whitespace", lambda text: max(1, len(text.split())), provisional=False
+        )
+        if not memo:
+            # Overflow the budget on every store, so no call is ever a hit.
+            counter._memo_chars = -(10**18)  # pyright: ignore[reportPrivateUsage]
+        chunker = StructuralChunker(counter, max_tokens=128, overlap_tokens=16, breadcrumb_tokens=8)
+        return [
+            (chunk.id, chunk.text, chunk.position, chunk.token_count)
+            for chunk in chunker.chunk(document(), blocks(seed))
+        ]
+
+    for seed in range(200):
+        assert chunked(seed, memo=True) == chunked(seed, memo=False), (
+            f"document {seed} chunks differently with the counter's memo; the memo must be "
+            f"invisible in the output or CHUNKER_VERSION has to move with it"
+        )

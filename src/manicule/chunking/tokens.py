@@ -87,6 +87,15 @@ class SupportsTokenCount(Protocol):
         ...
 
 
+MEMO_BUDGET_CHARS: Final = 4_000_000
+"""How many characters of measured text one counter remembers before starting over.
+
+Generous against a document and negligible against a process: the working set for a single
+40-block page measured 139 KB, so this holds a large document many times over and still costs
+less than a handful of the vectors the same run produces.
+"""
+
+
 class TokenCounter:
     """A token count, and the identity of whatever produced it.
 
@@ -127,14 +136,46 @@ class TokenCounter:
         self.tokenizer_id = provisional_tokenizer_id(tokenizer_id) if provisional else tokenizer_id
         self.provisional = provisional
         self._count = count
+        self._memo: dict[str, int] = {}
+        self._memo_chars = 0
 
     def __call__(self, text: str) -> int:
         if not text:
             return 0
-        raw = self._count(text)
+        raw = self._memo.get(text)
+        if raw is None:
+            raw = self._count(text)
+            self._remember(text, raw)
         if not self.provisional:
             return raw
         return int(raw * PROVISIONAL_SAFETY_FACTOR) + 1
+
+    def _remember(self, text: str, raw: int) -> None:
+        """Keep a count, within a budget measured in characters rather than entries.
+
+        **Memoized because the chunker asks the same question many times.** Packing a group,
+        checking whether a candidate fits, computing an overlap cap and hard-splitting an
+        oversized unit all measure overlapping strings, and each measurement re-ran the
+        tokenizer over the whole string. Instrumented over one 40-block page: 478 calls for 81
+        distinct strings, 623,382 characters counted where 139,241 are distinct — so 78% of the
+        tokenizer's work was a question it had already answered.
+
+        Sound because a token count is a pure function of the text and the vocabulary, and a
+        counter names its vocabulary: :attr:`tokenizer_id` is what a chunk fingerprint records,
+        and a counter whose answer could change for the same string would already have made
+        that fingerprint a lie.
+
+        **Budgeted in characters, not entries.** What costs memory here is the keys — the
+        strings themselves — and a cap counting entries would hold a hundred paragraphs and a
+        hundred whole documents equally happily. Cleared wholesale on overflow rather than
+        evicted: the access pattern is a working set per document, so the useful thing to keep
+        is *recent* and the useful thing to drop is the document that just finished.
+        """
+        if self._memo_chars + len(text) > MEMO_BUDGET_CHARS:
+            self._memo.clear()
+            self._memo_chars = 0
+        self._memo[text] = raw
+        self._memo_chars += len(text)
 
     @classmethod
     def bound_to(cls, embedder: SupportsTokenCount) -> TokenCounter:
