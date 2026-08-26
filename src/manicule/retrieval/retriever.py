@@ -462,7 +462,29 @@ class Retriever:
         if routing.utility is not None:
             handler = self._utility.get(routing.utility)
             if handler is not None:
-                answer = await handler(query)
+                # **Membership is resolved here too, because `retrieve` returns before it.**
+                # The resolution above `retrieve`'s pipeline is what turns `collection_ids` and
+                # `tag_ids` into `document_ids`, and its comment lists four readers of the
+                # filter — but a utility query never reaches it: `bypasses_retrieval` returns
+                # into this method several lines earlier. So a scoped "what documents are
+                # indexed?" handed the store a filter naming a collection, which no leg has a
+                # join for and every store refuses rather than drops. The narrowest question a
+                # caller can ask, answered with an exception.
+                #
+                # `None` is a real answer and not an error: it means the named collection holds
+                # nothing, which for a utility query is a sentence rather than an empty ranking.
+                # Resolving to an empty `document_ids` instead would restrict nothing and list
+                # the whole workspace — the failure `_resolve_membership` exists to refuse.
+                scoped = await self._resolve_membership(query)
+                answer = (
+                    await handler(scoped)
+                    if scoped is not None
+                    else UtilityAnswer(
+                        kind=routing.utility,
+                        text="No documents are indexed in the collection this question names.",
+                        data={"documents": []},
+                    )
+                )
         return RetrievalResult(
             context=Context(query=query),
             confidence=None,
