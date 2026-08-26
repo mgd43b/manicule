@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.13](https://github.com/mgd43b/manicule/compare/v0.1.12...v0.1.13) (2026-08-26)
+
+
+### Bug Fixes
+
+* 25 correctness defects and 8 performance hotspots found by a full-project review ([#316](https://github.com/mgd43b/manicule/issues/316)) ([8dd6fae](https://github.com/mgd43b/manicule/commit/8dd6faedbaa84d05c7acc9d87967901898962ef2))
+
 ## [0.1.12](https://github.com/mgd43b/manicule/compare/v0.1.11...v0.1.12) (2026-08-25)
 
 

@@ -1337,7 +1337,7 @@ wheels = [
 
 [[package]]
 name = "manicule"
-version = "0.1.12"
+version = "0.1.13"
 source = { editable = "." }
 dependencies = [
     { name = "packaging" },
@@ -1529,7 +1529,7 @@ dev = [
 
 [[package]]
 name = "manicule-mlx"
-version = "0.1.12"
+version = "0.1.13"
 source = { editable = "packages/manicule-mlx" }
 dependencies = [
     { name = "manicule" },
