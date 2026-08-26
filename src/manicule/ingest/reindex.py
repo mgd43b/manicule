@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from manicule.core.content import DocumentStatus, RawDocument, Retention
+from manicule.core.content import LEGACY_PUBLICATION, DocumentStatus, RawDocument, Retention
 from manicule.core.errors import ContextOverflowError, PolicyError
 from manicule.ingest.embedding import (
     DEFAULT_TARGET_BATCH_TOKENS,
@@ -223,6 +223,29 @@ async def re_embed(
     """
     report = ReindexReport()
     for document in documents:
+        if document.publication_id != LEGACY_PUBLICATION:
+            # **The write would be silently discarded, and the lineage would still move.**
+            # `LanceVectorStore.upsert` calls `when_matched_update_all()` only for the legacy
+            # publication; a content-addressed publication id is derived from the vectors
+            # themselves, so its physical rows are immutable and the merge takes the
+            # `when_not_matched_insert_all` arm alone. Every row here already matches on
+            # `ID_COLUMN`, so nothing is written.
+            #
+            # `set_lineage` below then records the new embedding fingerprint anyway, which is
+            # the damaging half: the document is marked re-embedded while the old vectors are
+            # still what search reads, and no later `reindex` will select it because its
+            # lineage already claims to be current.
+            #
+            # Refused rather than made to work. Re-embedding a content-addressed corpus means
+            # minting a new generation and flipping the pointer under a transaction fence, and
+            # that path already exists as the durable shadow-generation run.
+            report.note_unrepairable(
+                document,
+                "this document belongs to a content-addressed publication, whose vector rows "
+                "are immutable. Use `manicule reembed start` (or `resume`), which stages a "
+                "shadow generation and flips the publication pointer atomically.",
+            )
+            continue
         chunks = await store.document_chunks(document.id)
         if not chunks:
             if document.expects_chunks:

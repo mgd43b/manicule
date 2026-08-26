@@ -11,6 +11,8 @@ from sqlalchemy import text
 from manicule.core.content import DocumentStatus
 from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.fts import (
+    CREATE_TRIGGERS,
+    CURRENT_TRIGGERS,
     DROP_TRIGGERS,
     INTEGRITY_CHECK_FTS,
     REBUILD_FTS,
@@ -227,3 +229,43 @@ async def test_concurrent_searches_do_not_exhaust_the_connection_pool(
     counts = await asyncio.wait_for(asyncio.gather(*(search() for _ in range(40))), timeout=25)
 
     assert all(count > 0 for count in counts), "every concurrent search returns its own hits"
+
+
+async def test_the_rebuild_triggers_are_the_ones_the_head_revision_installs(
+    engine: AsyncEngine,
+) -> None:
+    """A lexical rebuild must not downgrade a trigger a migration replaced.
+
+    `CREATE_TRIGGERS` is imported by `20260814_6e31b7d592ac_atomic_publications`, so its bodies
+    describe the schema at *that* revision and may never change — editing them would
+    retroactively change what an already applied migration did.
+    `20260818_f3c18a9d72e1_workspace_index_identity` then replaced `chunks_ad` with a body that
+    resolves the deleted chunk's workspace and vector table into the tombstone.
+
+    The lexical rebuild drops all three triggers and recreates them, and it recreated them from
+    the frozen tuple. So publishing a rebuilt generation left the *pre-migration* trigger in
+    place, and every chunk deleted from then on wrote a tombstone with no workspace, namespace
+    or table — a row the sweep cannot attribute to the index it belongs to.
+
+    Silent in both directions: the rebuild succeeds, and `INTEGRITY_CHECK_FTS` compares
+    `chunks_fts` against `chunks` and has nothing to say about a trigger body.
+
+    Asserted against the database the migrations actually produce, not against a copy of the
+    SQL kept here — a second copy would drift from the migration exactly as the first one did.
+    """
+    async with engine.connect() as connection:
+        installed = (
+            await connection.execute(
+                text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='chunks_ad'")
+            )
+        ).scalar_one()
+
+    normalized = " ".join(str(installed).split())
+    assert " ".join(CURRENT_TRIGGERS[1].split()) == normalized, (
+        "CURRENT_TRIGGERS has drifted from the trigger the head revision installs; a lexical "
+        "rebuild would replace the live trigger with a different one"
+    )
+    assert "workspace_id" in normalized, "the fixture is meant to be migrated to head"
+    assert "workspace_id" not in " ".join(CREATE_TRIGGERS[1].split()), (
+        "CREATE_TRIGGERS is pinned to the revision that imports it and must not be updated"
+    )
