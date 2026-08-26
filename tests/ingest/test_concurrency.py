@@ -24,7 +24,8 @@ from manicule.connectors import CursorExpiredError
 from manicule.core.content import Chunk, Document, DocumentStatus, RawDocument
 from manicule.core.ids import content_hash
 from manicule.ingest.middleware import MiddlewareRunner
-from manicule.ingest.pipeline import IngestPipeline
+from manicule.ingest.pipeline import IngestPipeline, RunReport, _Sync
+from manicule.ingest.stages import Conveyor
 from manicule.ingest.workers import InProcessRunner
 from tests.fakes import MEDIA_TYPE, HashEmbedder
 from tests.ingest import fakes
@@ -34,7 +35,6 @@ if TYPE_CHECKING:
 
     from manicule.core.protocols import Embedder, Middleware
     from manicule.core.sources import DiscoveredDoc, Watermark
-    from manicule.ingest.pipeline import RunReport
     from manicule.ingest.workers import ParseRunner
 
 
@@ -1267,3 +1267,45 @@ async def _until_indexed(store: fakes.MemoryIngestStore, source_id: str) -> None
             if document is not None and document.status is DocumentStatus.INDEXED:
                 return
             await asyncio.sleep(0)
+
+
+async def test_a_stage_that_fails_while_draining_does_not_replace_the_cancellation() -> None:
+    """A stage failing inside the grace window is shutdown detail, not the run's ending.
+
+    ``stages`` is the ``_drive`` task, whose durable arm runs bare ``TaskGroup``s with nothing
+    broad caught on the path, so a store failure or a lost acquisition lease arriving mid-drain
+    surfaces as an ``ExceptionGroup``. ``wait_for`` re-raises it, and it is neither ``TimeoutError``
+    nor ``CancelledError``.
+
+    **What that cost is at the call site rather than here.** ``_run_guarded`` catches
+    ``CancelledError``, calls this, and *then* releases the acquisition lease before re-raising.
+    An exception escaping this method jumps out of that handler before the release — and the
+    sibling ``except ExceptionGroup`` on the same ``try`` cannot catch it, because it is already
+    inside the ``CancelledError`` arm. The run therefore kept a logical generation lease until
+    its wall-clock expiry, and the cancellation the caller asked for arrived as a stage failure.
+
+    So the assertion is that this *returns*: the caller's ``raise`` is what must win.
+    """
+    pipeline, _, _ = build()
+    run = _Sync(
+        connector=cast("Any", None),
+        report=RunReport(connector="fake"),
+        limit=None,
+        acquire_only=False,
+        retain_source_bytes=False,
+        watermark=None,
+        blobs=cast("Any", None),
+        refs=cast("Any", Conveyor(name="refs", capacity=1, consumers=1)),
+        bodies=cast("Any", Conveyor(name="refs", capacity=1, consumers=1)),
+    )
+
+    async def failing() -> None:
+        raise ExceptionGroup("stages", [RuntimeError("the document store went away")])
+
+    stages = asyncio.create_task(failing())
+
+    # Returns rather than raises. Before the fix this propagated the ExceptionGroup.
+    await pipeline._stop_within_grace(run, stages)
+
+    assert run.report.error_type == "RuntimeError", "the failure is recorded, not dropped"
+    assert "document store went away" in run.report.error_message

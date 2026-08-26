@@ -3044,6 +3044,21 @@ class IngestPipeline:
         is the documented behavior and the reason the impatient case is safe rather than
         different. Either way the recovery sweep is what finishes the story for a document left
         in flight, and no watermark is written.
+
+        **A stage that *fails* during the window is shutdown detail, not the run's outcome**,
+        and that is the third ending rather than an afterthought. `stages` is the `_drive` task,
+        whose durable arm runs bare `TaskGroup`s with nothing broad caught on the path, so a
+        store failure or a lost acquisition lease arriving mid-drain surfaces here as an
+        `ExceptionGroup`. `wait_for` re-raises it, and it is neither of the two types caught
+        above.
+
+        That mattered because of where this is called from. `_run_guarded` catches
+        `CancelledError`, calls this, and *then* releases the acquisition lease before
+        re-raising. An exception escaping here jumps out of that handler before the release —
+        and a sibling `except ExceptionGroup` on the same `try` cannot catch it, because it is
+        already inside the `CancelledError` arm. So the run lost its lease release and kept a
+        logical generation lease until wall-clock expiry, and the cancellation the caller asked
+        for arrived as a stage failure instead.
         """
         run.stop.set()
         try:
@@ -3052,6 +3067,18 @@ class IngestPipeline:
             stages.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await stages
+        except BaseExceptionGroup as failures:
+            # Recorded rather than dropped — this codebase does not swallow an exception it
+            # cannot name — but it must not become the run's ending. Only the first is kept: a
+            # teardown that fails after something was already recorded has nothing to add.
+            leaves = _leaves(cast("BaseExceptionGroup[Exception]", failures))
+            if leaves and not run.report.error_type:
+                run.report.error_type = type(leaves[0]).__name__
+                run.report.error_message = str(leaves[0])
+            # Deliberately no `stages.cancel()` and no second await. Reaching here means the
+            # task has already *finished* — by raising — so cancelling is a no-op and awaiting
+            # it again would re-raise the group this arm exists to absorb. That is not
+            # hypothetical: it is what the first version of this handler did.
 
     def _stage_report(self, run: _Sync) -> StageReport:
         """What the stages did, read out of the gauges and the hand-offs once, at the end."""
