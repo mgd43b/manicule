@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Forty-two MCP tools and thirty-one CLI commands. They are not a one-to-one mapping: some
+Forty-three MCP tools and thirty-one CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -265,6 +265,7 @@ server and the built command tree.
 | `stats` | ✓ | `index --stats` | counts, grouped three ways |
 | `document_list` | ✓ | `document list` | a page of documents |
 | `document_get` | ✓ | `document get` | one document, optionally its chunks |
+| `document_resolve` | ✓ | `document resolve` | one document by page id, URI or document id, with its retained bytes |
 | `document_delete` | ✓ | `document delete` | what was removed, and how |
 | `document_reindex` | ✓ | `document reindex <id>` | what was repaired |
 | `document_reindex_stale` | — | `document reindex --stale` | counts for a corpus-wide re-parse |
@@ -377,7 +378,7 @@ incremental walk, and is not the same claim as `false`. Absent `enumeration_offs
 corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The forty-two tools read
+assistant can call unattended should not be able to do any of that. The forty-three tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
 surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
 `collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
@@ -405,7 +406,7 @@ secret as a parameter, and a session cookie in a tool call is a session cookie i
 ### 4.1 What each tool says it does, and why that is not permission
 
 Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
-`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-four of the forty-two say they only
+`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-six of the forty-three say they only
 read.
 
 **They are a description, and nothing in manicule reads them back.** No tool is gated on its own
@@ -590,6 +591,43 @@ Each citation carries `slot`, `document_id`, `chunk_id`, `uri`, `title`, `headin
 Each hit carries the passage, its document, its anchor, its effective `score` **and** `scores`
 — the score every pipeline stage gave it. The per-stage history is kept because "reranking
 helped" is only checkable while the pre-rerank score survives.
+
+### `document_resolve` → `DocumentResolved`
+
+`document`, `resolved_by`, `content`, `encoding`, `byte_count`, `unavailable_reason`,
+`indexed_at`, `version_token`, `age_seconds`, `stale`.
+
+The operation another local program calls when it holds a source's own identifier rather than
+manicule's — a Confluence page id, or a URL somebody pasted — and wants the document behind it
+without holding that source's credentials. Three things about it are contract rather than
+implementation.
+
+**`content` is the retained source bytes, not the chunks.** Exactly what the connector
+delivered: storage-format XHTML or Atlassian Document Format for a Confluence page. It is not
+the chunks concatenated, and a consumer must not build it that way — chunks carry 64 tokens of
+overlap on prose and lists, so concatenating them duplicates text. `encoding` is `utf-8` or
+`base64`, decided by whether the bytes actually decode rather than by what `media_type`
+declares, so an attachment mislabeled upstream arrives intact rather than as mojibake.
+
+**`resolved_by` says which handle answered, because the three are not equally strong.**
+`document_id` and `source_id` are identity — the latter resolves by *deriving* the document id
+from `(workspace, source, source_id)` rather than by searching, so it cannot match two
+documents. `uri` is display data a source may change; nothing constrains it to be unique, a
+match is exact, and a URI naming more than one document is `AmbiguousHandleError` listing every
+candidate rather than a silent pick. A page renamed since it was last synced is stored under
+its former URI and is a miss.
+
+**`stale` is never a claim that the source has changed.** Nothing on this path reaches a
+network. It answers only whether the copy is older than the `max_age_s` the caller named, and
+is `null` when no `max_age_s` was given or when the copy has no `indexed_at` to measure — "not
+asked" and "nothing to measure", neither of which is `false`. `max_age_s` is reported against
+and never enforced: the document comes back either way. `connector_sync` is what refreshes it.
+
+`content` is `null` in two cases that are deliberately distinguishable in
+`unavailable_reason`: retention was off when the document was last ingested, or the bytes were
+retained and have since been reclaimed by the sweep. The first is a setting to change; the
+second is the retention policy working. `content=false` suppresses the body without either
+reason being set, since not asking is not a failure to hold.
 
 ### `explicit_definition` → the `Glossed` contract
 

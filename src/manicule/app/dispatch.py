@@ -28,6 +28,7 @@ from manicule.app.results import (
 )
 from manicule.app.tenancy import CrossWorkspaceError
 from manicule.core.errors import (
+    AmbiguousHandleError,
     ConfigError,
     FingerprintMismatchError,
     ManiculeError,
@@ -72,6 +73,13 @@ _HINTS: dict[type[Exception], str] = {
     UnknownEntityError: (
         "Check the name or path in the message above. The matching `list` command — "
         "`manicule document list`, `connector list`, `workspace list` — shows what exists."
+    ),
+    # The opposite remedy to UnknownEntityError's, which is why it is a type of its own: the
+    # document is there and the handle is not one. Every candidate is already named in the
+    # message, so this says what to do with them rather than repeating them.
+    AmbiguousHandleError: (
+        "A URI is display data, not identity. Re-request with the `source` and `source_id` of "
+        "the candidate you want, or with its document id — both are listed above."
     ),
     FingerprintMismatchError: (
         "The index was built by a different chunker or embedder. Re-index, or point at the "
@@ -213,6 +221,7 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         # Reads of what is stored.
         "document_list",
         "document_get",
+        "document_resolve",
         "index_status",
         "reembed_status",
         "rebuild_plan",

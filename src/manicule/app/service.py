@@ -31,10 +31,12 @@ import platform
 import secrets
 import time
 import tomllib
+from base64 import b64encode
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
@@ -56,6 +58,7 @@ from manicule.connectors.enriched import ENRICHED_KEY, AdapterOutcome
 from manicule.container import keys
 from manicule.core.content import PREVIOUS_IDENTITY, DocumentStatus
 from manicule.core.errors import (
+    AmbiguousHandleError,
     ConfigError,
     ManiculeError,
     PolicyError,
@@ -63,7 +66,7 @@ from manicule.core.errors import (
     UnknownEntityError,
 )
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
-from manicule.core.ids import document_id
+from manicule.core.ids import document_id as document_id_of
 from manicule.core.rebuild import (
     RebuildLeaseConflictError,
     RebuildLeaseError,
@@ -1086,7 +1089,7 @@ class ApplicationService:
             )
         gone = 0
         for path in removed:
-            identifier = document_id(self.workspace, source, str(_local(path).resolve()))
+            identifier = document_id_of(self.workspace, source, str(_local(path).resolve()))
             try:
                 await self.document_delete(identifier)
             except UnknownEntityError:
@@ -1776,6 +1779,197 @@ class ApplicationService:
                 for chunk in stored
             ),
         )
+
+    async def document_resolve(
+        self,
+        *,
+        document_id: str | None = None,
+        source: str | None = None,
+        source_id: str | None = None,
+        uri: str | None = None,
+        max_age_s: float | None = None,
+        content: bool = True,
+    ) -> r.DocumentResolved:
+        """One cached document, named by whichever handle the caller happens to hold.
+
+        This is the read that lets another program treat manicule as the local cache of a
+        source it does not want to call itself: hand it a Confluence page id or the URL off
+        somebody's clipboard, get back the bytes that were fetched, with the metadata needed to
+        judge how old they are. Nothing here contacts the source — see :attr:`stale`'s note in
+        :class:`~manicule.app.results.DocumentResolved`.
+
+        **Three handles, and they are not equally good.** Exactly one form must be given:
+
+        * ``document_id`` — this installation's own id.
+        * ``source`` **and** ``source_id`` together — the connector instance and the id the
+          source itself promises is stable, which for Confluence is the page id. This is
+          *identity*: it is what ``document_id`` is derived from, so it resolves by computing
+          that id rather than by searching, and it cannot match two documents.
+        * ``uri`` — display data, and the weakest of the three. A source is free to change it,
+          nothing constrains it to be unique, and a match is a lookup rather than a key.
+
+        ``source`` is required alongside ``source_id`` rather than being inferred from the one
+        connector that has such a page. Two connectors can carry the same id — a live
+        Confluence instance and a snapshot of it are the obvious pair — and guessing between
+        them would return a different document depending on what else happened to be indexed.
+
+        Args:
+            max_age_s: How old a copy the caller is willing to accept, in seconds. Only ever
+                *reported* against, never enforced: the document comes back either way, with
+                ``stale`` saying which side of the line it fell. Refusing to answer would leave
+                a caller who wanted the bytes anyway with no way to get them and no reason to
+                have asked.
+            content: Set false to read the metadata and the freshness without paying for the
+                bytes. A retained body can be megabytes, and "is my copy current" does not
+                need it.
+
+        Raises:
+            ValueError: No handle, or more than one, or ``source``/``source_id`` given alone.
+            UnknownEntityError: Nothing in this workspace answers to that handle.
+            AmbiguousHandleError: A ``uri`` matched more than one document.
+        """
+        resolved_by, document = await self._resolve_handle(
+            document_id=document_id, source=source, source_id=source_id, uri=uri
+        )
+        require_owns(self.workspace, document)
+
+        # Clamped once, here, so the reported age and the staleness verdict are the same
+        # number. A copy stamped in the future is clock skew rather than a document from
+        # tomorrow, and a negative age reported as such would look like a defect in manicule.
+        age = (
+            max((datetime.now(UTC) - document.indexed_at).total_seconds(), 0.0)
+            if document.indexed_at is not None
+            else None
+        )
+        body = await self._retained_body(document) if content else _Body()
+        return r.DocumentResolved(
+            document=_summary(document),
+            resolved_by=resolved_by,
+            content=body.text,
+            encoding=body.encoding,
+            byte_count=body.byte_count,
+            unavailable_reason=body.reason,
+            indexed_at=document.indexed_at,
+            version_token=document.version_token,
+            age_seconds=age,
+            # `None` unless both halves are in hand. A missing `max_age_s` means the question
+            # was not asked, and a missing `indexed_at` means there is nothing to measure —
+            # answering `False` to either would be a freshness claim built out of a gap.
+            stale=(age > max_age_s) if age is not None and max_age_s is not None else None,
+        )
+
+    async def _resolve_handle(
+        self,
+        *,
+        document_id: str | None,
+        source: str | None,
+        source_id: str | None,
+        uri: str | None,
+    ) -> tuple[r.ResolvedBy, Document]:
+        """Turn whichever handle was supplied into one document, or say why it could not."""
+        given = [
+            name
+            for name, supplied in (
+                ("document_id", document_id is not None),
+                ("source_id", source is not None or source_id is not None),
+                ("uri", uri is not None),
+            )
+            if supplied
+        ]
+        if not given:
+            msg = (
+                "name a document: pass document_id, or source and source_id together, or uri. "
+                "source and source_id are the identity a source promises is stable; uri is "
+                "display data and may match none or several."
+            )
+            raise ValueError(msg)
+        if len(given) > 1:
+            msg = (
+                f"name a document exactly once; got {' and '.join(given)}. Two handles are "
+                f"two questions, and answering the first silently would hide a disagreement "
+                f"between them."
+            )
+            raise ValueError(msg)
+
+        store = await self._backend.documents()
+        if document_id is not None:
+            found = await store.get_document(document_id)
+            return "document_id", _found_or_raise(found, f"document_id {document_id!r}")
+        if uri is not None:
+            return "uri", await self._by_uri(uri)
+        if not (source and source_id):
+            msg = (
+                "source and source_id identify a document together and neither works alone: "
+                "the same id in two connectors is two documents. Pass both."
+            )
+            raise ValueError(msg)
+        # A derivation, not a search. `document_id` is defined as a digest over
+        # `(workspace, source, source_id)`, so computing it is the lookup — and it carries the
+        # workspace scope into the key rather than applying it afterwards, which is what makes
+        # this path incapable of reaching another tenant's row even in principle.
+        derived = document_id_of(self.workspace, source, source_id)
+        found = await store.get_document(derived)
+        return "source_id", _found_or_raise(found, f"{source!r} document {source_id!r}")
+
+    async def _by_uri(self, uri: str) -> Document:
+        """The one live document at ``uri``, or a refusal that names the alternatives."""
+        store = await self._backend.documents()
+        candidates = await store.find_documents_by_uri(uri)
+        if not candidates:
+            # Retried once against a conservatively normalized form rather than normalizing up
+            # front, because the stored URI is the connector's own and an exact match is the
+            # only one that is certainly right. Only the differences no URI can carry meaning
+            # in are folded — never the path, where a Confluence page's title slug lives.
+            normalized = _normalize_uri(uri)
+            if normalized != uri:
+                candidates = await store.find_documents_by_uri(normalized)
+        if not candidates:
+            msg = (
+                f"no live document at {uri!r} in workspace {self.workspace!r}. A URI is "
+                f"matched exactly: a page renamed since it was last synced is stored under the "
+                f"URI it had then, so resolve it by source and source_id instead."
+            )
+            raise UnknownEntityError(msg)
+        require_owned(self.workspace, candidates)
+        if len(candidates) > 1:
+            listed = ", ".join(
+                f"{found.source!r}/{found.source_id!r} (document_id {found.id!r})"
+                for found in candidates
+            )
+            msg = f"{uri!r} matches {len(candidates)} documents in this workspace: {listed}"
+            raise AmbiguousHandleError(msg)
+        return candidates[0]
+
+    async def _retained_body(self, document: Document) -> _Body:
+        """The bytes this installation holds for ``document``, or the reason it holds none.
+
+        The two absences are reported as different strings on purpose. "Retention is off" is a
+        setting somebody can change and re-sync; "the bytes were reclaimed" is the retention
+        policy having done its job, and re-syncing is also the answer but the operator should
+        not go looking for a misconfiguration first.
+        """
+        if document.original_ref is None:
+            return _Body(
+                reason="never retained: storage.retain_source_bytes was off when this "
+                "document was last ingested. Set it true and re-sync to serve bytes."
+            )
+        blobs = await self._backend.retained()
+        raw = await blobs.get(document.original_ref)
+        if raw is None:
+            return _Body(
+                reason="retained and since reclaimed: the document still references its bytes "
+                "and the blob store no longer holds them. Re-sync to fetch them again."
+            )
+        try:
+            return _Body(text=raw.decode("utf-8"), encoding="utf-8", byte_count=len(raw))
+        except UnicodeDecodeError:
+            # A PDF or an image attachment. Encoded rather than refused, and labeled rather
+            # than guessed at by the caller — `media_type` is a declaration and this is a
+            # measurement, and an attachment mislabeled `text/plain` upstream would otherwise
+            # arrive as mojibake that looks like content.
+            return _Body(
+                text=b64encode(raw).decode("ascii"), encoding="base64", byte_count=len(raw)
+            )
 
     async def document_delete(self, document_id: str, *, hard: bool = False) -> r.DocumentDeleted:
         """Remove a document, into the trash by default.
@@ -2834,7 +3028,7 @@ class ApplicationService:
                             "old_source_id": document.source_id,
                             "old_document_id": document.id,
                             "new_source_id": document.provenance.source.source_id,  # pyright: ignore[reportOptionalMemberAccess]
-                            "new_document_id": document_id(
+                            "new_document_id": document_id_of(
                                 self.settings.workspace,
                                 document.source,
                                 document.provenance.source.source_id,  # pyright: ignore[reportOptionalMemberAccess]
@@ -5783,6 +5977,67 @@ def _summary(document: Document, *, chunk_count: int | None = None) -> r.Documen
         chunk_count=chunk_count,
         provenance=source_reference(document),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _Body:
+    """Retained bytes as ``document_resolve`` found them, or the reason they are absent.
+
+    One value with both outcomes in it, so the caller cannot assemble a response that carries
+    content *and* a reason it has none — the two are exclusive and a pair of loose locals would
+    let a future edit set both.
+    """
+
+    text: str | None = None
+    encoding: Literal["utf-8", "base64"] | None = None
+    byte_count: int | None = None
+    reason: str | None = None
+
+
+def _found_or_raise(document: Document | None, described: str) -> Document:
+    """``document``, or the refusal that says nothing about other workspaces.
+
+    The message names what was asked for and never whether it exists elsewhere, for the reason
+    :class:`~manicule.core.errors.UnknownEntityError` gives: the distinction is a membership
+    oracle for documents the caller cannot see.
+    """
+    if document is None:
+        msg = f"no live document for {described} in this workspace"
+        raise UnknownEntityError(msg)
+    return document
+
+
+def _normalize_uri(uri: str) -> str:
+    """Fold only the differences a URI cannot carry meaning in.
+
+    Scheme and host are case-insensitive per RFC 3986 §3.1 and §3.2.2, and a fragment is never
+    sent to a server, so none of the three can distinguish two documents. Everything else is
+    left exactly as the connector stored it — in particular the path, because a Confluence page
+    URL carries its title as the last segment and trimming it would silently match a different
+    page that happens to share a prefix.
+
+    The one trailing slash is dropped because a source that stored ``…/page`` and a caller who
+    pasted ``…/page/`` are describing the same resource, and no source in manicule distinguishes
+    them. It is dropped only when something precedes it, so a bare origin is left alone.
+    """
+    split = urlsplit(uri)
+    if split.username or split.password:
+        # Userinfo is case-sensitive, so folding the netloc would change it. No connector
+        # stores a URI carrying credentials — Confluence refuses one in `base_url` outright —
+        # so this is the unreachable case, and leaving it exactly as given is the one
+        # normalization that cannot be wrong.
+        return uri
+    host = split.hostname or ""
+    if ":" in host:
+        # An IPv6 literal. `hostname` strips the brackets that RFC 3986 §3.2.2 requires in a
+        # netloc, and putting it back unbracketed produces `http://::1:8080/…` — which is not
+        # the same URI, is not a valid one, and would match nothing. Restored before the port
+        # is appended, or the two colons become indistinguishable.
+        host = f"[{host}]"
+    if split.port is not None:
+        host = f"{host}:{split.port}"
+    path = split.path.removesuffix("/") if split.path not in {"", "/"} else split.path
+    return urlunsplit((split.scheme.lower(), host.lower(), path, split.query, ""))
 
 
 def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:

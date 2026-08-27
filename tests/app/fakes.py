@@ -25,6 +25,7 @@ from manicule.app.ports import (
     Maintenance,
     Organizing,
     ResetOutcome,
+    RetainedBytes,
     Retrieving,
     Telemetry,
 )
@@ -190,6 +191,23 @@ class FakeStore:
             ]
         return wanted[offset : offset + limit]
 
+    async def find_documents_by_uri(self, uri: str) -> Sequence[Document]:
+        """Live documents at ``uri``, scoped and ordered the way a correct store orders them.
+
+        The workspace scope is applied here for the reason ``list_documents`` applies it: this
+        is the control, and a control that leaked would make :class:`LeakyStore` prove nothing.
+        The sort is part of the contract rather than tidiness — an ambiguous URI has to be
+        reported identically twice or a caller cannot compare two answers.
+        """
+        return sorted(
+            (
+                document
+                for document in self.documents.values()
+                if belongs_to(self.workspace_id, document) and document.uri == uri
+            ),
+            key=lambda document: (document.source, document.source_id),
+        )
+
     async def document_chunks(self, document_id: str) -> Sequence[Chunk]:
         return self.chunks.get(document_id, [])
 
@@ -255,6 +273,9 @@ class LeakyStore(FakeStore):
       inherited, because :class:`FakeStore` does not scope that lookup either.
     * ``list_documents`` returns **every** document it holds, ignoring the filter, the limit
       and the offset.
+    * ``find_documents_by_uri`` matches on the URI alone, across every workspace. The URI
+      lookup is a second way into one document, so it needs a second experiment: a guard
+      written only into ``get_document``'s caller would leave this path open.
 
     Ignoring the *limit* as well as the filter is what makes this useful. A leaky store that
     still truncated would let the surface's "some of what I asked for came back missing" check
@@ -276,6 +297,13 @@ class LeakyStore(FakeStore):
     ) -> Sequence[Document]:
         del filter, limit, offset
         return list(self.documents.values())
+
+    @override
+    async def find_documents_by_uri(self, uri: str) -> Sequence[Document]:
+        return sorted(
+            (document for document in self.documents.values() if document.uri == uri),
+            key=lambda document: (document.source, document.source_id),
+        )
 
 
 @dataclass
@@ -1311,6 +1339,26 @@ class FakeKeys:
 
 
 @dataclass
+class FakeRetained:
+    """Retained bytes over a plain map, keyed by digest exactly as the real store is.
+
+    Content-addressed and therefore workspace-blind, which is not a simplification: the real
+    :class:`~manicule.storage.blobs.BlobStore` is too, because one blob is shared by every
+    workspace that indexed the same bytes. The scoping that matters happens before this is
+    reached, when the caller proves it owns the document whose ``original_ref`` it is about to
+    look up — so a test that reaches a digest any other way is testing the wrong boundary.
+
+    A digest that is absent returns ``None`` rather than raising, which is the real store's
+    answer for bytes the retention sweep has reclaimed.
+    """
+
+    data: dict[str, bytes] = field(default_factory=dict[str, bytes])
+
+    async def get(self, digest: str) -> bytes | None:
+        return self.data.get(digest)
+
+
+@dataclass
 class FakeBackend:
     """Everything the service is given, assembled from the fakes above."""
 
@@ -1324,6 +1372,7 @@ class FakeBackend:
     conversations_: FakeConversations = field(default_factory=FakeConversations)
     telemetry_: FakeTelemetry = field(default_factory=FakeTelemetry)
     keys_: FakeKeys = field(default_factory=FakeKeys)
+    retained_: FakeRetained = field(default_factory=FakeRetained)
     discovery: Discovery | None = None
     checks: list[Check] = field(default_factory=list[Check])
 
@@ -1333,6 +1382,9 @@ class FakeBackend:
 
     async def documents(self) -> DocumentSurface:
         return self.store
+
+    async def retained(self) -> RetainedBytes:
+        return self.retained_
 
     async def retriever(self) -> Retrieving:
         return self.retriever_
@@ -1368,6 +1420,7 @@ __all__ = [
     "FakeIngestion",
     "FakeKeys",
     "FakeMaintenance",
+    "FakeRetained",
     "FakeRetriever",
     "FakeStore",
     "LeakyStore",

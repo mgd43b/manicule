@@ -166,6 +166,53 @@ async def test_a_document_is_found_by_source_identity_not_by_uri(
     assert found.uri.endswith("New-Title")
 
 
+async def test_a_uri_lookup_returns_every_match_because_a_uri_is_not_a_key(
+    store: SqliteDocStore,
+) -> None:
+    """The counterpart to the test above, and the reason it returns a sequence.
+
+    Identity is ``(workspace, source, source_id)``, so nothing stops two connectors carrying
+    one URI — a live wiki and a snapshot of it are the pair that actually occurs. Returning a
+    single document would answer with whichever row SQLite listed first, and the caller would
+    never learn there had been a choice.
+
+    The order is asserted too. Unordered, an ambiguous URI would be reported differently on
+    two identical requests, and a caller could not compare them.
+    """
+    shared = "https://wiki.example.test/wiki/spaces/ENG/pages/12345/Retry-policy"
+    await store.upsert_document(make_document(source="confluence", source_id="12345", uri=shared))
+    await store.upsert_document(
+        make_document(source="confluence-snapshot", source_id="12345", uri=shared)
+    )
+    await store.upsert_document(
+        make_document(source="confluence", source_id="99999", uri="https://wiki.example.test/other")
+    )
+
+    found = await store.find_documents_by_uri(shared)
+
+    assert [document.source for document in found] == ["confluence", "confluence-snapshot"]
+    assert await store.find_documents_by_uri("https://wiki.example.test/absent") == []
+
+
+async def test_a_soft_deleted_document_is_not_found_by_its_uri(
+    store: SqliteDocStore,
+) -> None:
+    """Trashed is not live, and a cache read must not resurrect one.
+
+    Asserted separately from the lookup above because the ``deleted_at IS NULL`` predicate is
+    the kind of clause that is easy to leave off a new query and impossible to notice: the
+    document comes back, correctly formatted, from the trash.
+    """
+    uri = "https://wiki.example.test/wiki/spaces/ENG/pages/12345/Retry-policy"
+    document = make_document(source="confluence", source_id="12345", uri=uri)
+    await store.upsert_document(document)
+    assert await store.find_documents_by_uri(uri)
+
+    await store.soft_delete_document(document.id)
+
+    assert await store.find_documents_by_uri(uri) == []
+
+
 async def test_reparsing_replaces_chunks_rather_than_accumulating_them(
     store: SqliteDocStore,
 ) -> None:

@@ -175,6 +175,34 @@ class SqliteDocStore(
             ).scalar_one_or_none()
             return None if row is None else to_document(row)
 
+    async def find_documents_by_uri(self, uri: str) -> Sequence[Document]:
+        """Live documents of this workspace whose URI is exactly ``uri``.
+
+        The counterpart to :meth:`find_document`, and the docstring there is the reason this
+        one returns a sequence: the URI is display data a source is free to change, so nothing
+        makes it unique. Two connectors mirroring one page, or a source reissuing a path, both
+        produce several rows here — and picking one would be picking whichever the database
+        listed first.
+
+        Ordered by ``source`` then ``source_id`` so an ambiguous answer is reported the same
+        way twice. Unordered, a caller comparing two identical requests would see them differ.
+
+        ``ix_documents_workspace_id_uri`` covers this predicate.
+        """
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.Document)
+                    .where(
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.uri == uri,
+                        models.Document.deleted_at.is_(None),
+                    )
+                    .order_by(models.Document.source, models.Document.source_id)
+                )
+            ).scalars()
+            return [to_document(row) for row in rows]
+
     async def dependent_documents(
         self, source: str, source_ids: Collection[SourceId]
     ) -> Sequence[Document]:

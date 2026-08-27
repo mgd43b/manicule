@@ -71,6 +71,48 @@ async def trash(
 
 
 @router.get(
+    "/documents/resolve",
+    name="document_resolve",
+    summary="One cached document by page id, URI or document id, with its retained bytes.",
+)
+async def resolve_document(
+    service: Service,
+    caller: ViewerPrincipal,
+    *,
+    document_id: Annotated[str | None, Query(min_length=1)] = None,
+    source: Annotated[str | None, Query(min_length=1)] = None,
+    source_id: Annotated[str | None, Query(min_length=1)] = None,
+    uri: Annotated[str | None, Query(min_length=1)] = None,
+    max_age_s: Annotated[float | None, Query(gt=0)] = None,
+    content: Annotated[bool, Query()] = True,
+) -> Response:
+    """Read a document out of the cache without knowing manicule's own id for it.
+
+    This is the endpoint another local program calls when it wants the Confluence page behind
+    an id or a URL and does not want to hold Confluence credentials of its own. It serves the
+    bytes the connector fetched, and it reaches no network: ``max_age_s`` is reported against,
+    never enforced, because this installation cannot know what the source has done since.
+
+    Declared **above** ``/documents/{document_id}`` for the reason ``/documents/trash`` is:
+    Starlette matches in declaration order, so the parameterized route would otherwise take
+    ``resolve`` for an id and 404 a route that exists.
+    """
+    del caller
+    return await respond(
+        "document_resolve",
+        service,
+        lambda: service.document_resolve(
+            document_id=document_id,
+            source=source,
+            source_id=source_id,
+            uri=uri,
+            max_age_s=max_age_s,
+            content=content,
+        ),
+    )
+
+
+@router.get(
     "/documents/{document_id}",
     name="document_get",
     summary="One document, optionally with its chunks.",

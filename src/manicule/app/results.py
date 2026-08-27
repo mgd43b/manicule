@@ -719,6 +719,80 @@ class DocumentChunk(Payload):
     anchor: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+type ResolvedBy = Literal["document_id", "source_id", "uri"]
+"""Which handle actually resolved a document.
+
+Reported rather than inferred, because a caller that passed a URI and got an answer needs to
+know it was matched as display data rather than as identity — see
+:meth:`~manicule.app.ports.DocumentSurface.find_documents_by_uri`.
+"""
+
+
+class DocumentResolved(Payload):
+    """One cached document, named by any of its handles and served from retained bytes.
+
+    **The bytes are the ones the connector delivered, byte for byte.** Not the chunks, which
+    carry the chunker's 64-token overlap on prose and lists and therefore do not concatenate
+    back into a document; and not a re-rendering, which would be a derivation this installation
+    would then have to version. ``docs/storage.md`` §1 makes the retained snapshot the source
+    of authority, and this is the surface that hands it over.
+
+    **Freshness is reported, never asserted.** Nothing here contacts the source, so nothing
+    here can know whether the source has moved on. :attr:`indexed_at` and :attr:`version_token`
+    are facts about this installation's copy, and :attr:`stale` answers only the question the
+    caller actually asked — whether the copy is older than the ``max_age`` it named. With no
+    ``max_age`` it is ``None``, which is "not asked" rather than "no".
+    """
+
+    document: DocumentSummary
+    resolved_by: ResolvedBy
+
+    content: str | None = Field(
+        default=None,
+        description="The retained source bytes, decoded per ``encoding``. ``None`` when the "
+        "installation does not hold them, and then ``unavailable_reason`` says which of the "
+        "two reasons applies.",
+    )
+    encoding: Literal["utf-8", "base64"] | None = Field(
+        default=None,
+        description="How ``content`` carries the bytes. ``base64`` whenever they are not valid "
+        "UTF-8 — a PDF or an image attachment — so that a caller never has to guess whether a "
+        "string is text or a transport encoding of something else.",
+    )
+    byte_count: int | None = Field(
+        default=None, ge=0, description="Length of the retained bytes, before any encoding."
+    )
+    unavailable_reason: str | None = Field(
+        default=None,
+        description="Why there is no content. 'never retained' and 'retained and since "
+        "reclaimed' are different facts about the installation and are reported as different "
+        "strings, on the same principle as ``documents.original_omitted_reason``.",
+    )
+
+    indexed_at: datetime | None = Field(
+        default=None,
+        description="When this copy last reached ``indexed``. A fact about this installation, "
+        "and deliberately not the source's own modification time — the two are the timestamps "
+        "``docs/storage.md`` warns are easiest to conflate.",
+    )
+    version_token: str | None = Field(
+        default=None,
+        description="The connector's opaque change token for this copy — a Confluence version "
+        "number, a Git blob SHA. Compared for equality by the caller and interpreted by nobody.",
+    )
+    age_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        description="How long ago this copy was indexed. ``None`` when it never was.",
+    )
+    stale: bool | None = Field(
+        default=None,
+        description="Whether the copy is older than the ``max_age`` the caller named. ``None`` "
+        "when no ``max_age`` was given, or when the copy has no ``indexed_at`` to measure. "
+        "Never a claim that the source has changed; this installation has not asked it.",
+    )
+
+
 class DocumentDetail(Payload):
     """One document, optionally with its chunks."""
 
@@ -2405,6 +2479,7 @@ __all__ = [
     "DocumentDetail",
     "DocumentList",
     "DocumentReindexed",
+    "DocumentResolved",
     "DocumentRestored",
     "DocumentSummary",
     "DocumentTags",
@@ -2433,6 +2508,7 @@ __all__ = [
     "ReembedPlanReport",
     "ReembedRunReport",
     "ResetReport",
+    "ResolvedBy",
     "RestoreReport",
     "SearchHit",
     "SearchQuality",
