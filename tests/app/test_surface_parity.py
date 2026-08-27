@@ -118,12 +118,12 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_forty_two_tools(service: ApplicationService) -> None:
-    """Forty-two, named, and matching the declared surface."""
+def test_the_server_offers_exactly_forty_three_tools(service: ApplicationService) -> None:
+    """Forty-three, named, and matching the declared surface."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 42
+    assert len(offered) == 43
 
 
 def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
@@ -373,6 +373,22 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
         ["document", "list"],
         ("GET", "/api/v1/documents", {}),
         ("/ui/documents", ("documents", 0, "id")),
+    ),
+    (
+        # By `source`/`source_id` rather than by uri, because that is the handle the three
+        # surfaces spell differently — a positional argument that changes meaning with a flag
+        # on the command line, two query parameters over HTTP, two keywords in the tool — and
+        # a row that used manicule's own document id would compare three spellings of the one
+        # handle that needs no translating.
+        "document_resolve",
+        {"source": "local", "source_id": "notes.md"},
+        ["document", "resolve", "notes.md", "--source", "local"],
+        (
+            "GET",
+            "/api/v1/documents/resolve",
+            {"params": {"source": "local", "source_id": "notes.md"}},
+        ),
+        None,
     ),
     ("stats", {}, ["index", "--stats"], ("GET", "/api/v1/stats", {}), ("/ui", ("by_media_type",))),
     (

@@ -149,6 +149,21 @@ class UnknownEntityError(ManiculeError):
     """
 
 
+class AmbiguousHandleError(ManiculeError):
+    """A handle that is not an identity matched more than one document.
+
+    Raised only for lookups by URI, and it exists because a URI is display data a source is
+    free to change rather than a key — two connectors may mirror one page, and a source may
+    reissue a path it once gave something else. Answering with the first row would make the
+    result depend on storage order, and the caller would never learn there had been a choice.
+
+    Distinct from :class:`UnknownEntityError` because the remedy is the opposite one: the
+    document is there, and what is missing is a handle that identifies which. Every candidate
+    is named in the message — they are all inside the caller's own workspace, so listing them
+    discloses nothing the caller could not already list.
+    """
+
+
 class MiddlewareViolationError(ManiculeError):
     """A middleware hook did something the contract forbids.
 
@@ -312,6 +327,7 @@ class TokenStateError(ManiculeError):
 
 __all__ = [
     "AcquisitionLeaseLostError",
+    "AmbiguousHandleError",
     "ChunkingError",
     "CircularDependencyError",
     "ComponentSetupError",

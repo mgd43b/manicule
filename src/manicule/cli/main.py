@@ -636,6 +636,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "stats": r.Stats,
     "document_list": r.DocumentList,
     "document_get": r.DocumentDetail,
+    "document_resolve": r.DocumentResolved,
     "document_delete": r.DocumentDeleted,
     "document_reindex": r.DocumentReindexed,
     "document_reindex_stale": r.StaleReparseReport,
@@ -939,6 +940,62 @@ def document_get(
 ) -> None:
     """Read one document, and optionally every chunk it was split into."""
     emit("document_get", lambda service: service.document_get(document_id, chunks=chunks))
+
+
+@document_app.command("resolve")
+def document_resolve(
+    handle: Annotated[
+        str | None,
+        typer.Argument(
+            help="A URL, or the source's own id when --source is given. Omit and use --id "
+            "for manicule's own document id."
+        ),
+    ] = None,
+    source: Annotated[
+        str | None,
+        typer.Option(
+            "--source",
+            "-s",
+            help="Connector instance, e.g. confluence. Makes the "
+            "argument the source's own id rather than a URL.",
+        ),
+    ] = None,
+    document_id: Annotated[
+        str | None, typer.Option("--id", help="manicule's own document id.")
+    ] = None,
+    max_age: Annotated[
+        float | None,
+        typer.Option(
+            "--max-age",
+            help="Seconds. Reports whether the copy is older; never refuses one that is.",
+        ),
+    ] = None,
+    no_content: Annotated[
+        bool, typer.Option("--no-content", help="Metadata and freshness only.")
+    ] = False,
+) -> None:
+    """Read a cached document by its source's id or URL, with the bytes that were fetched.
+
+    The argument is a URL unless `--source` names a connector, in which case it is that
+    source's own id — a Confluence page id. One argument that changes meaning with a flag,
+    rather than three mutually exclusive options, because at a terminal the two things somebody
+    actually has are a URL and a page id, and which of the two it is is obvious from what they
+    typed.
+
+    Touches no network. This is the local cache: `--max-age` reports on how old the copy is
+    rather than refreshing it, and `connector sync` is what refreshes it.
+    """
+    emit(
+        "document_resolve",
+        lambda service: service.document_resolve(
+            document_id=document_id,
+            source=source,
+            source_id=handle if source else None,
+            uri=handle if not source and document_id is None else None,
+            max_age_s=max_age,
+            content=not no_content,
+        ),
+    )
 
 
 @document_app.command("delete")

@@ -298,6 +298,46 @@ def render_document(out: Console, payload: r.DocumentDetail) -> None:
         out.print(Text(chunk.text))
 
 
+def render_document_resolved(out: Console, payload: r.DocumentResolved) -> None:
+    """The document's identity and freshness, then the retained bytes.
+
+    The freshness rows are printed whether or not a ``--max-age`` was given, because "when was
+    this fetched" is the question somebody reading this at a terminal actually has. ``stale``
+    appears only when it was asked for: a row reading ``unknown`` would look like a measurement
+    that failed rather than one nobody requested.
+
+    Bytes are written with :class:`~rich.text.Text` so that markup in the body — a Confluence
+    storage fragment is full of angle brackets — is shown rather than interpreted.
+    """
+    document = payload.document
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_column()
+    table.add_column(overflow="fold")
+    table.add_row("id", document.id)
+    table.add_row("title", escape(document.title))
+    table.add_row("uri", escape(document.uri))
+    table.add_row("source", f"{escape(document.source)} / {escape(document.source_id)}")
+    table.add_row("resolved by", escape(payload.resolved_by))
+    table.add_row("media type", escape(document.media_type))
+    if payload.version_token:
+        table.add_row("version", escape(payload.version_token))
+    table.add_row(
+        "indexed", payload.indexed_at.isoformat() if payload.indexed_at else "[dim]never[/dim]"
+    )
+    if payload.age_seconds is not None:
+        table.add_row("age", f"{payload.age_seconds / 3600:.1f} h")
+    if payload.stale is not None:
+        table.add_row("stale", "yes" if payload.stale else "no")
+    out.print(table)
+    if payload.content is None:
+        # Printed rather than left as an empty body, because "this installation does not hold
+        # the bytes" and "the page is empty" look identical at a terminal otherwise.
+        out.print(f"\n[dim]no content — {escape(payload.unavailable_reason or 'not requested')}")
+        return
+    out.print(f"\n[dim]{payload.byte_count} bytes · {escape(payload.encoding or '')}[/dim]")
+    out.print(Text(payload.content))
+
+
 def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:
     where = "the trash" if payload.mode == "soft" else "the index, permanently"
     out.print(f"removed [bold]{payload.document_id}[/bold] into {where}")
@@ -1291,6 +1331,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.SearchResult: lambda out, p: render_search(out, _as(r.SearchResult, p)),
     r.DocumentList: lambda out, p: render_document_list(out, _as(r.DocumentList, p)),
     r.DocumentDetail: lambda out, p: render_document(out, _as(r.DocumentDetail, p)),
+    r.DocumentResolved: lambda out, p: render_document_resolved(out, _as(r.DocumentResolved, p)),
     r.DocumentDeleted: lambda out, p: render_document_deleted(out, _as(r.DocumentDeleted, p)),
     r.DocumentReindexed: lambda out, p: render_document_reindexed(out, _as(r.DocumentReindexed, p)),
     r.StaleReparseReport: lambda out, p: render_stale_reparse(out, _as(r.StaleReparseReport, p)),

@@ -273,12 +273,17 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
         updated_at=now,
     )
     document_id = next(iter(backend.store.documents))
+    document_uri = backend.store.documents[document_id].uri
     collection_id = next(iter(backend.organization_.collections))
 
     arguments: dict[str, dict[str, Any]] = {
         "search": {"query": "admission control", "collections": [COLLECTION], "limit": 3},
         "document_list": {},
         "document_get": {"document_id": document_id, "chunks": True},
+        # Resolved by uri rather than by document_id, so the exercised path is the one that
+        # searches rather than the one that already holds the answer. The other two handles
+        # reduce to `get_document`, which `document_get` above already runs.
+        "document_resolve": {"uri": document_uri},
         "index_status": {},
         "reembed_status": {"run_id": "read-run"},
         "lifecycle_reset_derived": {},

@@ -56,6 +56,7 @@ if TYPE_CHECKING:
         Maintenance,
         Organizing,
         ResetOutcome,
+        RetainedBytes,
         Retrieving,
         Telemetry,
     )
@@ -371,6 +372,16 @@ class Runtime:
     async def documents(self) -> DocumentSurface:
         """The relational store, migrated before it is ever read."""
         return await self._once("documents", self._build_documents)
+
+    async def retained(self) -> RetainedBytes:
+        """The blob store, narrowed to the one read a surface is allowed to make.
+
+        The *same* store :meth:`blobs` returns rather than a second one over the same
+        directory, for the reason given there. What differs is the protocol it arrives as:
+        :class:`~manicule.app.ports.RetainedBytes` is a single ``get``, so the service cannot
+        retain, stage or reconcile through a handle it was given in order to read a document.
+        """
+        return await self.blobs()
 
     async def vectors(self) -> VectorStore:
         """The vector store, opened but not yet committed to a dimension.

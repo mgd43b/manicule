@@ -87,6 +87,19 @@ class DocumentSurface(Protocol):
         offset: int = 0,
     ) -> Sequence[Document]: ...
 
+    async def find_documents_by_uri(self, uri: str) -> Sequence[Document]:
+        """Every live document of this workspace whose URI is exactly ``uri``.
+
+        **Plural, and that is the whole point.** A URI is display data a source is free to
+        change — :meth:`~manicule.storage.docstore.SqliteDocStore.find_document` says so, and
+        nothing constrains it to be unique. Two connectors may mirror one page, and a source
+        may reissue a URI it once gave something else. Returning one document would make the
+        caller's answer depend on which row the database happened to hand back first.
+
+        Identity is still ``(workspace, source, source_id)``. This is a lookup, never a key.
+        """
+        ...
+
     async def document_chunks(self, document_id: str) -> Sequence[Chunk]: ...
 
     async def count_documents(
@@ -620,6 +633,30 @@ class Keys(Protocol):
         ...
 
 
+class RetainedBytes(Protocol):
+    """Reading back the bytes a connector delivered, and nothing else.
+
+    One method, deliberately. :class:`~manicule.ingest.pipeline.BlobSink` is the pipeline's
+    view of the same store and carries six, because ingest writes, stages and reconciles;
+    a surface serving a cached document only ever reads one digest it already holds a
+    reference to. Handing the service the wider protocol would hand it retention and
+    acquisition-marker reconciliation as well, for a read.
+
+    ``get`` is content-addressed and therefore carries no workspace scope of its own — which
+    is exactly why the caller must arrive with a ``digest`` read off a document it has already
+    proven it owns. A blob is shared by every workspace that indexed the same bytes, so a
+    digest reached any other way is a cross-tenant read wearing a hash.
+    """
+
+    async def get(self, digest: str) -> bytes | None:
+        """The retained bytes, or ``None`` when the store no longer holds them.
+
+        ``None`` rather than raising, because "collected since" is an ordinary state on the
+        retention path rather than a failure — see ``docs/storage.md`` §7.
+        """
+        ...
+
+
 class Backend(Protocol):
     """Everything the service is given, built lazily and never by the service itself.
 
@@ -641,6 +678,8 @@ class Backend(Protocol):
         ...
 
     async def documents(self) -> DocumentSurface: ...
+
+    async def retained(self) -> RetainedBytes: ...
 
     async def retriever(self) -> Retrieving: ...
 
@@ -672,6 +711,7 @@ __all__ = [
     "Keys",
     "Maintenance",
     "Organizing",
+    "RetainedBytes",
     "Retrieving",
     "Telemetry",
 ]

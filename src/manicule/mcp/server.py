@@ -1,4 +1,4 @@
-"""The MCP server: forty-two tools, each a few lines over the application service.
+"""The MCP server: forty-three tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -204,6 +204,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "index_path",
     "document_list",
     "document_get",
+    "document_resolve",
     "document_delete",
     "document_reindex",
     "index_status",
@@ -796,6 +797,55 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             "document_get", lambda: service.document_get(document_id, chunks=chunks)
         )
 
+    @register.tool(READS)
+    async def document_resolve(
+        *,
+        document_id: str | None = None,
+        source: str | None = None,
+        source_id: str | None = None,
+        uri: str | None = None,
+        max_age_s: float | None = None,
+        content: bool = True,
+    ) -> dict[str, Any]:
+        """Read a cached document by whichever handle you have, with the bytes that were fetched.
+
+        Use this when you hold a source's own identifier rather than manicule's — a Confluence
+        page id, or a URL somebody pasted — and want the document behind it. It returns the
+        source bytes exactly as the connector delivered them, which for a Confluence page is
+        its storage-format or Atlassian Document Format body.
+
+        **It reaches no network.** The answer is this installation's cached copy, and
+        ``indexed_at``, ``version_token`` and ``age_seconds`` come back so you can judge how
+        old it is. Nothing here can tell you whether the source has changed since; run a
+        ``connector_sync`` if that matters.
+
+        Prefer this over ``document_get`` when you want the document's content, and
+        ``document_get`` when you want the chunks retrieval actually scores. The chunks carry
+        overlapping text by design and do not concatenate back into the document.
+
+        Args:
+            document_id: manicule's own id, if you have it.
+            source: The connector instance, e.g. ``confluence``. Required with ``source_id``.
+            source_id: The id the source itself uses — a Confluence page id. Needs ``source``
+                too, because two connectors can carry the same id.
+            uri: The document's URL. Matched exactly, so a page renamed since it was last
+                synced is stored under its former URL; resolve by ``source_id`` instead.
+            max_age_s: Report whether the cached copy is older than this many seconds. Only
+                reported on, never enforced — the document comes back either way.
+            content: Set false for metadata and freshness without the body, which can be large.
+        """
+        return await dispatch(
+            "document_resolve",
+            lambda: service.document_resolve(
+                document_id=document_id,
+                source=source,
+                source_id=source_id,
+                uri=uri,
+                max_age_s=max_age_s,
+                content=content,
+            ),
+        )
+
     @register.tool(hints(reads=False, removes=True, repeatable=False, reaches_out=False))
     async def document_delete(document_id: str, hard: bool = False) -> dict[str, Any]:
         """Remove a document from the index.
@@ -1112,6 +1162,7 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             index_path,
             document_list,
             document_get,
+            document_resolve,
             document_delete,
             document_reindex,
             index_status,
