@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.14](https://github.com/mgd43b/manicule/compare/v0.1.13...v0.1.14) (2026-08-27)
+
+
+### Features
+
+* **api:** resolve a cached document by page id, URI or document id ([#318](https://github.com/mgd43b/manicule/issues/318)) ([46b2338](https://github.com/mgd43b/manicule/commit/46b233830ff83de0e74678a9b17d850f5828f056))
+
 ## [0.1.13](https://github.com/mgd43b/manicule/compare/v0.1.12...v0.1.13) (2026-08-26)
 
 
