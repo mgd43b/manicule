@@ -6028,6 +6028,12 @@ def _normalize_uri(uri: str) -> str:
         # normalization that cannot be wrong.
         return uri
     host = split.hostname or ""
+    if ":" in host:
+        # An IPv6 literal. `hostname` strips the brackets that RFC 3986 §3.2.2 requires in a
+        # netloc, and putting it back unbracketed produces `http://::1:8080/…` — which is not
+        # the same URI, is not a valid one, and would match nothing. Restored before the port
+        # is appended, or the two colons become indistinguishable.
+        host = f"[{host}]"
     if split.port is not None:
         host = f"{host}:{split.port}"
     path = split.path.removesuffix("/") if split.path not in {"", "/"} else split.path

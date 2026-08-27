@@ -183,6 +183,27 @@ def test_a_failure_still_emits_a_parseable_envelope_and_exits_non_zero(
     assert parsed["error"]["type"] == "UnknownEntityError"
 
 
+def test_document_resolve_passes_both_handles_on_so_naming_two_is_refused(
+    bound: ApplicationService,
+) -> None:
+    """A positional handle and `--id` together is a caller error, not a precedence question.
+
+    The command decides which handle the argument *is* from `--source` and from nothing else.
+    Suppressing the uri when `--id` was also given would drop the argument somebody typed and
+    answer from the flag — so `resolve <url> --id <other>` would return a document, plausibly
+    and confidently, for a request that named two different ones. The service already refuses
+    two handles; the command's job is to let it see them.
+    """
+    del bound
+    result = run(["--json", "document", "resolve", "https://wiki.test/a", "--id", "abc123"])
+
+    assert result.exit_code == 1, result.output
+    parsed = json.loads(result.stdout)
+    assert parsed["ok"] is False
+    assert parsed["error"]["type"] == "ValueError"
+    assert "exactly once" in parsed["error"]["message"]
+
+
 def test_a_human_readable_failure_goes_to_stderr(bound: ApplicationService) -> None:
     """``manicule search x | jq`` on a failure reads an empty stream rather than prose."""
     del bound

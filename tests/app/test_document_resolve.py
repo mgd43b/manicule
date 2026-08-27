@@ -43,9 +43,10 @@ WORKSPACE = "default"
 PAGE = "123456"
 CANONICAL = "https://wiki.example.test/wiki/spaces/ENG/pages/123456/Retry-policy"
 BODY = b"<p>The client retries three times, then gives up.</p>"
+"""A Confluence storage-format fragment. Invented here; no real page, no real host."""
+
 VERSION = "47"
 """Confluence's ``version.number`` for the fixture page — a change token, not a credential."""
-"""A Confluence storage-format fragment. Invented here; no real page, no real host."""
 
 
 def _backend(
@@ -154,6 +155,22 @@ async def test_a_url_still_resolves_across_differences_it_cannot_carry_meaning_i
     3986 says none of the three is significant.
     """
     resolved = await _service(_backend()).document_resolve(uri=pasted)
+
+    assert resolved.document.source_id == PAGE
+
+
+async def test_an_ipv6_host_keeps_the_brackets_a_netloc_requires() -> None:
+    """`urlsplit().hostname` strips them, and putting the host back without them is a different URI.
+
+    `http://[::1]:8080/x` reassembled unbracketed is `http://::1:8080/x` — not valid, not the
+    same address, and matching nothing. A self-hosted wiki reached by IPv6 literal is exactly
+    the deployment that would hit it, and the symptom is a resolve that quietly never matches.
+    """
+    backend = _backend(uri="http://[::1]:8080/wiki/pages/123456/Retry-policy")
+
+    resolved = await _service(backend).document_resolve(
+        uri="http://[::1]:8080/wiki/pages/123456/Retry-policy/"
+    )
 
     assert resolved.document.source_id == PAGE
 

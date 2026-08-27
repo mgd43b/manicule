@@ -990,8 +990,13 @@ def document_resolve(
         lambda service: service.document_resolve(
             document_id=document_id,
             source=source,
+            # `--source` decides which handle the argument *is*, and nothing else does.
+            # Suppressing the uri when `--id` was also given would silently drop the argument
+            # somebody typed and answer from the flag instead — turning "you named a document
+            # twice" into a plausible answer about whichever one won. The service refuses two
+            # handles; this passes both so it can.
             source_id=handle if source else None,
-            uri=handle if not source and document_id is None else None,
+            uri=handle if not source else None,
             max_age_s=max_age,
             content=not no_content,
         ),
