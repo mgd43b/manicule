@@ -71,11 +71,20 @@ jobs:
       - name: re-lock the release pull request
         if: ${{ steps.release.outputs.pr }}
         env:
-          # `headBranchName` is the release branch release-please just wrote. Pushing anywhere
-          # else would put the lockfile in a commit the release does not contain.
-          BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          # The whole `pr` output, handed to the shell unparsed. `fromJSON` cannot be used
+          # here the way the two steps above use it: a step's `env` block is evaluated
+          # *before* its `if` is, while `with` is evaluated after. So on any push where
+          # release-please writes no pull request and leaves this output empty — every
+          # `build(deps)` bump, and every release merge, neither of which is a user-facing
+          # commit — `fromJSON('')` raised a template error and failed the job, even
+          # though the step it was attached to was correctly skipped.
+          PR: ${{ steps.release.outputs.pr }}
         run: |
           set -euo pipefail
+          # `headBranchName` is the release branch release-please just wrote. Pushing anywhere
+          # else would put the lockfile in a commit the release does not contain, so `-e` is
+          # what stops a shape change in that output from silently pushing to the wrong place.
+          BRANCH="$(jq -er '.headBranchName' <<<"$PR")"
           uv lock
           if git diff --quiet -- uv.lock; then
             echo "uv.lock already names the bumped version; nothing to do."
