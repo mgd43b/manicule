@@ -915,9 +915,15 @@ class ApplicationService:
         problem = plan_problem(
             limits,
             context_window=generator.context_window,
+            # `base.profile`, not `settings.rag.profile`. The reserve has to describe the run
+            # about to happen, and `history_tokens` is per profile — 512, 1024, 2048. Computed
+            # from the configured default, a `--profile precise` run reserved a kilobyte less
+            # than it would spend, so this check could approve a budget that then overflowed
+            # the window and had the prompt truncated from the front. The same mistake as
+            # `_research_context`'s, which was found and fixed while this one was not.
             reserved=self.settings.rag.context.system_prompt_tokens
             + self.settings.llm.max_tokens
-            + profile_config(self.settings.rag.profile, self.settings.rag.overrides).history_tokens,
+            + profile_config(base.profile, self.settings.rag.overrides).history_tokens,
         )
         if problem:
             raise ConfigError(problem)

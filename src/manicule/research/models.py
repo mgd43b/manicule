@@ -4,11 +4,20 @@ Every type here is frozen and forbids unknown fields, for the reason
 :mod:`manicule.core.retrieval` gives: a payload that silently accepts a misspelled key is a
 payload whose shape nobody can rely on.
 
-**None of these carries passage text.** A :class:`ResearchStep` records what was searched and
-how much came back; the passages themselves live in the ledger and reach a reader only as
-verified citations on the report. That split is the same one
-:class:`~manicule.generation.answers.GenerationTrace` makes, and for the same reason — a record
-of a run that contains the corpus is the leak the record was supposed to help diagnose.
+**Nothing in the *trace* carries passage text**, and :class:`Evidence` is the deliberate
+exception. A :class:`ResearchStep` and a :class:`ResearchTrace` record what was searched and how
+much came back — counts and the queries themselves, never a document — which is the split
+:class:`~manicule.generation.answers.GenerationTrace` makes and for the same reason: a record of
+a run that contains the corpus is the leak the record was supposed to help diagnose.
+
+:class:`Evidence` is the other thing entirely. It is the *payload* of the run rather than a
+record of it, its ``passages`` are whole :class:`~manicule.core.retrieval.Candidate` objects
+including each chunk's text, and they have to be — that text is what the report is assembled
+from and what its citations are verified against. It never reaches a surface: the application
+service consumes it, and what a reader receives is the report and its verified citations.
+Saying so explicitly because the trace's rule and this type's are opposite, and a docstring
+that claimed the rule covered both would be read as license to put an ``Evidence`` somewhere a
+trace may go.
 """
 
 from __future__ import annotations

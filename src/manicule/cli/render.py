@@ -115,9 +115,26 @@ def render_answer(
                 escape(citation.verification),
             )
         out.print(table)
-    elif payload.corpus_consulted:
+    elif payload.ungrounded:
         out.print("[yellow]no citation survived verification[/yellow]")
+    elif payload.corpus_consulted:
+        # Not "nothing survived verification", which is what `ungrounded` means and is a claim
+        # about *checking*. With nothing retrieved, or with passages the model chose not to
+        # cite, there was nothing to check — and telling a reader their citations failed
+        # verification when none were offered sends them looking for a defect that is not there.
+        out.print("[yellow]the answer cited nothing[/yellow]")
 
+    out.print(f"[dim]{' · '.join(_answer_facts(payload))}[/dim]")
+    _render_confidence_reason(out, payload.confidence_band, payload.confidence_reason)
+
+
+def _answer_facts(payload: r.AnswerResultPayload) -> list[str]:
+    """What was true of the run, as the dim line under the answer.
+
+    Split out for the reason ``_research_facts`` was: this function was over the branch limit,
+    and the split falls where the meaning does — above renders the answer and its citations,
+    here is the accounting for how both were produced.
+    """
     facts: list[str] = []
     if not payload.corpus_consulted:
         facts.append("the corpus was not consulted, so this answer carries no citations")
@@ -135,8 +152,7 @@ def render_answer(
     if payload.redacted:
         facts.append("personal data was redacted before sending")
     facts.append(f"{payload.elapsed_ms} ms")
-    out.print(f"[dim]{' · '.join(facts)}[/dim]")
-    _render_confidence_reason(out, payload.confidence_band, payload.confidence_reason)
+    return facts
 
 
 def render_research(
@@ -174,12 +190,34 @@ def render_research(
                 escape(citation.verification),
             )
         out.print(table)
-    elif payload.corpus_consulted:
-        out.print("[yellow]no citation survived verification[/yellow]")
+    else:
+        out.print(f"[yellow]{_nothing_cited(payload)}[/yellow]")
 
     out.print(f"[dim]{' · '.join(_research_facts(payload))}[/dim]")
     if payload.stopped_early:
         out.print(f"[dim]stopped early: {escape(payload.stopped_early)}[/dim]")
+
+
+def _nothing_cited(payload: r.ResearchReportPayload) -> str:
+    """Why a report carries no citations, distinguished rather than guessed at.
+
+    Three different things end here and only one of them is a verification failure.
+    ``ungrounded`` is the real one: passages were read and every marker was deleted. A run whose
+    searches returned nothing, or whose evidence was all withheld by policy, had nothing to
+    check — and telling a reader their citations failed verification sends them looking for a
+    defect that is not there.
+    """
+    if payload.ungrounded:
+        return "no citation survived verification"
+    if not payload.corpus_consulted:
+        return "no search reached the corpus, so this report carries no citations"
+    if not payload.passages_cited:
+        return (
+            "the searches found nothing to read"
+            if not payload.policy_withheld
+            else "every passage the searches found was withheld by policy"
+        )
+    return "the report cited nothing"
 
 
 def _research_facts(payload: r.ResearchReportPayload) -> list[str]:

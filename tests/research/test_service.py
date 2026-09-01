@@ -8,14 +8,34 @@ plausible constants.
 
 from __future__ import annotations
 
-import pytest
+import io
+from typing import cast
 
+import pytest
+from rich.console import Console
+
+from manicule.app import results as r
 from manicule.app.service import ApplicationService
 from manicule.app.tenancy import CrossWorkspaceError
+from manicule.cli.render import render_research
+from manicule.config.profiles import profile_config
 from manicule.core.errors import ConfigError
-from manicule.core.retrieval import Candidate
+from manicule.core.retrieval import Candidate, RetrievalProfile
 from tests.api.support import backend_with_a_document
 from tests.app.fakes import FakeBackend, make_chunk
+
+
+def _rendered(payload: r.ResearchReportPayload) -> str:
+    """What a person actually sees, rather than what a private helper returns.
+
+    Through the public renderer because that is the thing with the defect: a message is only
+    wrong once somebody reads it, and a test that called the helper directly would keep passing
+    if the renderer stopped calling it.
+    """
+    out = Console(file=io.StringIO(), width=200, no_color=True)
+    render_research(out, payload)
+    return cast("io.StringIO", out.file).getvalue()
+
 
 PLAN_TWO = '{"queries": [{"q": "retry policy", "why": "a"}, {"q": "backoff", "why": "b"}]}'
 NO_MORE = '{"queries": []}'
@@ -211,3 +231,61 @@ async def test_a_report_does_not_claim_the_glossary_matched_nothing() -> None:
 
     assert not hasattr(report, "expansions")
     assert not hasattr(report, "explicit_definition")
+
+
+async def test_the_window_check_reserves_the_history_the_run_will_actually_spend() -> None:
+    """`history_tokens` is per profile — 512, 1024, 2048 — so the reserve has to describe the
+    run about to happen rather than the configured default.
+
+    Computed from `settings.rag.profile`, a `--profile precise` run reserved a kilobyte less
+    than it would spend, and this check could therefore approve a budget that then overflowed
+    the window and had the prompt truncated from the front. That is the silent failure the
+    check exists to prevent, arriving through the check itself.
+    """
+    api, backend = service()
+    # Sized so `balanced`'s reserve fits and `precise`'s does not: the two differ by exactly
+    # the 1024 tokens of history the wrong profile would have failed to account for.
+    balanced = profile_config(RetrievalProfile.BALANCED, {})
+    precise = profile_config(RetrievalProfile.PRECISE, {})
+    settings_ = api.settings
+    fixed = (
+        settings_.research.report_tokens
+        + settings_.rag.context.system_prompt_tokens
+        + settings_.llm.max_tokens
+    )
+    backend.generator_.context_window = fixed + balanced.history_tokens
+
+    assert await api.research("q", profile="balanced")
+
+    with pytest.raises(ConfigError, match=r"research\.report_tokens"):
+        await api.research("q", profile="precise")
+
+    assert precise.history_tokens > balanced.history_tokens
+
+
+async def test_a_report_with_nothing_to_read_does_not_claim_verification_failed() -> None:
+    """`ungrounded` means passages were read and every marker was deleted. A run whose searches
+    returned nothing had nothing to check, and telling a reader their citations failed
+    verification sends them looking for a defect that is not there."""
+    api, backend = service()
+    backend.retriever_.candidates = []
+
+    report = await api.research("q")
+
+    assert report.passages_cited == 0
+    assert report.ungrounded is False
+    assert "found nothing to read" in _rendered(report)
+
+
+async def test_a_report_whose_evidence_was_all_withheld_says_that_instead() -> None:
+    """'We found nothing' and 'we found it and did not send it' are different facts, and the
+    second one is the operator's own configuration working."""
+    api, _ = service()
+    report = (await api.research("q")).model_copy(
+        update={"passages_cited": 0, "policy_withheld": 3, "corpus_consulted": True}
+    )
+
+    # The full sentence, not "withheld by policy" — that substring also appears in the facts
+    # line ("3 passage(s) withheld by policy"), so asserting on it passed whatever this
+    # branch returned. Caught by mutation-checking this test rather than by reading it.
+    assert "every passage the searches found was withheld" in _rendered(report)
