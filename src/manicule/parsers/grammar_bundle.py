@@ -784,12 +784,14 @@ def _pack_configuration_restored() -> Generator[None]:
 
     from manicule.parsers import grammars  # noqa: PLC0415 - avoids an import cycle
 
-    # The **base** manicule configured, not `pack.cache_dir()`. Those were the same path
-    # through 1.14 and are not from 1.15, where what is reported is the library directory and
-    # what `configure` takes is the root above the layout. Reading one back as the other
-    # appended the layout again on every restore, so a bundle build left the pack looking one
-    # level deeper than anything has ever written.
-    cache = Path(grammars.configured_base())
+    # Read back from the pack, which is what this restores and what the docstring promises.
+    # It broke on 1.15 because `configure` no longer accepted what `cache_dir()` reports, so
+    # every restore appended the layout again; it is safe once more because `configure_pack`
+    # normalizes a library directory back to the root the pack wants. Reading a remembered
+    # value here instead would restore what *manicule* last configured, and `_answers_for`
+    # reconfigures the pack directly two dozen times per build — so what is in force and what
+    # manicule remembers are not the same thing, and only the first one is the truth.
+    cache = grammars.cache_directory()
     manifest_url = os.environ.get(grammars.MANIFEST_URL_ENV)
     try:
         yield

@@ -711,7 +711,7 @@ def test_configuring_the_pack_with_its_own_reported_directory_does_not_move_it()
     grammars.configure_pack(grammars.DECLARED_LANGUAGES)
     first = grammars.cache_directory()
 
-    grammars.configure_pack(grammars.DECLARED_LANGUAGES, cache_dir=Path(grammars.configured_base()))
+    grammars.configure_pack(grammars.DECLARED_LANGUAGES, cache_dir=first)
 
     assert grammars.cache_directory() == first
 

@@ -110,7 +110,6 @@ __all__ = [
     "bundle_status",
     "cache_directory",
     "configure_pack",
-    "configured_base",
     "grammar_versions",
     "is_available",
     "language_for_media_type",
@@ -128,7 +127,6 @@ __all__ = [
 _supported: frozenset[str] | None = None
 _default_cache_dir: str | None = None
 _pack_layout: tuple[str, ...] | None = None
-_configured_base: str | None = None
 
 MANIFEST_URL_ENV: Final = "TREE_SITTER_LANGUAGE_PACK_MANIFEST_URL"
 """Environment variable the pack reads to locate the grammar manifest.
@@ -545,17 +543,6 @@ def _base_of(resolved: Path) -> str:
     return _without_layout(resolved, library_layout())
 
 
-def configured_base() -> str:
-    """The cache directory manicule last configured, as it was given to the pack.
-
-    Held rather than read back from :func:`cache_directory`, because from pack 1.15 those are
-    two different paths: what is reported is where the libraries are, and what ``configure``
-    takes is the directory above the layout in between. Feeding one back as the other appended
-    the layout a second time and pointed the pack at a directory that has never existed.
-    """
-    return _configured_base if _configured_base is not None else _default_configure_base()
-
-
 def _default_configure_base() -> str:
     """The pack's own per-user cache directory, as ``configure`` would take it.
 
@@ -632,8 +619,6 @@ def configure_pack(
     # module would report a language as available that the new cache does not contain.
     _PARSERS.clear()
     _QUERIES.clear()
-    global _configured_base  # noqa: PLW0603 - what is in force, for `configured_base`
-    _configured_base = _base_of(Path(cache_dir)) if cache_dir is not None else default_cache
 
 
 def is_available(language: str) -> bool:
