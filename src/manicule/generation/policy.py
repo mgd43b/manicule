@@ -167,8 +167,14 @@ def filter_context(
     if not drops:
         return context, ()
     # `token_count` is recomputed rather than carried over: `model_copy` does not re-validate,
-    # so a stale total would over-report the prompt in the trace and in any budget check
-    # downstream of it.
+    # so a stale total would go on describing a context that no longer exists, still counting
+    # the passages this filter has just removed.
+    #
+    # It is the **assembled context's** size and not the prompt's. The prompt is larger — a
+    # system message, the citation protocol, any history and the slot labels are not in this
+    # number — and the estimate that guards the window is taken separately, over the rendered
+    # messages, in `Answerer.answer`. Saying "prompt" here would name the wrong quantity and
+    # invite the next reader to use this one for a budget it does not describe.
     #
     # **In the generator's tokenizer, because that is the one the number is already in.** This
     # summed `Chunk.token_count` until it was noticed that doing so silently changed units:
