@@ -98,13 +98,24 @@ def bundle(tmp_path_factory: pytest.TempPathFactory) -> grammar_bundle.GrammarBu
 
 @pytest.fixture
 def empty_cache(tmp_path: Path) -> Path:
-    """A cache directory with no grammars in it, and no route to fetch any."""
+    """A cache directory with no grammars in it, and no route to fetch any.
+
+    **Where the pack will read**, which is what every user of this fixture means — it seeds into
+    it, lists it, and asserts on the files in it. That is the directory `configure` was given
+    only on packs that impose no layout of their own; from 1.15 it is a versioned subtree below
+    it, and a fixture handing back the configured root would have every one of those assertions
+    looking at an empty parent directory.
+    """
     cache = tmp_path / "cache"
     cache.mkdir()
     grammars.configure_pack(
         grammars.DECLARED_LANGUAGES, cache_dir=cache, manifest_url=UNREACHABLE_MANIFEST
     )
-    return cache
+    # Created, not merely named. Callers list it before seeding to assert it is empty, and on a
+    # pack that imposes a layout the directory it hands back is below the one made above.
+    resolved = grammars.cache_directory()
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
 # --- the air-gapped install ---------------------------------------------------------------
@@ -451,7 +462,7 @@ def test_a_read_only_bundle_is_a_cache_directory_in_its_own_right(
     try:
         grammars.configure_pack(
             grammars.DECLARED_LANGUAGES,
-            cache_dir=read_only / grammar_bundle.LIBRARY_DIR_NAME,
+            cache_dir=grammar_bundle.read(read_only).cache_root,
             manifest_url=UNREACHABLE_MANIFEST,
         )
 
@@ -638,7 +649,7 @@ def test_a_truncated_library_is_refused_when_the_bundle_is_read(
     that costs.
     """
     damaged = _copied_bundle(bundle, tmp_path)
-    library = damaged / grammar_bundle.LIBRARY_DIR_NAME / bundle.grammars["python"].filename
+    library = grammar_bundle.read(damaged).path_for("python")
     library.write_bytes(library.read_bytes()[:1024])
 
     with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
@@ -653,7 +664,7 @@ def test_a_library_missing_from_the_bundle_is_refused_when_it_is_read(
 ) -> None:
     """A manifest is a claim about files; the files are checked against it."""
     damaged = _copied_bundle(bundle, tmp_path)
-    (damaged / grammar_bundle.LIBRARY_DIR_NAME / bundle.grammars["rust"].filename).unlink()
+    grammar_bundle.read(damaged).path_for("rust").unlink()
 
     with pytest.raises(grammar_bundle.GrammarBundleError) as raised:
         grammar_bundle.read(damaged)
@@ -673,7 +684,7 @@ def test_a_library_edited_without_changing_its_length_is_refused_when_it_is_seed
     free and is where the check belongs.
     """
     damaged = _copied_bundle(bundle, tmp_path)
-    library = damaged / grammar_bundle.LIBRARY_DIR_NAME / bundle.grammars["python"].filename
+    library = grammar_bundle.read(damaged).path_for("python")
     content = bytearray(library.read_bytes())
     content[-1] ^= 0xFF
     library.write_bytes(bytes(content))
@@ -696,7 +707,7 @@ def test_verify_reads_every_byte_where_a_read_only_checks_lengths(
     is a library whose length is right and whose content is not.
     """
     damaged = _copied_bundle(bundle, tmp_path)
-    library = damaged / grammar_bundle.LIBRARY_DIR_NAME / bundle.grammars["rust"].filename
+    library = grammar_bundle.read(damaged).path_for("rust")
     content = bytearray(library.read_bytes())
     content[0] ^= 0xFF
     library.write_bytes(bytes(content))
@@ -1118,8 +1129,14 @@ from manicule.parsers import grammar_bundle, grammars
 
 cache = Path.home() / "grammars"
 cache.mkdir(parents=True)
-(cache / f"libtree_sitter_python{grammar_bundle.library_suffix()}").write_bytes(b"not a library")
+# Configured first, then planted where the pack will actually read: from pack 1.15 the
+# libraries sit under a layout below the configured directory, and a file written at the top
+# of it is a file the pack never sees — which would leave this asserting nothing.
 grammars.configure_pack(grammars.DECLARED_LANGUAGES, cache_dir=cache)
+libraries = grammars.cache_directory()
+libraries.mkdir(parents=True, exist_ok=True)
+broken = libraries / f"libtree_sitter_python{grammar_bundle.library_suffix()}"
+broken.write_bytes(b"not a library")
 
 report = {"reported_as_present": grammars.is_available("python")}
 try:

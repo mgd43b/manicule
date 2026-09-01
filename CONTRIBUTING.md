@@ -8,17 +8,30 @@ A change is done when every one of these is true. Not most of them.
 2. **`pyright` passes in strict mode.** No new `# pyright: ignore` without a comment on the
    same line saying why the checker is wrong.
 3. **`pytest` passes**, with tests at the levels described below.
-4. **CI is green on the pull request.** Not "green except the flaky one" — a test that fails
+4. **A test written to pin a fix has been shown to fail against the unfixed code.** Revert
+   the change, watch the new test go red, put it back. Not for every test — for the ones
+   whose whole purpose is that a specific defect cannot return.
+
+   This is a rule because the failure it catches is invisible by reading. A test can exercise
+   a pure function while the defect is in the wiring; it can assert a substring that also
+   appears somewhere else on the page; it can plant a fixture where the code under test no
+   longer looks. All three have happened here, all three read as careful tests, and all three
+   passed against the bug they were written for. It is the same shape as a skipped
+   conformance suite reporting green, a link checker exiting zero having checked nothing, and
+   a pre-seed succeeding against an empty cache — each of which this repository already
+   spends a CI job or a test defending against. A test that has only ever passed is not
+   evidence that it can fail.
+5. **CI is green on the pull request.** Not "green except the flaky one" — a test that fails
    intermittently is a bug in the test, and it is fixed in the same change.
-5. **`/code-review high` has been run against the pull request and every finding is
+6. **`/code-review high` has been run against the pull request and every finding is
    resolved in that same pull request.** Not noted, not filed — fixed. If the review is
    unavailable, run `/security-review` or `/review` instead and say in the pull request
    which one you actually ran. A review that did not happen is never reported as clean.
-6. **No new `TODO`, `FIXME` or `XXX`.** Ruff fails the build on them. If it is worth
+7. **No new `TODO`, `FIXME` or `XXX`.** Ruff fails the build on them. If it is worth
    marking, it is worth doing; if it is not worth doing, delete the comment.
-7. **The documents still describe the code.** A change that makes a document wrong fixes the
+8. **The documents still describe the code.** A change that makes a document wrong fixes the
    document.
-8. **The pull request title is a Conventional Commit.** `fix: keep the previous revision
+9. **The pull request title is a Conventional Commit.** `fix: keep the previous revision
    searchable after a failed refresh`, not `Fix the refresh bug`. This is not a style rule:
    the repository squash-merges, so the title *is* the commit on `main`, and release-please
    reads it to decide the next version and write the changelog. A title it cannot parse is a

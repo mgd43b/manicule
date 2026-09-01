@@ -230,9 +230,36 @@ class GrammarBundle:
     grammars: Mapping[str, BundledGrammar]
 
     @property
-    def library_dir(self) -> Path:
-        """Where the libraries are. Also a valid pack cache directory, read-only included."""
+    def cache_root(self) -> Path:
+        """What to hand the pack so it reads this bundle. Read-only included.
+
+        Unchanged since the bundle format was written, and deliberately: this is the directory
+        a read-only deployment points ``rag.grammar_cache`` at, and moving it would strand every
+        bundle already shipped.
+        """
         return self.root / LIBRARY_DIR_NAME
+
+    @property
+    def library_dir(self) -> Path:
+        """Where the library files actually sit, under whatever layout the pack imposes.
+
+        **The bundle carries the pack's own layout rather than fighting it.** Through 1.14 the
+        pack read the directory it was given and this is :attr:`cache_root` itself, which is the
+        format every existing bundle is written in. From 1.15 the pack reads
+        ``tree-sitter-language-pack/v<release>/libs`` beneath what it is given, so the libraries
+        go there — and :attr:`cache_root` keeps working as a cache directory without the caller
+        changing, without a copy, and on a filesystem nobody can write to.
+
+        That makes a bundle version-scoped from 1.15, which is upstream's own decision rather
+        than one taken here: it versions its cache path because a grammar library compiled for
+        one release is not the same artifact as one compiled for another. A bundle written under
+        an older pack still *seeds* — :meth:`path_for` reports what is missing rather than
+        guessing — it simply cannot serve as a cache in place for a pack that wants a layout it
+        was written before.
+        """
+        from manicule.parsers.grammars import library_layout  # noqa: PLC0415 - import cycle
+
+        return self.cache_root.joinpath(*library_layout())
 
     @property
     def languages(self) -> tuple[str, ...]:
@@ -652,14 +679,19 @@ def build(
         GrammarBundleError: The pack's license is not redistributable, ``source`` holds no
             library for a requested language, or the bundle fails to read back.
     """
-    from manicule.parsers.grammars import validate_languages  # noqa: PLC0415 - import cycle
+    from manicule.parsers.grammars import (  # noqa: PLC0415 - import cycle
+        library_layout,
+        validate_languages,
+    )
 
     wanted = validate_languages(languages)
     # Not ``license``: that is a Python builtin, and ruff's A001 refuses to let it be shadowed.
     declared = check_license(license_of_installed_pack())
     found = _discover_libraries(wanted, source)
 
-    library_dir = destination / LIBRARY_DIR_NAME
+    # Under the pack's layout, so `<destination>/libs` stays the directory a read-only host
+    # points the pack at while the files sit where that pack will actually look for them.
+    library_dir = destination.joinpath(LIBRARY_DIR_NAME, *library_layout())
     library_dir.mkdir(parents=True, exist_ok=True)
     entries: dict[str, BundledGrammar] = {}
     for language in wanted:
@@ -747,8 +779,17 @@ def _answers_for(candidate: Path, language: str) -> bool:
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - a parsing extra, not core
 
+    from manicule.parsers import grammars  # noqa: PLC0415 - avoids an import cycle
+
     with tempfile.TemporaryDirectory() as directory:
-        probe = Path(directory) / candidate.name
+        # Under the pack's own layout, not directly in the configured directory. From 1.15 a
+        # configured directory is the root the pack builds `tree-sitter-language-pack/v…/libs`
+        # beneath, so a library placed at the top of it is a library the pack never sees — and
+        # this probe would then answer "no" for every candidate, which reads as a grammar pack
+        # that has stopped shipping grammars.
+        root = Path(directory).joinpath(*grammars.library_layout())
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / candidate.name
         try:
             probe.symlink_to(candidate)
         except OSError:  # pragma: no cover - filesystems without symlinks
@@ -772,11 +813,17 @@ def _pack_configuration_restored() -> Generator[None]:
     built a bundle would silently be moved back to the per-user cache, and would look for its
     grammars somewhere they have never been.
     """
-    import tree_sitter_language_pack as pack  # noqa: PLC0415 - a parsing extra, not core
 
     from manicule.parsers import grammars  # noqa: PLC0415 - avoids an import cycle
 
-    cache = Path(pack.cache_dir())
+    # Read back from the pack, which is what this restores and what the docstring promises.
+    # It broke on 1.15 because `configure` no longer accepted what `cache_dir()` reports, so
+    # every restore appended the layout again; it is safe once more because `configure_pack`
+    # normalizes a library directory back to the root the pack wants. Reading a remembered
+    # value here instead would restore what *manicule* last configured, and `_answers_for`
+    # reconfigures the pack directly two dozen times per build — so what is in force and what
+    # manicule remembers are not the same thing, and only the first one is the truth.
+    cache = grammars.cache_directory()
     manifest_url = os.environ.get(grammars.MANIFEST_URL_ENV)
     try:
         yield
