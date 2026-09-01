@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.15](https://github.com/mgd43b/manicule/compare/v0.1.14...v0.1.15) (2026-09-01)
+
+
+### Features
+
+* answer a question from several searches with `research` ([#326](https://github.com/mgd43b/manicule/issues/326)) ([fc0d702](https://github.com/mgd43b/manicule/commit/fc0d702f79d8dd0c4fd58659afec13b99e633a2d))
+
+
+### Bug Fixes
+
+* follow the grammar pack when a configured cache stopped being the library directory ([#328](https://github.com/mgd43b/manicule/issues/328)) ([e594a99](https://github.com/mgd43b/manicule/commit/e594a99f60fa783e049e7d39454ca3fbb37aa256))
+* stop a policy drop silently changing the context's tokenizer ([#325](https://github.com/mgd43b/manicule/issues/325)) ([21e9114](https://github.com/mgd43b/manicule/commit/21e9114c76bc0349509ffde157cb64d0f87526ea))
+* stop a takeover test racing the machine it runs on ([#329](https://github.com/mgd43b/manicule/issues/329)) ([4a312fb](https://github.com/mgd43b/manicule/commit/4a312fb6e2cbf189af1eb23ff53acfa4b73b320c))
+* use a renewed browser session without a restart, and install the host for the right workspace ([#330](https://github.com/mgd43b/manicule/issues/330)) ([0f36215](https://github.com/mgd43b/manicule/commit/0f36215a175049d1e183f018a2e835452ba3d45b))
+
 ## [0.1.14](https://github.com/mgd43b/manicule/compare/v0.1.13...v0.1.14) (2026-08-27)
 
 
