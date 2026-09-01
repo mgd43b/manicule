@@ -8,12 +8,19 @@ tries to change scope, and when a generator cannot be given a prompt at all.
 
 from __future__ import annotations
 
+from typing import override
+
 import pytest
 
 from manicule.config.profiles import profile_config
-from manicule.core.errors import ConfigError
+from manicule.config.settings import Settings
+from manicule.core.errors import ConfigError, ManiculeError
 from manicule.core.retrieval import Filter, Query, RetrievalProfile
+from manicule.generation.policy import EgressPolicy
+from manicule.generation.redaction import Redactor
 from manicule.research.loop import ResearchLoop, plan_problem, report_overrides
+from manicule.retrieval.retriever import RetrievalResult
+from tests.generation.fakes import settings
 from tests.research.fakes import (
     PromptlessGenerator,
     ScriptedGenerator,
@@ -30,12 +37,17 @@ NO_MORE = '{"queries": []}'
 def loop(
     generator: ScriptedGenerator | PromptlessGenerator,
     retriever: ScriptedRetriever,
+    *,
+    config: Settings | None = None,
     **overrides: object,
 ) -> ResearchLoop:
+    resolved = config or settings()
     return ResearchLoop(
         generator=generator,
         retriever=retriever,
         limits=limits(**overrides),
+        policy=EgressPolicy.of(resolved),
+        redactor=Redactor(resolved.security.data_policy.auto_redact),
     )
 
 
@@ -318,3 +330,85 @@ def test_the_report_profile_keeps_an_operators_own_overrides() -> None:
     )
 
     assert overrides["min_score"] == 0.7
+
+
+# --- what the review found ---------------------------------------------------------------------
+
+
+async def test_a_failing_retrieval_surfaces_as_itself_rather_than_an_exception_group() -> None:
+    """`TaskGroup` wraps even a single failure, and `ExceptionGroup` is a type no surface catches.
+
+    `run_op` and the command line both catch `(ManiculeError, ValueError, OSError)`. A wrapped
+    store timeout escaped all three surfaces as an unhandled 500 with no envelope — the one
+    response shape the API guarantees — while the identical failure under `ask` produced a clean
+    `ok: false`.
+    """
+
+    class Failing(ScriptedRetriever):
+        @override
+        async def retrieve(self, query: Query) -> RetrievalResult:
+            msg = "the vector store timed out"
+            raise ManiculeError(msg)
+
+    generator = ScriptedGenerator(replies=[PLAN_TWO, NO_MORE])
+
+    with pytest.raises(ManiculeError, match="timed out"):
+        await loop(generator, Failing()).run("q", query())
+
+
+async def test_a_planning_prompt_is_redacted_before_it_is_sent() -> None:
+    """The question is the channel a person types a customer's email address into, and a
+    planning call is the first prompt of every run. The answer path redacts `query.text` on
+    every prompt it builds; this one would otherwise be the only one that did not."""
+    config = settings(
+        llm={"provider": "openai", "model": "gpt-4o-mini"},
+        providers={"openai": {"api_key": "k"}},
+        security={"data_policy": {"auto_redact": {"enabled": True, "patterns": ("email",)}}},
+    )
+    generator = ScriptedGenerator(replies=[PLAN_TWO, NO_MORE])
+
+    evidence = await loop(
+        generator, ScriptedRetriever(default=[candidate("c1")]), config=config
+    ).run("who owns oncall@example.invalid?", query())
+
+    assert generator.seen, "the planner was never called"
+    assert "oncall@example.invalid" not in str(generator.seen)
+    # Twice: the question is carried by the plan prompt and again by the gap prompt, and each
+    # is redacted on its way out rather than once at the top and trusted thereafter.
+    assert evidence.trace.redactions == {"email": 2}
+
+
+async def test_nothing_is_redacted_when_nothing_leaves_the_machine() -> None:
+    """A fully local install pays nothing, which is the whole shape of the redaction feature."""
+    generator = ScriptedGenerator(replies=[PLAN_TWO, NO_MORE])
+
+    evidence = await loop(generator, ScriptedRetriever(default=[candidate("c1")])).run(
+        "who owns oncall@example.invalid?", query()
+    )
+
+    assert evidence.trace.redactions == {}
+
+
+async def test_a_cycle_that_ran_no_searches_is_not_counted() -> None:
+    """Incrementing before the deadline check made `cycles_run` contradict `steps` and
+    `stopped_early` in the same trace."""
+    generator = ScriptedGenerator(replies=['{"queries": [{"q": "one"}]}'] * 5)
+    retriever = ScriptedRetriever(default=[candidate("c1")], delay_s=0.05)
+
+    evidence = await loop(generator, retriever, max_cycles=5, timeout_s=0.01).run("q", query())
+
+    assert evidence.trace.cycles_run == len({step.cycle for step in evidence.trace.steps})
+
+
+async def test_a_repeat_differing_only_in_whitespace_is_still_a_repeat() -> None:
+    """The fallback puts the raw question into the asked set while every proposed query has
+    been whitespace-collapsed, so comparing on case alone let a repeat through and spent a
+    whole cycle re-running a finished search."""
+    generator = ScriptedGenerator(
+        replies=['{"queries": [{"q": "retry  policy"}]}', '{"queries": [{"q": "retry policy"}]}']
+    )
+    retriever = ScriptedRetriever(default=[candidate("c1")])
+
+    evidence = await loop(generator, retriever, max_cycles=3).run("q", query())
+
+    assert len(evidence.trace.steps) == 1

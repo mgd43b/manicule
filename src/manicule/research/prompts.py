@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from typing import cast
 
 from manicule.generation.prompt import ChatMessage
@@ -116,15 +117,29 @@ def parse_queries(reply: str, *, limit: int) -> tuple[tuple[str, str], ...]:
     Tolerant on purpose. A model that fences its JSON, prefixes it with "Here is the plan:", or
     returns a bare list instead of an object is the ordinary case rather than a failure, and a
     parser that raised on any of them would make the feature fail most of the time. What it will
-    not do is guess: a reply with no recognizable JSON object yields an empty tuple, and the
-    caller falls back to searching the original question — a fact it records rather than hides.
+    not do is guess: a reply with no recognizable plan yields an empty tuple, and the caller
+    falls back to searching the original question — a fact it records rather than hides.
+
+    **Every JSON value in the reply is tried, not just the first one that decodes.** The
+    instructions above end with an example object, and a model that echoes the shape before
+    answering — which is common, and exactly the non-compliance this parser exists to
+    tolerate — puts a decodable but empty object in front of the real plan. Stopping at the
+    first decodable value read the echo, found no queries, and gave up two lines short of the
+    answer: the run then degraded to a single search, and on a gap call reported
+    ``stopped_early`` for a reason that was not true.
 
     Deduplicated case-insensitively, because a model asked for several angles on one question
     returns the same angle twice more often than it returns none.
     """
-    payload = _first_json_object(reply)
-    if payload is None:
-        return ()
+    for payload in _json_values(reply):
+        found = _queries_in(payload, limit=limit)
+        if found:
+            return found
+    return ()
+
+
+def _queries_in(payload: object, *, limit: int) -> tuple[tuple[str, str], ...]:
+    """The usable ``(query, reason)`` pairs in one decoded JSON value."""
     raw: object = (
         cast("dict[str, object]", payload).get("queries") if isinstance(payload, dict) else payload
     )
@@ -149,20 +164,28 @@ def parse_queries(reply: str, *, limit: int) -> tuple[tuple[str, str], ...]:
 def _one(item: object) -> tuple[str, str]:
     """One list element as ``(query, reason)``, or ``("", "")`` if it is not usable."""
     if isinstance(item, str):
-        return _clean(item), ""
+        return normalize_query(item), ""
     if not isinstance(item, dict):
         return "", ""
     entry = cast("dict[str, object]", item)
     for key in ("q", "query", "question", "text"):
         value = entry.get(key)
-        if isinstance(value, str) and _clean(value):
+        if isinstance(value, str) and normalize_query(value):
             reason = entry.get("why") or entry.get("reason") or ""
-            return _clean(value), _clean(reason) if isinstance(reason, str) else ""
+            return (
+                normalize_query(value),
+                normalize_query(reason) if isinstance(reason, str) else "",
+            )
     return "", ""
 
 
-def _clean(text: str) -> str:
-    """One line, trimmed, and empty when it is too long to be a query."""
+def normalize_query(text: str) -> str:
+    """One line, trimmed, and empty when it is too long to be a query.
+
+    Public because the loop compares an already-asked search against a newly-proposed one, and
+    two normalizations of one string are two rules that will disagree — which is how a query
+    differing only in internal whitespace slipped past the repeat guard.
+    """
     collapsed = " ".join(text.split())
     return "" if len(collapsed) > MAX_SUB_QUESTION_LEN else collapsed
 
@@ -170,14 +193,17 @@ def _clean(text: str) -> str:
 _OBJECT = re.compile(r"[{\[]")
 
 
-def _first_json_object(reply: str) -> object:
-    """The first JSON value in a reply, or ``None``.
+def _json_values(reply: str) -> Iterator[object]:
+    """Every JSON value in a reply, in the order they appear.
 
     Scans for an opening brace or bracket and hands the tail to
     :meth:`json.JSONDecoder.raw_decode`, which stops at the end of the first complete value and
     reports where. That is what makes trailing prose harmless without a second parser: the
     decoder itself decides where the JSON ended, rather than a regular expression guessing at
     the matching brace and getting it wrong on the first nested object.
+
+    A generator rather than a single value, so the caller can skip a decodable object that
+    holds no plan and keep looking — see :func:`parse_queries`.
     """
     decoder = json.JSONDecoder()
     for match in _OBJECT.finditer(reply):
@@ -185,14 +211,14 @@ def _first_json_object(reply: str) -> object:
             value, _ = decoder.raw_decode(reply[match.start() :])
         except ValueError:
             continue
-        return value
-    return None
+        yield value
 
 
 __all__ = [
     "MAX_SUB_QUESTION_LEN",
     "RESEARCH_SYSTEM_PROMPT",
     "gap_messages",
+    "normalize_query",
     "parse_queries",
     "plan_messages",
 ]

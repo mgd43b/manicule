@@ -109,6 +109,12 @@ class ResearchTrace(BaseModel):
         description="Why the loop stopped before its cycle budget, or empty. A bound that was "
         "reached is not the same fact as a loop that ran out of things to ask.",
     )
+    redactions: dict[str, int] = Field(
+        default_factory=dict[str, int],
+        description="Detector name to match count, over the planning prompts. **Names, never "
+        "values** — recording what a detector matched turns the record into the leak the "
+        "detector existed to prevent.",
+    )
     elapsed_ms: int = Field(default=0, ge=0)
 
 

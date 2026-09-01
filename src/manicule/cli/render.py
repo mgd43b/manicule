@@ -148,7 +148,6 @@ def render_research(
     multi-search report needs to see which angles it took — a report that missed the obvious
     question is only visible if the questions it did ask are on the page.
     """
-    _render_glossary(out, payload.expansions, payload.conflicts)
     if payload.text and not text_already_shown:
         out.print(Panel(Text(payload.text), title="report", border_style="cyan"))
     if payload.error:
@@ -192,7 +191,9 @@ def _research_facts(payload: r.ResearchReportPayload) -> list[str]:
     """
     facts: list[str] = []
     if not payload.model_planned:
-        facts.append("[yellow]planning returned nothing usable; searched the question as asked")
+        facts.append(
+            "[yellow]planning returned nothing usable; searched the question as asked[/yellow]"
+        )
     if not payload.corpus_consulted:
         facts.append("the searches found nothing, so this report carries no citations")
     if payload.ungrounded:
@@ -208,7 +209,9 @@ def _research_facts(payload: r.ResearchReportPayload) -> list[str]:
         facts.append(f"{payload.dropped} citation(s) dropped")
     if payload.context_truncated:
         facts.append("evidence truncated to fit the model's window")
-    if payload.redacted:
+    if payload.policy_withheld:
+        facts.append(f"{payload.policy_withheld} passage(s) withheld by policy")
+    if payload.redacted or payload.redactions:
         facts.append("personal data was redacted before sending")
     facts.append(f"{payload.elapsed_ms} ms")
     return facts

@@ -379,7 +379,7 @@ incremental walk, and is not the same claim as `false`. Absent `enumeration_offs
 corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The forty-three tools read
+assistant can call unattended should not be able to do any of that. The forty-four tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
 surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
 `collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
@@ -407,7 +407,7 @@ secret as a parameter, and a session cookie in a tool call is a session cookie i
 ### 4.1 What each tool says it does, and why that is not permission
 
 Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
-`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-six of the forty-three say they only
+`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-six of the forty-four say they only
 read.
 
 **They are a description, and nothing in manicule reads them back.** No tool is gated on its own
@@ -585,9 +585,15 @@ Each citation carries `slot`, `document_id`, `chunk_id`, `uri`, `title`, `headin
 
 ### `research` → `ResearchReportPayload`
 
-Everything `ask` reports plus the record of how the evidence was gathered: `sub_questions[]`,
-`planned`, `model_planned`, `cycles_run`, `cycles_allowed`, `stopped_early`, `passages_found`,
-`passages_cited`, `corroborated`, `model_calls`.
+Everything `ask` reports about the *answer*, plus the record of how the evidence was gathered:
+`sub_questions[]`, `planned`, `model_planned`, `cycles_run`, `cycles_allowed`, `stopped_early`,
+`passages_found`, `passages_cited`, `policy_withheld`, `corroborated`, `model_calls`,
+`redactions`.
+
+**It is deliberately not `Glossed`.** A run makes several retrievals, so it has several glossary
+stories rather than one, and `explicit_definition` is a claim about *the* query that cannot be
+made about a set of them. Publishing the three fields and populating none would be worse than
+omitting them: an empty `expansions` is a positive assertion that no term fired.
 
 The citation fields mean exactly what they mean on `ask`, because the report is produced by the
 same answer path over a wider context — `dropped` still counts markers that failed verification
@@ -595,9 +601,11 @@ and were deleted, `ungrounded` still means the context was non-empty and nothing
 
 Four of the run fields are separate claims and are never combined:
 
-- `passages_found` is what the searches turned up; `passages_cited` is how many of those fit the
-  report's context and were numbered. The gap between them is evidence the report could not
-  read, and a single number would hide it.
+- `passages_found` is what the searches turned up; `passages_cited` is how many of those the
+  report was actually given, counted **after** the egress filter; `policy_withheld` is how many
+  the data policy would not let leave the machine. Three numbers because "we did not find it",
+  "it did not fit" and "we found it and did not send it" are three different facts, and the last
+  one is the operator's own configuration working.
 - `corroborated` counts cited passages that **more than one** sub-question retrieved. It is
   agreement between searches, and it is deliberately not folded into `confidence`, which
   describes one retrieval's ranking and is reported per sub-question. There is no run-level

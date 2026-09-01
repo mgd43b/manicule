@@ -71,7 +71,10 @@ async def test_the_bounds_are_reported_alongside_what_was_spent() -> None:
 
     assert report.cycles_allowed == api.settings.research.max_cycles
     assert report.cycles_run >= 1
-    assert report.model_calls >= 1
+    # Exact, not `>= 1`: the field is documented as the loop's own planning calls, counted so
+    # that it and the answer never double-count one model call — and `>= 1` holds for any
+    # non-zero constant, including one that silently included the report's own generation.
+    assert report.model_calls == 2
     assert "no further searches" in report.stopped_early
 
 
@@ -182,3 +185,29 @@ async def test_the_report_widens_the_profile_the_query_actually_runs_under() -> 
     assert report.passages_cited == 10, (
         "the report read the passages a `balanced` run would, not the `precise` one asked for"
     )
+
+
+async def test_a_run_whose_searches_found_nothing_still_consulted_the_corpus() -> None:
+    """'We did not look' and 'we looked and there is nothing' are different claims, and `ask`
+    keeps them apart. Reporting the first when the second happened tells a reader the report
+    could not have had citations, when in fact the corpus simply does not cover the question."""
+    api, backend = service()
+    backend.retriever_.candidates = []
+
+    report = await api.research("q")
+
+    assert report.passages_found == 0
+    assert report.corpus_consulted is True
+
+
+async def test_a_report_does_not_claim_the_glossary_matched_nothing() -> None:
+    """The payload used to extend `Glossed` and populate none of it, so every report positively
+    asserted that no term fired — including runs whose sub-questions were expanded. A run has
+    several retrievals and therefore several glossary stories; publishing one empty triple is a
+    claim it cannot support."""
+    api, _ = service()
+
+    report = await api.research("q")
+
+    assert not hasattr(report, "expansions")
+    assert not hasattr(report, "explicit_definition")

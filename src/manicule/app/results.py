@@ -689,14 +689,21 @@ class ResearchSubQuestion(Payload):
     routed_away: bool = False
 
 
-class ResearchReportPayload(Glossed):
+class ResearchReportPayload(Payload):
     """What ``research`` produced.
 
-    A superset of ``ask``'s claims plus the record of how the evidence was gathered. Everything
-    ``ask`` reports about citations means the same thing here, because the report is produced by
-    the same answer path over a wider context — ``dropped`` still counts markers that failed
-    verification and were deleted, and ``ungrounded`` still means the context was non-empty and
-    nothing survived.
+    Everything ``ask`` reports about citations means the same thing here, because the report is
+    produced by the same answer path over a wider context — ``dropped`` still counts markers
+    that failed verification and were deleted, and ``ungrounded`` still means the context was
+    non-empty and nothing survived.
+
+    **Deliberately not** :class:`Glossed`. A run makes several retrievals, so it has several
+    glossary stories rather than one, and ``explicit_definition`` is a claim about *the* query
+    that cannot be made about a set of them. Extending ``Glossed`` published the three fields
+    and populated none, which is worse than omitting them: an empty ``expansions`` is a positive
+    assertion that no term fired, and it was made on every report including the ones whose
+    sub-questions were expanded. Carrying the union is a real thing to want and it is deferred
+    in ``docs/research.md`` §9 rather than faked here.
 
     Three numbers describe the *run* rather than the answer, and none of them is folded into
     ``confidence``: :attr:`passages_found` is what the searches turned up, :attr:`passages_cited`
@@ -738,6 +745,20 @@ class ResearchReportPayload(Glossed):
         ge=0,
         description="Planning calls the loop made. The report's own generation is not counted "
         "here, so this and the answer never double-count one model call.",
+    )
+    policy_withheld: int = Field(
+        default=0,
+        ge=0,
+        description="Passages the searches found and the data policy would not let leave this "
+        "machine. Counted separately from ``passages_found`` and ``passages_cited`` because "
+        "'we did not find it' and 'we found it and did not send it' are different facts, and "
+        "the second one is the operator's own configuration working.",
+    )
+    redactions: int = Field(
+        default=0,
+        ge=0,
+        description="Detector matches removed from the planning prompts before they were sent. "
+        "A count, never what matched.",
     )
     corpus_consulted: bool = True
     ungrounded: bool = False

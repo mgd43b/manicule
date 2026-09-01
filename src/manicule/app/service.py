@@ -895,6 +895,8 @@ class ApplicationService:
             AnswerResult,
             answering,
         )
+        from manicule.generation.policy import EgressPolicy  # noqa: PLC0415 - see above
+        from manicule.generation.redaction import Redactor  # noqa: PLC0415 - see above
         from manicule.research.ledger import corroborated  # noqa: PLC0415 - see above
         from manicule.research.loop import ResearchLoop, plan_problem  # noqa: PLC0415 - see above
 
@@ -920,17 +922,26 @@ class ApplicationService:
         if problem:
             raise ConfigError(problem)
 
-        evidence = await ResearchLoop(generator=generator, retriever=retriever, limits=limits).run(
-            question, base
-        )
+        evidence = await ResearchLoop(
+            generator=generator,
+            retriever=retriever,
+            limits=limits,
+            policy=EgressPolicy.of(self.settings, self.workspace),
+            redactor=Redactor(self.settings.security.data_policy.auto_redact),
+        ).run(question, base)
         documents = await self._require_scoped_chunks(
             candidate.chunk for candidate in evidence.passages
         )
         context = _research_context(self.settings, base, evidence.passages, limits)
 
-        request = AnswerRequest(
-            query=base, context=context, corpus_consulted=bool(context.passages)
-        )
+        # **Did we look**, not did we find. `bool(context.passages)` conflated the two claims
+        # `ask` keeps apart: a run whose searches all returned nothing would have reported "the
+        # corpus was not consulted", which is what a directly-routed question reports and is a
+        # different statement about the world. A sub-question the router answered without
+        # retrieving contributes nothing, which is why this reads `routed_away` rather than a
+        # count of passages.
+        consulted = any(not step.routed_away for step in evidence.trace.steps)
+        request = AnswerRequest(query=base, context=context, corpus_consulted=consulted)
         result = AnswerResult()
         envelope: AnswerEnvelope | None = None
         async with answering(answerer, request, result) as events:
@@ -942,6 +953,13 @@ class ApplicationService:
         if envelope is None:  # pragma: no cover - the answer path always ends with `final`
             msg = "the research report ended without a final event"
             raise ManiculeError(msg)
+        # Counted **after** the egress filter, not from the assembled context. `Answerer` drops
+        # passages the data policy forbids sending, so counting what was assembled reports
+        # evidence the model was never given — and reports it as evidence the report was built
+        # from. The dropped chunk ids are on the trace, which is the only place the post-filter
+        # set can be recovered from out here.
+        withheld = {drop.chunk_id for drop in result.trace.policy_dropped}
+        sent = tuple(passage for passage in context.passages if passage.chunk.id not in withheld)
         return r.ResearchReportPayload(
             question=question,
             text=envelope.text,
@@ -980,8 +998,10 @@ class ApplicationService:
             cycles_allowed=evidence.trace.cycles_allowed,
             stopped_early=evidence.trace.stopped_early,
             passages_found=evidence.trace.passages_found,
-            passages_cited=len(context.passages),
-            corroborated=corroborated(context.passages, evidence.support),
+            passages_cited=len(sent),
+            corroborated=corroborated(sent, evidence.support),
+            policy_withheld=len(withheld),
+            redactions=sum(evidence.trace.redactions.values()),
             model_calls=evidence.trace.model_calls,
             corpus_consulted=envelope.corpus_consulted,
             ungrounded=envelope.ungrounded,

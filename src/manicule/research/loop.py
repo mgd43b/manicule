@@ -12,6 +12,13 @@ passage. What the loop sends a model is the question, the list of searches it ha
 and how many passages came back — counts, not corpus. So the two prompts here are cheap, they
 cannot leak a document a policy would have refused, and the thing the model is deciding is
 which query to run next rather than what the evidence means.
+
+**They are redacted all the same.** A planning prompt carries no passage, but it carries the
+question — which is the channel a person types a customer's email address into — and the
+sub-questions a model wrote *from* that question, which inherit whatever was in it. The answer
+path redacts ``request.query.text`` on every prompt it builds; a planning call that skipped it
+would be the one prompt on the egress path that went out in the clear, and it would be the
+first prompt of every run.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import asyncio
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from pydantic import JsonValue
 
@@ -28,7 +36,9 @@ from manicule.core.errors import ConfigError, ManiculeError
 from manicule.core.protocols import Generator, generating
 from manicule.core.retrieval import Candidate, Context, Filter, Query
 from manicule.generation.answering import accepted_extras
+from manicule.generation.policy import EgressPolicy
 from manicule.generation.prompt import ChatMessage
+from manicule.generation.redaction import Redactor
 from manicule.research.config import ResearchLimits
 from manicule.research.ledger import EvidenceLedger
 from manicule.research.models import (
@@ -39,7 +49,12 @@ from manicule.research.models import (
     SubQuestion,
 )
 from manicule.research.ports import Retrieving
-from manicule.research.prompts import gap_messages, parse_queries, plan_messages
+from manicule.research.prompts import (
+    gap_messages,
+    normalize_query,
+    parse_queries,
+    plan_messages,
+)
 
 
 def plan_problem(limits: ResearchLimits, *, context_window: int, reserved: int) -> str:
@@ -62,6 +77,18 @@ def plan_problem(limits: ResearchLimits, *, context_window: int, reserved: int) 
         f"by the profile's own startup check. Lower research.report_tokens, or configure a "
         f"model with a larger window."
     )
+
+
+def _first_leaf(failures: BaseExceptionGroup[BaseException]) -> BaseException:
+    """The first non-group exception inside a possibly-nested group.
+
+    A ``TaskGroup`` may nest groups when a child is itself a group, so this walks rather than
+    indexing ``exceptions[0]``. There is always at least one leaf: a group cannot be empty.
+    """
+    first = failures.exceptions[0]
+    while isinstance(first, BaseExceptionGroup):
+        first = cast("BaseExceptionGroup[BaseException]", first).exceptions[0]
+    return first
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,12 +115,17 @@ class ResearchLoop:
         generator: Generator,
         retriever: Retrieving,
         limits: ResearchLimits,
+        policy: EgressPolicy,
+        redactor: Redactor,
     ) -> None:
         self._generator = generator
         self._retriever = retriever
         self._limits = limits
+        self._policy = policy
+        self._redactor = redactor
         self._extras = accepted_extras(generator)
         self._calls = 0
+        self._redactions: dict[str, int] = {}
 
     async def run(self, question: str, base: Query) -> Evidence:
         """Plan, search, and keep searching while the budget and the findings justify it.
@@ -120,13 +152,17 @@ class ResearchLoop:
         stopped = ""
 
         while pending and cycle < self._limits.max_cycles:
-            cycle += 1
+            # The deadline is checked *before* the counter moves. Incrementing first made
+            # `cycles_run` count a cycle that ran no retrievals, so the trace contradicted its
+            # own `steps` and its own `stopped_early` in the same breath.
             if time.monotonic() >= deadline:
                 stopped = "the run reached research.timeout_s before this cycle started"
                 break
+            cycle += 1
             found = await self._search(pending, base)
             for outcome in found:
-                fresh = 0 if outcome.routed_away else ledger.add(outcome.candidates)
+                added = ledger.add(outcome.candidates)
+                fresh = 0 if outcome.routed_away else added
                 asked.append(outcome.question.text)
                 steps.append(
                     ResearchStep(
@@ -165,6 +201,7 @@ class ResearchLoop:
                 passages_found=len(passages),
                 model_calls=self._calls,
                 stopped_early=stopped,
+                redactions=dict(self._redactions),
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             ),
         )
@@ -215,11 +252,16 @@ class ResearchLoop:
                 limit=self._limits.max_sub_questions,
             )
         )
-        already = {text.casefold() for text in asked}
+        # Compared after the same normalization the parser applies, because that is what
+        # every proposed query has already been through — and `_plan`'s fallback puts the
+        # *raw* question in `asked`, so a comparison on `casefold` alone let a query that
+        # differed only in internal whitespace spend a whole cycle re-running a finished
+        # search.
+        already = {normalize_query(text).casefold() for text in asked}
         return tuple(
             SubQuestion(text=text, reason=reason, cycle=cycle)
             for text, reason in parse_queries(reply, limit=self._limits.max_sub_questions)
-            if text.casefold() not in already
+            if normalize_query(text).casefold() not in already
         )
 
     async def _search(self, questions: Sequence[SubQuestion], base: Query) -> list[_Searched]:
@@ -248,8 +290,19 @@ class ResearchLoop:
                 routed_away=not result.cites_the_corpus,
             )
 
-        async with asyncio.TaskGroup() as group:
-            tasks = [group.create_task(one(question)) for question in questions]
+        try:
+            async with asyncio.TaskGroup() as group:
+                tasks = [group.create_task(one(question)) for question in questions]
+        except BaseExceptionGroup as failures:
+            # **Unwrapped, because an `ExceptionGroup` is not a type any surface catches.**
+            # `run_op` and the command line both catch `(ManiculeError, ValueError, OSError)`,
+            # and a `TaskGroup` wraps even a single failure — so a vector-store timeout that
+            # `ask` reports as a clean `ok: false` envelope escaped all three surfaces here as
+            # an unhandled 500 with no envelope at all, which is the one response shape the API
+            # guarantees. `ingest.pipeline` already documents this hazard and handles it the
+            # same way. Only the first leaf is re-raised: the siblings were canceled by the
+            # group, so their failures describe the cancellation rather than the cause.
+            raise _first_leaf(failures) from failures
         return [task.result() for task in tasks]
 
     async def _say(self, messages: list[ChatMessage]) -> str:
@@ -271,6 +324,7 @@ class ResearchLoop:
             )
             raise ConfigError(msg)
         self._calls += 1
+        messages = await self._redacted(messages)
         query = Query(text=_PLANNING_QUERY, filter=_PLANNING_FILTER)
         pieces: list[str] = []
         async with generating(
@@ -281,6 +335,31 @@ class ResearchLoop:
                     raise ManiculeError(token.error)
                 pieces.append(token.text)
         return "".join(pieces)
+
+    async def _redacted(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        """The prompt as it will actually be sent.
+
+        One :meth:`Redactor.redact_all` call over every message, which is the same shape the
+        answer path uses and matters for the same reason: the detectors run once over each
+        string rather than sequentially over an already-substituted one, where a hash
+        replacement can re-match a later pattern.
+
+        A :class:`~manicule.core.errors.RedactionError` is left to propagate. The fail-safe
+        direction is refuse-to-send, and there is no path in this design where a timeout or a
+        mistake results in an unredacted question reaching a model that may be on somebody
+        else's machine.
+        """
+        if not self._policy.should_redact:
+            return messages
+        texts, counts = await self._redactor.redact_all(
+            [message["content"] for message in messages]
+        )
+        for detector, fired in counts.items():
+            self._redactions[detector] = self._redactions.get(detector, 0) + fired
+        return [
+            {"role": message["role"], "content": text}
+            for message, text in zip(messages, texts, strict=True)
+        ]
 
 
 def _reworded(base: Query, text: str) -> Query:
