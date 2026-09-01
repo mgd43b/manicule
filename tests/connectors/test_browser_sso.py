@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
@@ -47,6 +47,7 @@ from manicule.connectors.sessions import (
     parse_cookies,
 )
 from manicule.core.errors import ConfigError
+from manicule.core.lifecycle import HealthState
 from tests.connectors.fake_confluence import (
     IDENTITY_PROVIDER,
     SERVER_BASE,
@@ -498,6 +499,247 @@ def test_a_browser_session_configuration_needs_no_token() -> None:
     """
     config = sso_config(SERVER_BASE)
     assert resolve_credentials(config, {}) == config
+
+
+# --- a session replaced while the connector reading it is alive --------------------------------
+#
+# A connector is built once and cached for the life of the process, because it carries a watermark
+# across a run. The session it authenticates with has no such lifetime: it is replaced from
+# outside, by somebody signing in again and the running server being handed the result. These are
+# the tests that the credential resolves the second fact instead of closing over the first — which
+# it used to, so a sign-in reported success and every later sync went on failing against the
+# session it had replaced, until the server was restarted.
+
+REPLACEMENT = "DEF456"
+"""The cookie of the session a sign-in hands over, distinct from every fixture's ``ABC123``."""
+
+
+def _held(
+    config: ConfluenceConfig,
+    value: str,
+    *,
+    account: str = SESSION_ACCOUNT,
+    captured_at: datetime | None = None,
+) -> BrowserSession:
+    """One captured session for ``config``'s instance, as a hand-over would have left it."""
+    return BrowserSession(
+        base_url=config.base_url,
+        account=account,
+        captured_at=captured_at if captured_at is not None else CAPTURED_AT,
+        cookies={"JSESSIONID": SecretStr(value)},
+    )
+
+
+async def test_a_session_replaced_after_the_credential_was_built_is_the_one_it_uses() -> None:
+    """The defect in one function call.
+
+    `credential_for` runs inside the connector plugin factory, once, before the connector is
+    constructed — and the connector is then cached for the life of the process. A credential
+    that kept the session it found there is a credential that can never see a renewal.
+    """
+    config = sso_config(SERVER_BASE)
+    store = SessionVault()
+    await store.save(_held(config, "ABC123"))
+    credential = credential_for(config, store=store, now=lambda: CAPTURED_AT)
+
+    await store.save(_held(config, REPLACEMENT, account="renewed.user"))
+    authorization = credential.authorize()
+
+    assert authorization.headers["Cookie"] == f"JSESSIONID={REPLACEMENT}"
+    assert authorization.account == "renewed.user", (
+        "the cookies were renewed but the account the reply is checked against was not"
+    )
+
+
+async def test_the_age_is_measured_from_the_capture_that_replaced_the_old_one() -> None:
+    """Which is the whole point of renewing rather than reporting.
+
+    An aged-out session and a replaced one used to be the same object, so a credential that had
+    started refusing went on refusing after the sign-in that fixed it — repeating a message about
+    a capture time that was no longer the current one. Here the same credential object goes from
+    refusing to working, and nothing about it changed except what the store holds.
+    """
+    config = sso_config(SERVER_BASE, session_max_age_hours=2.0)
+    store = SessionVault()
+    await store.save(_held(config, "ABC123"))
+    moment = CAPTURED_AT
+    credential = credential_for(config, store=store, now=lambda: moment)
+
+    moment = CAPTURED_AT + timedelta(hours=3)
+    with pytest.raises(SessionExpiredError, match="session_max_age_hours") as aged:
+        credential.authorize()
+    await store.save(_held(config, REPLACEMENT, captured_at=moment))
+
+    assert "ABC123" not in str(aged.value), "the refusal quoted the session it refused"
+    assert credential.authorize().headers["Cookie"] == f"JSESSIONID={REPLACEMENT}"
+
+
+async def test_forgetting_a_session_stops_a_credential_that_was_already_using_it() -> None:
+    """`--forget` has to mean it. A cached copy would keep authenticating with what was dropped.
+
+    The refusal is the one a connector built before anybody signed in gets, deliberately: the
+    fact is the same — this process holds no session for that instance — and an operator should
+    not have to work out that manicule described it two ways.
+    """
+    config = sso_config(SERVER_BASE)
+    store = SessionVault()
+    await store.save(_held(config, "ABC123"))
+    credential = credential_for(config, store=store, now=lambda: CAPTURED_AT)
+
+    assert await store.forget(config.base_url)
+
+    with pytest.raises(ConfigError, match="manicule connector login") as gone:
+        credential.authorize()
+    assert "ABC123" not in str(gone.value)
+    assert "ABC123" not in credential.describe()
+    assert "no longer holding" in credential.describe()
+
+
+async def test_a_hand_over_between_a_request_and_its_reply_is_not_read_as_another_account() -> None:
+    """The window reading the store per request opens, and why it is closed by hand.
+
+    `authorize()` builds the request; the account it names is what the reply is checked against.
+    Those are two moments with an `await` between them, and a hand-over can land in it — which is
+    not a rare race but the expected one, because somebody signs in again *precisely* when a sync
+    is failing. A client that asked the credential a second time for the check would compare a
+    reply against a session that never sent it, and report the session as expired at the moment
+    it had just been renewed.
+
+    The second request is here so the fix cannot be "ignore the store after the first reading":
+    renewal has to take effect at the next request boundary, and this asserts it does.
+    """
+    config = sso_config(SERVER_BASE)
+    store = SessionVault()
+    await store.save(_held(config, "ABC123"))
+    sent: list[str] = []
+
+    async def answer(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get("cookie", ""))
+        if len(sent) == 1:
+            await store.save(_held(config, REPLACEMENT, account="renewed.user"))
+            return httpx.Response(
+                200, json={"results": []}, headers={"X-AUSERNAME": SESSION_ACCOUNT}
+            )
+        return httpx.Response(200, json={"results": []}, headers={"X-AUSERNAME": "renewed.user"})
+
+    client = ConfluenceClient(
+        config,
+        credential=credential_for(config, store=store, now=lambda: CAPTURED_AT),
+        transport=httpx.MockTransport(answer),
+    )
+    await client.setup()
+    try:
+        await client.get_json(client.url("/rest/api/space"))
+        await client.get_json(client.url("/rest/api/space"))
+    finally:
+        await client.teardown()
+
+    assert sent == ["JSESSIONID=ABC123", f"JSESSIONID={REPLACEMENT}"]
+
+
+async def test_a_hand_over_arriving_while_a_request_is_open_does_not_disturb_it() -> None:
+    """The same window, opened by a task that genuinely overlaps rather than by the transport.
+
+    The test above lands the hand-over between two lines of one coroutine, which is the boundary
+    stated exactly. This one runs it as a separate task while a request is really open — the
+    client suspended on a socket, another coroutine replacing the session under it — and gates
+    the two on events so the ordering is arranged rather than raced. Between them they cover
+    both readings of "in flight", and the second is the one a scheduled sync and a
+    ``connector login`` running at the same time actually produce.
+
+    The request that was open must be answered as the account it went out as, and the request
+    after it must go out as the new one. A fix that took either half alone would pass one of
+    these two tests and fail the other.
+    """
+    config = sso_config(SERVER_BASE)
+    store = SessionVault()
+    await store.save(_held(config, "ABC123"))
+    accounts = {"ABC123": SESSION_ACCOUNT, REPLACEMENT: "renewed.user"}
+    opened, handed_over = asyncio.Event(), asyncio.Event()
+    sent: list[str] = []
+
+    async def answer(request: httpx.Request) -> httpx.Response:
+        cookie = request.headers.get("cookie", "")
+        sent.append(cookie)
+        if len(sent) == 1:
+            opened.set()
+            await handed_over.wait()
+        return httpx.Response(
+            200,
+            json={"results": []},
+            headers={"X-AUSERNAME": accounts[cookie.removeprefix("JSESSIONID=")]},
+        )
+
+    async def sign_in_again() -> None:
+        await opened.wait()
+        await store.save(_held(config, REPLACEMENT, account="renewed.user"))
+        handed_over.set()
+
+    client = ConfluenceClient(
+        config,
+        credential=credential_for(config, store=store, now=lambda: CAPTURED_AT),
+        transport=httpx.MockTransport(answer),
+    )
+    await client.setup()
+    try:
+        await asyncio.gather(client.get_json(client.url("/rest/api/space")), sign_in_again())
+        await client.get_json(client.url("/rest/api/space"))
+    finally:
+        await client.teardown()
+
+    assert sent == ["JSESSIONID=ABC123", f"JSESSIONID={REPLACEMENT}"]
+
+
+async def test_a_forgotten_session_is_a_health_report_rather_than_a_raised_exception() -> None:
+    """``doctor`` has to say what happened, and a raised exception is not a diagnosis.
+
+    ``SessionMissingError`` is a :class:`~manicule.core.errors.ConfigError` and not a
+    :class:`~manicule.connectors.errors.ConnectorError`, deliberately — the scheduler tells the
+    two refusals apart by type. That means ``health()``'s ordinary clause does not catch it, and
+    it only became reachable there at all once the credential started reading the vault per
+    request: a session forgotten while this connector is alive now stops its next request.
+
+    Left alone, the container's health sweep would report ``health check raised: ...`` with no
+    remedy — for the one state whose remedy is a single command. So the connector answers it
+    itself, and says the instance was **not contacted**, because "did not answer" would send an
+    operator to look at a wiki that is perfectly fine.
+    """
+    instance = _instance()
+    config = sso_config(instance.base_url)
+    store = SessionVault()
+    await store.save(_held(config, "ABC123"))
+    connector = await connected(
+        instance, config, credential=credential_for(config, store=store, now=lambda: CAPTURED_AT)
+    )
+    try:
+        assert "was not contacted" not in (await connector.health()).detail
+        assert await store.forget(config.base_url)
+        report = await connector.health()
+    finally:
+        await connector.teardown()
+
+    assert report.state is HealthState.DEGRADED
+    assert "was not contacted" in report.detail, report.detail
+    assert "manicule connector login" in report.remedy, report.remedy
+    assert "ABC123" not in report.detail + report.remedy
+
+
+async def test_a_token_credential_reads_nothing_from_the_vault() -> None:
+    """A personal access token is configuration, and no sign-in may reach it.
+
+    Stated as a test because the renewable credential is chosen by `auth_method`, and a mistake
+    there would send a token-authenticated connector to a store that has a session in it for the
+    same instance — authenticating a sync as whoever last signed in, rather than as the account
+    the operator configured.
+    """
+    config = server_config(SERVER_BASE)
+    store = SessionVault()
+    await store.save(_held(config, REPLACEMENT, account="somebody.else"))
+
+    credential = credential_for(config, store=store)
+
+    assert credential.authorize().headers == {"Authorization": "Bearer pat"}
+    assert credential.authorize().account == ""
 
 
 # --- the modes that already worked -------------------------------------------------------------

@@ -396,6 +396,17 @@ class Container:
         them naming one implementation are two sources. Sharing the constructed object would
         give the second instance the first's root, and — because ``Connector.name`` becomes
         the ``source`` half of ``document_id`` — file its documents under the first's identity.
+
+        **Nothing here is invalidated, and a credential with a lifetime is why that is worth
+        saying.** A Confluence browser session is replaced from outside this process while the
+        connector using it is alive — somebody signs in again and the running server is handed
+        the result — so an object cached for the life of the process looks like the wrong place
+        to be keeping one. Evicting the slot was considered and refused: there is no reference
+        count here, so a connector taken out from under a sync running on it is a teardown in
+        the middle of a request, and ``_order``, ``_started`` and ``_failed`` would each have to
+        stay consistent through a partial rebuild. The credential reads the session per request
+        instead (:class:`~manicule.connectors.credentials.HeldSessionCredential`), which leaves
+        this cache meaning exactly what it says: one configured source, one object.
         """
         configured = self.settings.connectors.get(instance)
         if configured is None:

@@ -38,6 +38,8 @@ says.
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import struct
 import sys
 from pathlib import Path
@@ -397,25 +399,85 @@ def host_manifest(shim: Path, *, extension_id: str = EXTENSION_ID) -> dict[str, 
     }
 
 
-def _shim(directory: Path) -> Path:
+def _write_private(path: Path, body: str, *, mode: int) -> None:
+    """Write ``body`` to ``path``, at ``mode`` from the moment it exists.
+
+    ``write_text`` followed by ``chmod`` has a window in between where the file exists at
+    whatever the umask allowed — which for a shell script this user's browser will execute, and
+    for the document that decides *which* executable it starts, is a window somebody else on the
+    machine could write through. Opening with the mode closes it for a new file; the ``chmod``
+    stays because ``O_CREAT`` does not change the mode of a file that already exists, and
+    re-running the installer over a shim written before this did is exactly the case that needs
+    narrowing.
+
+    The mode is a ceiling rather than a floor: the umask can only clear bits, so a stricter one
+    is honored and a permissive one cannot widen this.
+
+    **It is not a guarantee about the path, only about the file.** Neither ``os.open`` nor
+    ``chmod`` is told to refuse a symbolic link, so a path that is already one is followed to
+    its target — as ``write_text`` was. That is left alone rather than hardened because it buys
+    nothing here: every path this is given is inside a directory manicule creates ``0700``, and
+    anybody who can put a link there can replace the file outright.
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    path.chmod(mode)
+
+
+def _shim(directory: Path, *, config_file: Path) -> Path:
     """Write the executable Chrome starts, and return it.
 
     Chrome runs the ``path`` in the manifest directly and appends its own two arguments, so it
-    cannot be told to run ``manicule browser-auth host``. A two-line shim is the usual answer and
-    it also keeps the host off Typer: Click writes to stdout on a usage error, and stdout is the
+    cannot be told to run ``manicule browser-auth host``. A short shim is the usual answer and it
+    also keeps the host off Typer: Click writes to stdout on a usage error, and stdout is the
     protocol.
+
+    **It names the configuration, because Chrome cannot be relied on to.** The host is started
+    by the browser, with the browser's environment and the browser's working directory — neither
+    of which is the terminal the install was run from.
+    :func:`~manicule.config.settings.config_file` falls back to ``manicule.toml`` beside the
+    working directory and then to the user's config directory, so a host left to discover its own
+    configuration finds whichever one Chrome's cwd implies. That is not a missing session or a
+    bad cookie: it is a *different workspace*, and the symptom is the extension refusing a site
+    the operator can see configured, with a message about no connector being configured for it.
+    So ``MANICULE_CONFIG_FILE`` is written into the shim, from the path the install command had
+    already resolved, and the discovery never runs.
+
+    ``data_dir`` is deliberately **not** pinned alongside it. The control socket the host looks
+    for is derived from ``data_dir``, so it might seem to want the same treatment — but pinning
+    it would make an edit to the configuration file's own ``data_dir`` silently not take effect
+    here, while leaving it unpinned means the file stays the one thing that decides. The
+    remaining gap is narrow and worth stating: an operator who selects a data directory with
+    ``$MANICULE_DATA_DIR`` in their shell rather than in the file has selected it for their
+    shell, and the shim will not carry it.
+
+    Both interpolated paths go through :func:`shlex.quote`. A path is not this function's to
+    trust: a directory with a space in it used to produce a shim that ran the wrong argv, and one
+    containing a quote or a ``$(...)`` would have produced a shim that ran something else
+    entirely, as the user, every time Chrome started the host.
     """
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     shim = directory / "session-handoff-host"
-    shim.write_text(
-        f'#!/bin/sh\nexec "{sys.executable}" -m manicule.cli.extension "$@"\n', encoding="utf-8"
+    _write_private(
+        shim,
+        "#!/bin/sh\n"
+        "# Written by `manicule browser-auth install`. Chrome starts this with its own\n"
+        "# environment and working directory, so the configuration is named rather than found.\n"
+        f"MANICULE_CONFIG_FILE={shlex.quote(str(config_file))}\n"
+        "export MANICULE_CONFIG_FILE\n"
+        f'exec {shlex.quote(sys.executable)} -m manicule.cli.extension "$@"\n',
+        mode=0o700,
     )
-    shim.chmod(0o700)
     return shim
 
 
 def install(
-    *, data_dir: Path, browsers: Sequence[str] | None = None, extension_id: str = EXTENSION_ID
+    *,
+    data_dir: Path,
+    config_file: Path,
+    browsers: Sequence[str] | None = None,
+    extension_id: str = EXTENSION_ID,
 ) -> list[Path]:
     """Write the host manifest for each installed browser. Returns what was written.
 
@@ -427,6 +489,17 @@ def install(
     target list is known, so a platform this cannot serve, or a machine whose browsers have never
     been started, is refused having left no trace — rather than leaving an executable under the
     data directory that nothing will ever run.
+
+    Args:
+        data_dir: The selected workspace's data directory. The shim is written under it.
+        config_file: The configuration the install command is running under, already resolved to
+            an absolute path by its caller. Required rather than defaulted, because a default
+            would be this function calling
+            :func:`~manicule.config.settings.config_file` a second time — resolving it against
+            *this* process rather than against the one that chose it, which is the same
+            "discover it later" mistake the shim exists to avoid, moved one frame up.
+        browsers: Which browsers to write for. ``None`` is every one with a profile.
+        extension_id: The extension Chrome will start the host for.
 
     Raises:
         ConfigError: The platform has no known manifest locations, or no supported browser
@@ -457,13 +530,17 @@ def install(
         )
         raise ConfigError(msg)
 
-    shim = _shim(data_dir / "browser-auth")
+    shim = _shim(data_dir / "browser-auth", config_file=config_file)
     document = json.dumps(host_manifest(shim, extension_id=extension_id), indent=2)
     written: list[Path] = []
     for directory in targets:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # The shim is 0700 and the directory holding it is; the document naming both is written
+        # to match rather than to whatever the umask of the shell that ran the install happened
+        # to be. It carries no secret — a path and an extension id — but it decides which
+        # executable Chrome starts as this user, and that is worth not leaving group-writable.
         path = directory / f"{HOST_NAME}.json"
-        path.write_text(document + "\n", encoding="utf-8")
+        _write_private(path, document + "\n", mode=0o600)
         written.append(path)
     return written
 

@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, override
 import pytest
 
 from manicule.chunking import StructuralChunker, TokenCounter
+from manicule.connectors.errors import SessionMissingError
+from manicule.core.acquisition import AcquisitionFailureCode
 from manicule.core.content import Commit, DocumentStatus, PipelineStage, RawDocument, Retention
 from manicule.core.errors import PolicyError
 from manicule.core.fingerprints import ParseFingerprint
@@ -949,6 +951,36 @@ async def test_a_discovery_failure_marks_the_run_unclean_without_losing_what_was
     assert not report.clean
     assert report.error == "RuntimeError: source enumeration failed"
     assert "cursor expired" not in report.error
+
+
+async def test_a_session_forgotten_mid_run_is_recorded_as_an_authentication_failure() -> None:
+    """The state ``connector login --forget`` now produces in a server that is already running.
+
+    A browser-session credential reads the vault before every request rather than holding the
+    session it was built with, so forgetting one stops a connector that was already constructed
+    — at its next request, in the middle of a run. Before that, ``SessionMissingError`` could
+    only be raised while a connector was being built, so no run ever saw one and the classifier
+    below had no reason to know the type.
+
+    Recorded as ``authentication`` rather than left uncategorized because the persisted code is
+    what an operator reads afterwards, and "this account cannot authenticate, sign in again" is
+    the same instruction an expired session earns. A run with no category at all sends somebody
+    to look at an instance that was never contacted.
+    """
+    pipeline, _, _ = build()
+
+    class Forgotten(fakes.DictConnector):
+        @override
+        async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+            del watermark
+            yield discovered("a", "alpha")
+            raise SessionMissingError("no Confluence browser session is held for that instance")
+
+    report = await pipeline.run(Forgotten({"a": "alpha"}))
+
+    assert not report.clean
+    assert report.error_type == "SessionMissingError"
+    assert report.enumeration_failure_code == AcquisitionFailureCode.AUTHENTICATION.value
 
 
 async def test_ingesting_the_same_bytes_twice_produces_the_same_chunk_ids() -> None:

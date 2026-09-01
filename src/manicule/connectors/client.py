@@ -37,7 +37,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
 from manicule.connectors.config import ConfluenceConfig
-from manicule.connectors.credentials import Credential, token_credential
+from manicule.connectors.credentials import Authorization, Credential, token_credential
 from manicule.connectors.errors import (
     AttachmentTooLargeError,
     ConnectorError,
@@ -194,21 +194,29 @@ class ConfluenceClient:
         if client is not None:
             await client.aclose()
 
-    def _headers(self) -> dict[str, str]:
-        """The credential for the request about to be made.
+    def _authorization(self) -> Authorization:
+        """The credential for the request about to be made, and who it makes it as.
 
         Built per request rather than once at :meth:`setup`, which is the difference a browser
         session forces. A token is the same string every time and could have been baked into
-        the client; a session expires on the instance's schedule and is renewed out of band, so
-        the only correct time to ask what the credential is — and whether there still is one —
-        is immediately before using it.
+        the client; a session expires on the instance's schedule, is renewed out of band, and
+        may have been *replaced* since the last request — so the only correct time to ask what
+        the credential is, and whether there still is one, is immediately before using it.
+
+        **The whole answer is kept rather than only its headers**, because
+        :meth:`_verify` checks the reply against the account the request was made as. Asking the
+        credential a second time after the response would read whatever session the process
+        holds *then*, and a hand-over arriving in between would make this client refuse its own
+        answer for coming back as somebody else — at the exact moment somebody had signed in.
 
         Raises:
             SessionExpiredError: The credential has a lifetime and has outlived it. Raised
                 here, before the request, because a request made with a dead session comes back
                 as a sign-in page rather than as an error.
+            SessionMissingError: The credential is whatever session this process holds for the
+                instance, and it is holding none.
         """
-        return dict(self._credential.authorize().headers)
+        return self._credential.authorize()
 
     # --- requests ------------------------------------------------------------------------
 
@@ -374,7 +382,10 @@ class ConfluenceClient:
         for attempt in range(self._config.max_retries + 1):
             self.requests += 1
             try:
-                async with client.stream("GET", url, headers=self._headers()) as response:
+                authorization = self._authorization()
+                async with client.stream(
+                    "GET", url, headers=dict(authorization.headers)
+                ) as response:
                     wait = self._retry_delay(response.status_code, response.headers, attempt)
                     if wait is not None:
                         await response.aread()
@@ -385,7 +396,10 @@ class ConfluenceClient:
                         await response.aread()
                         return redirect
                     self._raise_for_status(response.status_code, url, response.headers)
-                    self._verify(Answer(url, response.status_code, dict(response.headers)))
+                    self._verify(
+                        Answer(url, response.status_code, dict(response.headers)),
+                        account=authorization.account,
+                    )
                     chunks: list[bytes] = []
                     total = 0
                     async for chunk in response.aiter_bytes():
@@ -399,7 +413,8 @@ class ConfluenceClient:
                                     response.status_code,
                                     dict(response.headers),
                                     b"".join([*chunks, chunk]),
-                                )
+                                ),
+                                account=authorization.account,
                             )
                         total += len(chunk)
                         if total > max_bytes:
@@ -420,11 +435,14 @@ class ConfluenceClient:
         self, url: str, params: Params, *, surface_read_timeouts: bool = False
     ) -> httpx.Response:
         for _ in range(MAX_REDIRECTS + 1):
-            response = await self._attempt(url, params, surface_read_timeouts=surface_read_timeouts)
+            response, authorization = await self._attempt(
+                url, params, surface_read_timeouts=surface_read_timeouts
+            )
             redirect = self._redirect(url, response.status_code, response.headers)
             if redirect is None:
                 self._verify(
-                    Answer(url, response.status_code, dict(response.headers), response.content)
+                    Answer(url, response.status_code, dict(response.headers), response.content),
+                    account=authorization.account,
                 )
                 return response
             # The Location is a complete URL, so the query that was sent does not travel with
@@ -435,8 +453,14 @@ class ConfluenceClient:
 
     async def _attempt(
         self, url: str, params: Params, *, surface_read_timeouts: bool = False
-    ) -> httpx.Response:
-        """One URL's worth of requesting, including the retries. Redirects are the caller's."""
+    ) -> tuple[httpx.Response, Authorization]:
+        """One URL's worth of requesting, including the retries. Redirects are the caller's.
+
+        The :class:`~manicule.connectors.credentials.Authorization` comes back beside the
+        response because it is the one that response answers. A retry reads the credential
+        again, so a caller that asked for it afterwards would not be asking about the request
+        that was actually sent.
+        """
         client = self._require_client()
         url = self._checked(url)
         import httpx  # noqa: PLC0415 - see setup()
@@ -444,7 +468,10 @@ class ConfluenceClient:
         for attempt in range(self._config.max_retries + 1):
             self.requests += 1
             try:
-                response = await client.get(url, params=list(params), headers=self._headers())
+                authorization = self._authorization()
+                response = await client.get(
+                    url, params=list(params), headers=dict(authorization.headers)
+                )
             except httpx.TransportError as exc:
                 if surface_read_timeouts and isinstance(exc, httpx.ReadTimeout):
                     raise self._timed_out(url) from exc
@@ -461,9 +488,9 @@ class ConfluenceClient:
                 await self._sleep(wait)
                 continue
             if response.status_code in _REDIRECT_STATUSES:
-                return response
+                return response, authorization
             self._raise_for_status(response.status_code, url, response.headers)
-            return response
+            return response, authorization
         raise self._exhausted(url)
 
     # --- redirects and sign-in pages -----------------------------------------------------
@@ -501,17 +528,23 @@ class ConfluenceClient:
             raise SessionExpiredError(f"{signin}. {self._credential.renewal()}")
         return target
 
-    def _verify(self, answer: Answer) -> None:
+    def _verify(self, answer: Answer, *, account: str) -> None:
         """Refuse a response that is a sign-in rather than an answer.
 
         Runs on every response this client returns, for every credential, because the thing in
         front of Confluence does not know or care which one was sent: a reverse proxy answers a
         personal access token with a sign-in page exactly as it answers a dead browser session.
 
+        ``account`` is passed in rather than read from the credential, and it is the account of
+        the :class:`~manicule.connectors.credentials.Authorization` this request was made with.
+        See :meth:`_authorization`: a browser session can be replaced between the request and
+        the reply, and asking again here would compare an answer against a session that never
+        sent it.
+
         Raises:
             SessionExpiredError: It is a sign-in page.
         """
-        reason = signed_out(answer, expected_account=self._credential.account())
+        reason = signed_out(answer, expected_account=account)
         if reason is not None:
             raise SessionExpiredError(f"{reason}. {self._credential.renewal()}")
 

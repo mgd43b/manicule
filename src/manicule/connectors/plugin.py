@@ -96,8 +96,11 @@ def build_confluence(context: BuildContext) -> Connector:
     reports progress and indexes nothing. It happens in two steps for two kinds of credential:
     :func:`~manicule.connectors.config.resolve_credentials` fills a token in from the
     environment, and :func:`~manicule.connectors.credentials.credential_for` builds the object
-    each request will be made with — which for a browser session means reading the keychain and
-    refusing a session already too old to use.
+    each request will be made with — which for a browser session means refusing one already too
+    old to use, and otherwise handing back a credential that reads the session this process is
+    holding rather than one that closes over the session found here. This connector is cached
+    for the life of the process and the session is not: somebody signing in again replaces it,
+    and the next request has to be made with what they replaced it with.
 
     Raises:
         ConfigError: The context carries configuration of some other type, or the credential
