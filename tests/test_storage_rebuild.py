@@ -2875,7 +2875,14 @@ async def test_expired_owner_is_fenced_after_takeover(  # noqa: PLR0915 - one ta
         lease_generation=first.lease_generation,
         now=NOW,
     )
-    takeover_now = datetime.now(UTC)
+    # Ten minutes ahead, as every other takeover test in this file anchors its own, and for
+    # the reason they do: the lease claimed below expires 1.5 seconds after this instant,
+    # and `copy_checkpointed_vectors` fences each replay page against the **real** clock
+    # unless a caller injects one. Anchored at `now` that budget is 1.5 seconds of real
+    # time for everything between the claim and the page — which a laptop wins and a
+    # loaded runner does not, so the lease expired and the injected crash never fired.
+    # The test is about what fencing does, not about how fast the machine is.
+    takeover_now = datetime.now(UTC) + timedelta(minutes=10)
     second = await rebuilds.claim_generation(
         plan.generation_id,
         "second",
