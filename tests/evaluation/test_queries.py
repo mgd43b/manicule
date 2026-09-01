@@ -29,7 +29,9 @@ from manicule.evaluation.queries import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-EXAMPLE_SET = Path(__file__).resolve().parents[2] / "docs" / "evaluation" / "example-queries.json"
+EVALUATION_DOCS = Path(__file__).resolve().parents[2] / "docs" / "evaluation"
+EXAMPLE_SET = EVALUATION_DOCS / "example-queries.json"
+MULTI_HOP_SET = EVALUATION_DOCS / "multi-hop-queries.json"
 
 
 def a_set(**overrides: object) -> QuerySet:
@@ -152,3 +154,62 @@ def test_the_shipped_example_set_is_the_current_schema() -> None:
     payload: Mapping[str, object] = json.loads(EXAMPLE_SET.read_text(encoding="utf-8"))
 
     assert payload["schema_version"] == QUERY_SET_SCHEMA_VERSION
+
+
+# --- the multi-hop subset -----------------------------------------------------------------------
+
+
+def test_the_multi_hop_set_loads_and_is_evidence() -> None:
+    """``retrieval.md`` §13 defers query decomposition until this set exists.
+
+    Its provenance is ``authored`` rather than ``example``, so a report built from it is a
+    measurement rather than an illustration — and it therefore has to be a set the loader
+    accepts under the schema this build reads, not a file that merely looks like one.
+    """
+    loaded = load_query_set(MULTI_HOP_SET)
+
+    assert loaded.provenance is Provenance.AUTHORED
+    assert loaded.is_evidence
+    assert len(loaded.queries) >= 15
+
+
+def test_every_multi_hop_query_names_the_passages_it_has_to_join() -> None:
+    """What makes the set *labeled* rather than merely a set.
+
+    A question is multi-hop because answering it needs more than one passage, and nothing in
+    the schema records that — there is no ``multi_hop`` field and ``extra="forbid"`` means
+    there cannot be one without a schema version. So the label lives in the note, and this is
+    what stops it being a claim: every query has to say which passages a correct answer joins.
+    Without it the set would be indistinguishable from any other authored set, and the gate
+    §13 describes would be measuring something nobody had characterized.
+    """
+    loaded = load_query_set(MULTI_HOP_SET)
+
+    unlabeled = [query.id for query in loaded.queries if len(query.note.split()) < 12]
+
+    assert unlabeled == [], (
+        f"{unlabeled} do not say what they join. A multi-hop set whose queries are not "
+        f"characterized is a set nobody can check the multi-hop claim against."
+    )
+
+
+def test_the_multi_hop_set_covers_more_than_explanatory_questions() -> None:
+    """A set made only of ``how_does_x_work`` would flatter paraphrase.
+
+    ``Intent`` exists because the categories fail differently: a reranker earns its cost on
+    explanatory questions and often costs precision on identifier lookups. A multi-hop set
+    drawn only from the first would let a change that helps one and harms the other report as
+    a uniform improvement, which is the averaging this whole module refuses.
+    """
+    loaded = load_query_set(MULTI_HOP_SET)
+
+    assert len(loaded.by_intent()) >= 3
+    assert Intent.EXACT_IDENTIFIER in loaded.by_intent()
+
+
+def test_the_multi_hop_set_ids_are_unique_and_stable() -> None:
+    """Preferences key on the id, so a duplicate silently merges two questions' records."""
+    ids = [query.id for query in load_query_set(MULTI_HOP_SET).queries]
+
+    assert len(ids) == len(set(ids))
+    assert all(identifier.startswith("multihop-") for identifier in ids)

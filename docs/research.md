@@ -265,7 +265,7 @@ second egress class to police is not.
 
 | Deferred | What would have to be true |
 |---|---|
-| A labeled multi-hop query set, and a measured win on it | [`retrieval.md`](retrieval.md) §13 defers query decomposition until one exists, and names building it as the first deliverable. This feature is decomposition one level up — above the pipeline rather than inside it, so it widens no locked contract — but the measurement it owes is the same. **It has not been made.** |
+| A measured win on the multi-hop query set | [`retrieval.md`](retrieval.md) §13 defers query decomposition until a labeled multi-hop subset exists and names building it as the first deliverable. That half is done — [`evaluation/multi-hop-queries.json`](evaluation/multi-hop-queries.json). This feature is decomposition one level up, above the pipeline rather than inside it, so it widens no locked contract, but it owes the same measurement: nDCG@10 on that set alone, a decomposing configuration against a single-query one. **That has not been run**, and until it has, this feature is unmeasured rather than measured-and-good. |
 | Streaming the report | A surface that shows the searches as they complete, so the silence is filled by progress rather than nothing |
 | Re-ranking the ledger across cycles | Evidence that a cross-encoder pass over the union beats each search's own ranking, measured on the query set above |
 | Carrying a run's evidence into a follow-up question | A history budget that can hold it, which today it cannot |
@@ -300,4 +300,5 @@ second egress class to police is not.
 - [x] Bounded before the run starts, on rounds, searches and wall clock
 - [x] The same envelope, payload and error contract as every other operation
 - [x] CLI, MCP and HTTP, with the MCP tool marked as reaching out and not read-only
-- [ ] A measured improvement on a labeled multi-hop query set — §9, and it is not done
+- [x] A labeled multi-hop query set to measure against — `docs/evaluation/multi-hop-queries.json`
+- [ ] A measured improvement on it — §9, and it has not been run

@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "name": "multi-hop over manicule's own documents",
+  "provenance": "authored",
+  "description": "Questions that cannot be answered from one passage. `retrieval.md` §13 defers query decomposition until a labeled multi-hop subset exists and names building it as the first deliverable; this is that subset. Its corpus is this repository's own `docs/` tree, which is reproducible by anyone with the repository and is what makes a result here checkable rather than reported. Provenance is 'authored' and not 'exported': these were written for the purpose, so they are the questions the system was built to answer and will read kinder than real traffic. Every query's note names the passages a correct answer has to join, which is what makes 'multi-hop' a property of the query rather than a claim about it. This set is not a measurement. It is the input one needs, and `retrieval.md` §13's gate — nDCG@10 on this set alone, against a decomposing configuration and a single-query one — has not been run.",
+  "queries": [
+    {
+      "id": "multihop-budget-units",
+      "text": "why is a chunk's token count the wrong number to use for the generator's context budget",
+      "intent": "how_does_x_work",
+      "note": "Joins parsing.md §1.2 on the embedder's SentencePiece budget with retrieval.md §7.2 on the generator's tokenizer. Neither passage answers it: one says what the chunk budget is, the other says what the context budget is, and the answer is the relationship."
+    },
+    {
+      "id": "multihop-citation-survives-redaction",
+      "text": "how can a citation still resolve when the passage it points at was redacted before sending",
+      "intent": "how_does_x_work",
+      "note": "Joins generation.md §7.4 on redaction as a projection over a copy with §3.3's verification ladder running against retained bytes. The mechanism is that the two never meet, which no single passage states."
+    },
+    {
+      "id": "multihop-profile-refusal",
+      "text": "what makes a retrieval profile fail to start rather than fail on the first question",
+      "intent": "how_does_x_work",
+      "note": "Joins retrieval.md §7.4's window cross-check with generation.md §4.3 on the served window being a property of the machine. The refusal is the first, the number it uses is the second."
+    },
+    {
+      "id": "multihop-reranker-confidence",
+      "text": "why can turning the reranker off raise the confidence a search reports",
+      "intent": "how_does_x_work",
+      "note": "Joins retrieval.md §8.2's per-component weights with §8.3's rule that a suppressed component's weight is not redistributed. Either passage alone reads as an ordinary scoring description."
+    },
+    {
+      "id": "multihop-ollama-endpoint",
+      "text": "can an ollama configuration send my documents to another machine",
+      "intent": "how_does_x_work",
+      "note": "Joins generation.md §7.1 on egress being classified by resolved endpoint rather than provider name with the base_url setting in settings.md. Answering from the provider name alone gets it exactly backwards."
+    },
+    {
+      "id": "multihop-fast-profile-high",
+      "text": "why can the fast profile never report high confidence",
+      "intent": "how_does_x_work",
+      "note": "Joins the profile table's rerank=False for fast with retrieval.md §8.3 on bands not being ceiling-normalized. The answer is arithmetic across the two."
+    },
+    {
+      "id": "multihop-collection-vs-tag-scope",
+      "text": "difference between scoping a search by collection and by tag",
+      "intent": "comparison",
+      "note": "Needs both sides retrieved from separate passages, plus retrieval.md §3.1 on how membership resolves to document ids before the query runs."
+    },
+    {
+      "id": "multihop-bundle-vs-preseed",
+      "text": "when should an air-gapped host use a grammar bundle instead of the ordinary pre-seed",
+      "intent": "comparison",
+      "note": "Joins the offline-bundle description with the pre-seed step in deployment.md. Both are routes to the same end state and the choice is the difference between them."
+    },
+    {
+      "id": "multihop-cli-vs-mcp-absence",
+      "text": "which operations are on the command line but deliberately not offered to an assistant, and why",
+      "intent": "comparison",
+      "note": "Joins surfaces.md §4's list of absent tools with the reasoning in §4.1 about hints not being permission. The list alone answers 'which' and not 'why'."
+    },
+    {
+      "id": "multihop-reindex-after-parser-bump",
+      "text": "what has to be re-indexed after a parser dependency is upgraded, and what does not",
+      "intent": "comparison",
+      "note": "Joins ParseFingerprint's per-document record with the dependabot groups that decide which upgrades move it. Answering needs both what is recorded and what changes it."
+    },
+    {
+      "id": "multihop-ungrounded-vs-not-consulted",
+      "text": "difference between an answer that is ungrounded and one that did not consult the corpus",
+      "intent": "comparison",
+      "note": "Joins surfaces.md §5's three separate claims with retrieval.md §9.3 on a directly-routed answer carrying no confidence. Two passages, two halves."
+    },
+    {
+      "id": "multihop-atomic-flip-and-search",
+      "text": "what does a search return while a document is being re-indexed",
+      "intent": "how_does_x_work",
+      "note": "Joins storage.md's copy-on-write publication with the hydration filter that excludes unpublished vectors. The guarantee is the two together."
+    },
+    {
+      "id": "multihop-anchor-lock-and-quote",
+      "text": "why can an interface show less of a passage than the citation quotes but never store it",
+      "intent": "how_does_x_work",
+      "note": "Joins generation.md §3.6 on Citation.quote being the chunk text byte for byte with contracts.md §1's anchor round-trip obligation. The prohibition follows from the second."
+    },
+    {
+      "id": "multihop-glossary-conflict",
+      "text": "what happens when two documents define the same acronym differently",
+      "intent": "how_does_x_work",
+      "note": "Joins retrieval.md §14's conflict rule with the settings block that has deliberately no conflict-resolution option. That the absence is deliberate is the answer."
+    },
+    {
+      "id": "multihop-error-code-across-surfaces",
+      "text": "CrossWorkspaceError",
+      "intent": "exact_identifier",
+      "note": "The lexical leg's home ground, but the answer spans surfaces.md's status-code table and the tenancy section that explains why it is 5xx rather than 4xx. Included so the multi-hop set is not made only of explanatory questions, which would let a change that helps paraphrase look uniformly good."
+    },
+    {
+      "id": "multihop-chunk-fingerprint-fields",
+      "text": "ChunkFingerprint grammars field",
+      "intent": "exact_identifier",
+      "note": "Joins the fingerprint's field list with versions.py's reasoning for recording the pack per language rather than alongside the runtime. An identifier lookup whose answer is not where the identifier is defined."
+    }
+  ]
+}
