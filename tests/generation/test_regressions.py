@@ -35,6 +35,7 @@ from manicule.generation.answering import (
 )
 from manicule.generation.answers import DropReason, EventKind
 from manicule.generation.binder import CitationBinder
+from manicule.generation.budget import MAX_CACHED_COUNTS, TokenEstimator
 from manicule.generation.history import Turn
 from manicule.generation.markers import ATTEMPT_PREFIX, MARKER_MAX_LEN, MarkerScanner, ScanEventKind
 from manicule.generation.policy import EgressPolicy, filter_context
@@ -45,6 +46,7 @@ from manicule.generation.verification import (
     UnverifiableSource,
     load_documents,
 )
+from manicule.retrieval.tokens import ContextTokenCounter
 from manicule.testing.normalize import contains_claimed_text
 from tests.generation.fakes import (
     FakeDocuments,
@@ -53,6 +55,7 @@ from tests.generation.fakes import (
     ScriptedGenerator,
     candidate,
     context,
+    context_estimator,
     document,
     query,
     resolver,
@@ -561,7 +564,9 @@ def test_a_passage_whose_document_vanished_is_not_sent_to_a_remote_model() -> No
     )
     assembled = context((candidate(chunk_id="c1", document_id="doc-gone"),))
 
-    filtered, drops = filter_context(assembled, {}, EgressPolicy.of(remote))
+    filtered, drops = filter_context(
+        assembled, {}, EgressPolicy.of(remote), counter=context_estimator(remote)
+    )
 
     assert filtered.passages == ()
     assert "not in the index" in drops[0].reason
@@ -576,7 +581,9 @@ def test_a_passage_whose_document_vanished_is_kept_when_nothing_leaves() -> None
     """
     assembled = context((candidate(chunk_id="c1", document_id="doc-gone"),))
 
-    filtered, drops = filter_context(assembled, {}, EgressPolicy.of(settings()))
+    filtered, drops = filter_context(
+        assembled, {}, EgressPolicy.of(settings()), counter=context_estimator()
+    )
 
     assert len(filtered.passages) == 1
     assert drops == ()
@@ -600,9 +607,91 @@ def test_dropping_a_passage_recomputes_the_context_token_count() -> None:
         "doc-2": document(document_id="doc-2", source="public"),
     }
 
-    filtered, _ = filter_context(assembled, documents, EgressPolicy.of(remote))
+    counter = context_estimator(remote)
 
-    assert filtered.token_count == filtered.passages[0].chunk.token_count
+    filtered, _ = filter_context(assembled, documents, EgressPolicy.of(remote), counter=counter)
+
+    assert filtered.token_count == counter.count_chunk(filtered.passages[0].chunk)
+
+
+def test_a_filtered_context_reports_its_tokens_in_the_units_assembly_measured_them_in() -> None:
+    """A policy drop must not silently change tokenizers.
+
+    This recomputed the total by summing ``Chunk.token_count``, which is the **embedder's**
+    SentencePiece count for a model that is not generating anything, while assembly had
+    measured the same field with tiktoken inflated by ``rag.context.safety_factor``. Both are
+    plausible integers, so a filtered context reported a figure comparable with neither the
+    value assembly produced nor the ``token_budget`` recorded beside it — wrong by an unknown
+    factor that varies with language and content type. The chunk here declares an embedder
+    count of 1 so the two cannot coincide.
+    """
+    remote = settings(
+        llm={"provider": "openai", "model": "gpt-4o-mini"},
+        providers={"openai": {"api_key": "k"}},
+        security={"data_policy": {"source_restrictions": {"local_only": ["secrets"]}}},
+    )
+    surviving = candidate(chunk_id="c2", document_id="doc-2", text="authentication " * 40)
+    lying = surviving.model_copy(
+        update={"chunk": surviving.chunk.model_copy(update={"token_count": 1})}
+    )
+    assembled = context((candidate(chunk_id="c1", document_id="doc-1"), lying))
+    documents = {
+        "doc-1": document(document_id="doc-1", source="secrets"),
+        "doc-2": document(document_id="doc-2", source="public"),
+    }
+
+    counter = context_estimator(remote)
+
+    filtered, _ = filter_context(assembled, documents, EgressPolicy.of(remote), counter=counter)
+
+    assert filtered.token_count > 1
+    assert filtered.token_count == counter.count_chunk(lying.chunk)
+
+
+def test_the_context_counter_agrees_with_the_one_assembly_used() -> None:
+    """Two implementations of one measurement, and the fix depends on them agreeing.
+
+    ``retrieval.assembly`` measures ``Context.token_count`` with a
+    :class:`~manicule.retrieval.tokens.ContextTokenCounter`; ``filter_context`` recomputes it
+    with a :class:`~manicule.generation.budget.TokenEstimator`, because generation must not
+    import retrieval to do it. They are separate classes doing the same arithmetic over the
+    same vocabulary, so this pins the agreement rather than trusting it — one predicate stated
+    twice is two predicates that will disagree.
+    """
+    config = settings()
+    assembly_counter = ContextTokenCounter(
+        encoding=config.rag.context.encoding, safety_factor=config.rag.context.safety_factor
+    )
+    measured = candidate(text="authentication " * 40).chunk
+
+    assert context_estimator(config).count_chunk(measured) == assembly_counter.count_chunk(measured)
+
+
+def test_the_per_chunk_count_cache_is_bounded() -> None:
+    """An unbounded memo on a process-lifetime object is a slow leak.
+
+    ``TokenEstimator._chunks`` had no cap while nothing called ``count_chunk`` — the answer
+    path counts the rendered prompt with ``count``, which does not cache — so making the policy
+    filter its first caller would otherwise have grown one entry per chunk ever measured, on an
+    ``Answerer`` built once per runtime. Its sibling in ``retrieval.tokens`` has always capped
+    the identical cache; this holds the two to the same bound.
+
+    ``== 1`` rather than ``<= MAX_CACHED_COUNTS``, because the weaker assertion also passes
+    against a cache that clears on every call — which is bounded, and is not a cache.
+    """
+    estimator = TokenEstimator()
+    filled = {f"filler-{position}": 1 for position in range(MAX_CACHED_COUNTS)}
+    estimator._chunks.update(filled)  # pyright: ignore[reportPrivateUsage] - the cap is the claim
+
+    counted = estimator.count_chunk(candidate(chunk_id="past-the-cap").chunk)
+    cache = estimator._chunks  # pyright: ignore[reportPrivateUsage] - the cap is the claim
+
+    assert counted > 0
+    assert len(cache) == 1
+
+    estimator.count_chunk(candidate(chunk_id="one-more", text="different text").chunk)
+
+    assert len(cache) == 2
 
 
 def test_a_workspace_override_applies_however_its_key_is_capitalized() -> None:

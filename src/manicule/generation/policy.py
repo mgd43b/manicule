@@ -23,6 +23,7 @@ from manicule.config.settings import RedactionScope, Settings
 from manicule.core.content import Document
 from manicule.core.retrieval import Candidate, Context
 from manicule.generation.answers import PolicyDrop
+from manicule.generation.budget import TokenEstimator
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +114,11 @@ class EgressPolicy:
 
 
 def filter_context(
-    context: Context, documents: Mapping[str, Document], policy: EgressPolicy
+    context: Context,
+    documents: Mapping[str, Document],
+    policy: EgressPolicy,
+    *,
+    counter: TokenEstimator,
 ) -> tuple[Context, tuple[PolicyDrop, ...]]:
     """Remove passages policy forbids sending, and say which.
 
@@ -131,6 +136,17 @@ def filter_context(
     retrieve it at rank 7. Search still shows the document, because search is local and only
     generation crosses the boundary — so a user learns the document exists and that its
     content did not leave. They already had read access; nothing is disclosed that was not.
+
+    Args:
+        context: The assembled context, as retrieval produced it.
+        documents: The documents its passages point into, by id.
+        policy: What this configuration permits for the generation endpoint.
+        counter: Measures a surviving passage in the units
+            :attr:`~manicule.core.retrieval.Context.token_count` is already in — so it must be
+            configured from ``rag.context``, the settings
+            :class:`~manicule.retrieval.tokens.ContextTokenCounter` is built from, and not from
+            ``llm.token_safety_factor``. Required rather than defaulted, because a default here
+            would be this module guessing at another one's tokenizer.
     """
     kept: list[Candidate] = []
     drops: list[PolicyDrop] = []
@@ -153,7 +169,17 @@ def filter_context(
     # `token_count` is recomputed rather than carried over: `model_copy` does not re-validate,
     # so a stale total would over-report the prompt in the trace and in any budget check
     # downstream of it.
-    kept_tokens = sum(candidate.chunk.token_count for candidate in kept)
+    #
+    # **In the generator's tokenizer, because that is the one the number is already in.** This
+    # summed `Chunk.token_count` until it was noticed that doing so silently changed units:
+    # that field is the *embedder's* SentencePiece count, for a model that is not generating
+    # anything, and assembly measured this total with tiktoken inflated by
+    # `rag.context.safety_factor`. A filtered context therefore reported a figure comparable
+    # with neither the one assembly produced nor the `token_budget` sitting beside it in
+    # `Context.metadata` — wrong by an unknown factor that varies with language and content
+    # type. Nothing reads this today, which is exactly why it was worth fixing before
+    # something does: the failure is a plausible number, not a missing one.
+    kept_tokens = sum(counter.count_chunk(candidate.chunk) for candidate in kept)
     return (
         context.model_copy(update={"passages": tuple(kept), "token_count": kept_tokens}),
         tuple(drops),

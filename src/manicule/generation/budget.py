@@ -27,9 +27,26 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Final
 
 from manicule.core.content import Chunk
 from manicule.core.generation import Usage
+
+MAX_CACHED_COUNTS: Final = 50_000
+"""How many per-chunk counts to remember.
+
+The same cap, for the same reason, as :data:`manicule.retrieval.tokens.MAX_CACHED_COUNTS`,
+and stated here rather than imported because generation does not depend on retrieval. The
+counts can never go stale — a chunk id is derived from its content, so a changed chunk is a
+different key — but a process serving a large corpus for weeks would otherwise accumulate one
+entry per chunk it has ever measured, and :class:`~manicule.generation.answering.Answerer` is
+built once per runtime. The cap is on memory, not on correctness: an evicted entry is
+recomputed and gives the same answer.
+
+The cache went uncapped this long because nothing called :meth:`TokenEstimator.count_chunk`:
+the answer path measures the rendered prompt with :meth:`TokenEstimator.count`, which does not
+cache at all. :func:`manicule.generation.policy.filter_context` is its first caller.
+"""
 
 GENERATION_ENCODING = "o200k_base"
 """The stand-in vocabulary, by encoding name.
@@ -72,6 +89,8 @@ class TokenEstimator:
         cached = self._chunks.get(chunk.id)
         if cached is None:
             cached = self.count(chunk.text)
+            if len(self._chunks) >= MAX_CACHED_COUNTS:
+                self._chunks.clear()
             self._chunks[chunk.id] = cached
         return cached
 
@@ -140,6 +159,7 @@ def drift_problem(*, estimate: int, measured: int | None, tolerance: float, mode
 
 __all__ = [
     "GENERATION_ENCODING",
+    "MAX_CACHED_COUNTS",
     "TokenEstimator",
     "drift_problem",
     "usable_prompt_tokens",

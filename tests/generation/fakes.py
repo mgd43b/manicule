@@ -17,6 +17,7 @@ from manicule.core.anchors import Anchor, HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus, RawDocument
 from manicule.core.generation import FinishReason, Token, Usage
 from manicule.core.retrieval import Candidate, Context, Filter, Query
+from manicule.generation.budget import TokenEstimator
 from manicule.generation.prompt import ChatMessage
 from manicule.generation.verification import ChainRouter, OpenSource, RetainedBytesResolver
 
@@ -264,6 +265,22 @@ def settings(**overrides: Any) -> Settings:
     return Settings(**base)
 
 
+def context_estimator(config: Settings | None = None) -> TokenEstimator:
+    """A counter in the units ``Context.token_count`` is already in.
+
+    Built from ``rag.context`` — the settings ``ContextTokenCounter`` is built from in
+    ``manicule.retrieval.retriever.build_retriever`` — rather than from
+    ``llm.token_safety_factor``, which measures the prompt and is a different number. This is
+    what ``filter_context`` requires, and a test that passed the wrong one would be asserting
+    a total in units nothing else in the system uses.
+    """
+    resolved = config if config is not None else settings()
+    return TokenEstimator(
+        safety_factor=resolved.rag.context.safety_factor,
+        encoding_name=resolved.rag.context.encoding,
+    )
+
+
 __all__ = [
     "WORKSPACE",
     "BrokenResolver",
@@ -277,6 +294,7 @@ __all__ = [
     "candidate",
     "chunk",
     "context",
+    "context_estimator",
     "document",
     "query",
     "resolver",

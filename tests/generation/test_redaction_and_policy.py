@@ -18,7 +18,7 @@ from manicule.core.retrieval import Context
 from manicule.generation.policy import EgressPolicy, filter_context
 from manicule.generation.redaction import BUILTIN_DETECTORS, Redactor
 from manicule.testing import assert_local_only_policy_is_enforced
-from tests.generation.fakes import candidate, context, document, settings
+from tests.generation.fakes import candidate, context, context_estimator, document, settings
 
 EMAIL = "someone@example.invalid"
 
@@ -212,7 +212,10 @@ def test_a_local_only_source_drops_its_passage_and_never_the_query() -> None:
     assembled, documents = two_passages_from(("secrets", "confluence"))
 
     filtered, drops = filter_context(
-        assembled, documents, remote_policy(source_restrictions={"local_only": ["secrets"]})
+        assembled,
+        documents,
+        remote_policy(source_restrictions={"local_only": ["secrets"]}),
+        counter=context_estimator(),
     )
 
     assert len(filtered.passages) == 1
@@ -233,6 +236,7 @@ def test_a_workspace_override_cannot_release_a_local_only_source() -> None:
             source_restrictions={"local_only": ["secrets"]},
             workspace_overrides={"default": {"cloud_allowed": True}},
         ),
+        counter=context_estimator(),
     )
 
     assert len(drops) == 2
@@ -248,6 +252,7 @@ def test_a_workspace_that_forbids_cloud_drops_all_but_the_exempted_sources() -> 
             source_restrictions={"cloud_allowed": ["public"]},
             workspace_overrides={"default": {"cloud_allowed": False}},
         ),
+        counter=context_estimator(),
     )
 
     assert [c.chunk.id for c in filtered.passages] == ["c2"]
@@ -259,7 +264,9 @@ def test_policy_filtering_only_removes_and_never_reorders_or_backfills() -> None
     model you asked, and two runs that saw different passages are not comparable."""
     assembled, documents = two_passages_from(("public", "public"))
 
-    filtered, drops = filter_context(assembled, documents, remote_policy())
+    filtered, drops = filter_context(
+        assembled, documents, remote_policy(), counter=context_estimator()
+    )
 
     assert filtered is assembled
     assert drops == ()

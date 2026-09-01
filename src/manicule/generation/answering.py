@@ -170,6 +170,17 @@ class Answerer:
         self._estimator = estimator or TokenEstimator(
             safety_factor=settings.llm.token_safety_factor
         )
+        # A second estimator, in **assembly's** units rather than this class's, and the two are
+        # not interchangeable. `self._estimator` measures the prompt for the drift comparison
+        # and is configured from `llm.token_safety_factor`; `Context.token_count` was produced
+        # by `manicule.retrieval.assembly` from `rag.context`, and is what a policy drop has to
+        # keep comparable. Recomputing that total with the prompt estimator would leave the
+        # field in a third set of units, agreeing with neither the value assembly produced nor
+        # the `token_budget` recorded beside it in `Context.metadata`.
+        self._context_estimator = TokenEstimator(
+            safety_factor=settings.rag.context.safety_factor,
+            encoding_name=settings.rag.context.encoding,
+        )
         self._conversations = conversations
         # Derived from the profile rather than defaulted, because the startup window
         # cross-check reserves `profile.history_tokens` and refuses a configuration that does
@@ -236,7 +247,9 @@ class Answerer:
         try:
             try:
                 documents = await load_documents(self._documents, request.context)
-                context, policy_drops = filter_context(request.context, documents, self._policy)
+                context, policy_drops = filter_context(
+                    request.context, documents, self._policy, counter=self._context_estimator
+                )
                 run = self._verifier.start(context, documents, started_at=started)
                 binder = CitationBinder(run=run)
 
@@ -360,6 +373,12 @@ class Answerer:
             },
         )
         trail = iter(trail_texts)
+        # `token_count` is deliberately **not** recomputed here, which is the opposite of what
+        # the policy filter does and for a reason worth writing down. The filter changes which
+        # passages are present, so the total has to follow. Redaction changes their text after
+        # the fitter has already approved a budget, so re-measuring would report a size that
+        # was never the one selection was made against — and it would report it smaller, since
+        # a redacted span is shorter than what it replaced.
         sent_context = context.model_copy(
             update={
                 "passages": tuple(
