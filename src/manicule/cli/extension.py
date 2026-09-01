@@ -410,8 +410,13 @@ def _write_private(path: Path, body: str, *, mode: int) -> None:
     re-running the installer over a shim written before this did is exactly the case that needs
     narrowing.
 
-    The mode is a ceiling rather than a floor: the umask can only clear bits, so a stricter one
-    is honored and a permissive one cannot widen this.
+    **The umask decides nothing about the result, and that is deliberate.** ``os.open`` applies
+    it at creation, but the ``chmod`` then sets the mode exactly — so the file ends at ``mode``
+    whichever umask the installing shell had, including one that would have cleared a bit. An
+    unusual umask leaving Chrome a host it cannot execute would be a broken install, and both
+    modes this is called with grant nothing whatever to group or other, so setting them exactly
+    is what makes that guarantee unconditional rather than a matter of how somebody's shell was
+    configured.
 
     **It is not a guarantee about the path, only about the file.** Neither ``os.open`` nor
     ``chmod`` is told to refuse a symbolic link, so a path that is already one is followed to

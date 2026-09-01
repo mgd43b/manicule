@@ -522,8 +522,8 @@ def test_the_extension_ships_where_the_command_says_it_is() -> None:
 # Chrome's. Every test below runs the generated executable in a child process with a sterile
 # environment and an unrelated working directory, because that is the only arrangement in which
 # a host that carries its configuration is distinguishable from one that inherits it — and the
-# defect these pin is exactly a host that inherited a different workspace and refused a site the
-# operator could see configured.
+# defect these tests pin is exactly a host that inherited a different workspace and refused a
+# site the operator could see configured.
 
 
 def _config_naming(path: Path, site: str, *, data_dir: Path) -> Path:
