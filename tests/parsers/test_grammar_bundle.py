@@ -98,13 +98,24 @@ def bundle(tmp_path_factory: pytest.TempPathFactory) -> grammar_bundle.GrammarBu
 
 @pytest.fixture
 def empty_cache(tmp_path: Path) -> Path:
-    """A cache directory with no grammars in it, and no route to fetch any."""
+    """A cache directory with no grammars in it, and no route to fetch any.
+
+    **Where the pack will read**, which is what every user of this fixture means — it seeds into
+    it, lists it, and asserts on the files in it. That is the directory `configure` was given
+    only on packs that impose no layout of their own; from 1.15 it is a versioned subtree below
+    it, and a fixture handing back the configured root would have every one of those assertions
+    looking at an empty parent directory.
+    """
     cache = tmp_path / "cache"
     cache.mkdir()
     grammars.configure_pack(
         grammars.DECLARED_LANGUAGES, cache_dir=cache, manifest_url=UNREACHABLE_MANIFEST
     )
-    return cache
+    # Created, not merely named. Callers list it before seeding to assert it is empty, and on a
+    # pack that imposes a layout the directory it hands back is below the one made above.
+    resolved = grammars.cache_directory()
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
 # --- the air-gapped install ---------------------------------------------------------------

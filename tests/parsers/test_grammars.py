@@ -314,7 +314,11 @@ def test_a_dropped_transfer_is_retried_with_backoff_and_the_seed_succeeds(
         attempts.append(list(languages))
         if len(attempts) < 3:
             raise RuntimeError(DROPPED_TRANSFER)
-        shutil.copy2(library, cache / library.name)
+        # Into the directory the pack will actually read, creating the layout it imposes
+        # between the configured root and its libraries — a real seed does the same.
+        destination = grammars.cache_directory()
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(library, destination / library.name)
 
     monkeypatch.setattr(_installed_pack(), "prefetch", flaky)
 
@@ -390,7 +394,11 @@ def test_a_download_that_works_first_time_neither_retries_nor_waits(
 
     def works(languages: list[str]) -> None:
         attempts.append(list(languages))
-        shutil.copy2(library, cache / library.name)
+        # Into the directory the pack will actually read, creating the layout it imposes
+        # between the configured root and its libraries — a real seed does the same.
+        destination = grammars.cache_directory()
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(library, destination / library.name)
 
     monkeypatch.setattr(_installed_pack(), "prefetch", works)
 
@@ -685,3 +693,56 @@ def test_the_grammar_pack_is_still_distributed_under_a_permissive_license() -> N
     declared = metadata("tree-sitter-language-pack")["License-Expression"]
 
     assert declared in PERMISSIVE_LICENSES
+
+
+# --- the pack's cache layout ------------------------------------------------------------------
+
+
+def test_configuring_the_pack_with_its_own_reported_directory_does_not_move_it() -> None:
+    """The round trip that broke on pack 1.15.
+
+    ``cache_directory()`` reports where the libraries *are*; ``configure`` takes the directory
+    the pack builds its layout *under*. Through 1.14 those were one path and feeding either back
+    as the other was harmless. From 1.15 the pack appends
+    ``tree-sitter-language-pack/v<release>/libs`` to whatever it is given, so a round trip
+    appended it twice and pointed the pack at a directory nothing has ever written to — and
+    every grammar then read as absent, on a host that had just pre-seeded them.
+    """
+    grammars.configure_pack(grammars.DECLARED_LANGUAGES)
+    first = grammars.cache_directory()
+
+    grammars.configure_pack(grammars.DECLARED_LANGUAGES, cache_dir=Path(grammars.configured_base()))
+
+    assert grammars.cache_directory() == first
+
+
+def test_the_default_survives_a_round_trip_through_an_override(tmp_path: Path) -> None:
+    """Going back to the default has to actually go back to it.
+
+    An absent ``cache_dir`` means "keep whatever is in force" — checked against 1.14 when this
+    was written and still true on 1.15 — so the default is passed explicitly. It therefore has
+    to be a directory ``configure`` accepts rather than the one ``cache_directory`` reports.
+    """
+    grammars.configure_pack(grammars.DECLARED_LANGUAGES)
+    default = grammars.cache_directory()
+
+    grammars.configure_pack(["python"], cache_dir=tmp_path / "elsewhere")
+    grammars.configure_pack(grammars.DECLARED_LANGUAGES)
+
+    assert grammars.cache_directory() == default
+
+
+def test_a_configured_directory_is_where_the_libraries_are_looked_for(tmp_path: Path) -> None:
+    """Whatever layout the pack imposes, seeding and reading agree on one directory.
+
+    Stated as a property rather than as a path, because the layout is upstream's and this
+    repository measures it instead of restating it: on a pack that adds nothing this is the
+    configured directory itself, and on one that adds a versioned subtree it is inside it.
+    """
+    cache = tmp_path / "grammars"
+    cache.mkdir()
+
+    grammars.configure_pack(["python"], cache_dir=cache, manifest_url=UNREACHABLE_MANIFEST)
+
+    assert grammars.cache_directory().is_relative_to(cache)
+    assert grammars.cache_directory().parts[len(cache.parts) :] == grammars.library_layout()

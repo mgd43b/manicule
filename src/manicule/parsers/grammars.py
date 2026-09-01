@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -109,9 +110,11 @@ __all__ = [
     "bundle_status",
     "cache_directory",
     "configure_pack",
+    "configured_base",
     "grammar_versions",
     "is_available",
     "language_for_media_type",
+    "library_layout",
     "load_parser",
     "missing_grammars",
     "pack_version",
@@ -124,6 +127,8 @@ __all__ = [
 
 _supported: frozenset[str] | None = None
 _default_cache_dir: str | None = None
+_pack_layout: tuple[str, ...] | None = None
+_configured_base: str | None = None
 
 MANIFEST_URL_ENV: Final = "TREE_SITTER_LANGUAGE_PACK_MANIFEST_URL"
 """Environment variable the pack reads to locate the grammar manifest.
@@ -494,20 +499,78 @@ def cache_directory() -> Path:
     return Path(pack.cache_dir())
 
 
-def _remember_default_cache_directory() -> str:
-    """The pack's own per-user cache directory, read once while it is still in force.
+def library_layout() -> tuple[str, ...]:
+    """What the pack appends to a configured cache directory to reach its libraries.
 
-    Read rather than recomputed. The path carries the pack release and the platform's cache
-    convention, so deriving it here would duplicate upstream's rules and go wrong on the
-    release that changes them. Reading it on the first call is safe because every override
-    manicule applies goes through :func:`configure_pack`, so the pack is still on its default
-    the first time this runs.
+    **Measured against the installed pack, never derived from its version.** This is upstream's
+    layout rule, and a copy of it here is what goes wrong on the release that changes it — which
+    is precisely what happened. Through 1.14 a configured directory *was* the library directory
+    and this is empty; from 1.15 the pack appends ``tree-sitter-language-pack/v<release>/libs``
+    to whatever it is given.
+
+    The measurement is one ``configure`` against a scratch directory, memoized for the process,
+    and it **puts the pack back on the directory it was reading first**. Leaving it pointed at a
+    scratch directory that is then deleted would make every later ``is_available`` answer
+    ``False`` for grammars sitting right there — the failure this module already guards against
+    in :func:`configure_pack`, reintroduced by the thing measuring the guard.
+    """
+    import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
+
+    global _pack_layout  # noqa: PLW0603 - a one-shot cache of an immutable property
+    if _pack_layout is None:
+        before = Path(pack.cache_dir())
+        with tempfile.TemporaryDirectory(prefix="manicule-pack-layout-") as directory:
+            base = Path(directory)
+            pack.configure(pack.PackConfig(cache_dir=directory, languages=[]))
+            resolved = Path(pack.cache_dir())
+            _pack_layout = resolved.relative_to(base).parts if resolved.is_relative_to(base) else ()
+        pack.configure(
+            pack.PackConfig(
+                cache_dir=_without_layout(before, _pack_layout), languages=list(DECLARED_LANGUAGES)
+            )
+        )
+    return _pack_layout
+
+
+def _without_layout(resolved: Path, layout: tuple[str, ...]) -> str:
+    """``resolved`` with the pack's layout removed, which is what ``configure`` takes."""
+    parts = resolved.parts
+    if layout and parts[-len(layout) :] == layout:
+        return str(Path(*parts[: -len(layout)]))
+    return str(resolved)
+
+
+def _base_of(resolved: Path) -> str:
+    """The directory to configure so the pack's libraries land in ``resolved``."""
+    return _without_layout(resolved, library_layout())
+
+
+def configured_base() -> str:
+    """The cache directory manicule last configured, as it was given to the pack.
+
+    Held rather than read back from :func:`cache_directory`, because from pack 1.15 those are
+    two different paths: what is reported is where the libraries are, and what ``configure``
+    takes is the directory above the layout in between. Feeding one back as the other appended
+    the layout a second time and pointed the pack at a directory that has never existed.
+    """
+    return _configured_base if _configured_base is not None else _default_configure_base()
+
+
+def _default_configure_base() -> str:
+    """The pack's own per-user cache directory, as ``configure`` would take it.
+
+    Read while the pack is still on its default rather than recomputed: the path carries the
+    release and the platform's cache convention, and deriving it would duplicate upstream's
+    rules. What is stripped from it is measured the same way — see :func:`library_layout`.
+    Reading it on the first call is safe because every override manicule applies goes through
+    :func:`configure_pack`.
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
 
     global _default_cache_dir  # noqa: PLW0603 - a one-shot cache of an immutable value
     if _default_cache_dir is None:
-        _default_cache_dir = pack.cache_dir()
+        resolved = Path(pack.cache_dir())
+        _default_cache_dir = _base_of(resolved)
     return _default_cache_dir
 
 
@@ -538,7 +601,7 @@ def configure_pack(
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - lazy, see module docstring
 
-    default_cache = _remember_default_cache_directory()
+    default_cache = _default_configure_base()
     if manifest_url is None:
         os.environ.pop(MANIFEST_URL_ENV, None)
     else:
@@ -549,8 +612,18 @@ def configure_pack(
             # an absent ``cache_dir`` as "keep whatever is already in force", so a call
             # meaning "go back to the default" would silently keep the previous override —
             # and every later call would then report the languages of a directory nobody
-            # asked for. Verified against the installed pack, not assumed.
-            cache_dir=str(cache_dir) if cache_dir is not None else default_cache,
+            # asked for. Verified against the installed pack, not assumed, and re-verified
+            # against 1.15: still true there.
+            #
+            # What changed at 1.15 is the *kind* of path this takes. It is the directory the
+            # pack builds its layout under, not the directory the libraries end up in — so
+            # `_base_of` strips the layout when a caller hands back what `cache_directory()`
+            # reported. That makes the round trip idempotent, which is the property everything
+            # here relied on when the two paths were the same: a caller that reads where the
+            # grammars are and configures the pack there gets the directory it named. A
+            # directory that does not already carry the layout is taken as the root to build it
+            # under, which is what a caller naming a fresh directory means.
+            cache_dir=_base_of(Path(cache_dir)) if cache_dir is not None else default_cache,
             languages=list(languages),
         )
     )
@@ -559,6 +632,8 @@ def configure_pack(
     # module would report a language as available that the new cache does not contain.
     _PARSERS.clear()
     _QUERIES.clear()
+    global _configured_base  # noqa: PLW0603 - what is in force, for `configured_base`
+    _configured_base = _base_of(Path(cache_dir)) if cache_dir is not None else default_cache
 
 
 def is_available(language: str) -> bool:

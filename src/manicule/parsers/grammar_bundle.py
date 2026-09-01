@@ -747,8 +747,17 @@ def _answers_for(candidate: Path, language: str) -> bool:
     """
     import tree_sitter_language_pack as pack  # noqa: PLC0415 - a parsing extra, not core
 
+    from manicule.parsers import grammars  # noqa: PLC0415 - avoids an import cycle
+
     with tempfile.TemporaryDirectory() as directory:
-        probe = Path(directory) / candidate.name
+        # Under the pack's own layout, not directly in the configured directory. From 1.15 a
+        # configured directory is the root the pack builds `tree-sitter-language-pack/v…/libs`
+        # beneath, so a library placed at the top of it is a library the pack never sees — and
+        # this probe would then answer "no" for every candidate, which reads as a grammar pack
+        # that has stopped shipping grammars.
+        root = Path(directory).joinpath(*grammars.library_layout())
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / candidate.name
         try:
             probe.symlink_to(candidate)
         except OSError:  # pragma: no cover - filesystems without symlinks
@@ -772,11 +781,15 @@ def _pack_configuration_restored() -> Generator[None]:
     built a bundle would silently be moved back to the per-user cache, and would look for its
     grammars somewhere they have never been.
     """
-    import tree_sitter_language_pack as pack  # noqa: PLC0415 - a parsing extra, not core
 
     from manicule.parsers import grammars  # noqa: PLC0415 - avoids an import cycle
 
-    cache = Path(pack.cache_dir())
+    # The **base** manicule configured, not `pack.cache_dir()`. Those were the same path
+    # through 1.14 and are not from 1.15, where what is reported is the library directory and
+    # what `configure` takes is the root above the layout. Reading one back as the other
+    # appended the layout again on every restore, so a bundle build left the pack looking one
+    # level deeper than anything has ever written.
+    cache = Path(grammars.configured_base())
     manifest_url = os.environ.get(grammars.MANIFEST_URL_ENV)
     try:
         yield
