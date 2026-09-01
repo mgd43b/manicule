@@ -1345,6 +1345,25 @@ candidate, it is a plausible number, and it is measured in the wrong units for a
 not generating anything. It is wrong by an unknown factor that varies by language and by
 content type.
 
+**The third row is measured twice, and the rule above was broken inside the module that states
+it.** `Context.token_count` is produced by `retrieval.assembly` from `rag.context`, and §7.5's
+policy filter has to recompute it after a drop — `model_copy` does not re-validate, so
+carrying a stale total forward would go on describing a context that no longer exists. It
+recomputed by summing `Chunk.token_count`, so a filtered context reported a figure comparable
+with neither the value assembly produced nor the `token_budget` recorded beside it in
+`Context.metadata`. The number is the assembled context's size, not the prompt's — the prompt
+is larger, and the estimate that guards the window is taken separately over the rendered
+messages.
+
+The filter therefore takes its counter as a required argument, and `Answerer` holds a second
+`TokenEstimator` for it. That one is configured from `rag.context`, not from
+`llm.token_safety_factor`: the two settings are independent and default to 1.2 and 1.15, so
+reusing the prompt estimator would have replaced one wrong number with another. It is the same
+row of the table as §9.2's estimate and a different configuration of it, which is why they are
+two objects rather than one. Nothing reads `Context.token_count` after the filter today, and
+that is the reason to fix it rather than a reason not to — the failure mode is a plausible
+number in the field, not a missing one.
+
 ### 9.2 The estimate, and the one measurement that replaces it
 
 The estimate follows `retrieval.md` §7.2 exactly and this document adds nothing to it:
