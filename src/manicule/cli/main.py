@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from pydantic import JsonValue
+    from rich.console import Console
 
     from manicule.app.results import Payload
     from manicule.generation.answers import AnswerEvent
@@ -585,6 +586,29 @@ async def _locally(command: Command) -> Envelope:
         return failed(command.op, STATE.workspace or UNKNOWN_WORKSPACE, error_info(exc))
 
 
+def _rendered_as_streamed(out: Console, payload: r.Payload) -> bool:
+    """Render a payload whose text may already be on the screen, or report it is not one.
+
+    ``ask`` and ``research`` both write their text to a terminal as it arrives, so both need
+    the renderer told what the reader has already seen. ``RENDERERS`` has no channel for that
+    — it renders a settled payload, not the tail of a stream — which is why these two are
+    dispatched here while everything else goes through the table.
+
+    A function rather than two more branches in :func:`print_envelope`, which was already at
+    the limit: a printer that grows a branch per payload is the shape the table exists to
+    avoid.
+    """
+    if isinstance(payload, r.AnswerResultPayload):
+        out.print()
+        render.render_answer(out, payload, text_already_shown=STATE.text_already_streamed)
+        return True
+    if isinstance(payload, r.ResearchReportPayload):
+        out.print()
+        render.render_research(out, payload, text_already_shown=STATE.text_already_streamed)
+        return True
+    return False
+
+
 def print_envelope(envelope: Envelope) -> None:
     """Write one result the way the caller asked for, and set the exit status.
 
@@ -603,9 +627,7 @@ def print_envelope(envelope: Envelope) -> None:
     if envelope.data is not None:
         payload = PAYLOADS[envelope.op].model_validate(envelope.data)
         console = render.console()
-        if isinstance(payload, r.AnswerResultPayload):
-            console.print()
-            render.render_answer(console, payload, text_already_shown=STATE.text_already_streamed)
+        if _rendered_as_streamed(console, payload):
             if envelope.ok:
                 return
             raise typer.Exit(1)
@@ -629,6 +651,7 @@ def print_envelope(envelope: Envelope) -> None:
 
 PAYLOADS: dict[str, type[Payload]] = {
     "ask": r.AnswerResultPayload,
+    "research": r.ResearchReportPayload,
     "search": r.SearchResult,
     "index_path": r.IngestReport,
     "index_changes": r.IngestReport,
@@ -824,6 +847,52 @@ def ask(
             sources=tuple(source or ()),
             collections=tuple(collection or ()),
             conversation_id=conversation,
+            on_event=on_event if stream else None,
+        ),
+    )
+
+
+# --- research ---
+
+
+@app.command()
+def research(
+    question: Annotated[str | None, typer.Argument(help="The question. Reads stdin if absent.")] = (
+        None
+    ),
+    *,
+    profile: Annotated[str | None, typer.Option(help="fast, balanced or precise.")] = None,
+    limit: Annotated[int | None, typer.Option(help="Passages each search retrieves.")] = None,
+    source: Annotated[
+        list[str] | None, typer.Option("--source", help="Restrict to these sources.")
+    ] = None,
+    collection: Annotated[
+        list[str] | None, typer.Option("--collection", help="Restrict to these collections.")
+    ] = None,
+) -> None:
+    """Answer a question from several searches, with citations that resolve.
+
+    Slower and more expensive than `ask` — it plans, searches several times, and reads more
+    passages. Worth it for a question with several parts; for one fact, `ask` is the same
+    citation guarantee in a fraction of the time.
+    """
+    stream = not STATE.json_output and sys.stdout.isatty()
+    out = render.console()
+
+    def on_event(event: AnswerEvent) -> None:
+        if event.kind is EventKind.DELTA and event.text:
+            out.file.write(event.text)
+            out.file.flush()
+
+    STATE.text_already_streamed = stream
+    emit(
+        "research",
+        lambda service: service.research(
+            _from_stdin(question),
+            profile=profile,
+            limit=limit,
+            sources=tuple(source or ()),
+            collections=tuple(collection or ()),
             on_event=on_event if stream else None,
         ),
     )

@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.organization import Collection as DocumentCollection
     from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
-    from manicule.core.protocols import Connector
+    from manicule.core.protocols import Connector, Generator
     from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Filter, Query
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
@@ -684,6 +684,15 @@ class Backend(Protocol):
     async def retriever(self) -> Retrieving: ...
 
     async def answerer(self) -> Answering: ...
+
+    async def generator(self) -> Generator:
+        """The configured generator itself, for the one caller that is not the answer path.
+
+        A research run has to *plan* before it has anything to answer from, which is a model
+        call with no context and no citations. That cannot go through ``answerer``: the answer
+        path exists to bind and verify citations, and a planning call has no slots to bind.
+        """
+        ...
 
     async def ingestion(self) -> Ingesting: ...
 

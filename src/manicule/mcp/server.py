@@ -200,6 +200,7 @@ fall out of step with them.
 
 TOOL_NAMES: tuple[str, ...] = (
     "ask",
+    "research",
     "search",
     "index_path",
     "document_list",
@@ -651,6 +652,51 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
                 sources=tuple(sources or ()),
                 collections=tuple(collections or ()),
                 conversation_id=conversation_id,
+            ),
+        )
+
+    # Not read-only, for the two reasons `ask` is not, plus one that is this tool's own: it
+    # reaches a model that may be on somebody else's machine, it persists nothing but it runs
+    # several retrievals rather than one. What makes it callable unattended at all is that
+    # every one of those is bounded before the run starts — at most `research.max_cycles` times
+    # `research.max_sub_questions` retrievals, inside `research.timeout_s`. An unbounded
+    # version would belong on the command line only, for the reason `document_reindex_stale`
+    # is there: an assistant that can start one has the machine for as long as it likes.
+    @register.tool(hints(reads=False, removes=False, repeatable=False, reaches_out=True))
+    async def research(
+        question: str,
+        *,
+        profile: str | None = None,
+        limit: int | None = None,
+        sources: list[str] | None = None,
+        collections: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Research a question across several searches and report with citations that resolve.
+
+        Slower and more expensive than `ask`: it plans the question into searches, runs them,
+        and reads more passages than one answer would. Prefer `ask` for a single fact, and this
+        for a question with several parts or one that needs sources compared.
+
+        Args:
+            question: The question to research.
+            profile: Retrieval profile for each search - fast, balanced or precise.
+            limit: Passages each individual search retrieves.
+            sources: Restrict to these sources.
+            collections: Restrict to these collections, by name.
+
+        Returns:
+            The envelope. `data` carries the report, its citations, and `sub_questions` - the
+            searches it actually ran, so a caller can see which angles were covered rather than
+            inferring them from the prose.
+        """
+        return await dispatch(
+            "research",
+            lambda: service.research(
+                question,
+                profile=profile,
+                limit=limit,
+                sources=tuple(sources or ()),
+                collections=tuple(collections or ()),
             ),
         )
 
@@ -1158,6 +1204,7 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         tool.__name__
         for tool in (
             ask,
+            research,
             search,
             index_path,
             document_list,

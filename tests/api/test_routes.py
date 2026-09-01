@@ -576,6 +576,11 @@ ABSENT_TOOLS: tuple[tuple[str, str], ...] = (
     ("collection_delete", "deleting a grouping"),
     ("collection_add", "changing what a grouping holds"),
     ("collection_remove", "changing what a grouping holds"),
+    (
+        "research",
+        "several model calls and several retrievals for one call, which is `ask`'s reasons "
+        "over again and more of them",
+    ),
     ("ask", "it persists a turn given a conversation, and calls a model that may be elsewhere"),
 )
 """Every mutating tool, named with what it would let an unattended caller do from the network.

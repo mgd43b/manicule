@@ -42,10 +42,12 @@ from manicule.core.embedding import (
     VectorChecksumCoverage,
 )
 from manicule.core.errors import NameInUseError, UnknownEntityError
+from manicule.core.generation import FinishReason, Token
 from manicule.core.glossary import QueryExpansion
 from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.core.organization import Collection as DocumentCollection
 from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
+from manicule.core.protocols import Generator
 from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.core.rebuild import (
     RebuildCheckpoint,
@@ -67,6 +69,7 @@ from manicule.generation.ports import (
     FeedbackReason,
     SharedTurn,
 )
+from manicule.generation.prompt import ChatMessage
 from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.ingest.pipeline import RunReport, Watching
 from manicule.ingest.reembed import (
@@ -779,6 +782,38 @@ class FakeRetriever:
 
 
 @dataclass
+class FakeGenerator:
+    """A generator that replies with a fixed script, one entry per call.
+
+    Declares ``messages`` because that is the keyword the research loop refuses a generator for
+    lacking — a fake without it could exercise neither the refusal nor the happy path, and the
+    happy path would silently be testing a prompt nobody built.
+    """
+
+    replies: list[str] = field(default_factory=list[str])
+    model_id: str = "fake/model"
+    context_window: int = 32768
+    seen: list[list[ChatMessage]] = field(default_factory=list[list[ChatMessage]])
+
+    def generate(
+        self,
+        query: Query,
+        context: Context,
+        *,
+        history: Sequence[ChatMessage] = (),
+        documents: Mapping[str, Document] | None = None,
+        messages: Sequence[ChatMessage] | None = None,
+    ) -> AsyncIterator[Token]:
+        del query, context, history, documents
+        self.seen.append(list(messages or ()))
+        return self._stream(self.replies.pop(0) if self.replies else "{}")
+
+    async def _stream(self, reply: str) -> AsyncIterator[Token]:
+        yield Token(text=reply)
+        yield Token(finish_reason=FinishReason.STOP)
+
+
+@dataclass
 class FakeAnswerer:
     """An answerer that emits one delta and a final envelope."""
 
@@ -1373,6 +1408,7 @@ class FakeBackend:
     telemetry_: FakeTelemetry = field(default_factory=FakeTelemetry)
     keys_: FakeKeys = field(default_factory=FakeKeys)
     retained_: FakeRetained = field(default_factory=FakeRetained)
+    generator_: FakeGenerator = field(default_factory=FakeGenerator)
     discovery: Discovery | None = None
     checks: list[Check] = field(default_factory=list[Check])
 
@@ -1391,6 +1427,9 @@ class FakeBackend:
 
     async def answerer(self) -> Answering:
         return self.answerer_
+
+    async def generator(self) -> Generator:
+        return self.generator_
 
     async def ingestion(self) -> Ingesting:
         return self.ingestion_
