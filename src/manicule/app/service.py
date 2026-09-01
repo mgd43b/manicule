@@ -45,6 +45,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from manicule.app import results as r
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
 from manicule.config.loader import load_settings
+from manicule.config.profiles import profile_config
 from manicule.config.settings import (
     AuthMode,
     BrowserProvider,
@@ -77,10 +78,11 @@ from manicule.core.rebuild import (
     RebuildTerminalGenerationError,
     RebuildValidationError,
 )
-from manicule.core.retrieval import Filter, Query, RetrievalProfile
+from manicule.core.retrieval import Candidate, Context, Filter, Query, RetrievalProfile
 from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
 from manicule.core.version import CORE_VERSION
 from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
+from manicule.research.config import ResearchLimits
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
@@ -857,6 +859,139 @@ class ApplicationService:
                 record.payload = self._answer_payload(
                     question, envelope, record, started, conversation_id, documents=documents
                 )
+
+    async def research(
+        self,
+        question: str,
+        *,
+        profile: str | None = None,
+        limit: int | None = None,
+        sources: Sequence[str] = (),
+        collections: Sequence[str] = (),
+        on_event: Callable[[AnswerEvent], None] | None = None,
+    ) -> r.ResearchReportPayload:
+        """Answer one question from several searches, and report with verified citations.
+
+        The loop plans, searches, and decides whether another cycle is worth running; it never
+        writes prose that becomes evidence. What it returns is passages, and this method then
+        runs **the ordinary answer path** over them — the same ``Answerer``, the same egress
+        filter, the same binder, the same three-level verification. That is the whole reason a
+        research report's citations are worth what an ``ask``'s citations are worth: they are
+        produced by the same objects, not by a second implementation that could omit one.
+
+        The tenancy check happens before the model, over the whole accumulated ledger rather
+        than one retrieval's context — several searches is several chances to surface another
+        tenant's row, and checking each retrieval separately would leave the union unchecked.
+
+        ``on_event`` is a view hook, exactly as it is on :meth:`ask`: it cannot change the
+        report, and the payload is identical whether or not one is passed.
+
+        Raises:
+            ConfigError: The configured generator cannot be given a prepared prompt, or
+                ``research.report_tokens`` does not fit the generator's context window.
+        """
+        from manicule.generation.answering import (  # noqa: PLC0415 - keeps a cold start cold
+            AnswerRequest,
+            AnswerResult,
+            answering,
+        )
+        from manicule.research.ledger import corroborated  # noqa: PLC0415 - see above
+        from manicule.research.loop import ResearchLoop, plan_problem  # noqa: PLC0415 - see above
+
+        started = time.monotonic()
+        limits = _research_limits(self.settings)
+        base = self._query(
+            question,
+            limit=limit or 8,
+            profile=profile,
+            sources=sources,
+            collection_ids=sorted(await self._collection_scope(collections)),
+        )
+        retriever = await self._backend.retriever()
+        answerer = await self._backend.answerer()
+        generator = await self._backend.generator()
+        problem = plan_problem(
+            limits,
+            context_window=generator.context_window,
+            reserved=self.settings.rag.context.system_prompt_tokens
+            + self.settings.llm.max_tokens
+            + profile_config(self.settings.rag.profile, self.settings.rag.overrides).history_tokens,
+        )
+        if problem:
+            raise ConfigError(problem)
+
+        evidence = await ResearchLoop(generator=generator, retriever=retriever, limits=limits).run(
+            question, base
+        )
+        documents = await self._require_scoped_chunks(
+            candidate.chunk for candidate in evidence.passages
+        )
+        context = _research_context(self.settings, base, evidence.passages, limits)
+
+        request = AnswerRequest(
+            query=base, context=context, corpus_consulted=bool(context.passages)
+        )
+        result = AnswerResult()
+        envelope: AnswerEnvelope | None = None
+        async with answering(answerer, request, result) as events:
+            async for event in events:
+                if event.envelope is not None:
+                    envelope = event.envelope
+                if on_event is not None:
+                    on_event(event)
+        if envelope is None:  # pragma: no cover - the answer path always ends with `final`
+            msg = "the research report ended without a final event"
+            raise ManiculeError(msg)
+        return r.ResearchReportPayload(
+            question=question,
+            text=envelope.text,
+            citations=tuple(
+                r.AnswerCitation(
+                    slot=citation.slot,
+                    document_id=citation.document_id,
+                    chunk_id=citation.chunk_id,
+                    uri=citation.uri,
+                    title=citation.title,
+                    heading_path=citation.heading_path,
+                    kind=citation.kind.value,
+                    anchor=_json_object(citation.anchor.model_dump(mode="json")),
+                    quote=citation.quote,
+                    verification=citation.verification.value,
+                    provenance=source_reference(documents.get(citation.document_id)),
+                )
+                for citation in envelope.citations
+            ),
+            dropped=len(envelope.dropped),
+            sub_questions=tuple(
+                r.ResearchSubQuestion(
+                    question=step.sub_question,
+                    cycle=step.cycle,
+                    retrieved=step.retrieved,
+                    fresh=step.fresh,
+                    confidence=step.confidence,
+                    confidence_band=step.confidence_band,
+                    routed_away=step.routed_away,
+                )
+                for step in evidence.trace.steps
+            ),
+            planned=evidence.trace.planned,
+            model_planned=evidence.plan.model_planned,
+            cycles_run=evidence.trace.cycles_run,
+            cycles_allowed=evidence.trace.cycles_allowed,
+            stopped_early=evidence.trace.stopped_early,
+            passages_found=evidence.trace.passages_found,
+            passages_cited=len(context.passages),
+            corroborated=corroborated(context.passages, evidence.support),
+            model_calls=evidence.trace.model_calls,
+            corpus_consulted=envelope.corpus_consulted,
+            ungrounded=envelope.ungrounded,
+            context_truncated=envelope.context_truncated,
+            redacted=envelope.redacted,
+            finish_reason=envelope.finish_reason.value if envelope.finish_reason else None,
+            error=envelope.error,
+            model=self.settings.llm.model,
+            elapsed_ms=_millis(started),
+        )
 
     async def search(
         self,
@@ -5634,6 +5769,51 @@ class ApplicationService:
 
 
 # --- module helpers --------------------------------------------------------------------------
+
+
+def _research_limits(settings: Settings) -> ResearchLimits:
+    """The settings block as the loop's own bounds type.
+
+    Two models rather than one because ``manicule.research`` must be constructible without a
+    whole ``Settings`` tree — a loop that could only be built from global configuration is a
+    loop nobody can unit-test. The fields are named identically, so the translation is a copy
+    and cannot drift into a reinterpretation.
+    """
+    block = settings.research
+    return ResearchLimits(
+        max_cycles=block.max_cycles,
+        max_sub_questions=block.max_sub_questions,
+        concurrency=block.concurrency,
+        report_passages=block.report_passages,
+        report_tokens=block.report_tokens,
+        timeout_s=block.timeout_s,
+    )
+
+
+def _research_context(
+    settings: Settings, query: Query, passages: Sequence[Candidate], limits: ResearchLimits
+) -> Context:
+    """Fit a run's accumulated passages into the report's context, in ledger order.
+
+    Uses the **same** fitter an ordinary answer uses, against a profile widened only in the two
+    fields a report needs. That matters more than the code it saves: assembly's rule is that a
+    passage is included whole or not at all, because a trimmed passage makes its citation quote
+    text the source does not contain — and a second fitter here would be a second place for that
+    rule to be got wrong.
+    """
+    from manicule.research.loop import report_overrides  # noqa: PLC0415 - keeps startup cold
+    from manicule.retrieval.assembly import ContextAssembler  # noqa: PLC0415 - see above
+    from manicule.retrieval.profile import Profiles  # noqa: PLC0415 - see above
+    from manicule.retrieval.tokens import ContextTokenCounter  # noqa: PLC0415 - see above
+
+    base = profile_config(query.profile, settings.rag.overrides)
+    counter = ContextTokenCounter(
+        encoding=settings.rag.context.encoding,
+        safety_factor=settings.rag.context.safety_factor,
+        drift_tolerance=settings.rag.context.drift_tolerance,
+    )
+    profiles = Profiles(report_overrides(limits, base, settings.rag.overrides))
+    return ContextAssembler(counter=counter, profiles=profiles).assemble(query, list(passages))
 
 
 def cited_definition(

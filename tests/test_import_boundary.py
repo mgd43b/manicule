@@ -99,6 +99,12 @@ MANICULE_PACKAGES = (
     # import lives inside the factory that builds the generator, so an installation that
     # never asks a question never pays for it — and `manicule doctor` does not load it at all.
     "manicule.generation",
+    # Research is in this list for the same reason as generation: it composes retrieval and
+    # generation without importing either's runtime. Its planning calls reach a model
+    # through the container's generator, and its context assembly is imported inside the
+    # one function that needs it — so importing the package loads no tokenizer, no provider
+    # library and no store.
+    "manicule.research",
     # The vocabulary package exists because `tiktoken` fetches a BPE table from a blob store
     # on first use, and it must not become the reason `tiktoken` is loaded at all. Every one
     # of its functions imports the library inside itself, so a process that pre-seeds pays for

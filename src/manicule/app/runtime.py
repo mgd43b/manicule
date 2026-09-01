@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from manicule.core.ann import AnnIndexBuild, AnnIndexState
     from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
     from manicule.core.fingerprints import GlossaryFingerprint
-    from manicule.core.protocols import Connector, Embedder, Parser, VectorStore
+    from manicule.core.protocols import Connector, Embedder, Generator, Parser, VectorStore
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
@@ -465,6 +465,14 @@ class Runtime:
     async def retriever(self) -> Retrieving:
         """The whole of retrieval. Builds the embedder, so it is not built for a listing."""
         return await self._once("retriever", self._build_retriever)
+
+    async def generator(self) -> Generator:
+        """The configured generator, memoized by the container.
+
+        Not a second construction: :meth:`answerer` resolves the same container key, so a
+        research run's planning calls and its report reach one model through one object.
+        """
+        return await self._container.aget(keys.GENERATOR)
 
     async def answerer(self) -> Answering:
         """The answer path. Builds the generator, so it is not built for a search."""

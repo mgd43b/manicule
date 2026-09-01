@@ -278,6 +278,11 @@ the rest only with a measured improvement.
 Streaming answers with citations and confidence, multi-turn memory, shared conversation
 links, feedback capture. **Carries over.**
 
+And one operation above it that OpenDocuments has no equivalent for: `research` answers a
+question from several searches rather than one, and reports from a deliberately wider context.
+It reuses the answer path whole rather than building a second citation chain — see
+[`docs/research.md`](docs/research.md).
+
 | | OpenDocuments | manicule | |
 |---|---|---|---|
 | Providers | 5 hand-written clients (Ollama, OpenAI, Anthropic, Google, xAI) | **litellm** | **Gain.** One dependency, plus every OpenAI-compatible endpoint |

@@ -13,16 +13,16 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | Area | Items | Ticket |
 |---|---:|---|
 | CLI capability items | 48 | #8 — **built** |
-| MCP capability items | 44 | #8 — **built** |
+| MCP capability items | 45 | #8 — **built** |
 | HTTP endpoints | 62 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **212** | |
+| **Total** | **213** | |
 
 ## CLI — 48
 
 Ticket: #8 — **built.** The 48 rows below are upstream capability items, not the current command
-count. Manicule exposes 31 top-level commands; `manicule --help` and the asserted inventory in
+count. Manicule exposes 32 top-level commands; `manicule --help` and the asserted inventory in
 [`docs/surfaces.md`](docs/surfaces.md) are authoritative. Several bare verbs below are subcommands,
 so the mapping is noted where it is not obvious. The output shape is also a contract there.
 
@@ -83,6 +83,10 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 
 ### Added, because the commands above could not do their job without them
 
+- `research` — one question, several searches, one report with citations that resolve. `ask`
+  retrieves once, and a question with several facets cannot be answered from one ranking's top
+  five passages. Bounded before it starts: `research.max_cycles` rounds of at most
+  `research.max_sub_questions` searches, inside `research.timeout_s`.
 - `--workspace/-w` — run one command in another workspace, without editing configuration.
 - `index --stats` — counts grouped by source, media type and status.
 - `index --source` — the source name documents are recorded under. It is part of their
@@ -104,16 +108,16 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
   connector-free derived publication with no separate settlement command.
 
-## MCP tools — 44
+## MCP tools — 45
 
-Ticket: #8 — **built.** Forty-three implemented tools over the same application service the command
+Ticket: #8 — **built.** Forty-four implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
-The checklist below has forty-four capability items because it also records the deliberately
+The checklist below has forty-five capability items because it also records the deliberately
 declined catch-all `run-command` surface; that item is not a registered MCP tool.
 
-**All forty-three over stdio; the twenty-six read-only ones over a socket.** MCP is also served
+**All forty-four over stdio; the twenty-six read-only ones over a socket.** MCP is also served
 at `/mcp/` on the HTTP port, and every mutating tool is *absent* from that surface rather than
 refused on it — see [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are
 unreachable from a network by construction, and a socket has to replace that property rather
@@ -154,6 +158,7 @@ than assume it.
 - [x] `plugin_add`
 - [x] `plugin_list`
 - [x] `plugin_remove`
+- [x] `research`
 - [x] `search`
 - [x] `snapshot_status`
 - [x] `snapshot_verify`

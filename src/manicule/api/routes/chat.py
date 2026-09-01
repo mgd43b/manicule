@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 
 from manicule.api.context import Service
 from manicule.api.envelopes import respond
-from manicule.api.models import AskBody, FeedbackBody
+from manicule.api.models import AskBody, FeedbackBody, ResearchBody
 from manicule.api.security import MemberPrincipal
 from manicule.api.streaming import SSE_HEADERS, SSE_MEDIA_TYPE, answer_frames, sse
 
@@ -77,6 +77,29 @@ async def chat_stream(
         frames(),  # pyright: ignore[reportArgumentType] - an async generator of str is a valid body
         media_type=SSE_MEDIA_TYPE,
         headers=dict(SSE_HEADERS),
+    )
+
+
+@router.post("/research", name="research", summary="Research a question across several searches.")
+async def research(service: Service, caller: MemberPrincipal, body: ResearchBody) -> Response:
+    """Plan a question into searches, run them, and report with citations that resolve.
+
+    Not streamed. The report is the product and it is written in one pass at the end of a run
+    that is mostly retrieval — so a stream would be a long silence and then everything at once,
+    which is a worse experience than a request that says it is working. `POST /api/v1/chat/stream`
+    remains the streaming surface for a single answer.
+    """
+    del caller
+    return await respond(
+        "research",
+        service,
+        lambda: service.research(
+            body.question,
+            profile=body.profile,
+            limit=body.limit,
+            sources=body.sources,
+            collections=body.collections,
+        ),
     )
 
 

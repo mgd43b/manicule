@@ -39,6 +39,16 @@ class AskBody(Body):
     )
 
 
+class ResearchBody(Body):
+    """A question to research across several searches."""
+
+    question: str = Field(min_length=1)
+    profile: str | None = None
+    limit: int | None = Field(default=None, ge=1, le=100)
+    sources: tuple[str, ...] = ()
+    collections: tuple[str, ...] = ()
+
+
 class FeedbackBody(Body):
     """A rating on one answer."""
 

@@ -139,6 +139,81 @@ def render_answer(
     _render_confidence_reason(out, payload.confidence_band, payload.confidence_reason)
 
 
+def render_research(
+    out: Console, payload: r.ResearchReportPayload, *, text_already_shown: bool = False
+) -> None:
+    """The report, its citations, what was searched, and what the run cost.
+
+    The searches are shown in full rather than counted. A reader deciding whether to trust a
+    multi-search report needs to see which angles it took — a report that missed the obvious
+    question is only visible if the questions it did ask are on the page.
+    """
+    _render_glossary(out, payload.expansions, payload.conflicts)
+    if payload.text and not text_already_shown:
+        out.print(Panel(Text(payload.text), title="report", border_style="cyan"))
+    if payload.error:
+        out.print(f"[red]{escape(payload.error)}[/red]")
+
+    if payload.sub_questions:
+        searches = Table("cycle", "search", "found", "new", box=None, pad_edge=False)
+        for step in payload.sub_questions:
+            searches.add_row(
+                str(step.cycle),
+                escape(step.question),
+                "routed" if step.routed_away else str(step.retrieved),
+                "-" if step.routed_away else str(step.fresh),
+            )
+        out.print(searches)
+
+    if payload.citations:
+        table = Table("slot", "document", "location", "verified", box=None, pad_edge=False)
+        for citation in payload.citations:
+            table.add_row(
+                str(citation.slot),
+                escape(citation.title or citation.uri),
+                escape(_anchor_summary(citation.anchor)),
+                escape(citation.verification),
+            )
+        out.print(table)
+    elif payload.corpus_consulted:
+        out.print("[yellow]no citation survived verification[/yellow]")
+
+    out.print(f"[dim]{' · '.join(_research_facts(payload))}[/dim]")
+    if payload.stopped_early:
+        out.print(f"[dim]stopped early: {escape(payload.stopped_early)}[/dim]")
+
+
+def _research_facts(payload: r.ResearchReportPayload) -> list[str]:
+    """What was true of the run, as the dim line under the report.
+
+    Split out of :func:`render_research` because that function was over the branch limit, and
+    the split falls where the meaning does: above it renders the report and its evidence,
+    here is the accounting for how both were produced.
+    """
+    facts: list[str] = []
+    if not payload.model_planned:
+        facts.append("[yellow]planning returned nothing usable; searched the question as asked")
+    if not payload.corpus_consulted:
+        facts.append("the searches found nothing, so this report carries no citations")
+    if payload.ungrounded:
+        facts.append("[red]ungrounded[/red]: passages were found and none could be verified")
+    facts.append(
+        f"{payload.cycles_run}/{payload.cycles_allowed} cycles · "
+        f"{len(payload.sub_questions)} searches · {payload.model_calls} planning calls"
+    )
+    facts.append(f"{payload.passages_found} passages found, {payload.passages_cited} read")
+    if payload.corroborated:
+        facts.append(f"{payload.corroborated} found by more than one search")
+    if payload.dropped:
+        facts.append(f"{payload.dropped} citation(s) dropped")
+    if payload.context_truncated:
+        facts.append("evidence truncated to fit the model's window")
+    if payload.redacted:
+        facts.append("personal data was redacted before sending")
+    facts.append(f"{payload.elapsed_ms} ms")
+    return facts
+
+
 def _render_glossary(
     out: Console,
     expansions: Sequence[r.GlossaryExpansion],
@@ -1328,6 +1403,7 @@ def render_rebuild_run(out: Console, payload: r.RebuildRunReport) -> None:
 
 RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.AnswerResultPayload: lambda out, p: render_answer(out, _as(r.AnswerResultPayload, p)),
+    r.ResearchReportPayload: lambda out, p: render_research(out, _as(r.ResearchReportPayload, p)),
     r.SearchResult: lambda out, p: render_search(out, _as(r.SearchResult, p)),
     r.DocumentList: lambda out, p: render_document_list(out, _as(r.DocumentList, p)),
     r.DocumentDetail: lambda out, p: render_document(out, _as(r.DocumentDetail, p)),

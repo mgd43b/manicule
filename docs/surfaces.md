@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Forty-three MCP tools and thirty-one CLI commands. They are not a one-to-one mapping: some
+Forty-four MCP tools and thirty-two CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -258,6 +258,7 @@ server and the built command tree.
 | Operation (`op`) | MCP tool | Command | Payload |
 |---|---|---|---|
 | `ask` | ✓ | `ask` | answer, citations, confidence |
+| `research` | ✓ | `research` | report, citations, the searches it ran |
 | `search` | ✓ | `search` | ranked passages |
 | `index_path` | ✓ | `index <path>` | run counters |
 | `index_changes` | — | `index --watch` | run counters |
@@ -581,6 +582,38 @@ Three of those are separate claims and are never combined:
 
 Each citation carries `slot`, `document_id`, `chunk_id`, `uri`, `title`, `heading_path`,
 `kind`, `anchor`, `quote` and `verification`.
+
+### `research` → `ResearchReportPayload`
+
+Everything `ask` reports plus the record of how the evidence was gathered: `sub_questions[]`,
+`planned`, `model_planned`, `cycles_run`, `cycles_allowed`, `stopped_early`, `passages_found`,
+`passages_cited`, `corroborated`, `model_calls`.
+
+The citation fields mean exactly what they mean on `ask`, because the report is produced by the
+same answer path over a wider context — `dropped` still counts markers that failed verification
+and were deleted, `ungrounded` still means the context was non-empty and nothing survived.
+
+Four of the run fields are separate claims and are never combined:
+
+- `passages_found` is what the searches turned up; `passages_cited` is how many of those fit the
+  report's context and were numbered. The gap between them is evidence the report could not
+  read, and a single number would hide it.
+- `corroborated` counts cited passages that **more than one** sub-question retrieved. It is
+  agreement between searches, and it is deliberately not folded into `confidence`, which
+  describes one retrieval's ranking and is reported per sub-question. There is no run-level
+  confidence: a mean across several retrievals describes none of them.
+- `model_planned` is `false` when planning returned nothing usable and the run searched the
+  question as asked. A run that degraded to one search is otherwise indistinguishable from a
+  question that only had one facet.
+- `stopped_early` says why the loop stopped before its cycle budget, or is empty. Reaching a
+  bound and running out of things to ask are different facts about a run.
+
+`research` is **not** read-only, for the two reasons `ask` is not and one of its own: it makes
+several model calls and several retrievals for one invocation. What makes it reachable from an
+unattended surface at all is that all of it is bounded before the run starts —
+`research.max_cycles` rounds of at most `research.max_sub_questions` searches, inside
+`research.timeout_s`. That is the same argument `document_reindex` makes against
+`document_reindex_stale`: one document is a bound.
 
 ### `search` → `SearchResult`
 
@@ -1046,7 +1079,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 |---|---|
 | health | `GET /healthz`, `GET /readyz`, `GET /api/v1/health`, `GET /api/v1/stats`, `GET /api/v1/workspaces` |
 | documents | `GET /api/v1/documents`, `GET /api/v1/documents/{id}`, `DELETE /api/v1/documents/{id}`, `GET /api/v1/documents/trash`, `POST /api/v1/documents/{id}/restore`, `POST /api/v1/documents/{id}/reindex`, `GET /api/v1/search` |
-| chat | `POST /api/v1/chat`, `POST /api/v1/chat/stream`, `POST /api/v1/chat/feedback` |
+| chat | `POST /api/v1/chat`, `POST /api/v1/chat/stream`, `POST /api/v1/chat/research`, `POST /api/v1/chat/feedback` |
 | conversations | `GET`/`POST /api/v1/conversations`, `GET /api/v1/conversations/{id}/messages`, `PATCH`/`DELETE /api/v1/conversations/{id}`, `POST`/`DELETE /api/v1/conversations/{id}/share`, `GET /shared/{token}` |
 | collections | `GET`/`POST /api/v1/collections`, `PATCH`/`DELETE /api/v1/collections/{id}`, `POST /api/v1/collections/{id}/name`, `GET`/`PUT`/`DELETE /api/v1/collections/{id}/rule`, `GET /api/v1/collections/{id}/counts`, `GET /api/v1/collections/{id}/documents`, `POST`/`DELETE /api/v1/collections/{id}/documents/{docId}` |
 | tags | `GET`/`POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`, `POST`/`DELETE /api/v1/documents/{docId}/tags/{tagId}` |

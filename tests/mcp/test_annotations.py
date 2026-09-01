@@ -76,6 +76,7 @@ MUTATIONS: tuple[str, ...] = (
     "collection_add",
     "collection_remove",
     "ask",
+    "research",
 )
 """Every tool that changes something, named so the negative is a list rather than a leftover.
 

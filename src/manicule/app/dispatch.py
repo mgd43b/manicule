@@ -217,6 +217,7 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         # made conditional on a write is the failure that code exists to avoid, and refusing
         # a search because an index is being rebuilt would be the same failure one level up.
         "ask",
+        "research",
         "search",
         # Reads of what is stored.
         "document_list",

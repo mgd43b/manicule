@@ -673,6 +673,82 @@ class AnswerResultPayload(Glossed):
     elapsed_ms: int = Field(default=0, ge=0)
 
 
+class ResearchSubQuestion(Payload):
+    """One search a research run ran, and what it returned.
+
+    Counts and identifiers, never passage text. ``fresh`` is what this search added that no
+    earlier one had found, which is the number that says whether a cycle earned its latency.
+    """
+
+    question: str
+    cycle: int = Field(ge=1)
+    retrieved: int = Field(default=0, ge=0)
+    fresh: int = Field(default=0, ge=0)
+    confidence: float | None = None
+    confidence_band: str | None = None
+    routed_away: bool = False
+
+
+class ResearchReportPayload(Glossed):
+    """What ``research`` produced.
+
+    A superset of ``ask``'s claims plus the record of how the evidence was gathered. Everything
+    ``ask`` reports about citations means the same thing here, because the report is produced by
+    the same answer path over a wider context — ``dropped`` still counts markers that failed
+    verification and were deleted, and ``ungrounded`` still means the context was non-empty and
+    nothing survived.
+
+    Three numbers describe the *run* rather than the answer, and none of them is folded into
+    ``confidence``: :attr:`passages_found` is what the searches turned up, :attr:`passages_cited`
+    is how many of those the report was able to number, and :attr:`corroborated` is how many
+    more than one sub-question found. Confidence describes one retrieval's ranking and is
+    reported per sub-question; a mean across several would describe none of them.
+    """
+
+    question: str
+    text: str
+    citations: tuple[AnswerCitation, ...] = ()
+    dropped: int = Field(default=0, ge=0)
+    sub_questions: tuple[ResearchSubQuestion, ...] = ()
+    planned: int = Field(default=0, ge=0)
+    model_planned: bool = Field(
+        default=True,
+        description="False when planning returned nothing usable and the run searched the "
+        "question as asked. Reported because a run that degraded to one search looks, in its "
+        "output, exactly like a question with one facet.",
+    )
+    cycles_run: int = Field(default=0, ge=0)
+    cycles_allowed: int = Field(default=0, ge=0)
+    stopped_early: str = Field(
+        default="",
+        description="Why the loop stopped before its cycle budget, or empty. Reaching a bound "
+        "and running out of things to ask are different facts about a run.",
+    )
+    passages_found: int = Field(default=0, ge=0)
+    passages_cited: int = Field(default=0, ge=0)
+    corroborated: int = Field(
+        default=0,
+        ge=0,
+        description="Cited passages that more than one sub-question retrieved. Reported on its "
+        "own rather than blended into confidence: it measures agreement between searches, and "
+        "confidence measures one search's ranking.",
+    )
+    model_calls: int = Field(
+        default=0,
+        ge=0,
+        description="Planning calls the loop made. The report's own generation is not counted "
+        "here, so this and the answer never double-count one model call.",
+    )
+    corpus_consulted: bool = True
+    ungrounded: bool = False
+    context_truncated: bool = False
+    redacted: bool = False
+    finish_reason: str | None = None
+    error: str | None = None
+    model: str = ""
+    elapsed_ms: int = Field(default=0, ge=0)
+
+
 # --- documents -----------------------------------------------------------------------------
 
 
@@ -2507,6 +2583,8 @@ __all__ = [
     "ReembedCleanupReport",
     "ReembedPlanReport",
     "ReembedRunReport",
+    "ResearchReportPayload",
+    "ResearchSubQuestion",
     "ResetReport",
     "ResolvedBy",
     "RestoreReport",
