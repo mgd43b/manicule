@@ -110,8 +110,10 @@ class SessionStore(Protocol):
     **``load`` is synchronous and the other two are not**, which is an asymmetry worth stating
     rather than tidying away. Loading is consulted by
     :func:`~manicule.connectors.credentials.credential_for` from inside the connector plugin
-    factory — ordinary synchronous code that runs before a connector is built — and in every
-    implementation it is a dictionary lookup in this process's memory.
+    factory — ordinary synchronous code that runs before a connector is built — and again by
+    :meth:`~manicule.connectors.credentials.HeldSessionCredential.authorize` before every
+    request that connector makes. In every implementation it is a dictionary lookup in this
+    process's memory, which is what makes reading it per request unremarkable.
 
     Saving and forgetting are the two that may have to *reach* the process holding the
     sessions. On the command line they cross the control socket to the server, because the
@@ -218,7 +220,10 @@ the plugin API, where every third-party connector would see it.
 
 In a command-line process this is empty and stays empty: capture hands the session to the
 server over the control socket rather than keeping a copy. In a served process it is where
-``connector login`` puts one and where every sync reads it.
+``connector login`` puts one and where every request reads it — *every request*, rather than
+once per connector, because a connector is built once and kept while the session it
+authenticates with is replaced from outside. See
+:class:`~manicule.connectors.credentials.HeldSessionCredential`.
 """
 
 

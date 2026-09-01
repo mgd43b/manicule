@@ -10,15 +10,24 @@ produces no held session at all rather than a smaller one.
 stream; the tests write frames into it. That is the whole reason the framing is a pair of
 functions rather than something buried in `main`.
 
+The one exception is the last section, and it is an exception on purpose. What the shim carries
+cannot be checked by reading it: the defect it exists to prevent was a host that *looked* right
+and resolved a different workspace once Chrome — not a shell — decided its environment and its
+working directory. So those tests run the generated executable in a child process with neither.
+
 Fixtures are synthetic: `https://wiki.example.test/confluence`, invented cookies, and a fake
 instance that exists only in this file's process.
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import os
+import shlex
 import struct
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -26,16 +35,37 @@ import pytest
 from pydantic import JsonValue
 
 import manicule.cli.extension as host
+import manicule.cli.main as cli
 import manicule.connectors.sessions as sessions_module
+from manicule.app import results as r
+from manicule.app.runtime import Runtime
+from manicule.app.service import ApplicationService
 from manicule.cli import proxy
+from manicule.config.loader import load_settings
 from manicule.config.settings import ConnectorSettings, Settings
 from manicule.core.errors import ConfigError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping
+
+    from manicule.app.results import Payload
 
 BASE = "https://wiki.example.test/confluence"
 SENTINEL = "not-a-real-session-value"
+
+HOST_SITE = "https://confluence.example.test/wiki"
+"""A site named only by a configuration file a test writes, and by no default workspace.
+
+Distinct from :data:`BASE` so that the child-process tests below cannot pass by finding the
+suite's own fixture: a host that resolved this site read the file it was installed with.
+"""
+
+ELSEWHERE_SITE = "https://elsewhere.example.test/wiki"
+"""A site no test configures, so a host that accepts it is accepting anything."""
+
+HOST_TIMEOUT_S = 120.0
+"""How long a child host may take to import manicule and answer. Generous, because the ceiling
+is only here so a hung child fails the suite instead of the job."""
 
 _LENGTH = struct.Struct("=I")
 
@@ -383,7 +413,7 @@ def test_a_platform_with_no_known_locations_refuses_without_writing_anything(
     monkeypatch.setattr(host, "manifest_dirs", dict)
 
     with pytest.raises(ConfigError, match="does not know where"):
-        host.install(data_dir=tmp_path)
+        host.install(data_dir=tmp_path, config_file=tmp_path / "manicule.toml")
 
     assert not (tmp_path / "browser-auth").exists(), "a refusal left an executable behind"
 
@@ -397,7 +427,7 @@ def test_no_browser_profile_yet_refuses_with_the_advice_that_applies(
     )
 
     with pytest.raises(ConfigError, match="Start the browser once"):
-        host.install(data_dir=tmp_path)
+        host.install(data_dir=tmp_path, config_file=tmp_path / "manicule.toml")
 
     assert not (tmp_path / "browser-auth").exists()
 
@@ -419,7 +449,7 @@ def test_a_manifest_is_written_for_each_browser_that_has_a_profile(
         },
     )
 
-    written = host.install(data_dir=tmp_path)
+    written = host.install(data_dir=tmp_path, config_file=tmp_path / "manicule.toml")
 
     assert [path.parent.parent.name for path in written] == ["chrome"]
     assert not absent.exists()
@@ -437,7 +467,7 @@ def test_the_manifest_names_one_extension_and_a_shim_that_exists(
     profile.mkdir()
     monkeypatch.setattr(host, "manifest_dirs", lambda: {"chrome": profile / "NativeMessagingHosts"})
 
-    (written,) = host.install(data_dir=tmp_path)
+    (written,) = host.install(data_dir=tmp_path, config_file=tmp_path / "manicule.toml")
     document = json.loads(written.read_text(encoding="utf-8"))
 
     assert document["allowed_origins"] == [f"chrome-extension://{host.EXTENSION_ID}/"]
@@ -445,6 +475,9 @@ def test_the_manifest_names_one_extension_and_a_shim_that_exists(
     shim = Path(document["path"])
     assert shim.is_file(), "the manifest names a host that is not there"
     assert shim.stat().st_mode & 0o077 == 0, "the shim is reachable by other users"
+    assert written.stat().st_mode & 0o077 == 0, (
+        "the document deciding which executable Chrome starts is reachable by other users"
+    )
 
 
 def test_the_pinned_key_is_the_one_chrome_will_derive_the_id_from() -> None:
@@ -481,3 +514,341 @@ def test_the_extension_ships_where_the_command_says_it_is() -> None:
         "popup.html",
         "popup.js",
     }
+
+
+# --- the configuration the host starts under ---------------------------------------------------
+#
+# Chrome starts the shim, so the shim's environment is Chrome's and its working directory is
+# Chrome's. Every test below runs the generated executable in a child process with a sterile
+# environment and an unrelated working directory, because that is the only arrangement in which
+# a host that carries its configuration is distinguishable from one that inherits it — and the
+# defect these tests pin is exactly a host that inherited a different workspace and refused a
+# site the operator could see configured.
+
+
+def _config_naming(path: Path, site: str, *, data_dir: Path) -> Path:
+    """A configuration file with one browser-session Confluence source, written at ``path``.
+
+    ``data_dir`` is named in the file so the host looks for a control socket under a directory
+    this test owns rather than under the one the developer running the suite actually uses.
+    Values go through :func:`json.dumps` rather than being interpolated between quotes: one of
+    the tests below deliberately puts a quote in a path, and a fixture that could not express
+    that would quietly test something easier.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"data_dir = {json.dumps(str(data_dir))}\n"
+        f"\n"
+        f"[connectors.handbook]\n"
+        f'type = "confluence"\n'
+        f"\n"
+        f"[connectors.handbook.options]\n"
+        f"base_url = {json.dumps(site)}\n"
+        f'deployment = "server"\n'
+        f'auth = "browser_session"\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def _sterile(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """A working directory and an environment with nothing of manicule's in either.
+
+    No ``MANICULE_*`` variable and no ``manicule.toml`` within reach, which is what makes the
+    assertion mean something: a host that resolves the right workspace here can only have been
+    told, because there is nothing to infer it from. ``TMPDIR`` is set so the control socket the
+    host goes looking for is under a directory this test owns.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    home = tmp_path / "sterile-home"
+    home.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    return elsewhere, {"PATH": os.defpath, "HOME": str(home), "TMPDIR": str(runtime)}
+
+
+def _installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, config_file: Path) -> Path:
+    """Run the installer against a fake browser profile, and return the shim it wrote."""
+    profile = tmp_path / "chrome"
+    profile.mkdir(exist_ok=True)
+    monkeypatch.setattr(host, "manifest_dirs", lambda: {"chrome": profile / "NativeMessagingHosts"})
+    (written,) = host.install(data_dir=tmp_path / "data", config_file=config_file)
+    return Path(json.loads(written.read_text(encoding="utf-8"))["path"])
+
+
+def _asked(shim: Path, site: str, *, cwd: Path, env: Mapping[str, str]) -> dict[str, JsonValue]:
+    """Start the host as Chrome would, send it one message, and read the one frame back.
+
+    The whole of stdout has to be that frame. Chrome parses this stream, so a warning or a stray
+    `print` is not noise beside the answer — it *is* the answer, malformed, and the extension
+    reports a parse failure rather than the thing that went wrong.
+    """
+    completed = subprocess.run(  # noqa: S603 - the shim this test just wrote, and no shell
+        [str(shim)],
+        input=framed({"base_url": site, "cookies": [cookie()]}),
+        capture_output=True,
+        cwd=cwd,
+        env=dict(env),
+        timeout=HOST_TIMEOUT_S,
+        check=False,
+    )
+    assert len(completed.stdout) >= _LENGTH.size, (
+        f"the host wrote no usable reply ({len(completed.stdout)} bytes). Its stderr was: "
+        f"{completed.stderr.decode('utf-8', 'replace')}"
+    )
+    (length,) = _LENGTH.unpack(completed.stdout[: _LENGTH.size])
+    assert len(completed.stdout) == _LENGTH.size + length, (
+        "something other than the reply reached stdout, which is the protocol"
+    )
+    answered: dict[str, JsonValue] = json.loads(
+        completed.stdout[_LENGTH.size : _LENGTH.size + length]
+    )
+    return answered
+
+
+def _refusal(answered: Mapping[str, JsonValue]) -> str:
+    assert answered["ok"] is False, answered
+    error = answered["error"]
+    assert isinstance(error, str)
+    return error
+
+
+@pytest.mark.slow
+def test_a_host_installed_under_one_configuration_resolves_that_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defect, at the boundary that produced it.
+
+    `browser-auth install` reads the selected configuration correctly and used to write a shim
+    that named neither it nor anything else — so the host Chrome started fell back to
+    `manicule.toml` beside *Chrome's* working directory, and then to the default config
+    directory. The site the operator had configured was not in whichever file that found, and the
+    extension refused it for having no connector configured, while the server it was talking
+    about had one and was running.
+
+    Reaching `no manicule server is running` is the assertion: that message comes from *after*
+    the connector lookup in `handle`, so getting it proves the lookup found the source this
+    configuration names. The failure this excludes is the refusal on the next line down.
+    """
+    config = _config_naming(tmp_path / "selected" / "manicule.toml", HOST_SITE, data_dir=tmp_path)
+    shim = _installed(tmp_path, monkeypatch, config_file=config)
+    elsewhere, sterile = _sterile(tmp_path)
+
+    error = _refusal(_asked(shim, HOST_SITE, cwd=elsewhere, env=sterile))
+
+    assert "no manicule server is running" in error, error
+    assert "no enabled Confluence connector" not in error, (
+        "the host resolved a workspace other than the one it was installed under"
+    )
+
+
+@pytest.mark.slow
+def test_a_site_the_selected_configuration_does_not_name_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half, without which the test above would pass against a host that took anything.
+
+    Carrying the configuration must not turn into ignoring it. The check that keeps an extension
+    from choosing what manicule holds a session for is that the site must name a *configured*
+    connector, and it has to still refuse one that does not.
+    """
+    config = _config_naming(tmp_path / "selected" / "manicule.toml", HOST_SITE, data_dir=tmp_path)
+    shim = _installed(tmp_path, monkeypatch, config_file=config)
+    elsewhere, sterile = _sterile(tmp_path)
+
+    error = _refusal(_asked(shim, ELSEWHERE_SITE, cwd=elsewhere, env=sterile))
+
+    assert "no enabled Confluence connector" in error, error
+
+
+@pytest.mark.slow
+def test_a_configuration_path_a_shell_would_mangle_reaches_the_host_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path is not the installer's to trust, and it is written into a shell script.
+
+    A directory with a space in it used to produce a host that ran the wrong argv. One with a
+    quote or a `$(...)` in it would have produced a host that ran something else entirely, as
+    this user, every time Chrome started it — and Chrome starts it on a person's own machine,
+    which is where the paths with apostrophes and spaces in them live.
+
+    Two things are asserted because two things could go wrong: the path survives, and nothing in
+    it was executed.
+    """
+    awkward = tmp_path / "a b \"c\" 'd' $(touch pwned) ;touch pwned2; ünïcode"
+    config = _config_naming(awkward / "manicule.toml", HOST_SITE, data_dir=tmp_path)
+    shim = _installed(tmp_path, monkeypatch, config_file=config)
+    elsewhere, sterile = _sterile(tmp_path)
+
+    error = _refusal(_asked(shim, HOST_SITE, cwd=elsewhere, env=sterile))
+
+    assert "no manicule server is running" in error, error
+    for marker in ("pwned", "pwned2"):
+        assert not (elsewhere / marker).exists(), f"the shim ran {marker!r} from a path"
+        assert not (awkward / marker).exists(), f"the shim ran {marker!r} from a path"
+
+
+@pytest.mark.slow
+def test_a_reinstall_replaces_the_configuration_the_shim_was_carrying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running it again is how somebody moves the host to another workspace.
+
+    A shim that kept the first configuration would make the second install look like it did
+    something and change nothing — the same shape of silent failure as the original defect, with
+    the operator now certain they had fixed it.
+    """
+    first = _config_naming(tmp_path / "first" / "manicule.toml", ELSEWHERE_SITE, data_dir=tmp_path)
+    second = _config_naming(tmp_path / "second" / "manicule.toml", HOST_SITE, data_dir=tmp_path)
+    _installed(tmp_path, monkeypatch, config_file=first)
+    shim = _installed(tmp_path, monkeypatch, config_file=second)
+    elsewhere, sterile = _sterile(tmp_path)
+
+    assert str(first) not in shim.read_text(encoding="utf-8")
+    assert "no manicule server is running" in _refusal(
+        _asked(shim, HOST_SITE, cwd=elsewhere, env=sterile)
+    )
+    assert "no enabled Confluence connector" in _refusal(
+        _asked(shim, ELSEWHERE_SITE, cwd=elsewhere, env=sterile)
+    )
+
+
+@pytest.mark.slow
+def test_an_installation_with_no_configuration_file_yet_still_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordinary first-run case: a default installation whose config file does not exist.
+
+    Naming a file that is not there must leave the host able to start and answer, because that is
+    what `browser-auth install` does on a machine where nobody has written any configuration yet.
+    A host that refused to run, or that died instead of framing a reply, would make the
+    installer's own happy path the broken one.
+    """
+    shim = _installed(tmp_path, monkeypatch, config_file=tmp_path / "absent" / "manicule.toml")
+    elsewhere, sterile = _sterile(tmp_path)
+
+    error = _refusal(_asked(shim, HOST_SITE, cwd=elsewhere, env=sterile))
+
+    assert "no enabled Confluence connector" in error, error
+
+
+def test_nothing_a_session_could_be_read_from_is_written_to_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`browser-auth install` writes two files, and neither may ever grow a credential.
+
+    The one claim this whole subsystem makes is that a session is held in the server's memory and
+    written nowhere. The shim is a file on disk that the installer generates, so it is the
+    obvious place for a later change to put "just the account" or "just a token" — and it is
+    read by anything that can read the data directory. Pinning its shape is cheaper than
+    noticing.
+    """
+    config = _config_naming(tmp_path / "selected" / "manicule.toml", HOST_SITE, data_dir=tmp_path)
+    profile = tmp_path / "chrome"
+    profile.mkdir()
+    monkeypatch.setattr(host, "manifest_dirs", lambda: {"chrome": profile / "NativeMessagingHosts"})
+
+    (written,) = host.install(data_dir=tmp_path / "data", config_file=config)
+    shim = Path(json.loads(written.read_text(encoding="utf-8"))["path"])
+    launcher = shim.read_text(encoding="utf-8")
+
+    assert launcher.startswith("#!/bin/sh\n")
+    assert shlex.quote(str(config)) in launcher, "the configuration is not quoted for a shell"
+    assert set(json.loads(written.read_text(encoding="utf-8"))) == {
+        "name",
+        "description",
+        "path",
+        "type",
+        "allowed_origins",
+    }
+    for credential in ("Cookie", "JSESSIONID", "token", SENTINEL):
+        assert credential not in launcher, f"{credential!r} was written into the launcher"
+
+
+def _install_command(monkeypatch: pytest.MonkeyPatch) -> r.MessagingHostInstalled:
+    """Run `browser-auth install`'s own body against a real service, and return what it reported.
+
+    :func:`~manicule.cli.main.emit` is replaced rather than the command re-implemented, because
+    the line that has to be covered is the one inside `browser_auth_install` that resolves the
+    configuration. A test calling `install()` itself would only be asserting about an argument
+    it had chosen.
+    """
+    captured: list[Payload] = []
+
+    def emit(op: str, call: Callable[[ApplicationService], Awaitable[Payload]]) -> None:
+        assert op == "browser_auth_install"
+
+        async def once() -> Payload:
+            runtime = Runtime(load_settings(), writer=False)
+            try:
+                return await call(ApplicationService(runtime))
+            finally:
+                await runtime.aclose()
+
+        captured.append(asyncio.run(once()))
+
+    monkeypatch.setattr(cli, "emit", emit)
+    cli.browser_auth_install()
+    (reported,) = captured
+    assert isinstance(reported, r.MessagingHostInstalled)
+    return reported
+
+
+@pytest.mark.slow
+def test_the_command_installs_a_host_carrying_the_configuration_it_was_run_under(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manicule_environment: Path
+) -> None:
+    """The boundary the defect actually lived at, driven from the command that has it.
+
+    Every other test in this section calls `install()` with a path it chose itself, which proves
+    the installer honors the argument and not that `manicule browser-auth install` supplies one.
+    The reported failure was an operator selecting a workspace with `MANICULE_CONFIG_FILE` and
+    getting a host that did not carry it — so this sets that variable, runs the command, and then
+    starts the host it wrote in a process where the variable is gone again.
+    """
+    del manicule_environment
+    config = _config_naming(tmp_path / "selected" / "manicule.toml", HOST_SITE, data_dir=tmp_path)
+    monkeypatch.setenv("MANICULE_CONFIG_FILE", str(config))
+    profile = tmp_path / "chrome"
+    profile.mkdir()
+    monkeypatch.setattr(host, "manifest_dirs", lambda: {"chrome": profile / "NativeMessagingHosts"})
+
+    reported = _install_command(monkeypatch)
+
+    (written,) = (Path(path) for path in reported.installed)
+    shim = Path(json.loads(written.read_text(encoding="utf-8"))["path"])
+    elsewhere, sterile = _sterile(tmp_path)
+    error = _refusal(_asked(shim, HOST_SITE, cwd=elsewhere, env=sterile))
+
+    assert "no manicule server is running" in error, error
+    assert "no enabled Confluence connector" not in error, (
+        "the command installed a host that resolves a workspace other than the selected one"
+    )
+
+
+@pytest.mark.slow
+def test_the_command_installs_a_working_host_with_no_configuration_file_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manicule_environment: Path
+) -> None:
+    """A default installation, through the same command and with nothing selected.
+
+    `config_file()` falls back to the user's config directory when nothing names one, and on a
+    machine where nobody has written any configuration yet that names a file which does not
+    exist. Pinning a path to a file that is not there has to leave a host that still starts and
+    still frames a reply, or the installer's own ordinary path is the broken one.
+    """
+    del manicule_environment
+    profile = tmp_path / "chrome"
+    profile.mkdir()
+    monkeypatch.setattr(host, "manifest_dirs", lambda: {"chrome": profile / "NativeMessagingHosts"})
+
+    reported = _install_command(monkeypatch)
+
+    (written,) = (Path(path) for path in reported.installed)
+    shim = Path(json.loads(written.read_text(encoding="utf-8"))["path"])
+    elsewhere, sterile = _sterile(tmp_path)
+
+    assert "no enabled Confluence connector" in _refusal(
+        _asked(shim, HOST_SITE, cwd=elsewhere, env=sterile)
+    )

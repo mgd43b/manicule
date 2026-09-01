@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,18 +20,21 @@ import pytest
 from pydantic import SecretStr
 
 from manicule.app import control
+from manicule.app.runtime import Runtime
 from manicule.app.served import SESSIONS_HELD, ControlHandler
 from manicule.app.service import ApplicationService
 from manicule.cli import proxy
-from manicule.config.settings import ConnectorSettings
+from manicule.config.settings import ConnectorSettings, Settings
+from manicule.connectors.confluence import ConfluenceConnector
 from manicule.connectors.credentials import BrowserSession, credential_for
+from manicule.connectors.errors import SessionMissingError
 from manicule.connectors.sessions import SESSIONS, SessionVault, load_session
 from manicule.core.errors import ConfigError
 from tests.app.fakes import FakeBackend
 from tests.connectors import support
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
 
     from manicule.app.results import Check
     from manicule.connectors.config import ConfluenceConfig
@@ -65,9 +69,11 @@ def socket_for() -> Iterator[Callable[[], Path]]:
         path.unlink(missing_ok=True)
 
 
-def a_session(*, value: str = SENTINEL, account: str = "sync.user") -> BrowserSession:
+def a_session(
+    *, value: str = SENTINEL, account: str = "sync.user", base_url: str = SITE
+) -> BrowserSession:
     return BrowserSession(
-        base_url=SITE,
+        base_url=base_url,
         account=account,
         captured_at=datetime.now(tz=UTC),
         cookies={"JSESSIONID": SecretStr(value)},
@@ -112,7 +118,7 @@ async def test_a_session_handed_to_the_server_is_usable_by_a_sync_it_did_not_cap
 
     credential = credential_for(sso_config(), store=vault)
 
-    assert credential.account() == "sync.user"
+    assert credential.authorize().account == "sync.user"
     assert credential.authorize().headers["Cookie"] == f"JSESSIONID={SENTINEL}", (
         "the session reached the server but does not authenticate a request there"
     )
@@ -283,6 +289,281 @@ async def test_the_capture_time_the_client_proved_is_the_one_the_server_measures
         credential_for(sso_config(session_max_age_hours=2.0), store=vault)
 
 
+# --- the connector that was already built --------------------------------------------------------
+#
+# The hand-off above proves the session reaches the server. These prove it reaches the *object*
+# doing the syncing, which is a different claim and was the false one: a connector is constructed
+# once and cached for the life of the process, so a credential that closed over the session it
+# found at construction went on offering that one until a restart. The sign-in reported success,
+# `doctor` agreed the server was holding the new session, and every sync kept failing against the
+# old — the worst shape a defect can have, because the thing that fixes it says it worked.
+#
+# So the arrangement here is the served one and not a piece of it: a real `Runtime`, therefore the
+# container and the connector plugin factory that ship, and a real `ControlHandler` over this
+# process's own vault, which is where `connector login` puts a session and where the factory reads
+# one. A test that called `credential_for()` again after updating a vault would pass against the
+# defect — that call always read the vault correctly. What has to be looked at is the connector the
+# container hands back the second time.
+
+OTHER_SITE = "https://runbooks.example.test/confluence"
+"""A second instance, so a renewal for one authority can be shown not to reach another."""
+
+PAT_SITE = "https://bearer.example.test/confluence"
+"""A third, authenticating with a personal access token, which no sign-in may reach."""
+
+REPLACEMENT = "replacement-session-value-4d71c8"
+"""The cookie of the session a later sign-in hands over. Distinct from :data:`SENTINEL` so that
+"which session is this connector using" is answered by the value rather than by absence."""
+
+
+def _browser_source(base_url: str) -> ConnectorSettings:
+    return ConnectorSettings(
+        type="confluence",
+        options={"base_url": base_url, "deployment": "server", "auth": "browser_session"},
+    )
+
+
+def _configured(tmp_path: Path) -> Settings:
+    """Four sources: two on one instance, one on another, one authenticating with a token."""
+    return Settings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        connectors={
+            "handbook": _browser_source(SITE),
+            "runbooks": _browser_source(SITE),
+            "elsewhere": _browser_source(OTHER_SITE),
+            "tokened": ConnectorSettings(
+                type="confluence",
+                options={
+                    "base_url": PAT_SITE,
+                    "deployment": "server",
+                    "personal_access_token": "pat",
+                },
+            ),
+        },
+    )
+
+
+@asynccontextmanager
+async def _served(path: Path, tmp_path: Path) -> AsyncGenerator[Runtime]:
+    """A server answering on ``path`` for a real container over ``tmp_path``'s configuration."""
+    runtime = Runtime(_configured(tmp_path), writer=False)
+    server = control.ControlServer(path, ControlHandler(ApplicationService(runtime), SESSIONS))
+    await server.start()
+    try:
+        yield runtime
+    finally:
+        await server.aclose()
+        await runtime.aclose()
+
+
+@pytest.fixture
+async def emptied() -> AsyncIterator[None]:
+    """Empty this process's own vault afterwards, whatever the test put in it.
+
+    The vault rather than a substituted store, because the connector plugin factory reads
+    :func:`~manicule.connectors.sessions.default_store` and the served process is the case under
+    test — a container handed some other vault would be an arrangement that does not ship.
+    """
+    yield
+    for site in (SITE, OTHER_SITE, PAT_SITE):
+        await SESSIONS.forget(site)
+
+
+def _authorization(connector: ConfluenceConnector) -> tuple[str, str]:
+    """The cookie header and account the next request this connector makes would carry.
+
+    Two private attributes deep, and that is the assertion rather than a way around it. The
+    defect lived in a *cached object*, so anything that resolved a credential afresh would have
+    reported the renewal correctly while the connector went on using the old session. The object
+    the container hands back is the only place the answer is not already known.
+    """
+    credential = connector._client._credential  # pyright: ignore[reportPrivateUsage]
+    authorized = credential.authorize()
+    return authorized.headers.get("Cookie", ""), authorized.account
+
+
+async def _hand_over(path: Path, session: BrowserSession) -> None:
+    """Send one session to the server on ``path``, the way ``connector login`` sends one."""
+    await proxy.HandoverStore(path).save(session)
+
+
+async def test_a_session_handed_over_reaches_the_connector_the_server_already_built(
+    socket_for: Callable[[], Path],
+    tmp_path: Path,
+    manicule_environment: Path,
+    emptied: None,
+) -> None:
+    """The defect, through every layer that produced it.
+
+    The connector is resolved *first*, so it is constructed and cached with the session that was
+    there at the time — which is what a server running before somebody signs in again does. The
+    hand-off then crosses the control socket into ``ControlHandler``, and the connector is
+    resolved again from the same container.
+
+    Two assertions, and the first is not incidental. The connector must be the **same object**:
+    invalidating the cache would have been the other way to fix this, and it would mean an
+    in-flight sync losing the connector it was running on. Nothing is torn down; what changed is
+    where the credential looks.
+    """
+    del manicule_environment, emptied
+    path = socket_for()
+    await SESSIONS.save(a_session(value=SENTINEL, account="sync.user"))
+    async with _served(path, tmp_path) as runtime:
+        before = await runtime.connector("handbook")
+        assert isinstance(before, ConfluenceConnector)
+        assert _authorization(before) == (f"JSESSIONID={SENTINEL}", "sync.user")
+
+        await _hand_over(path, a_session(value=REPLACEMENT, account="renewed.user"))
+        after = await runtime.connector("handbook")
+
+    assert after is before, "the connector was rebuilt; an in-flight sync would have lost it"
+    assert isinstance(after, ConfluenceConnector)
+    assert _authorization(after) == (f"JSESSIONID={REPLACEMENT}", "renewed.user"), (
+        "the server holds the new session and the connector is still using the old one"
+    )
+
+
+async def test_every_connector_on_that_instance_sees_the_renewal(
+    socket_for: Callable[[], Path],
+    tmp_path: Path,
+    manicule_environment: Path,
+    emptied: None,
+) -> None:
+    """One sign-in covers an instance, not a connector name.
+
+    Sessions are filed under the authority, so two sources pointed at one Confluence are one
+    sign-in — that is a property of ``authority_key`` and it has to survive being read through
+    two separately constructed connectors, each of which was built before the hand-off.
+    """
+    del manicule_environment, emptied
+    path = socket_for()
+    await SESSIONS.save(a_session(value=SENTINEL))
+    async with _served(path, tmp_path) as runtime:
+        built = [await runtime.connector(name) for name in ("handbook", "runbooks")]
+        await _hand_over(path, a_session(value=REPLACEMENT, account="renewed.user"))
+        again = [await runtime.connector(name) for name in ("handbook", "runbooks")]
+
+    assert again[0] is not again[1], "two sources sharing a type must be two objects"
+    for connector in again:
+        assert isinstance(connector, ConfluenceConnector)
+        assert _authorization(connector) == (f"JSESSIONID={REPLACEMENT}", "renewed.user")
+    assert again == built
+
+
+async def test_a_connector_for_another_instance_keeps_the_session_it_had(
+    socket_for: Callable[[], Path],
+    tmp_path: Path,
+    manicule_environment: Path,
+    emptied: None,
+) -> None:
+    """A renewal is for one authority, and reaching another would be the serious failure.
+
+    Splitting one instance into two costs somebody a second sign-in. Merging two would hand a
+    live session for one site to a connector configured for another, which is the direction
+    ``authority_key`` is deliberately conservative about — asserted here through the connectors
+    rather than only through the vault.
+    """
+    del manicule_environment, emptied
+    path = socket_for()
+    await SESSIONS.save(a_session(value=SENTINEL))
+    await SESSIONS.save(a_session(value="other-instance-value", base_url=OTHER_SITE))
+    async with _served(path, tmp_path) as runtime:
+        elsewhere = await runtime.connector("elsewhere")
+        await _hand_over(path, a_session(value=REPLACEMENT, account="renewed.user"))
+
+    assert isinstance(elsewhere, ConfluenceConnector)
+    assert _authorization(elsewhere) == ("JSESSIONID=other-instance-value", "sync.user")
+
+
+async def test_a_token_authenticated_connector_is_untouched_by_a_hand_over(
+    socket_for: Callable[[], Path],
+    tmp_path: Path,
+    manicule_environment: Path,
+    emptied: None,
+) -> None:
+    """A personal access token is configuration, and no sign-in may reach it.
+
+    Worth asserting through the container rather than only over ``credential_for``, because what
+    chooses between the two credentials is ``auth_method`` on the configuration the factory was
+    handed — and a mistake there would authenticate a configured token source as whoever last
+    signed in.
+    """
+    del manicule_environment, emptied
+    path = socket_for()
+    async with _served(path, tmp_path) as runtime:
+        tokened = await runtime.connector("tokened")
+        await _hand_over(path, a_session(value=REPLACEMENT, base_url=PAT_SITE))
+
+    assert isinstance(tokened, ConfluenceConnector)
+    credential = tokened._client._credential  # pyright: ignore[reportPrivateUsage]
+    authorized = credential.authorize()
+
+    assert authorized.headers == {"Authorization": "Bearer pat"}
+    assert authorized.account == "", "a token names no account for a reply to be checked against"
+
+
+async def test_a_refused_hand_over_leaves_the_connector_authenticating_as_it_was(
+    socket_for: Callable[[], Path],
+    tmp_path: Path,
+    manicule_environment: Path,
+    emptied: None,
+) -> None:
+    """A failed sign-in must cost nothing. It is the case where somebody is already in trouble.
+
+    A hand-over with no cookies is refused before the vault is touched, so the working session a
+    connector is using has to still be there afterwards — the alternative is that trying to
+    re-authenticate is how you lose the credential you had.
+    """
+    del manicule_environment, emptied
+    path = socket_for()
+    await SESSIONS.save(a_session(value=SENTINEL))
+    async with _served(path, tmp_path) as runtime:
+        connector = await runtime.connector("handbook")
+        answered = await control.connect(
+            path,
+            control.Handover(
+                base_url=SITE, account="sync.user", captured_at=datetime.now(tz=UTC).isoformat()
+            ),
+            on_progress=lambda _: None,
+        )
+
+    assert answered["ok"] is False
+    assert isinstance(connector, ConfluenceConnector)
+    assert _authorization(connector) == (f"JSESSIONID={SENTINEL}", "sync.user")
+
+
+async def test_forgetting_stops_a_connector_that_was_already_using_the_session(
+    socket_for: Callable[[], Path],
+    tmp_path: Path,
+    manicule_environment: Path,
+    emptied: None,
+) -> None:
+    """``--forget`` has to mean it for the connectors as well as for the vault.
+
+    A cached credential holding its own copy would go on authenticating with the session an
+    operator had just dropped, which is the same defect as the renewal one and reads far worse:
+    the point of forgetting is usually that the session should not be used again.
+
+    The refusal is the one a connector built before anybody signed in gets, deliberately — the
+    fact is the same, and an operator should not have to work out that manicule described it two
+    ways.
+    """
+    del manicule_environment, emptied
+    path = socket_for()
+    await SESSIONS.save(a_session(value=SENTINEL))
+    async with _served(path, tmp_path) as runtime:
+        connector = await runtime.connector("handbook")
+        assert await proxy.HandoverStore(path).forget(SITE) is True
+
+    assert isinstance(connector, ConfluenceConnector)
+    with pytest.raises(SessionMissingError) as dropped:
+        _authorization(connector)
+    message = str(dropped.value)
+    assert "manicule connector login" in message, message
+    assert SENTINEL not in message, "the refusal quoted the session it had just dropped"
+
+
 # --- everywhere it must not appear -------------------------------------------------------------
 
 
@@ -323,7 +604,7 @@ def test_no_session_value_reaches_a_credential_s_own_messages() -> None:
     assert SENTINEL not in repr(credential)
     assert SENTINEL not in credential.describe()
     assert SENTINEL not in credential.renewal()
-    assert SENTINEL not in str(credential.account())
+    assert SENTINEL not in str(credential.authorize().account)
 
 
 def test_no_session_value_reaches_an_expiry_refusal() -> None:

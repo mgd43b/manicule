@@ -65,6 +65,7 @@ from manicule.connectors.errors import (
     RemoteError,
     RequestTimeoutError,
     SessionExpiredError,
+    SessionMissingError,
 )
 from manicule.core.acquisition import (
     UNSET,
@@ -218,8 +219,16 @@ class _UnprovenSourceRevisionError(RuntimeError):
 
 
 def _acquisition_diagnostic(exc: Exception) -> AcquisitionDiagnostic:
-    """Reduce source failures to a bounded, non-sensitive persisted vocabulary."""
-    if isinstance(exc, SessionExpiredError) or (
+    """Reduce source failures to a bounded, non-sensitive persisted vocabulary.
+
+    ``SessionMissingError`` sits beside ``SessionExpiredError`` rather than falling through to
+    ``FETCH_FAILED``, and it reaches here at all only because a browser-session credential now
+    reads the vault per request: a session forgotten while this connector is alive stops the
+    next request instead of a copy of it carrying on. The two are one fact for an operator
+    reading a run afterwards — this account cannot authenticate and a person has to sign in —
+    and a run recorded as a generic fetch failure sends them to look at the instance.
+    """
+    if isinstance(exc, (SessionExpiredError, SessionMissingError)) or (
         isinstance(exc, RemoteError) and exc.status_code in {401, 403}
     ):
         code = AcquisitionFailureCode.AUTHENTICATION
@@ -255,9 +264,12 @@ def _enumeration_diagnostic(exc: Exception) -> AcquisitionDiagnostic | None:
         code = AcquisitionFailureCode.SOURCE_TIMEOUT
     elif isinstance(exc, CursorExpiredError):
         code = AcquisitionFailureCode.CURSOR_EXPIRED
-    elif isinstance(exc, SessionExpiredError) or (
+    elif isinstance(exc, (SessionExpiredError, SessionMissingError)) or (
         isinstance(exc, RemoteError) and exc.status_code in {401, 403}
     ):
+        # See `_acquisition_diagnostic`: a session forgotten mid-run is an authentication
+        # failure, and returning `None` here would leave the run with no category at all for a
+        # state that has a closed vocabulary word and a one-command remedy.
         code = AcquisitionFailureCode.AUTHENTICATION
     else:
         return None

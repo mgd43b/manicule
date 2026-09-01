@@ -1732,16 +1732,29 @@ def browser_auth_install() -> None:
 
     Nothing here grants access to a site. The extension asks Chrome for that itself, for the one
     origin you name in its popup, and Chrome's own dialog is what approves it.
+
+    The configuration in force right now is written into the host it generates. Chrome starts
+    that host with Chrome's environment and Chrome's working directory, so a host left to work
+    out its own configuration would find whichever one those imply — and then refuse a site this
+    workspace has configured, for not being configured in the one it found.
     """
     from manicule.cli.extension import (  # noqa: PLC0415
         EXTENSION_ID,
         extension_dir,
         install,
     )
+    from manicule.config.settings import config_file  # noqa: PLC0415 - see below
 
     def run(service: ApplicationService) -> Awaitable[Payload]:
         async def written() -> Payload:
-            paths = install(data_dir=service.settings.data_dir)
+            # Resolved here, in the process that has the operator's environment and working
+            # directory, and made absolute: `config_file()` answers with `manicule.toml` beside
+            # the working directory when there is one, and Chrome's working directory is not
+            # this one. A relative path in the shim would name a different file, or none.
+            paths = install(
+                data_dir=service.settings.data_dir,
+                config_file=config_file().resolve(),
+            )
             return r.MessagingHostInstalled(
                 installed=tuple(str(path) for path in paths),
                 extension_id=EXTENSION_ID,

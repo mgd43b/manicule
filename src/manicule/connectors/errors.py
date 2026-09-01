@@ -234,12 +234,18 @@ class ProviderRefusedError(ConfigError):
 
 
 class SessionMissingError(ConfigError):
-    """Nobody has signed in to this instance in this process's lifetime.
+    """This process is holding no session for the instance.
 
     Distinct from :class:`SessionExpiredError`, and the distinction is the point rather than a
-    taxonomy. An expired session was captured and has aged out; **this one was never captured at
+    taxonomy. An expired session was captured and has aged out; **this one is not there at
     all**, which after a restart is the ordinary state and not a fault — sessions live in the
     server's memory, so a crash, a logout or a reboot ends every one of them.
+
+    Two ways to arrive at it and one message, deliberately. Nobody has signed in yet, or
+    ``connector login --forget`` dropped the one that was held — which a connector already
+    built discovers at its next request, because
+    :class:`~manicule.connectors.credentials.HeldSessionCredential` reads the vault rather than
+    a copy of it. The fact an operator has to act on is the same either way.
 
     A :class:`~manicule.core.errors.ConfigError` rather than a
     :class:`ConnectorError`, because that is what this was before it had a name of its own and

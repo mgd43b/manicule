@@ -306,6 +306,14 @@ That writes the messaging host manifest for every Chromium-family browser it fin
 the directory to load in the next step — resolved on your machine, so it is right whether you
 installed manicule with `pip` or are working in a checkout.
 
+**Run it under the configuration you want it to use.** Chrome starts the host with Chrome's
+environment and Chrome's working directory, so a host left to find its own configuration would
+find whichever one those imply — usually the default, which is the wrong workspace and refuses a
+site you can see configured. The command writes the configuration file it is running under into
+the host it generates, so `MANICULE_CONFIG_FILE=... manicule browser-auth install` installs a
+host for *that* workspace. Moving it to another one is the same command run again under the other
+configuration; a re-run replaces what the previous one wrote.
+
 **2. Load the extension.** In Chrome:
 
 1. open `chrome://extensions`
@@ -386,6 +394,11 @@ browser first started afterwards needs the command run again.
 Confluence connector. It is compared by authority — scheme, host, port and context path — so
 check it names the same site as the connector's `base_url`.
 
+If the connector *is* configured and enabled, check which configuration the host was installed
+under: it carries the one that was in force when `browser-auth install` ran, so a host installed
+under the default configuration will not see a connector that only exists in the one you select
+with `MANICULE_CONFIG_FILE`. Re-run the command under that configuration.
+
 **"no manicule server is running".** Sessions live in the server's memory. Start one with
 `manicule serve`.
 
@@ -450,6 +463,14 @@ blunter version of the same thing.
 touched, so a timeout, a closed window, a dead cookie or a state file for the wrong site leaves
 whatever was stored exactly as it was. There is no delete-then-write window because the write is
 the last thing that happens and it happens only on success.
+
+**Signing in again does not need the server restarted.** A connector is built once and kept for
+the life of the process — it carries a watermark across a run — but the session it authenticates
+with is read from the server's memory before every request rather than held by the connector. So
+a session handed over now is the one the next request uses, for every connector on that
+authority, and connectors for other instances are unaffected. `--forget` works the same way in
+reverse: the next request a connector makes finds nothing held and stops, rather than carrying on
+with a copy of what you dropped.
 
 ### 1.1d When it does not work
 

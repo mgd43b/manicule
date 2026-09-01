@@ -742,10 +742,11 @@ def resolve_credentials(
     An explicitly configured token is never overwritten by an environment variable.
 
     **A browser session is not resolved here and never lands on this model.** It is a secret
-    with a lifetime, it lives in the operating system's keychain rather than in configuration,
-    and reading it costs a subprocess — none of which belongs in a module that plugin discovery
-    imports in every process that starts. :func:`manicule.connectors.credentials.credential_for`
-    does that half, and the factory calls both before constructing anything.
+    with a lifetime, it lives in the running server's memory rather than in configuration, and
+    it is read again for every request rather than once — none of which belongs on a model that
+    plugin discovery imports in every process that starts.
+    :func:`manicule.connectors.credentials.credential_for` does that half, and the factory calls
+    both before constructing anything.
 
     Raises:
         ConfigError: The credential for this deployment is absent, or Cloud was configured

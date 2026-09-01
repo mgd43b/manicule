@@ -51,6 +51,7 @@ from manicule.connectors.errors import (
     NotFoundError,
     PermissionDeniedError,
     RequestTimeoutError,
+    SessionMissingError,
 )
 from manicule.connectors.macros import (
     IncludedPage,
@@ -385,9 +386,24 @@ class ConfluenceConnector:
 
         A connector that reports healthy because nothing has asked it to do anything yet is
         reporting on itself rather than on the source.
+
+        **Two failures, and they are not the same news.** A source that answered badly is a
+        problem with the source. A server holding no session for it is a problem with nobody —
+        the instance was not contacted at all, and a person signing in fixes it. That second
+        one became reachable here when the browser-session credential started reading the vault
+        per request: ``connector login --forget`` now stops a connector that was already built.
+        Without its own clause it is not a :class:`ConnectorError`, so it escapes this method
+        and the container reports "health check raised" with no remedy — a raised exception in
+        place of a diagnosis, for the one state whose remedy is a single command.
         """
         try:
             await self._client.get_json(self._client.url(_SPACE_PATH), [("limit", "1")])
+        except SessionMissingError:
+            return HealthReport.degraded(
+                f"{self._config.base_url} was not contacted: this server holds no browser "
+                f"session for it, so there is nothing to authenticate with.",
+                remedy="Sign in again with `manicule connector login <name> --browser`.",
+            )
         except ConnectorError as exc:
             return HealthReport.failing(
                 f"{self._config.base_url} did not answer: {exc}",
