@@ -1490,7 +1490,7 @@ requires-dist = [
     { name = "aiosqlite", marker = "extra == 'storage'", specifier = ">=0.20" },
     { name = "alembic", marker = "extra == 'storage'", specifier = ">=1.14" },
     { name = "fastapi", marker = "extra == 'serve'", specifier = ">=0.115" },
-    { name = "fastmcp", marker = "extra == 'serve'", specifier = ">=2.10" },
+    { name = "fastmcp", marker = "extra == 'serve'", specifier = ">=4" },
     { name = "httpx", marker = "extra == 'connectors'", specifier = ">=0.28" },
     { name = "huggingface-hub", marker = "extra == 'embeddings'", specifier = ">=0.26" },
     { name = "jinja2", marker = "extra == 'serve'", specifier = ">=3.1" },

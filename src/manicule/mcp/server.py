@@ -182,10 +182,10 @@ def hints(*, reads: bool, removes: bool, repeatable: bool, reaches_out: bool) ->
         The annotations, ready to hand to ``@mcp.tool``.
     """
     return ToolAnnotations(
-        readOnlyHint=reads,
-        destructiveHint=removes,
-        idempotentHint=repeatable,
-        openWorldHint=reaches_out,
+        read_only_hint=reads,
+        destructive_hint=removes,
+        idempotent_hint=repeatable,
+        open_world_hint=reaches_out,
     )
 
 
@@ -314,8 +314,8 @@ class _Registrar:
         wiring check at the end of :func:`build_server` reads ``__name__`` off the same object on
         both surfaces.
 
-        ``annotations.readOnlyHint is True`` rather than a truth test, and rather than
-        ``not annotations.destructiveHint``: the field is ``bool | None``, and a tool that left
+        ``annotations.read_only_hint is True`` rather than a truth test, and rather than
+        ``not annotations.destructive_hint``: the field is ``bool | None``, and a tool that left
         it unanswered must be excluded rather than admitted by a falsy comparison going the
         convenient way. :func:`hints` makes all four required, so this cannot fire today; it is
         the direction the code fails in if that ever stops being true.
@@ -323,7 +323,7 @@ class _Registrar:
 
         def register(function: Tool) -> Tool:
             self.named[function.__name__] = annotations
-            if self._read_only and annotations.readOnlyHint is not True:
+            if self._read_only and annotations.read_only_hint is not True:
                 return function
             self.carried.add(function.__name__)
             return self._mcp.tool(annotations=annotations)(function)
@@ -1266,7 +1266,7 @@ def _check_wiring(register: _Registrar, declared: set[str], *, read_only: bool) 
     if not read_only:
         return
     writes = sorted(
-        name for name in register.carried if register.named[name].readOnlyHint is not True
+        name for name in register.carried if register.named[name].read_only_hint is not True
     )
     if writes:  # pragma: no cover - `_Registrar.tool` is what makes this unreachable
         msg = (
