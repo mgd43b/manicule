@@ -697,20 +697,21 @@ async def test_every_published_tool_says_it_reads() -> None:
     backend, _ = backend_with_a_document()
     for name, tool in (await _network_tools(backend)).items():
         assert tool.annotations is not None, f"{name} publishes no annotations"
-        assert tool.annotations.readOnlyHint is True, f"{name} is served on a socket and writes"
+        assert tool.annotations.read_only_hint is True, f"{name} is served on a socket and writes"
 
 
 async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> None:
     """So that "I cannot do that" is available before a turn is spent discovering it.
 
-    Read off the initialization result rather than off the constant, because instructions the
-    server computes and does not send buy nothing.
+    Read off the negotiation result rather than off the constant, because instructions the
+    server computes and does not send buy nothing. ``client.instructions`` answers from whichever
+    handshake the connection used — MCP SDK v2's ``server/discover`` leaves ``initialize_result``
+    unset — so this stays a claim about what a client receives.
     """
     backend, _ = backend_with_a_document()
     async with mounted(backend) as client:
-        result = client.initialize_result
-    assert result is not None, "the client never completed initialization"
-    instructions = result.instructions or ""
+        instructions = client.instructions
+    assert instructions is not None, "the server sent no instructions"
     assert "read-only" in instructions, instructions
     assert "manicule serve" in instructions, instructions
     assert "## Scope every question to a collection" in instructions, (

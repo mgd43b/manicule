@@ -149,7 +149,21 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #1
   "rich>=13.9",
   # FastMCP is decorators over functions: the tool surface is the service surface, with no
   # protocol plumbing of our own to keep in step with the specification. Apache-2.0.
-  "fastmcp>=2.10",
+  # The 4 floor is MCP SDK v2, and it is a floor rather than a preference. v2 renamed the
+  # annotation fields to snake_case and `manicule.mcp.server.hints` writes that spelling — but
+  # `ToolAnnotations` is an `extra="allow"` model, so on 3.x those four keyword arguments are
+  # accepted as *extra* fields and the four real hints stay `None`. Nothing raises. What happens
+  # instead is that `_Registrar.tool` finds `read_only_hint is not True` of every tool, and the
+  # read-only surface — the whole of `manicule serve` — comes up carrying nothing. The suite says
+  # so loudly (`tests/api/test_routes.py` holds that surface to `MINIMUM_TOOLS`), but only when
+  # it is run against 3.x, and it never is: the lock pins 4. This floor is what stands between
+  # an *installation* that resolved an older fastmcp and a server that silently offers no tools.
+  # v2 also added the `server/discover` handshake, which leaves `Client.initialize_result` unset,
+  # so the tests read instructions through the era-neutral `Client.instructions` — absent on 3.x.
+  # Going the other way and keeping the camelCase spelling is not an option either: 4 still
+  # answers to it, through a deprecation shim that warns, and `filterwarnings = ["error"]` makes
+  # that warning a failure.
+  "fastmcp>=4",
   # FastAPI derives the OpenAPI document from the same type hints the routes are written
   # against, so the published schema cannot drift from the handler. Starlette underneath it
   # brings the CORS middleware, the SSE-shaped streaming response and the websocket. MIT.

@@ -48,7 +48,21 @@ if TYPE_CHECKING:
 
 WORKSPACE = "default"
 
-HINTS: tuple[str, ...] = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+HINTS: tuple[str, ...] = (
+    "read_only_hint",
+    "destructive_hint",
+    "idempotent_hint",
+    "open_world_hint",
+)
+"""The four hints under the names the SDK's model carries.
+
+Separate from :data:`HINT_KEYS` because MCP SDK v2 renamed the Python attributes to snake_case
+and left the wire alone: an attribute is read under one spelling and a published schema is
+searched for the other, and a single tuple serving both would be wrong for one of them.
+"""
+
+HINT_KEYS: tuple[str, ...] = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+"""The same four under the names a client receives, and never under a call's own arguments."""
 
 TICKETED: tuple[str, ...] = (
     "collection_list",
@@ -97,11 +111,18 @@ async def _tools(service: ApplicationService) -> list[Tool]:
 
 
 async def _instructions(service: ApplicationService) -> str:
-    """Server guidance from the initialization result, as a client receives it."""
+    """Server guidance from the negotiation result, as a client receives it.
+
+    ``client.instructions`` rather than ``client.initialize_result.instructions``: MCP SDK v2
+    added a second handshake, and a client that negotiated over ``server/discover`` has a
+    ``DiscoverResult`` and no ``InitializeResult`` at all. This accessor answers from whichever
+    one the era produced, so the test says "what a client receives" without also deciding which
+    handshake it used to receive it. Read inside the connection, where it is populated.
+    """
     async with Client(build_server(service)) as client:
-        result = client.initialize_result
-    assert result is not None, "the client never completed initialization"
-    return result.instructions or ""
+        instructions = client.instructions
+    assert instructions is not None, "the server sent no instructions"
+    return instructions
 
 
 @pytest.fixture
@@ -121,10 +142,10 @@ async def test_the_four_operations_the_ticket_names_report_themselves_read_only(
     for name in TICKETED:
         annotations = found[name]
         assert annotations is not None, f"{name} publishes no annotations at all"
-        assert annotations.readOnlyHint is True, name
-        assert annotations.destructiveHint is False, name
-        assert annotations.idempotentHint is True, name
-        assert annotations.openWorldHint is False, name
+        assert annotations.read_only_hint is True, name
+        assert annotations.destructive_hint is False, name
+        assert annotations.idempotent_hint is True, name
+        assert annotations.open_world_hint is False, name
 
 
 async def test_every_registered_tool_answers_all_four_questions(
@@ -201,7 +222,7 @@ async def test_no_tool_that_changes_something_reports_itself_read_only(
     for name in MUTATIONS:
         annotations = found[name]
         assert annotations is not None, name
-        assert annotations.readOnlyHint is False, f"{name} claims to be read-only and is not"
+        assert annotations.read_only_hint is False, f"{name} claims to be read-only and is not"
 
 
 async def test_the_mutations_and_the_reads_together_are_the_whole_surface(
@@ -215,7 +236,7 @@ async def test_the_mutations_and_the_reads_together_are_the_whole_surface(
     reads = {
         tool.name
         for tool in await _tools(service)
-        if tool.annotations is not None and tool.annotations.readOnlyHint
+        if tool.annotations is not None and tool.annotations.read_only_hint
     }
     assert reads | set(MUTATIONS) == set(TOOL_NAMES)
     assert reads & set(MUTATIONS) == set()
@@ -316,7 +337,7 @@ async def test_a_tool_that_says_it_reads_leaves_the_installation_as_it_found_it(
         reads = [
             tool.name
             for tool in published
-            if tool.annotations is not None and tool.annotations.readOnlyHint
+            if tool.annotations is not None and tool.annotations.read_only_hint
         ]
         unexercised = sorted(set(reads) - set(arguments))
         assert unexercised == [], f"no arguments recorded for read-only tool(s): {unexercised}"
@@ -365,13 +386,13 @@ async def test_no_hint_leaked_into_an_input_schema(service: ApplicationService) 
         published = list(await client.list_tools())
 
     for tool in published:
-        serialized = json.dumps(tool.inputSchema)
-        for hint in HINTS:
+        serialized = json.dumps(tool.input_schema)
+        for hint in (*HINT_KEYS, *HINTS):
             assert hint not in serialized, f"{tool.name}'s input schema mentions {hint}"
         registered = await server.get_tool(tool.name)
         assert isinstance(registered, FunctionTool)
         expected = sorted(inspect.signature(registered.fn).parameters)
-        assert sorted(tool.inputSchema.get("properties", {})) == expected, tool.name
+        assert sorted(tool.input_schema.get("properties", {})) == expected, tool.name
 
 
 async def test_nothing_on_this_server_is_gated_on_its_own_annotation(
@@ -443,7 +464,7 @@ async def test_collection_rule_mcp_schema_is_canonical_and_annotations_are_exact
 ) -> None:
     tools = {tool.name: tool for tool in await _tools(service)}
     setting = tools["collection_rule_set"]
-    rule_schema = setting.inputSchema["properties"]["rule"]
+    rule_schema = setting.input_schema["properties"]["rule"]
     assert set(rule_schema["properties"]) == {
         "sources",
         "media_types",
@@ -452,15 +473,15 @@ async def test_collection_rule_mcp_schema_is_canonical_and_annotations_are_exact
         "updated_before",
     }
     assert rule_schema["additionalProperties"] is False
-    assert "rule" in setting.inputSchema.get("required", [])
+    assert "rule" in setting.input_schema.get("required", [])
 
     for name in ("collection_rule_set", "collection_rule_clear"):
         annotations = tools[name].annotations
         assert annotations is not None
-        assert annotations.readOnlyHint is False
-        assert annotations.destructiveHint is True
-        assert annotations.idempotentHint is True
-        assert annotations.openWorldHint is False
+        assert annotations.read_only_hint is False
+        assert annotations.destructive_hint is True
+        assert annotations.idempotent_hint is True
+        assert annotations.open_world_hint is False
 
 
 def test_the_server_ships_no_blanket_approval_setting() -> None:
@@ -495,7 +516,7 @@ async def test_a_client_can_tell_the_reads_from_the_writes_without_reading_a_doc
     reads: Sequence[str] = [
         tool.name
         for tool in published
-        if tool.annotations is not None and tool.annotations.readOnlyHint
+        if tool.annotations is not None and tool.annotations.read_only_hint
     ]
     assert "search" in reads
     assert "collection_list" in reads

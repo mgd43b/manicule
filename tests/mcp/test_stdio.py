@@ -115,13 +115,13 @@ async def test_the_read_only_annotations_survive_the_transport() -> None:
     for name in ("collection_list", "collection_counts", "collection_documents", "search"):
         annotations = published[name]
         assert annotations is not None, f"{name} arrived with no annotations"
-        assert annotations.readOnlyHint is True, name
-        assert annotations.destructiveHint is False, name
-        assert annotations.idempotentHint is True, name
-        assert annotations.openWorldHint is False, name
+        assert annotations.read_only_hint is True, name
+        assert annotations.destructive_hint is False, name
+        assert annotations.idempotent_hint is True, name
+        assert annotations.open_world_hint is False, name
 
     assert published["document_delete"] is not None
-    assert published["document_delete"].readOnlyHint is False
+    assert published["document_delete"].read_only_hint is False
 
 
 async def test_stdio_still_carries_the_whole_tool_surface() -> None:
