@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.17](https://github.com/mgd43b/manicule/compare/v0.1.16...v0.1.17) (2026-09-13)
+
+
+### Features
+
+* **container:** publish the image to ghcr.io on release ([#338](https://github.com/mgd43b/manicule/issues/338)) ([88360d2](https://github.com/mgd43b/manicule/commit/88360d2f0d9ffe66fc6b276536a4b8e09ee0786d))
+
 ## [0.1.16](https://github.com/mgd43b/manicule/compare/v0.1.15...v0.1.16) (2026-09-13)
 
 
