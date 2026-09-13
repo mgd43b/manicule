@@ -7,7 +7,19 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # **A superseded pull-request push is canceled; `main` is never canceled.**
+  #
+  # `github.ref` is `refs/heads/main` for every push to it, so one group held all of them and each
+  # merge canceled the run for the merge before it. That lost information even on its own terms —
+  # a run on `main` is the record of whether `main` is releasable, and a canceled run records
+  # nothing about the commit it was testing.
+  #
+  # With release.yml's `ci-green` gate reading exactly that verdict it became worse than lossy.
+  # Merging a release pull request and then merging anything else within CI's runtime would cancel
+  # the release commit's run; the gate would see a run that did not succeed, and would refuse the
+  # release — after the release pull request had already been merged and was no longer there to
+  # merge again.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read

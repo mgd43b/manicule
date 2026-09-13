@@ -22,8 +22,109 @@ on:
 permissions: {}
 
 jobs:
+  # **Nothing in this workflow acts on a commit whose CI has not passed.**
+  #
+  # It used to. `push: branches: [main]` fires the moment a merge lands, and ci.yml's run on that
+  # same commit is a *sibling* of this workflow, not a prerequisite — so the two raced, and this
+  # one is much the shorter. v0.1.17 is the proof rather than the hypothesis: Release finished at
+  # 17:45:05 having published both wheels to PyPI and the image to ghcr.io, while CI on the very
+  # same commit was still running its test shards. Had a shard failed, the release would already
+  # have been on PyPI, which does not accept deletions as a fix.
+  #
+  # The hole is not closed by branch protection, and that is worth being precise about: required
+  # checks are evaluated against a *pull request's* head, and a squash merge creates a commit that
+  # has never been tested under that name. Two pull requests that each pass alone and conflict
+  # semantically produce exactly this — a green tick on both, a red main, and a release workflow
+  # already running.
+  #
+  # So this job resolves the commit being released and waits for ci.yml's own verdict on it.
+  # Everything that tags, builds or publishes declares `needs: ci-green`, and — because the jobs
+  # below use `always()` to survive a skipped `release-please` — each of them also tests
+  # `needs.ci-green.result` explicitly. `always()` would otherwise sail straight past a failed
+  # gate, which is the one way to reintroduce this bug while appearing to have fixed it.
+  #
+  # The cost is stated plainly: every push to `main` now waits for CI before release-please
+  # updates the release pull request, and CI's slowest job builds the container. A release PR that
+  # appears twenty-five minutes later harms nothing; releasing from a commit nobody has tested
+  # does. `release-please` is gated along with the publishers on purpose — it is what creates the
+  # tag and the GitHub Release, and a tag on a red commit is a smaller mess than a bad wheel but
+  # is still one nobody chose.
+  ci-green:
+    name: CI is green for this commit
+    runs-on: ubuntu-latest
+    # Longer than CI's own worst case, which is the container build. The script below keeps its
+    # own shorter deadline so that a timeout reports *which* commit it gave up on.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      # To read another workflow's run status. Nothing here writes.
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: which commit has to be green
+        id: commit
+        env:
+          # Empty on a push, which is what selects `github.sha` below.
+          TAG: ${{ inputs.tag }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TAG}" ]; then
+            # `commits/<ref>` dereferences a tag to its commit, so this is right for an annotated
+            # tag as well as a lightweight one — `git/ref/tags/<t>` would hand back the tag object.
+            sha="$(gh api "repos/${REPO}/commits/${TAG}" --jq '.sha')"
+            echo "workflow_dispatch of ${TAG}, which is ${sha}"
+          else
+            sha="${PUSH_SHA}"
+            echo "push of ${sha}"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: wait for CI on it, and require success
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # `event=push` narrows this to CI's run on `main`. Without it the same commit can also
+          # match a `pull_request` run, and answering with a pull request's verdict is how a gate
+          # like this passes for the wrong reason.
+          query="repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=push&per_page=1"
+          deadline=$(( SECONDS + 75 * 60 ))
+          while :; do
+            run="$(gh api "${query}" --jq '.workflow_runs[0] | "\(.status)\t\(.conclusion)\t\(.html_url)"' 2>/dev/null || true)"
+            case "${run}" in
+              ''|null*)
+                # Not an error yet: this workflow and CI are triggered by the same push, so CI's
+                # run may not have been created at the instant this one started looking.
+                echo "no CI run for ${SHA} on main yet; waiting."
+                ;;
+              *)
+                status="$(printf '%s' "${run}" | cut -f1)"
+                conclusion="$(printf '%s' "${run}" | cut -f2)"
+                url="$(printf '%s' "${run}" | cut -f3)"
+                if [ "${status}" = "completed" ]; then
+                  echo "CI concluded ${conclusion}: ${url}"
+                  if [ "${conclusion}" != "success" ]; then
+                    echo "refusing to release ${SHA}: its CI did not pass." >&2
+                    exit 1
+                  fi
+                  exit 0
+                fi
+                echo "CI is ${status} for ${SHA}; waiting. ${url}"
+                ;;
+            esac
+            if [ "${SECONDS}" -ge "${deadline}" ]; then
+              echo "gave up waiting for CI on ${SHA}; nothing has been released." >&2
+              exit 1
+            fi
+            sleep 30
+          done
+
   release-please:
     name: release-please
+    needs: ci-green
     runs-on: ubuntu-latest
     # Skipped on a manual republish: there is no new commit to read, and running it would only
     # re-derive a release PR that already exists.
@@ -103,10 +204,12 @@ jobs:
   # same set of files rather than two builds that ought to agree.
   build:
     name: build
-    needs: release-please
+    needs: [release-please, ci-green]
     # `always()` because `release-please` is skipped on a manual republish, and a skipped
-    # dependency would otherwise skip this too.
-    if: ${{ always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch') }}
+    # dependency would otherwise skip this too — which is exactly why `ci-green` has to be named
+    # here as well. `always()` does not care that a dependency failed, so without this clause the
+    # gate above would be decorative.
+    if: ${{ always() && needs.ci-green.result == 'success' && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
@@ -259,8 +362,10 @@ jobs:
   # the kind of thing that is remembered until it is not.
   publish-container:
     name: publish container
-    needs: release-please
-    if: ${{ always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch') }}
+    needs: [release-please, ci-green]
+    # `needs.ci-green.result` for the reason `build` states: `always()` ignores a failed
+    # dependency, so the gate has to be tested rather than merely depended on.
+    if: ${{ always() && needs.ci-green.result == 'success' && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # **Serialized, because every guarantee below is a check followed by a write.** Two releases
     # merged minutes apart overlap for the whole length of this job — it is twenty-odd minutes of
@@ -269,7 +374,7 @@ jobs:
     # `latest` and a deployment tracking it rolls back. Neither is fixable inside one run, because
     # a registry push is not a compare-and-swap.
     #
-    # `cancel-in-progress: false` — the default, but stated, because cancelling is the wrong answer
+    # `cancel-in-progress: false` — the default, but stated, because canceling is the wrong answer
     # here. The queued run is a *different release* that also has to publish; it waits rather than
     # being dropped.
     concurrency:

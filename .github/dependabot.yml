@@ -247,3 +247,68 @@ updates:
           - "nbformat"
           - "markdown-it-py"
           - "ruamel*"
+
+  # ----------------------------------------------------------------------------------------
+  # Docker — the base images the published container is built from
+  # ----------------------------------------------------------------------------------------
+  # Added once the image started being *published*. Until #338 the Dockerfile was built only by
+  # the `container` job in ci.yml and the result was thrown away, so a stale base image was a
+  # thrown-away artifact. It is now pushed to `ghcr.io/mgd43b/manicule` on every release and
+  # pulled by a Kubernetes cluster, which is a different thing to leave unattended.
+  #
+  # The `FROM` tags in the Dockerfile are written literally, and have to stay that way for any of
+  # this to do anything: Dependabot's Docker parser records a dependency only when the tag is a
+  # literal token, so the `ARG PYTHON_VERSION` indirection this repository used until now was
+  # parsed as no version at all. The Dockerfile says so at the point where somebody would be
+  # tempted to put it back.
+  #
+  # **One of these two images is index-affecting, which is not the obvious answer and is the
+  # reason there are two groups.** `uv.lock` is frozen — `UV_FROZEN=1` in the Dockerfile and on
+  # the release job — so no base image bump can change a *resolved dependency*, which rules out
+  # the usual routes to a moved vector, chunk boundary or extracted byte.
+  #
+  # The interpreter itself is the exception, and it is a real one. `glossary_fingerprint()` records
+  # `python@<major>.<minor>` and `unicodedata@<unidata_version>` among its inputs, and the stale
+  # check selects documents whose glossary fingerprint differs from the installed detector's. The
+  # granularity is deliberately `3.14` rather than `3.14.11` — `glossary_lineage.py` argues the
+  # case, that re-staling on a CPython patch would invalidate a corpus for a change CPython's own
+  # policy says does not exist. A *minor* bump is exactly what it does catch.
+  #
+  # And 3.14 → 3.15 is the only thing Dependabot will ever raise for `python:3.14-slim-bookworm`,
+  # because a minor tag already floats to the newest patch on its own. So the one pull request this
+  # produces for that image is, by construction, the one that stales every glossary detection in
+  # the corpus. Accepting it means `manicule document reindex --stale-glossary`, which recomputes
+  # them; `manicule doctor` reports the count in the meantime. Hence the `index-affecting-` prefix,
+  # so the pull request title says so before anybody opens it.
+  #
+  # `ghcr.io/astral-sh/uv` is the other half and is genuinely routine: uv reaches only the builder
+  # stage through `COPY --from=uv /uv` and is not in the shipped image at all, so that bump is
+  # build reproducibility rather than a production surface, and it cannot touch a fingerprint.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    ignore:
+      # **`compose.yaml` is in scope whether or not that was intended.** This ecosystem does not
+      # read only Dockerfiles; it treats an `image:` value in a YAML manifest as a dependency too,
+      # and compose declares `image: manicule:local` for the image it builds from this repository.
+      # That is a local build tag, not something any registry serves — but the name is now also a
+      # real package (`ghcr.io/mgd43b/manicule`, published since #338), so leaving it unignored
+      # invites a pull request that "updates" the tag a developer's `docker compose build` writes
+      # to. There is nothing here for Dependabot to be right about.
+      - dependency-name: "manicule"
+    # Group order is meaningful here for the same reason it is in the uv block: a dependency joins
+    # the first group it matches, and the wildcard group repeats the exclusion rather than relying
+    # on that ordering alone.
+    groups:
+      # The interpreter, for the glossary-fingerprint reason above. `python` is the dependency name
+      # Dependabot derives from `FROM python:3.14-slim-bookworm`.
+      index-affecting-glossary:
+        patterns:
+          - "python"
+      # Everything else the Dockerfile pulls, which today is the uv stage.
+      base-images:
+        patterns: ["*"]
+        exclude-patterns:
+          - "python"
