@@ -177,6 +177,26 @@ def require_ollama() -> str:
     pytest.skip(detail)
 
 
+def require_served(client: OllamaClient, served: Served) -> None:
+    """Skip — or fail, when a job named it — unless this server actually holds ``served``.
+
+    Every case in this file needs it, including the two that drive the client directly rather
+    than through an embedder. They were the two that did not have it, and on a server holding
+    only the model CI seeds they failed with a 404 from `/api/embed` instead of skipping: a
+    test-harness defect that reads exactly like a backend defect, which is the reason the
+    decision lives in one function rather than at each call site.
+    """
+    try:
+        client.describe(served.model)
+    except ConfigError as exc:
+        if is_required(served.model):
+            pytest.fail(
+                f"{client.base_url} cannot serve {served.model!r}, which "
+                f"{REQUIRE_OLLAMA_ENV} names: {exc}"
+            )
+        pytest.skip(f"{client.base_url} does not serve {served.model!r}: {exc}")
+
+
 async def embedder_for(
     served: Served, *, cache_entries: int = 10_000, **overrides: object
 ) -> OllamaEmbedder:
@@ -194,17 +214,14 @@ async def embedder_for(
         url, timeout_s=config.timeout_s, connect_timeout_s=config.connect_timeout_s
     )
     try:
+        require_served(client, served)
         resolved = resolve(client, served.model, config)
-    except ConfigError as exc:
-        await client.aclose()
-        if is_required(served.model):
-            pytest.fail(
-                f"{url} cannot serve {served.model!r}, which {REQUIRE_OLLAMA_ENV} names: {exc}"
-            )
-        pytest.skip(f"{url} does not serve {served.model!r}: {exc}")
     except OllamaUnavailableError as exc:
         await client.aclose()
         pytest.skip(f"{url} is not answering: {exc}")
+    except BaseException:
+        await client.aclose()
+        raise
     record(resolved, client, MEASUREMENT_CACHE)
     embedder = OllamaEmbedder(
         resolved,
@@ -287,6 +304,7 @@ async def test_the_declared_context_is_not_the_served_one(served: Served) -> Non
     url = require_ollama()
     client = OllamaClient(url, timeout_s=300.0)
     try:
+        require_served(client, served)
         long_text = " ".join(["paragraph"] * (served.context_length * 2))
         asked = await client.embed(
             served.model,
@@ -322,6 +340,7 @@ async def test_truncation_is_real_and_is_what_truncate_false_prevents(served: Se
     url = require_ollama()
     client = OllamaClient(url, timeout_s=300.0)
     try:
+        require_served(client, served)
         num_ctx = min(512, served.context_length)
         over = " ".join(["paragraph"] * (num_ctx * 3))
 

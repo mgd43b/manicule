@@ -14,7 +14,13 @@ from pathlib import Path
 import pytest
 from manicule_ollama.client import OllamaClient
 from manicule_ollama.config import OllamaEmbedderConfig
-from manicule_ollama.served import CONTEXT_RESERVE, cached_fingerprint, record, resolve
+from manicule_ollama.served import (
+    CONTEXT_RESERVE,
+    cached_fingerprint,
+    declaration_path,
+    record,
+    resolve,
+)
 from ollama_fake import ARCHITECTURE, DIGEST, MODEL, SPECIAL_TOKENS, FakeOllama, config_payload
 
 from manicule.core.embedding import Pooling
@@ -301,14 +307,33 @@ def test_a_model_the_server_does_not_hold_names_what_it_does(vocabulary: Path) -
         resolve(client, "not-pulled:latest", config)
 
 
-def test_a_bare_name_matches_the_latest_tag_the_server_reports(vocabulary: Path) -> None:
+def test_the_servers_spelling_of_a_name_is_the_one_that_reaches_identity(
+    vocabulary: Path,
+) -> None:
     """`ollama list` shows `nomic-embed-text:latest` for what configuration calls
-    `nomic-embed-text`, and being told it does not exist would be wrong."""
+    `nomic-embed-text`, and one blob has to be one identity.
+
+    Being told a model visible in `ollama list` does not exist would be wrong, and so would the
+    other half: if the configured spelling reached the fingerprint, an operator who rewrote
+    their configuration to the tag Ollama itself prints would get a mismatch against their own
+    index and a full re-embed, for a change that moved nothing about the vectors.
+    """
     server = FakeOllama(model="synthetic-embed:latest")
     config = OllamaEmbedderConfig.model_validate(config_payload(tokenizer=str(vocabulary)))
-    client = OllamaClient(config.base_url, transport=server.transport())
 
-    assert resolve(client, "synthetic-embed", config).info.digest == DIGEST
+    bare = resolve(
+        OllamaClient(config.base_url, transport=server.transport()), "synthetic-embed", config
+    )
+    tagged = resolve(
+        OllamaClient(config.base_url, transport=server.transport()),
+        "synthetic-embed:latest",
+        config,
+    )
+
+    assert bare.info.digest == tagged.info.digest == DIGEST
+    assert bare.fingerprint.model_id == "ollama:synthetic-embed:latest"
+    assert bare.fingerprint.canonical() == tagged.fingerprint.canonical()
+    assert bare.weights_identity == tagged.weights_identity
 
 
 def test_missing_gguf_metadata_is_refused_by_name(vocabulary: Path) -> None:
@@ -352,17 +377,123 @@ def test_planning_refuses_rather_than_contacting_the_server(
         cached_fingerprint(tmp_path / "cache", config.base_url, MODEL, config)
 
 
-def test_a_declaration_measured_under_a_different_num_ctx_is_stale(
+def test_planning_re_derives_under_the_configuration_in_force(
     vocabulary: Path, tmp_path: Path
 ) -> None:
-    """The usable limit is derived from `num_ctx`, so a record written under another one
-    describes a different configuration rather than this one."""
-    client, served, _ = build(FakeOllama(context_length=64), vocabulary, num_ctx=64)
+    """A record is server *facts*, and the derivation is run again against current settings.
+
+    Storing the conclusions was wrong in the one direction that matters. A declaration written
+    before `max_sequence_length` was lowered still reported the old, larger limit — and
+    `manicule.app.runtime._rebuild_target` compares a chunk budget against exactly that number,
+    so a plan would be accepted here and refused by the live embedder partway through the run
+    it had authorized.
+    """
+    client, served, _ = build(FakeOllama(context_length=64), vocabulary)
+    cache = tmp_path / "cache"
+    record(served, client, cache)
+    assert served.fingerprint.max_sequence_length == 64 - CONTEXT_RESERVE - SPECIAL_TOKENS
+
+    for overrides, expected in (
+        ({"num_ctx": 32}, 32 - CONTEXT_RESERVE - SPECIAL_TOKENS),
+        ({"max_sequence_length": 20}, 20),
+    ):
+        changed = OllamaEmbedderConfig.model_validate(
+            config_payload(tokenizer=str(vocabulary), **overrides)
+        )
+        live = resolve(
+            OllamaClient(changed.base_url, transport=FakeOllama(context_length=64).transport()),
+            MODEL,
+            changed,
+        )
+        planned = cached_fingerprint(cache, client.base_url, MODEL, changed)
+
+        assert planned.max_sequence_length == expected
+        assert planned.canonical() == live.fingerprint.canonical()
+
+
+def test_planning_refuses_a_configuration_the_model_cannot_serve(
+    vocabulary: Path, tmp_path: Path
+) -> None:
+    """The same derivation means the same refusals, offline.
+
+    A `num_ctx` above the architecture's is a limit the server would never grant, and it is
+    refused here for the reason it is refused live rather than quietly clamped into a number
+    that reads as a measurement.
+    """
+    client, served, _ = build(FakeOllama(context_length=2048), vocabulary)
     cache = tmp_path / "cache"
     record(served, client, cache)
     changed = OllamaEmbedderConfig.model_validate(
-        config_payload(tokenizer=str(vocabulary), num_ctx=32)
+        config_payload(tokenizer=str(vocabulary), num_ctx=8192)
     )
 
-    with pytest.raises(ConfigError, match="describes a different configuration"):
+    with pytest.raises(ConfigError, match="serves the smaller of the two"):
         cached_fingerprint(cache, client.base_url, MODEL, changed)
+
+
+def test_planning_refuses_a_record_measured_with_another_vocabulary(
+    vocabulary: Path, tmp_path: Path
+) -> None:
+    """The one input planning cannot re-derive, because reading it may need a download.
+
+    The vocabulary decides how many special tokens wrap every input and therefore what the
+    usable limit is. A metadata-only path must not fetch one, so a changed `tokenizer` is a
+    refusal naming the command that would rewrite the record.
+    """
+    client, served, _ = build(FakeOllama(), vocabulary)
+    cache = tmp_path / "cache"
+    record(served, client, cache)
+    other = tmp_path / "other"
+    other.mkdir()
+    write_tokenizer(other / "tokenizer.json")
+    (other / "tokenizer.json").write_bytes(
+        (other / "tokenizer.json").read_bytes() + b"\n"  # same vocabulary, different bytes
+    )
+    changed = OllamaEmbedderConfig.model_validate(config_payload(tokenizer=str(other)))
+
+    with pytest.raises(ConfigError, match="was measured with tokenizer"):
+        cached_fingerprint(cache, client.base_url, MODEL, changed)
+
+
+def test_an_unreadable_record_is_absent_rather_than_an_exception(
+    vocabulary: Path, tmp_path: Path
+) -> None:
+    """A half-written or schema-shifted record must not escape as a library traceback.
+
+    Every value in it is re-derivable from the server, so the useful answer is the one that
+    names the command which would rewrite it — not a validation error from inside pydantic,
+    arriving in the middle of a rebuild plan.
+    """
+    client, served, config = build(FakeOllama(), vocabulary)
+    cache = tmp_path / "cache"
+    record(served, client, cache)
+    declaration_path(cache, client.base_url, MODEL).write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="has been recorded on this machine"):
+        cached_fingerprint(cache, client.base_url, MODEL, config)
+
+
+def test_a_bare_name_records_and_plans_under_one_key(vocabulary: Path, tmp_path: Path) -> None:
+    """The lookup key is the configured name; the canonical one lives inside the record.
+
+    These are two different names for a bare configuration — `nomic-embed-text` is served as
+    `nomic-embed-text:latest` — and they are needed for two different things. Identity has to
+    use the server's, so one blob is one vector space. The declaration *cache* has to use
+    configuration's, because a metadata-only path has nothing else to look one up by and must
+    not reach the server to find out what the server would call it.
+
+    Writing under one and reading under the other left rebuild planning reporting "nothing has
+    been recorded on this machine" against a record sitting on disk, for every model configured
+    without a tag. Found by running the real container rather than by reading.
+    """
+    server = FakeOllama(model="synthetic-embed:latest")
+    config = OllamaEmbedderConfig.model_validate(config_payload(tokenizer=str(vocabulary)))
+    client = OllamaClient(config.base_url, transport=server.transport())
+    served = resolve(client, "synthetic-embed", config)
+    cache = tmp_path / "cache"
+    record(served, client, cache)
+
+    planned = cached_fingerprint(cache, client.base_url, "synthetic-embed", config)
+
+    assert planned.canonical() == served.fingerprint.canonical()
+    assert planned.model_id == "ollama:synthetic-embed:latest"

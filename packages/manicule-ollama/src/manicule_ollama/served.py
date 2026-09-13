@@ -130,6 +130,17 @@ class ServedModel:
     num_ctx: int
     """The context this backend asks the server for, in total tokens. Sent on every request."""
 
+    configured_name: str
+    """What configuration called this model, which is **not** what identity calls it.
+
+    The two diverge for a bare name: ``nomic-embed-text`` is served as
+    ``nomic-embed-text:latest``, and :attr:`ServedModelInfo.model` carries the server's spelling
+    so that one blob is one identity. The declaration cache, though, is looked up by whatever
+    ``[embedding] model`` says — because that is all a metadata-only path has to go on, and it
+    must not reach the server to find out what the server would call it. So the file is keyed on
+    this, and its contents carry the canonical name.
+    """
+
     weights_ref: str
     weights_identity: str
 
@@ -166,9 +177,17 @@ class ServedDeclaration(BaseModel):
     context_length: int
     declared_dimension: int
     measured_dimension: int
-    pooling: Pooling
+    pooling_type: int
+    """llama.cpp's raw value, **not** the reduction derived from it.
+
+    The raw fact is what is recorded, because the derivation reads configuration too: a GGUF
+    declaring no pooling takes the reduction from ``pooling``, and storing the *result* would
+    leave a record that could not tell a changed setting from an unchanged one. Everything here
+    is a server fact for the same reason — planning re-runs the same functions ``resolve`` does
+    rather than trusting a conclusion drawn under a configuration that has since moved.
+    """
+
     tokenizer_id: str
-    tokenizer_path: Path
     special_token_count: int
     num_ctx: int
     max_sequence_length: int = Field(gt=0)
@@ -188,6 +207,23 @@ class ServedDeclaration(BaseModel):
     The *free* half of the check, which is the load-bearing one, runs every time regardless:
     see :meth:`~manicule_ollama.backend.OllamaEmbedder._verify_context_limit`.
     """
+
+    def as_info(self) -> ServedModelInfo:
+        """The server facts, back in the shape the derivation functions take.
+
+        So that planning runs the *same* functions ``resolve`` does rather than a second copy
+        of the same arithmetic — which is how the two come to disagree, and the disagreement
+        here is a limit that planning believes and ingest refuses.
+        """
+        return ServedModelInfo(
+            model=self.model,
+            digest=self.digest,
+            architecture=self.architecture,
+            context_length=self.context_length,
+            embedding_length=self.declared_dimension,
+            pooling_type=self.pooling_type,
+            capabilities=("embedding",),
+        )
 
 
 def resolve(client: OllamaClient, model: str, config: OllamaEmbedderConfig) -> ServedModel:
@@ -243,6 +279,7 @@ def resolve(client: OllamaClient, model: str, config: OllamaEmbedderConfig) -> S
         card=card,
         info=info,
         num_ctx=num_ctx,
+        configured_name=model,
         weights_ref=f"{BACKEND}:{info.model}@sha256:{info.digest}",
         weights_identity=weights_identity(info.model, info.digest),
     )
@@ -299,14 +336,16 @@ def record(served: ServedModel, client: OllamaClient, cache_dir: Path) -> Served
         context_length=served.info.context_length,
         declared_dimension=served.info.embedding_length,
         measured_dimension=served.card.dimension,
-        pooling=served.card.pooling,
+        pooling_type=served.info.pooling_type,
         tokenizer_id=served.card.tokenizer_id,
-        tokenizer_path=served.card.path,
         special_token_count=served.card.special_token_count,
         num_ctx=served.num_ctx,
         max_sequence_length=served.card.max_sequence_length,
     )
-    path = declaration_path(cache_dir, client.base_url, served.info.model)
+    # Keyed on the name configuration used, not the one the server answered with: planning has
+    # only the former, and reaching the server to learn the latter is the thing this file exists
+    # to avoid. The canonical name is inside the record.
+    path = declaration_path(cache_dir, client.base_url, served.configured_name)
     previous = _read(path)
     if previous is not None and previous.model_copy(update={"ceiling_verified": False}) == (
         declaration
@@ -364,38 +403,60 @@ def cached_fingerprint(
 ) -> EmbedFingerprint:
     """Rebuild the configured identity from disk, with the network structurally out of reach.
 
+    **What is stored are the server's facts, and the derivation is run again here** — through
+    the same :func:`_pooling`, :func:`_num_ctx` and :func:`_usable_length` that :func:`resolve`
+    uses, against the configuration currently in force. Storing the conclusions instead was
+    wrong in the direction that matters: a record written before ``max_sequence_length`` was
+    lowered still reported the old, larger limit, and
+    ``manicule.app.runtime._rebuild_target`` compares a chunk budget against exactly that
+    number — so a plan would be accepted here and refused by the live embedder partway through
+    the run it authorized.
+
+    Two things cannot be re-derived without the server or the network, and each is handled
+    rather than assumed. The **width** was measured from a real vector, so the recorded one is
+    used; nothing in configuration can change it. The **vocabulary** decides the special-token
+    count, and reading a new one may need a download, so a ``tokenizer`` that has changed since
+    the record was written is a refusal rather than a re-derivation.
+
     Raises:
-        ConfigError: Nothing has read this server yet, or the record predates a configuration
-            change that would derive a different limit from the same server.
+        ConfigError: Nothing usable has been recorded for this server and model, the configured
+            tokenizer is not the one the record was measured with, or the configuration in
+            force is one this model cannot serve.
     """
-    path = declaration_path(cache_dir, base_url, model)
-    if not path.is_file():
+    declaration = _read(declaration_path(cache_dir, base_url, model))
+    if declaration is None:
         msg = (
-            f"no declaration for {model!r} on {base_url} has been recorded on this machine, "
-            f"so rebuild planning cannot derive the configured embedding identity without "
-            f"contacting the server — and a planner that contacted it would be doing the "
-            f"thing this cache exists to avoid. Run any command that builds the embedder "
+            f"no usable declaration for {model!r} on {base_url} has been recorded on this "
+            f"machine, so rebuild planning cannot derive the configured embedding identity "
+            f"without contacting the server — and a planner that contacted it would be doing "
+            f"the thing this cache exists to avoid. Run any command that builds the embedder "
             f"once (`manicule doctor` is enough) while the server is reachable."
         )
         raise ConfigError(msg)
-    declaration = ServedDeclaration.model_validate_json(path.read_text(encoding="utf-8"))
-    expected_ctx = config.num_ctx or declaration.context_length
-    if min(expected_ctx, declaration.context_length) != declaration.num_ctx:
+
+    expected_tokenizer = tokenizer_identity(config)
+    if expected_tokenizer != declaration.tokenizer_id:
         msg = (
-            f"the recorded declaration for {model!r} was measured with num_ctx="
-            f"{declaration.num_ctx} and configuration now asks for {expected_ctx}. The usable "
-            f"limit is derived from that number, so the record describes a different "
-            f"configuration rather than this one. Rebuild it by running against the server."
+            f"the recorded declaration for {model!r} was measured with tokenizer "
+            f"{declaration.tokenizer_id!r} and configuration now names {expected_tokenizer!r}. "
+            f"The vocabulary decides how many special tokens wrap every input and therefore "
+            f"what the usable limit is, and reading the new one may need a download — which a "
+            f"metadata-only path must not do. Run once against the server."
         )
         raise ConfigError(msg)
+
+    info = declaration.as_info()
+    num_ctx = _num_ctx(info, config.num_ctx)
     return EmbedFingerprint(
         model_id=f"{BACKEND}:{declaration.model}",
         revision=f"sha256:{declaration.digest}",
         dimension=declaration.measured_dimension,
-        pooling=declaration.pooling,
+        pooling=_pooling(info, config.pooling),
         normalized=True,
         tokenizer_id=declaration.tokenizer_id,
-        max_sequence_length=declaration.max_sequence_length,
+        max_sequence_length=_usable_length(
+            info, num_ctx, declaration.special_token_count, config.max_sequence_length
+        ),
         backend=BACKEND,
         weights_ref=f"{BACKEND}:{declaration.model}@sha256:{declaration.digest}",
         weights_identity=weights_identity(declaration.model, declaration.digest),
@@ -405,8 +466,12 @@ def cached_fingerprint(
 # --- the individual measurements ----------------------------------------------------------
 
 
-def _resolve_tokenizer(config: OllamaEmbedderConfig) -> tuple[Path, str]:
-    """The directory holding ``tokenizer.json``, and the public identity of that vocabulary.
+def tokenizer_identity(config: OllamaEmbedderConfig) -> str:
+    """The public identity of the configured vocabulary, **without touching the network**.
+
+    Split out of :func:`_resolve_tokenizer` so that metadata-only planning can ask whether the
+    configured tokenizer is still the one a record was measured with. A local one is hashed,
+    which is a local read; a remote one is named by repository and commit, which is pure.
 
     The identity carries no filesystem path, for the reason
     :func:`manicule.embedding.artifacts.resolve_artifact` gives about ``weights_ref``: it is
@@ -441,8 +506,7 @@ def _resolve_tokenizer(config: OllamaEmbedderConfig) -> tuple[Path, str]:
         if not file.is_file():
             msg = f"`tokenizer` {config.tokenizer!r} holds no tokenizer.json"
             raise ConfigError(msg)
-        digest = hashlib.sha256(file.read_bytes()).hexdigest()
-        return local, f"local:sha256:{digest}"
+        return f"local:sha256:{hashlib.sha256(file.read_bytes()).hexdigest()}"
 
     if not config.tokenizer_revision:
         msg = (
@@ -453,11 +517,23 @@ def _resolve_tokenizer(config: OllamaEmbedderConfig) -> tuple[Path, str]:
             f"move when the thing it describes does."
         )
         raise ConfigError(msg)
+    return f"hf:{config.tokenizer}@{config.tokenizer_revision}"
+
+
+def _resolve_tokenizer(config: OllamaEmbedderConfig) -> tuple[Path, str]:
+    """The directory holding ``tokenizer.json``, and the identity of that vocabulary.
+
+    The identity comes from :func:`tokenizer_identity`, which is the half planning can compute
+    without a network; this adds the half that may need one.
+    """
+    identity = tokenizer_identity(config)
+    local = Path(config.tokenizer).expanduser()
+    if local.is_dir():
+        return local, identity
 
     from manicule.embedding.runtimes.hub import snapshot  # noqa: PLC0415 - an embeddings extra
 
-    path = snapshot(config.tokenizer, TOKENIZER_FILES, config.tokenizer_revision)
-    return path, f"hf:{config.tokenizer}@{config.tokenizer_revision}"
+    return snapshot(config.tokenizer, TOKENIZER_FILES, config.tokenizer_revision), identity
 
 
 def _special_token_count(tokenizer_path: Path) -> int:
@@ -629,5 +705,6 @@ __all__ = [
     "mark_ceiling_verified",
     "record",
     "resolve",
+    "tokenizer_identity",
     "weights_identity",
 ]

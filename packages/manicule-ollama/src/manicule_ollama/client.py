@@ -26,7 +26,6 @@ Three responses carry everything this backend knows about the model, and each is
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, cast
@@ -153,7 +152,7 @@ class OllamaClient:
                 substitute.
             OllamaUnavailableError: The server could not be reached.
         """
-        digest = self._digest(model)
+        name, digest = self._digest(model)
         shown = self._post_sync("/api/show", {"model": model})
         info = _mapping(shown.get("model_info"), "model_info", model)
         capabilities = tuple(
@@ -178,7 +177,7 @@ class OllamaClient:
             )
             raise ConfigError(msg)
         return ServedModelInfo(
-            model=model,
+            model=name,
             digest=digest,
             architecture=architecture,
             context_length=_positive_int(info, f"{architecture}.context_length", model, self),
@@ -187,8 +186,8 @@ class OllamaClient:
             capabilities=capabilities,
         )
 
-    def _digest(self, model: str) -> str:
-        """The digest of the blob ``model`` currently resolves to, read synchronously."""
+    def _digest(self, model: str) -> tuple[str, str]:
+        """The name the server uses for ``model`` and the digest behind it, read synchronously."""
         return self._match_digest(self._post_sync("/api/tags", None, method="GET"), model)
 
     async def digest(self, model: str) -> str:
@@ -200,15 +199,22 @@ class OllamaClient:
         an operator scrapes while an ingest is in flight, and where a blocking HTTP call would
         stall every other coroutine in the process for as long as the server took to answer.
         """
-        return self._match_digest(await self._get("/api/tags"), model)
+        return self._match_digest(await self._get("/api/tags"), model)[1]
 
-    def _match_digest(self, listed: Mapping[str, object], model: str) -> str:
-        """Pick ``model``'s digest out of an ``/api/tags`` listing.
+    def _match_digest(self, listed: Mapping[str, object], model: str) -> tuple[str, str]:
+        """Pick ``model``'s name and digest out of an ``/api/tags`` listing.
 
         From ``/api/tags`` rather than ``/api/show``, which does not report it. Matched against
         the name Ollama itself uses, including the ``:latest`` it appends to a bare name — so a
         configuration saying ``nomic-embed-text`` finds ``nomic-embed-text:latest`` rather than
         being told a model it can see in ``ollama list`` does not exist.
+
+        **The server's spelling is what comes back, not the configuration's**, and that is an
+        identity decision rather than a tidiness one. ``nomic-embed-text`` and
+        ``nomic-embed-text:latest`` are one blob with one digest, so they have to be one
+        embedding identity — otherwise an operator who rewrites their configuration to the tag
+        ``ollama list`` prints gets a fingerprint mismatch and a full re-embed for a change that
+        moved nothing about the vectors.
         """
         models = cast("Sequence[object]", listed.get("models") or ())
         wanted = model if ":" in model else f"{model}:latest"
@@ -228,7 +234,7 @@ class OllamaClient:
                         f"pull produced, so a model without one cannot be given an identity."
                     )
                     raise ConfigError(msg)
-                return digest.removeprefix("sha256:")
+                return name, digest.removeprefix("sha256:")
         available = ", ".join(sorted(names)) or "nothing"
         msg = (
             f"{self.base_url} is not serving {wanted!r}. It holds: {available}. Run "
@@ -329,7 +335,10 @@ class OllamaClient:
             )
         try:
             parsed: object = response.json()
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:
+            # `ValueError` rather than `json.JSONDecodeError`, which is one of its subclasses:
+            # a response whose bytes are not decodable text raises `UnicodeDecodeError`, also a
+            # `ValueError`, and letting that escape would take a diagnostic down with it.
             raise OllamaUnavailableError(
                 f"{self.base_url}{path} answered {response.status_code} with a body that is "
                 f"not JSON. This is usually a proxy or a captive portal between manicule and "
@@ -415,7 +424,7 @@ def _error_text(response: httpx.Response) -> str:
     """Ollama's own ``{"error": "..."}`` when it sent one, and the raw body otherwise."""
     try:
         parsed: object = response.json()
-    except json.JSONDecodeError:
+    except ValueError:
         return response.text[:400]
     if isinstance(parsed, Mapping):
         error = cast("Mapping[str, object]", parsed).get("error")

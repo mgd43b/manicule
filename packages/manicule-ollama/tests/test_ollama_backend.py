@@ -509,3 +509,25 @@ async def _setup_with_cache(
     )
     await embedder.setup()
     return embedder
+
+
+async def test_health_reports_rather_than_raises_whatever_the_server_does(
+    vocabulary: Path, counter: Callable[[str], int]
+) -> None:
+    """`SupportsHealth` says a health check reports instead of raising, and it means it.
+
+    The caller is a diagnostic asking every component at once, so one that escapes takes down
+    the surface that was about to say which component is unwell. A proxy answering `/api/tags`
+    with a 400 whose body happens to carry the phrase this client maps to a context overflow is
+    the narrow case, and the fix is to catch everything this package raises rather than the two
+    things it usually raises here.
+    """
+    server = FakeOllama(count=counter)
+    embedder = await ready(server, vocabulary)
+    server.tags_error = "the input length exceeds the context length"
+
+    report = await embedder.health()
+
+    assert not report.ok
+    assert "exceeds the context length" in report.detail
+    await embedder.teardown()

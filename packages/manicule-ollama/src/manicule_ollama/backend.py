@@ -45,7 +45,7 @@ from manicule.core.embedding import (
     is_finite_vector,
     require_within_context,
 )
-from manicule.core.errors import ConfigError, ContextOverflowError
+from manicule.core.errors import ConfigError, ContextOverflowError, ManiculeError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.lifecycle import HealthReport, Lifecycle, Metric
 from manicule.embedding.cache import EmbeddingCache
@@ -238,7 +238,11 @@ class OllamaEmbedder(Lifecycle):
             )
         try:
             digest = await self._client.digest(self._served.info.model)
-        except (OllamaUnavailableError, ConfigError) as exc:
+        except ManiculeError as exc:
+            # Every error this package raises, rather than the two it usually raises here.
+            # `SupportsHealth` says a health check reports instead of raising, and the caller
+            # is a diagnostic asking every component at once — so one that escapes takes down
+            # the surface that was about to say which component is unwell.
             return HealthReport.failing(
                 f"{self.fingerprint.describe()} on {self._client.base_url}: {exc}",
                 remedy=f"Check that the server answers `curl {self._client.base_url}/api/tags` "
@@ -504,8 +508,12 @@ class OllamaEmbedder(Lifecycle):
         and failing later is failing partway through building one.
         """
         model = self._served.info.model
+        # The *configured* name is the cache key — see `ServedModel.configured_name`. Reading
+        # it under the canonical one would miss every record written for a bare name, and the
+        # expensive probe would run on every start while looking as though it were cached.
+        key = self._served.configured_name
         if self._cache_dir is not None and ceiling_verified(
-            self._cache_dir, self._client.base_url, model
+            self._cache_dir, self._client.base_url, key
         ):
             return
 
@@ -524,7 +532,7 @@ class OllamaEmbedder(Lifecycle):
             raise ConfigError(msg) from exc
         self._require_unit_norm(result.vectors)
         if self._cache_dir is not None:
-            mark_ceiling_verified(self._cache_dir, self._client.base_url, model)
+            mark_ceiling_verified(self._cache_dir, self._client.base_url, key)
 
     def _text_of_length(self, tokens: int) -> str:
         """A string this tokenizer measures at exactly ``tokens`` content tokens.

@@ -112,6 +112,14 @@ class FakeOllama:
     A switch here rather than a monkeypatch in a test, so the endpoint under test stays the one
     that ships."""
 
+    tags_error: str = ""
+    """If set, ``/api/tags`` answers 400 with this message instead of a listing.
+
+    For the health check, which is the one caller that must report rather than raise. The
+    message worth setting is Ollama's context refusal, because this client maps that phrase to
+    a distinct exception — so a health check catching only the two errors it usually sees would
+    let it escape and take the diagnostic down with it."""
+
     requests: Requests = field(default_factory=_no_requests)
     """Every request, in order, for a test that wants to assert what was *sent*."""
 
@@ -131,6 +139,8 @@ class FakeOllama:
                 body = cast("Mapping[str, object]", parsed)
         self.requests.append((request.url.path, body))
         if request.url.path == "/api/tags":
+            if self.tags_error:
+                return httpx.Response(400, json={"error": self.tags_error})
             return httpx.Response(200, json=self._tags())
         if request.url.path == "/api/show":
             return httpx.Response(200, json=self._show())
