@@ -102,10 +102,12 @@ adding or removing the package is an operation rather than a migration.
 > itself carries no implementation dependencies, deliberately: that boundary is what lets a
 > plugin author depend on its contracts without installing a vector database and a model
 > runtime, and [`tests/test_import_boundary.py`](tests/test_import_boundary.py) fails the build
-> if it erodes. `[all]` is the extra that turns the library into the program — storage,
-> embeddings, the parsers, ingest, retrieval, generation, the connectors and the serving stack,
-> about 240 MB. A bare `pip install manicule` succeeds and then tells you this rather than
-> raising.
+> if it erodes. `[all]` is the extra that turns the library into the program — storage, the
+> Qdrant client for the networked vector store, embeddings, the parsers, ingest, retrieval,
+> generation, the connectors and the serving stack, about 240 MB. `qdrant` is its own extra
+> rather than part of `storage` because the two vector stores are alternatives: an installation
+> that keeps the embedded default should not carry a network client to reach a server it never
+> dials. A bare `pip install manicule` succeeds and then tells you this rather than raising.
 
 Two extras are **not** in `[all]`, and the reason is size rather than taste:
 
@@ -618,12 +620,14 @@ The build downloads the weights and the grammars, and the resulting image is abo
 That cost is paid at `build`, where a long step is legible, rather than inside the first `index`,
 where it looks like a hang.
 
-The image runs as an unprivileged user with a `0700` data directory and publishes no port; the
-compose file additionally drops every capability. It runs the ONNX backend, because MLX is Apple
-silicon and no Linux container can use it: **the same vectors, at a lower rate** — indexing this
+The image runs as an unprivileged user with a `0700` data directory and publishes no port — a
+statement about what can reach in, not about what this process reaches out to; the compose file
+additionally drops every capability. It runs the ONNX backend, because MLX is Apple silicon and
+no Linux container can use it: **the same vectors, at a lower rate** — indexing this
 repository's `docs/` took 5 minutes 4 seconds in the container against 38 seconds natively on
 MLX. `manicule ask` needs a generator; the compose file points at an Ollama on the host, which is
-one line to change.
+one line to change, and a `storage.vector_db = "qdrant"` install dials its server the same way,
+over the network this container was never asked to listen on.
 
 > [!WARNING]
 > **MCP is better run natively.** Handing a container's stdio to an assistant means the client
@@ -684,7 +688,11 @@ are called unattended, so that is not a distinction worth risking.
 **Nothing binds a network socket unless it is asked to.** The MCP server speaks stdio by default,
 which opens no socket at all; every HTTP bind goes through one policy that starts at loopback,
 and widening it takes an address somebody wrote down, an explicit flag no config file can supply,
-and authentication switched on. Any one missing is a refusal.
+and authentication switched on. Any one missing is a refusal. That is a claim about what
+listens, not about what this process dials: a `qdrant` vector store reaches out to
+`storage.vector_db_url` the same way a remote generator or a connector does, and it is
+`Settings.policy_problems()` — not this rule — that refuses the connection when the data
+policy does not allow the corpus to leave the machine.
 
 **Nothing believes a forwarded address unless it was told to.** `X-Forwarded-For` is read only
 from a peer inside `security.transport.trusted_proxies`, which is empty by default — so on an

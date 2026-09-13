@@ -2,12 +2,16 @@
 #
 # manicule in a container.
 #
-# **Everything the running container needs arrives with the image.** The grammars, the model
-# weights and the Python environment are all resolved while the build has a network, and the
-# final stage proves it by doing a whole index-and-search with the network switched off. That
-# is manicule's own rule applied to the image: pre-seed, never lazy-load. A container that
-# downloads two gigabytes the first time somebody types `index` looks broken for ten minutes
-# and then works, which is the worst of both.
+# **Everything the shipped configuration needs arrives with the image.** The grammars, the
+# model weights and the Python environment are all resolved while the build has a network, and
+# the final stage proves it by doing a whole index-and-search with the network switched off —
+# for `storage.vector_db`'s default, `lancedb`. That is manicule's own rule applied to the
+# image: pre-seed, never lazy-load. A container that downloads two gigabytes the first time
+# somebody types `index` looks broken for ten minutes and then works, which is the worst of
+# both. Point `storage.vector_db_url` at a Qdrant server instead — the `qdrant` extra ships in
+# this image too, so nothing more needs installing — and the container dials it on every
+# search and every ingest: a route this build never had to prove, because it does not exist
+# until an operator adds it.
 #
 # The image runs as an unprivileged user and its data directory is `0700`. That is not
 # decoration either: with retained source bytes the data directory holds the corpus itself
@@ -41,7 +45,7 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/manicule/venv \
 # torch, it is gigabytes, and the retrieval profiles reach a cross-encoder through a seam that
 # is simply unfilled without it. `embeddings` resolves to onnxruntime here — mlx-embeddings is
 # marked for Apple Silicon in pyproject.toml and does not install on Linux at all.
-ARG EXTRAS="--extra storage --extra embeddings --extra parsers --extra retrieval --extra generation --extra connectors --extra ingest --extra serve"
+ARG EXTRAS="--extra storage --extra qdrant --extra embeddings --extra parsers --extra retrieval --extra generation --extra connectors --extra ingest --extra serve"
 
 WORKDIR /src
 
@@ -218,12 +222,16 @@ RUN install --directory --mode=0700 --owner=manicule --group=manicule /data
 USER manicule
 WORKDIR /home/manicule
 
-# Seed the grammars out of the installed bundle, and prove the whole thing works offline.
+# Seed the grammars out of the installed bundle, and prove the shipped configuration works
+# offline.
 #
 # `--network=none` is the assertion, not a precaution: this step reaches for grammars, model
-# weights, a database and a vector index, and it runs with no route to anything. A build that
-# passes it cannot be an image that quietly fetches on first use — which is exactly the
-# failure a passing build would otherwise hide.
+# weights, a database and a LanceDB vector index — everything the default configuration
+# needs — and it runs with no route to anything. A build that passes it cannot be an image
+# that quietly fetches on first use, for that configuration. It says nothing about a container
+# later pointed at `storage.vector_db = "qdrant"`, which reaches for a server instead of a
+# local index and needs a route this step was never asked to have — docs/deployment.md §5
+# says what changes.
 #
 # `doctor` is in here because it is the acceptance test for everything above it: it fails, not
 # warns, on a data directory that is group- or world-readable, so an image that ran as root

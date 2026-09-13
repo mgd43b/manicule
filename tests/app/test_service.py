@@ -3070,7 +3070,7 @@ async def test_a_store_with_no_ann_lifecycle_reports_nothing_rather_than_exhaust
     status = await service.index_status()
 
     assert status.vector_index is None
-    with pytest.raises(ConfigError, match="does not maintain"):
+    with pytest.raises(ConfigError, match="no approximate-nearest-neighbor index"):
         await service.vector_index_build()
 
 

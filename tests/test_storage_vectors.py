@@ -36,26 +36,27 @@ from manicule.core.embedding import (
     classify_stored_vector,
     embedding_input_identity,
 )
-from manicule.core.errors import FingerprintMismatchError
+from manicule.core.errors import FingerprintMismatchError, VectorStoreStateError
 from manicule.core.protocols import VectorStore
 from manicule.core.retrieval import Filter
 from manicule.storage.engine import VECTORS_DIRNAME
-from manicule.storage.vectors import (
+from manicule.storage.vector_schema import (
     CHUNK_ID_COLUMN,
-    DISTANCE_METRIC,
     EXEMPT_FILTER_FIELDS,
     IDENTITY_COLUMN,
-    META_TABLE,
     PUBLICATION_COLUMN,
-    VALIDATION_CHUNK_INDEX,
     VECTOR_COLUMN,
+    space_name,
+    unit,
+)
+from manicule.storage.vectors import (
+    DISTANCE_METRIC,
+    META_TABLE,
+    VALIDATION_CHUNK_INDEX,
     LanceVectorStore,
     PublishedLanceVectorStore,
-    VectorStoreStateError,
     predicate_for,
     quote,
-    table_name,
-    unit,
 )
 from manicule.testing import (
     assert_protocol_signatures,
@@ -555,7 +556,7 @@ async def test_the_vector_table_is_named_after_the_fingerprint_it_holds(
 
     written = {path.stem for path in directory.iterdir()}
 
-    assert written == {META_TABLE, table_name(fingerprint())}
+    assert written == {META_TABLE, space_name(fingerprint())}
 
 
 async def test_the_same_fingerprint_offered_twice_is_accepted(tmp_path: Path) -> None:
@@ -1035,7 +1036,7 @@ async def _rewrite_chunk_json(directory: Path, chunk_id: str, replacement: Chunk
     ``None`` writes something that is not a chunk at all.
     """
     connection = await lancedb.connect_async(directory)
-    table = await connection.open_table(table_name(fingerprint()))
+    table = await connection.open_table(space_name(fingerprint()))
     encoded = "not json at all" if replacement is None else replacement.model_dump_json()
     await table.update(where=f"id = {quote(chunk_id)}", updates={"chunk_json": encoded})
     connection.close()
@@ -1044,7 +1045,7 @@ async def _rewrite_chunk_json(directory: Path, chunk_id: str, replacement: Chunk
 async def _drop_identity_column(directory: Path, embed: EmbedFingerprint) -> None:
     """Make a table look like one written before the identity column existed."""
     connection = await lancedb.connect_async(directory)
-    table = await connection.open_table(table_name(embed))
+    table = await connection.open_table(space_name(embed))
     await table.drop_columns([IDENTITY_COLUMN])
     connection.close()
 
@@ -1052,7 +1053,7 @@ async def _drop_identity_column(directory: Path, embed: EmbedFingerprint) -> Non
 async def _drop_generation_columns(directory: Path, embed: EmbedFingerprint) -> None:
     """Recreate the schema shape written before publication generations existed."""
     connection = await lancedb.connect_async(directory)
-    table = await connection.open_table(table_name(embed))
+    table = await connection.open_table(space_name(embed))
     await table.drop_columns([CHUNK_ID_COLUMN, PUBLICATION_COLUMN])
     connection.close()
 
@@ -1363,7 +1364,7 @@ async def test_the_index_state_of_a_directory_with_no_vectors_is_an_answer_not_a
 async def _create_foreign_index(directory: Path) -> None:
     """An index on the vector column under a name this project would never choose."""
     connection = await lancedb.connect_async(directory)
-    table = await connection.open_table(table_name(fingerprint()))
+    table = await connection.open_table(space_name(fingerprint()))
     await table.create_index(
         VECTOR_COLUMN,
         config=IvfPq(distance_type=DISTANCE_METRIC, num_partitions=4, num_sub_vectors=1),

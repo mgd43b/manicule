@@ -1113,10 +1113,8 @@ async def test_reset_reprepares_a_new_fingerprint_in_the_same_runtime(  # noqa: 
     from manicule.app.results import ResetReport  # noqa: PLC0415
     from manicule.app.served import ControlHandler  # noqa: PLC0415
     from manicule.connectors.sessions import SessionVault  # noqa: PLC0415
-    from manicule.storage.vectors import (  # noqa: PLC0415
-        LanceVectorStore,
-        VectorStoreStateError,
-    )
+    from manicule.core.errors import VectorStoreStateError  # noqa: PLC0415
+    from manicule.storage.vectors import LanceVectorStore  # noqa: PLC0415
     from tests.fakes import HashEmbedder  # noqa: PLC0415
     from tests.ingest.fakes import DictConnector  # noqa: PLC0415
     from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
@@ -1467,7 +1465,8 @@ async def test_upgraded_shared_legacy_reset_preserves_foreign_workspace_until_la
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
     from manicule.storage.engine import VECTORS_DIRNAME, create_engine  # noqa: PLC0415
     from manicule.storage.migrator import upgrade  # noqa: PLC0415
-    from manicule.storage.vectors import LanceVectorStore, table_name  # noqa: PLC0415
+    from manicule.storage.vector_schema import space_name  # noqa: PLC0415
+    from manicule.storage.vectors import LanceVectorStore  # noqa: PLC0415
     from tests.fakes import HashEmbedder  # noqa: PLC0415
     from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
 
@@ -1494,7 +1493,7 @@ async def test_upgraded_shared_legacy_reset_preserves_foreign_workspace_until_la
                     models.IndexState(
                         workspace_id=workspace,
                         vector_namespace="legacy",
-                        vector_table=table_name(fingerprint),
+                        vector_table=space_name(fingerprint),
                         embed_fingerprint=fingerprint.model_dump_json(),
                     )
                 )

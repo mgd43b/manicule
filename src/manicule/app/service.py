@@ -2724,9 +2724,10 @@ class ApplicationService:
         build = await maintenance.build_vector_index(force=force, dry_run=dry_run)
         if build is None:
             msg = (
-                f"the configured vector store ({self.settings.storage.vector_db}) does not "
-                f"maintain an approximate-nearest-neighbor index. Its search is exhaustive and "
-                f"exact, and there is nothing here to build."
+                f"the configured vector store ({self.settings.storage.vector_db}) has no "
+                f"approximate-nearest-neighbor index for manicule to build. Either its search "
+                f"is exhaustive and exact, or it maintains its own index on its own schedule; "
+                f"either way there is nothing here to trigger."
             )
             raise ConfigError(msg)
         return r.VectorIndexReport(

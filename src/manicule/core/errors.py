@@ -109,6 +109,19 @@ class DerivedResetFenceLostError(ManiculeError):
     """A derived writer was assembled before a confirmed workspace reset completed."""
 
 
+class VectorStoreStateError(ManiculeError):
+    """A vector store was used outside the state the operation needs.
+
+    Either before ``ensure_ready`` established which fingerprint the vectors belong to, or
+    against a store whose recorded fingerprint no longer says one thing. Both are wiring or
+    tampering rather than user error, and both are fatal to the operation: guessing the
+    fingerprint is exactly the mistake the recorded one exists to prevent.
+
+    Here rather than beside a backend because both vector stores raise it and neither owns it —
+    an installation configured for one must not import the other to catch it.
+    """
+
+
 class StorageBusyError(ManiculeError):
     """SQLite writer ownership stayed unavailable beyond the bounded retry policy.
 
@@ -363,5 +376,6 @@ __all__ = [
     "TokenStateError",
     "UnknownComponentError",
     "UnknownEntityError",
+    "VectorStoreStateError",
     "WorkerKilledError",
 ]

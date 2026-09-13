@@ -55,14 +55,13 @@ from manicule.core.embedding import (
 )
 from manicule.core.protocols import VectorIntegrityMaintenance
 from manicule.core.retrieval import Filter
-from manicule.storage.vectors import (
+from manicule.storage.vector_schema import (
     CHECKSUM_COLUMN,
     CHECKSUM_VERSION_COLUMN,
     VECTOR_COLUMN,
-    LanceVectorStore,
-    PublishedLanceVectorStore,
-    table_name,
+    space_name,
 )
+from manicule.storage.vectors import LanceVectorStore, PublishedLanceVectorStore
 from manicule.testing import assert_protocol_signatures
 from tests.vector_helpers import nudged, read_column, rewrite_row, rows_of
 
@@ -120,7 +119,7 @@ async def prepared(directory: Path, dimension: int = DIMENSION) -> LanceVectorSt
 async def drop_checksum_columns(directory: Path) -> None:
     """Make a table look like one written before the checksum columns existed."""
     connection = await lancedb.connect_async(directory)
-    table = await connection.open_table(table_name(fingerprint()))
+    table = await connection.open_table(space_name(fingerprint()))
     await table.drop_columns([CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN])
     connection.close()
 

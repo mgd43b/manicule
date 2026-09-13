@@ -40,6 +40,7 @@ from manicule.config.providers import (
     ModelRole,
     ProviderSettings,
     egress_for,
+    endpoint_egress,
     env_var_names,
     needs_credential,
     resolve_provider_keys,
@@ -52,6 +53,22 @@ from manicule.core.retrieval import RetrievalProfile
 
 ENV_PREFIX = "MANICULE_"
 APP_NAME = "manicule"
+
+QDRANT_COLLECTION_PREFIX = "manicule"
+"""What this installation's Qdrant collections are called before its own scopes are appended.
+
+The default lives here rather than beside the store, because a default that also exists in the
+implementation is a second answer to one question, and the two only disagree once somebody
+changes the wrong one. The store takes the prefix it is given and has no opinion about it.
+"""
+
+QDRANT_API_KEY_ENV = "QDRANT_API_KEY"
+"""The conventional variable a Qdrant key arrives in, read when configuration sets none.
+
+The same convention model providers use — ``<SERVICE>_API_KEY`` — because an operator who has
+already exported it for `qdrant`'s own tooling should not have to write it down twice, and a
+credential in a config file is a credential in a backup.
+"""
 
 
 def _xdg(var: str, default: str) -> Path:
@@ -474,21 +491,87 @@ class EventSettings(Section):
     webhooks: tuple[WebhookSettings, ...] = ()
 
 
+class QdrantSettings(Section):
+    """How to reach the Qdrant server, when ``storage.vector_db`` selects it.
+
+    Where the server *is* lives in ``storage.vector_db_url``, beside ``storage.db_url``,
+    because an endpoint is a property of the installation rather than of the client dialing
+    it — and two places a location can be set is how the two come to disagree. What is here
+    is everything else the dial needs.
+    """
+
+    api_key: SecretStr | None = Field(
+        default=None,
+        description="Qdrant API key. Resolved from QDRANT_API_KEY when not set here, and "
+        "held as a secret so that printing configuration cannot leak it.",
+    )
+    prefer_grpc: bool = Field(
+        default=False,
+        description="Speak gRPC on the data path instead of HTTP. Faster — a float32 vector "
+        "crosses as bytes rather than as JSON decimal text — and it needs the gRPC port open "
+        "and terminated, which an HTTP ingress in front of Qdrant usually does not do. HTTP "
+        "is the default because it is the one that works through whatever is already there; "
+        "neither transport changes a stored value.",
+    )
+    grpc_port: int = Field(
+        default=6334,
+        ge=1,
+        le=65535,
+        description="The gRPC port, used only when prefer_grpc is set. Qdrant's own default, "
+        "and not carried by the URL: storage.vector_db_url names the HTTP endpoint.",
+    )
+    timeout_s: int = Field(
+        default=30,
+        ge=1,
+        description="Wall clock for one request, in whole seconds — the unit the client "
+        "takes. Its own default is five, which a bulk upsert over a slow link exceeds "
+        "honestly rather than exceptionally.",
+    )
+    collection_prefix: str = Field(
+        default=QDRANT_COLLECTION_PREFIX,
+        min_length=1,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+        description="What this installation's collections are called, and the only thing that "
+        "keeps two installations sharing one server apart. A workspace digest and the "
+        "fingerprint hash follow it, so one installation's workspaces and embedding spaces "
+        "already cannot meet — but nothing identifies an installation on its own, and a "
+        "workspace is called 'default' on both machines. Leave this at its default on a shared "
+        "server and the two share collections. Give each its own.",
+    )
+
+
 class StorageSettings(Section):
     """Where indexed data lives.
 
-    The choices are closed: a relational store for the 35 modeled tables that own the corpus,
-    durable acquisition, re-embedding, collections, versions and audit records, and a vector
-    store for vectors. Naming the alternatives in
-    configuration would advertise support that does not exist.
+    One relational store, and two vector stores that are alternatives rather than layers.
+    ``db`` is closed at ``sqlite``: the 35 modeled tables that own the corpus, durable
+    acquisition, re-embedding, collections, versions and audit records have one implementation
+    and naming another would advertise support that does not exist.
+
+    ``vector_db`` is a real choice, and the two differ in where the index lives rather than in
+    what it holds. ``lancedb`` is embedded — a directory under the data directory, no server,
+    nothing to reach — and is the default because it is the configuration that works with
+    nothing else running. ``qdrant`` puts the index on a server, which is what lets several
+    processes share one and what lets a container keep no volume; it costs a network
+    dependency, a backup procedure that is no longer a directory copy, and — because the chunk
+    travels with the vector — a corpus that leaves this machine. Re-embedding's shadow
+    generations are a LanceDB mechanism and stay one; a durable re-embed on any other backend
+    is refused by name rather than half-performed.
     """
 
     db: Literal["sqlite"] = "sqlite"
     db_url: str | None = Field(
         default=None, description="Overrides the default path under the data directory."
     )
-    vector_db: Literal["lancedb"] = "lancedb"
-    vector_db_url: str | None = None
+    vector_db: Literal["lancedb", "qdrant"] = "lancedb"
+    vector_db_url: str | None = Field(
+        default=None,
+        description="Where the vector store is, for a backend that is somewhere. Required by "
+        "'qdrant' — the Qdrant HTTP endpoint, e.g. https://qdrant.internal:6333 — and refused "
+        "for 'lancedb', which lives under the data directory and would otherwise be reading a "
+        "setting that looks like it is in force.",
+    )
+    qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
     retain_source_bytes: bool = Field(
         default=True,
         description="Keep fetched bytes so re-parsing never means re-fetching. Turning this "
@@ -518,7 +601,9 @@ class StorageSettings(Section):
         "index is wanted. Below it search is exact and an index would trade recall for "
         "latency nobody is waiting on. The same number, applied to the rows an existing index "
         "does not cover, is when that index reads as stale. ``0`` keeps search exhaustive "
-        "permanently and leaves any index already built alone.",
+        "permanently and leaves any index already built alone. Read only by a vector store "
+        "whose index manicule builds, which is 'lancedb'; 'qdrant' maintains its own and "
+        "reports no lifecycle rather than reporting this one.",
     )
 
     checksum_backfill_batch: int = Field(
@@ -528,8 +613,9 @@ class StorageSettings(Section):
         description="Vector rows one pass of `manicule vector-checksum --yes` reads and "
         "rewrites. The bound on both its memory and the work a crash can lose: the pass "
         "selects rows that record no checksum, so an interruption costs at most this many rows "
-        "and the next pass resumes without a cursor. Larger is fewer Lance commits over a big "
-        "corpus; smaller is a shorter interval in which a rewrite is in flight.",
+        "and the next pass resumes without a cursor. Larger is fewer commits — or, on a "
+        "network-backed store, fewer round trips — over a big corpus; smaller is a shorter "
+        "interval in which a rewrite is in flight.",
     )
 
     @field_validator("ann_index_threshold")
@@ -542,6 +628,11 @@ class StorageSettings(Section):
         means every surface reports a build as due, forever, and every attempt to perform one
         is declined for a reason that has nothing to do with the number the operator set.
         Caught here, it is a typo at startup instead.
+
+        Checked whatever the selected vector store is, and deliberately: the floor belongs to
+        the setting rather than to a backend, so switching to a store that ignores the number
+        does not quietly make an unusable value acceptable — and switching back would then fail
+        at a moment that has nothing to do with the edit that caused it.
 
         Raises:
             ValueError: The threshold is neither ``0`` nor a value a build could reach.
@@ -1439,11 +1530,16 @@ class Settings(BaseSettings):
 
     @override
     def model_post_init(self, context: Any, /) -> None:
-        """Fill provider credentials from the environment by convention."""
+        """Fill provider and vector-store credentials from the environment by convention."""
         del context
+        environment = provider_environment()
         self.providers = resolve_provider_keys(
-            self.providers, self.selected_providers, environ=provider_environment()
+            self.providers, self.selected_providers, environ=environment
         )
+        if self.storage.qdrant.api_key is None:
+            supplied = environment.get(QDRANT_API_KEY_ENV, "").strip()
+            if supplied:
+                self.storage.qdrant.api_key = SecretStr(supplied)
 
     # --- derived ------------------------------------------------------------------------
 
@@ -1567,6 +1663,7 @@ class Settings(BaseSettings):
 
         problems.extend(self._redaction_problems())
         problems.extend(self._source_restriction_problems())
+        problems.extend(self._vector_store_problems())
 
         if self.security.auth.mode is AuthMode.OAUTH and not self.security.auth.providers:
             problems.append("security.auth.mode is 'oauth' but no OAuth providers are configured")
@@ -1574,6 +1671,71 @@ class Settings(BaseSettings):
         if self.security.audit.destination is AuditDestination.WEBHOOK and not self.events.webhooks:
             problems.append("security.audit.destination is 'webhook' but events.webhooks is empty")
 
+        return problems
+
+    def _vector_store_problems(self) -> list[str]:
+        """Vector-store settings that cannot do what they say, and the egress one.
+
+        Three refusals, and the third is the one this method exists for.
+
+        **An endpoint the selected backend does not dial**, or does not have. ``lancedb`` lives
+        under the data directory and reads no URL; ``qdrant`` is nothing without one. Either
+        mismatch leaves a setting that appears to be in force and is not.
+
+        **A corpus that leaves the machine while the policy says it may not.** The chunk travels
+        with the vector (``docs/storage.md`` §6.2), so a vector store on another host is an
+        egress path for document *text*, not merely for embeddings — and it is one
+        :attr:`selected_endpoints` cannot see, because that records model endpoints and a
+        database is not one. Without this check a local-only data policy would report itself
+        satisfied while every ingest wrote the corpus to another machine, which is worse than
+        having no policy at all.
+
+        **A ``local_only`` source indexed into a remote store.** ``local_only`` is a floor that
+        no exemption releases (``docs/generation.md`` §7.5), and the argument it rests on is
+        that search never leaves this machine. A network-backed vector store falsifies exactly
+        that premise for every source, so the two are refused together rather than the floor
+        being quietly lowered for the sources that most depend on it.
+        """
+        storage = self.storage
+        problems: list[str] = []
+        url = (storage.vector_db_url or "").strip()
+
+        if storage.vector_db == "qdrant" and not url:
+            problems.append(
+                "storage.vector_db is 'qdrant' but storage.vector_db_url is empty. A "
+                "network-backed vector store has nowhere to be by default; set it to the "
+                "Qdrant HTTP endpoint, e.g. https://qdrant.internal:6333."
+            )
+        if storage.vector_db == "lancedb" and url:
+            problems.append(
+                f"storage.vector_db_url is {url!r} but storage.vector_db is 'lancedb', which "
+                f"lives in a directory under the data directory and dials nothing. That "
+                f"setting is not in force; remove it, or select a served vector store."
+            )
+        if storage.vector_db != "qdrant" or not url:
+            return problems
+
+        if endpoint_egress(url).leaves_machine:
+            policy = self.security.data_policy
+            if not policy.cloud_allowed:
+                problems.append(
+                    f"security.data_policy.cloud_allowed is false, but storage.vector_db_url "
+                    f"is {url!r}, which is not on this machine. The chunk's text is stored "
+                    f"beside its vector, so every ingest would write the corpus to another "
+                    f"host. Point it at loopback, choose the 'lancedb' vector store, or allow "
+                    f"cloud processing."
+                )
+            restricted = policy.source_restrictions.local_only
+            if restricted:
+                named = ", ".join(sorted(restricted))
+                problems.append(
+                    f"security.data_policy.source_restrictions.local_only names {named}, but "
+                    f"storage.vector_db_url is {url!r}, which is not on this machine. "
+                    f"local_only is a floor that rests on search staying local, and indexing "
+                    f"into a remote vector store sends those documents' text off this machine "
+                    f"before any question is asked. Use the 'lancedb' vector store for a "
+                    f"corpus with local-only sources, or stop restricting them."
+                )
         return problems
 
     def _redaction_problems(self) -> list[str]:

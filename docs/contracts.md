@@ -203,9 +203,10 @@ rather than merely threatening to.
 
 ## 4. Settled
 
-**Metadata store: SQLite plus LanceDB**, and therefore SQLite FTS5 for BM25. Sixteen
-relational tables belong in a relational store; a columnar vector store is the wrong tool
-for joins and transactional updates. See `PLAN.md` §2.
+**Metadata store: SQLite, plus a vector store** — LanceDB embedded, or Qdrant on a server
+(`storage.md` §6.7) — and therefore SQLite FTS5 for BM25 either way. Sixteen relational tables
+belong in a relational store; a vector store is the wrong tool for joins and transactional
+updates, whichever one is configured. See `PLAN.md` §2.
 
 **Vector dimensionality is a runtime parameter**, read from `Embedder.fingerprint` — never
 a constant. The vector table is created at first ingest, and ingest must refuse to start
@@ -251,8 +252,10 @@ Both remaining questions were retrieval questions, and
 The field list is fixed, and `workspace_ids` is **required, non-empty and set-valued**: it is
 a security boundary rather than a performance question, and a boundary you can forget to pass
 is not a boundary. The split that was waiting on data volumes is settled as a *rule* rather
-than a constant — fields with a promoted Lance column push down, fields needing a join resolve
-in SQLite into a document-id set first, and which of the two plans runs is decided per query by
+than a constant — fields with a promoted column push down on either backend (`document_ids`,
+`kinds`, `langs`; `storage.md` §6.7 is why the list is not wider on Qdrant even though its
+payload could filter on more), fields needing a join resolve in SQLite into a document-id set
+first, and which of the two plans runs is decided per query by
 a derived over-fetch factor and a configurable id-list threshold. Both inputs to that decision
 are recorded on every query, so the threshold gets set from measurement instead of argument.
 `workspace_ids` alone pushes down to neither store: it is enforced by the hydrating join inside

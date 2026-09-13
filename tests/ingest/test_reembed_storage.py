@@ -16,7 +16,7 @@ from sqlalchemy import delete, event, func, insert, select, update
 
 from manicule.core.content import Chunk
 from manicule.core.embedding import IndexFingerprints, Vector
-from manicule.core.errors import StorageBusyError
+from manicule.core.errors import StorageBusyError, VectorStoreStateError
 from manicule.ingest.reembed import (
     ChunkKey,
     CorpusSnapshot,
@@ -41,14 +41,13 @@ from manicule.storage.reembed import (
     SqliteReembedStore,
 )
 from manicule.storage.types import utcnow
+from manicule.storage.vector_schema import space_name
 from manicule.storage.vectors import (
     LanceVectorStore,
     PublishedLanceVectorStore,
     VectorStoreReprepareRequiredError,
-    VectorStoreStateError,
     generation_pin,
     quote,
-    table_name,
 )
 from tests.fakes import HashEmbedder
 from tests.storage_helpers import fingerprint, make_chunk, make_document
@@ -174,7 +173,7 @@ async def test_snapshots_runs_and_counts_are_workspace_scoped(  # noqa: PLR0915
                     {
                         "workspace_id": workspace,
                         "vector_namespace": "legacy",
-                        "vector_table": table_name(old),
+                        "vector_table": space_name(old),
                         "embed_fingerprint": old.model_dump_json(),
                         "created_at": utcnow(),
                         "updated_at": utcnow(),
@@ -341,7 +340,7 @@ async def seeded_run(
             insert(models.IndexState).values(
                 workspace_id="default",
                 vector_namespace="legacy",
-                vector_table=table_name(old_fingerprint),
+                vector_table=space_name(old_fingerprint),
                 embed_fingerprint=old_fingerprint.model_dump_json(),
                 vector_inventory_digest=None,
                 created_at=utcnow(),
@@ -437,7 +436,7 @@ async def test_failed_or_canceled_plan_removes_every_private_snapshot_row(
             insert(models.IndexState).values(
                 workspace_id="default",
                 vector_namespace="legacy",
-                vector_table=table_name(old),
+                vector_table=space_name(old),
                 embed_fingerprint=old.model_dump_json(),
                 vector_inventory_digest=None,
                 created_at=utcnow(),
@@ -476,7 +475,7 @@ async def test_start_cleans_its_self_created_snapshot_when_run_creation_does_not
             insert(models.IndexState).values(
                 workspace_id="default",
                 vector_namespace="legacy",
-                vector_table=table_name(old),
+                vector_table=space_name(old),
                 embed_fingerprint=old.model_dump_json(),
                 created_at=utcnow(),
                 updated_at=utcnow(),
@@ -1145,7 +1144,7 @@ async def test_inspection_recomputes_every_retrieval_and_source_identity_column(
     connection = await lancedb.connect_async(  # pyright: ignore[reportUnknownMemberType]
         str(shadows.directory(generation.id))
     )
-    table = await connection.open_table(table_name(HashEmbedder(dimension=4).fingerprint))
+    table = await connection.open_table(space_name(HashEmbedder(dimension=4).fingerprint))
     physical_id = source.vector_id
     await table.update(where=f"id = {quote(physical_id)}", updates={column: corrupt_value})
 
@@ -1248,7 +1247,7 @@ async def test_inspection_pages_are_stably_streamed_and_bounded(data_dir: Path) 
     connection = await lancedb.connect_async(  # pyright: ignore[reportUnknownMemberType]
         str(data_dir / "bounded-shadow")
     )
-    table = await connection.open_table(table_name(target))
+    table = await connection.open_table(space_name(target))
     await table.update(updates={"document_id": "duplicate", "position": 0, "chunk_id": "duplicate"})
     duplicate_pages = [page async for page in shadow.inspection_pages(page_size=256)]
     assert [len(page) for page in duplicate_pages] == [256, 256, 1]
@@ -1277,7 +1276,7 @@ async def test_inspection_does_not_skip_more_than_a_page_of_duplicate_logical_ke
     connection = await lancedb.connect_async(  # pyright: ignore[reportUnknownMemberType]
         str(shadows.directory(generation.id))
     )
-    table = await connection.open_table(table_name(HashEmbedder(dimension=4).fingerprint))
+    table = await connection.open_table(space_name(HashEmbedder(dimension=4).fingerprint))
     await table.update(
         updates={
             "id": "duplicate-physical",

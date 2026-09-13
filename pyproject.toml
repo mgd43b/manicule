@@ -47,6 +47,18 @@ storage = [        # #2
   "lancedb>=0.17",
   "pyarrow>=18.0",
 ]
+qdrant = [
+  # The network-backed vector store, and the only part of manicule that reaches a database
+  # over a socket. Separate from `storage` rather than inside it because the two are
+  # alternatives: an installation picks one with `storage.vector_db`, and the embedded
+  # default should not pay for grpcio and protobuf to reach a server it never dials.
+  #
+  # Apache-2.0, so it belongs in this distribution rather than in a package of its own —
+  # the split that `mlx-embeddings` forced is a licensing consequence, not a house pattern.
+  # The floor is 1.15: `query_points` replaced `search` there, and this store is written
+  # against the replacement rather than against an API already deprecated when it arrived.
+  "qdrant-client>=1.15",
+]
 embeddings = [     # #3
   # Pooling happens in our own numpy, from token states the backend hands back, because a
   # backend's convenience output is not reliably the model's own pooling. docs/embeddings.md §4.
@@ -205,7 +217,7 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #1
 # the documented install does not have, which is the kind of drift nobody notices until an
 # operator reports a command missing from one of them.
 all = [
-  "manicule[storage,embeddings,ingest,parsers,retrieval,generation,connectors,serve]",
+  "manicule[storage,qdrant,embeddings,ingest,parsers,retrieval,generation,connectors,serve]",
 ]
 
 # The built-in parsers and the chunker register the same way a third-party plugin does, through
@@ -313,6 +325,13 @@ dev = [
   # configuration, so its integration suites need the real SQLite store and the real vector
   # store behind the container rather than fakes of both.
   "manicule[storage]",
+  # The other vector store. Here rather than left to the dedicated CI job because
+  # `tests/test_storage_qdrant.py` imports `qdrant_client` at module scope, and a test module
+  # that cannot be *collected* fails the run rather than skipping it — so without this the
+  # gate CONTRIBUTING documents, `uv sync --all-groups && uv run pytest`, would not run at all
+  # on a fresh checkout. The suite needs no server: qdrant-client ships an in-process mode, and
+  # the four tests that do need one skip without `QDRANT_TEST_URL`.
+  "manicule[qdrant]",
   # Directory watching, for `manicule index --watch`.
   "manicule[ingest]",
   # What Starlette's test client is written against. It imports `httpx2` under TYPE_CHECKING

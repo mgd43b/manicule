@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 import lancedb
 
-from manicule.storage.vectors import CHUNK_ID_COLUMN, ID_COLUMN, table_name
+from manicule.storage.vector_schema import CHUNK_ID_COLUMN, ID_COLUMN, space_name
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -46,7 +46,7 @@ async def rewrite_row(
     replacing the whole row is the only way to change it from outside the store.
     """
     connection = await lancedb.connect_async(directory)
-    table = await connection.open_table(table_name(embed))
+    table = await connection.open_table(space_name(embed))
     found: list[dict[str, Any]] = await table.query().to_list()
     rows = [row for row in found if str(row[CHUNK_ID_COLUMN]) == chunk_id]
     assert rows, f"no row for {chunk_id!r} to rewrite"
@@ -64,7 +64,7 @@ async def read_column(directory: Path, embed: EmbedFingerprint, chunk_id: str, c
     and a caller reading one already knows which.
     """
     connection = await lancedb.connect_async(directory)
-    table = await connection.open_table(table_name(embed))
+    table = await connection.open_table(space_name(embed))
     found: list[dict[str, Any]] = await table.query().to_list()
     rows = [row for row in found if str(row[CHUNK_ID_COLUMN]) == chunk_id]
     connection.close()
@@ -75,7 +75,7 @@ async def read_column(directory: Path, embed: EmbedFingerprint, chunk_id: str, c
 async def rows_of(directory: Path, embed: EmbedFingerprint, predicate: str) -> list[dict[str, Any]]:
     """Every physical row matching ``predicate``, as plain dictionaries."""
     connection = await lancedb.connect_async(directory)
-    table = await connection.open_table(table_name(embed))
+    table = await connection.open_table(space_name(embed))
     found: list[dict[str, Any]] = await table.query().where(predicate).to_list()
     connection.close()
     return found

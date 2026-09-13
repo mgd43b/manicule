@@ -57,12 +57,8 @@ from manicule.storage import models
 from manicule.storage.engine import sqlite_busy
 from manicule.storage.rows import to_chunk, to_document
 from manicule.storage.types import utcnow
-from manicule.storage.vectors import (
-    CHECKSUM_COLUMN,
-    CHECKSUM_VERSION_COLUMN,
-    LanceVectorStore,
-    generation_pin,
-)
+from manicule.storage.vector_schema import CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN
+from manicule.storage.vectors import LanceVectorStore, generation_pin
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine

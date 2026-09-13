@@ -269,7 +269,7 @@ jobs:
     # `latest` and a deployment tracking it rolls back. Neither is fixable inside one run, because
     # a registry push is not a compare-and-swap.
     #
-    # `cancel-in-progress: false` — the default, but stated, because cancelling is the wrong answer
+    # `cancel-in-progress: false` — the default, but stated, because canceling is the wrong answer
     # here. The queued run is a *different release* that also has to publish; it waits rather than
     # being dropped.
     concurrency:

@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING
 
 from manicule.core.embedding import IndexFingerprints
 from manicule.core.errors import FingerprintMismatchError, PolicyError
+from manicule.storage.vector_schema import space_name
 
 if TYPE_CHECKING:
     from manicule.core.embedding import EmbedFingerprint
@@ -115,7 +116,8 @@ def _vector_table(embed: EmbedFingerprint, vectors: VectorStore | None) -> str |
 
     A publication-aware store reports the SQLite pointer it just resolved, because after a
     shadow swap that pointer names a generation directory rather than the inner Lance table.
-    A plain store is derived through the same ``table_name(fingerprint)`` function it uses.
+    A plain store is derived through the same :func:`~manicule.storage.vector_schema.space_name`
+    function it uses.
 
     Returns:
         The table name, or ``None`` when there is no vector store — because then there is no
@@ -129,9 +131,7 @@ def _vector_table(embed: EmbedFingerprint, vectors: VectorStore | None) -> str |
     publication_pointer = getattr(vectors, "publication_pointer", None)
     if isinstance(publication_pointer, str):
         return publication_pointer
-    from manicule.storage.vectors import table_name  # noqa: PLC0415 - a storage extra
-
-    return table_name(embed)
+    return space_name(embed)
 
 
 def require_measured(chunk: ChunkFingerprint) -> None:

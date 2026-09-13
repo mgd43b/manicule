@@ -30,7 +30,7 @@ OpenDocuments got it right. Where it does not, the reason is stated.
 |---|---|
 | Language / tooling | Python 3.14+ · uv · ruff · pyright strict · pytest |
 | Config & models | Pydantic v2 · pydantic-settings |
-| Vectors | LanceDB |
+| Vectors | LanceDB (default; `qdrant` optional — 2026-09-13 addendum, §2) |
 | Metadata | SQLite · SQLAlchemy 2.0 async · Alembic |
 | Lexical search | SQLite FTS5 |
 | Embeddings | **BGE-M3** on **MLX**, in-process · **onnxruntime** for parity and portability |
@@ -66,7 +66,7 @@ Sixteen tables carry over unchanged in shape: `documents` `chunk_relations` `col
 
 | | OpenDocuments | manicule | |
 |---|---|---|---|
-| Vectors | LanceDB | **LanceDB** | Already correct. Embedded, no server, ACID, versioned |
+| Vectors | LanceDB | **LanceDB** | Already correct. Embedded, no server, ACID, versioned. `qdrant` is now a second option — 2026-09-13 addendum below |
 | Metadata | SQLite (better-sqlite3) | **SQLite** via SQLAlchemy 2.0 async | |
 | Migrations | hand-rolled runner over 8 `.sql` files | **Alembic** | **Gain.** Autogenerate, downgrade, branching |
 | Lexical | SQLite FTS5 | **SQLite FTS5** | |
@@ -80,6 +80,31 @@ LanceDB's Tantivy index is newer and has had incremental-indexing limitations. A
 what the working reference implementation does.
 
 This closes the BM25 question with it — the two were one decision.
+
+### 2026-09-13 addendum — a second vector store
+
+The decision above picked LanceDB because the corpus needed no server. That premise does not
+hold for every deployment: several manicule processes sharing one index, or a container with no
+persistent volume, needs the index on a machine this process does not own. `storage.vector_db`
+is now `Literal["lancedb", "qdrant"]`; `lancedb` stays the default, for the reason above — it
+is still the configuration that works with nothing else running. `qdrant` trades that for a
+network dependency, a backup procedure that is no longer a directory copy, and — because the
+chunk travels with the vector (`docs/storage.md` §6.2) — a corpus that leaves this machine,
+which `Settings.policy_problems()` now treats as an egress path for document text rather than as
+an implementation detail: it refuses `vector_db=qdrant` at a non-loopback `storage.vector_db_url`
+when `security.data_policy.cloud_allowed` is false, and again whenever any `local_only` source
+is configured, regardless of `cloud_allowed`.
+
+Reached at `storage.vector_db_url` (required for `qdrant`, refused for `lancedb`, where it would
+read as a setting in force and is not) and configured under `storage.qdrant` (API key, transport,
+timeout, collection prefix). Implemented in `src/manicule/storage/qdrant.py`, sharing field
+names, the filter rules and the integrity verdict with the LanceDB store through
+`src/manicule/storage/vector_schema.py` so the two cannot drift into answering one question two
+ways. Filter push-down (`document_ids`, `kinds`, `langs`) is deliberately identical on both —
+not widened for Qdrant even though its engine could filter on more, so the same query returns
+the same rows regardless of which store an installation configured. Qdrant builds and maintains
+its own HNSW index, so `storage.ann_index_threshold` and the IVF-PQ build it schedules stay
+LanceDB-only; durable re-embedding (shadow generations) was already LanceDB-only and remains so.
 
 ## 3. Plugin system
 
@@ -262,7 +287,7 @@ fitting, three profiles (fast / balanced / precise). **Carries over.**
 
 | | Choice |
 |---|---|
-| Dense | LanceDB vector search |
+| Dense | LanceDB vector search (or Qdrant — 2026-09-13 addendum, §2) |
 | Lexical | SQLite FTS5 (BM25) |
 | Fusion | RRF |
 | Rerank | sentence-transformers CrossEncoder |
@@ -409,7 +434,7 @@ Issue numbers match these steps exactly — step 4 is [#4](https://github.com/mg
 | | Ticket | Phase | |
 |---|---|---|---|
 | 1 | [Protocols, container & config](https://github.com/mgd43b/manicule/issues/1) | Core | Everything plugs in here |
-| 2 | [Storage & data model](https://github.com/mgd43b/manicule/issues/2) | Core | 16 tables, Alembic, LanceDB |
+| 2 | [Storage & data model](https://github.com/mgd43b/manicule/issues/2) | Core | 16 tables, Alembic, LanceDB; `qdrant` added as a second vector store, 2026-09-13 |
 | 3 | [Embeddings](https://github.com/mgd43b/manicule/issues/3) | Core | ⚠️ fixes vector dimensionality |
 | 4 | [Parsers & chunking](https://github.com/mgd43b/manicule/issues/4) | Core | ⚠️ fixes chunk size. The largest upgrade |
 | 5 | [Ingest pipeline](https://github.com/mgd43b/manicule/issues/5) | Core | |

@@ -20,6 +20,7 @@ import pytest
 IMPLEMENTATION_MODULES = (
     # storage (#2)
     "lancedb",
+    "qdrant_client",
     "sqlalchemy",
     "alembic",
     "aiosqlite",
@@ -313,12 +314,24 @@ torch. Neither has any business being loaded by discovery, which runs in every p
 starts — including one whose profile is ``fast`` and will never construct a reranker at all.
 """
 
-STORAGE_LIBRARIES = ("sqlalchemy", "alembic", "aiosqlite", "lancedb", "pyarrow")
+STORAGE_LIBRARIES = (
+    "sqlalchemy",
+    "alembic",
+    "aiosqlite",
+    "lancedb",
+    "pyarrow",
+    "qdrant_client",
+)
 """What the built-in stores are built on, and none of them cheap.
 
-Alembic drags in Mako, LanceDB drags in PyArrow, and every process that starts runs discovery
-— including one that is printing a completion script. What registration needs eagerly is a
-configuration model, and that lives in ``manicule.storage.config``.
+Alembic drags in Mako, LanceDB drags in PyArrow, ``qdrant-client`` drags in grpcio and
+protobuf, and every process that starts runs discovery — including one that is printing a
+completion script. What registration needs eagerly is a configuration model, and that lives in
+``manicule.storage.config``.
+
+The two vector stores are alternatives, which makes this stricter than a cost argument: an
+installation that configures one must not load the other, and discovery loading either would
+mean every installation pays for both.
 """
 
 GENERATION_LIBRARIES = ("litellm", "openai", "anthropic", "httpx", "tiktoken")
@@ -425,6 +438,7 @@ def test_the_installed_distribution_declares_no_implementation_dependency() -> N
     }
     forbidden = {
         "lancedb",
+        "qdrant-client",
         "sqlalchemy",
         "litellm",
         "fastapi",
