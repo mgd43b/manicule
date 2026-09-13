@@ -520,8 +520,16 @@ it is resolved from the other end when the target is published. Targets match af
 normalization, because `[[a-b]]` and `[[a_b]]` are one target.
 
 The extractor carries a fingerprint of its own, recorded per document, so correcting one of its
-rules makes the corpus visibly stale and the existing documents are selected by the repair that
-already exists. There is no backfill command: on first enable, that selection is everything.
+rules makes the corpus visibly stale. Bringing it up to date is the repair rung the glossary
+already has:
+
+```bash
+manicule document reindex --stale-relations   # --dry-run first, to see the selection
+```
+
+It reads stored chunks and writes rows — no parser, no connector, no embedder — and on the run
+that first configures an extractor it selects **everything**, because until then no document has
+been scanned by one.
 
 ## Running it as a server
 

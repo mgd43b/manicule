@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, override
 import pytest
 
 from manicule.core.content import DocumentStatus
-from manicule.core.errors import MiddlewareViolationError
+from manicule.core.errors import MiddlewareViolationError, PolicyError
 from manicule.core.fingerprints import (
     EXTRACTION_DISABLED,
     RelationFingerprint,
@@ -254,3 +254,134 @@ async def test_a_document_whose_parse_failed_records_no_extractor() -> None:
     assert document.status is DocumentStatus.FAILED
     assert extractor.seen == [document.id], "the hooks still saw it"
     assert store.relation_lineage_by_id.get(document.id) is None
+
+
+# --- the repair that reaches an existing corpus ------------------------------------------------
+
+
+class Recording(Extractor):
+    """An extractor that records which documents it was asked to scan, and can be made to fail."""
+
+    def __init__(self, *, fails: frozenset[str] = frozenset()) -> None:
+        super().__init__()
+        self._fails = fails
+
+    @override
+    async def after_store(self, document: Document) -> None:
+        self.seen.append(document.id)
+        if document.id in self._fails:
+            msg = "the extractor could not read this document"
+            raise RuntimeError(msg)
+
+
+async def _corpus(documents: dict[str, str]) -> fakes.MemoryIngestStore:
+    """A store holding documents ingested with **no** extractor configured.
+
+    Which is the state every corpus is in the day one is installed: chunks stored, and
+    ``relation_fp`` recording the disabled fingerprint rather than the installed one.
+    """
+    store = fakes.MemoryIngestStore()
+    pipeline, _, _ = build(store=store, middleware=[])
+    await pipeline.run(fakes.DictConnector(documents))
+    return store
+
+
+async def test_the_sweep_selects_every_document_the_configured_chain_did_not_scan() -> None:
+    """Installing an extractor reaches nothing already stored. This is what reaches it.
+
+    Extraction runs at ingest, a re-sync of unchanged bytes skips before it, and no other
+    fingerprint moves when an extraction rule does — so without this verb the graph stays empty
+    until every document happens to change, which for a corpus of settled facts is never.
+    """
+    store = await _corpus({"one": PROSE, "two": PROSE})
+    extractor = Recording()
+    middleware = MiddlewareRunner([extractor])
+
+    sweep = await reindex.rescan_stale_relations(
+        store=store, middleware=middleware, fingerprint=middleware.relation_lineage()
+    )
+
+    assert (sweep.selected, sweep.rescanned, sweep.failed) == (2, 2, 0)
+    assert len(extractor.seen) == 2, "the chain was run over each of them"
+
+
+async def test_a_second_run_selects_nothing() -> None:
+    """The loop terminates, and a repaired document records the fingerprint that found it.
+
+    Including a document that produced no edges at all, which is the case a design recording
+    lineage only where there are rows to hang it on would sweep for ever.
+    """
+    store = await _corpus({"one": PROSE})
+    middleware = MiddlewareRunner([Recording()])
+    fingerprint = middleware.relation_lineage()
+    await reindex.rescan_stale_relations(
+        store=store, middleware=middleware, fingerprint=fingerprint
+    )
+
+    again = await reindex.rescan_stale_relations(
+        store=store, middleware=middleware, fingerprint=fingerprint
+    )
+
+    assert (again.selected, again.rescanned) == (0, 0)
+
+
+async def test_a_document_the_extractor_failed_on_keeps_its_lineage_and_the_sweep_continues() -> (
+    None
+):
+    """One document tripping a rule is not a reason to leave a corpus on superseded ones.
+
+    And the failure must not advance that document's lineage, or the repair it needs would never
+    select it again. The cursor still moves past it, which is what makes the loop terminate on a
+    corpus where nothing can be repaired at all.
+    """
+    store = await _corpus({"one": PROSE, "two": PROSE})
+    broken = await store.find_document("memory", "one")
+    assert broken is not None
+    middleware = MiddlewareRunner([Recording(fails=frozenset({broken.id}))])
+
+    sweep = await reindex.rescan_stale_relations(
+        store=store, middleware=middleware, fingerprint=middleware.relation_lineage()
+    )
+
+    assert (sweep.selected, sweep.rescanned, sweep.failed) == (2, 1, 1)
+    assert broken.id in sweep.failures[0]
+    assert store.relation_lineage_by_id.get(broken.id) != middleware.relation_lineage().canonical()
+
+
+async def test_a_plan_writes_nothing_and_runs_no_extractor() -> None:
+    """A dry run needs no chain and must not touch one — it answers a question about rows."""
+    store = await _corpus({"one": PROSE})
+    extractor = Recording()
+    middleware = MiddlewareRunner([extractor])
+
+    before = dict(store.relation_lineage_by_id)
+
+    sweep = await reindex.plan_stale_relations(
+        store=store, fingerprint=middleware.relation_lineage()
+    )
+
+    assert (sweep.dry_run, sweep.selected, sweep.rescanned) == (True, 1, 0)
+    assert extractor.seen == [], "a plan scanned a document"
+    # Unchanged rather than empty: ingesting with no extractor correctly records the *disabled*
+    # fingerprint, which is what makes configuring one select the whole corpus. What a plan must
+    # not do is move it.
+    assert store.relation_lineage_by_id == before, "a plan wrote lineage"
+
+
+async def test_a_repair_with_no_extractor_configured_is_refused() -> None:
+    """Under no extractor the installed fingerprint *is* the disabled one.
+
+    So the selection would be every document some extractor did derive edges for — on a working
+    corpus, all of them — reported as work this command would not do. Worse, proceeding would
+    stamp each of them as scanned by an extractor that does not exist, taking them out of the
+    repair they need the day one is configured.
+    """
+    store = await _corpus({"one": PROSE})
+    empty = MiddlewareRunner([])
+
+    with pytest.raises(PolicyError, match="no configured middleware"):
+        await reindex.rescan_stale_relations(
+            store=store, middleware=empty, fingerprint=empty.relation_lineage()
+        )
+    with pytest.raises(PolicyError, match="no configured middleware"):
+        await reindex.plan_stale_relations(store=store, fingerprint=empty.relation_lineage())

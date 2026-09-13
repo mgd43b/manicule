@@ -1340,6 +1340,45 @@ class StaleReparseReport(Payload):
     """One line per superseded document: which it is and what overtook it. No document text."""
 
 
+class StaleRelationReport(Payload):
+    """What a corpus-wide chunk-relation rescan did.
+
+    The third of the repair reports, and the shortest, because the stage it describes has the
+    fewest ways to be interesting: an extractor either read a document or it did not. There are
+    no entry counts as there are for the glossary and no chunk counts as there are for a
+    re-parse — an edge belongs to two documents, so counting edges would make one that gained
+    three and lost two look busier than one that gained a single link.
+
+    **No field carries document text or a link target.** Every string here is a document id, a
+    URI or an error, on :class:`StaleGlossaryReport`'s rule: the subject of this operation is
+    what the corpus says about itself, and a report naming the slugs it resolved would print the
+    shape of the index to a terminal and to whatever a shell pipeline points at.
+    """
+
+    dry_run: bool = False
+    """Whether this was a plan. A dry run reports ``selected`` and writes nothing at all."""
+
+    selected: int = Field(default=0, ge=0)
+    """Documents whose recorded relation lineage is not what the configured chain produces.
+
+    Includes every document with no recorded lineage, which the first time an extractor is
+    configured is the whole corpus — that is the point of the column rather than a surprise.
+    """
+
+    rescanned: int = Field(default=0, ge=0)
+    """Documents whose edges were rebuilt from stored chunks. Zero on a dry run."""
+
+    failed: int = Field(default=0, ge=0)
+    failures: tuple[str, ...] = ()
+    """One line per document the chain could not scan. Its lineage is untouched, so it is
+    selected again next time."""
+
+    unrepairable: int = Field(default=0, ge=0)
+    unrepairable_documents: tuple[str, ...] = ()
+    """Documents with no stored chunks to scan. A count of its own rather than more failures,
+    because the remedy is a rung up — a re-parse — rather than a fix to an extractor."""
+
+
 class StaleGlossaryReport(Payload):
     """What a corpus-wide glossary recompute did.
 
@@ -2737,6 +2776,7 @@ __all__ = [
     # imports the module rather than its star. Adding one name beside it and leaving the gap
     # would make the omission look deliberate.
     "StaleGlossaryReport",
+    "StaleRelationReport",
     "StaleReparseReport",
     "Stats",
     "TagDeleted",

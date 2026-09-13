@@ -50,16 +50,13 @@ declared link and a mention — live in `links.py`, and this package digests tha
 extractor's identity. manicule records that identity per document, so correcting a rule makes
 every already-scanned document visibly stale and the repair selector finds them:
 
-```python
-from manicule.ingest import reindex
-from manicule.ingest.middleware import MiddlewareRunner
-
-installed = MiddlewareRunner(configured).relation_lineage()
-stale = await reindex.select(store, relation_fingerprint=installed)
+```bash
+manicule document reindex --stale-relations   # --dry-run first, to see the selection
 ```
 
-There is no backfill command, deliberately. On the run that first enables this plugin every
-document records `NULL`, so that selection is the whole corpus — which is exactly what a first
+That is the same rung `--stale-glossary` occupies: it reads stored chunks and writes rows, with
+no parser, no connector and no embedder in it. On the run that first enables this plugin every
+document records `NULL`, so the selection is the whole corpus — which is exactly what a first
 enable should select.
 
 A document that contains no links records the fingerprint with **no edges**, which is a

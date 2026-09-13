@@ -326,14 +326,15 @@ So `RelationFingerprint` is modeled on `GlossaryFingerprint`, including `middlew
 hook may move in `after_parse`, carrying no declaration at all. It is recorded in
 `documents.relation_fp` and backfill is the repair selector that already exists:
 
-```python
-# what the configured middleware chain would produce now
-installed = MiddlewareRunner(configured).relation_lineage()
-stale = await reindex.select(store, relation_fingerprint=installed)
+```bash
+manicule document reindex --stale-relations [--dry-run] [--batch N]
 ```
 
-`IngestPipeline.relation_lineage` is the canonical string of the same value, which is what a
-running pipeline stamps — so the two can be compared without building a second chain.
+`reindex.rescan_stale_relations` is the verb behind it, and it keeps the glossary sweep's cost
+boundary exactly: it builds no pipeline, so there is no chunker, no embedder, no vector store and
+no blob store in it — the middleware chain and the document store are all it needs. On first
+enable the selection is the entire corpus, because every row records `NULL` until something has
+scanned it.
 
 On first enable that selection is the entire corpus, because every row records `NULL` until
 something has scanned it.

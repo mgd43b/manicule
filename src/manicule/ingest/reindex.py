@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     )
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Embedder, VectorStore
+    from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline
     from manicule.ingest.ports import GlossaryStore, IngestStore
 
@@ -187,8 +188,8 @@ async def select(
     what the configured chain would produce now —
     :meth:`~manicule.ingest.middleware.MiddlewareRunner.relation_lineage` — and the selection is
     everything that disagrees, which on the first enable is every document, because each records
-    ``NULL`` until something has scanned it. There is no backfill command: this is the selector,
-    and :func:`re_parse` is the repair.
+    ``NULL`` until something has scanned it. :func:`rescan_stale_relations` is the verb that runs
+    over that selection, reached from ``manicule document reindex --stale-relations``.
 
     **The predicates are ANDed.** Two fingerprints together select what is stale in both stages
     rather than in either, which is almost never what a repair wants — one repair, one stage,
@@ -1181,6 +1182,181 @@ async def redetect_stale_glossary(
                 sweep.unchanged += 1
 
 
+@dataclass
+class RelationSweep:
+    """What one relation-only repair pass did, in counts an operator can act on.
+
+    Separate from :class:`GlossarySweep` for the reason that one is separate from
+    :class:`StaleSweep`: the two share no interesting number. A glossary pass reports entries,
+    because its subject is a vocabulary. This reports **documents**, because an edge belongs to
+    two of them and counting edges would make a document that gained three and lost two look
+    busier than one that gained one.
+    """
+
+    dry_run: bool = False
+    selected: int = 0
+    """Documents whose recorded relation lineage is not what the configured chain produces."""
+
+    rescanned: int = 0
+    """Documents whose edges were rebuilt. Zero on a dry run, by construction."""
+
+    failed: int = 0
+    failures: list[str] = field(default_factory=list[str])
+    """One line per document the chain could not scan, naming it and the error.
+
+    A failure leaves that document's lineage exactly as it was, so it is still selected next
+    time. The sweep continues: one document tripping a rule is not a reason to leave the rest of
+    a corpus on superseded ones.
+    """
+
+    unrepairable: int = 0
+    unrepairable_documents: list[str] = field(default_factory=list[str])
+    """Documents whose edges cannot be derived because their chunks are gone.
+
+    A count of its own rather than more failures, on :attr:`GlossarySweep.unrepairable`'s
+    reasoning: a failure is a bug in an extractor and clears when it is fixed, while this is a
+    document whose *inputs* are missing and the remedy is a rung further up — a re-parse from
+    retained bytes.
+    """
+
+
+NO_EXTRACTOR = (
+    "no configured middleware derives chunk relations, so there is no extractor for the corpus "
+    "to be brought up to date with. Recomputing would write nothing and then stamp every "
+    "document as scanned by an extractor that does not exist, which would take them out of the "
+    "repair they need the day one is configured. Configure a relation middleware — "
+    '`plugins.middleware = ["wikilinks"]` installs the one this project ships — and run this '
+    "again."
+)
+"""Why relation repair refuses rather than proceeding when nothing extracts.
+
+The plan refuses too, and for the sharper half of the reason: under no extractor the installed
+fingerprint *is* the disabled one, so the selection would be "every document some extractor did
+derive edges for" — on a working corpus, all of them — reported as work this command would not
+do.
+"""
+
+
+async def plan_stale_relations(
+    *,
+    store: IngestStore,
+    fingerprint: RelationFingerprint,
+    batch: int = DEFAULT_SWEEP_BATCH,
+) -> RelationSweep:
+    """What :func:`rescan_stale_relations` would do. The selection, and nothing else.
+
+    A function rather than a flag, on :func:`plan_stale`'s reasoning: a dry run needs no
+    middleware chain and no store writes, and taking them as arguments it would not use is how a
+    plan ends up constructing the thing it exists to describe.
+
+    Raises:
+        PolicyError: Nothing configured extracts relations. See :data:`NO_EXTRACTOR`.
+    """
+    _require_extraction(fingerprint)
+    sweep = RelationSweep(dry_run=True)
+    while True:
+        # The offset is the count, exactly: a plan repairs nothing, so every document it has
+        # seen is still in the selection and still in front of the next page.
+        page = await select(
+            store, relation_fingerprint=fingerprint, limit=batch, offset=sweep.selected
+        )
+        if not page:
+            return sweep
+        sweep.selected += len(page)
+
+
+async def rescan_stale_relations(
+    *,
+    store: IngestStore,
+    middleware: MiddlewareRunner,
+    fingerprint: RelationFingerprint,
+    batch: int = DEFAULT_SWEEP_BATCH,
+) -> RelationSweep:
+    """Bring every document's chunk relations up to the configured extractor. Corpus-wide.
+
+    **This is the backfill**, and it is the reason `relation_fp` is a column rather than a
+    property of the edges. Extraction runs at ingest; a re-sync of unchanged bytes skips before
+    it; and no other fingerprint moves when an extraction rule does. So installing the middleware
+    reaches nothing already stored, and correcting one of its rules reaches nothing at all, until
+    this runs. On the first enable the selection is the whole corpus, because every document
+    records ``NULL`` until something has scanned it.
+
+    **It builds no pipeline**, which is the cost boundary :func:`redetect_stale_glossary` keeps
+    for the same reason: the hooks read stored chunks and write rows, so there is no parser, no
+    embedder, no vector store and no blob store in it. What it needs is the middleware chain and
+    the document store.
+
+    **Paged, with the cursor counting what the pass left behind**, exactly as the two sweeps
+    above. A rescanned document records the installed fingerprint and leaves the selection; one
+    that failed keeps its lineage and stays in it, so the cursor has to move past it or the loop
+    reads the same page for ever.
+
+    Args:
+        store: Where the selection is queried, chunks are read and lineage is written.
+        middleware: The configured chain, whose ``after_store`` hooks write the edges.
+        fingerprint: What that chain produces now.
+        batch: Documents per page.
+
+    Raises:
+        PolicyError: Nothing configured extracts relations. See :data:`NO_EXTRACTOR`.
+    """
+    _require_extraction(fingerprint)
+    sweep = RelationSweep()
+    left_behind = 0
+    while True:
+        page = await select(
+            store, relation_fingerprint=fingerprint, limit=batch, offset=left_behind
+        )
+        if not page:
+            return sweep
+        for document in page:
+            sweep.selected += 1
+            if not await store.document_chunks(document.id):
+                # No chunks is not a scan that found nothing: there is nothing to scan. Stamping
+                # it would take the document out of this selection for ever while its edges stay
+                # underivable, so it keeps its lineage and is reported for the rung above.
+                left_behind += 1
+                sweep.unrepairable += 1
+                sweep.unrepairable_documents.append(
+                    f"{document.id} ({document.uri}): {NO_CHUNKS_TO_SCAN}"
+                )
+                continue
+            try:
+                await middleware.after_store(document)
+            except Exception as exc:  # noqa: BLE001 - one document's extractor is not the run's
+                left_behind += 1
+                sweep.failed += 1
+                sweep.failures.append(f"{document.id}: {type(exc).__name__}: {exc}")
+                continue
+            await store.set_lineage(
+                document.id, chunk_fp=None, embed_fp=None, relation_fp=fingerprint.canonical()
+            )
+            sweep.rescanned += 1
+
+
+NO_CHUNKS_TO_SCAN = (
+    "no stored chunks, so there is no text to find links in. An edge also names a chunk, so "
+    "there would be nothing for one to point at even if a link were found. Repair the chunks "
+    "first with `document reindex <id>`, which reads the retained bytes, and run this again"
+)
+"""Why a selected document cannot have its relations derived, worded once.
+
+Its own constant rather than :data:`NO_STORED_CHUNKS`, which says the same thing about the
+glossary: the sentence has to name what *this* repair cannot do, and a shared message that said
+"glossary" during a relation sweep would send somebody to the wrong rung.
+"""
+
+
+def _require_extraction(fingerprint: RelationFingerprint) -> None:
+    """Refuse a repair against a chain that derives no relations.
+
+    Raises:
+        PolicyError: The fingerprint describes no extractor.
+    """
+    if not fingerprint.extracts:
+        raise PolicyError(NO_EXTRACTOR)
+
+
 def _require_detection(fingerprint: GlossaryFingerprint) -> None:
     if fingerprint.detects:
         return
@@ -1190,6 +1366,7 @@ def _require_detection(fingerprint: GlossaryFingerprint) -> None:
 __all__ = [
     "DEFAULT_SWEEP_BATCH",
     "DETECTION_IS_OFF",
+    "NO_CHUNKS_TO_SCAN",
     "NO_RETAINED_BYTES",
     "NO_STORED_CHUNKS",
     "GlossaryOutcome",
@@ -1198,6 +1375,7 @@ __all__ = [
     "StaleSweep",
     "plan_stale",
     "plan_stale_glossary",
+    "plan_stale_relations",
     "re_embed",
     "re_parse",
     "re_parse_stale",
@@ -1205,5 +1383,6 @@ __all__ = [
     "redetect_stale_glossary",
     "reindex_document",
     "repair",
+    "rescan_stale_relations",
     "select",
 ]

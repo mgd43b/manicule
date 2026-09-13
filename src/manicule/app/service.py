@@ -48,6 +48,7 @@ from manicule.config.loader import load_settings
 from manicule.config.profiles import profile_config
 from manicule.config.settings import (
     AuthMode,
+    AuthoringSettings,
     BrowserProvider,
     ConnectorSettings,
     Role,
@@ -718,6 +719,20 @@ class ApplicationService:
 
     def __init__(self, backend: Backend) -> None:
         self._backend = backend
+        self._authoring = asyncio.Lock()
+        """Serializes :meth:`document_create` within this process.
+
+        Authoring is three steps that must not interleave — decide whether the slug is taken,
+        write the file, index the path — and two concurrent calls for one new slug could
+        otherwise both find it free, both write, and each report a document whose stored body is
+        the other's. One lock rather than one per slug because there is nothing to evict and
+        nothing to reason about: authoring is a single small file and one ingest, never a bulk
+        path, and every writer is already queued behind the data directory's own lock.
+
+        It is not the whole guarantee, and is not meant to be. A second *process* is fenced by
+        the exclusive create in :func:`_write_authored`, which is what makes the default refusal
+        atomic rather than merely checked.
+        """
 
     @property
     def backend(self) -> Backend:
@@ -2245,7 +2260,35 @@ class ApplicationService:
             )
             raise UnknownEntityError(msg)
 
+        async with self._authoring:
+            return await self._author(
+                authoring,
+                collection=collection,
+                slug=slug,
+                content=content,
+                found=found,
+                overwrite=overwrite,
+                started=started,
+            )
+
+    async def _author(
+        self,
+        authoring: AuthoringSettings,
+        *,
+        collection: str,
+        slug: str,
+        content: str,
+        found: Collection,
+        overwrite: bool,
+        started: float,
+    ) -> r.DocumentCreated:
+        """The part of :meth:`document_create` that must not interleave with another call.
+
+        Split out so the lock wraps exactly the check-write-index sequence and nothing else: the
+        validation above it refuses bad arguments without waiting behind somebody else's embed.
+        """
         connector = await self._filesystem_source(authoring.source, require_profiles=False)
+        _require_within_ceiling(content, connector, authoring.source)
         # Through a thread because resolution is a syscall per segment, and **resolved** because
         # the identity below has to be the one ingestion will record: `index_path` resolves the
         # path it is given, so a target that differed by a symlinked segment would be written
@@ -2258,7 +2301,18 @@ class ApplicationService:
         if conflict is not None and not overwrite:
             raise PolicyError(conflict)
 
-        await asyncio.to_thread(_write_authored, target, content)
+        try:
+            await asyncio.to_thread(_write_authored, target, content, replace=overwrite)
+        except FileExistsError as exc:
+            # The exclusive create lost a race this process could not see: another process wrote
+            # the slug between the conflict check and here. Reported as the same refusal the
+            # check would have given, because it is the same fact arriving a moment later.
+            msg = (
+                f"{target} was created by something else while this write was being prepared. "
+                f"Read it and write the revised fact back with overwrite, rather than replacing "
+                f"content that arrived after the check."
+            )
+            raise PolicyError(msg) from exc
 
         report = await self.index_path(target, source=authoring.source)
         documents = await self._backend.documents()
@@ -2480,6 +2534,42 @@ class ApplicationService:
             failures=tuple(sweep.failures),
             superseded=sweep.superseded,
             superseded_documents=tuple(sweep.superseded_documents),
+        )
+
+    async def document_rescan_relations(
+        self, *, batch: int = DEFAULT_SWEEP_BATCH, dry_run: bool = False
+    ) -> r.StaleRelationReport:
+        """Bring every document's chunk relations on to the configured extractor's rules.
+
+        **The repair installing a relation middleware needs, and the one no other verb
+        performs.** Extraction runs at ingest, after chunking; a re-sync of unchanged bytes skips
+        before it; and no other fingerprint moves when an extraction rule does. So configuring
+        the middleware reaches nothing already stored — which for a corpus whose graph is the
+        point would leave that graph empty until every document happened to change.
+
+        Nothing here parses, fetches or embeds. It reads stored chunks and writes rows, exactly
+        as the glossary repair does, which is why it is its own verb rather than a wider
+        ``--stale`` sweep that would charge a re-parse and a re-embed for a change to a link
+        rule.
+
+        Args:
+            batch: Documents per page of the selection.
+            dry_run: Report the selection and write nothing at all.
+
+        Raises:
+            PolicyError: No configured middleware derives relations, so there is no extractor
+                for the corpus to be current with.
+        """
+        ingestion = await self._backend.ingestion()
+        sweep = await ingestion.rescan_stale_relations(batch=batch, dry_run=dry_run)
+        return r.StaleRelationReport(
+            dry_run=sweep.dry_run,
+            selected=sweep.selected,
+            rescanned=sweep.rescanned,
+            failed=sweep.failed,
+            failures=tuple(sweep.failures),
+            unrepairable=sweep.unrepairable,
+            unrepairable_documents=tuple(sweep.unrepairable_documents),
         )
 
     async def document_redetect_glossary(
@@ -6810,6 +6900,38 @@ def _authored_markdown(body: str) -> str:
     return body if body.endswith("\n") else body + "\n"
 
 
+def _require_within_ceiling(content: str, connector: FilesystemConnector, source: str) -> None:
+    """Refuse a body the configured source would not index, **before** it is written.
+
+    ``max_bytes`` is the operator's own number and the connector already enforces it — but at
+    *discovery*, by skipping the file silently, which is right for a corpus somebody else fills
+    and wrong here: authoring writes first, so without this the oversized document lands on disk
+    and the very next step declines it, leaving a caller holding a path that is never going to be
+    indexed and a reason that says nothing about size.
+
+    Measured on the encoded bytes rather than on ``len(content)``, because the ceiling is a file
+    size and a character is not a byte. ``None`` means the source declares no ceiling, and this
+    invents none: a limit nobody configured would be this function deciding policy, and the
+    honest answer to "how large may a document be" is then "as large as the filesystem allows".
+
+    Raises:
+        PolicyError: The body exceeds the source's configured ``max_bytes``.
+    """
+    ceiling = connector.max_bytes
+    if ceiling is None:
+        return
+    size = len(content.encode("utf-8"))
+    if size <= ceiling:
+        return
+    msg = (
+        f"the document is {size} bytes and source {source!r} is configured to index nothing "
+        f"larger than {ceiling}. Written, it would be skipped at discovery and never indexed, so "
+        f"it is refused before anything reaches the disk. Raise `max_bytes` on that connector, "
+        f"or split the fact."
+    )
+    raise PolicyError(msg)
+
+
 def _authored_path(connector: FilesystemConnector, *, collection: str, slug: str) -> Path:
     """Where a document authored into ``collection`` under ``slug`` is written.
 
@@ -6837,16 +6959,29 @@ def _authored_path(connector: FilesystemConnector, *, collection: str, slug: str
     return target
 
 
-def _write_authored(target: Path, content: str) -> None:
+def _write_authored(target: Path, content: str, *, replace: bool) -> None:
     """Write the file, creating the collection's directory if it is the first document in it.
 
     Blocking, and called through a thread for that reason. UTF-8 and ``\n`` explicitly rather
     than by platform default: a corpus written on one machine and read on another must not
     differ by the locale of whoever wrote it, and a line ending that varies would move the
     version token of every file it touched.
+
+    **Without ``replace`` the create is exclusive**, and that is what makes the default refusal a
+    guarantee rather than a check. Deciding the slug is free and then writing it are two
+    syscalls, and between them another process — a second manicule, an editor, a ``git
+    checkout`` — can create the file; a plain write would then destroy content this operation
+    never saw, having reported that there was none. ``O_EXCL`` moves the decision into the
+    create, where the filesystem settles it.
+
+    Raises:
+        FileExistsError: The slug was taken between the conflict check and this write, and the
+            caller did not ask to replace it.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8", newline="\n")
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if replace else os.O_EXCL)
+    with os.fdopen(os.open(target, flags, 0o644), "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(content)
 
 
 def _not_indexed(report: r.IngestReport, stored: Document | None) -> str:

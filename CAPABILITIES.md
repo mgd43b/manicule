@@ -110,7 +110,7 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 
 ## MCP tools — 46
 
-Ticket: #8 — **built.** Forty-four implemented tools over the same application service the command
+Ticket: #8 — **built.** Forty-five implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 

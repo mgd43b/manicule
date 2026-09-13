@@ -71,7 +71,12 @@ if TYPE_CHECKING:
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
-    from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
+    from manicule.ingest.reindex import (
+        GlossarySweep,
+        ReindexReport,
+        RelationSweep,
+        StaleSweep,
+    )
     from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
     from manicule.storage.docstore import SqliteDocStore
@@ -1786,6 +1791,48 @@ class _Ingestion:
             return None
         fingerprint = await inspect()
         return None if fingerprint is None else fingerprint.canonical()
+
+    async def rescan_stale_relations(self, *, batch: int, dry_run: bool = False) -> RelationSweep:
+        if dry_run:
+            return await self._rescan_stale_relations_guarded(batch=batch, dry_run=True)
+        async with self._runtime.derived_mutation_guard():
+            return await self._rescan_stale_relations_guarded(batch=batch, dry_run=False)
+
+    async def _rescan_stale_relations_guarded(
+        self, *, batch: int, dry_run: bool = False
+    ) -> RelationSweep:
+        """Bring every document's chunk relations up to the configured chain. Reads chunks only.
+
+        **No pipeline on either path**, which is the same cost boundary
+        :meth:`_redetect_stale_glossary_guarded` keeps and for the same reason: the hooks read
+        stored chunks and write rows, so there is no chunker, no embedder, no vector store, no
+        pool of parse workers and no blob store in it. What it needs is the middleware chain —
+        built here on its own, which the container already supports — and the document store.
+
+        The fingerprint refusals that guard a writing run are deliberately not run, exactly as
+        they are not for the glossary: they exist because a corpus must not have *chunks or
+        vectors* written by components that disagree with it, and this writes neither.
+        """
+        from manicule.ingest.reindex import (  # noqa: PLC0415
+            plan_stale_relations,
+            rescan_stale_relations,
+        )
+
+        store = await self._runtime.documents()
+        middleware = await self._runtime.middleware()
+        fingerprint = middleware.relation_lineage()
+        if dry_run:
+            return await plan_stale_relations(
+                store=store,  # pyright: ignore[reportArgumentType] - it satisfies IngestStore
+                fingerprint=fingerprint,
+                batch=batch,
+            )
+        return await rescan_stale_relations(
+            store=store,  # pyright: ignore[reportArgumentType] - it satisfies IngestStore
+            middleware=middleware,
+            fingerprint=fingerprint,
+            batch=batch,
+        )
 
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
         if dry_run:

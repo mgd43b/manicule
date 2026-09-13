@@ -665,6 +665,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "document_reindex": r.DocumentReindexed,
     "document_reindex_stale": r.StaleReparseReport,
     "document_redetect_glossary": r.StaleGlossaryReport,
+    "document_rescan_relations": r.StaleRelationReport,
     "reembed_plan": r.ReembedPlanReport,
     "reembed_start": r.ReembedRunReport,
     "reembed_resume": r.ReembedRunReport,
@@ -1166,6 +1167,14 @@ def document_reindex(
             "Reads stored chunks: no parser, no connector, no embedder.",
         ),
     ] = False,
+    stale_relations: Annotated[
+        bool,
+        typer.Option(
+            "--stale-relations",
+            help="Rebuild chunk relations for every document a changed extractor has moved "
+            "past, and for every document none has scanned. Reads stored chunks.",
+        ),
+    ] = False,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="With a sweep: report the plan and write nothing."),
@@ -1187,16 +1196,21 @@ def document_reindex(
     through this and through nothing else. It reads the chunks already stored, runs no parser,
     fetches nothing and produces no vector, so it costs no GPU time at all.
 
-    Stopping either is safe at a document boundary; running it again resumes.
+    `--stale-relations` is the same rung again, for the stage that turns `[[wikilinks]]` into
+    graph edges. It is the only thing that reaches an existing corpus: extraction runs at
+    ingest, so configuring the middleware — or correcting one of its rules — changes nothing
+    already stored until this runs, and the first run after configuring one selects everything.
+
+    Stopping any of them is safe at a document boundary; running it again resumes.
     """
-    sweeping = stale or stale_glossary
-    if stale and stale_glossary:
+    rungs = [stale, stale_glossary, stale_relations]
+    if sum(rungs) > 1:
         raise typer.BadParameter(REINDEX_IS_ONE_RUNG)
     if stale and document_id is not None:
         raise typer.BadParameter(REINDEX_IS_ONE_OR_ALL)
-    if stale_glossary and document_id is not None:
+    if (stale_glossary or stale_relations) and document_id is not None:
         raise typer.BadParameter(GLOSSARY_IS_NOT_A_DOCUMENT_SWEEP)
-    if not sweeping:
+    if not any(rungs):
         if document_id is None:
             raise typer.BadParameter(REINDEX_NEEDS_A_TARGET)
         if dry_run:
@@ -1205,6 +1219,9 @@ def document_reindex(
         return
     if stale_glossary:
         submit(Command("document_redetect_glossary", {"batch": batch, "dry_run": dry_run}))
+        return
+    if stale_relations:
+        submit(Command("document_rescan_relations", {"batch": batch, "dry_run": dry_run}))
         return
     submit(Command("document_reindex_stale", {"batch": batch, "dry_run": dry_run}))
 

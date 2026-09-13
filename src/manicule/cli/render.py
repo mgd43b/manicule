@@ -569,6 +569,34 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
         )
 
 
+def render_stale_relations(out: Console, payload: r.StaleRelationReport) -> None:
+    """The relation sweep's counts, and the documents whose chunks the chain could not read.
+
+    Documents rather than edges, because an edge belongs to two of them: counting edges would
+    make a document that gained three and lost two read as busier than one that gained a single
+    link, which is the opposite of what an operator is asking.
+
+    **No link target reaches this function.** The payload carries none, on the same rule the
+    glossary report follows — what this command is about is the shape of the corpus, and a
+    terminal is the last place to print it.
+    """
+    if payload.dry_run:
+        out.print("[dim]dry run: nothing was scanned or written[/dim]")
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_row("selected", str(payload.selected))
+    if not payload.dry_run:
+        table.add_row("re-scanned", str(payload.rescanned))
+    table.add_row("unrepairable", str(payload.unrepairable))
+    table.add_row("failed", str(payload.failed))
+    out.print(table)
+    # Named individually, in increasing order of how much somebody has to do about them: an
+    # unrepairable document needs a command, and a failure is a defect.
+    for line in payload.unrepairable_documents:
+        out.print(f"[yellow]{escape(line)}[/yellow]")
+    for line in payload.failures:
+        out.print(f"[red]{escape(line)}[/red]")
+
+
 def render_stale_glossary(out: Console, payload: r.StaleGlossaryReport) -> None:
     """The glossary sweep's counts, and the documents whose text the detector could not read.
 
@@ -1482,6 +1510,9 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.DocumentReindexed: lambda out, p: render_document_reindexed(out, _as(r.DocumentReindexed, p)),
     r.StaleReparseReport: lambda out, p: render_stale_reparse(out, _as(r.StaleReparseReport, p)),
     r.StaleGlossaryReport: lambda out, p: render_stale_glossary(out, _as(r.StaleGlossaryReport, p)),
+    r.StaleRelationReport: lambda out, p: render_stale_relations(
+        out, _as(r.StaleRelationReport, p)
+    ),
     r.ReembedPlanReport: lambda out, p: render_reembed_plan(out, _as(r.ReembedPlanReport, p)),
     r.ReembedRunReport: lambda out, p: render_reembed_run(out, _as(r.ReembedRunReport, p)),
     r.ReembedCleanupReport: lambda out, p: render_reembed_cleanup(

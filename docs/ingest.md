@@ -1671,14 +1671,16 @@ They are not interchangeable, and the price of each is the reason:
 | `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | a re-index; the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything |
 | `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
 | `documents.glossary_fp` | any detection or normalization rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
-| `documents.relation_fp` | a relation extractor is configured, unconfigured, or its rules change | `ingest.reindex.select(relation_fingerprint=...)`, then `re_parse` | a re-ingest of the selected documents |
+| `documents.relation_fp` | a relation extractor is configured, unconfigured, or its rules change | `document reindex --stale-relations` | a pass over stored chunks; **no GPU at all** |
 
-**The fifth has no flag of its own**, and that is the decision rather than an omission. The stage
-belongs to a plugin, so there is nothing in this repository that knows how to re-run it over
-stored chunks the way `--stale-glossary` re-runs detection; what core supplies is the fingerprint,
-the column and the selector, which is what makes the repair a query rather than a command somebody
-had to invent. On the run that first configures an extractor that selection is the whole corpus,
-because every row records `NULL` until something has scanned it.
+**The fifth belongs to a plugin and the repair does not**, which is the division worth stating.
+Core supplies the fingerprint, the column, the selector and the sweep; what a plugin supplies is
+the rules and the hook that writes the edges. So `--stale-relations` re-runs the configured chain
+over stored chunks exactly as `--stale-glossary` re-runs detection, builds no pipeline, and costs
+a text pass rather than a re-parse. On the run that first configures an extractor its selection is
+the whole corpus, because every row records `NULL` until something has scanned it — and with none
+configured it **refuses**, because the installed fingerprint is then the disabled one and
+proceeding would stamp every document as scanned by an extractor that does not exist.
 
 ### 10.4 Offline derived-generation rebuilds
 

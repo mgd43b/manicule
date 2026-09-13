@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Protocol, override, runtime_checkable
 from pydantic import BaseModel, Field
 
 from manicule.container import keys
-from manicule.core.errors import ConfigError, UnknownEntityError
+from manicule.core.errors import ConfigError
 from manicule.core.fingerprints import RelationRules
 from manicule.core.organization import ChunkRelationType
 from manicule.core.protocols import ChunkRelationExtractor, Middleware
@@ -423,20 +423,26 @@ class WikilinkMiddleware(Middleware):
         return _entry_of(chunks) if chunks else None
 
     async def _relate(self, source: str, target: str, relation: ChunkRelationType) -> None:
-        """Write one edge, tolerating the two ends having moved since they were read.
+        """Write one edge. A race at either end **fails the hook** rather than being swallowed.
 
         ``relate`` refuses a chunk that is not live in this workspace, and between reading a
-        target's chunks and writing the edge a concurrent sync can have replaced them. That is an
-        ordinary race with an ordinary outcome — the edge is not written, the document is not
-        stamped as scanned, and the repair writes it later — rather than a reason to fail a
-        document that is already published.
+        target's chunks and writing the edge a concurrent sync can have replaced them. Catching
+        that and carrying on reads as tolerance and is a way of losing an edge for good: the hook
+        would return normally, the pipeline would stamp this document's relation lineage as
+        current, and the repair selects on that lineage — so the document would never be looked
+        at again. The **inbound** direction makes it worse, because there the edge belongs to
+        some *other* document that already carries a current fingerprint of its own and would not
+        be selected either.
+
+        So the exception propagates. The pipeline treats a raising ``after_store`` as this hook's
+        problem — the document stays published, the failure is recorded in its metadata — and,
+        crucially, leaves ``relation_fp`` untouched, so the next repair picks the document up and
+        writes the edges against chunks that are current by then. Losing a scan is recoverable;
+        losing an edge while claiming the scan happened is not.
         """
         if source == target:
             return
-        try:
-            await self._store.relate(source, target, relation)
-        except UnknownEntityError:
-            return
+        await self._store.relate(source, target, relation)
 
 
 class WikilinkPlugin:

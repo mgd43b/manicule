@@ -155,6 +155,12 @@ async def service_for(
     return ApplicationService(await backend_for(settings, fails=fails, existing=existing))
 
 
+def seed_existing(path: Path, content: str) -> None:
+    """Put a file where a document would go, as something other than manicule would."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
     """The corpus directory, a level below ``tmp_path``.
@@ -556,3 +562,98 @@ def test_the_terminal_is_told_why_a_kept_file_is_not_indexed(
     assert "retry_policy.md" in result.output
     assert "is not indexed" in result.output
     assert "the embedder declined" in result.output
+
+
+async def test_a_slug_created_between_the_check_and_the_write_is_refused(
+    monkeypatch: pytest.MonkeyPatch, root: Path
+) -> None:
+    """The default refusal is a guarantee, not a check that happened to run first.
+
+    Deciding the slug is free and writing it are two syscalls, and between them another process —
+    a second manicule, an editor, a `git checkout` — can create the file. A plain write would
+    destroy content this operation never saw, having just reported that there was none. The
+    exclusive create moves the decision into the filesystem, where it is settled.
+
+    Simulated by writing the file from underneath, at the moment the conflict check has already
+    passed, which is the only way to occupy that window deterministically.
+    """
+    service = await service_for(settings_for(root))
+    target = root / COLLECTION / "retry_policy.md"
+
+    async def free_then_taken(
+        service: ApplicationService, target: Path, document_id: str
+    ) -> str | None:
+        """Report the slug free, then let somebody else take it. The window, held open.
+
+        Patched by name through ``monkeypatch`` rather than assigned onto the instance, so the
+        test reaches the seam the way pytest offers and the service keeps its own shape.
+        """
+        del service, document_id
+        seed_existing(target, "# Written by somebody else\n")
+        return None
+
+    monkeypatch.setattr(ApplicationService, "_authored_conflict", free_then_taken)
+
+    with pytest.raises(PolicyError, match="created by something else"):
+        await service.document_create(collection=COLLECTION, slug="retry_policy", body=BODY)
+
+    assert target.read_text(encoding="utf-8") == "# Written by somebody else\n", (
+        "the loser of the race must not have overwritten the winner"
+    )
+
+
+async def test_overwrite_still_replaces_a_file_that_appeared(root: Path) -> None:
+    """The exclusive create is the *default*, not the operation.
+
+    A caller that asked to replace the slug means it, and must not be refused because the file
+    exists — which is the failure a blanket `O_EXCL` would introduce.
+    """
+    service = await service_for(settings_for(root))
+    seed_existing(root / COLLECTION / "retry_policy.md", "# Older\n")
+
+    created = await service.document_create(
+        collection=COLLECTION, slug="retry_policy", body=BODY, overwrite=True
+    )
+
+    assert created.overwritten is True
+    assert (root / COLLECTION / "retry_policy.md").read_text(encoding="utf-8") == BODY
+
+
+async def test_a_body_the_source_would_not_index_is_refused_before_it_is_written(
+    root: Path,
+) -> None:
+    """The ceiling is the operator's own `max_bytes`, and it is checked before the disk.
+
+    The connector already enforces it — by skipping the file at discovery, silently, which is
+    right for a corpus somebody else fills. Authoring writes first, so without this check the
+    oversized document lands on disk and the next step declines it: a caller left holding a path
+    that is never going to be indexed, and a reason that says nothing about size.
+    """
+    settings = Settings(
+        connectors={
+            SOURCE: ConnectorSettings(
+                type="filesystem", options={"root": str(root), "max_bytes": 64}
+            )
+        },
+        authoring=AuthoringSettings(source=SOURCE, collections=(COLLECTION,)),
+        security=SecuritySettings(auth=AuthSettings(mode=AuthMode.API_KEY)),
+    )
+    service = await service_for(settings)
+
+    with pytest.raises(PolicyError, match="max_bytes"):
+        await service.document_create(
+            collection=COLLECTION, slug="long", body="# Long\n\n" + ("x" * 200)
+        )
+
+    assert written_under(root) == [], "nothing reaches the disk"
+
+
+async def test_a_source_with_no_ceiling_declares_none(root: Path) -> None:
+    """`max_bytes` unset means unset. Inventing a default here would be policy nobody chose."""
+    service = await service_for(settings_for(root))
+
+    created = await service.document_create(
+        collection=COLLECTION, slug="long", body="# Long\n\n" + ("x" * 200_000)
+    )
+
+    assert created.indexed is True

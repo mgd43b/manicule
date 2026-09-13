@@ -4138,3 +4138,66 @@ async def test_replay_across_several_leases_completes_when_the_lease_is_renewed(
     assert checkpoint.vector_publication_id == second.vector_publication_id, (
         "a completed replay certifies the takeover's own namespace"
     )
+
+
+async def test_a_rebuild_clears_the_relation_lineage_it_cannot_rederive(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """A rebuild erases the graph, so it must stop claiming the graph is current.
+
+    Publication deletes this document's chunks, and ``chunk_relations`` cascades from them — so
+    every edge is gone by the end of that transaction. The rebuild deriver produces documents,
+    chunks and glossary entries and has no middleware chain, so it cannot put them back. Carrying
+    the previous ``relation_fp`` forward would leave the document claiming an extractor's output
+    it no longer has, and a relation repair would never select it: the graph would stay empty and
+    every fingerprint would report itself current.
+
+    ``NULL`` is the honest value and the useful one — it is what a document nothing has scanned
+    records, which after a rebuild is exactly true.
+    """
+    run_id, blob_ref, raw = await promoted_snapshot(store, engine, data_dir)
+    document = make_document(
+        source="wiki",
+        source_id=raw.source_id,
+        body=b"old text",
+        uri=raw.uri,
+        media_type=raw.media_type,
+    ).model_copy(update={"original_ref": blob_ref})
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "old text")])
+    await store.set_lineage(
+        document.id, chunk_fp=None, embed_fp=None, relation_fp="wikilink-rules-v1"
+    )
+    async with session_factory(engine)() as session:
+        before = await session.get(models.Document, document.id)
+        assert before is not None
+        assert before.relation_fp == "wikilink-rules-v1", "the fixture must set what it checks"
+
+    target, embed = rebuild_target()
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(embed)
+    rebuilds = SqliteRebuildStore(
+        engine,
+        workspace_id=store.workspace_id,
+        blobs=BlobStore(engine, data_dir),
+        vectors=vectors,
+    )
+    planned = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
+    await publish_one_replacement(
+        rebuilds,
+        vectors,
+        estimate_id=planned.generation_id,
+        target=target,
+        document=document,
+        raw=raw,
+        blob_ref=blob_ref,
+        owner="publisher",
+    )
+
+    async with session_factory(engine)() as session:
+        after = await session.get(models.Document, document.id)
+        assert after is not None
+        assert after.glossary_fp == target.glossary_fingerprint, "the rebuild did derive these"
+        assert after.relation_fp is None, "and it did not derive this one"

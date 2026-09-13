@@ -324,6 +324,9 @@ BINDERS: Mapping[str, Binder] = {
     "document_redetect_glossary": lambda service, args, report: service.document_redetect_glossary(
         batch=args.count("batch", default=DEFAULT_SWEEP_BATCH), dry_run=args.flag("dry_run")
     ),
+    "document_rescan_relations": lambda service, args, report: service.document_rescan_relations(
+        batch=args.count("batch", default=DEFAULT_SWEEP_BATCH), dry_run=args.flag("dry_run")
+    ),
     "document_reindex": lambda service, args, report: service.document_reindex(
         args.text("document_id")
     ),

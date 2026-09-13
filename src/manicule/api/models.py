@@ -88,11 +88,15 @@ class ShareBody(Body):
 class DocumentBody(Body):
     """A document to author: which collection, which slug, and the markdown itself.
 
-    ``body`` has no upper length here and every other text field in this module has one. That
-    is deliberate rather than an omission: a maximum on a *document* would be this surface
-    inventing a corpus rule the filesystem connector does not have, and a caller would discover
-    it by having a legitimate document refused at a number nobody chose. What bounds a request
-    is the server's own body limit, which is one setting rather than one per field.
+    ``body`` has no upper length here and every other text field in this module has one. That is
+    deliberate rather than an omission: a maximum on a *document* would be this surface inventing
+    a corpus rule, and a caller would discover it by having a legitimate document refused at a
+    number nobody chose.
+
+    **The bound is the authoring source's own** ``max_bytes``, checked by the service before
+    anything is written, so it is the same number on every surface and it is one an operator set.
+    A source that declares no ceiling has none — this application configures no request-size
+    limit of its own, and saying it did would describe a guard that does not exist.
     """
 
     collection: str = Field(min_length=1, max_length=200)

@@ -295,6 +295,49 @@ write tool's name on a socket — an absence, not a refusal.
 """
 
 
+async def require_network_member(service: ApplicationService) -> None:
+    """Refuse a socket caller who is not an authenticated member. A no-op over stdio.
+
+    :data:`NETWORK_AUTHORING` decides which tools a socket *carries*; this decides who may call
+    the one that writes. They are separate questions and were briefly answered as one, which is
+    how a viewer came to be able to author: the mount's guard asks for
+    :attr:`~manicule.api.security.Role.VIEWER`, because it carries the read surface, and
+    ``POST /api/v1/documents`` asks for a member — so admitting one write tool to that mount
+    without a floor of its own gave a read-only key an authority the HTTP route denies it.
+
+    **Stdio is exempt, and that is the transport rather than an exception.** There is no request,
+    no principal and no key: stdin and stdout are a pipe between one client and one process, and
+    the client already runs as whoever started it. :func:`get_http_request` raising is precisely
+    the signal "this call did not arrive over HTTP", so the exemption is read off the transport
+    rather than passed in by a caller who could pass it wrongly.
+
+    **A socket with no principal at all is refused**, which is the case that matters most. The
+    ``--mcp-only`` transport hands the server to FastMCP's own HTTP app, so none of
+    :func:`manicule.api.app.build_app`'s middleware runs and nothing has identified the caller.
+    Resolving here rather than trusting ``request.state`` is what makes that a refusal instead of
+    an unauthenticated write: an absent principal resolves to an unauthenticated one, and
+    :func:`~manicule.api.security.require` refuses it wherever authentication is configured.
+
+    Raises:
+        UnauthenticatedError: Authentication is configured and no usable key was presented.
+        ForbiddenError: A valid key without member authority.
+    """
+    from fastmcp.server.dependencies import get_http_request  # noqa: PLC0415 - HTTP only
+
+    from manicule.api.proxy import ProxyPolicy  # noqa: PLC0415 - keeps FastAPI off stdio
+    from manicule.api.security import Role, require, resolve  # noqa: PLC0415
+
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        # No HTTP request in context: this arrived over stdio, where the pipe is the boundary.
+        return
+    principal = getattr(request.state, "principal", None)
+    if principal is None:
+        principal = await resolve(service, ProxyPolicy.of(service.settings), request)
+    require(principal, Role.MEMBER)
+
+
 type Tool = Callable[..., Awaitable[dict[str, Any]]]
 """What every tool in this module is: a coroutine function returning an envelope as JSON.
 
@@ -902,12 +945,18 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             overwrite: Replace the document already holding this slug. Refused without it, and
                 the refusal names what is already there so it can be read first.
         """
-        return await dispatch(
-            "document_create",
-            lambda: service.document_create(
+
+        async def authored() -> Payload:
+            # The floor is checked inside the dispatched call rather than before it, so a
+            # refusal comes back as the ordinary envelope — `ok: false` with the type and the
+            # hint every other failure carries — instead of a transport error an assistant
+            # cannot act on.
+            await require_network_member(service)
+            return await service.document_create(
                 collection=collection, slug=slug, body=body, overwrite=overwrite
-            ),
-        )
+            )
+
+        return await dispatch("document_create", authored)
 
     @register.tool(READS)
     async def document_list(
@@ -1391,4 +1440,5 @@ __all__ = [
     "build_server",
     "build_surface",
     "hints",
+    "require_network_member",
 ]

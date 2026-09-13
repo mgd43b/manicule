@@ -328,6 +328,18 @@ class FilesystemConnector:
         return self._root
 
     @property
+    def max_bytes(self) -> int | None:
+        """The largest file this source will index, or ``None`` for no configured ceiling.
+
+        Public for the reason :attr:`root` is: it is part of what this source *is*, and one
+        caller has to know it **before** a file exists. ``discover`` skips a file over the
+        ceiling silently — the right behavior for a corpus somebody else fills — but authoring
+        writes the file first, so without reading this it would write a document the very next
+        step declines, and report a path that is never going to be indexed.
+        """
+        return self._max_bytes
+
+    @property
     def profiles(self) -> tuple[EnrichedProfile, ...]:
         """The enriched-document conventions this connector recognizes, in precedence order.
 

@@ -794,6 +794,61 @@ def test_an_application_without_authoring_configured_is_built_unauthenticated() 
     assert build_app(ApplicationService(backend)) is not None
 
 
+AUTHORING = {
+    "security": {"auth": {"mode": "api_key"}},
+    "authoring": {"source": "memories", "collections": ["memory"]},
+}
+"""An installation that has configured authoring, with authentication on.
+
+Both, because one without the other cannot be served: ``require_authoring_authentication``
+refuses to build an application whose authoring is reachable unauthenticated.
+"""
+
+
+async def _authored_as(role: str) -> dict[str, Any]:
+    """Call ``document_create`` over the mount with a key of this role, and return the envelope.
+
+    Through the mounted endpoint rather than the in-memory server, because the floor is a
+    property of *a call that arrived over HTTP* — the check reads the request out of the FastMCP
+    context, and a server driven in memory has none.
+    """
+    backend, _ = backend_with_a_document(**AUTHORING)
+    issued = await ApplicationService(backend).api_key_create(f"{role}-key", role=role)
+    async with mounted(backend, credential={"X-API-Key": issued.secret}) as client:
+        result = await client.call_tool(
+            "document_create",
+            {"collection": "memory", "slug": "retry-policy", "body": "# Retry\n"},
+        )
+    return dict(result.structured_content or {})
+
+
+async def test_a_viewer_key_cannot_author_over_the_mounted_surface() -> None:
+    """The mount admits viewers because it carries the read surface. Authoring is not a read.
+
+    The guard's floor is ``Role.VIEWER`` — right for `search`, `collection_list` and the rest of
+    what a socket offers — so admitting one write tool to that mount without a floor of its own
+    handed a read-only key an authority ``POST /api/v1/documents`` denies it. The two surfaces
+    must not disagree about who may write into a corpus.
+    """
+    envelope = await _authored_as("viewer")
+
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "ForbiddenError"
+
+
+async def test_a_member_key_clears_the_floor() -> None:
+    """The other half, without which the refusal above passes on a tool that refuses everybody.
+
+    A member gets *past* the floor and then meets this installation's own configuration — the
+    fake backend has no filesystem connector to author into — so what is asserted is that the
+    failure is no longer an authorization one.
+    """
+    envelope = await _authored_as("member")
+
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] not in {"ForbiddenError", "UnauthenticatedError"}
+
+
 async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> None:
     """So that "I cannot do that" is available before a turn is spent discovering it.
 

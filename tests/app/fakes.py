@@ -81,7 +81,7 @@ from manicule.ingest.reembed import (
     ReembedRun,
     ReembedState,
 )
-from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
+from manicule.ingest.reindex import GlossarySweep, ReindexReport, RelationSweep, StaleSweep
 from manicule.ingest.sweeps import SweepResult
 from manicule.retrieval.retriever import RetrievalResult
 from manicule.storage.organization import normalize_name
@@ -1150,6 +1150,20 @@ class FakeIngestion:
 
     async def physical_index_fingerprint(self) -> str | None:
         return None
+
+    relation_sweeps: list[tuple[int, bool]] = field(default_factory=list[tuple[int, bool]])
+    """``(batch, dry_run)`` per relation sweep, so a test can show what reached the port."""
+
+    relation_sweep: RelationSweep = field(
+        default_factory=lambda: RelationSweep(selected=7, rescanned=4, failed=2, unrepairable=1)
+    )
+    """What the relation sweep reports. Every number different, for the reason the two above
+    give: a payload that dropped a field would still compare equal across surfaces if two of
+    them happened to match."""
+
+    async def rescan_stale_relations(self, *, batch: int, dry_run: bool = False) -> RelationSweep:
+        self.relation_sweeps.append((batch, dry_run))
+        return replace(self.relation_sweep, dry_run=dry_run)
 
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
         self.glossary_sweeps.append((batch, dry_run))

@@ -57,7 +57,12 @@ if TYPE_CHECKING:
     from manicule.generation.sharing import ShareLink
     from manicule.ingest.pipeline import RunReport, Watching
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
-    from manicule.ingest.reindex import GlossarySweep, ReindexReport, StaleSweep
+    from manicule.ingest.reindex import (
+        GlossarySweep,
+        ReindexReport,
+        RelationSweep,
+        StaleSweep,
+    )
     from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
@@ -287,6 +292,23 @@ class Ingesting(Protocol):
 
     async def physical_index_fingerprint(self) -> str | None:
         """Existing vector metadata identity, read without loading a model or creating a table."""
+        ...
+
+    async def rescan_stale_relations(self, *, batch: int, dry_run: bool = False) -> RelationSweep:
+        """Rebuild the chunk relations of every document the configured extractor did not derive.
+
+        The same cost boundary :meth:`redetect_stale_glossary` keeps, one stage further on: the
+        hooks read stored chunks and write rows, so no pipeline is built and no model is loaded.
+
+        **It is the only thing that reaches an existing corpus.** Extraction runs at ingest, a
+        re-sync of unchanged bytes skips before it, and no other fingerprint moves when an
+        extraction rule does — so installing the middleware, or correcting one of its rules,
+        reaches nothing already stored until this runs.
+
+        Raises:
+            PolicyError: Nothing configured derives relations, so there is no extractor for the
+                corpus to be brought up to date with.
+        """
         ...
 
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
