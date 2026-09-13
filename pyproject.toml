@@ -265,6 +265,20 @@ dev = [
   # balance and cannot cost coverage. It has no configuration file of its own — every option is
   # a flag, and the ones CI passes are in `.github/workflows/ci.yml`.
   "pytest-split>=0.10",
+  # What parallelizes a shard, which `pytest-split` deliberately does not: it partitions a
+  # suite across *jobs* and each job then ran on one core. Measured on this repository at
+  # 5,864 tests — 18m50s serial against 8m50s under `-n auto`, everything passing, coverage
+  # still reported. The suite is top-heavy rather than uniformly slow (two parametrized cases
+  # of one end-to-end test are 17% of it), so the win comes from overlapping a handful of very
+  # slow tests with the thousands of fast ones rather than from cores alone — which is why it
+  # scales to about 2x rather than to the core count, and why it helps most on the CI runner
+  # where those tests are slowest.
+  #
+  # It composes with the sharding rather than replacing it: `--splits/--group` chooses which
+  # tests a job runs, `-n auto` decides how many processes run them. Safe here because every
+  # fixture that touches disk is `tmp_path`-scoped, which is what the 8m50s run above checked
+  # rather than assumed.
+  "pytest-xdist>=3.6",
   "ruff>=0.16.3",
   "pyright>=1.1.390",
   # Fixture generation (docs/parsing.md §3.5): fixtures are built by a checked-in script

@@ -8,12 +8,12 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # **A superseded pull-request push is canceled; `main` is never canceled.**
-  #
+      #
   # `github.ref` is `refs/heads/main` for every push to it, so one group held all of them and each
   # merge canceled the run for the merge before it. That lost information even on its own terms —
   # a run on `main` is the record of whether `main` is releasable, and a canceled run records
   # nothing about the commit it was testing.
-  #
+      #
   # With release.yml's `ci-green` gate reading exactly that verdict it became worse than lossy.
   # Merging a release pull request and then merging anything else within CI's runtime would cancel
   # the release commit's run; the gate would see a run that did not succeed, and would refuse the
@@ -86,20 +86,31 @@ jobs:
   # and not worth making on any of the others. The 33s of setup ahead of `pytest` is what makes
   # splitting across runners the cheap option rather than the expensive one: a shard re-pays
   # half a minute, not the several minutes an install-heavy job would.
-  #
+      #
   # Three, and not more, because two costs do not shard. Setup is 33s per shard however many
   # there are, and `pytest` collects the *whole* suite before deselecting the other groups, so
   # collection and the session fixtures are another 34s that every shard pays in full. Only the
-  # ~320s of test time actually divides, which is the curve: 1 shard 6m27s, 2 shards 3m47s,
-  # 3 shards 2m54s, 4 shards 2m27s, 5 shards 2m11s. A fourth buys 27s for two more jobs, and
-  # the floor under all of it is those 67s plus the single longest test — a 25s parser corpus
-  # round-trip — which no number of shards divides.
-  #
-  # Those are measured on this runner rather than modeled: the two ends are the real 390s
-  # unsharded leg and the real 174s three-shard one, and the curve is fitted to them. Worth
-  # saying because a laptop does not predict them — collection there costs a few seconds rather
-  # than 34, which makes local timings far too optimistic about what another shard would buy.
-  #
+  # test time actually divides, and when this was measured that was ~320s: 1 shard 6m27s,
+  # 2 shards 3m47s, 3 shards 2m54s, 4 shards 2m27s, 5 shards 2m11s. A fourth bought 27s for two
+  # more jobs, and the floor under all of it is those 67s plus the single longest test.
+      #
+  # Those were measured on this runner rather than modeled. Worth saying because a laptop does
+  # not predict them — collection there costs a few seconds rather than 34, which makes local
+  # timings far too optimistic about what another shard would buy.
+      #
+  # **The suite has since outgrown those numbers, and the answer is `-n auto` rather than a
+  # fourth shard.** A shard is now ~15 minutes rather than ~3, because the test time those
+  # figures divide has grown roughly fivefold — and it is top-heavy rather than uniformly
+  # larger: two parametrized cases of one end-to-end test are 17% of the recorded duration, and
+  # the slowest 100 of 5,864 tests are half of it. More jobs would divide that the same way they
+  # divided 320s, and would pay the 67s fixed cost again each time. `pytest-xdist` inside the
+  # shard divides it without a new job, and overlaps the very slow tests with the cheap ones
+  # instead of hoping they land in different groups.
+      #
+  # The cost is honest and is the same collection cost named above, now per *worker* rather
+  # than per shard: each process collects the whole suite. That is why the win is smaller here
+  # than on a laptop, and it is still large — the test time it divides dwarfs it.
+      #
   # The shard count is written twice — `--splits` below and the `shard:` list — and it has to
   # be: `strategy:` cannot read the `env` context, so there is no one place to put it. That is
   # the dangerous kind of duplication rather than the merely untidy kind, because the two
@@ -199,6 +210,17 @@ jobs:
       # `sys.monitoring` it costs nothing to produce. Combining across shards would mean an
       # artifact upload and a fourth job to `coverage combine` them, which is real machinery to
       # make an unread number correct. If it is ever read, that is the moment to build it.
+      # **`-n auto` inside the shard, because sharding alone left each job single-core.**
+      # `--splits/--group` decides *which* tests a job runs and `pytest-xdist` decides how many
+      # processes run them, so the two compose rather than compete. This suite is top-heavy rather
+      # than uniformly slow — two parametrized cases of one end-to-end test are 17% of the recorded
+      # duration, and the slowest 100 tests of 5,864 are half of it — so the win is overlapping
+      # those with the thousands of cheap ones, not the core count: measured at 18m50s serial
+      # against 8m50s under `-n auto`, with coverage still reported and nothing flaky.
+      #
+      # Safe because every fixture that touches disk is `tmp_path`-scoped, each test getting its
+      # own SQLite file and vector directory. That was checked by running the whole suite this way
+      # rather than inferred from the fixtures.
       - name: pytest
         env:
           REQUIRE_GRAMMAR_BUNDLE: "1"
@@ -208,6 +230,7 @@ jobs:
           uv run --python ${{ matrix.python }} pytest
           --splits 3 --group ${{ matrix.shard }}
           --splitting-algorithm least_duration
+          -n auto
           --cov --cov-report=term-missing --durations=25
 
   # The vector-store suite that a server is the only way to check. `qdrant-client` ships an
@@ -217,7 +240,7 @@ jobs:
   # `float32` survives the REST transport's JSON rounding, and that the reuse contract holds
   # over a socket — and the store would pass every other test in the repository while getting
   # any of them wrong.
-  #
+      #
   # `REQUIRE_QDRANT` turns the suite's skips into failures, the way the grammar and vocabulary
   # jobs do: a skipped conformance suite reports green while proving nothing, and this one
   # skips by default so that a developer with no Qdrant running gets a green first checkout.
@@ -280,14 +303,14 @@ jobs:
 
   # The macOS job. Two claims live here, and both are claims that can only be checked on a
   # second platform — which is why they share a runner rather than each having one.
-  #
+      #
   # **Backend parity.** MLX is Apple Silicon only, so the ubuntu matrix above has one backend
   # and cannot compare two. What is being defended is `EmbedFingerprint` excluding `backend`
   # from identity — the property that lets a corpus move between machines without a re-embed.
   # That exclusion is a claim about numbers, and this job is where the numbers are checked. If
   # it ever goes red, the fix is to move `backend` into IDENTITY_FIELDS, not to widen a
   # tolerance.
-  #
+      #
   # **Grammars and the offline bundle.** The same shape of claim: the grammar pack resolves its
   # cache through `platformdirs`, which honors `XDG_CACHE_HOME` on Linux and `~/Library/Caches`
   # on macOS, and a bundle is valid for exactly one operating system and architecture. Both are
@@ -425,17 +448,17 @@ jobs:
       # runs everywhere, so there is nothing here to arm.
 
   # The image build, which is also the image's test.
-  #
+      #
   # The Dockerfile's last stage runs `doctor`, an ingest and a search with `--network=none`,
   # so `docker build` succeeding *is* the assertion that the image needs no network and that
   # its data directory is one only its own account can read. Nothing here re-states those; a
   # second copy of an assertion is a second thing to keep in step.
-  #
+      #
   # What this job adds is the two checks that can only be made from outside the build: the
   # **shipped** image runs as a non-root account, and the `/data` it carries is `0700`. Both
   # are properties of the final image rather than of any layer, and a `USER` line dropped in a
   # later edit would leave every in-build check passing.
-  #
+      #
   # Unconditional rather than path-filtered. The build depends on `uv.lock`, the extras in
   # `pyproject.toml`, the grammar bundle tool and every module the smoke test imports, and a
   # filter listing those is a list that goes stale silently — which is the failure this
@@ -674,7 +697,7 @@ jobs:
   # never seen it. Every other job here runs against the working tree with `uv sync`, and that
   # is a different program: it has the dev group, the workspace's plugin fixtures, and an
   # editable `src/` on the path. None of those exist for a person running `pip install manicule`.
-  #
+      #
   # The gap is not hypothetical. Before this job existed, `pip install manicule` produced a
   # console script whose first act was `ModuleNotFoundError: No module named 'typer'` — typer is
   # in the `serve` extra, correctly, and nothing checked that the entry point survived its
