@@ -173,7 +173,7 @@ being wrong means writing outside the corpus.
 
 ### 4.9 Surfaces
 
-Behaviour lives in `ApplicationService` and nowhere else. The MCP tool, the CLI command
+Behavior lives in `ApplicationService` and nowhere else. The MCP tool, the CLI command
 (`manicule document create <collection> <slug>`, body from `--file` or standard input) and the HTTP
 route (`POST /api/v1/documents`) produce byte-identical envelopes;
 `tests/app/test_document_create.py` compares all three.
@@ -235,7 +235,7 @@ value is that every entry explains itself, so the absence explains itself too.
 
 **Why the extra care, given it is only one tool:** this corpus is read as *instructions*, not just
 data. `feedback_` memories are treated as standing instructions by every assistant that recalls
-them. So write access here is the ability to inject behaviour into future sessions across every
+them. So write access here is the ability to inject behavior into future sessions across every
 project — a materially higher-stakes write than indexing a directory, and the reason the default
 stays off and the scope stays narrow.
 
@@ -321,7 +321,7 @@ types nobody bumped stale for ever". Relation extraction is the same shape — i
 normalization, relation typing, §5.2–5.4) move on their own schedule, and none of the existing
 fingerprints shift when they do.
 
-So `RelationFingerprint` is modelled on `GlossaryFingerprint`, including `middleware` among its
+So `RelationFingerprint` is modeled on `GlossaryFingerprint`, including `middleware` among its
 `IDENTITY_FIELDS`: an edge names a *chunk*, and which chunk holds a link follows from boundaries any
 hook may move in `after_parse`, carrying no declaration at all. It is recorded in
 `documents.relation_fp` and backfill is the repair selector that already exists:
