@@ -247,3 +247,51 @@ updates:
           - "nbformat"
           - "markdown-it-py"
           - "ruamel*"
+
+  # ----------------------------------------------------------------------------------------
+  # Docker — the base images the published container is built from
+  # ----------------------------------------------------------------------------------------
+  # Added once the image started being *published*. Until #338 the Dockerfile was built only by
+  # the `container` job in ci.yml and the result was thrown away, so a stale base image was a
+  # thrown-away artifact. It is now pushed to `ghcr.io/mgd43b/manicule` on every release and
+  # pulled by a Kubernetes cluster, which is a different thing to leave unattended.
+  #
+  # **Nothing here is index-affecting, and that is worth stating in a file organized around the
+  # distinction.** `uv.lock` is frozen — `UV_FROZEN=1` in the Dockerfile, and the release job
+  # sets it too — so no base image bump can change a resolved dependency, which is the only way
+  # one could move a stored vector, a chunk boundary or an extracted byte. A bump here can fail
+  # the build. It cannot invalidate a corpus. One group, therefore, and no `index-affecting-`
+  # prefix.
+  #
+  # **The honest value is narrower than "keep the base image current" suggests**, for two
+  # reasons specific to this Dockerfile, and both are arguments for reviewing these promptly
+  # rather than for skipping them:
+  #
+  #   - `ARG PYTHON_VERSION=3.14` is a *minor* pin, so `python:3.14-slim-bookworm` already
+  #     resolves to the newest patch on every build — and the release build has no layer cache,
+  #     so it genuinely re-pulls. CPython patch and Debian bookworm security updates therefore
+  #     arrive without Dependabot. What this adds for that image is a pull request at the
+  #     3.14 → 3.15 boundary, which is a decision rather than a routine bump.
+  #   - `ARG UV_VERSION` is an exact pin and does go stale, but uv reaches only the builder
+  #     stage through `COPY --from=uv /uv` and is never in the shipped image. That bump is build
+  #     reproducibility, not a production CVE surface.
+  #
+  # **One thing to confirm from Dependabot's own job log rather than assume.** Both `FROM` lines
+  # take their version from a build ARG — `FROM python:${PYTHON_VERSION}-slim-bookworm` — and
+  # resolving that indirection has historically been the weak spot in this ecosystem's parser.
+  # If the Dependabot run reports no dependencies for the Dockerfile, the fix is to write the
+  # tags literally into the `FROM` lines: nothing in this repository passes `--build-arg` for
+  # either of them, not compose, not CI, not the documentation, so the indirection is
+  # self-documentation and costs nothing to drop.
+  #
+  # `compose.yaml` is deliberately not a second entry here. Its only `image:` is
+  # `manicule:local`, built from this same Dockerfile, so there is no external tag for a
+  # `docker-compose` ecosystem to update.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      base-images:
+        patterns: ["*"]
