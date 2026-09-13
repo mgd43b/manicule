@@ -263,6 +263,11 @@ dev = [
   # Installed so that entry-point discovery is exercised against a real distribution rather
   # than a mock. See packages/manicule-plugin-example.
   "manicule-plugin-example",
+  # The wikilink extractor, in the dev group for the same reason: its suites run against the
+  # real registry and the real ingest pipeline, and the relation fingerprint it supplies is
+  # what licenses `RelationFingerprint.disabled` being the value every other installation
+  # records. A claim about what happens when a plugin is installed needs one installed.
+  "manicule-plugin-wikilinks",
   # The Metal backend, which is a separate distribution because it is GPL-3.0-or-later and
   # this project is MIT. In the dev group because CI has to run its suites: `test_parity.py`
   # there is what licenses `backend` staying out of `EmbedFingerprint`'s identity fields, and
@@ -335,6 +340,7 @@ members = ["packages/*"]
 manicule = { workspace = true }
 manicule-mlx = { workspace = true }
 manicule-plugin-example = { workspace = true }
+manicule-plugin-wikilinks = { workspace = true }
 manicule-plugin-hostile = { workspace = true }
 
 # **README.md is the PyPI long description, and PyPI resolves relative links against nothing.**

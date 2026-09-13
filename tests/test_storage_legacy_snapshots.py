@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 
 from manicule.core.acquisition import (
     AcquiredSource,
@@ -80,6 +80,54 @@ async def _legacy_document(
             await session.execute(select(models.Document).where(models.Document.id == document.id))
         ).scalar_one()
     return row, retained
+
+
+async def _pre_journal_document(
+    engine: AsyncEngine,
+    store: SqliteDocStore,
+    blobs: BlobStore,
+    source_id: str,
+    body: bytes,
+    *,
+    source: str = "wiki",
+) -> None:
+    """:func:`_legacy_document`, written in SQL so it can run against an older schema.
+
+    Every column here exists at ``6e31b7d592ac``; the ones added since are left to their
+    defaults, which is what a row written then would have. The metadata block is the same one
+    ``_legacy_document`` writes, because :func:`migrate_legacy_snapshots` reads it.
+    """
+    retained = await blobs.put(body, "text/markdown")
+    assert isinstance(retained, StoredBlob)
+    document = make_document(source=source, source_id=source_id, body=body)
+    metadata = (
+        '{"citation": "synthetic", "_source": {"provider": "wiki", '
+        '"provider_url": "https://wiki.example.test", "source_id": "' + source_id + '"}}'
+    )
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO documents (id, publication_id, workspace_id, source, source_id, "
+                "uri, title, media_type, content_hash, version_token, original_ref, status, "
+                "metadata, created_at, updated_at) VALUES (:id, 'legacy', :workspace, :source, "
+                ":source_id, :uri, :title, :media_type, :content_hash, :token, :ref, 'indexed', "
+                ":metadata, :now, :now)"
+            ),
+            {
+                "id": document.id,
+                "workspace": store.workspace_id,
+                "source": source,
+                "source_id": source_id,
+                "uri": document.uri,
+                "title": document.title,
+                "media_type": document.media_type,
+                "content_hash": document.content_hash,
+                "token": f"version-{source_id}",
+                "ref": retained.hash,
+                "metadata": metadata,
+                "now": utcnow().isoformat(),
+            },
+        )
 
 
 async def _legacy_run(store: SqliteDocStore, connector: str) -> AcquisitionRun:
@@ -769,13 +817,21 @@ async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
 async def test_pre_journal_schema_upgrades_then_gains_legacy_snapshot_ownership(
     data_dir: Path,
 ) -> None:
+    """A document retained before the journal existed gains ownership after the upgrade.
+
+    The row is seeded in **SQL** rather than through ``SqliteDocStore``, unlike every other test
+    in this file, and the pinned revision is why: the ORM's mapping is the current one, so a
+    column added to ``documents`` after ``6e31b7d592ac`` is in the ``SELECT`` it emits and in no
+    row it is reading. Writing it after the upgrade instead would not be a pre-journal document,
+    which is the whole subject.
+    """
     engine = create_engine(data_dir)
     try:
         await upgrade(engine, revision="6e31b7d592ac")
         old_store = SqliteDocStore(engine)
         await old_store.ensure_workspace()
         blobs = BlobStore(engine, data_dir)
-        await _legacy_document(old_store, blobs, "pre-journal", b"survives upgrade")
+        await _pre_journal_document(engine, old_store, blobs, "pre-journal", b"survives upgrade")
 
         await upgrade(engine)
         upgraded = SqliteDocStore(engine)

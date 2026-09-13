@@ -82,7 +82,9 @@ def address_for(
 
     Raises:
         PolicyError: The address is not loopback and something required to widen it is
-            missing. The message names which.
+            missing. The message names which. Authoring's own refusal is not here: it belongs
+            to :func:`~manicule.api.app.build_app`, which fires even when something other than
+            this function is doing the listening.
     """
     bind = resolve_bind(service.settings, host=host, port=port, allow_public=allow_public)
     return bind, ServerAddress(

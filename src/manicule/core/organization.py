@@ -328,6 +328,28 @@ class ChunkRelationType(StrEnum):
     introduce a pair that can fall out of step.
     """
 
+    LINKS_TO = "links_to"
+    """``source`` declares a link to ``target``. Directional, and asymmetric in meaning.
+
+    What a *declared* reference looks like in a corpus of markdown: a link that is the whole of
+    a list item, with or without a leading verb — ``- [[other]]``, ``relates_to [[other]]``.
+    Somebody writing that is stating a relationship rather than mentioning a name in passing,
+    and the inverse ("other is linked to from here") is a different fact, so the row is written
+    once in the direction it was written in and read from both ends.
+    """
+
+    MENTIONS = "mentions"
+    """``source`` refers to ``target`` in prose. A soft reference.
+
+    **Separate from** :attr:`LINKS_TO` **rather than folded into it**, even though a corpus is
+    usually mostly this. The two are not the same claim: a passing mention inside a sentence is
+    evidence that two documents are about related things, while a declared link is an assertion
+    by the author about how they relate. Collapsing them would make the distinction
+    unrecoverable — and it is the distinction a reader would want first when asking what a
+    document is actually connected to, since ranking by mention count and ranking by declared
+    links give different answers on the same corpus.
+    """
+
 
 class ChunkEdge(_Organization):
     """One typed link between two chunks, as stored.

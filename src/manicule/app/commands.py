@@ -312,6 +312,12 @@ BINDERS: Mapping[str, Binder] = {
         watching=report,
         acquire_only=args.flag("acquire_only"),
     ),
+    "document_create": lambda service, args, report: service.document_create(
+        collection=args.text("collection"),
+        slug=args.text("slug"),
+        body=args.text("body"),
+        overwrite=args.flag("overwrite"),
+    ),
     "document_delete": lambda service, args, report: service.document_delete(
         args.text("document_id"), hard=args.flag("hard")
     ),

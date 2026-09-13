@@ -1078,6 +1078,19 @@ class IngestPipeline:
                 enabled=detect_glossary, middleware=self._middleware.chain()
             ).canonical()
         )
+        # Read once as well, and for the same reason: the extractor digests its own sources and
+        # the chain is fixed for the life of this pipeline. Computed even when nothing in the
+        # chain extracts, because `disabled` is a value a document records rather than an absence
+        # — which is what makes installing an extractor select the whole corpus for repair.
+        #
+        # `None` where derivation is off, and that is a different `None` from the one above. An
+        # acquisition-only pipeline has no middleware at all — `self._middleware` is a cast over
+        # one — so there is no chain to ask, and it stores no chunks for an edge to name either.
+        # Claiming the disabled fingerprint for it would stamp documents nothing has derived
+        # anything from as scanned.
+        self._relation_lineage = (
+            self._middleware.relation_lineage().canonical() if self._derivation_enabled else None
+        )
         # --- how many of each stage a run may occupy, all derived here and nowhere else ------
         #
         # Read once, at construction, so that every bound in one run comes from one reading of
@@ -1173,6 +1186,21 @@ class IngestPipeline:
                 self._mutations[document_id] = (lock, holders - 1)
             else:
                 del self._mutations[document_id]
+
+    @property
+    def relation_lineage(self) -> str | None:
+        """The extractor identity this pipeline stamps once ``after_store`` has run.
+
+        Public for the reason :attr:`glossary_lineage` is: it has to agree with what the repair
+        selects against, and an agreement nothing can read is an agreement nobody can check.
+
+        A chain with no extractor in it stamps the **disabled** fingerprint rather than nothing,
+        which is a different statement from a document nothing has scanned and is what makes
+        enabling one a repair rather than a silence. ``None`` is the narrower case: a pipeline
+        with derivation switched off, which stores no chunks and so has nothing an edge could
+        name.
+        """
+        return self._relation_lineage
 
     @property
     def glossary_lineage(self) -> str | None:
@@ -4512,7 +4540,23 @@ class IngestPipeline:
             await self._store.set_status(existing.id, status)
 
     async def _observe(self, document: Document) -> None:
-        """Let hooks see a committed document. Their failure is theirs, not the document's."""
+        """Let hooks see a committed document, then record what derived its relations.
+
+        The hooks' failure is theirs, not the document's: it is already published, and a
+        ``after_store`` that raises costs whatever that hook was going to add and nothing else.
+
+        **The lineage is written only on the path where they all returned**, and that placement
+        is the contract rather than an ordering detail. Relation extraction happens in these
+        hooks, over chunks that are already committed, so there is no publish transaction left to
+        carry the fingerprint — and stamping it regardless would claim an extractor had run over
+        a document it raised on, which is precisely the "reports itself current" failure the
+        column exists to prevent. Left unwritten, the document keeps ``NULL`` or its previous
+        value and stays selected by the next repair.
+
+        A document with no links records the fingerprint all the same, because the hooks
+        succeeded: an empty result is a derived result, and the alternative is re-selecting every
+        link-free document in the corpus on every repair for ever.
+        """
         try:
             await self._middleware.after_store(document)
         except Exception as exc:  # noqa: BLE001 - the document is already committed
@@ -4523,6 +4567,11 @@ class IngestPipeline:
                 await publisher.fenced_annotate(fence, document.id, updates)
             else:
                 await self._store.annotate(document.id, updates)
+            return
+        if self._relation_lineage is not None:
+            await self._store.set_lineage(
+                document.id, chunk_fp=None, embed_fp=None, relation_fp=self._relation_lineage
+            )
 
     async def _fail(
         self,

@@ -1661,7 +1661,7 @@ of the ingest is untouched — a glossary bug does not cost a working index — 
 the document, because a detector that has stopped working behind a screen of green counters is
 the other half of failing silently.
 
-### 10.3 Four lineages, four migrations, and how to tell which one you need
+### 10.3 Five lineages, five migrations, and how to tell which one you need
 
 They are not interchangeable, and the price of each is the reason:
 
@@ -1671,6 +1671,14 @@ They are not interchangeable, and the price of each is the reason:
 | `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | a re-index; the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything |
 | `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
 | `documents.glossary_fp` | any detection or normalization rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
+| `documents.relation_fp` | a relation extractor is configured, unconfigured, or its rules change | `ingest.reindex.select(relation_fingerprint=...)`, then `re_parse` | a re-ingest of the selected documents |
+
+**The fifth has no flag of its own**, and that is the decision rather than an omission. The stage
+belongs to a plugin, so there is nothing in this repository that knows how to re-run it over
+stored chunks the way `--stale-glossary` re-runs detection; what core supplies is the fingerprint,
+the column and the selector, which is what makes the repair a query rather than a command somebody
+had to invent. On the run that first configures an extractor that selection is the whole corpus,
+because every row records `NULL` until something has scanned it.
 
 ### 10.4 Offline derived-generation rebuilds
 

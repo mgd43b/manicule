@@ -21,6 +21,11 @@ absent value in each case is the safe one.
 Stdio transports never come here at all, and that is the point of
 :func:`stdio` — a bind decision that is not made cannot be made wrongly, so the MCP server's
 default mode has no address to get wrong.
+
+:func:`require_authoring_authentication` is the one rule here that is stricter than the three
+above: a socket carrying ``document_create`` needs authentication even on loopback, because
+"reachable only from this machine" is a weaker statement about a write into a corpus than it is
+about a read out of one.
 """
 
 from __future__ import annotations
@@ -84,6 +89,46 @@ class Bind:
         """One line, for a banner or a log."""
         scope = "loopback only" if self.loopback else "REACHABLE FROM THE NETWORK"
         return f"{self.host}:{self.port} ({scope})"
+
+
+def require_authoring_authentication(settings: Settings) -> None:
+    """Refuse to serve authoring over a socket without authentication.
+
+    Called by every path that puts a server on a port —
+    :func:`manicule.mcp.serve.address_for` for the MCP-only transport and
+    :func:`manicule.api.app.build_app` for the application everything else is served from. Not
+    called for stdio, which has no port for anything to reach.
+
+    **This is stricter than :func:`resolve_bind`, deliberately.** That one admits a loopback bind
+    with no authentication at all, which is right for a surface that reads: the port is reachable
+    only from this machine. ``document_create`` writes into a corpus, and on a laptop "only from
+    this machine" includes every process on it and every page a browser has open. So the rule for
+    authoring is the one :func:`resolve_bind` applies to a wide bind, applied to every bind.
+
+    **The condition is authoring being configured, not the tool existing.** Unconfigured, it is
+    published and refuses every call with a :class:`~manicule.core.errors.ConfigError` naming the
+    settings it needs — so it carries no authority, and an installation that never wanted it is
+    not asked to turn authentication on for a feature it does not use.
+
+    Refusing at startup rather than per call, because the alternative is a server that runs,
+    accepts connections and declines the one operation somebody deployed it for — discovered by a
+    client, at the far end, after a turn has been spent on it.
+
+    Raises:
+        PolicyError: Authoring is configured and ``security.auth.mode`` is ``none``.
+    """
+    if not settings.authoring.configured or settings.security.auth.mode is not AuthMode.NONE:
+        return
+    msg = (
+        f"refusing to serve on a socket with authoring configured and no authentication. "
+        f"`authoring.source` is {settings.authoring.source!r}, so document_create can write into "
+        f"that corpus, and `security.auth.mode` is 'none', so anything that can reach the port "
+        f"can call it — on loopback that is every process and every page on this machine. Set "
+        f"security.auth.mode to 'api_key' or 'oauth', or clear `authoring.source` and "
+        f"`authoring.collections` to serve this installation read-only. Authoring over stdio "
+        f"needs none of this: a pipe has no port."
+    )
+    raise PolicyError(msg)
 
 
 def stdio() -> None:
@@ -165,6 +210,7 @@ __all__ = [
     "Bind",
     "is_every_interface",
     "is_loopback",
+    "require_authoring_authentication",
     "resolve_bind",
     "stdio",
 ]

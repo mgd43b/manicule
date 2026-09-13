@@ -323,7 +323,7 @@ shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifec
 
 | Surface | Started by | Shape |
 |:---|:---|:---|
-| **MCP** | `manicule start --mcp-only` | 41 tools over stdio, which opens no socket; 24 read-only tools at `/mcp/` when served over a port |
+| **MCP** | `manicule start --mcp-only` | 45 tools over stdio, which opens no socket; 27 at `/mcp/` when served over a port — the read-only ones, plus `document_create` |
 | **Command line** | `manicule <command>` | 27 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 12 areas of server-rendered HTML, 11 in the navigation |
@@ -389,9 +389,12 @@ caches it — and when there is no browser surface to redirect to, it says so an
 process *is* serving. `docs/surfaces.md` §6.3.
 
 **MCP is served from that same process and port**, at `/mcp/`, and it carries the **read-only
-tools only** — the write tools are not registered on it rather than refused, so there is no
-handler behind `document_delete` or `connector_sync` there at all. Over stdio, where one client
-talks to one process down a pipe, the whole surface is offered. `docs/surfaces.md` §6.1 says why.
+tools plus `document_create`** — every other write tool is not registered on it rather than
+refused, so there is no handler behind `document_delete` or `connector_sync` there at all.
+Authoring is the one exception because it is bounded by configuration an operator wrote rather
+than by arguments a caller sends, it is off until that configuration exists, and a socket serving
+it without authentication refuses to start. Over stdio, where one client talks to one process down
+a pipe, the whole surface is offered. `docs/surfaces.md` §6.1 says why.
 
 `/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
 same envelope the CLI prints under `--json`.
@@ -417,7 +420,7 @@ has a route, so there is no upload and no configuration write here either.
 
 ### The MCP server
 
-The primary interface: forty-one tools over the same service, speaking stdio by default,
+The primary interface: forty-five tools over the same service, speaking stdio by default,
 which opens no socket at all. To let Claude Code use your index:
 
 ```bash
@@ -443,6 +446,35 @@ server for you alone. What it writes:
 
 The server is also reachable as `python -m manicule.mcp`, for a client that would rather name an
 interpreter and a module than trust a console script to be on the PATH it happens to have.
+
+### Letting an assistant write, not only read
+
+`document_create` writes a markdown file into a configured filesystem source's root and indexes
+that path, returning once the document is searchable. The file stays the record — the corpus is a
+directory of markdown that git versions and anything else can read — so this adds an author, not a
+note database.
+
+```toml
+[authoring]
+source = "memories"        # a configured filesystem connector instance
+collections = ["memory"]   # the collections it may author into
+```
+
+Both are empty by default, and empty means authoring is off: the tool is offered on every surface
+and refuses every call naming these settings. With them set, a caller supplies a collection, a
+slug and a complete markdown body; manicule derives `<collection>/<slug>.md` beneath that source's
+root, so no caller ever names a path. The slug is the document's permanent identity, which is why
+retitling never breaks a citation or an inbound link. Writing to a slug that is taken is refused
+unless `overwrite` is passed, and the refusal names the document that holds it. If the write
+succeeds and the index does not take it, the file is kept and the result says so with the path.
+
+It is the one write tool served over a socket, and a socket that would serve it without
+authentication refuses to start. [`docs/memory-authoring.md`](docs/memory-authoring.md) is the
+whole of the reasoning, including why that is a narrower authority than indexing a directory.
+
+Install `manicule-plugin-wikilinks` beside it and `[[wikilinks]]` in those documents become typed
+graph edges, in both directions, with a lineage column that makes a rule change a repair rather
+than a silence.
 
 ## Running it as a server
 
@@ -574,11 +606,12 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
 | `src/manicule/cli` | Twenty-eight commands over that service, and nothing else |
-| `src/manicule/mcp` | Forty-one MCP tools over that service, and nothing else |
+| `src/manicule/mcp` | Forty-five MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/extension` | A Chrome extension that hands this browser's Confluence session to a local manicule. No build step |
 | `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
+| `packages/manicule-plugin-wikilinks` | Turns `[[wikilinks]]` into typed chunk relations. A plugin doing real work |
 
 The four surfaces are adapters: they parse arguments, call one method, and render what comes
 back. A rule that lived in one of them would be a rule the others did not have — and two of them

@@ -10,11 +10,15 @@ client and one process, so a write tool on it is unreachable from a network by c
 non-loopback bind needs a host somebody wrote down, an explicit opt-in the caller passes, and
 authentication switched on. Any one missing is a refusal.
 
-**And it carries the read-only tools only.** Binding a socket removes the property stdio had, so
-something has to replace it: :func:`~manicule.mcp.server.build_server` is asked for the read-only
-surface, which never registers a tool whose ``readOnlyHint`` is not true. The write tools stay on
-stdio, on the command line, and on the control socket of #139 — every one of them a place where a
-person is present or a process is the writer. See :data:`NETWORK_SURFACE_IS_READ_ONLY`.
+**And it carries the read-only tools, plus exactly one write.** Binding a socket removes the
+property stdio had, so something has to replace it: :func:`~manicule.mcp.server.build_server` is
+asked for the read-only surface, which registers a tool only when its ``readOnlyHint`` is true or
+its name is in :data:`~manicule.mcp.server.NETWORK_AUTHORING`. That set holds ``document_create``
+and nothing else. Every other write tool stays on stdio, on the command line, and on the control
+socket of #139 — every one of them a place where a person is present or a process is the writer.
+See :data:`NETWORK_SURFACE_IS_READ_ONLY`, and
+:func:`~manicule.app.bind.require_authoring_authentication` for the one thing a socket
+carrying authoring must have.
 
 **A socket also gets a front door**, which stdio has no use for and no place to put. ``/`` on
 this transport is where ``--mcp-only`` lands somebody who opened the address the process printed,
@@ -28,7 +32,7 @@ from typing import TYPE_CHECKING, Literal
 from starlette.responses import PlainTextResponse
 
 from manicule.app import frontdoor
-from manicule.app.bind import resolve_bind, stdio
+from manicule.app.bind import require_authoring_authentication, resolve_bind, stdio
 from manicule.app.results import ServerAddress
 from manicule.core.errors import PolicyError
 from manicule.mcp.server import TOOL_NAMES, Surface, build_surface
@@ -42,7 +46,7 @@ if TYPE_CHECKING:
 type Transport = Literal["stdio", "http"]
 
 NETWORK_SURFACE_IS_READ_ONLY = True
-"""Whether MCP served over a socket carries only the tools that read. It does, always.
+"""Whether MCP served over a socket is built as the read-only surface. It is, always.
 
 A named constant rather than a parameter, and that is the whole point of it: a parameter is a
 way of asking for the other answer, and there is no caller entitled to one. The absence of the
@@ -51,9 +55,14 @@ it keeps ``tests/api/test_routes.py``'s absences — by not building the thing, 
 guarding it — and a setting that could grant an exception would trade that for a configuration
 guarantee, which is a weaker one that fails silently.
 
+**What "read-only surface" means is decided at the registrations**, not here, and it now admits
+one named write: :data:`~manicule.mcp.server.NETWORK_AUTHORING`. That was its own decision with
+its own threat model, written down where the registrar reads it — which is exactly the shape
+this constant's last paragraph asked for. This still says "there is no per-caller escape from
+the surface the transport implies", and that remains true of every other write tool.
+
 It exists so the rule can be *read* at the one place a reader would look for it, and so
-``tests/mcp/test_transports.py`` can name it. If a write over the network is ever wanted, it is
-its own decision with its own threat model rather than a flag flipped here.
+``tests/mcp/test_transports.py`` can name it.
 """
 
 
@@ -116,7 +125,7 @@ def address_for(
 
     ``tools`` counts what *this* transport offers rather than what the module registers, so the
     line an operator reads at startup says how many tools the thing they just started actually
-    has. Reporting forty-three for a socket that carries twenty-six would be the banner
+    has. Reporting forty-five for a socket that carries twenty-seven would be the banner
     disagreeing with ``tools/list`` on the one number somebody would check.
 
     Raises:
@@ -126,6 +135,10 @@ def address_for(
     if transport == "stdio":
         stdio()
         return ServerAddress(transport="stdio", loopback=True, tools=len(TOOL_NAMES))
+    # Before the bind, so an installation that cannot legitimately serve authoring is refused
+    # for that reason rather than for whichever of the address checks it happens to also fail.
+    # Reached only here, past the stdio branch above: a pipe has no port for anything to reach.
+    require_authoring_authentication(service.settings)
     bind = resolve_bind(service.settings, host=host, port=port, allow_public=allow_public)
     return ServerAddress(
         transport="http",

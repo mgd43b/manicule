@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from manicule.app.results import (
+    DocumentCreated,
     Envelope,
     ErrorInfo,
     IngestReport,
@@ -164,48 +165,80 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
         payload = await call()
     except (ManiculeError, ValueError, OSError) as exc:
         return failed(op, workspace, error_info(exc))
+    reported = _self_reported_failure(op, payload)
+    if reported is None:
+        return succeeded(op, workspace, payload)
+    # Retained for the two payloads that carry work already done — counters an ingest committed,
+    # a file authoring left on disk. Every other failing payload describes something that did
+    # not happen, and attaching it would offer a partial result there is no partial result of.
+    retained = payload if isinstance(payload, IngestReport | DocumentCreated) else None
+    return failed(op, workspace, reported, payload=retained)
+
+
+def _self_reported_failure(op: str, payload: Payload) -> ErrorInfo | None:
+    """The failure a *successful-looking* payload is admitting to, or ``None``.
+
+    Five operations can return normally and still describe something that did not work, and
+    each of them has to reach a caller as ``ok: false`` rather than as a success whose counters
+    happen to say otherwise. An assistant reading ``ok`` first would otherwise be told an ingest
+    completed when its watermark did not advance, or that a document was authored when the file
+    is on disk and out of the index.
+
+    Separate from :func:`run_op` because the two ask different questions — "what happened" and
+    "is what happened a failure" — and because keeping them together made a single function with
+    one branch per operation, which is the shape that acquires a sixth branch nobody reads.
+    """
+    if isinstance(payload, DocumentCreated) and not payload.indexed:
+        # The file was written and the index did not take it. Reported as a failure **with the
+        # payload retained**, because the path on it is the only way back to content the caller
+        # has already handed over — and removing the file to make the envelope tidy would
+        # destroy the record in order to keep the derived index consistent with it, which is
+        # the wrong direction. A later sync indexes what is on disk.
+        return ErrorInfo(
+            type="DocumentNotIndexedError",
+            message=(
+                f"{payload.path} was written and could not be indexed"
+                + (f": {payload.detail}" if payload.detail else "")
+            ),
+            hint=(
+                "The file is on disk and is the record; it was not removed. Fix what the "
+                "message names and run the connector sync, or index the path again — the "
+                "document keeps the id reported here."
+            ),
+        )
     if isinstance(payload, IngestReport) and payload.retry_required:
-        reason = payload.incomplete_reason or ErrorInfo(
+        return payload.incomplete_reason or ErrorInfo(
             type="IncompleteIngestError",
             message="the ingest run did not complete",
             hint="Run the same ingest operation again; its watermark was not advanced.",
         )
-        return failed(op, workspace, reason, payload=payload)
     if (
         isinstance(payload, SnapshotStatusReport)
         and payload.verification_performed
         and payload.lifecycle.outcome == "failed"
     ):
-        return failed(
-            op,
-            workspace,
-            ErrorInfo(
-                type="SnapshotVerificationError",
-                message="the durable source snapshot failed manifest verification",
-                hint="Reacquire the source snapshot before rebuilding derived generations.",
-            ),
+        return ErrorInfo(
+            type="SnapshotVerificationError",
+            message="the durable source snapshot failed manifest verification",
+            hint="Reacquire the source snapshot before rebuilding derived generations.",
         )
     if (
         isinstance(payload, ReembedRunReport)
         and op in {"reembed_start", "reembed_resume"}
         and payload.lifecycle.outcome in {"failed", "canceled", "refused"}
     ):
-        return failed(
-            op,
-            workspace,
-            ErrorInfo(
-                type="ReembedLifecycleError",
-                message="the durable re-embedding operation did not complete successfully",
-                hint="Inspect `reembed status` before retrying or starting another run.",
-            ),
+        return ErrorInfo(
+            type="ReembedLifecycleError",
+            message="the durable re-embedding operation did not complete successfully",
+            hint="Inspect `reembed status` before retrying or starting another run.",
         )
     if (
         isinstance(payload, RebuildRunReport)
         and op == "rebuild_run"
         and payload.lifecycle.outcome in {"failed", "canceled"}
     ):
-        return failed(op, workspace, error_info(RebuildTerminalError()))
-    return succeeded(op, workspace, payload)
+        return error_info(RebuildTerminalError())
+    return None
 
 
 READ_ONLY_OPS: frozenset[str] = frozenset(

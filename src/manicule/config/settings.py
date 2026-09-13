@@ -1309,6 +1309,57 @@ class PluginSettings(Section):
     )
 
 
+class AuthoringSettings(Section):
+    """Where an authored document is allowed to land, and in which collections.
+
+    ``document_create`` writes a markdown file into a configured filesystem source's root and
+    then indexes that path, so the file stays the record and the connector stays how content
+    enters. What this section decides is the *bounds* of that authority, and it is two names
+    rather than one because they answer two questions an operator would not want answered by
+    the same setting: which directory may be written into, and which groupings within it a
+    caller may add to.
+
+    **Both are empty by default, and empty means authoring is off.** The operation exists on
+    every surface whether or not this is set; unconfigured, it refuses and names the settings.
+    That is the safe direction for a write, and it is the reason no surface needs a switch of
+    its own: an installation that never configured authoring has none, including over a socket.
+
+    The corpus this was built for is read as *instructions* rather than as data — assistants
+    treat recalled guidance as standing direction — so write access here is the ability to
+    place text in front of future sessions. Bounded authority is the whole design: one
+    workspace, one configured source, one of a named set of collections, at a path the caller
+    never supplies.
+    """
+
+    source: str = Field(
+        default="",
+        description="A configured connector *instance* name — the key in "
+        "``[connectors.<name>]`` — which must be a filesystem source. Its root is the only "
+        "directory an authored document can be written beneath, and its name becomes the "
+        "``source`` half of the document's identity, so a document authored here and the same "
+        "file later re-synced by that connector are one document rather than two.",
+    )
+    collections: tuple[str, ...] = Field(
+        default=(),
+        description="The collections a caller may author into, by name. A collection this "
+        "does not list is refused even when it exists in the workspace: the point of naming "
+        "them is that adding a collection to manicule does not silently widen what may be "
+        "written. Each name is also the directory beneath the root that its documents land "
+        "in, so it must be a single path segment.",
+    )
+
+    @property
+    def configured(self) -> bool:
+        """Whether authoring has been switched on by naming both a source and a collection.
+
+        Both, because either alone describes an operation that cannot run: a source with no
+        collection has nowhere to put a document that is not an unscoped pile, and collections
+        with no source have no root to be written beneath. Reporting "configured" for half of
+        it would move the refusal from the setting to the first call.
+        """
+        return bool(self.source and self.collections)
+
+
 # --- root ------------------------------------------------------------------------------------
 
 
@@ -1350,6 +1401,7 @@ class Settings(BaseSettings):
     events: EventSettings = Field(default_factory=EventSettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     ui: UiSettings = Field(default_factory=UiSettings)
+    authoring: AuthoringSettings = Field(default_factory=AuthoringSettings)
 
     @classmethod
     @override
@@ -1780,6 +1832,7 @@ __all__ = [
     "AuditSettings",
     "AuthMode",
     "AuthSettings",
+    "AuthoringSettings",
     "ConnectorSettings",
     "ContextSettings",
     "DataPolicySettings",

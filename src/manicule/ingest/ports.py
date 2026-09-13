@@ -189,6 +189,7 @@ class IngestStore(Protocol):
         embed_fp: str | None,
         parse_fp: str | None = None,
         glossary_fp: str | None = None,
+        relation_fp: str | None = None,
     ) -> None:
         """Record which fingerprints *this document* was last built with.
 
@@ -216,6 +217,14 @@ class IngestStore(Protocol):
                 fingerprint travels with them through
                 :meth:`GlossaryWriter.replace_glossary_entries`, so that the rows and the claim
                 about which rules produced them are one transaction rather than two.
+            relation_fp: Canonical ``RelationFingerprint``, or ``None`` to leave it. **This is
+                the only path that writes it**, and it is written after the document is
+                published rather than with it: relation extraction runs in ``after_store``,
+                over a document that is already committed, so there is no publish transaction
+                left to carry it. The consequence is deliberate — an extractor that raises
+                leaves this column exactly as it was, so the document stays selected and the
+                next repair picks it up. A fingerprint recorded at publication would claim an
+                extractor had run over a document it failed on.
         """
         ...
 
@@ -247,6 +256,8 @@ class IngestStore(Protocol):
         statuses: Collection[DocumentStatus] | None = None,
         glossary_fp_other_than: str | None = None,
         glossary_fp_unrecorded: bool = False,
+        relation_fp_other_than: str | None = None,
+        relation_fp_unrecorded: bool = False,
     ) -> int:
         """How many documents match. A count, so a diagnostic need not page a corpus.
 
@@ -255,6 +266,11 @@ class IngestStore(Protocol):
         documents disagree with the installed detector, and reading them out to count them
         would make a health check proportional to the corpus. ``glossary_fp_unrecorded`` is the
         ``NULL`` half of that, which is a one-time migration rather than ordinary staleness.
+
+        ``relation_fp_other_than`` and ``relation_fp_unrecorded`` are the same pair one stage
+        further on, and are here for the same caller: ``doctor`` reports how much of the corpus
+        disagrees with the installed extractor, and reading the documents to count them would
+        make a health check proportional to the corpus.
         """
         ...
 
@@ -267,6 +283,7 @@ class IngestStore(Protocol):
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
+        relation_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> Sequence[Document]:
@@ -290,6 +307,12 @@ class IngestStore(Protocol):
                 A set rather than a single value because there is no one current parse
                 fingerprint: a corpus holds as many as it has parsers, and a ``pypdfium2``
                 bump moves exactly one of them.
+            relation_fp_other_than: Everything a *different* extractor derived edges from, plus
+                everything nothing has derived edges from at all. A single value and an
+                exclusion, on ``glossary_fp_other_than``'s reasoning exactly — and on first
+                enable the selection is the whole corpus, because every row records ``NULL``
+                until something has scanned it. That is the backfill: no command of its own,
+                the repair selector the other stages already have.
             limit: Cap the result.
             offset: How many of the selected documents to skip, in the store's own order.
 

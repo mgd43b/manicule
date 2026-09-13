@@ -454,6 +454,26 @@ def render_document_resolved(out: Console, payload: r.DocumentResolved) -> None:
     out.print(Text(payload.content))
 
 
+def render_document_created(out: Console, payload: r.DocumentCreated) -> None:
+    """Where the file is, first, and on both outcomes.
+
+    The path leads because it is the durable half: on success it says where the corpus grew,
+    and on a write the index declined it is the only way back to content the caller has already
+    handed over. The failure's own sentence is printed by the envelope above this; what would
+    be unhelpful here is a renderer that showed a path only when everything worked.
+    """
+    verb = "replaced" if payload.overwritten else "wrote"
+    out.print(f"{verb} [bold]{escape(payload.path)}[/bold]")
+    if not payload.indexed:
+        out.print("[yellow]the file is on disk and is not indexed; it was not removed[/yellow]")
+        return
+    member = payload.collection if payload.member else f"{payload.collection} (not added)"
+    out.print(
+        f"[dim]{payload.document_id} · {payload.chunks} chunk(s) · "
+        f"{escape(member)} · {payload.elapsed_ms} ms[/dim]"
+    )
+
+
 def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:
     where = "the trash" if payload.mode == "soft" else "the index, permanently"
     out.print(f"removed [bold]{payload.document_id}[/bold] into {where}")
@@ -1449,6 +1469,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.DocumentList: lambda out, p: render_document_list(out, _as(r.DocumentList, p)),
     r.DocumentDetail: lambda out, p: render_document(out, _as(r.DocumentDetail, p)),
     r.DocumentResolved: lambda out, p: render_document_resolved(out, _as(r.DocumentResolved, p)),
+    r.DocumentCreated: lambda out, p: render_document_created(out, _as(r.DocumentCreated, p)),
     r.DocumentDeleted: lambda out, p: render_document_deleted(out, _as(r.DocumentDeleted, p)),
     r.DocumentReindexed: lambda out, p: render_document_reindexed(out, _as(r.DocumentReindexed, p)),
     r.StaleReparseReport: lambda out, p: render_stale_reparse(out, _as(r.StaleReparseReport, p)),

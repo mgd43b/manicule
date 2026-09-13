@@ -47,7 +47,12 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
 
     from manicule.core.content import Chunk, Document
-    from manicule.core.fingerprints import ChunkFingerprint, GlossaryFingerprint, ParseFingerprint
+    from manicule.core.fingerprints import (
+        ChunkFingerprint,
+        GlossaryFingerprint,
+        ParseFingerprint,
+        RelationFingerprint,
+    )
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Embedder, VectorStore
     from manicule.ingest.pipeline import BlobSink, IngestPipeline
@@ -146,6 +151,7 @@ async def select(
     chunk_fingerprint: ChunkFingerprint | None = None,
     parse_fingerprints: Collection[ParseFingerprint] | None = None,
     glossary_fingerprint: GlossaryFingerprint | None = None,
+    relation_fingerprint: RelationFingerprint | None = None,
     limit: int | None = None,
     offset: int = 0,
 ) -> Sequence[Document]:
@@ -175,6 +181,19 @@ async def select(
     version is being resolved by the new one. This is the selector that closes that window on
     demand, and it needs no network — re-parse reads retained bytes.
 
+    ``relation_fingerprint`` is the same thing again for the extractor that derived a document's
+    chunk relations, and it is the whole of how the existing corpus acquires a graph. Extraction
+    runs during ingest, so a middleware installed today reaches nothing already stored; pass
+    what the configured chain would produce now —
+    :meth:`~manicule.ingest.middleware.MiddlewareRunner.relation_lineage` — and the selection is
+    everything that disagrees, which on the first enable is every document, because each records
+    ``NULL`` until something has scanned it. There is no backfill command: this is the selector,
+    and :func:`re_parse` is the repair.
+
+    **The predicates are ANDed.** Two fingerprints together select what is stale in both stages
+    rather than in either, which is almost never what a repair wants — one repair, one stage,
+    one fingerprint.
+
     ``offset`` is for the caller that repairs what it selects: see :func:`re_parse_stale`,
     which is the only one, and :meth:`~manicule.ingest.ports.IngestStore.select_documents` for
     why a page number would be the wrong cursor for a set that shrinks under it.
@@ -191,6 +210,7 @@ async def select(
         chunk_fp_other_than=chunk_fingerprint.canonical() if chunk_fingerprint else None,
         parse_fp_current=current,
         glossary_fp_other_than=(glossary_fingerprint.canonical() if glossary_fingerprint else None),
+        relation_fp_other_than=(relation_fingerprint.canonical() if relation_fingerprint else None),
         limit=limit,
         offset=offset,
     )

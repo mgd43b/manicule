@@ -173,6 +173,9 @@ class MemoryIngestStore:
         start of every run and make change detection pass for the wrong reason.
         """
         self.glossary_lineage_by_id: dict[str, str] = {}
+        self.relation_lineage_by_id: dict[str, str] = {}
+        """``documents.relation_fp`` per document. Empty by default, which is the honest state
+        for a fixture nothing has extracted relations from — and the one a repair must select."""
         """``documents.glossary_fp``, beside the documents for the same reason ``parse_fp`` is.
 
         The domain :class:`~manicule.core.content.Document` deliberately does not carry it —
@@ -417,6 +420,7 @@ class MemoryIngestStore:
         embed_fp: str | None,
         parse_fp: str | None = None,
         glossary_fp: str | None = None,
+        relation_fp: str | None = None,
     ) -> None:
         current = self.lineage.get(document_id, (None, None))
         self.lineage[document_id] = (
@@ -427,6 +431,8 @@ class MemoryIngestStore:
             self.parse_lineage[document_id] = parse_fp
         if glossary_fp is not None:
             self.glossary_lineage_by_id[document_id] = glossary_fp
+        if relation_fp is not None:
+            self.relation_lineage_by_id[document_id] = relation_fp
 
     async def set_original(
         self, document_id: str, *, ref: str | None, omitted_reason: str | None
@@ -462,12 +468,19 @@ class MemoryIngestStore:
         statuses: Collection[DocumentStatus] | None = None,
         glossary_fp_other_than: str | None = None,
         glossary_fp_unrecorded: bool = False,
+        relation_fp_other_than: str | None = None,
+        relation_fp_unrecorded: bool = False,
     ) -> int:
         found = await self.select_documents(
-            source=source, statuses=statuses, glossary_fp_other_than=glossary_fp_other_than
+            source=source,
+            statuses=statuses,
+            glossary_fp_other_than=glossary_fp_other_than,
+            relation_fp_other_than=relation_fp_other_than,
         )
         if glossary_fp_unrecorded:
             found = [d for d in found if d.id not in self.glossary_lineage_by_id]
+        if relation_fp_unrecorded:
+            found = [d for d in found if d.id not in self.relation_lineage_by_id]
         return len(found)
 
     async def select_documents(
@@ -479,6 +492,7 @@ class MemoryIngestStore:
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
+        relation_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> Sequence[Document]:
@@ -507,6 +521,14 @@ class MemoryIngestStore:
             # would otherwise drop those rows on three-valued logic.
             chosen = [
                 d for d in chosen if self.glossary_lineage_by_id.get(d.id) != glossary_fp_other_than
+            ]
+        if relation_fp_other_than is not None:
+            # The same shape once more, and the ``NULL`` half matters more here: until something
+            # has extracted relations every document records nothing, so on a first enable this
+            # predicate selects the whole corpus and a fake that dropped the unrecorded rows
+            # would report a backfill as already finished.
+            chosen = [
+                d for d in chosen if self.relation_lineage_by_id.get(d.id) != relation_fp_other_than
             ]
         # Sliced after every predicate, in that order, because the store applies `OFFSET` to the
         # filtered result and a fake that skipped first would page through a different set.

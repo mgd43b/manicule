@@ -660,6 +660,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "document_list": r.DocumentList,
     "document_get": r.DocumentDetail,
     "document_resolve": r.DocumentResolved,
+    "document_create": r.DocumentCreated,
     "document_delete": r.DocumentDeleted,
     "document_reindex": r.DocumentReindexed,
     "document_reindex_stale": r.StaleReparseReport,
@@ -984,6 +985,60 @@ def index(
 
 
 # --- document ---------------------------------------------------------------------------------
+
+
+@document_app.command("create")
+def document_create(
+    collection: Annotated[str, typer.Argument(help="Which collection to author into, by name.")],
+    slug: Annotated[str, typer.Argument(help="Identity and filename stem. One path component.")],
+    file: Annotated[
+        Path | None,
+        typer.Option(
+            "--file",
+            "-f",
+            help="Read the markdown from this file. Omit it, or pass -, to read standard input.",
+        ),
+    ] = None,
+    *,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Replace the document already holding this slug."),
+    ] = False,
+) -> None:
+    """Write a markdown document into the corpus and index it.
+
+    The body comes from a file or from standard input rather than from an argument, because a
+    complete markdown document with front matter in it is not a thing anybody types between
+    quotes — and a shell that helpfully interpreted a `$` or a backtick in it would change the
+    document without saying so.
+    """
+    submit(
+        Command(
+            "document_create",
+            {
+                "collection": collection,
+                "slug": slug,
+                "body": _authored_body(file),
+                "overwrite": overwrite,
+            },
+        )
+    )
+
+
+def _authored_body(file: Path | None) -> str:
+    """The markdown to author, from a file or from standard input.
+
+    ``-`` means standard input as it does everywhere else, and so does no ``--file`` at all: a
+    heredoc is how a person writes a document at a terminal and a pipe is how a script does.
+
+    Read here rather than in the service because a :class:`~manicule.app.commands.Command` is
+    JSON that may cross a socket to a server, and a *path* in it would be resolved in whichever
+    process ran the command — which is the wrong one whenever the server is not on this machine.
+    The body travels; the path does not.
+    """
+    if file is None or str(file) == "-":
+        return sys.stdin.read()
+    return Path(file).expanduser().read_text(encoding="utf-8")
 
 
 @document_app.command("list")

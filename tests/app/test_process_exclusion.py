@@ -271,6 +271,11 @@ WRITERS: frozenset[str] = frozenset(
         "config_set",
         "connector_sidecar",
         "connector_sync",
+        # Authoring writes a file into the corpus directory and then indexes it, so it takes
+        # the data directory exactly as `index_path` does — and the file write is not the
+        # reason. A reader that saw "it writes a file, not the index" and classified it the
+        # other way would have an ingest running without the lock.
+        "document_create",
         "document_delete",
         "document_redetect_glossary",
         "document_reindex",

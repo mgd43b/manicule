@@ -333,6 +333,7 @@ class Document(Base):
     chunk_fp:      Mapped[str | None]                          # short hash, §6.4
     embed_fp:      Mapped[str | None]
     glossary_fp:   Mapped[str | None]                          # canonical, §6.4
+    relation_fp:   Mapped[str | None]                          # canonical, §6.4
 
     metadata_:     Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     created_at:    Mapped[datetime]
@@ -446,7 +447,7 @@ which needs no counter and is correct even after a crash.
 Indexes: `(workspace_id, status)`, `(workspace_id, uri)`, `(content_hash)`,
 `(workspace_id, deleted_at) WHERE deleted_at IS NOT NULL` (the trash view; live-row queries
 fold `deleted_at IS NULL` into the partial indexes above), `(connector_id)`,
-`(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`, `(glossary_fp)`.
+`(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`, `(glossary_fp)`, `(relation_fp)`.
 
 ### 4.2.1 Authoritative source metadata, and why it is not a column
 
@@ -584,6 +585,17 @@ Index("ix_chunk_relations_target", "target_chunk_id")
 The index on `target_chunk_id` is not redundant with the primary key. Lookups are
 `WHERE source = ? OR target = ?`, and a composite key leading with `source` cannot serve the
 second half of that predicate.
+
+`relation_type` is plain `TEXT` with no `CHECK`, and the vocabulary is closed in
+`manicule.core.organization.ChunkRelationType` instead: `parent`, `sibling`, `links_to` and
+`mentions`. That is the right side of the trade §3.4 describes — a misspelled relation type
+produces an edge no query asks for, which is visible, inert and reversible, while a database
+constraint would make a plugin-defined relation a schema migration.
+
+The last two arrive with the wikilink middleware and are two claims rather than one spelling of
+the same claim: `links_to` is an author declaring a relationship — a link that is the content of
+its line — and `mentions` is a reference inside a sentence. Ranking a corpus by one and by the
+other gives different answers, and that difference is unrecoverable once the two are one type.
 
 ### 4.5 `blobs`
 
@@ -1470,6 +1482,36 @@ cost the thing it is asking about.
 **`NULL` is not backfilled**, for the reason it is not backfilled one column along, and with a
 cheaper remedy: the repair reads chunks rather than retained bytes, so the price of admitting
 ignorance is a text pass rather than a re-parse and a re-embed.
+
+**`documents.relation_fp` is the fifth, and it reads exactly as `glossary_fp` does one stage
+further on.** It carries the canonical `RelationFingerprint`: the extraction strategy's name, a
+digest over the rules that decide which `chunk_relations` edges a document contributes, and the
+configured middleware chain. Extraction is a plugin's — `[[wikilink]]` is a memory idiom rather
+than a markdown one — so an installation with no relation middleware configured records the
+`disabled` fingerprint rather than nothing at all, and installing one therefore selects the whole
+corpus:
+
+```sql
+-- everything a different extractor derived edges from, plus everything nothing has scanned
+SELECT id FROM documents WHERE relation_fp IS NULL OR relation_fp <> :installed
+```
+
+The `IS NULL` half matters more here than one column along, not less: until something has scanned
+a document its relation lineage is `NULL`, so on a first enable that half *is* the corpus, and a
+plain inequality would select nothing and report a backfill as finished before it started.
+
+**It is a column rather than a property of the edges**, and the reason is the state with no edges
+in it. A document that contains no links records the fingerprint and writes no rows; stored beside
+the rows, "the current extractor found nothing here" and "nobody has looked" would be one state —
+and since most of a corpus is link-free, every repair would re-select almost all of it and end with
+exactly as much outstanding as it started with.
+
+**It is written after publication and only on success.** Extraction runs in `after_store`, over a
+document already committed, so there is no publish transaction left to carry it;
+`manicule.ingest.pipeline.IngestPipeline._observe` writes it through `set_lineage` on the path
+where every hook returned. An extractor that raises leaves the column as it was, so the document
+stays selected — where stamping regardless would claim an extractor had run over a document it
+failed on.
 
 **`parse_fp` cannot express a re-route, and this is the limit of it rather than a defect in
 it.** The query above compares each document against the current fingerprint *of the parser it

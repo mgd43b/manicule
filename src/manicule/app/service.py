@@ -1812,7 +1812,9 @@ class ApplicationService:
             ),
         )
 
-    async def _filesystem_source(self, name: str) -> FilesystemConnector:
+    async def _filesystem_source(
+        self, name: str, *, require_profiles: bool = True
+    ) -> FilesystemConnector:
         """The constructed filesystem connector for a configured source, or a stated refusal.
 
         Every check here answers "would naming this source produce a conversion that agrees with
@@ -1824,6 +1826,13 @@ class ApplicationService:
         Ordered so that the cheap configuration questions are answered before anything is built.
         A disabled or mistyped source should not construct a connector to be told it was the
         wrong one.
+
+        ``require_profiles`` is the one check that is not universal, and it is a parameter
+        rather than a second resolver because every other question here — configured, enabled,
+        a filesystem source, actually building one — is asked identically by both callers.
+        Sidecar generation needs enriched profiles; authoring needs a **root**, and refusing to
+        author into a plain directory of markdown because it declares no HTML export convention
+        would be a check borrowed from an unrelated operation.
         """
         from manicule.connectors.config import FILESYSTEM_CONNECTOR_NAME  # noqa: PLC0415
         from manicule.connectors.filesystem import FilesystemConnector  # noqa: PLC0415
@@ -1869,7 +1878,7 @@ class ApplicationService:
                 f"enriched profiles this can convert with."
             )
             raise ConfigError(msg)
-        if not connector.profiles:
+        if require_profiles and not connector.profiles:
             msg = (
                 f"{name!r} declares an empty `enriched_profiles`, which turns adaptation off: "
                 f"every HTML file under it is indexed as ordinary HTML and none is an enriched "
@@ -2131,6 +2140,182 @@ class ApplicationService:
             return _Body(
                 text=b64encode(raw).decode("ascii"), encoding="base64", byte_count=len(raw)
             )
+
+    async def document_create(
+        self,
+        *,
+        collection: str,
+        slug: str,
+        body: str,
+        overwrite: bool = False,
+    ) -> r.DocumentCreated:
+        """Author one markdown document into the corpus, and return once it is searchable.
+
+        **A file is written into the configured filesystem source's root and that path is then
+        indexed.** Nothing stores a document any other way: the file remains the record, the
+        connector remains how content enters, and manicule stays retrieval infrastructure over
+        sources rather than acquiring a second notion of what a document is. What that buys is
+        an exit — the corpus is a directory of markdown that git versions and any other tool can
+        read — and it keeps data-ownership and migration obligations out of this project.
+
+        **The caller supplies a slug, never a path.** ``<collection>/<slug>.md`` beneath the
+        root is derived here, which is what makes traversal impossible by construction rather
+        than by validation; :func:`_authored_path` then checks containment anyway, because a
+        derivation and a check are two different kinds of confidence. A slug rather than a title
+        because ``document_id`` is a digest of ``(workspace, source, source_id)`` and
+        ``source_id`` is that path — so whatever this picks is the document's identity
+        permanently, and a title is a thing people change.
+
+        **It returns only once the document is published**, rather than queuing the file for a
+        watcher to notice. An assistant that writes a memory and immediately searches for it has
+        to find it; anything else makes the operation feel broken in exactly the situation it
+        exists for. Embedding one small markdown file is not a reason to go asynchronous.
+
+        **Front matter is the caller's.** Nothing here synthesizes ``name``, ``description`` or
+        a type. The corpus has its own schema and its own conventions, and a retrieval system
+        inventing metadata for someone else's documents is how two sources of truth start. What
+        is checked is that what arrived is well formed enough to parse as intended.
+
+        Args:
+            collection: The collection to author into, by name — the handle a person and an
+                assistant both have, where an id is a uuid nobody quotes. It must be one of
+                ``authoring.collections``, and it is also the directory beneath the root that
+                the file lands in.
+            slug: The document's identity and its filename stem. A single path segment.
+            body: Complete markdown, front matter included.
+            overwrite: Replace the document already holding this slug. Off by default: the
+                convention is to revise an existing fact rather than add a near-duplicate, so
+                callers write to an existing slug deliberately — and also by accident. This is
+                the whole of update; there is no patch or append, because the corpus is one
+                self-contained fact per file rather than a log, and an append that never read
+                the file cannot know where the front-matter fence ends.
+
+        Returns:
+            Where the file is, the identity it was indexed under, and whether the index has it.
+            A write that could not be indexed keeps the file and reports ``indexed: false``.
+
+        Raises:
+            ConfigError: Authoring is not configured, or the configured source is not a usable
+                filesystem source.
+            PolicyError: The collection is not one authoring may write into, or the slug is
+                already taken and ``overwrite`` was not asked for.
+            UnknownEntityError: The collection is configured for authoring and does not exist
+                in this workspace.
+            ValueError: The slug is not a single safe path segment, or the body is empty or
+                opens a front-matter fence it never closes.
+        """
+        started = time.monotonic()
+        authoring = self.settings.authoring
+        if not authoring.configured:
+            msg = (
+                "document authoring is not configured. Set `authoring.source` to a configured "
+                "filesystem connector instance and `authoring.collections` to the collections "
+                "it may write into; until both are set there is no root to write beneath and "
+                "no scope to write within, so the operation refuses rather than choosing one."
+            )
+            raise ConfigError(msg)
+        if collection not in authoring.collections:
+            permitted = ", ".join(repr(name) for name in authoring.collections)
+            # Refused against the *configured* list rather than against the workspace's
+            # collections, and the difference is the point: adding a collection to manicule must
+            # not widen what may be written into it.
+            msg = (
+                f"collection {collection!r} is not one this installation authors into. "
+                f"`authoring.collections` names {permitted}. Authoring is scoped to a configured "
+                f"set so that creating a collection is not also the act of granting write access "
+                f"to it."
+            )
+            raise PolicyError(msg)
+        _require_segment(slug, "slug")
+        # The collection name is a directory beneath the root as well as a scope, so it is held
+        # to the same rule. Operator-supplied rather than caller-supplied, which makes this
+        # unlikely rather than impossible — and "unlikely" is not what a path check is for.
+        _require_segment(collection, "collection name")
+        content = _authored_markdown(body)
+
+        store = await self._backend.organization()
+        found = await store.find_collection(collection)
+        if found is None:
+            msg = (
+                f"no collection {collection!r} in workspace {self.workspace!r}, though "
+                f"`authoring.collections` names it. Create it — `manicule collection create "
+                f"{collection}` — or correct the setting. The document is not written: a file "
+                f"on disk that no collection holds is exactly the unscoped pile taking a "
+                f"collection on this operation exists to prevent."
+            )
+            raise UnknownEntityError(msg)
+
+        connector = await self._filesystem_source(authoring.source, require_profiles=False)
+        # Through a thread because resolution is a syscall per segment, and **resolved** because
+        # the identity below has to be the one ingestion will record: `index_path` resolves the
+        # path it is given, so a target that differed by a symlinked segment would be written
+        # under one id and reported under another.
+        target = await asyncio.to_thread(
+            _authored_path, connector, collection=collection, slug=slug
+        )
+        identifier = document_id_of(self.workspace, authoring.source, str(target))
+        conflict = await self._authored_conflict(target, identifier)
+        if conflict is not None and not overwrite:
+            raise PolicyError(conflict)
+
+        await asyncio.to_thread(_write_authored, target, content)
+
+        report = await self.index_path(target, source=authoring.source)
+        documents = await self._backend.documents()
+        stored = await documents.get_document(identifier)
+        indexed = stored is not None and stored.status is DocumentStatus.INDEXED
+        member, detail = False, "" if indexed else _not_indexed(report, stored)
+        if indexed:
+            try:
+                await self.collection_add(found.id, [identifier])
+            except ManiculeError as exc:
+                # Reported rather than raised, because by here the file is on disk **and** in the
+                # index: raising would replace a result naming a document that exists with an
+                # error naming nothing, and the caller would have no handle on the thing it just
+                # created. `member` is the field that says which of the two writes happened.
+                detail = f"indexed, and not added to collection {collection!r}: {exc}"
+            else:
+                member = True
+        return r.DocumentCreated(
+            document_id=identifier,
+            path=str(target),
+            slug=slug,
+            collection=collection,
+            collection_id=found.id,
+            source=authoring.source,
+            indexed=indexed,
+            member=member,
+            overwritten=conflict is not None,
+            chunks=len(await documents.document_chunks(identifier)) if indexed else 0,
+            detail=detail,
+            elapsed_ms=_millis(started),
+        )
+
+    async def _authored_conflict(self, target: Path, document_id: str) -> str | None:
+        """Why writing to this path would replace something, or ``None`` when it would not.
+
+        Two questions rather than one, because they can disagree and the answer has to cover
+        both. A stored document says the slug is taken and names what holds it, which is what a
+        caller needs in order to read the existing fact and revise it. A file on disk with no
+        stored document says the slug is taken too — a write that failed to index, a file
+        committed by hand, a corpus not yet synced — and silently overwriting it because the
+        index had not noticed it yet would lose content manicule never saw.
+        """
+        store = await self._backend.documents()
+        stored = await store.get_document(document_id)
+        if stored is not None:
+            return (
+                f"document {stored.id} already holds slug {target.stem!r} at {target}. Read it "
+                f"first and write the revised fact back with overwrite, rather than adding a "
+                f"near-duplicate: the corpus convention is one self-contained fact per file."
+            )
+        if await asyncio.to_thread(target.exists):
+            return (
+                f"{target} already exists and is not indexed in workspace {self.workspace!r}. "
+                f"It may be a write that did not reach the index, or a file another tool put "
+                f"there. Pass overwrite to replace it, having read it."
+            )
+        return None
 
     async def document_delete(self, document_id: str, *, hard: bool = False) -> r.DocumentDeleted:
         """Remove a document, into the trash by default.
@@ -6544,6 +6729,141 @@ def pre_upgrade_destination(data_dir: Path, *, moment: int) -> Path:
         An absent directory, ready to be created by whoever writes into it.
     """
     return data_dir.parent / f"{data_dir.name}-backups" / f"pre-upgrade-{moment}"
+
+
+AUTHORED_SUFFIX = ".md"
+"""The one extension an authored document is written under.
+
+Fixed rather than derived from the body or supplied by the caller. A caller that could name an
+extension could name the media type the parser chain picks, which is a second way of deciding
+what a document *is* alongside the one the connector already has — and the operation is
+markdown authoring, so there is nothing for the choice to express.
+"""
+
+
+def _require_segment(value: str, what: str) -> None:
+    """Refuse anything that is not one ordinary path component.
+
+    Separators, ``.``, ``..``, an absolute path, a drive letter, a NUL: each refused by name so
+    the message says which rule was broken rather than reporting a resolved path somebody has
+    to reverse-engineer. The last clause is the general one — a value that does not survive
+    normalization unchanged is not the value it appears to be, whatever produced the difference.
+
+    **This is belt to :func:`_authored_path`'s braces.** The caller supplies no path at all, so
+    traversal is already impossible by construction; what this adds is that a slug which *looks*
+    like a traversal attempt is refused with a sentence about slugs rather than accepted and
+    then silently transformed into a neighboring filename.
+    """
+    if not value.strip():
+        msg = f"a {what} is required and must not be empty or blank"
+        raise ValueError(msg)
+    if value in {os.curdir, os.pardir}:
+        msg = f"{value!r} is not a {what}; it names a directory relative to another one"
+        raise ValueError(msg)
+    if any(character in value for character in ("/", "\\", "\x00")) or os.sep in value:
+        msg = (
+            f"a {what} is one path component, so {value!r} is refused: it carries a separator. "
+            f"The path a document is written to is derived from the collection and the slug and "
+            f"is never supplied by a caller."
+        )
+        raise ValueError(msg)
+    if value != value.strip() or Path(value).is_absolute() or Path(value).name != value:
+        msg = (
+            f"{value!r} is not usable as a {what}: it does not survive normalization unchanged, "
+            f"so the file it names is not the file it reads as"
+        )
+        raise ValueError(msg)
+
+
+def _authored_markdown(body: str) -> str:
+    """The body as it will be written, refusing what would not parse as intended.
+
+    Two refusals, and neither authors anything. An empty document is a file with no content to
+    retrieve, which is a mistake in every case and an expensive one where it overwrites a fact
+    that had content. An **unterminated front-matter fence** is the sharper one: CommonMark
+    reads ``name: something`` followed by ``---`` as a setext heading, so a document whose fence
+    never closes acquires a top-level heading nobody wrote and hangs every heading path in the
+    file beneath it. The parser's ``front_matter`` setting skips a *closed* fence; it has no way
+    to rescue an open one, and the damage is silent.
+
+    A trailing newline is added when the body has none, which is the one edit made to what a
+    caller sent. It is a property of the file rather than of the content — every tool that
+    reads the corpus, git included, treats a missing final newline as a difference — and it
+    changes no block, no anchor and no chunk.
+    """
+    if not body.strip():
+        msg = "the document body is empty; there would be nothing to index or to cite"
+        raise ValueError(msg)
+    from manicule.parsers.markdown import (  # noqa: PLC0415 - keeps markdown-it off this path
+        FRONT_MATTER_FENCE,
+        front_matter_end,
+    )
+
+    lines = body.splitlines()
+    if lines and lines[0].strip() == FRONT_MATTER_FENCE and front_matter_end(lines) == 0:
+        msg = (
+            "the front matter opens with `---` and never closes. Left that way the whole block "
+            "is read as content, and CommonMark turns its last line into a heading the document "
+            "does not have — so every heading path below it would be wrong. Close the fence."
+        )
+        raise ValueError(msg)
+    return body if body.endswith("\n") else body + "\n"
+
+
+def _authored_path(connector: FilesystemConnector, *, collection: str, slug: str) -> Path:
+    """Where a document authored into ``collection`` under ``slug`` is written.
+
+    Derived from the two names and the connector's own resolved root, so the caller names no
+    part of it, and returned resolved so that this and the path ingestion records are one string.
+    Containment is nonetheless asserted with
+    :meth:`~manicule.connectors.filesystem.FilesystemConnector.contains` — the same check that
+    decides whether a stored document's path may be *read* — because a derivation is an argument
+    and a check is a fact, and the two are worth having separately at the one boundary where
+    being wrong means writing outside the corpus.
+
+    Raises:
+        ConfigError: The derived path resolves outside the root, which can only happen where
+            something under the root is a symbolic link out of it.
+    """
+    target = (connector.root / collection / f"{slug}{AUTHORED_SUFFIX}").resolve()
+    if not connector.contains(target):
+        msg = (
+            f"{target} resolves outside {connector.root}, which is the only tree the "
+            f"{connector.name!r} source serves. A path derived from a collection and a slug "
+            f"reaches outside a root only through a symbolic link inside it; authoring does "
+            f"not follow one, because the connector that later reads the corpus does not."
+        )
+        raise ConfigError(msg)
+    return target
+
+
+def _write_authored(target: Path, content: str) -> None:
+    """Write the file, creating the collection's directory if it is the first document in it.
+
+    Blocking, and called through a thread for that reason. UTF-8 and ``\n`` explicitly rather
+    than by platform default: a corpus written on one machine and read on another must not
+    differ by the locale of whoever wrote it, and a line ending that varies would move the
+    version token of every file it touched.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8", newline="\n")
+
+
+def _not_indexed(report: r.IngestReport, stored: Document | None) -> str:
+    """Why a written file is not searchable, in one sentence for the caller who wrote it.
+
+    The ingest run's own error first, because it is the specific one. Then the stored
+    document's status detail, which is where a parse or embed refusal lands. Then a fallback
+    that is true whatever happened — the counters are on the envelope's payload, and a sentence
+    that claimed more than that would be guessing.
+    """
+    if report.error:
+        return report.error
+    if stored is not None:
+        return f"the document is {stored.status.value}" + (
+            f": {stored.status_detail}" if stored.status_detail else ""
+        )
+    return "the ingest run indexed nothing for this path"
 
 
 def _local(path: Path | str) -> Path:

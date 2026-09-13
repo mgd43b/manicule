@@ -108,7 +108,7 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
   connector-free derived publication with no separate settlement command.
 
-## MCP tools — 45
+## MCP tools — 46
 
 Ticket: #8 — **built.** Forty-four implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
@@ -141,6 +141,7 @@ than assume it.
 - [x] `connector_list`
 - [x] `connector_sync`
 - [x] `doctor`
+- [x] `document_create`
 - [x] `document_delete`
 - [x] `document_get`
 - [x] `document_resolve`
