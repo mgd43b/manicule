@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.18](https://github.com/mgd43b/manicule/compare/v0.1.17...v0.1.18) (2026-09-13)
+
+
+### Features
+
+* **storage:** serve the vector index from a Qdrant server ([#346](https://github.com/mgd43b/manicule/issues/346)) ([393f615](https://github.com/mgd43b/manicule/commit/393f615398183aaa1f9ae711b2501dacf72be4ce))
+
 ## [0.1.17](https://github.com/mgd43b/manicule/compare/v0.1.16...v0.1.17) (2026-09-13)
 
 
