@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/mgd43b/manicule/compare/v0.1.15...v0.1.16) (2026-09-13)
+
+
+### Features
+
+* author documents into the corpus, and extract [[wikilinks]] as relations ([#336](https://github.com/mgd43b/manicule/issues/336)) ([67f1da5](https://github.com/mgd43b/manicule/commit/67f1da51239930944939de78d6bce0e6afb49622))
+
 ## [0.1.15](https://github.com/mgd43b/manicule/compare/v0.1.14...v0.1.15) (2026-09-01)
 
 
