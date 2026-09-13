@@ -1,10 +1,11 @@
 """Fingerprints — the identity of a process that produced stored data.
 
-Four exist: :class:`~manicule.core.embedding.EmbedFingerprint` for vectors,
+Five exist: :class:`~manicule.core.embedding.EmbedFingerprint` for vectors,
 :class:`ChunkFingerprint` for chunk boundaries, :class:`ParseFingerprint` for the text
-and anchors a parser extracted, and :class:`GlossaryFingerprint` for the definitions a
-detector read out of chunks. All four are persisted alongside the index and compared
-before anything is written, because all four describe transformations whose output is
+and anchors a parser extracted, :class:`GlossaryFingerprint` for the definitions a
+detector read out of chunks, and :class:`RelationFingerprint` for the edges an extractor
+derived from them. All five are persisted alongside the index and compared
+before anything is written, because all five describe transformations whose output is
 useless when mixed with output from a different version of themselves — and useless in the
 quiet way, where nothing raises and every answer is slightly wrong.
 
@@ -34,19 +35,23 @@ calls that per-document lineage; parsing is the case where it is the *only* hone
 detector rather than many, but its output is repaired one document at a time from chunks that
 are already stored, so a mismatch has to name the documents rather than refuse the run.
 
-**A mismatch does not raise for that last one, and it is the only exception.** The three above
-describe data that is *incomparable* across versions — a vector from another model, chunks from
-another budget — so mixing them is a defect nothing downstream can detect and the only available
-answer is to stop. Glossary entries from a superseded detector are merely wrong, which is a
-repairable state and one an operator has to be able to survey, re-index around and fix in place.
+**A mismatch does not raise for the last two, and they are the only exceptions.** The three
+above describe data that is *incomparable* across versions — a vector from another model, chunks
+from another budget — so mixing them is a defect nothing downstream can detect and the only
+available answer is to stop. Glossary entries from a superseded detector are merely wrong, which
+is a repairable state and one an operator has to be able to survey, re-index around and fix in
+place.
 Refusing every run against a corpus whose detector has moved would make a detector fix
-unshippable: the fix is what makes the corpus stale.
+unshippable: the fix is what makes the corpus stale. :class:`RelationFingerprint` is the same
+shape one stage further on — edges from a superseded extractor are wrong rather than
+incomparable, and repairable one document at a time from chunks that are already stored.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import ClassVar, Final, Self, override
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -396,11 +401,155 @@ class GlossaryFingerprint(Fingerprint):
         return f"{self.detector} rules {self.rules} ({listed})"
 
 
+@dataclass(frozen=True, slots=True)
+class RelationRules:
+    """What a relation extractor says about itself, for its fingerprint.
+
+    A value rather than three loose arguments because the whole of it comes from one place — a
+    middleware that derives edges — and travels to one place, :meth:`RelationFingerprint.of`. An
+    extractor that could contribute one field without the others would be an extractor whose
+    lineage is partly somebody else's, which is the state a fingerprint exists to make
+    impossible.
+
+    The extractor supplies these three and **not** the middleware chain, deliberately: it can
+    know its own rules and cannot know what else is configured beside it. The chain is added by
+    the pipeline, which is the only thing that does know.
+    """
+
+    extractor: str
+    """Which extraction strategy produced the edges. A name, for the same reason
+    :attr:`GlossaryFingerprint.detector` is one: a digest tells two versions apart and cannot
+    tell a typo fix from a different strategy."""
+
+    rules: str
+    """A digest over everything that decides which edges get written and how they are typed.
+
+    Whatever the extractor considers its own inputs — the link syntax it recognizes, the
+    normalization it applies to a target, the rule that decides a declared link from a mention.
+    Opaque here: this module compares it and never reads it.
+    """
+
+    libraries: tuple[str, ...] = ()
+    """Sorted ``name@version`` for everything outside the extractor that decides a stored edge.
+
+    Empty is a real answer, and the expected one for an extractor built on regular expressions
+    over text the pipeline already holds.
+    """
+
+
+EXTRACTION_DISABLED: Final = "disabled"
+"""What :attr:`RelationFingerprint.extractor` says when no extractor was configured.
+
+A recorded value rather than an absent one, on exactly :data:`DETECTION_DISABLED`'s argument.
+``NULL`` already means "never scanned", so an installation with no relation middleware must
+record *something* or an operator cannot tell a corpus whose edges were looked for and not found
+from one nobody has ever looked at. Installing the extractor then changes the fingerprint, which
+selects the whole corpus on the next repair — which is what somebody enabling it expects and
+would otherwise have to know to ask for.
+"""
+
+
+class RelationFingerprint(Fingerprint):
+    """The identity of the process that decided one document's stored chunk relations.
+
+    Relation extraction is a stage of its own with rules of its own, and this exists for the
+    reason :class:`GlossaryFingerprint` exists one stage over: the rules that decide which edges
+    a document contributes — a link syntax, a normalization, the line between a declared link
+    and a passing mention — move on their own schedule, and **none of the other three
+    fingerprints moves when they do**. A corpus would then report current parse, chunk and embed
+    lineage while serving a graph built by rules that had since been corrected.
+
+    **Why not a field on** :class:`ChunkFingerprint`. That one is compared once per run for the
+    whole corpus and a mismatch refuses the run, so folding extraction into it would make an
+    extractor fix unshippable: the fix is what makes the corpus stale, and the refusal would
+    then stop the repair. It is also the wrong scope — the chunk fingerprint describes where
+    chunks begin and end, and an extractor decided none of that. So this is per document, like
+    the glossary's, and a mismatch names documents rather than refusing a run.
+
+    **The empty result is a derived result.** A document scanned under the current rules that
+    contains no links records this fingerprint with no edges, and that is a different fact from
+    a document nothing has scanned, which records ``NULL``. Collapsing them is expensive rather
+    than merely untidy: every link-free document — most of a corpus — would be re-selected by
+    every repair, for ever, and each repair would end with exactly as much work outstanding as
+    it started with.
+    """
+
+    IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = ("extractor", "rules", "libraries", "middleware")
+
+    extractor: str = Field(
+        min_length=1,
+        description="Which extraction strategy produced the edges, or "
+        f"``{EXTRACTION_DISABLED!r}`` when no relation middleware was configured for the run "
+        "that last touched this document.",
+    )
+    rules: str = Field(
+        default="",
+        description="The extractor's digest over its own sources. Empty when extraction is "
+        "disabled, because none of them ran.",
+    )
+    libraries: tuple[str, ...] = Field(
+        default=(),
+        description="Sorted ``name@version`` for everything outside the extractor that decides "
+        "a stored edge. Empty when extraction is disabled.",
+    )
+    middleware: tuple[str, ...] = Field(
+        default=(),
+        description="Sorted ``name@version`` for **every** configured middleware, not only the "
+        "extractor and not only the ones declaring ``mutates_embedded_text``. The same reasoning "
+        ":attr:`GlossaryFingerprint.middleware` gives, arriving through a different door: an "
+        "edge names a *chunk*, so which chunk holds a link is part of what is stored — and chunk "
+        "boundaries follow from block metadata any hook may rewrite in ``after_parse``, carrying "
+        "no declaration at all. Filtering on ``mutates_embedded_text`` would be a guard that "
+        "looks right and covers the one field extraction never reads. Empty when extraction is "
+        "disabled.",
+    )
+
+    @classmethod
+    def disabled(cls) -> RelationFingerprint:
+        """What a document records when no extractor was configured.
+
+        Carries nothing but the state itself, on :meth:`GlossaryFingerprint.disabled`'s
+        reasoning: folding in a chain that did not run would churn the lineage of every document
+        nobody extracted anything for, every time an unrelated hook was configured.
+        """
+        return cls(extractor=EXTRACTION_DISABLED)
+
+    @classmethod
+    def of(cls, rules: RelationRules, *, middleware: Sequence[str] = ()) -> RelationFingerprint:
+        """One extractor's declaration, with the configured chain folded in.
+
+        The two halves come from different places and are joined here rather than at a call
+        site, so there is one answer to "what does this installation's extraction identity look
+        like" and the extractor cannot be asked to know something it cannot see.
+        """
+        return cls(
+            extractor=rules.extractor,
+            rules=rules.rules,
+            libraries=tuple(sorted(set(rules.libraries))),
+            middleware=tuple(sorted(set(middleware))),
+        )
+
+    @property
+    def extracts(self) -> bool:
+        """Whether this fingerprint describes an extractor that ran."""
+        return self.extractor != EXTRACTION_DISABLED
+
+    @override
+    def describe(self) -> str:
+        if not self.extracts:
+            return "chunk relation extraction disabled"
+        listed = ", ".join((*self.libraries, *self.middleware)) or "no libraries, no middleware"
+        return f"{self.extractor} rules {self.rules} ({listed})"
+
+
 __all__ = [
     "DETECTION_DISABLED",
+    "EXTRACTION_DISABLED",
     "PROVISIONAL_TOKENIZER_PREFIX",
     "ChunkFingerprint",
     "Fingerprint",
     "GlossaryFingerprint",
     "ParseFingerprint",
+    "RelationFingerprint",
+    "RelationRules",
 ]

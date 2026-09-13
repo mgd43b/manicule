@@ -26,10 +26,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from manicule.api.app import MCP_PATH, ROUTE_GROUPS
-from manicule.mcp.server import TOOL_NAMES
+from manicule.api.app import MCP_PATH, ROUTE_GROUPS, build_app
+from manicule.app.service import ApplicationService
+from manicule.core.errors import PolicyError
+from manicule.mcp.server import NETWORK_AUTHORING, TOOL_NAMES, build_server
 from tests.api.live import mounted
 from tests.api.support import app_for, backend_with_a_document, client_for, envelope
 from tests.routing_support import Reach, classify, walk_routes
@@ -583,7 +586,26 @@ ABSENT_TOOLS: tuple[tuple[str, str], ...] = (
     ),
     ("ask", "it persists a turn given a conversation, and calls a model that may be elsewhere"),
 )
-"""Every mutating tool, named with what it would let an unattended caller do from the network.
+"""Every mutating tool the network may not reach, named with what it would let a caller do.
+
+**``document_create`` is deliberately not in this list, and it is the only write that is not.**
+Every entry above is excluded for the *authority* it carries rather than for being a write:
+``index_path`` walks any directory this process can read, ``config_set`` rewrites the
+configuration the server is running from, ``plugin_add`` enables code with this process's full
+authority, ``collection_delete`` removes a grouping the call cannot restore. Authoring writes one
+document, to one workspace, in one configured collection, beneath one configured connector's
+root, at a path the caller never supplies — bounded by settings an operator wrote rather than by
+arguments a caller sends. That is a different kind of thing from its neighbors here, and the list
+is only worth having because every entry explains itself, so its absence has to explain itself
+too.
+
+The care is not proportional to the tool's size, and that is the point of saying it out loud: the
+corpus this exists for is read as *instructions*. Guidance recalled from it is treated as standing
+direction by whatever recalls it, so writing into it is the ability to place text in front of
+future sessions. That is why the default is off — an installation that configures no authoring
+source has no authoring, including over a socket — and why
+:func:`~manicule.app.bind.require_authoring_authentication` refuses to start a socket that would
+serve it unauthenticated.
 
 The MCP twin of :data:`ABSENT`, kept in the same file because it is the same boundary: these two
 lists are the whole of what this process refuses to let a network reach, and splitting them
@@ -686,18 +708,145 @@ async def test_the_absent_tools_and_the_offered_ones_are_the_whole_surface() -> 
     assert published & absent == set()
 
 
-async def test_every_published_tool_says_it_reads() -> None:
+async def test_every_published_tool_reads_or_is_the_one_named_write() -> None:
     """The surface and the classification agree, checked over the protocol at the far end.
 
     ``manicule.mcp.server`` builds the read-only surface *from* these hints, so this is the round
-    trip: what a client is told about a tool it can reach on the socket is that the tool reads.
-    A published tool answering ``readOnlyHint: false`` would mean the filter and the annotation
-    had come apart between the registration and the wire.
+    trip: what a client is told about a tool it can reach on the socket is that the tool reads —
+    unless it is named in ``NETWORK_AUTHORING``. A published tool answering ``readOnlyHint: false``
+    and *not* in that set would mean the filter and the annotation had come apart between the
+    registration and the wire.
+
+    The exception is read from the constant rather than written out here, because a literal in a
+    test is a second place the set is decided and the two would agree until somebody edited one.
+    What this file writes out instead is the *equality* below, which is the claim worth pinning.
     """
     backend, _ = backend_with_a_document()
     for name, tool in (await _network_tools(backend)).items():
         assert tool.annotations is not None, f"{name} publishes no annotations"
+        if name in NETWORK_AUTHORING:
+            assert tool.annotations.read_only_hint is False, (
+                f"{name} is in NETWORK_AUTHORING, which exists for tools that write. A read-only "
+                f"tool there is admitted by a rule it does not need."
+            )
+            continue
         assert tool.annotations.read_only_hint is True, f"{name} is served on a socket and writes"
+
+
+async def test_the_network_surface_is_the_reads_plus_exactly_one_named_write() -> None:
+    """Asserted as a set operation, so nothing else can drift onto a socket behind authoring.
+
+    **This is the test that makes ``NETWORK_AUTHORING`` safe to have at all.** Every assertion
+    above names a tool; a second write tool admitted tomorrow would be named by none of them and
+    would pass all of them. This one names no tool: the published set *is* the read-only set plus
+    that constant, and a third member — or a write tool let through by some other route — fails
+    here with both sides printed.
+
+    The read-only set is derived from the published annotations of the **whole** surface rather
+    than from ``ABSENT_TOOLS``, so this does not compare one hand-maintained list against another.
+    """
+    backend, _ = backend_with_a_document()
+    async with Client(build_server(ApplicationService(backend))) as client:
+        everything = {tool.name: tool.annotations for tool in await client.list_tools()}
+    reads = {
+        name
+        for name, annotations in everything.items()
+        if annotations is not None and annotations.read_only_hint is True
+    }
+    published = set(await _network_tools(backend))
+    assert published == reads | NETWORK_AUTHORING
+    assert {"document_create"} == NETWORK_AUTHORING, (
+        "the network surface grew a second write tool. That is a decision with its own threat "
+        "model — see docs/surfaces.md — not a line to update until this passes."
+    )
+
+
+def test_an_application_serving_authoring_without_authentication_refuses_to_be_built() -> None:
+    """The second half of the same rule, and the half that covers somebody else's server.
+
+    ``manicule.api.serve`` is not the only thing that puts this application on a port: a
+    container entry point or a production ASGI server builds it and does the listening itself.
+    That is the reason ``_require_auth_for_wide_bind`` lives here rather than beside the bind,
+    and authoring's refusal is here for it too — stricter, because it refuses a **loopback** bind
+    as well. ``/mcp/`` is mounted on this application, so an unauthenticated local port would
+    otherwise carry a tool that writes into a corpus.
+    """
+    from manicule.api.app import build_app  # noqa: PLC0415 - keeps FastAPI out of the CLI path
+    from manicule.config.settings import AuthoringSettings  # noqa: PLC0415
+
+    backend, _ = backend_with_a_document()
+    backend.settings = backend.settings.model_copy(
+        update={"authoring": AuthoringSettings(source="memories", collections=("memory",))}
+    )
+
+    with pytest.raises(PolicyError, match="authoring"):
+        build_app(ApplicationService(backend))
+
+
+def test_an_application_without_authoring_configured_is_built_unauthenticated() -> None:
+    """The condition is authoring being *configured*, not the tool existing.
+
+    Without this, the refusal above would make every loopback installation require an API key —
+    a change to how manicule is served, imposed by a feature that installation does not use.
+    """
+    backend, _ = backend_with_a_document()
+    assert backend.settings.authoring.configured is False
+    assert build_app(ApplicationService(backend)) is not None
+
+
+AUTHORING = {
+    "security": {"auth": {"mode": "api_key"}},
+    "authoring": {"source": "memories", "collections": ["memory"]},
+}
+"""An installation that has configured authoring, with authentication on.
+
+Both, because one without the other cannot be served: ``require_authoring_authentication``
+refuses to build an application whose authoring is reachable unauthenticated.
+"""
+
+
+async def _authored_as(role: str) -> dict[str, Any]:
+    """Call ``document_create`` over the mount with a key of this role, and return the envelope.
+
+    Through the mounted endpoint rather than the in-memory server, because the floor is a
+    property of *a call that arrived over HTTP* — the check reads the request out of the FastMCP
+    context, and a server driven in memory has none.
+    """
+    backend, _ = backend_with_a_document(**AUTHORING)
+    issued = await ApplicationService(backend).api_key_create(f"{role}-key", role=role)
+    async with mounted(backend, credential={"X-API-Key": issued.secret}) as client:
+        result = await client.call_tool(
+            "document_create",
+            {"collection": "memory", "slug": "retry-policy", "body": "# Retry\n"},
+        )
+    return dict(result.structured_content or {})
+
+
+async def test_a_viewer_key_cannot_author_over_the_mounted_surface() -> None:
+    """The mount admits viewers because it carries the read surface. Authoring is not a read.
+
+    The guard's floor is ``Role.VIEWER`` — right for `search`, `collection_list` and the rest of
+    what a socket offers — so admitting one write tool to that mount without a floor of its own
+    handed a read-only key an authority ``POST /api/v1/documents`` denies it. The two surfaces
+    must not disagree about who may write into a corpus.
+    """
+    envelope = await _authored_as("viewer")
+
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "ForbiddenError"
+
+
+async def test_a_member_key_clears_the_floor() -> None:
+    """The other half, without which the refusal above passes on a tool that refuses everybody.
+
+    A member gets *past* the floor and then meets this installation's own configuration — the
+    fake backend has no filesystem connector to author into — so what is asserted is that the
+    failure is no longer an authorization one.
+    """
+    envelope = await _authored_as("member")
+
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] not in {"ForbiddenError", "UnauthenticatedError"}
 
 
 async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> None:
@@ -714,6 +863,10 @@ async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> 
     assert instructions is not None, "the server sent no instructions"
     assert "read-only" in instructions, instructions
     assert "manicule serve" in instructions, instructions
+    assert "document_create" in instructions, (
+        "the notice lists what a socket does not carry, and authoring is the one write it does. "
+        "A client told the server is read-only and not told about the exception will not call it."
+    )
     assert "## Scope every question to a collection" in instructions, (
         "the read-only notice replaced the ordinary instructions instead of being added to them"
     )

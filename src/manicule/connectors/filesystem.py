@@ -328,6 +328,18 @@ class FilesystemConnector:
         return self._root
 
     @property
+    def max_bytes(self) -> int | None:
+        """The largest file this source will index, or ``None`` for no configured ceiling.
+
+        Public for the reason :attr:`root` is: it is part of what this source *is*, and one
+        caller has to know it **before** a file exists. ``discover`` skips a file over the
+        ceiling silently — the right behavior for a corpus somebody else fills — but authoring
+        writes the file first, so without reading this it would write a document the very next
+        step declines, and report a path that is never going to be indexed.
+        """
+        return self._max_bytes
+
+    @property
     def profiles(self) -> tuple[EnrichedProfile, ...]:
         """The enriched-document conventions this connector recognizes, in precedence order.
 
@@ -434,7 +446,7 @@ class FilesystemConnector:
                 let a stored document address any file the process can open.
         """
         path = Path(str(ref.metadata.get(SNAPSHOT_PATH) or ref.source_id))
-        if not self._within_root(path):
+        if not self.contains(path):
             msg = (
                 f"{str(path)!r} is outside {self._root}, which is the only tree this source serves"
             )
@@ -446,7 +458,7 @@ class FilesystemConnector:
             raise NotFoundError(msg) from exc
         # Read here rather than at discovery, because building the record needs the digest of
         # the bytes to check a declared checksum against — and discovery must stay decidable
-        # without reading a file. `_within_root` above has already refused anything outside the
+        # without reading a file. `contains` above has already refused anything outside the
         # tree, so the path handed to the reader is one this connector was willing to open.
         provenance = await asyncio.to_thread(
             sidecar.provenance_for, path, root=self._root, checksum=content_hash(content)
@@ -718,7 +730,18 @@ class FilesystemConnector:
                     continue
                 yield entry
 
-    def _within_root(self, path: Path) -> bool:
+    def contains(self, path: Path) -> bool:
+        """Whether ``path`` resolves to this connector's root or somewhere beneath it.
+
+        Public because it is the answer to a question asked from outside as well as in.
+        :meth:`fetch` asks it of a path a stored document names; ``document_create`` asks it of
+        a path it is about to write, so that the containment guarding a *read* and the
+        containment guarding a *write* are one implementation rather than two that agree today.
+
+        Resolved before comparing, so ``..`` segments, an absolute path elsewhere and a
+        symlinked parent are all one question with one answer. Comparing the text would leave
+        ``root/../../etc`` looking like a path under the root.
+        """
         try:
             resolved = path.resolve()
         except OSError:  # pragma: no cover - resolution failure is itself a refusal

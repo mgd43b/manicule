@@ -694,6 +694,7 @@ class Document(Base):
     chunk_fp: Mapped[str | None] = mapped_column(Text)
     embed_fp: Mapped[str | None] = mapped_column(Text)
     glossary_fp: Mapped[str | None] = mapped_column(Text)
+    relation_fp: Mapped[str | None] = mapped_column(Text)
     """Which fingerprints this document was last built with.
 
     Per-document lineage is what makes invalidation set-valued: a grammar upgrade that
@@ -715,6 +716,15 @@ class Document(Base):
     entries were never computed; a fingerprint whose ``detector`` reads ``disabled`` means
     detection was switched off when this document was last ingested, and the two are different
     states on purpose.
+
+    ``relation_fp`` is the third of that kind and reads exactly as ``glossary_fp`` does, one
+    stage further on: which extractor derived this document's ``chunk_relations`` rows. It is a
+    column here rather than a property of the edges for the reason that matters most about it —
+    **a document with no links is a result**, and there are no rows to hang that fact on. Stored
+    beside the entries instead, "the current extractor found nothing here" and "nobody has
+    looked" would be one state, and every link-free document in a corpus would be re-selected by
+    every repair for ever. ``NULL`` means never scanned; an ``extractor`` reading ``disabled``
+    means no relation middleware was configured when this document was last ingested.
     """
 
     doc_metadata: Mapped[JsonValue] = mapped_column("metadata", JSON, nullable=False, default=dict)
@@ -749,6 +759,7 @@ class Document(Base):
         Index("ix_documents_chunk_fp", "chunk_fp"),
         Index("ix_documents_embed_fp", "embed_fp"),
         Index("ix_documents_glossary_fp", "glossary_fp"),
+        Index("ix_documents_relation_fp", "relation_fp"),
         Index(
             "ix_documents_workspace_live_id",
             "workspace_id",

@@ -52,9 +52,17 @@ CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 # The workspace members that go to PyPI. `manicule` is MIT; `manicule-mlx` is
 # GPL-3.0-or-later because it links `mlx-embeddings`, which is the entire reason it is a
-# separate distribution rather than an extra. The other two members are test fixtures — a
-# reference plugin and a deliberately hostile one — and publishing either would put a parser
-# that hangs on purpose on the index.
+# separate distribution rather than an extra. Three members are withheld: two are test
+# fixtures — a reference plugin and a deliberately hostile one, and publishing either would put
+# a parser that hangs on purpose on the index — and the third is `manicule-plugin-wikilinks`,
+# which is neither.
+#
+# `manicule-plugin-wikilinks` is withheld because **publishing is a release decision, not an
+# authoring one**: it needs a version line release-please can move, a build and an upload step in
+# `release.yml`, and an answer to what its `core_version` range means once the two distributions
+# can move independently. None of that is settled by writing the plugin, and a package added to
+# `PUBLISHED` without it would be built by a workflow that does not know about it. It is
+# installable from the workspace today, which is what its tests and this repository need.
 #
 # Written down here rather than inferred, because neither answer is a safe default for a
 # workspace member nobody classified: a new package silently published is a mistake that
@@ -342,7 +350,11 @@ def test_every_workspace_member_is_classified() -> None:
         for path in sorted(PACKAGES.iterdir())
         if (path / "pyproject.toml").is_file()
     }
-    withheld = {"manicule-plugin-example", "manicule-plugin-hostile"}
+    withheld = {
+        "manicule-plugin-example",
+        "manicule-plugin-hostile",
+        "manicule-plugin-wikilinks",
+    }
 
     assert members == (set(PUBLISHED) - {"manicule"}) | withheld, (
         f"packages/ holds {sorted(members)}, which is neither the published set nor the "

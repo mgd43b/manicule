@@ -1661,7 +1661,7 @@ of the ingest is untouched — a glossary bug does not cost a working index — 
 the document, because a detector that has stopped working behind a screen of green counters is
 the other half of failing silently.
 
-### 10.3 Four lineages, four migrations, and how to tell which one you need
+### 10.3 Five lineages, five migrations, and how to tell which one you need
 
 They are not interchangeable, and the price of each is the reason:
 
@@ -1671,6 +1671,16 @@ They are not interchangeable, and the price of each is the reason:
 | `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | a re-index; the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything |
 | `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
 | `documents.glossary_fp` | any detection or normalization rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
+| `documents.relation_fp` | a relation extractor is configured, unconfigured, or its rules change | `document reindex --stale-relations` | a pass over stored chunks; **no GPU at all** |
+
+**The fifth belongs to a plugin and the repair does not**, which is the division worth stating.
+Core supplies the fingerprint, the column, the selector and the sweep; what a plugin supplies is
+the rules and the hook that writes the edges. So `--stale-relations` re-runs the configured chain
+over stored chunks exactly as `--stale-glossary` re-runs detection, builds no pipeline, and costs
+a text pass rather than a re-parse. On the run that first configures an extractor its selection is
+the whole corpus, because every row records `NULL` until something has scanned it — and with none
+configured it **refuses**, because the installed fingerprint is then the disabled one and
+proceeding would stamp every document as scanned by an extractor that does not exist.
 
 ### 10.4 Offline derived-generation rebuilds
 

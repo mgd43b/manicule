@@ -40,6 +40,7 @@ WRITE_TOOLS = frozenset(
     {
         "index_path",
         "connector_sync",
+        "document_create",
         "document_delete",
         "document_reindex",
         "collection_create",
@@ -47,7 +48,22 @@ WRITE_TOOLS = frozenset(
         "config_set",
     }
 )
-"""Tools this test must not call. Named so the claim in the docstring is checkable below."""
+"""Tools this test must not call. Named so the claim in the docstring is checkable below.
+
+It does two jobs, and ``document_create`` was added for the second as much as the first. The
+session below must not call any of them, because "nothing was indexed, synchronized or deleted
+to make that work" is what this file establishes — and authoring writes a file into a corpus, so
+it belongs in that set exactly as its neighbors do.
+
+The second job is
+:func:`test_stdio_still_carries_the_whole_tool_surface`, which asserts every name here is
+**present** over a pipe. ``document_create`` differs from its neighbors there and the difference
+is deliberate: it is the one entry that is also on the network surface
+(``manicule.mcp.server.NETWORK_AUTHORING``), so its presence here is a statement about stdio
+carrying the whole surface rather than about where the write boundary runs. Adding it because a
+test went red would have been the wrong reason; the right one is that it writes, and this file's
+subject is a session that writes nothing.
+"""
 
 
 def _transport() -> StdioTransport:

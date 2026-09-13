@@ -94,6 +94,18 @@ def _glossary_is_not(fingerprint: str) -> ColumnElement[bool]:
     return (models.Document.glossary_fp.is_(None)) | (models.Document.glossary_fp != fingerprint)
 
 
+def _relation_is_not(fingerprint: str) -> ColumnElement[bool]:
+    """Documents whose relation lineage is not ``fingerprint``, ``NULL`` included.
+
+    :func:`_glossary_is_not` one stage over, and the ``NULL`` clause matters more here rather
+    than less: until something has scanned a document its relation lineage is ``NULL``, so on
+    the run that first configures an extractor the ``NULL`` half **is** the corpus. A plain
+    inequality would select nothing at all and report a backfill that had finished before it
+    started.
+    """
+    return (models.Document.relation_fp.is_(None)) | (models.Document.relation_fp != fingerprint)
+
+
 LISTABLE_FILTER_FIELDS: Final = frozenset(
     {
         "workspace_ids",
@@ -576,6 +588,16 @@ class SqliteDocStore(
         row.chunk_fp = chunk_fp
         row.embed_fp = embed_fp
         row.parse_fp = parse_fp
+        # **Cleared here, stamped later, and the gap between the two is the point.** This
+        # publication replaces the document's chunks, and `chunk_relations` cascades from them —
+        # so the edges an extractor derived are gone the moment this commits, while the hooks
+        # that would rebuild them run afterwards, in `after_store`. Carrying the previous value
+        # through would leave a window in which the document claims edges it no longer has, and
+        # anything that ended the run inside that window — a failing hook, a killed process —
+        # would leave the claim standing for ever, because the repair selects on this column and
+        # the old value can equal the current one. `NULL` is the fail-safe direction: the worst
+        # a cleared lineage costs is one document rescanned that did not need it.
+        row.relation_fp = None
         await session.flush()
         return Commit(committed=True, stored=to_document(row))
 
@@ -919,6 +941,7 @@ class SqliteDocStore(
         embed_fp: str | None,
         parse_fp: str | None = None,
         glossary_fp: str | None = None,
+        relation_fp: str | None = None,
     ) -> None:
         """Record which fingerprints this document was last built with.
 
@@ -929,6 +952,12 @@ class SqliteDocStore(
         this path moves only when detection did not run — when it did, the fingerprint is
         written beside the rows it describes by
         :meth:`~manicule.storage.glossary.GlossaryMixin.replace_glossary_entries`.
+
+        ``relation_fp`` is the one lineage this path is the *only* writer of, because relation
+        extraction happens after publication — in ``after_store``, over a document already
+        committed — so there is no publish transaction left for it to travel in. It is written
+        only when the extractor chain completed, which is what keeps a failed extraction
+        selected rather than stamped.
         """
         async with self._sessions.begin() as session:
             row = await self._live_document(session, document_id)
@@ -942,6 +971,8 @@ class SqliteDocStore(
                 row.embed_fp = embed_fp
             if glossary_fp is not None:
                 row.glossary_fp = glossary_fp
+            if relation_fp is not None:
+                row.relation_fp = relation_fp
 
     async def set_original(
         self, document_id: str, *, ref: str | None, omitted_reason: str | None
@@ -998,6 +1029,8 @@ class SqliteDocStore(
         statuses: Collection[DocumentStatus] | None = None,
         glossary_fp_other_than: str | None = None,
         glossary_fp_unrecorded: bool = False,
+        relation_fp_other_than: str | None = None,
+        relation_fp_unrecorded: bool = False,
     ) -> int:
         """How many live documents match, counted in the database.
 
@@ -1011,6 +1044,10 @@ class SqliteDocStore(
         changed" is routine and clears itself; "this index predates glossary lineage" is a
         one-time migration and is what somebody upgrading needs to be told, once, rather than
         having it folded into a number that looks like ordinary staleness.
+
+        ``relation_fp_other_than`` and ``relation_fp_unrecorded`` are the same pair for the
+        extractor, and the second is the larger number by far on any index that has not run one:
+        every document reads ``NULL`` until something has scanned it.
         """
         statement = (
             select(func.count())
@@ -1028,6 +1065,10 @@ class SqliteDocStore(
             statement = statement.where(_glossary_is_not(glossary_fp_other_than))
         if glossary_fp_unrecorded:
             statement = statement.where(models.Document.glossary_fp.is_(None))
+        if relation_fp_other_than is not None:
+            statement = statement.where(_relation_is_not(relation_fp_other_than))
+        if relation_fp_unrecorded:
+            statement = statement.where(models.Document.relation_fp.is_(None))
         async with self._sessions() as session:
             return (await session.execute(statement)).scalar_one()
 
@@ -1073,6 +1114,7 @@ class SqliteDocStore(
         chunk_fp_other_than: str | None = None,
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
+        relation_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> Sequence[Document]:
@@ -1098,6 +1140,12 @@ class SqliteDocStore(
         exclusion for the same reason: the documents that most need repairing are the ones with
         ``NULL`` there, and a predicate spelled ``= current`` would leave every one of them out
         of the selection it exists to find.
+
+        ``relation_fp_other_than`` is the same again for the extractor that derived a document's
+        ``chunk_relations`` rows. **Every predicate here is ANDed**, which is worth saying out
+        loud for this one: passing it together with ``parse_fp_current`` selects the documents
+        that are stale in *both* stages, not the union. A caller repairing one stage passes that
+        stage's fingerprint and no other.
 
         ``offset`` pages through the selection, and the ``ORDER BY`` above is what makes that
         mean anything: ``created_at`` alone is not unique, so two documents written in the same
@@ -1130,6 +1178,8 @@ class SqliteDocStore(
             )
         if glossary_fp_other_than is not None:
             statement = statement.where(_glossary_is_not(glossary_fp_other_than))
+        if relation_fp_other_than is not None:
+            statement = statement.where(_relation_is_not(relation_fp_other_than))
         if limit is not None:
             statement = statement.limit(limit)
         if offset:

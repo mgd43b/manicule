@@ -43,7 +43,7 @@ from manicule.core.embedding import (
     VectorChecksumBackfill,
     VectorChecksumCoverage,
 )
-from manicule.core.fingerprints import ChunkFingerprint
+from manicule.core.fingerprints import ChunkFingerprint, RelationRules
 from manicule.core.generation import Token
 from manicule.core.organization import (
     ChunkEdge,
@@ -1208,9 +1208,37 @@ class Middleware(Protocol):
         return
 
 
+@runtime_checkable
+class ChunkRelationExtractor(Protocol):
+    """A middleware that derives :class:`~manicule.core.organization.ChunkEdge` rows.
+
+    Implemented **in addition to** :class:`Middleware` rather than instead of it. The extraction
+    itself is an ordinary ``after_store`` hook writing through a
+    :class:`ChunkRelationStore`; what this protocol adds is the one thing a hook cannot be asked
+    for through the middleware interface — an account of the rules it derived those edges under.
+
+    **Why the pipeline has to be able to ask.** Edges are derived state, and derived state whose
+    producer is not versioned is state that reports itself current after the producer has been
+    corrected. :class:`~manicule.core.fingerprints.RelationFingerprint` is what fixes that, and
+    it is recorded per document by the pipeline rather than by the hook — because the pipeline is
+    what knows whether the hook chain ran to the end, and because the identity has to include
+    the whole configured chain, which a hook cannot see.
+
+    So an extractor states its own half and the pipeline adds the rest. A middleware that does
+    not implement this is not an extractor and contributes nothing to the fingerprint; an
+    installation with none configured records
+    :meth:`~manicule.core.fingerprints.RelationFingerprint.disabled`.
+    """
+
+    def relation_rules(self) -> RelationRules:
+        """What decides the edges this extractor writes. Never awaits; never reads the index."""
+        ...
+
+
 __all__ = [
     "CLOSE_DEADLINE_S",
     "AnnIndexMaintenance",
+    "ChunkRelationExtractor",
     "ChunkRelationStore",
     "Chunker",
     "CollectionStore",

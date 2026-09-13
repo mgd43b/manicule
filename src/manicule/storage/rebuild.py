@@ -2014,6 +2014,15 @@ class SqliteRebuildStore(WorkspaceScoped):
             stored.chunk_fp = target.chunk_fingerprint
             stored.embed_fp = target.embedding_fingerprint
             stored.glossary_fp = target.glossary_fingerprint
+            # **Cleared, not carried.** The delete below removes this document's chunks, and
+            # `chunk_relations` cascades from them — so every edge it had is gone by the end of
+            # this transaction. A rebuild derives documents, chunks and glossary entries and has
+            # no middleware chain to run, so it cannot put them back either. Leaving the previous
+            # value would leave the document claiming an extractor's output it no longer has,
+            # which is the one state `relation_fp` exists to make impossible: `NULL` is "nothing
+            # has derived edges for this document", which is now the truth, and it is what puts
+            # it back in the next relation repair.
+            stored.relation_fp = None
         await session.flush()
         await session.execute(
             delete(models.GlossaryEntry).where(models.GlossaryEntry.document_id.in_(document_ids))

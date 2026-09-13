@@ -8,6 +8,7 @@ members = [
     "manicule-mlx",
     "manicule-plugin-example",
     "manicule-plugin-hostile",
+    "manicule-plugin-wikilinks",
 ]
 
 [[package]]
@@ -1475,6 +1476,7 @@ dev = [
     { name = "manicule-mlx" },
     { name = "manicule-plugin-example" },
     { name = "manicule-plugin-hostile" },
+    { name = "manicule-plugin-wikilinks" },
     { name = "openpyxl" },
     { name = "pyright" },
     { name = "pytest" },
@@ -1547,6 +1549,7 @@ dev = [
     { name = "manicule-mlx", editable = "packages/manicule-mlx" },
     { name = "manicule-plugin-example", editable = "packages/manicule-plugin-example" },
     { name = "manicule-plugin-hostile", editable = "packages/manicule-plugin-hostile" },
+    { name = "manicule-plugin-wikilinks", editable = "packages/manicule-plugin-wikilinks" },
     { name = "openpyxl", specifier = ">=3.1" },
     { name = "pyright", specifier = ">=1.1.390" },
     { name = "pytest", specifier = ">=8.3" },
@@ -1589,6 +1592,17 @@ requires-dist = [{ name = "manicule", editable = "." }]
 name = "manicule-plugin-hostile"
 version = "0.1.0"
 source = { editable = "packages/manicule-plugin-hostile" }
+dependencies = [
+    { name = "manicule" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "manicule", editable = "." }]
+
+[[package]]
+name = "manicule-plugin-wikilinks"
+version = "0.1.0"
+source = { editable = "packages/manicule-plugin-wikilinks" }
 dependencies = [
     { name = "manicule" },
 ]

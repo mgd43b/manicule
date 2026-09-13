@@ -108,20 +108,22 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
   connector-free derived publication with no separate settlement command.
 
-## MCP tools — 45
+## MCP tools — 46
 
-Ticket: #8 — **built.** Forty-four implemented tools over the same application service the command
+Ticket: #8 — **built.** Forty-five implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
-The checklist below has forty-five capability items because it also records the deliberately
+The checklist below has forty-six capability items because it also records the deliberately
 declined catch-all `run-command` surface; that item is not a registered MCP tool.
 
-**All forty-four over stdio; the twenty-six read-only ones over a socket.** MCP is also served
-at `/mcp/` on the HTTP port, and every mutating tool is *absent* from that surface rather than
-refused on it — see [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are
-unreachable from a network by construction, and a socket has to replace that property rather
-than assume it.
+**All forty-five over stdio; over a socket the twenty-six read-only ones plus
+`document_create`.** MCP is also served at `/mcp/` on the HTTP port, and every *other* mutating
+tool is *absent* from that surface rather than refused on it — see
+[`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are unreachable from a
+network by construction, and a socket has to replace that property rather than assume it;
+authoring is the one exception, bounded by configuration and refused to a caller who is not an
+authenticated member.
 
 - [x] `ask`
 - [x] `collection_add`
@@ -141,6 +143,7 @@ than assume it.
 - [x] `connector_list`
 - [x] `connector_sync`
 - [x] `doctor`
+- [x] `document_create`
 - [x] `document_delete`
 - [x] `document_get`
 - [x] `document_resolve`

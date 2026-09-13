@@ -74,6 +74,7 @@ TICKETED: tuple[str, ...] = (
 
 MUTATIONS: tuple[str, ...] = (
     "index_path",
+    "document_create",
     "document_delete",
     "document_reindex",
     "connector_sync",
@@ -93,6 +94,14 @@ MUTATIONS: tuple[str, ...] = (
     "research",
 )
 """Every tool that changes something, named so the negative is a list rather than a leftover.
+
+``document_create`` is here for the reason every other entry is — it writes — and it is the one
+entry whose presence here says nothing about whether a socket carries it. This file classifies
+behavior; ``manicule.mcp.server.NETWORK_AUTHORING`` decides the network surface, and authoring is
+in both, deliberately. An earlier arrangement made the second follow from the first, so listing a
+tool here was also the act of removing it from the network — which is how a classification quietly
+becomes an authorization. ``tests/api/test_routes.py`` asserts the network surface as a set
+operation against that constant instead.
 
 ``ask`` is here and it is the entry worth pausing on. It reads the corpus like ``search`` does,
 and it is not read-only for two independent reasons: given a ``conversation_id`` it persists the

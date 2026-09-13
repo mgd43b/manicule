@@ -660,10 +660,12 @@ PAYLOADS: dict[str, type[Payload]] = {
     "document_list": r.DocumentList,
     "document_get": r.DocumentDetail,
     "document_resolve": r.DocumentResolved,
+    "document_create": r.DocumentCreated,
     "document_delete": r.DocumentDeleted,
     "document_reindex": r.DocumentReindexed,
     "document_reindex_stale": r.StaleReparseReport,
     "document_redetect_glossary": r.StaleGlossaryReport,
+    "document_rescan_relations": r.StaleRelationReport,
     "reembed_plan": r.ReembedPlanReport,
     "reembed_start": r.ReembedRunReport,
     "reembed_resume": r.ReembedRunReport,
@@ -986,6 +988,76 @@ def index(
 # --- document ---------------------------------------------------------------------------------
 
 
+@document_app.command("create")
+def document_create(
+    collection: Annotated[str, typer.Argument(help="Which collection to author into, by name.")],
+    slug: Annotated[str, typer.Argument(help="Identity and filename stem. One path component.")],
+    file: Annotated[
+        Path | None,
+        typer.Option(
+            "--file",
+            "-f",
+            help="Read the markdown from this file. Omit it, or pass -, to read standard input.",
+        ),
+    ] = None,
+    *,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Replace the document already holding this slug."),
+    ] = False,
+) -> None:
+    """Write a markdown document into the corpus and index it.
+
+    The body comes from a file or from standard input rather than from an argument, because a
+    complete markdown document with front matter in it is not a thing anybody types between
+    quotes — and a shell that helpfully interpreted a `$` or a backtick in it would change the
+    document without saying so.
+    """
+    submit(
+        Command(
+            "document_create",
+            {
+                "collection": collection,
+                "slug": slug,
+                "body": _authored_body(file),
+                "overwrite": overwrite,
+            },
+        )
+    )
+
+
+def _authored_body(file: Path | None) -> str:
+    """The markdown to author, from a file or from standard input.
+
+    ``-`` means standard input as it does everywhere else, and so does no ``--file`` at all: a
+    heredoc is how a person writes a document at a terminal and a pipe is how a script does.
+
+    Read here rather than in the service because a :class:`~manicule.app.commands.Command` is
+    JSON that may cross a socket to a server, and a *path* in it would be resolved in whichever
+    process ran the command — which is the wrong one whenever the server is not on this machine.
+    The body travels; the path does not.
+
+    **A terminal is told what it is waiting for.** Reading standard input with nothing piped in
+    looks exactly like a hang, and the recovery — an end-of-file — is not something somebody
+    guesses at. The notice goes to stderr, so ``--json`` output stays a single document on
+    stdout and a pipeline is unaffected.
+    """
+    if file is None or str(file) == "-":
+        if sys.stdin.isatty():
+            typer.echo("reading the document from standard input; end it with Ctrl-D", err=True)
+        return sys.stdin.read()
+    path = Path(file).expanduser()
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        # A usage error rather than a traceback. This runs in the command callback, before
+        # anything has an envelope to fail into: `main` hands control to Typer, which converts
+        # nothing a callback raises, so an unreadable `--file` printed a stack trace naming a
+        # line of manicule for what is a mistyped path or a file in another encoding.
+        msg = f"cannot read the document from {path}: {exc}"
+        raise typer.BadParameter(msg, param_hint="--file") from exc
+
+
 @document_app.command("list")
 def document_list(
     limit: Annotated[int, typer.Option(help="Page size.")] = 50,
@@ -1104,6 +1176,14 @@ def document_reindex(
             "Reads stored chunks: no parser, no connector, no embedder.",
         ),
     ] = False,
+    stale_relations: Annotated[
+        bool,
+        typer.Option(
+            "--stale-relations",
+            help="Rebuild chunk relations for every document a changed extractor has moved "
+            "past, and for every document none has scanned. Reads stored chunks.",
+        ),
+    ] = False,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="With a sweep: report the plan and write nothing."),
@@ -1125,16 +1205,21 @@ def document_reindex(
     through this and through nothing else. It reads the chunks already stored, runs no parser,
     fetches nothing and produces no vector, so it costs no GPU time at all.
 
-    Stopping either is safe at a document boundary; running it again resumes.
+    `--stale-relations` is the same rung again, for the stage that turns `[[wikilinks]]` into
+    graph edges. It is the only thing that reaches an existing corpus: extraction runs at
+    ingest, so configuring the middleware — or correcting one of its rules — changes nothing
+    already stored until this runs, and the first run after configuring one selects everything.
+
+    Stopping any of them is safe at a document boundary; running it again resumes.
     """
-    sweeping = stale or stale_glossary
-    if stale and stale_glossary:
+    rungs = [stale, stale_glossary, stale_relations]
+    if sum(rungs) > 1:
         raise typer.BadParameter(REINDEX_IS_ONE_RUNG)
     if stale and document_id is not None:
         raise typer.BadParameter(REINDEX_IS_ONE_OR_ALL)
-    if stale_glossary and document_id is not None:
+    if (stale_glossary or stale_relations) and document_id is not None:
         raise typer.BadParameter(GLOSSARY_IS_NOT_A_DOCUMENT_SWEEP)
-    if not sweeping:
+    if not any(rungs):
         if document_id is None:
             raise typer.BadParameter(REINDEX_NEEDS_A_TARGET)
         if dry_run:
@@ -1143,6 +1228,9 @@ def document_reindex(
         return
     if stale_glossary:
         submit(Command("document_redetect_glossary", {"batch": batch, "dry_run": dry_run}))
+        return
+    if stale_relations:
+        submit(Command("document_rescan_relations", {"batch": batch, "dry_run": dry_run}))
         return
     submit(Command("document_reindex_stale", {"batch": batch, "dry_run": dry_run}))
 

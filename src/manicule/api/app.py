@@ -75,7 +75,7 @@ from manicule.api.routes import health as health_routes
 from manicule.api.security import require, resolve
 from manicule.api.widget import router as widget_router
 from manicule.app import frontdoor
-from manicule.app.bind import is_loopback
+from manicule.app.bind import is_loopback, require_authoring_authentication
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import PolicyError
 from manicule.core.version import CORE_VERSION
@@ -248,6 +248,13 @@ def build_app(
 
     settings = service.settings
     _require_auth_for_wide_bind(service, bind)
+    # Beside it rather than in `manicule.api.serve`, on that function's own reasoning: this
+    # decides whether an *application* may exist, so it fires when a container entry point or a
+    # production ASGI server is doing the listening. Stricter than the line above, because it
+    # refuses a loopback bind too — `document_create` is mounted at `/mcp/` here, and a write
+    # into a corpus reachable by every process on the machine is not made safe by the port
+    # being local.
+    require_authoring_authentication(settings)
 
     # Built before the application, because the application needs its lifespan. FastMCP's ASGI
     # app owns a session manager that has to be started and stopped, and a mount does not run a

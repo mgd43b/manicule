@@ -3452,19 +3452,52 @@ async def test_retry_and_reacquire_keep_retained_bytes_in_backlog_accounting(
 
 
 async def test_migration_preserves_publications_and_creates_no_backlog(data_dir: Path) -> None:
+    """A document published before the journal existed survives the upgrade, unchanged.
+
+    The row is seeded in **SQL** rather than through ``SqliteDocStore``, and the reason is the
+    pinned revision: the ORM's mapping is the current one, so every column added to ``documents``
+    after ``6e31b7d592ac`` appears in the ``SELECT`` it emits and in none of the rows it is
+    reading. That fails on the column rather than on anything this test is about — and fails
+    again for whoever adds the next one. ``tests/test_storage_migrations.py::_seed`` is the same
+    idiom for the same reason.
+    """
     engine = create_engine(data_dir)
     try:
         await upgrade(engine, revision="6e31b7d592ac")
         store = SqliteDocStore(engine)
         await store.ensure_workspace()
         published = make_document(source="wiki", source_id="already-indexed")
-        await store.upsert_document(published)
-        before = await store.find_document("wiki", "already-indexed")
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO documents (id, publication_id, workspace_id, source, source_id, "
+                    "uri, title, media_type, content_hash, status, metadata, created_at, "
+                    "updated_at) VALUES (:id, 'legacy', :workspace, :source, :source_id, :uri, "
+                    ":title, :media_type, :content_hash, 'indexed', '{}', :now, :now)"
+                ),
+                {
+                    "id": published.id,
+                    "workspace": store.workspace_id,
+                    "source": published.source,
+                    "source_id": published.source_id,
+                    "uri": published.uri,
+                    "title": published.title,
+                    "media_type": published.media_type,
+                    "content_hash": published.content_hash,
+                    "now": datetime.now(UTC).isoformat(),
+                },
+            )
 
         await upgrade(engine)
 
-        assert before is not None
-        assert await store.find_document("wiki", "already-indexed") == before
+        after = await store.find_document("wiki", "already-indexed")
+        assert after is not None
+        assert (after.id, after.source_id, after.content_hash, after.publication_id) == (
+            published.id,
+            published.source_id,
+            published.content_hash,
+            "legacy",
+        )
         assert await store.latest_unsettled_acquisition_run("wiki") is None
     finally:
         await engine.dispose()

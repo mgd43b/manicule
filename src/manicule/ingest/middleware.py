@@ -30,6 +30,13 @@ Three refusals, in the order they bite:
 A hook that raises fails one document
     Not the batch, and not the hook. A hook that fails on one document is usually a document
     problem, and auto-disabling would make the corpus depend on ingest order.
+
+One hook in the chain may also be a
+:class:`~manicule.core.protocols.ChunkRelationExtractor`, which derives ``chunk_relations`` rows
+in ``after_store``. :meth:`MiddlewareRunner.relation_lineage` is where that is noticed, and the
+noticing is the whole of this module's involvement: the edges are the hook's to write, and the
+*version* of the rules that wrote them is the pipeline's to record, because only the pipeline
+knows whether the chain ran to the end and what else was configured beside it.
 """
 
 from __future__ import annotations
@@ -39,6 +46,8 @@ from typing import TYPE_CHECKING, cast
 
 from manicule.core.content import Chunk, Document, ParsedBlock, RawDocument
 from manicule.core.errors import MiddlewareViolationError
+from manicule.core.fingerprints import RelationFingerprint
+from manicule.core.protocols import ChunkRelationExtractor
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -128,6 +137,45 @@ class MiddlewareRunner:
     def chain(self, versions: Mapping[str, str] | None = None) -> tuple[str, ...]:
         """The glossary-fingerprint contribution of this chain: every hook, not a subset."""
         return chain(self._middleware, versions)
+
+    def relation_lineage(self, versions: Mapping[str, str] | None = None) -> RelationFingerprint:
+        """The identity of whatever in this chain derives chunk relations.
+
+        **Zero or one.** A chain with no
+        :class:`~manicule.core.protocols.ChunkRelationExtractor` in it records
+        :meth:`~manicule.core.fingerprints.RelationFingerprint.disabled`, which is a value an
+        operator can read rather than an absence they have to interpret — and which, the day an
+        extractor is installed, differs from what the extractor produces and so selects the whole
+        corpus for repair. That is the backfill, and it costs no command of its own.
+
+        Two extractors are **refused** rather than merged or silently first-wins. Their edges
+        would land in one table with one lineage column between them, so a change to either would
+        have to invalidate both, and neither could be repaired without re-running the other. The
+        refusal is at construction, where somebody is reading configuration, rather than per
+        document.
+
+        The whole chain goes into the fingerprint, not only the extractor — see
+        :attr:`~manicule.core.fingerprints.RelationFingerprint.middleware` for why an unrelated
+        hook can move which chunk a link lands in.
+
+        Raises:
+            MiddlewareViolationError: More than one configured middleware extracts relations.
+        """
+        extractors = [hook for hook in self._middleware if isinstance(hook, ChunkRelationExtractor)]
+        if not extractors:
+            return RelationFingerprint.disabled()
+        if len(extractors) > 1:
+            named = ", ".join(sorted(hook.name for hook in extractors))
+            msg = (
+                f"middleware {named} all derive chunk relations, and one column records which "
+                f"extractor produced a document's edges. Two of them writing into one table "
+                f"under one lineage would make a change to either invalidate both and neither "
+                f"repairable on its own. Configure one."
+            )
+            raise MiddlewareViolationError(msg)
+        return RelationFingerprint.of(
+            extractors[0].relation_rules(), middleware=self.chain(versions)
+        )
 
     async def before_parse(self, raw: RawDocument) -> RawDocument | None:
         """Transform the fetched document, or return ``None`` if a hook dropped it.

@@ -225,6 +225,9 @@ says so loudly in the pull request.
 
 Start from `packages/manicule-plugin-example`. It is the smallest complete plugin, and CI
 builds it, installs it and loads it, so it cannot go stale.
+`packages/manicule-plugin-wikilinks` is the one to read next: a plugin doing real work, with a
+component that writes rows, a configuration model that bounds a query, and a fingerprint of its
+own so a change to its rules makes the corpus visibly stale rather than quietly wrong.
 
 - Advertise an entry point in the `manicule.plugins` group. The entry-point name and
   `manifest.name` must match.

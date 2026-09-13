@@ -14,6 +14,13 @@ here: accepting bytes over HTTP and writing them into the corpus is an ingest pa
 different threat model from every other one — no filesystem permission check, no path the
 operator chose — and ``index_path`` over a directory the operator named is the ingest this
 build offers.
+
+**``POST /documents`` is not that upload**, and the sentence above is the test it has to pass.
+It takes no path and no filename: a slug becomes ``<collection>/<slug>.md`` beneath the root of
+a filesystem source an operator configured for authoring, in one of a configured set of
+collections, and an installation that configured neither refuses the call. So the two things the
+upload lacked — a filesystem boundary somebody chose, and a path that is not the caller's — are
+exactly what this has.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from fastapi import APIRouter, Query, Response
 
 from manicule.api.context import Service
 from manicule.api.envelopes import respond
+from manicule.api.models import DocumentBody
 from manicule.api.security import MemberPrincipal, ViewerPrincipal
 
 router = APIRouter(prefix="/api/v1", tags=["documents"])
@@ -132,6 +140,34 @@ async def get_document(
     del caller
     return await respond(
         "document_get", service, lambda: service.document_get(document_id, chunks=chunks)
+    )
+
+
+@router.post("/documents", name="document_create", summary="Author a document into the corpus.")
+async def create_document(
+    service: Service, caller: MemberPrincipal, body: DocumentBody
+) -> Response:
+    """Write a markdown file into the configured authoring source and index it.
+
+    **This is not the upload the module docstring says is absent**, and the difference is the
+    whole of why it is here. An upload takes bytes and a path from the caller; this takes a slug
+    and derives ``<collection>/<slug>.md`` beneath a root an operator configured, into one of a
+    configured set of collections, so nothing the caller sends decides where anything is written.
+    An installation that has configured no authoring source refuses every call to it.
+
+    A write that could not be indexed answers ``ok: false`` with the payload still attached, so
+    the path of the file that was kept is in the response rather than only in a log.
+    """
+    del caller
+    return await respond(
+        "document_create",
+        service,
+        lambda: service.document_create(
+            collection=body.collection,
+            slug=body.slug,
+            body=body.body,
+            overwrite=body.overwrite,
+        ),
     )
 
 

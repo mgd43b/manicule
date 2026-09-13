@@ -300,12 +300,14 @@ async def test_every_revision_downgrades_and_upgrades_back_to_the_same_schema(
 async def test_workspace_index_migration_backfills_legacy_identity_and_owned_tombstones(
     data_dir: Path,
 ) -> None:
-    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
-
     engine = create_engine(data_dir)
     try:
         await upgrade(engine, revision="e6a2c91f04bd")
-        store = SqliteDocStore(engine)
+        # Seeded in SQL rather than through `SqliteDocStore`, on the same rule `_seed` follows.
+        # The ORM's document mapping is the *current* one, so every column added to `documents`
+        # after this revision is in the SELECT it emits and in none of the rows it is reading —
+        # which fails on the column rather than on anything this test is about, and fails again
+        # for whoever adds the next one.
         async with engine.begin() as connection:
             await connection.execute(
                 text(
@@ -314,15 +316,28 @@ async def test_workspace_index_migration_backfills_legacy_identity_and_owned_tom
                 ),
                 {"created_at": datetime.now(UTC).isoformat()},
             )
-        document = make_document()
-        stored_chunk = make_chunk(document, 0, "migration-bound vector")
-        await store.upsert_document(document)
-        await store.replace_chunks(document.id, [stored_chunk])
-        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO documents (id, workspace_id, source, source_id, uri, title, "
+                    "media_type, content_hash, status, metadata, created_at, updated_at) "
+                    "VALUES ('legacy-doc', 'default', 'fs', 's1', 'file:///a.md', 'A', "
+                    "'text/markdown', 'h', 'indexed', '{}', :now, :now)"
+                ),
+                {"now": datetime.now(UTC).isoformat()},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO chunks (id, document_id, vector_id, text, embed_text, "
+                    "heading_text, heading_path, kind, position, token_count, anchor, metadata, "
+                    "created_at) VALUES ('legacy-chunk', 'legacy-doc', 'legacy-chunk', "
+                    "'migration-bound vector', 'migration-bound vector', '', '[]', 'prose', 0, "
+                    "2, '{}', '{}', :now)"
+                ),
+                {"now": datetime.now(UTC).isoformat()},
+            )
             vector_id = (
                 await connection.execute(
-                    text("SELECT vector_id FROM chunks WHERE id = :id"),
-                    {"id": stored_chunk.id},
+                    text("SELECT vector_id FROM chunks WHERE id = 'legacy-chunk'")
                 )
             ).scalar_one()
             await connection.execute(
@@ -532,10 +547,14 @@ async def test_downgrade_refuses_to_expose_retired_real_vector_generations(
         await vectors.upsert([retired], [[0.1] * 5], publication_id="retired-publication")
         await vectors.upsert([active], [[0.2] * 5], publication_id=document.publication_id)
 
-        with pytest.raises(RuntimeError, match="refusing to downgrade atomic publications"):
-            await downgrade(engine, "d4a90c7e15b3")
-
-        assert await current(engine) == head_revision()
+        # Read **before** the downgrade is attempted, and the order is the assertion's
+        # precondition rather than a style choice. On SQLite the pysqlite driver commits DDL
+        # outside the transaction Alembic wraps a run in, so a chain that refuses part-way has
+        # already applied the revisions it walked past — every column added after
+        # `d4a90c7e15b3` is gone by the time the refusal is raised, and the current ORM mapping
+        # cannot read `documents` at all. That is a hazard worth knowing about and it is not
+        # this test's subject: what is under test is that the pointer keeping one publication
+        # visible is never removed, which is a statement about the corpus at head.
         candidates = await vectors.search([0.0] * 5, 10)
         visible = await visible_documents(
             store,
@@ -548,6 +567,14 @@ async def test_downgrade_refuses_to_expose_retired_real_vector_generations(
             if visible.get(candidate.chunk.document_id) == candidate.publication_id
         ]
         assert [candidate.publication_id for candidate in admitted] == [document.publication_id]
+
+        with pytest.raises(RuntimeError, match="refusing to downgrade atomic publications"):
+            await downgrade(engine, "d4a90c7e15b3")
+
+        assert await current(engine) == head_revision(), (
+            "the refusal must leave the recorded revision where it was, so nothing treats the "
+            "database as downgraded"
+        )
     finally:
         await vectors.teardown()
         await engine.dispose()

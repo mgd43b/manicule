@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manicule-plugin-wikilinks"
+version = "0.1.0"
+description = "Turns [[wikilinks]] in markdown into typed chunk relations."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.14"
+dependencies = ["manicule>=0.1,<0.2"]
+
+[project.entry-points."manicule.plugins"]
+wikilinks = "manicule_plugin_wikilinks:PLUGIN"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manicule_plugin_wikilinks"]

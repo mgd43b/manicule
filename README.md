@@ -5,7 +5,8 @@
 **Self-hosted retrieval infrastructure for AI assistants.**
 
 An agent searches a private corpus or asks a grounded question, and gets evidence that resolves
-to a real location in a real document — a page, a heading, a line, a cell.
+to a real location in a real document — a page, a heading, a line, a cell. It can write one back,
+too, as a markdown file the corpus keeps.
 
 [![CI](https://github.com/mgd43b/manicule/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mgd43b/manicule/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/manicule.svg)](https://pypi.org/project/manicule/)
@@ -14,8 +15,9 @@ to a real location in a real document — a page, a heading, a line, a cell.
 [![packaged with uv](https://img.shields.io/badge/packaged%20with-uv-de5fe9.svg)](https://docs.astral.sh/uv/)
 
 [Install](#install) · [First run](#first-run) · [The four surfaces](#the-four-surfaces) ·
-[As a server](#running-it-as-a-server) · [In a container](#in-a-container) ·
-[Design](#the-idea-it-is-organized-around) · [Layout](#layout) · [Extending](#extending-it)
+[Authoring](#writing-into-the-corpus) · [As a server](#running-it-as-a-server) ·
+[In a container](#in-a-container) · [Design](#the-idea-it-is-organized-around) ·
+[Layout](#layout) · [Extending](#extending-it)
 
 </div>
 
@@ -42,6 +44,12 @@ manicule doctor                   # what is wrong, and what to do about it
 pipeline, plus evidence a caller can inspect at its source. The command line and HTTP expose the
 same service; the browser is a functional operator and retrieval-inspection console, not the
 primary knowledge-work interface.
+
+**An assistant can write, and the file is still the record.** `document_create` writes a markdown
+file into a configured source's root and indexes that path — so manicule gains an author without
+gaining a second notion of what a document is, and the corpus stays a directory of markdown any
+other tool can read. That is [its own section](#writing-into-the-corpus), because it is the one
+operation here that is not a read, and it is off until it is configured.
 
 **Re-indexing is copy-on-write at the document boundary.** Vectors are staged under a publication
 id, then the document, chunks, glossary and lineage become active in one relational transaction.
@@ -323,7 +331,7 @@ shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifec
 
 | Surface | Started by | Shape |
 |:---|:---|:---|
-| **MCP** | `manicule start --mcp-only` | 41 tools over stdio, which opens no socket; 24 read-only tools at `/mcp/` when served over a port |
+| **MCP** | `manicule start --mcp-only` | 45 tools over stdio, which opens no socket; 27 at `/mcp/` when served over a port — the read-only ones, plus `document_create` |
 | **Command line** | `manicule <command>` | 27 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 12 areas of server-rendered HTML, 11 in the navigation |
@@ -389,9 +397,12 @@ caches it — and when there is no browser surface to redirect to, it says so an
 process *is* serving. `docs/surfaces.md` §6.3.
 
 **MCP is served from that same process and port**, at `/mcp/`, and it carries the **read-only
-tools only** — the write tools are not registered on it rather than refused, so there is no
-handler behind `document_delete` or `connector_sync` there at all. Over stdio, where one client
-talks to one process down a pipe, the whole surface is offered. `docs/surfaces.md` §6.1 says why.
+tools plus `document_create`** — every other write tool is not registered on it rather than
+refused, so there is no handler behind `document_delete` or `connector_sync` there at all.
+Authoring is the one exception because it is bounded by configuration an operator wrote rather
+than by arguments a caller sends, it is off until that configuration exists, and a socket serving
+it without authentication refuses to start. Over stdio, where one client talks to one process down
+a pipe, the whole surface is offered. `docs/surfaces.md` §6.1 says why.
 
 `/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
 same envelope the CLI prints under `--json`.
@@ -417,7 +428,7 @@ has a route, so there is no upload and no configuration write here either.
 
 ### The MCP server
 
-The primary interface: forty-one tools over the same service, speaking stdio by default,
+The primary interface: forty-five tools over the same service, speaking stdio by default,
 which opens no socket at all. To let Claude Code use your index:
 
 ```bash
@@ -443,6 +454,82 @@ server for you alone. What it writes:
 
 The server is also reachable as `python -m manicule.mcp`, for a client that would rather name an
 interpreter and a module than trust a console script to be on the PATH it happens to have.
+
+## Writing into the corpus
+
+Every other way content enters is a connector pulling from a source. `document_create` is the one
+operation that lets a *caller* supply a body, and it is what lets an assistant keep durable memory
+here rather than only search documents something else wrote.
+
+It is off until two settings name where it may write:
+
+```toml
+[authoring]
+source = "memories"        # a configured filesystem connector instance
+collections = ["memory"]   # the collections it may author into
+```
+
+```bash
+manicule document create memory retry-policy -f fact.md   # or pipe the body on stdin
+```
+
+Like every other write command, that one needs a running `manicule serve` — the server owns the
+data directory. Over MCP and HTTP it is a call like any other.
+
+**It writes a markdown file into that source's root and then indexes that path**, returning only
+once the document is published and searchable — so an assistant that writes a memory and
+immediately searches for it finds it. The file stays the record. The corpus remains a directory
+of markdown that git versions and anything else can read, which is what keeps this an author
+rather than a note database, and what keeps the exit door open.
+
+**A caller supplies a collection, a slug and a complete markdown body — never a path.** manicule
+derives `<collection>/<slug>.md` beneath the configured root, so traversal is impossible by
+construction rather than by validation. The slug is the document's **permanent identity**: it
+becomes the filename and the id every citation and inbound link resolves through, which is why
+retitling breaks neither. Front matter is yours and is written exactly as sent; nothing here
+invents `name`, `description` or a type.
+
+Four refusals are worth knowing before you call it:
+
+| | |
+|---|---|
+| **Unconfigured** | Both settings empty is the default, and means authoring is off. The tool is offered on every surface and refuses every call, naming the settings it needs. |
+| **An unlisted collection** | Refused even when the workspace has it — so creating a collection is not also the act of granting write access to it. |
+| **A slug already taken** | Refused unless `overwrite` is passed, and the refusal names the document that holds it. A file nothing has indexed counts as holding it too. |
+| **A socket with no authentication** | Refuses to *start*, loopback included. Authoring is the one write tool served over a socket, and a corpus read back as standing instructions is not something to serve unauthenticated. |
+
+If the file is written and the index then declines it, **the file is kept** and the result says
+so with the path — the content is not lost, and a later sync indexes it.
+[`docs/memory-authoring.md`](docs/memory-authoring.md) is the whole of the reasoning, including
+why this is a narrower authority than indexing a directory.
+
+### `[[wikilinks]]` become a graph
+
+Install [`manicule-plugin-wikilinks`](packages/manicule-plugin-wikilinks) beside it and
+`[[wikilinks]]` in those documents become typed `chunk_relations` edges:
+
+```toml
+[plugins]
+middleware = ["wikilinks"]
+```
+
+Two types, because two things are being written: `links_to` for a link that is the content of its
+line (`- [[x]]`, `Related: [[a]], [[b]]`), and `mentions` for a reference inside a sentence. A
+link may name a document that does not exist yet — that is part of the writing convention — so
+it is resolved from the other end when the target is published. Targets match after
+normalization, because `[[a-b]]` and `[[a_b]]` are one target.
+
+The extractor carries a fingerprint of its own, recorded per document, so correcting one of its
+rules makes the corpus visibly stale. Bringing it up to date is the repair rung the glossary
+already has:
+
+```bash
+manicule document reindex --stale-relations   # --dry-run first, to see the selection
+```
+
+It reads stored chunks and writes rows — no parser, no connector, no embedder — and on the run
+that first configures an extractor it selects **everything**, because until then no document has
+been scanned by one.
 
 ## Running it as a server
 
@@ -574,11 +661,12 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
 | `src/manicule/cli` | Twenty-eight commands over that service, and nothing else |
-| `src/manicule/mcp` | Forty-one MCP tools over that service, and nothing else |
+| `src/manicule/mcp` | Forty-five MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/extension` | A Chrome extension that hands this browser's Confluence session to a local manicule. No build step |
 | `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
+| `packages/manicule-plugin-wikilinks` | Turns `[[wikilinks]]` into typed chunk relations. A plugin doing real work |
 
 The four surfaces are adapters: they parse arguments, call one method, and render what comes
 back. A rule that lived in one of them would be a rule the others did not have — and two of them

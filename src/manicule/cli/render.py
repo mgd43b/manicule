@@ -454,6 +454,34 @@ def render_document_resolved(out: Console, payload: r.DocumentResolved) -> None:
     out.print(Text(payload.content))
 
 
+def render_document_created(out: Console, payload: r.DocumentCreated) -> None:
+    """Where the file is, first, and on both outcomes.
+
+    The path leads because it is the durable half: on success it says where the corpus grew,
+    and on a write the index declined it is the only way back to content the caller has already
+    handed over. A renderer that showed a path only when everything worked would be unhelpful in
+    exactly the case the path matters most.
+
+    ``detail`` is printed on **both** outcomes, and that is not symmetry for its own sake:
+    :func:`~manicule.cli.main.print_envelope` renders a payload *instead of* the error whenever
+    one is retained, so this is the only place a human is told why. It carries two different
+    sentences — why the document is not indexed, and why an indexed one is not in its collection
+    — and dropping either would leave a visible "(not added)" with nothing saying what happened.
+    """
+    verb = "replaced" if payload.overwritten else "wrote"
+    out.print(f"{verb} [bold]{escape(payload.path)}[/bold]")
+    if not payload.indexed:
+        out.print("[yellow]the file is on disk and is not indexed; it was not removed[/yellow]")
+    else:
+        member = payload.collection if payload.member else f"{payload.collection} (not added)"
+        out.print(
+            f"[dim]{payload.document_id} · {payload.chunks} chunk(s) · "
+            f"{escape(member)} · {payload.elapsed_ms} ms[/dim]"
+        )
+    if payload.detail:
+        out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
+
+
 def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:
     where = "the trash" if payload.mode == "soft" else "the index, permanently"
     out.print(f"removed [bold]{payload.document_id}[/bold] into {where}")
@@ -539,6 +567,34 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
             "\n[dim]a document with no retained bytes can only be repaired by fetching it "
             "again: [/dim]manicule connector sync <name>"
         )
+
+
+def render_stale_relations(out: Console, payload: r.StaleRelationReport) -> None:
+    """The relation sweep's counts, and the documents whose chunks the chain could not read.
+
+    Documents rather than edges, because an edge belongs to two of them: counting edges would
+    make a document that gained three and lost two read as busier than one that gained a single
+    link, which is the opposite of what an operator is asking.
+
+    **No link target reaches this function.** The payload carries none, on the same rule the
+    glossary report follows — what this command is about is the shape of the corpus, and a
+    terminal is the last place to print it.
+    """
+    if payload.dry_run:
+        out.print("[dim]dry run: nothing was scanned or written[/dim]")
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_row("selected", str(payload.selected))
+    if not payload.dry_run:
+        table.add_row("re-scanned", str(payload.rescanned))
+    table.add_row("unrepairable", str(payload.unrepairable))
+    table.add_row("failed", str(payload.failed))
+    out.print(table)
+    # Named individually, in increasing order of how much somebody has to do about them: an
+    # unrepairable document needs a command, and a failure is a defect.
+    for line in payload.unrepairable_documents:
+        out.print(f"[yellow]{escape(line)}[/yellow]")
+    for line in payload.failures:
+        out.print(f"[red]{escape(line)}[/red]")
 
 
 def render_stale_glossary(out: Console, payload: r.StaleGlossaryReport) -> None:
@@ -1449,10 +1505,14 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.DocumentList: lambda out, p: render_document_list(out, _as(r.DocumentList, p)),
     r.DocumentDetail: lambda out, p: render_document(out, _as(r.DocumentDetail, p)),
     r.DocumentResolved: lambda out, p: render_document_resolved(out, _as(r.DocumentResolved, p)),
+    r.DocumentCreated: lambda out, p: render_document_created(out, _as(r.DocumentCreated, p)),
     r.DocumentDeleted: lambda out, p: render_document_deleted(out, _as(r.DocumentDeleted, p)),
     r.DocumentReindexed: lambda out, p: render_document_reindexed(out, _as(r.DocumentReindexed, p)),
     r.StaleReparseReport: lambda out, p: render_stale_reparse(out, _as(r.StaleReparseReport, p)),
     r.StaleGlossaryReport: lambda out, p: render_stale_glossary(out, _as(r.StaleGlossaryReport, p)),
+    r.StaleRelationReport: lambda out, p: render_stale_relations(
+        out, _as(r.StaleRelationReport, p)
+    ),
     r.ReembedPlanReport: lambda out, p: render_reembed_plan(out, _as(r.ReembedPlanReport, p)),
     r.ReembedRunReport: lambda out, p: render_reembed_run(out, _as(r.ReembedRunReport, p)),
     r.ReembedCleanupReport: lambda out, p: render_reembed_cleanup(

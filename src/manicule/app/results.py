@@ -227,7 +227,14 @@ class Envelope(BaseModel):
 
     @model_validator(mode="after")
     def one_outcome_shape(self) -> Self:
-        """Hold the data/error invariant at every constructor, not only in the helpers."""
+        """Hold the data/error invariant at every constructor, not only in the helpers.
+
+        **Two operations may fail and still carry data**, and they are enumerated rather than
+        permitted in general. A failure with a payload beside it is a shape a consumer has to be
+        told about — it reads ``ok`` first and then finds ``data`` populated — so it is worth
+        exactly as much scrutiny as the success shape, and an operation that started retaining
+        partial results without anybody deciding to is the drift this validator exists against.
+        """
         if self.ok:
             if self.data is None or self.error is not None:
                 msg = "a successful envelope requires data and forbids error"
@@ -238,6 +245,19 @@ class Envelope(BaseModel):
             raise ValueError(msg)
         if self.data is None:
             return self
+        if self.op == "document_create":
+            self._retained_authoring()
+            return self
+        self._retained_ingest()
+        return self
+
+    def _retained_ingest(self) -> None:
+        """An incomplete ingest keeps its counters, and only then.
+
+        Raises:
+            ValueError: The data is not a retry-required incomplete report whose own reason is
+                the error beside it.
+        """
         partial = IngestReport.model_validate(self.data)
         if (
             self.op not in {"index_path", "index_changes", "connector_sync", "import"}
@@ -250,7 +270,31 @@ class Envelope(BaseModel):
                 "IngestReport whose reason matches error"
             )
             raise ValueError(msg)
-        return self
+
+    def _retained_authoring(self) -> None:
+        """A written document the index declined keeps the path it was written to.
+
+        The condition is ``indexed`` being false rather than the error's type, because the
+        payload is the thing that decides: a result saying the document *is* indexed alongside a
+        failure would be two answers to one question, and the path is only worth retaining for
+        the case where there is a file nothing else knows about.
+
+        Raises:
+            ValueError: The data is not a ``DocumentCreated`` that reports itself unindexed.
+        """
+        written = DocumentCreated.model_validate(self.data)
+        if written.indexed:
+            msg = (
+                "a failed document_create envelope may retain data only for a document that "
+                "was written and not indexed; this one reports itself indexed"
+            )
+            raise ValueError(msg)
+        if written.path not in (self.error.message if self.error else ""):
+            msg = (
+                "a failed document_create envelope retains the path so a caller can find the "
+                "file that was kept; the error beside it must name the same path"
+            )
+            raise ValueError(msg)
 
     def as_json(self) -> dict[str, Any]:
         """The envelope as plain JSON-safe data.
@@ -269,9 +313,20 @@ def succeeded(op: str, workspace: str, payload: Payload) -> Envelope:
 
 
 def failed(
-    op: str, workspace: str, error: ErrorInfo, *, payload: IngestReport | None = None
+    op: str,
+    workspace: str,
+    error: ErrorInfo,
+    *,
+    payload: IngestReport | DocumentCreated | None = None,
 ) -> Envelope:
-    """Wrap a failure, retaining a partial result when the operation produced one."""
+    """Wrap a failure, retaining a partial result when the operation produced one.
+
+    Two payload types reach here, and both are operations that did part of what was asked and
+    must say which part. An ingest run that has to be retried names its watermark; an authored
+    document that could not be indexed names the file it left on disk. In both cases the
+    alternative — an error with no data — would leave a caller unable to find the work that
+    was in fact done.
+    """
     return Envelope(
         op=op,
         ok=False,
@@ -905,6 +960,62 @@ class DocumentDeleted(Payload):
     mode: Literal["soft", "hard"]
 
 
+class DocumentCreated(Payload):
+    """One authored document: where its file is, and whether the index has it yet.
+
+    **The path is on this payload whether or not the operation succeeded**, and that is the
+    whole of the partial-failure contract in one field. A file is written and then indexed;
+    when indexing fails the file is kept, because the file is the record and the index is
+    derived from it. A caller told only that something went wrong would have no way to find
+    the content it just sent, and deleting it to keep the two in step would destroy the
+    durable half to tidy the disposable one.
+
+    ``indexed`` is therefore the field to read, not the envelope alone — though the two agree:
+    :func:`~manicule.app.dispatch.run_op` turns ``indexed: false`` into ``ok: false`` with this
+    payload still attached, the same way it reports an ingest run that must be retried.
+    """
+
+    document_id: str
+    """Derived from ``(workspace, source, path)``, so it is known before ingestion runs.
+
+    Reported even on the failure path for that reason: it is the handle a later sync will
+    index the kept file under, so a caller can watch for it rather than guess at it.
+    """
+
+    path: str
+    """The absolute path of the file that was written. Beneath the configured source's root."""
+
+    slug: str
+    collection: str
+    collection_id: str
+    source: str
+    """The configured connector instance the document was recorded under."""
+
+    indexed: bool
+    """Whether the document is published and searchable now, rather than merely written."""
+
+    member: bool
+    """Whether collection membership was written.
+
+    Distinct from ``indexed`` because it is a second write with its own way of not happening,
+    and a caller that found the document in search but not in its collection would otherwise
+    have nothing in the result that said so.
+    """
+
+    overwritten: bool
+    """Whether an existing document was replaced rather than a new one created."""
+
+    chunks: int = Field(default=0, ge=0)
+    detail: str = ""
+    """Why this result is not the complete one, in the words of whatever declined.
+
+    Two shapes reach it: why the document is not indexed, and — for a document that *is* — why it
+    was not added to its collection. Empty when both writes happened, which is the ordinary case.
+    """
+
+    elapsed_ms: int = Field(default=0, ge=0)
+
+
 class DocumentReindexed(Payload):
     """The outcome of a reindex of one document."""
 
@@ -1227,6 +1338,45 @@ class StaleReparseReport(Payload):
 
     superseded_documents: tuple[str, ...] = ()
     """One line per superseded document: which it is and what overtook it. No document text."""
+
+
+class StaleRelationReport(Payload):
+    """What a corpus-wide chunk-relation rescan did.
+
+    The third of the repair reports, and the shortest, because the stage it describes has the
+    fewest ways to be interesting: an extractor either read a document or it did not. There are
+    no entry counts as there are for the glossary and no chunk counts as there are for a
+    re-parse — an edge belongs to two documents, so counting edges would make one that gained
+    three and lost two look busier than one that gained a single link.
+
+    **No field carries document text or a link target.** Every string here is a document id, a
+    URI or an error, on :class:`StaleGlossaryReport`'s rule: the subject of this operation is
+    what the corpus says about itself, and a report naming the slugs it resolved would print the
+    shape of the index to a terminal and to whatever a shell pipeline points at.
+    """
+
+    dry_run: bool = False
+    """Whether this was a plan. A dry run reports ``selected`` and writes nothing at all."""
+
+    selected: int = Field(default=0, ge=0)
+    """Documents whose recorded relation lineage is not what the configured chain produces.
+
+    Includes every document with no recorded lineage, which the first time an extractor is
+    configured is the whole corpus — that is the point of the column rather than a surprise.
+    """
+
+    rescanned: int = Field(default=0, ge=0)
+    """Documents whose edges were rebuilt from stored chunks. Zero on a dry run."""
+
+    failed: int = Field(default=0, ge=0)
+    failures: tuple[str, ...] = ()
+    """One line per document the chain could not scan. Its lineage is untouched, so it is
+    selected again next time."""
+
+    unrepairable: int = Field(default=0, ge=0)
+    unrepairable_documents: tuple[str, ...] = ()
+    """Documents with no stored chunks to scan. A count of its own rather than more failures,
+    because the remedy is a rung up — a re-parse — rather than a fix to an extractor."""
 
 
 class StaleGlossaryReport(Payload):
@@ -2572,6 +2722,7 @@ __all__ = [
     "ConversationTurn",
     "Diagnosis",
     "DocumentChunk",
+    "DocumentCreated",
     "DocumentDeleted",
     "DocumentDetail",
     "DocumentList",
@@ -2625,6 +2776,7 @@ __all__ = [
     # imports the module rather than its star. Adding one name beside it and leaving the gap
     # would make the omission look deliberate.
     "StaleGlossaryReport",
+    "StaleRelationReport",
     "StaleReparseReport",
     "Stats",
     "TagDeleted",

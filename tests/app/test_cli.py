@@ -2421,8 +2421,13 @@ MINIMAL: dict[str, list[str]] = {
     "connector_list": ["connector", "list"],
     "connector_sidecar": ["connector", "sidecar", "."],
     "connector_sync": ["connector", "sync", "handbook"],
+    # No ``--file``, so the body comes from standard input — which the runner leaves empty,
+    # and an empty document is refused. That is the point of this table: the *arguments* a
+    # command needs, run against a backend that will usually decline them.
+    "document_create": ["document", "create", "memory", "retry-policy"],
     "document_delete": ["document", "delete", "doc-1"],
     "document_redetect_glossary": ["document", "reindex", "--stale-glossary"],
+    "document_rescan_relations": ["document", "reindex", "--stale-relations"],
     "document_reindex": ["document", "reindex", "doc-1"],
     "document_reindex_stale": ["document", "reindex", "--stale"],
     "import": ["import", "archive.tar.gz"],

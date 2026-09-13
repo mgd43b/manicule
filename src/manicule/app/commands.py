@@ -312,10 +312,19 @@ BINDERS: Mapping[str, Binder] = {
         watching=report,
         acquire_only=args.flag("acquire_only"),
     ),
+    "document_create": lambda service, args, report: service.document_create(
+        collection=args.text("collection"),
+        slug=args.text("slug"),
+        body=args.text("body"),
+        overwrite=args.flag("overwrite"),
+    ),
     "document_delete": lambda service, args, report: service.document_delete(
         args.text("document_id"), hard=args.flag("hard")
     ),
     "document_redetect_glossary": lambda service, args, report: service.document_redetect_glossary(
+        batch=args.count("batch", default=DEFAULT_SWEEP_BATCH), dry_run=args.flag("dry_run")
+    ),
+    "document_rescan_relations": lambda service, args, report: service.document_rescan_relations(
         batch=args.count("batch", default=DEFAULT_SWEEP_BATCH), dry_run=args.flag("dry_run")
     ),
     "document_reindex": lambda service, args, report: service.document_reindex(

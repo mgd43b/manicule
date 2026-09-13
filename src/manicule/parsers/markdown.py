@@ -46,7 +46,13 @@ from manicule.parsers.base import (
 )
 from manicule.parsers.config import MARKDOWN_MEDIA_TYPES, MarkdownConfig
 
-__all__ = ["MARKDOWN_MEDIA_TYPES", "MarkdownConfig", "MarkdownParser"]
+__all__ = [
+    "FRONT_MATTER_FENCE",
+    "MARKDOWN_MEDIA_TYPES",
+    "MarkdownConfig",
+    "MarkdownParser",
+    "front_matter_end",
+]
 
 _BLOCK_KINDS: Mapping[str, BlockKind] = {
     "paragraph_open": BlockKind.PROSE,
@@ -65,7 +71,14 @@ _TEXT_CHILDREN = frozenset({"text", "code_inline"})
 """Inline token types that carry literal characters. Emphasis and link markers do not, so a
 heading's rendered title is built from these alone."""
 
-_FRONT_MATTER_FENCE = "---"
+FRONT_MATTER_FENCE = "---"
+"""What opens and closes a front-matter block.
+
+Public because one other place has to recognize the same fence: authoring refuses a body
+that opens one and never closes it, since the parser can skip a closed fence and has no way
+to rescue an open one. A second spelling of ``---`` would be a second answer to "is this
+front matter", and the two would agree until one of them was changed.
+"""
 
 _JSX_TAG = re.compile(r"^</?(?P<name>[A-Z][A-Za-z0-9_.]*)(?:\s[^<>]*?)?/?>$")
 """A JSX component tag alone on a line. Capitalized initial letter is what distinguishes a
@@ -175,7 +188,7 @@ class MarkdownParser:
         parse as ordinary Markdown instead of being absorbed into the tag.
         """
         masked = list(lines)
-        start = _front_matter_end(lines) if self._config.front_matter else 0
+        start = front_matter_end(lines) if self._config.front_matter else 0
         for index in range(start):
             masked[index] = ""
         media: list[_Draft] = []
@@ -221,12 +234,18 @@ def _component_lines(lines: Sequence[str], start: int) -> Iterator[tuple[int, st
             yield index, match["name"]
 
 
-def _front_matter_end(lines: Sequence[str]) -> int:
-    """How many leading lines are front matter. Zero when there is none."""
-    if not lines or lines[0].strip() != _FRONT_MATTER_FENCE:
+def front_matter_end(lines: Sequence[str]) -> int:
+    """How many leading lines are front matter. Zero when there is none.
+
+    **Zero is also the answer for a fence that never closes**, which is the case the parser
+    cannot do anything about and authoring therefore refuses at the door: an unterminated
+    block is read as content, and CommonMark turns its last line into a setext heading the
+    document does not have. Two callers, one rule.
+    """
+    if not lines or lines[0].strip() != FRONT_MATTER_FENCE:
         return 0
     for index in range(1, len(lines)):
-        if lines[index].strip() == _FRONT_MATTER_FENCE:
+        if lines[index].strip() == FRONT_MATTER_FENCE:
             return index + 1
     return 0
 
