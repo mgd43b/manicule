@@ -17,8 +17,17 @@
 # No port is exposed and none should be. manicule serves MCP over stdio, which opens no
 # socket at all.
 
-ARG PYTHON_VERSION=3.14
-ARG UV_VERSION=0.9.7
+# **Base image tags are literal, and that is a requirement rather than a style.** These were
+# `ARG PYTHON_VERSION` / `ARG UV_VERSION`, referenced from the `FROM` lines below as
+# `python:${PYTHON_VERSION}-slim-bookworm`. That reads well and is invisible to Dependabot: its
+# Docker parser records a dependency only when the tag is a literal token, so an ARG-supplied
+# version is parsed as no version at all and the image is skipped entirely. The base images of a
+# container that is published to ghcr.io and pulled by a cluster were therefore tracked by nothing.
+#
+# So do not reintroduce the indirection. Nothing needed it — no `--build-arg` for either name
+# appears in compose.yaml, in CI, or in the documentation — and the failure it causes is silent:
+# dependency tracking stops, while `.github/dependabot.yml` goes on looking correct. To build
+# against another interpreter, edit the two `FROM` lines.
 
 # --- the environment, the grammars and the weights ------------------------------------------
 #
@@ -26,8 +35,8 @@ ARG UV_VERSION=0.9.7
 # so that what is fetched is decided by manicule's own code rather than by a list copied into
 # this file and left to drift.
 
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
-FROM python:${PYTHON_VERSION}-slim-bookworm AS build
+FROM ghcr.io/astral-sh/uv:0.9.7 AS uv
+FROM python:3.14-slim-bookworm AS build
 
 COPY --from=uv /uv /usr/local/bin/uv
 
@@ -174,7 +183,7 @@ assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
 
 # --- the image ------------------------------------------------------------------------------
 
-FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS runtime
 
 LABEL org.opencontainers.image.title="manicule" \
       org.opencontainers.image.description="Self-hosted document search and answers, with citations that resolve." \
