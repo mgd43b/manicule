@@ -19,7 +19,8 @@ from manicule.storage import models
 from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.engine import VECTORS_DIRNAME
 from manicule.storage.types import utcnow
-from manicule.storage.vectors import LanceVectorStore, table_name
+from manicule.storage.vector_schema import space_name
+from manicule.storage.vectors import LanceVectorStore
 from tests.fakes import HashEmbedder, MemoryVectorStore
 from tests.storage_helpers import fingerprint, make_chunk, make_document
 
@@ -79,7 +80,7 @@ async def _seed_live_generation(runtime: Runtime, data_dir: Path) -> None:
             insert(models.IndexState).values(
                 workspace_id="default",
                 vector_namespace="legacy",
-                vector_table=table_name(old),
+                vector_table=space_name(old),
                 embed_fingerprint=old.model_dump_json(),
                 vector_inventory_digest=None,
                 created_at=utcnow(),
@@ -229,3 +230,35 @@ async def test_custom_vector_backend_is_refused_before_snapshot_model_or_run(
 
         with pytest.raises(AssemblyError, match="engine has not been opened"):
             runtime.require_engine()
+
+
+async def test_startup_recovery_on_a_backend_that_cannot_re_embed_is_quiet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recovery with nothing to recover is a success on any vector backend.
+
+    `_recover_reembedding` runs unconditionally in every served process, so requiring a backend
+    that could resume a run *before* asking whether one exists made an installation that has
+    never started a re-embed — every installation on a store that cannot, which is every
+    networked one — announce a failed recovery on every boot, for a run that does not exist.
+    The announcement is the defect: it is indistinguishable from the real thing, and the real
+    thing is a corpus half-swapped between two generations.
+
+    Ordering is the fix, and the refusal it moves is still reachable: a saved run on a backend
+    that cannot resume it remains a conflict, and
+    `test_custom_vector_backend_is_refused_before_snapshot_model_or_run` is where that is held.
+    """
+    data_dir = tmp_path / "data"
+    embedder = CountingEmbedder()
+    async with _runtime(data_dir, embedder) as runtime:
+
+        async def custom_vectors() -> MemoryVectorStore:
+            return MemoryVectorStore()
+
+        monkeypatch.setattr(runtime, "vectors", custom_vectors)
+
+        outcome = await ApplicationService(runtime).reembed_recover_pending()
+
+    assert outcome.recovered == 0
+    assert outcome.failures == 0
+    assert outcome.failure_types == ()

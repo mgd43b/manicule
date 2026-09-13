@@ -22,7 +22,7 @@ from manicule.core.acquisition import (
     SnapshotItemOutcome,
     SnapshotPromotionPolicy,
 )
-from manicule.core.errors import ManiculeError
+from manicule.core.errors import ManiculeError, VectorStoreStateError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import document_id, glossary_entry_id, vector_id
 from manicule.core.rebuild import (
@@ -63,7 +63,6 @@ from manicule.storage.fts import (
 from manicule.storage.rows import apply_document, to_chunk
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
-from manicule.storage.vectors import VectorStoreStateError
 
 if TYPE_CHECKING:
     from collections.abc import (

@@ -1091,6 +1091,23 @@ to a local model. That refusal already exists in `policy_problems()`; what #44 c
 input it is computed from, so that it fires on the configuration that actually sends content
 away rather than on the one that merely names a hosted provider.
 
+**One endpoint in this section is not a model's.** `Egress` classifies the endpoints a
+*provider* resolves to, and `selected_endpoints` enumerates them per model role — which is the
+right shape for the question this section is about and cannot see the vector store, because a
+database is not a model. `storage.vector_db = "qdrant"` makes that omission material: the chunk
+is stored beside its vector (`storage.md` §6.2), so a vector index on another host receives
+document *text* on every ingest, on a path no prompt passes through and no redactor sees.
+
+The classification is not widened to cover it, and the reason is that the two are different
+kinds of egress rather than two instances of one. A model endpoint is per-query, per-role, and
+is what a trace has to record on an answer; the vector store is per-installation and per-ingest,
+and redaction is not available to it at all — a redacted index would not verify the citations it
+exists to verify (§7.4). So it is refused at configuration time instead, by
+`Settings.policy_problems()`, which declines a non-loopback `storage.vector_db_url` when
+`cloud_allowed` is false and says so in the same list as every other joint impossibility. That
+is the same principle §7.1 opens with — the predicate is the endpoint — applied to an endpoint
+that `Egress` is the wrong instrument for.
+
 ### 7.2 What is redacted, and what deliberately is not
 
 Redaction applies to **everything on the egress path and nothing else** — which is five text
@@ -1102,7 +1119,7 @@ batch:
 
 | Redacted | Not redacted | Why |
 |---|---|---|
-| Passage bodies in the prompt | `Chunk.text` in the index | The index is local and is what a citation is verified against (§7.4) |
+| Passage bodies in the prompt | `Chunk.text` in the index | The index is what a citation is verified against (§7.4), and redacting it would make verification fail against the document it cites |
 | The user's query, as sent | `query_logs.query` | Storage is local; `AtRestSettings.redact_logs_content` is the separate, existing knob for logs |
 | Conversation history, as sent | `messages.content` | Same reason. A stored conversation is local |
 | — | The model's answer | It has already left. Redacting the reply protects nothing and would rewrite the answer, which §3.4 refuses |
@@ -1221,6 +1238,17 @@ to retrieve it at rank 7. Dropping the passage answers the question from what po
 and says what it could not use. Search still shows the document, because search is local and
 only generation crosses the boundary, so a user learns the document exists and that its content
 did not leave. They already had read access; nothing is disclosed that was not.
+
+**"Search is local" is a premise, and configuration is what keeps it true.** It holds because
+the document store and the vector index are both on this machine — and `storage.vector_db =
+"qdrant"` can put the vector index on another one. A chunk's text is stored beside its vector
+(`storage.md` §6.2), so indexing a `local_only` document into a remote collection sends exactly
+the content this section protects, at ingest, before any question is asked and with no prompt to
+filter it out of. Dropping the passage at generation time would then be protecting a boundary
+that had already been crossed. So the two are refused together: `Settings.policy_problems()`
+declines a configuration that names any `local_only` source while `storage.vector_db_url` points
+off this machine, and says which of the two to change. The floor is not lowered for the sources
+that most depend on it, and it is not silently relied on either.
 
 Three rules to keep it coherent:
 

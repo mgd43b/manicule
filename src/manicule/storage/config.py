@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 DOC_STORE_NAME = "sqlite"
 VECTOR_STORE_NAME = "lancedb"
+QDRANT_VECTOR_STORE_NAME = "qdrant"
 
 
 class DocStoreConfig(BaseModel):
@@ -43,9 +44,26 @@ class VectorStoreConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class QdrantVectorStoreConfig(BaseModel):
+    """Settings for the network-backed vector store.
+
+    Empty for the same reason :class:`DocStoreConfig` holds no path: where the server is, and
+    how to reach it, are properties of the installation rather than of this component, and they
+    live in ``storage.vector_db_url`` and ``storage.qdrant``. A component-level override would
+    be a second place an endpoint can be set, and two of those disagree by default.
+
+    Declared rather than omitted so that configuration written for this component is rejected
+    rather than ignored, and so that the first real per-component setting has a place to go.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
 __all__ = [
     "DOC_STORE_NAME",
+    "QDRANT_VECTOR_STORE_NAME",
     "VECTOR_STORE_NAME",
     "DocStoreConfig",
+    "QdrantVectorStoreConfig",
     "VectorStoreConfig",
 ]

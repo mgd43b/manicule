@@ -52,7 +52,7 @@ can fail on.
                 │ miss
    ─────────────┼─────────────────────────────  declared stages, in configuration order
         ┌───────▼────────┐
-        │ dense          │   embed → LanceDB k′ → hydrating join → k live candidates
+        │ dense          │   embed → VectorStore k′ → hydrating join → k live candidates
         ├────────────────┤
         │ lexical        │   FTS5 BM25, one joined statement, merged into the list
         ├────────────────┤
@@ -226,10 +226,11 @@ the merged vocabulary — `Document.source`, `DocStore.find_document(source, sou
 than `storage.md` §6.6's `connector_ids`, because a filter field that does not match the column
 it filters is a field people get wrong.
 
-**`langs` is added.** The Lance table already promotes a `lang` column
-([`storage.md`](storage.md) §6.2) that no filter field can currently reach. A promoted column
-nothing can name is dead weight in every row of the index, and language is a real query
-restriction on a corpus the embedder was chosen to handle in 100+ languages.
+**`langs` is added.** Both vector stores promote a `lang` field — a column in LanceDB's schema, a
+payload field in Qdrant's ([`storage.md`](storage.md) §6.2) — that no filter field could
+previously reach. A promoted field nothing can name is dead weight in every row of the index,
+and language is a real query restriction on a corpus the embedder was chosen to handle in 100+
+languages.
 
 **`extra: dict[str, JsonValue]` is removed.** It shipped so that "a store can accept a predicate
 this type cannot yet express without anyone widening it prematurely." With the shape settled it
@@ -310,9 +311,9 @@ set it.**
 
 | Filter field | Resolved by | Why |
 |---|---|---|
-| `document_ids`, `kinds`, `langs` | Lance predicate | A promoted column exists ([`storage.md`](storage.md) §6.2) |
-| `workspace_ids` | **Neither.** The hydrating join (§4.2) | No Lance column, deliberately: promoting it creates a value that can disagree with SQLite |
-| `sources`, `media_types`, `collection_ids`, `tag_ids`, `updated_*` | SQLite, into `document_ids`, then pushed down | Each needs a join the vector table has no columns for |
+| `document_ids`, `kinds`, `langs` | Vector store predicate | A promoted field exists on both backends ([`storage.md`](storage.md) §6.2), and neither is widened past it: the same query must return the same rows whichever store an installation configured |
+| `workspace_ids` | **Neither.** The hydrating join (§4.2) | No field on either store, deliberately: promoting it creates a value that can disagree with SQLite |
+| `sources`, `media_types`, `collection_ids`, `tag_ids`, `updated_*` | SQLite, into `document_ids`, then pushed down | Each needs a join neither vector store has fields for |
 
 The lexical leg needs none of this: it is one SQL statement against the authoritative store and
 applies the whole filter inline, before `LIMIT` ([`storage.md`](storage.md) §6.1).
@@ -322,15 +323,15 @@ early exit. The rule that picks between them:
 
 ```
 1.  If no join-requiring field is set, there is nothing to resolve:
-        push down what has a column, over-fetch (§4.3), and let the
-        hydrating join do the rest.
+        push down what the store can filter on, over-fetch (§4.3), and
+        let the hydrating join do the rest.
 2.  Otherwise resolve those fields in SQLite into a document-id set.
 3.  If the set is EMPTY, the filter matches no document:
         return no candidates. Do not fall through.
 4.  If |set| <= prefilter_id_limit:
         push it down as document_ids. Selectivity is now the store's problem.
 5.  Otherwise:
-        push down only what has a column, over-fetch, and post-filter.
+        push down only what the store can filter on, over-fetch, and post-filter.
 ```
 
 **Step 3 is not a special case, it is the one that has to be written down.** "No join-requiring
@@ -370,11 +371,12 @@ the rule is good. The condition is precise —
 derived_overfetch > overfetch_max · k   AND   resolved_id_count > prefilter_id_limit
 ```
 
-— and the answer if it is ever observed is a `workspace_id` column promoted into the Lance table,
-which [`storage.md`](storage.md) §6.2 rejects today for a good reason (a value that can disagree
-with SQLite) that would then have to be traded against a worse one. It is a storage change and it
-becomes a storage ticket when the trace shows the condition occurring, not before. Nothing about
-correctness depends on it: the post-filter plan is always correct, only slower.
+— and the answer if it is ever observed is a `workspace_id` field promoted into the vector store
+(a column in LanceDB, a payload field in Qdrant), which [`storage.md`](storage.md) §6.2 rejects
+today for a good reason (a value that can disagree with SQLite) that would then have to be
+traded against a worse one. It is a storage change and it becomes a storage ticket when the
+trace shows the condition occurring, not before. Nothing about correctness depends on it: the
+post-filter plan is always correct, only slower.
 
 ### 3.4 What this costs in already-merged code
 
@@ -451,14 +453,14 @@ returned **zero** live in-workspace results — a total loss of recall, silently
 well-formed empty result set. The lexical leg fixed it by filtering inside the statement, before
 `LIMIT`.
 
-**The dense leg cannot do that, and the reason is structural rather than an oversight.** The
-Lance table holds a physical `id`, logical `chunk_id`, `publication_id`, `vector`,
-`document_id`, `kind`, `lang`, `position` and `chunk_json`. It holds no `deleted_at`, no
-`status`, and no `workspace_id`, and it holds none of them
-deliberately: liveness and tenancy live on `documents`, in the authoritative store, and copying
-them into a derived one creates a value that can disagree. So `VectorStore.search(v, k)` returns
-`k` rows of which an unknown number are invisible, and the join that removes them necessarily
-runs afterwards.
+**The dense leg cannot do that, and the reason is structural rather than an oversight.** Every
+vector store row — a Lance column, or a Qdrant payload field, the names shared between the two
+([`storage.md`](storage.md) §6.2) — holds a physical `id`, logical `chunk_id`, `publication_id`,
+`vector`, `document_id`, `kind`, `lang`, `position` and `chunk_json`. Neither backend holds
+`deleted_at`, `status`, or `workspace_id`, and neither holds them deliberately: liveness and
+tenancy live on `documents`, in the authoritative store, and copying them into a derived one
+creates a value that can disagree. So `VectorStore.search(v, k)` returns `k` rows of which an
+unknown number are invisible, and the join that removes them necessarily runs afterwards.
 
 The dense stage is therefore three operations that are one stage:
 
@@ -474,13 +476,13 @@ d.status = 'indexed'`, plus `d.workspace_id`, followed by equality between the v
 publication and `d.publication_id`. It is inside the stage rather than beside it for
 the reason in §2.4: a boundary that configuration can omit is not a boundary.
 
-**The join also re-reads the chunk.** Lance returns `chunk_json`, which is a second copy of the
-chunk text carried so the store can satisfy the protocol on its own
-([`storage.md`](storage.md) §6.2). Retrieval uses the SQLite row, because SQLite is
-authoritative and a divergence between the two copies must resolve toward the truth rather than
-toward whichever one the query happened to read. The Lance copy is what makes
-`assert_vector_store_is_dimension_agnostic` pass with no relational store behind it; it is not
-what gets cited.
+**The join also re-reads the chunk.** The vector store returns `chunk_json` too, on either
+backend — a second copy of the chunk text every implementation carries so it can satisfy the
+protocol on its own ([`storage.md`](storage.md) §6.2). Retrieval uses the SQLite row, because
+SQLite is authoritative and a divergence between the two copies must resolve toward the truth
+rather than toward whichever one the query happened to read. That stored copy is what makes
+`assert_vector_store_is_dimension_agnostic` pass with no relational store behind it, on either
+backend; it is not what gets cited.
 
 ### 4.3 The over-fetch factor is derived, not constant
 
@@ -492,7 +494,7 @@ embed batch size in [`ingest.md`](ingest.md) §8.2.
 ```
 live_fraction = chunks of live, indexed documents IN THIS WORKSPACE
                 ───────────────────────────────────────────────────
-                          rows in the vector table
+                          rows in the vector store
 
 k′ = ceil(k / clamp(live_fraction, 0.05, 1.0))
 k′ = max(k′, overfetch_min · k)
@@ -502,20 +504,21 @@ k′ = min(k′, overfetch_max · k, absolute_row_cap)
 **The numerator is workspace-scoped and stops there — it does not model the rest of the filter.**
 That is deliberate, and it is what keeps the fraction cacheable. Workspace and liveness are the
 two exclusions the dense leg *cannot* push down and must therefore absorb by over-fetching;
-everything else in the filter either has a Lance column or takes the pre-filter path in §3.3, so
-it is already the store's problem rather than the over-fetch's. Folding the whole filter into the
-fraction would make it a per-query aggregate — two `COUNT`s on the hot path of every search, to
-refine a number that then gets clamped and rounded to a multiple anyway.
+everything else in the filter either has a field on the vector store or takes the pre-filter
+path in §3.3, so it is already the store's problem rather than the over-fetch's. Folding the
+whole filter into the fraction would make it a per-query aggregate — two `COUNT`s on the hot
+path of every search, to refine a number that then gets clamped and rounded to a multiple
+anyway.
 
 | Knob | Default | Why that value |
 |---|---|---|
-| `overfetch_min` | 3 | A healthy single-workspace index still loses rows to the soft-delete grace window, in-flight documents and unswept tombstones. 3× removes the retry from the common path, and over an exhaustive search below the ANN threshold (`docs/storage.md` §6.2) it is not measurable. That threshold now has a lifecycle behind it rather than only a number, so the claim is checkable: `manicule index` with no path says whether this index is still exhaustive. Past the threshold the over-fetch stops being free — it costs probes against an IVF_PQ index rather than a longer linear scan, which is the same interaction §3.3 flags for filters |
+| `overfetch_min` | 3 | A healthy single-workspace index still loses rows to the soft-delete grace window, in-flight documents and unswept tombstones. 3× removes the retry from the common path. On LanceDB, over an exhaustive search below `storage.ann_index_threshold` (`docs/storage.md` §6.2) it is not measurable, and that threshold now has a lifecycle behind it rather than only a number, so the claim is checkable: `manicule index` with no path says whether this index is still exhaustive; past the threshold the over-fetch stops being free — it costs probes against an IVF_PQ index rather than a longer linear scan, which is the same interaction §3.3 flags for filters. `ann_index_threshold` is LanceDB-only — Qdrant builds and maintains its own HNSW index on every write, with no exhaustive/indexed distinction this setting could describe |
 | `overfetch_max` | 20 | Past this the plan should have inverted to the pre-filter regime (§3.3); the cap is what makes that visible in the trace rather than absorbed as latency |
 | `absolute_row_cap` | 2000 | Every over-fetched row is a `chunk_json` decode. The cap bounds the work independently of the multiplier |
 
-**The denominator is the vector table's row count, not the chunk count.** Unswept tombstones are
-still rows in Lance and still consume top-`k` slots; a fraction computed against SQLite's chunk
-count would call an index clean while it was full of pending deletions.
+**The denominator is the vector store's row count, not the chunk count.** Unswept tombstones are
+still rows in the vector store and still consume top-`k` slots; a fraction computed against
+SQLite's chunk count would call an index clean while it was full of pending deletions.
 
 **It is computed once per `(generation, workspace)`, not per query.** Two counts — one SQLite
 aggregate, one `VectorStore.count()` — cached against the same generation counter that invalidates

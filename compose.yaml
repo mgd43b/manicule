@@ -19,9 +19,10 @@ services:
     # reaper for pid 1 so ^C during a long ingest is not swallowed.
     init: true
     volumes:
-      # The data directory: the database, the vector index, and — because ingest retains
-      # source bytes — a byte-identical copy of everything indexed. Treat it as the corpus
-      # itself. docs/deployment.md §1.
+      # The data directory: the database, the LanceDB vector index (the default — absent under
+      # storage.vector_db = "qdrant", see the profiled service below), and — because ingest
+      # retains source bytes — a byte-identical copy of everything indexed. Treat it as the
+      # corpus itself. docs/deployment.md §1.
       - manicule-data:/data
       # Read-only, so an indexing run cannot write to what it is reading.
       - ${MANICULE_CORPUS:-.}:/corpus:ro
@@ -46,5 +47,28 @@ services:
     # that is an operator's decision: docs/deployment.md §4 says what it costs, and manicule
     # refuses a non-loopback bind without authentication either way.
 
+  # A local Qdrant, for trying `storage.vector_db = "qdrant"` without a server already running
+  # somewhere else. Gated behind a compose profile rather than added to the default service
+  # list, so it changes nothing about `docker compose run --rm manicule ...` above: a profiled
+  # service is neither built nor started unless its profile is named. docs/deployment.md §6.5
+  # has the settings; this is a server to point them at.
+  #
+  #   docker compose --profile qdrant up -d qdrant
+  #   docker compose --profile qdrant run --rm \
+  #     -e MANICULE_STORAGE__VECTOR_DB=qdrant \
+  #     -e MANICULE_STORAGE__VECTOR_DB_URL=http://qdrant:6333 \
+  #     manicule doctor
+  #
+  # `qdrant:6333` rather than `localhost`: the two services share this compose network and
+  # reach each other by service name, the same reason `host.docker.internal` stands in for the
+  # host's own Ollama above. No `ports:` published here either — add one yourself to reach this
+  # Qdrant from outside the compose network.
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    profiles: ["qdrant"]
+    volumes:
+      - qdrant-data:/qdrant/storage
+
 volumes:
   manicule-data:
+  qdrant-data:

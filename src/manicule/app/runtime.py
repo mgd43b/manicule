@@ -1574,16 +1574,32 @@ class _Ingestion:
             return await self._reembed_recover_pending_guarded()
 
     async def _reembed_recover_pending_guarded(self) -> ReembedRecovery:
-        """Recover while reset cannot terminalize a run between listing and resumption."""
+        """Recover while reset cannot terminalize a run between listing and resumption.
+
+        **The backend is required only once there is something to recover**, and the ordering
+        is the whole of it. This runs unconditionally at startup in every served process, so
+        asking first whether the backend *could* resume a run would make an installation that
+        has never started one — every Qdrant installation, since it cannot — announce a failed
+        re-embedding recovery on every boot, for a run that does not exist. A recovery with
+        nothing to recover is a success on any backend.
+
+        A saved run and a backend that cannot resume it is a real conflict, and still refuses:
+        that corpus was re-embedded under the embedded store and its configuration has moved
+        since.
+        """
         import secrets  # noqa: PLC0415
 
+        from manicule.ingest.reembed import ReembedRecovery  # noqa: PLC0415
         from manicule.storage.reembed import SqliteReembedStore  # noqa: PLC0415
 
-        await self._require_reembed_backend()
         await self._runtime.documents()
         authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
+        recoverable = await authority.recoverable_run_ids()
+        if not recoverable:
+            return ReembedRecovery()
+        await self._require_reembed_backend()
         return await _recover_reembed_runs(
-            await authority.recoverable_run_ids(),
+            recoverable,
             lambda run_id: self.reembed_resume(run_id, secrets.token_urlsafe(24)),
         )
 
@@ -1617,9 +1633,12 @@ class _Ingestion:
         vectors = await self._runtime.vectors()
         if not isinstance(vectors, PublishedLanceVectorStore):
             raise ReembedError(
-                "durable re-embedding requires the built-in SQLite/Lance vector backend; "
-                "the configured custom backend does not implement named shadow generations, "
-                "atomic publication, inspection, and cleanup"
+                f"durable re-embedding requires the built-in SQLite/Lance vector backend, and "
+                f"storage.vector_db is {self._runtime.settings.storage.vector_db!r}. No other "
+                f"vector store implements named shadow generations, atomic publication, "
+                f"inspection and cleanup — the four things a re-embed swaps a whole generation "
+                f"with — and ordinary VectorStore methods cannot emulate them safely. Re-index "
+                f"instead, or move the corpus to 'lancedb' for the re-embed."
             )
 
     def _require_reembed_capacity(self, run: ReembedRun) -> None:

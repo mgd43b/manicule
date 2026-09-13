@@ -129,7 +129,10 @@ For a self-hosted corpus that is not a constraint worth trading retrieval qualit
 multilingual coverage for. Two things already in the design absorb most of it: exhaustive
 search stays exact below the ANN threshold ([`storage.md`](storage.md) §6.2), and vectors are
 the *derived* store — rebuildable, and not what a backup is protecting
-([`storage.md`](storage.md) §1).
+([`storage.md`](storage.md) §1). What a restore then costs still differs by backend, though:
+a directory copy back into place for the embedded default, a re-embed of the corpus for a
+remote Qdrant collection that `backup` never captured to begin with
+([`storage.md`](storage.md) §9.4).
 
 Recorded rather than argued: an earlier draft made a 768-over-1024 case specific to the models
 then under consideration. It does not transfer, and it is not re-derived here.

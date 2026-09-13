@@ -1250,7 +1250,10 @@ fails if any is classified as neither, so the decision is made rather than inher
 another process may be writing, so a copy taken during active indexing is a copy of something
 moving. That was true before this lock existed and is not fixed by it. Making them writers
 would mean no backup could be taken while a server was up, which is when somebody most wants
-one; a consistent copy under load needs a snapshot, not a lock.
+one; a consistent copy under load needs a snapshot, not a lock. Under `storage.vector_db =
+"qdrant"` the directory being copied is smaller — SQLite and the blob store, nothing
+vector-shaped (`storage.md` §9.4) — but the argument is unchanged: what moves while it is being
+read is still being read, whichever store ends up holding the vectors themselves.
 
 **Shutdown.** The lock is released after the container and after the engine, so it outlives
 every storage operation it was taken to exclude. `Ctrl-C` and `SIGTERM` reach the runtime's
@@ -2089,10 +2092,11 @@ takeover. Publication writes its receipt and terminal checkpoint in the same SQL
 For installations upgraded from the earlier split checkpoint, the receipt remains authoritative:
 status and resume report `published`, and abandon cannot turn the live run into `failed`.
 
-The workflow currently requires the built-in SQLite/Lance backend. A custom vector store is
-refused before a snapshot, model, or run is constructed unless it supplies the complete named
-shadow-generation, inspection, atomic-publication and cleanup contract; ordinary `VectorStore`
-methods are not enough to emulate that safely.
+The workflow currently requires the built-in SQLite/Lance backend. Every other vector store —
+Qdrant included, first-party as it now is — is refused before a snapshot, model, or run is
+constructed, by name rather than by probing for a missing method: none of them supplies the
+complete named shadow-generation, inspection, atomic-publication and cleanup contract, and
+ordinary `VectorStore` methods are not enough to emulate that safely.
 
 After a successful publication the runtime explicitly prepares its long-lived pointer-following
 vector handle for the configured target. A handle still prepared for the old fingerprint refuses

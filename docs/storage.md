@@ -16,8 +16,13 @@ what, and what happens when they disagree.
 
 ## 1. The whole design in four sentences
 
-**SQLite is authoritative. LanceDB and FTS5 are derived indexes. The blob store is
+**SQLite is authoritative. The vector index and FTS5 are derived indexes. The blob store is
 immutable. Nothing is ever deleted from a derived store synchronously.**
+
+The vector index is LanceDB by default and Qdrant when `storage.vector_db` says so (§6.7).
+Which one it is changes where the derived side *lives* and nothing about its standing: both
+are rebuildable from `chunks.embed_text`, and every invariant below is stated about the
+derived store rather than about an engine.
 
 Every decision below follows from those four. They matter because two stores with no shared
 transaction *will* diverge on a crash, and there are only two possible recovery stories:
@@ -54,7 +59,7 @@ for anything except genuinely new content — which is what `original_ref` in
   manicule.db              SQLite — the authority
   manicule.db-wal
   manicule.db-shm
-  vectors/                 LanceDB — derived
+  vectors/                 LanceDB — derived; absent under storage.vector_db = "qdrant"
     workspaces/<sha256>/   opaque, stable workspace namespace
       chunks__<fp8>.lance/ vector table, name carries the fingerprint hash
       _manicule_meta.lance/ one row: the workspace fingerprint
@@ -77,6 +82,11 @@ it: **all three live under one root**, because a backup is a snapshot of that ro
 restore is a replacement of it. Splitting the vector store onto a different volume is a
 supported deployment, but it makes the backup procedure in §9 the operator's problem rather
 than manicule's, and `doctor` says so.
+
+`storage.vector_db = "qdrant"` is the same split taken to its limit: the vector index is not on
+a volume at all, and `vectors/` is never created. The authority and the retained bytes still
+live under this root and are still what a backup is protecting; §6.7 and §9.4 say what changes
+for the leg that does not.
 
 ---
 
@@ -261,7 +271,7 @@ proposal could not do.
 | `chunks` | Chunks carry an `Anchor`, and anchors are the type `docs/contracts.md` §1 calls the most important in the system and locks once ingest runs. Storing them only inside a columnar vector store's JSON blob puts the system's most valuable data in its most disposable store. A real table also gives `chunk_relations` something to point a foreign key at, and gives rung 2 of the ladder somewhere to read `embed_text` from. |
 | `blobs` | Content-addressed retained source bytes with media type, size and compression, plus a target for `documents.original_ref` to reference. §7. |
 | `index_state` | One row per workspace recording its fingerprints, vector namespace and live derived-index name. §6.3. |
-| `vector_tombstones` | Workspace- and physical-binding-qualified chunk IDs deleted from SQLite whose vectors have not yet been swept from LanceDB. §8.2. |
+| `vector_tombstones` | Workspace- and physical-binding-qualified chunk IDs deleted from SQLite whose vectors have not yet been swept from the vector store. §8.2. |
 | `acquisition_runs` | Durable connector-run lifecycle, base and candidate watermarks, generation-fenced lease, completion markers, predecessor/successor fence lineage, typed inventory recovery, and bounded acquired/reused/reconciled-deletion counters. It separates discovering source coverage from publishing derived content. |
 | `acquisition_records` | One idempotent source identity per run, with the validated fetched envelope, acquisition/indexing state and retained-blob reference. Acquired and indexing states require the blob; the acquired transition also stores the fetched URI, media type, encoding, metadata, byte length and content hash atomically. Unchanged remains a distinct terminal provenance state. A discovery record is acknowledged only after this row commits. |
 | `acquisition_markers` | Indexed inventory of filesystem recovery markers. It blocks history cleanup until marker ownership is reconciled and contributes blob hashes to GC without a directory-wide scan. |
@@ -879,7 +889,7 @@ better choice and the operator can make it.
 Rebuilding is rung 1 of the ladder: `INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`.
 Nothing is re-fetched, re-parsed or re-embedded.
 
-### 6.2 LanceDB behind `VectorStore`
+### 6.2 LanceDB behind `VectorStore` — the embedded default
 
 The Lance table holds the minimum needed to find a chunk and to filter before finding it:
 
@@ -1021,9 +1031,12 @@ The application also requires the candidate vector's `publication_id` to equal
 cross-store commit pointer: staged and retired generations fail it even when their logical
 chunk id still exists.
 
-Nothing needs to be deleted from LanceDB for a result to stop being served. The cost of
+Nothing needs to be deleted from the vector store for a result to stop being served — the
+publication comparison is what retires a generation, on either backend. The cost of
 `chunk_json` is a second copy of the corpus text, and the honest accounting is that the
-protocol bought self-sufficiency with duplication.
+protocol bought self-sufficiency with duplication. Under §6.7 that copy also leaves the
+machine, which is why a remote vector store is an egress path for document text rather than
+for embeddings alone.
 
 **No `workspace_id` column.** Workspace lives on `documents`, and the join above applies it.
 Promoting it into Lance would make it a value that can disagree with SQLite.
@@ -1594,6 +1607,91 @@ post-filtering does *not* guarantee `k` survivors. The implementation must eithe
 retry, or report the result set as truncated. It must never quietly return fewer than `k` and
 let the caller assume the corpus had no more.
 
+### 6.7 Qdrant behind `VectorStore` — the networked alternative
+
+`storage.vector_db = "qdrant"` puts the derived vector index on a server instead of in a
+directory. The reason to want that is not performance: it is that an embedded index is owned by
+one filesystem, so several processes cannot share one, and a container with no persistent volume
+cannot keep one. The reason to be careful about it is that everything §6.2 gets from a local
+directory — atomic replacement, a backup that is a directory copy, a corpus that never reaches a
+socket — has to be re-established, re-scoped, or given up explicitly. This section is which.
+
+**The row is the same row.** A Lance column and a Qdrant payload field carry the same names,
+written from the same object by the same rules: `id`, `chunk_id`, `publication_id`,
+`document_id`, `kind`, `lang`, `position`, `chunk_json`, `embed_identity`, `vector_checksum`,
+`vector_checksum_version`. Those names, the `Filter` fields a store may answer, and the
+read-side integrity verdict live in `manicule.storage.vector_schema`, which imports no database
+— so an installation configured for Qdrant does not need LanceDB and PyArrow on disk to know
+what a row is called, and the two backends cannot drift into answering one question two ways.
+
+**A collection name carries both scopes, because Qdrant has one flat namespace.** Where the
+embedded store gets a workspace's isolation from a directory and a fingerprint's from a table
+inside it, here both are in the name: `<prefix>_<workspace digest>_chunks__<fp8>`. Two
+workspaces therefore cannot meet, and neither can two installations pointed at one server —
+which matters more here than on local disk, because a shared server is the configuration this
+backend exists for. The fingerprint itself is one point per workspace in a `<prefix>_meta`
+collection, holding the serialized fingerprint and the canonical form beside it; a point whose
+two halves disagree is refused rather than resolved, exactly as §6.3 refuses a contradictory
+`_manicule_meta`.
+
+**A point id is a UUIDv5 over the physical row id.** Qdrant accepts an unsigned integer or a
+UUID and nothing else, and a physical row id is neither in general — for the legacy publication
+it is the chunk id verbatim, which is arbitrary text. The derivation is total and deterministic,
+so the same row written twice lands on the same point and a retry is an overwrite rather than a
+duplicate; the row id is kept in the payload as well, because the derivation does not invert.
+
+**A readback is narrowed to float32 before it is believed, and no further.** §6.2.5 defines the
+checksum over the `binary32` values that were persisted. Qdrant stores exactly those, but the
+REST transport serializes a stored `float32` as JSON decimal text, and parsing that text yields
+a `float64` a few parts in 10⁹ away — enough for every recomputed digest to disagree and for a
+healthy corpus to read as entirely corrupt. Narrowing undoes precisely that rounding. It is
+deliberately *not* canonicalization, which would also re-normalize and so would quietly repair a
+stored vector that had genuinely drifted off unit length — the one thing the checksum exists to
+notice. Over gRPC the narrowing is an identity operation, and that is the point: what the store
+answers does not depend on which transport an operator configured.
+
+**Filter push-down is the same on both backends, deliberately not wider.** `document_ids`,
+`kinds` and `langs` push down; `workspace_ids` is exempt and enforced by the hydrating join
+(`retrieval.md` §4.2); everything else is refused. Qdrant could filter a payload on anything
+written into it, and a Qdrant-only exception would be easy — and would make dense retrieval
+return different rows depending on which store an installation configured, which is the outcome
+`retrieval.md` §3.3 exists to prevent. The indexed payload fields are created when the
+collection is, and re-declared on every `ensure_ready`: an index is invisible to correctness, so
+a half-created one is a corpus that silently gets slower rather than a failure anybody sees.
+
+**What this backend does not have, said plainly.**
+
+- **No ANN lifecycle.** Qdrant builds and maintains its own HNSW index on its own schedule, so
+  there is no build for an operator to trigger and no partition count this project chose. The
+  store does not implement `AnnIndexMaintenance` at all rather than reporting an IVF-PQ
+  lifecycle for an index manicule neither built nor can replace; `storage.ann_index_threshold`
+  is read only by the embedded store, and every surface reports no index state rather than an
+  empty one (§6.2.2 is the reason that distinction is kept).
+- **No shadow generations, and therefore no durable re-embedding.** §6.5's replacement is a
+  directory swap behind a SQLite pointer, and `manicule.app.runtime` refuses a durable re-embed
+  by name on any backend that does not implement it. Refusing is the whole of the design here: a
+  half-built generation mechanism on a second engine is how two stores come to disagree about
+  which generation is live.
+- **No atomic insert-if-absent.** §6.4 keys a physical row by publication plus chunk so that
+  staging a replacement cannot overwrite the generation retrieval is serving, and the embedded
+  store gets that from one `merge_insert` commit. Qdrant offers neither a conditional insert nor
+  a compare-and-set, so the same rule is kept by a read followed by a write — which covers the
+  case it is actually for, one worker replaying its own checkpoint, and does not close a window
+  between two concurrent writers of one publication. What that window can cost is bounded by
+  what two such writers can disagree about: the id is derived from the publication and the
+  chunk, the payload from the chunk, and the vector is a pure function of the chunk's embedding
+  input under a fingerprint both writers had to match to get here.
+
+**The corpus leaves this machine, and configuration says so before it does.** The chunk travels
+with the vector (§6.2), so a vector store on another host is an egress path for document *text*
+rather than merely for embeddings — and it is one the model-endpoint classification in
+`generation.md` §7 cannot see, because that records model endpoints and a database is not one.
+`Settings.policy_problems()` therefore refuses `vector_db = "qdrant"` at a non-loopback endpoint
+when `security.data_policy.cloud_allowed` is false, and refuses it outright when any
+`local_only` source is configured — because `local_only` rests on search staying local, and
+indexing into a remote store sends those documents' text off this machine before any question is
+asked.
+
 ---
 
 ## 7. Retained original bytes
@@ -1727,7 +1825,7 @@ disclosure itself is discharged here.
 | | |
 |---|---|
 | **I1** | Every servable chunk has a row in `chunks`. Retrieval hydrates through the inner join in §6.2, so this is enforced by construction, not by convention. |
-| **I2** | LanceDB may be a **superset** of active `chunks`. Each vector row names a publication, and hydration admits it only when that value equals `documents.publication_id`; staged and retired vectors are therefore inert and sweepable. |
+| **I2** | The vector store may be a **superset** of active `chunks`, whichever backend holds it. Each vector row names a publication, and hydration admits it only when that value equals `documents.publication_id`; staged and retired vectors are therefore inert and sweepable. |
 | **I3** | One SQLite transaction replaces the document, chunks, glossary rows and all four lineage values and flips `documents.publication_id`. That flip is the commit point: readers see the complete old publication or the complete new one. |
 | **I4** | FTS5 cannot diverge from `chunks` at all, because the triggers in §6.1 run inside the same transaction as the row change. Its only failure mode is corruption, which `integrity-check` detects and `rebuild` fixes for free. |
 
@@ -1735,7 +1833,8 @@ disclosure itself is discharged here.
 
 1. Derive a content-addressed publication id from the document, chunks, vectors and stage
    fingerprints. Vector values are normalized and rounded to the exact float32 representation
-   Lance persists before hashing, so a reused vector's read/write round trip keeps the same id.
+   a vector store persists before hashing — `canonical_stored_vector`, which both backends write
+   through — so a reused vector's read/write round trip keeps the same id.
 2. Write vector tombstones for that publication's physical row ids, then stage every vector.
    The logical chunk id remains stable; the physical id includes the publication, so changed
    `embed_text` cannot overwrite the vector the active revision still uses. Non-legacy rows are
@@ -1770,7 +1869,7 @@ the join. Restore is clearing the timestamp — no re-embed, no re-parse, no re-
 deletion cascades to `chunks`, whose `AFTER DELETE` trigger records each row's stored physical
 `vector_id`. That includes container-member and workspace cascades. A pre-existing legacy logical
 tombstone is never cleared while publications turn over, because it may still name an old row
-awaiting its first sweep. The sweep removes every named row from LanceDB later.
+awaiting its first sweep. The sweep removes every named row from the vector store later.
 
 **Soft delete is idempotent and does not restart the clock.** A second delete of an
 already-deleted document leaves the original `deleted_at` alone. This is not politeness: §11.2
@@ -1879,11 +1978,11 @@ a restore procedure. This is the storage half of that.
 Two stores, no shared transaction, and copying the vector directory takes long enough that
 SQLite moves underneath it. Naively there is no instant at which both are captured.
 
-**Ordering alone gets most of the way.** Because SQLite is authoritative and LanceDB may be a
-superset (I2), the safe skew is **LanceDB ahead of SQLite**, never behind: extra vectors are
-inert, missing vectors mean a document marked `indexed` that silently returns nothing. So
-snapshot **SQLite first, LanceDB second** — which is the opposite of the intuition that you
-capture the big slow thing first.
+**Ordering alone gets most of the way.** Because SQLite is authoritative and the vector store
+may be a superset (I2), the safe skew is **the vector store ahead of SQLite**, never behind:
+extra vectors are inert, missing vectors mean a document marked `indexed` that silently returns
+nothing. So snapshot **SQLite first, the vector store second** — the opposite of the intuition
+that you capture the big slow thing first.
 
 **Ordering alone is not sufficient**, because a delete landing between the two snapshots
 removes vectors that the already-captured SQLite still references, reproducing exactly the
@@ -1974,6 +2073,36 @@ Plus two variants, because they are the cases the procedure exists for:
   instance must satisfy I1 and I2 and must not serve a document whose vectors are missing.
 - **Restore into a differently-configured instance** — asserts a refusal with the §6.3
   message, not a successful restore into a silently broken index.
+
+### 9.4 When the vector index is not in the directory
+
+Everything above — the skew argument, the ordering, the recorded Lance version, the manifest's
+`vector_table` and `lance_version` — is a procedure for copying two stores that share a
+filesystem. Under `storage.vector_db = "qdrant"` the vector leg is not on that filesystem, and
+pretending otherwise is the failure worth naming: a backup that appeared to include the index
+and did not would be discovered at the one moment nobody can afford to discover it.
+
+**What `backup` captures is the authority and the retained bytes, and it says so.** SQLite,
+`blobs/`, the manifest. Not the collection. The consistency problem §9.1 solves does not arise,
+because there is no second local store to skew against — but the *other* half of §9.1's
+reasoning still holds and is now the whole story: the index is derived, and the safe direction
+of skew is the derived side being a superset of the authority.
+
+**Restore therefore costs a re-embed, unless Qdrant was backed up too.** Two honest postures,
+and an installation should pick one deliberately rather than discover which it has:
+
+- **Treat the collection as disposable.** Restore the data directory, re-ingest, and let the
+  reuse path (§6.2) rebuild vectors from `chunks.embed_text`. This is correct, needs nothing
+  from Qdrant, and costs a full pass of the embedder over the corpus.
+- **Back the collection up with Qdrant's own tooling**, on Qdrant's own schedule. A snapshot
+  taken independently of the SQLite backup is skewed against it in an unknown direction, so
+  the restored pair must be reconciled the way §8.3 reconciles any crash: the authority wins,
+  and vectors it does not account for are tombstoned rather than trusted.
+
+**The acceptance test in §9.3 does not exercise this backend**, and that is a statement about
+what it proves rather than a gap to paper over: step 3 destroys the data directory, which
+leaves a remote collection entirely untouched, so a run under `vector_db = "qdrant"` would pass
+while testing nothing about disaster recovery for the leg that is not local.
 
 ---
 
@@ -2308,7 +2437,7 @@ one.
 | Restore after the grace period returns `pending` and names the rung its repair lands on | §11.6 |
 | `chunk_relations` rows are written once and read from both ends; no `CHECK` on `relation_type` | §11.7 |
 | Prior versions release their bytes rather than deleting their history | §7 |
-| Backup order is SQLite first, LanceDB second, under a sweep-blocking lock | §9.1 |
+| Backup order is SQLite first, the vector store second, under a sweep-blocking lock | §9.1 |
 | `STRICT` tables rejected for v1 | §3.4 |
 
 ## Appendix B: deliberately not here

@@ -8,7 +8,7 @@ from manicule.core.retrieval import Filter
 from manicule.retrieval import prefilter
 from manicule.retrieval.trace import Regime
 from manicule.storage.docstore import SqliteDocStore
-from manicule.storage.vectors import EXEMPT_FILTER_FIELDS, PUSHED_DOWN_FILTER_FIELDS
+from manicule.storage.vector_schema import EXEMPT_FILTER_FIELDS, PUSHED_DOWN_FILTER_FIELDS
 from tests.retrieval.fakes import SCOPE
 from tests.storage_helpers import make_document
 

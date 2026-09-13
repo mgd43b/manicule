@@ -18,7 +18,7 @@ from manicule.ingest.refusals import (
     require_coherent,
     require_measured,
 )
-from manicule.storage.vectors import table_name
+from manicule.storage.vector_schema import space_name
 from tests.ingest import fakes
 
 
@@ -235,8 +235,8 @@ async def test_a_first_ingest_records_which_table_its_vectors_are_in() -> None:
         embed=embed(), chunk=chunk(), store=store, vectors=fakes.MemoryVectors()
     )
 
-    assert committed.vector_table == table_name(embed())
-    assert store.state.vector_table == table_name(embed())
+    assert committed.vector_table == space_name(embed())
+    assert store.state.vector_table == space_name(embed())
 
 
 async def test_a_published_generation_pointer_is_not_replaced_by_its_inner_table_name() -> None:

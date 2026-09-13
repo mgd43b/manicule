@@ -646,3 +646,113 @@ def test_overriding_one_field_leaves_the_others_alone() -> None:
     assert adjusted.final_top_k == 8
     assert adjusted.context_tokens == base.context_tokens
     assert adjusted.candidates == base.candidates
+
+
+# --- the vector store, and the egress it is ------------------------------------------------
+
+
+def _qdrant(url: str | None, **storage: Any) -> Settings:
+    """Settings selecting the networked vector store at ``url``."""
+    return Settings.model_validate(
+        {"storage": {"vector_db": "qdrant", "vector_db_url": url, **storage}}
+    )
+
+
+def test_the_networked_vector_store_needs_somewhere_to_be() -> None:
+    """It has no default location, and a client dialed at no address fails later and worse."""
+    problems = _qdrant(None).policy_problems()
+
+    assert any("storage.vector_db_url is empty" in problem for problem in problems)
+
+
+def test_an_endpoint_the_embedded_store_never_reads_is_refused() -> None:
+    """A setting that is silently ignored reads as in force, which is the failure to avoid.
+
+    ``vector_db_url`` did nothing at all before the second backend existed, so this refusal
+    surfaces a configuration that was already inert rather than breaking one that worked.
+    """
+    settings = Settings.model_validate(
+        {"storage": {"vector_db": "lancedb", "vector_db_url": "https://qdrant.internal:6333"}}
+    )
+
+    problems = settings.policy_problems()
+
+    assert any("is not in force" in problem for problem in problems)
+
+
+def test_a_remote_index_is_refused_when_the_policy_forbids_leaving_the_machine() -> None:
+    """The chunk is stored beside its vector, so this endpoint carries document text.
+
+    ``selected_endpoints`` records model endpoints and cannot see a database, so without this
+    a local-only policy would report itself satisfied while every ingest wrote the corpus to
+    another host.
+    """
+    settings = _qdrant("https://qdrant.internal:6333")
+    settings.security.data_policy.cloud_allowed = False
+
+    problems = settings.policy_problems()
+
+    assert any(
+        "cloud_allowed is false" in problem and "vector_db_url" in problem for problem in problems
+    )
+
+
+def test_a_loopback_index_satisfies_the_same_policy() -> None:
+    """A Qdrant on this machine is not egress, and refusing it would be refusing the fix."""
+    settings = _qdrant("http://127.0.0.1:6333")
+    settings.security.data_policy.cloud_allowed = False
+
+    problems = settings.policy_problems()
+
+    assert not any("vector_db_url" in problem for problem in problems)
+
+
+def test_local_only_sources_and_a_remote_index_are_refused_together() -> None:
+    """`local_only` rests on search staying local, and indexing remotely falsifies that.
+
+    Dropping the passage at generation time would be protecting a boundary already crossed at
+    ingest, so the two configurations are refused together rather than the floor being lowered.
+    """
+    settings = _qdrant("https://qdrant.internal:6333")
+    settings.security.data_policy.source_restrictions.local_only = ("hr-confluence",)
+
+    problems = settings.policy_problems()
+
+    assert any("local_only names hr-confluence" in problem for problem in problems)
+
+
+def test_the_qdrant_key_is_read_from_the_conventional_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator who exported it for Qdrant's own tooling should not write it down twice.
+
+    A credential in a config file is a credential in a backup, so the environment is the path
+    that does not require one.
+    """
+    monkeypatch.setenv("QDRANT_API_KEY", "from-the-environment")
+
+    settings = _qdrant("https://qdrant.internal:6333")
+
+    assert settings.storage.qdrant.api_key is not None
+    assert settings.storage.qdrant.api_key.get_secret_value() == "from-the-environment"
+
+
+def test_an_explicit_qdrant_key_is_never_overwritten_by_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Configuration wins over convention, as it does for every model provider."""
+    monkeypatch.setenv("QDRANT_API_KEY", "from-the-environment")
+
+    settings = _qdrant("https://qdrant.internal:6333", qdrant={"api_key": "written-down"})
+
+    assert settings.storage.qdrant.api_key is not None
+    assert settings.storage.qdrant.api_key.get_secret_value() == "written-down"
+
+
+def test_the_qdrant_key_does_not_survive_being_printed() -> None:
+    """`manicule config show` is what somebody pastes into an issue."""
+    settings = _qdrant("https://qdrant.internal:6333", qdrant={"api_key": "shhh"})
+
+    printed = settings.redacted()
+
+    assert "shhh" not in str(printed)

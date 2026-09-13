@@ -57,8 +57,6 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import hashlib
-import json
-import math
 import os
 import re
 import shutil
@@ -106,9 +104,30 @@ from manicule.core.embedding import (
     vector_checksum,
     verify_stored_checksum,
 )
-from manicule.core.errors import ManiculeError
+from manicule.core.errors import VectorStoreStateError
 from manicule.core.ids import vector_id
 from manicule.core.retrieval import Candidate, Filter
+from manicule.storage.vector_schema import (
+    CHECKSUM_COLUMN,
+    CHECKSUM_VERSION_COLUMN,
+    CHUNK_COLUMN,
+    CHUNK_ID_COLUMN,
+    FILTERABLE_COLUMNS,
+    ID_COLUMN,
+    IDENTITY_COLUMN,
+    PUBLICATION_COLUMN,
+    SOURCE_CREATED_AT_COLUMN,
+    SOURCE_PUBLICATION_COLUMN,
+    SOURCE_SEQUENCE_COLUMN,
+    SOURCE_VECTOR_ID_COLUMN,
+    VECTOR_COLUMN,
+    checksum_of,
+    embed_text_of,
+    refuse_unhonored_fields,
+    row_integrity,
+    space_name,
+    unit,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -124,23 +143,6 @@ if TYPE_CHECKING:
 META_TABLE: Final = "_manicule_meta"
 """Where the fingerprint lives, beside the vectors it describes."""
 
-TABLE_PREFIX: Final = "chunks__"
-"""Vector tables are ``chunks__<fp8>``; the suffix is the fingerprint hash (§6.5)."""
-
-FINGERPRINT_HASH_LENGTH: Final = 8
-
-ID_COLUMN: Final = "id"
-CHUNK_ID_COLUMN: Final = "chunk_id"
-PUBLICATION_COLUMN: Final = "publication_id"
-VECTOR_COLUMN: Final = "vector"
-CHUNK_COLUMN: Final = "chunk_json"
-IDENTITY_COLUMN: Final = "embed_identity"
-CHECKSUM_COLUMN: Final = "vector_checksum"
-CHECKSUM_VERSION_COLUMN: Final = "vector_checksum_version"
-SOURCE_VECTOR_ID_COLUMN: Final = "source_vector_id"
-SOURCE_PUBLICATION_COLUMN: Final = "source_publication_id"
-SOURCE_SEQUENCE_COLUMN: Final = "source_sequence"
-SOURCE_CREATED_AT_COLUMN: Final = "source_created_at"
 DISTANCE_COLUMN: Final = "_distance"
 
 DISTANCE_METRIC: Final = "cosine"
@@ -175,54 +177,10 @@ _VECTOR_STATE_PRIORITY: Final = {
 }
 """Best evidence across several physical publications of one logical chunk."""
 
-FILTERABLE_COLUMNS: Final = frozenset({"document_id", "kind", "lang", "position"})
-"""The promoted columns a predicate may name.
-
-An allowlist rather than a convention: every column name that reaches a predicate is checked
-against this set, so a future edit that threads a name in from somewhere less trustworthy
-fails loudly instead of composing a query out of it.
-"""
-
-PUSHED_DOWN_FILTER_FIELDS: Final = frozenset({"document_ids", "kinds", "langs"})
-""":class:`~manicule.core.retrieval.Filter` fields this store can answer by itself.
-
-One entry per promoted column. Every other field needs a join the vector table has no columns
-for; those are resolved in the document store first and arrive here as ``document_ids``
-(``docs/retrieval.md`` §3.3).
-"""
-
-EXEMPT_FILTER_FIELDS: Final = frozenset({"workspace_ids"})
-""":class:`~manicule.core.retrieval.Filter` fields this store neither honors nor refuses.
-
-**A named exemption rather than an omission, because the two look identical in a loop and
-only one of them is deliberate.** ``workspace_ids`` is a security boundary (``PLAN.md`` §14),
-and the vector table has no column for it — not by oversight but by design: tenancy and
-liveness live on ``documents`` in the authoritative store, and copying them into a derived one
-creates a value that can disagree (``docs/storage.md`` §6.2).
-
-The boundary therefore moved rather than disappeared. It is enforced by the hydrating join
-inside the dense stage (``docs/retrieval.md`` §4.2), which is also what stops soft-deleted and
-cross-workspace rows consuming top-``k`` slots, and
-:func:`manicule.testing.assert_pipeline_enforces_scope` is what holds a pipeline to it. That
-check is the reason this exemption is acceptable at all: without it, "the boundary is enforced
-somewhere else" is a claim nothing verifies.
-"""
-
-
 _FOREIGN_INDEX_DETAIL: Final = (
     "an index this installation did not build carries the vector column; its partition count "
     "and build generation are unknown, and the maintenance boundary will not replace it"
 )
-
-
-class VectorStoreStateError(ManiculeError):
-    """The store was used outside the state the operation needs.
-
-    Either before :meth:`LanceVectorStore.ensure_ready` established which fingerprint the
-    vectors belong to, or against a ``_manicule_meta`` table that no longer says one thing.
-    Both are wiring or tampering, not user error, and both are fatal to the operation:
-    guessing the fingerprint is exactly the mistake the meta table exists to prevent.
-    """
 
 
 class VectorStoreReprepareRequiredError(VectorStoreStateError):
@@ -265,21 +223,6 @@ async def generation_pin(directory: Path, *, exclusive: bool = False) -> AsyncGe
         os.close(descriptor)
 
 
-def fingerprint_hash(fingerprint: EmbedFingerprint) -> str:
-    """The short hash that names a vector table (``docs/storage.md`` §6.5).
-
-    Taken over the canonical identity bytes, so two fingerprints share a table name only if
-    they share a vector space.
-    """
-    digest = hashlib.sha256(fingerprint.canonical().encode("utf-8")).hexdigest()
-    return digest[:FINGERPRINT_HASH_LENGTH]
-
-
-def table_name(fingerprint: EmbedFingerprint) -> str:
-    """The vector table these vectors belong in."""
-    return f"{TABLE_PREFIX}{fingerprint_hash(fingerprint)}"
-
-
 def quote(value: str) -> str:
     """Render ``value`` as a SQL string literal, doubling any quote inside it.
 
@@ -314,7 +257,8 @@ def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the doma
 
     ``None`` covers two cases that are the same instruction to this store: no filter at all,
     and a filter restricting only fields resolved elsewhere — which
-    :data:`EXEMPT_FILTER_FIELDS` names, one field, with the reason attached.
+    :data:`~manicule.storage.vector_schema.EXEMPT_FILTER_FIELDS` names, one field, with the
+    reason attached.
 
     Raises:
         ValueError: When ``filter`` sets a field this store can neither honor nor has been
@@ -322,18 +266,9 @@ def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the doma
             returns results the filter was written to exclude, and the search still looks
             like it worked.
     """
+    refuse_unhonored_fields(filter)
     if filter is None:
         return None
-
-    unhonored = sorted(filter.restricting_fields - PUSHED_DOWN_FILTER_FIELDS - EXEMPT_FILTER_FIELDS)
-    if unhonored:
-        msg = (
-            f"the vector table has no column for {', '.join(unhonored)}, so this store "
-            f"cannot honor {'them' if len(unhonored) > 1 else 'it'}. Resolve those fields "
-            f"in the document store and pass the result as document_ids; ignoring them here "
-            f"would return results the filter was written to exclude."
-        )
-        raise ValueError(msg)
 
     terms: list[str] = []
     if filter.document_ids:
@@ -343,25 +278,6 @@ def predicate_for(filter: Filter | None) -> str | None:  # noqa: A002 - the doma
     if filter.langs:
         terms.append(membership("lang", filter.langs))
     return " AND ".join(terms) if terms else None
-
-
-def _embed_text_of(record: dict[str, Any]) -> str | None:
-    """The ``embed_text`` of the chunk a row carries, or ``None`` if the row cannot say.
-
-    Reads the one field rather than validating the whole :class:`~manicule.core.content.Chunk`,
-    because this is a hot read on every document a sweep touches and the rest of the model is
-    not being asked about. ``None`` covers every way the column can fail to answer — not JSON,
-    not an object, no ``embed_text``, an ``embed_text`` that is not a string — since they all
-    mean the same thing to the caller: this row cannot be checked against itself.
-    """
-    try:
-        decoded = json.loads(str(record[CHUNK_COLUMN]))
-    except (ValueError, TypeError, KeyError):
-        return None
-    if not isinstance(decoded, dict):
-        return None
-    value = decoded.get("embed_text")
-    return value if isinstance(value, str) else None
 
 
 def _unrecorded_checksum_predicate() -> str:
@@ -378,7 +294,8 @@ def _unrecorded_checksum_predicate() -> str:
 
     ``NULL`` is spelled out beside ``''`` because a column added by a migration and a column
     written by a row are not guaranteed to agree on which absence they use, and
-    :func:`_checksum_of` already treats the two the same on the read side.
+    :func:`~manicule.storage.vector_schema.checksum_of` already treats the two the same on the
+    read side.
     """
     empty = quote("")
     return (
@@ -399,71 +316,6 @@ def _half_written_checksum_predicate() -> str:
     recorded = f"({CHECKSUM_COLUMN} <> {empty} AND {CHECKSUM_COLUMN} IS NOT NULL)"
     versioned = f"({CHECKSUM_VERSION_COLUMN} <> {empty} AND {CHECKSUM_VERSION_COLUMN} IS NOT NULL)"
     return f"(({recorded} AND NOT {versioned}) OR (NOT {recorded} AND {versioned}))"
-
-
-def _checksum_of(record: dict[str, Any]) -> tuple[str, str]:
-    """The numerical-integrity pair a row carries, as two strings.
-
-    ``get`` rather than indexing, because a table that predates the columns does not have them
-    and a row read before :meth:`LanceVectorStore._ensure_generation_columns` has run therefore
-    answers nothing at all. Absent, ``NULL`` and empty all mean the same thing here — no
-    checksum was recorded — and :func:`~manicule.core.embedding.verify_stored_checksum` decides
-    whether that is a refusal.
-    """
-    return (
-        str(record.get(CHECKSUM_COLUMN) or UNRECORDED_CHECKSUM),
-        str(record.get(CHECKSUM_VERSION_COLUMN) or UNRECORDED_CHECKSUM),
-    )
-
-
-def _row_integrity(record: dict[str, Any]) -> VectorIntegrity:
-    """The numerical verdict on one row read straight from the table.
-
-    The read-path half of :meth:`LanceVectorStore._verdict`, for the queries that have a vector
-    and its checksum but no chunk to classify against — search results and the coverage scan.
-    Provenance is not its business and it does not pretend otherwise: a row can be
-    :attr:`~manicule.core.embedding.VectorIntegrity.VERIFIED` here and still be stale, which is
-    what makes the two checks two checks.
-
-    A record with no checksum column at all came from a table that predates them, and reads as
-    unverified. That is a different absence from a row whose *vector* is null, which is a row
-    nothing can be established about, and conflating the two would drop every result a
-    pre-upgrade directory returns.
-    """
-    if CHECKSUM_COLUMN not in record:
-        return VectorIntegrity.UNVERIFIED
-    stored = record.get(VECTOR_COLUMN)
-    if stored is None:
-        return VectorIntegrity.UNREADABLE
-    values = [float(value) for value in stored]
-    if not is_finite_vector(values):
-        return VectorIntegrity.NON_FINITE
-    checksum, version = _checksum_of(record)
-    return verify_stored_checksum(values, recorded=checksum, version=version, required=False)
-
-
-def unit(vector: Vector) -> list[float]:
-    """``vector`` scaled to length one, so that cosine distance is ``1 - similarity``.
-
-    A vector of all zeros has no direction and is returned unchanged. Nothing here can invent
-    one for it, and cosine similarity against it is undefined rather than small — see
-    :meth:`LanceVectorStore.search` for what the store does about that.
-
-    **A vector already of unit length within the column's precision is also returned
-    unchanged**, and that is what makes a reused vector a reused vector rather than a
-    very slightly different one. Read a stored vector back and the ``float32`` rounding leaves
-    its length a few parts in 10^8 from one; dividing by that length and rounding to
-    ``float32`` again lands on a different value in roughly one row in five hundred, measured.
-    So without this, re-writing a row with the vector it already holds would perturb the odd
-    row by one ulp, and "the vector was not recomputed" would be a claim no test could make
-    exactly. The correction being skipped is smaller than :data:`FLOAT32_EPSILON`, which is
-    smaller than the column can represent: it moves bits and cannot move meaning.
-    """
-    values = [float(value) for value in vector]
-    norm = math.sqrt(math.fsum(value * value for value in values))
-    if norm == 0.0 or abs(norm - 1.0) < FLOAT32_EPSILON:
-        return values
-    return [value / norm for value in values]
 
 
 class _MetaRow(LanceModel):
@@ -604,7 +456,7 @@ class LanceVectorStore:
                 )
             if expected is not None:
                 stored.require_match(expected)
-            name = table_name(stored)
+            name = space_name(stored)
             if name not in await self._table_names(connection):
                 raise VectorStoreStateError(
                     f"published vector generation {self._directory} is missing {name}"
@@ -877,7 +729,7 @@ class LanceVectorStore:
                 score=min(1.0, max(-1.0, 1.0 - float(record[DISTANCE_COLUMN]))),
             )
             for record in records
-            if _row_integrity(record).accepts
+            if row_integrity(record).accepts
         ]
 
     async def count(self) -> int:
@@ -1120,7 +972,7 @@ class LanceVectorStore:
         failures: dict[str, int] = {}
         async for page in self._integrity_pages(table, page_size=page_size):
             for record in page:
-                integrity = _row_integrity(record)
+                integrity = row_integrity(record)
                 if integrity is VectorIntegrity.VERIFIED:
                     verified += 1
                 elif integrity is not VectorIntegrity.UNVERIFIED:
@@ -1504,7 +1356,7 @@ class LanceVectorStore:
         for chunk in chunks:
             record = by_id[chunk.id]
             values = tuple(float(value) for value in record[VECTOR_COLUMN])
-            checksum, version = _checksum_of(record)
+            checksum, version = checksum_of(record)
             integrity = verify_stored_checksum(
                 values, recorded=checksum, version=version, required=True
             )
@@ -1641,11 +1493,11 @@ class LanceVectorStore:
         :meth:`publication_page_is_complete`.
         """
         stored = record.get(VECTOR_COLUMN)
-        checksum, version = _checksum_of(record)
+        checksum, version = checksum_of(record)
         return classify_stored_vector(
             chunk,
             recorded_identity=str(record.get(IDENTITY_COLUMN) or UNRECORDED_IDENTITY),
-            stored_embed_text=_embed_text_of(record),
+            stored_embed_text=embed_text_of(record),
             stored_vector=None if stored is None else [float(value) for value in stored],
             embed=fingerprint,
             middleware=self._middleware,
@@ -1675,7 +1527,7 @@ class LanceVectorStore:
                 score=0.0,
             )
             for record in records
-            if _row_integrity(record).accepts
+            if row_integrity(record).accepts
         ]
 
     def _row(
@@ -1793,7 +1645,7 @@ class LanceVectorStore:
     async def _ensure_table(
         self, connection: AsyncConnection, fingerprint: EmbedFingerprint
     ) -> AsyncTable:
-        name = table_name(fingerprint)
+        name = space_name(fingerprint)
         if name in await self._table_names(connection):
             table = await connection.open_table(name)
             await self._ensure_generation_columns(table)
@@ -1880,7 +1732,7 @@ class LanceVectorStore:
             stored = await self._stored_fingerprint(connection)
             if stored is None:
                 return None
-            name = table_name(stored)
+            name = space_name(stored)
             if name not in await self._table_names(connection):
                 return None
             return await connection.open_table(name)
@@ -2341,31 +2193,18 @@ async def reset_vector_directory(directory: Path, *, legacy_root: bool) -> bool:
 
 
 __all__ = [
-    "CHECKSUM_COLUMN",
-    "CHECKSUM_VERSION_COLUMN",
-    "EXEMPT_FILTER_FIELDS",
-    "FILTERABLE_COLUMNS",
+    "DISTANCE_METRIC",
     "FLOAT32_EPSILON",
-    "IDENTITY_COLUMN",
     "INTEGRITY_SCAN_PAGE",
     "META_TABLE",
-    "PUSHED_DOWN_FILTER_FIELDS",
-    "SOURCE_CREATED_AT_COLUMN",
-    "SOURCE_PUBLICATION_COLUMN",
-    "SOURCE_SEQUENCE_COLUMN",
-    "SOURCE_VECTOR_ID_COLUMN",
-    "TABLE_PREFIX",
+    "VALIDATION_CHUNK_INDEX",
     "LanceVectorStore",
     "PublishedLanceVectorStore",
     "VectorStoreReprepareRequiredError",
-    "VectorStoreStateError",
-    "fingerprint_hash",
     "generation_pin",
     "membership",
     "predicate_for",
     "quote",
     "reset_vector_directory",
-    "table_name",
-    "unit",
     "workspace_vector_directory",
 ]

@@ -23,10 +23,16 @@ with no `XDG_DATA_HOME` set — and is overridden by `data_dir` in the config fi
 | | |
 |---|---|
 | `manicule.db` | SQLite: documents, chunks, versions, workspaces, API key digests, conversations |
-| `vectors/` | The LanceDB table the dense leg searches |
+| `vectors/` | The LanceDB table the dense leg searches — under the default, `storage.vector_db = "lancedb"` |
 | `blobs/sha256/…` | **The retained original bytes of every ingested document** |
 
 That third row is the one to read twice.
+
+The second row is conditional on that default. Set `storage.vector_db = "qdrant"` and the dense
+index moves off this filesystem entirely, onto the server named by `storage.vector_db_url` —
+no vector index data lives under `<data_dir>` any more — `prepare_data_dir` still creates an
+empty `vectors/`, for the reason §2 gives — and a copy of this directory is a copy of the
+authority and the retained bytes only. §6.5 says what running that way changes.
 
 ### 1.1 It is a complete, verbatim copy of everything indexed
 
@@ -70,6 +76,12 @@ permissions are now the only access control left.
 `0700`, and the blob store writes retained bytes `0600`. The modes are set explicitly rather
 than left to the process `umask`, because a default that varies with the invoking shell is not
 a default.
+
+That call does not branch on `storage.vector_db` — it runs wherever the SQLite engine is
+opened, which is every process regardless of which vector store is configured. So `vectors/`
+is still created, still `0700`, under `storage.vector_db = "qdrant"`; it is simply never
+written into, because the dense index lives on the Qdrant server instead. An install that
+switches backends later finds an empty directory where the index used to be, not a missing one.
 
 **`manicule doctor` fails — not warns — when `<data_dir>` carries any group or other
 permission bit**, and names the directory and the mode:
@@ -133,6 +145,19 @@ SQLite's own online backup API, then the vector table, then the blob store — i
 the derived stores can only ever be *ahead* of the database snapshot, never behind it. A
 manifest records the schema revision, the embedding and chunking fingerprints and an inventory.
 `manicule backup --restore <dir>` puts one back.
+
+That "vector table" is `vectors/`, and under `storage.vector_db = "qdrant"` it holds nothing to
+copy (§1, §2): the collection lives on the Qdrant server, off this filesystem, and `backup`
+never reaches out to it. A Qdrant-configured snapshot is therefore the authority and the
+retained bytes only — correct as far as it goes, and silent about the leg it cannot see.
+`manicule backup --restore <dir>` puts that much back; the dense index then has to come from
+somewhere else, and there are two honest sources rather than one. Re-ingesting lets the reuse
+path rebuild vectors from `chunks.embed_text` (`storage.md` §6.2), which needs nothing from
+Qdrant and costs a full pass of the embedder over the corpus. Or the collection was backed up
+separately, on Qdrant's own schedule, in which case the restored pair has to be reconciled the
+way any crash is (`storage.md` §8.3): the authority wins, and vectors it does not account for
+are tombstoned rather than trusted. `storage.md` §9.4 has the full argument, including why the
+offline acceptance test in this repository does not exercise this backend.
 
 The output directory is created `0700`, and the snapshot database and manifest inside it
 `0600`.
@@ -304,8 +329,12 @@ the commit it came from.
 
 What that buys, and what it costs:
 
-- **No network at run time.** `HF_HUB_OFFLINE=1` is set in the image and the grammar bundle is
-  installed as a distribution, so nothing reaches out mid-ingest.
+- **No network at run time — for the configuration that ships.** `HF_HUB_OFFLINE=1` is set in
+  the image and the grammar bundle is installed as a distribution, so nothing reaches out
+  mid-ingest, as long as `storage.vector_db` is left at its default. Point `storage.vector_db_url`
+  at a reachable Qdrant instead and the container dials it on every search, every upsert and
+  every delete — that is the whole reason the backend exists (`storage.md` §6.7), and it is an
+  outbound connection this image did not need before an operator asked for one.
 - **About 3.4 GB**, of which 2.3 GB is the model. Weights are baked in rather than mounted
   from a cache volume so that the download happens during `docker build`, where a long step is
   expected, rather than inside a first `index` that appears to hang.
@@ -315,6 +344,15 @@ What that buys, and what it costs:
 - **No published port.** The image `EXPOSE`s nothing and the compose file declares no
   `ports:`, because the default command serves MCP over stdio. Publishing one is an operator's
   decision, and §4 is what it costs.
+
+**Why the default stays `lancedb`, here specifically.** The `--network=none` smoke test below
+is an assertion about the configuration this image actually ships with, not about every
+configuration it is able to run. Proving a Qdrant-configured container needs no network would
+mean putting a reachable Qdrant inside the build with nothing able to reach it, which asserts
+nothing; proving it of the embedded default is what makes "this image works offline" a claim
+the build backs rather than one that merely sounds true. The `qdrant` extra installs into the
+image regardless (`ARG EXTRAS` above), so the image *can* be pointed at a server — `manicule
+init` and this Dockerfile simply never choose that for you.
 
 The container puts its config file in the data directory too — `MANICULE_CONFIG_FILE` is
 `/data/config.toml` — so one named volume carries the whole installation. `MANICULE_CACHE_DIR`
@@ -333,6 +371,14 @@ same time: SQLite's locking is per-file and a concurrent ingest from two process
 something this design has been exercised against.
 
 ### 5.1 An install with no network, outside the container
+
+This is the air-gap story for the embedded default, `storage.vector_db = "lancedb"` — an
+install that, once these three are seeded, never needs a route to anywhere. `storage.vector_db
+= "qdrant"` gives that property up on purpose (§6.5): a route to `storage.vector_db_url` is not
+optional there, on the first search and on every one after. Nothing below changes what the
+grammars, the vocabularies or the model weights need; it changes only whether the vector leg is
+one more thing seeded onto this machine or one more thing this machine reaches over the network
+for.
 
 The image carries what it needs because the build put it there. A native install on an
 air-gapped host has to be given the same two things, and neither of them ships in a wheel.
@@ -609,28 +655,33 @@ and why it is that order.
 
 ### 6.4 Keeping the vectors honest
 
-Vectors are the one part of the data directory that no amount of metadata can vouch for. A
-chunk's text is content-addressed, a blob has a digest, a document has a fingerprint — but a
-vector is a thousand floats whose only distinguishing property is being those floats. Change one
-of them into another perfectly valid float and every identity, fingerprint, dimension and
-publication check in manicule still passes.
+Vectors are the one part of the corpus that no amount of metadata can vouch for, whether they
+sit in `<data_dir>` or out on a Qdrant server. A chunk's text is content-addressed, a blob has a
+digest, a document has a fingerprint — but a vector is a thousand floats whose only
+distinguishing property is being those floats. Change one of them into another perfectly valid
+float and every identity, fingerprint, dimension and publication check in manicule still passes.
 
-So every vector manicule writes carries a SHA-256 over the exact `float32` values that reach
-disk, recomputed on every read. `docs/storage.md` §6.2.5 has the contract; what an operator needs
-is the four-way distinction it sits inside, because these get called "integrity" interchangeably
-and only one of them is what a green check means:
+So every vector manicule writes carries a SHA-256 over the exact `float32` values that are
+stored — on disk for `lancedb`, on the Qdrant server for `qdrant` — recomputed on every read.
+`docs/storage.md` §6.2.5 has the contract; what an operator needs is the four-way distinction it
+sits inside, because these get called "integrity" interchangeably and only one of them is what a
+green check means:
 
 | You want to know | What answers it | What it costs |
 |---|---|---|
-| Are the stored numbers the numbers that were written? | the vector checksum — `manicule vector-checksum --verify` | a hash per row; ~18,000 rows/s at `D = 1024` |
+| Are the stored numbers the numbers that were written? | the vector checksum — `manicule vector-checksum --verify` | a hash per row; ~18,000 rows/s at `D = 1024` on `lancedb` — a network round trip per page against `qdrant`, so the bound is the server's latency rather than local disk |
 | Is this vector this chunk's, made by this model? | the embedding-input identity and the fingerprint, on every read | a comparison per row |
 | Did the model produce the *right* vector for the text? | re-embedding, and nothing else | a forward pass per row — hours over a large corpus |
 | Could somebody have changed a vector without leaving a trace? | nothing manicule ships | out of scope |
 
 The last row is not a hedge. The checksum is unkeyed and stored beside the vector it describes,
-so anything with write access to the data directory can change both. It detects **accident** —
-bit rot, a partial write, a storage layer that rewrote a block — and says nothing about an
-actor. `<data_dir>` permissions (§2) are what keep actors out.
+so anything with write access to where the vectors live can change both. It detects
+**accident** — bit rot, a partial write, a storage layer that rewrote a block — and says nothing
+about an actor. `<data_dir>` permissions (§2) are what keep actors out of an embedded index; a
+Qdrant collection is shared infrastructure instead, reached over the network rather than through
+the filesystem, and anything holding `storage.qdrant.api_key` can write into it exactly as
+manicule does — which is why coverage is measured on the server rather than assumed from the
+fact that this store always writes a checksum.
 
 **Reading the report.** `manicule index` with no path and `manicule doctor` both report
 coverage as two counts, and the distinction between them is the whole point:
@@ -646,9 +697,10 @@ as far as anything knows; what is true is that nothing has vouched for their num
 
 **After upgrading.** Run `manicule vector-checksum --yes` until `remaining` reaches zero. Each
 pass reads and rewrites one bounded page (`storage.checksum_backfill_batch`, default 512),
-hashes vectors already on disk, and contacts nothing — no model, no connector, no source system.
-It is safe to interrupt: the next pass selects rows that still record neither half of the
-checksum pair, so it resumes without a cursor and cannot duplicate or skip a row. Running it once
+hashes the vectors as stored — on disk for `lancedb`, over the wire for `qdrant` — and contacts
+nothing but that store: no model, no connector, no source system. It is safe to interrupt: the
+next pass selects rows that still record neither half of the checksum pair, so it resumes
+without a cursor and cannot duplicate or skip a row. Running it once
 more after it finishes reads nothing. Rows it will never touch — a vector it cannot hash, or a row
 holding one half of the pair and not the other — are reported as `failed` rather than backfilled,
 because writing over them would erase what they are telling you.
@@ -664,7 +716,56 @@ future; a rebuild is what re-establishes the past.
 **`failing` means something else entirely.** A recorded checksum that no longer matches its
 vector is a row whose numbers changed after they were written. `manicule vector-checksum
 --verify` reports how many and of what kind without printing any of them; the response is a
-rebuild of the affected generation and a look at the disk underneath it, not a backfill.
+rebuild of the affected generation and a look at what is underneath it — the disk for
+`lancedb`, the collection for `qdrant` — not a backfill.
+
+### 6.5 Running against Qdrant
+
+Setting `storage.vector_db = "qdrant"` and `storage.vector_db_url` to a reachable Qdrant HTTP
+endpoint (`https://qdrant.internal:6333`, say) moves the dense index off this machine and onto
+that server. `storage.qdrant` carries what the dial needs beyond the endpoint:
+`collection_prefix`, `prefer_grpc` and `grpc_port` for the data path, and `timeout_s` for how
+long one request is allowed to take.
+
+**Set `collection_prefix` per installation if the server is shared.** A collection is named
+`<prefix>_<workspace digest>_chunks__<fp8>`, so one installation's workspaces and embedding
+spaces already cannot collide. An *installation* has no identity of its own that survives a
+moved data directory or a rebuilt container, so the prefix is it — and two installations that
+both leave it at `manicule` while pointing at one server share collections. Retrieval survives
+that, because the hydrating join admits only document ids the local authority knows; nothing
+else does. `manicule index` reports the union, and the second installation to prepare a
+workspace is refused outright when its embedder differs from the first's.
+
+`storage.qdrant.api_key` is a secret, and is also read from the `QDRANT_API_KEY` environment
+variable when the setting itself is left unset — so a credential need not be written into the
+config file at all.
+
+**`manicule doctor` reports reachability, once the store has been built.** Component health in
+this system reports on what a process has already constructed, so a fresh process that has not
+yet opened the vector store — before the first search or the first ingest — shows nothing for
+it, the same as it would for any other component nobody has touched yet. From then on, `doctor`
+carries a check backed by the store's own `health()`: it asks the server for its collection list
+rather than pinging a bare health endpoint, because that exercises the transport, the TLS and
+the credential this installation actually configured, and a failure names both
+`storage.vector_db_url` and `storage.qdrant.api_key` in its remedy rather than leaving you to
+guess which of the two is wrong.
+
+**Two refusals, checked at startup before anything is built.** `Settings.policy_problems()` —
+surfaced by `manicule config show` and by `doctor`'s `configuration` check — refuses
+`storage.vector_db = "qdrant"` at a non-loopback URL when `security.data_policy.cloud_allowed`
+is false, and refuses it there too when any `local_only` source is configured. Both rest on the
+same fact: the chunk's text travels with its vector, so a vector store on another host is an
+egress path for document *text*, not merely for embeddings, and `local_only`'s premise — that
+search never leaves this machine — does not survive indexing into one.
+
+**Backup and restore are Qdrant's problem for the vector leg**, and §3 above has the honest
+version of what that means: `manicule backup` still captures the authority and the retained
+bytes; the index itself is either re-embedded or restored from a snapshot Qdrant took on its own
+schedule, and nothing manicule ships does that for you.
+
+`lancedb` stays the default everywhere, including in the published container image (§5) — the
+`qdrant` extra ships in it too, but an installation opts into the networked backend by one
+setting rather than having it chosen for them.
 
 ## 7. Still open
 

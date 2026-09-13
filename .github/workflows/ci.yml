@@ -210,6 +210,52 @@ jobs:
           --splitting-algorithm least_duration
           --cov --cov-report=term-missing --durations=25
 
+  # The vector-store suite that a server is the only way to check. `qdrant-client` ships an
+  # in-process mode the ordinary suite uses, and it is a Python reimplementation: it searches
+  # exhaustively, ignores payload indexes, and hands back the list it was given. Three
+  # properties therefore exist only here — that the payload indexes are created at all, that a
+  # `float32` survives the REST transport's JSON rounding, and that the reuse contract holds
+  # over a socket — and the store would pass every other test in the repository while getting
+  # any of them wrong.
+  #
+  # `REQUIRE_QDRANT` turns the suite's skips into failures, the way the grammar and vocabulary
+  # jobs do: a skipped conformance suite reports green while proving nothing, and this one
+  # skips by default so that a developer with no Qdrant running gets a green first checkout.
+  qdrant:
+    name: vector store (qdrant)
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        # Pinned rather than `latest`, because the thing under test is an interaction with a
+        # server's wire behavior and "it passed on whatever was published that morning" is not
+        # a result anybody can reproduce.
+        image: qdrant/qdrant:v1.19.1
+        ports:
+          - 6333:6333
+          - 6334:6334
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --all-extras
+      # The service container is up before the step runs, but "up" is the container, not the
+      # server inside it. Polling the endpoint the tests will use turns a slow start into a
+      # wait rather than into a connection error attributed to the first test that ran.
+      - name: wait for qdrant
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:6333/healthz >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "qdrant did not answer /healthz within 30s" >&2
+          exit 1
+      - name: pytest (qdrant)
+        env:
+          QDRANT_TEST_URL: http://localhost:6333
+          REQUIRE_QDRANT: "1"
+        run: uv run pytest tests/test_storage_qdrant.py -q -rs
+
   # A model edited without a migration and a downgrade that has never run both look exactly
   # like a healthy repository. Its own job so a drifted schema is distinguishable from a
   # failing test at a glance. Closes #18.

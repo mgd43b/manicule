@@ -340,12 +340,13 @@ Provider credentials additionally follow the conventional `<PROVIDER>_API_KEY` n
 - [x] `replacement` → `security.data_policy.auto_redact.replacement`
 - [x] `security` → `security`
 - [x] `sourceRestrictions` → `security.data_policy.source_restrictions`
-- [x] `storage` → `storage` (database and vectors), and `security.storage` (at rest)
+- [x] `storage` → `storage` (database, vector store choice, and the Qdrant connection), and
+  `security.storage` (at rest)
 - [x] `telemetry` → `telemetry` — off unless switched on
 - [x] `theme` → `ui.theme`
 - [x] `transport` → `security.transport` — binds loopback by default
 - [x] `ui` → `ui`
-- [x] `vectorDb` → `storage.vector_db`
+- [x] `vectorDb` → `storage.vector_db` — `lancedb` (default) or `qdrant`
 - [x] `webhooks` → `events.webhooks`
 - [x] `widgetAllowedDomains` → `security.transport.widget_allowed_domains`
 - [x] `workspaceOverrides` → `security.data_policy.workspace_overrides`
@@ -359,9 +360,13 @@ Provider credentials additionally follow the conventional `<PROVIDER>_API_KEY` n
 embedder's fingerprint at run time. A configurable dimension is a value that can disagree
 with the model, and when it does, the index is silently wrong.
 
-**No alternative database or vector store in the enum.** `storage.db` is `sqlite` and
-`storage.vector_db` is `lancedb`, and those are the only accepted values. Naming
-alternatives in configuration advertises support that does not exist.
+**No alternative relational database in the enum.** `storage.db` is `sqlite`, and that is the
+only accepted value: the 35 modeled tables that own the corpus, durable acquisition,
+re-embedding, collections, versions and audit records have one implementation, and naming an
+alternative in configuration would advertise support that does not exist. `storage.vector_db`
+is not closed the same way — `lancedb` (embedded, the default) and `qdrant` (a server, dialed
+through `storage.vector_db_url` and configured under `storage.qdrant`) are both real, because
+the two differ in where the index lives rather than in what it holds.
 
 **No encryption-at-rest switch.** A setting that raises "not implemented" when you turn it on
 is a feature list entry, not a feature.

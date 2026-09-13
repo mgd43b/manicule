@@ -30,6 +30,7 @@ from manicule.core.acquisition import (
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, RawDocument
 from manicule.core.embedding import EmbedFingerprint, Pooling
+from manicule.core.errors import VectorStoreStateError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.glossary import DefinitionForm, GlossaryEntry
 from manicule.core.ids import chunk_id, content_hash, document_id
@@ -49,7 +50,7 @@ from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.engine import session_factory
 from manicule.storage.rebuild import RebuildLeaseConflictError, SqliteRebuildStore
-from manicule.storage.vectors import LanceVectorStore, VectorStoreStateError
+from manicule.storage.vectors import LanceVectorStore
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
