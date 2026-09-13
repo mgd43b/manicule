@@ -287,6 +287,13 @@ dev = [
   # Linux the marker on `mlx-embeddings` resolves to nothing, the backend refuses at setup,
   # and those tests skip with a reason — exactly as they did when the backend was in-tree.
   "manicule-mlx",
+  # The Ollama backend, which is a separate distribution because its model is a remote
+  # service rather than an artifact this process loads. In the dev group because CI has to
+  # type-check and collect its suites: the ones that need a server skip with a reason, exactly
+  # as `manicule-mlx`'s skip on a runner with no Metal, and the ones that drive a synthetic
+  # Ollama over `httpx.MockTransport` run everywhere and are where the identity, truncation
+  # and tokenizer rules are actually held.
+  "manicule-ollama",
   # Parsers that hang, allocate and crash on purpose, so that "one bad document never
   # aborts a batch" is demonstrated rather than asserted. Not published.
   "manicule-plugin-hostile",
@@ -358,6 +365,7 @@ members = ["packages/*"]
 [tool.uv.sources]
 manicule = { workspace = true }
 manicule-mlx = { workspace = true }
+manicule-ollama = { workspace = true }
 manicule-plugin-example = { workspace = true }
 manicule-plugin-wikilinks = { workspace = true }
 manicule-plugin-hostile = { workspace = true }

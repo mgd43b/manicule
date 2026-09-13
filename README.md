@@ -680,6 +680,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
 | `packages/manicule-plugin-wikilinks` | Turns `[[wikilinks]]` into typed chunk relations. A plugin doing real work |
+| `packages/manicule-ollama` | Embedding on an Ollama server, for a host that cannot embed in process |
 
 The four surfaces are adapters: they parse arguments, call one method, and render what comes
 back. A rule that lived in one of them would be a rule the others did not have — and two of them
