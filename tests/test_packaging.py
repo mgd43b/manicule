@@ -45,10 +45,20 @@ from manicule.core.version import CORE_VERSION
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
+COMPOSE = REPO_ROOT / "compose.yaml"
 SRC = REPO_ROOT / "src" / "manicule"
 PACKAGES = REPO_ROOT / "packages"
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+QDRANT_PIN = re.compile(r"^qdrant/qdrant:(v\d+\.\d+\.\d+)$")
+"""A Qdrant image pinned to an exact release.
+
+Anchored, and to all three components. A tag is what reproducibility rests on here: `latest`
+floats by definition, and a `vMAJOR.MINOR` tag floats to the newest patch on its own — the
+Dockerfile's own note about `python:3.14-slim-bookworm` says so. Either would leave the suite
+certifying the vector store against whatever was published that morning.
+"""
 
 # The workspace members that go to PyPI. `manicule` is MIT; `manicule-mlx` is
 # GPL-3.0-or-later because it links `mlx-embeddings`, which is the entire reason it is a
@@ -125,6 +135,82 @@ def test_the_image_installs_what_the_documented_install_installs() -> None:
         "the container and `manicule[all]` install different extras.\n"
         f"  only in the image:   {sorted(image_extras - requirement.extras)}\n"
         f"  only in `all`:       {sorted(requirement.extras - image_extras)}"
+    )
+
+
+def _qdrant_service_image(path: Path, job: str | None) -> str:
+    """The image `services.qdrant.image` names in a parsed document, not in its prose.
+
+    Read from the service definition rather than matched in the file's text, because the text
+    also contains sentences *about* the image — this repository's workflows and manifests
+    explain themselves at length, and the comment block right above the CI service says
+    `qdrant/qdrant` in prose. A regular expression over the raw bytes reads those sentences as
+    pins, so a service that was removed or renamed would go on matching its own explanation.
+    `test_ci_and_release_sync_the_same_way` parses for the same reason.
+
+    ``job`` names the workflow job the service hangs off, or ``None`` for a compose file, which
+    declares its services at the top level.
+    """
+    import yaml  # noqa: PLC0415 - a test-only dependency, kept out of this module's import cost
+
+    document = cast(dict[str, Any], yaml.safe_load(path.read_text()))
+    if job is not None:
+        jobs = cast(dict[str, Any], document["jobs"])
+        assert job in jobs, f"no `{job}` job in {path.name}; this test is reading for one"
+        document = cast(dict[str, Any], jobs[job])
+    services = cast(dict[str, Any], document.get("services") or {})
+    assert "qdrant" in services, (
+        f"no `qdrant` service in {path.name}"
+        + (f" job `{job}`" if job else "")
+        + "; this test is reading for one. If the service moved or was removed, this test is "
+        "what needs updating."
+    )
+    return cast(str, cast(dict[str, Any], services["qdrant"])["image"])
+
+
+def test_the_qdrant_the_suite_tests_against_is_the_one_compose_runs() -> None:
+    """The two Qdrant services name one exact release, and Dependabot only sees one of them.
+
+    Not a tidiness check, and the asymmetry is the whole reason for it. Dependabot's `docker`
+    ecosystem reads `image:` in a YAML manifest as well as a Dockerfile, so the pin in
+    `compose.yaml` is tracked and gets a pull request when a release lands. The one in
+    `ci.yml` is not: that ecosystem does not scan `.github/workflows/`, and `github-actions`
+    updates `uses:` references rather than a job's `services.*.image`.
+
+    So the tracked pin moves and the untracked one stays, silently — and the untracked one is
+    the server the vector-store conformance suite actually runs against, which makes it the
+    half that matters. Holding them equal turns the bump Dependabot *does* raise into a failing
+    build until both move together, which is the same trick
+    `test_the_image_installs_what_the_documented_install_installs` plays on the Dockerfile's
+    extras, for the same reason: two copies of one decision, and only one of them maintained.
+
+    **Equality alone is not enough**, which is the second assertion. Two references that both
+    said `latest` would be equal and would agree about nothing: the suite would certify the
+    backend against whatever was published that morning, and a wire-behavior regression would
+    arrive as a test failure on an unrelated pull request. The tag has to be an exact release
+    before it is worth comparing.
+    """
+    pins = {
+        COMPOSE.name: _qdrant_service_image(COMPOSE, None),
+        CI_WORKFLOW.name: _qdrant_service_image(CI_WORKFLOW, "qdrant"),
+    }
+
+    floating = {name: image for name, image in pins.items() if not QDRANT_PIN.match(image)}
+    assert not floating, (
+        "a Qdrant service is not pinned to an exact release.\n"
+        + "".join(f"  {name}: {image}\n" for name, image in sorted(floating.items()))
+        + "`latest` floats by definition and a `vMAJOR.MINOR` tag floats to the newest patch, "
+        "so either would leave the conformance suite testing against whatever was published "
+        "most recently. Pin `vMAJOR.MINOR.PATCH`."
+    )
+
+    versions = {cast(re.Match[str], QDRANT_PIN.match(image)).group(1) for image in pins.values()}
+    assert len(versions) == 1, (
+        "the Qdrant the test suite runs against and the one `docker compose` starts have "
+        "drifted.\n"
+        + "".join(f"  {name}: {image}\n" for name, image in sorted(pins.items()))
+        + "Dependabot tracks the compose pin and not the workflow one, so this is what a "
+        "merged bump looks like. Move the other to match."
     )
 
 

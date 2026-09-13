@@ -307,7 +307,18 @@ updates:
       index-affecting-glossary:
         patterns:
           - "python"
-      # Everything else the Dockerfile pulls, which today is the uv stage.
+      # Everything else this ecosystem sees: the uv builder stage in the Dockerfile, and
+      # `qdrant/qdrant` from the profiled service in `compose.yaml` — which is here because the
+      # ignore note above is right that an `image:` in a YAML manifest counts as a dependency.
+      #
+      # **The workflow's copy of that Qdrant pin is not tracked, and cannot be from here.** A
+      # job's `services.*.image` in `.github/workflows/ci.yml` is out of scope for this
+      # ecosystem, which reads the root, and out of scope for `github-actions`, which updates
+      # `uses:` references rather than service containers. The pin that is tracked is therefore
+      # the compose one, and the untracked one is the server the vector-store conformance suite
+      # runs against. `tests/test_packaging.py` holds the two equal so that accepting the pull
+      # request this group raises fails the build until the workflow moves with it — the same
+      # arrangement the Dockerfile's `EXTRAS` has with the `all` extra.
       base-images:
         patterns: ["*"]
         exclude-patterns:
