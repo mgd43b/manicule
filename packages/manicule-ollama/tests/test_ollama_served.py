@@ -497,3 +497,33 @@ def test_a_bare_name_records_and_plans_under_one_key(vocabulary: Path, tmp_path:
 
     assert planned.canonical() == served.fingerprint.canonical()
     assert planned.model_id == "ollama:synthetic-embed:latest"
+
+
+def test_two_writers_do_not_share_one_temporary_file(vocabulary: Path, tmp_path: Path) -> None:
+    """The cache directory is shared, so the scratch name cannot be.
+
+    A manicule server and an ingest run against one data directory both write this record. With
+    a fixed ``<name>.json.tmp`` beside it, the second writer opens the first writer's in-flight
+    file, overwrites its bytes and then renames it into place — so what lands is a declaration
+    neither process wrote, read by the next one as fact.
+
+    Simulated by leaving that exact deterministic name in place as another writer's half-written
+    file: this process must neither read it, overwrite it, nor rename it away.
+    """
+    client, served, config = build(FakeOllama(), vocabulary)
+    cache = tmp_path / "cache"
+    record(served, client, cache)
+    path = declaration_path(cache, client.base_url, MODEL)
+
+    shared = path.with_suffix(".json.tmp")
+    shared.write_text("{half written by another process", encoding="utf-8")
+    record(served, client, cache)
+
+    assert shared.is_file(), (
+        "another writer's in-flight file was renamed away, so both processes were using one "
+        "scratch name and each could publish the other's partial bytes"
+    )
+    assert shared.read_text(encoding="utf-8") == "{half written by another process"
+    assert cached_fingerprint(cache, client.base_url, MODEL, config).canonical() == (
+        served.fingerprint.canonical()
+    )

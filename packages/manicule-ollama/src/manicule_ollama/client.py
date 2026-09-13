@@ -415,7 +415,18 @@ def _embed_result(body: Mapping[str, object], model: str, base_url: str) -> Embe
                 f"belongs. A vector is a list of numbers; anything else is a server this "
                 f"backend does not understand rather than a value to coerce."
             )
-        vectors.append([float(cast("Any", value)) for value in cast("list[object]", row)])
+        try:
+            vectors.append([float(cast("Any", value)) for value in cast("list[object]", row)])
+        except (TypeError, ValueError, OverflowError) as exc:
+            # A `null`, a string, or a number no float can hold, somewhere inside the array.
+            # Everything this module raises is one of its own two errors precisely so the
+            # backend's mapping covers it; a bare `TypeError` from a comprehension would
+            # escape that and arrive from inside a library the operator did not choose.
+            raise OllamaUnavailableError(
+                f"{base_url}/api/embed returned a component of vector {index} for {model!r} "
+                f"that is not a number ({exc}). A vector is a list of numbers; anything else "
+                f"is a server this backend does not understand rather than a value to coerce."
+            ) from exc
     count = body.get("prompt_eval_count")
     return EmbedResult(vectors=vectors, prompt_eval_count=count if isinstance(count, int) else -1)
 

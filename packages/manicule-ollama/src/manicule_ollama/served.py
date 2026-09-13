@@ -37,6 +37,7 @@ disagreement of a single token on a single probe is a refusal.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -354,13 +355,34 @@ def record(served: ServedModel, client: OllamaClient, cache_dir: Path) -> Served
         # is still a verification of *this* configuration. Dropping it here would make the
         # expensive probe run on every start, which is the cost the flag exists to avoid.
         declaration = declaration.model_copy(update={"ceiling_verified": previous.ceiling_verified})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Written whole and replaced, never appended to: a half-written declaration read by the
-    # next process would describe a model that does not exist.
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(declaration.model_dump_json(indent=2), encoding="utf-8")
-    temporary.replace(path)
+    _write(path, declaration)
     return declaration
+
+
+def _write(path: Path, declaration: ServedDeclaration) -> None:
+    """Replace ``path`` with ``declaration``, atomically and without a shared scratch name.
+
+    Written whole and moved into place, never appended to: a half-written declaration read by
+    the next process would describe a model that does not exist.
+
+    **The temporary name carries this process's pid**, which a fixed ``.tmp`` beside the record
+    did not. Two manicule processes against one cache directory — the common case, since the
+    server and an ingest run share it — would otherwise write the same scratch file and each
+    could move the other's half-written bytes into place. Same directory, so the rename stays
+    on one filesystem and therefore stays atomic.
+
+    The read-modify-write in :func:`mark_ceiling_verified` is still not serialized across
+    processes, and deliberately: the only value it can lose is a flag saying an expensive probe
+    already passed, and losing it costs one repeat of that probe. Locking a cache to avoid
+    re-measuring something is a worse trade than re-measuring it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(declaration.model_dump_json(indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _read(path: Path) -> ServedDeclaration | None:
@@ -390,12 +412,7 @@ def mark_ceiling_verified(cache_dir: Path, base_url: str, model: str) -> None:
     declaration = _read(path)
     if declaration is None or declaration.ceiling_verified:
         return
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(
-        declaration.model_copy(update={"ceiling_verified": True}).model_dump_json(indent=2),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    _write(path, declaration.model_copy(update={"ceiling_verified": True}))
 
 
 def cached_fingerprint(

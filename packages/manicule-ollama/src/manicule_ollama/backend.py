@@ -143,6 +143,9 @@ class OllamaEmbedder(Lifecycle):
         self._server_tokens = 0
         self._verified = False
         self._closed = False
+        self._superseded: str | None = None
+        """The digest the server answered with, once it stopped being the one in the
+        fingerprint. Set by :meth:`health`, and refused by :meth:`embed` from then on."""
 
     # --- the embedder protocol -----------------------------------------------------------
 
@@ -154,6 +157,7 @@ class OllamaEmbedder(Lifecycle):
         """
         if not texts:
             return []
+        self._require_the_model_has_not_moved()
 
         slots, pending = self._cache.lookup(self.fingerprint, texts)
         resolved: dict[str, Vector] = {}
@@ -249,6 +253,11 @@ class OllamaEmbedder(Lifecycle):
                 f"and holds {self._served.info.model!r}.",
             )
         if digest != self._served.info.digest:
+            # **Recorded, not merely reported.** Ingest and retrieval call `embed` directly and
+            # never consult a health report, so a check that only said so would watch vectors
+            # from the new model being appended to the old model's index between sweeps. Once
+            # this is known, embedding stops.
+            self._superseded = digest
             return HealthReport.failing(
                 f"{self._served.info.model!r} on {self._client.base_url} now resolves to "
                 f"sha256:{digest}, but this index's vectors were made by "
@@ -299,6 +308,31 @@ class OllamaEmbedder(Lifecycle):
                 labels=labels,
             ),
         )
+
+    def _require_the_model_has_not_moved(self) -> None:
+        """Refuse to embed once the server is known to be serving different bytes.
+
+        The digest is in the fingerprint, so vectors made after an ``ollama pull`` belong to a
+        different space — and the index has no way to tell them apart, because the fingerprint
+        it compares against has not changed. A health check that reported the mismatch and let
+        embedding continue would leave the two mixed in one table for as long as the process
+        ran.
+
+        Deliberately **not** a per-request check. Asking ``/api/tags`` before every batch would
+        double the requests an ingest makes to catch something that happens when a person runs
+        a command on the server; what this does is make the first observation final.
+        """
+        if self._superseded is None:
+            return
+        msg = (
+            f"{self._served.info.model!r} on {self._client.base_url} is now sha256:"
+            f"{self._superseded}, and this embedder's vectors were made by sha256:"
+            f"{self._served.info.digest}. Embedding stops here rather than appending vectors "
+            f"from a different model to an index whose fingerprint says the model did not "
+            f"change. Restart manicule to pick up the new one — which will refuse the existing "
+            f"index and name the re-embed — or restore the previous model on the server."
+        )
+        raise ConfigError(msg)
 
     # --- internals ------------------------------------------------------------------------
 
@@ -592,6 +626,19 @@ class OllamaEmbedder(Lifecycle):
         written against, which is float32 noise either side of one.
         """
         for index, vector in enumerate(vectors):
+            # Finiteness first, and not merely for tidiness: `abs(nan - 1.0) > tolerance` is
+            # **false**, so a probe full of NaN would pass the comparison below and this
+            # backend would record `normalized=True` about a vector that has no length at all.
+            # `_finish` catches it on a later real embedding; the point of this check is to
+            # catch it before the fingerprint is trusted.
+            if not is_finite_vector(vector):
+                msg = (
+                    f"{self._served.info.model!r} on {self._client.base_url} returned a "
+                    f"non-finite component in probe {index}. Nothing about normalization can "
+                    f"be established from it, and a NaN compares false against every "
+                    f"tolerance rather than failing one."
+                )
+                raise ConfigError(msg)
             norm = math.sqrt(sum(value * value for value in vector))
             if abs(norm - 1.0) > NORM_TOLERANCE:
                 msg = (

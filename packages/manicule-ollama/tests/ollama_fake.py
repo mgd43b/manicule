@@ -112,6 +112,15 @@ class FakeOllama:
     A switch here rather than a monkeypatch in a test, so the endpoint under test stays the one
     that ships."""
 
+    non_finite: bool = False
+    """Whether the first component of every vector is ``NaN``.
+
+    For the guard that has to run *before* the norm comparison: a NaN compares false against
+    every tolerance rather than failing one, so a tolerance check alone waves it through."""
+
+    null_component: bool = False
+    """Whether a vector arrives with a ``null`` in it, rather than a number."""
+
     tags_error: str = ""
     """If set, ``/api/tags`` answers 400 with this message instead of a listing.
 
@@ -190,7 +199,13 @@ class FakeOllama:
                 400, json={"error": "the input length exceeds the context length"}
             )
 
-        vectors = [self._vector(text) for text in inputs]
+        vectors: list[list[float | None]] = [
+            cast("list[float | None]", self._vector(text)) for text in inputs
+        ]
+        if self.non_finite:
+            vectors = [[float("nan"), *row[1:]] for row in vectors]
+        if self.null_component:
+            vectors = [[None, *row[1:]] for row in vectors]
         payload: dict[str, object] = {
             "model": self.model,
             "embeddings": vectors[:-1] if self.short_answer and len(vectors) > 1 else vectors,
@@ -199,7 +214,15 @@ class FakeOllama:
             payload["prompt_eval_count"] = sum(
                 min(total, ceiling) for total in totals
             ) + self.count_offset * len(inputs)
-        return httpx.Response(200, json=payload)
+        # Serialized here rather than through `json=`, which refuses `NaN` outright. Python's
+        # own encoder emits it as a bare token and its decoder reads it back, which is exactly
+        # what a server built on a C JSON library does — and a backend that never sees one
+        # cannot be shown to refuse it.
+        return httpx.Response(
+            200,
+            content=json.dumps(payload),
+            headers={"content-type": "application/json"},
+        )
 
     def _vector(self, text: str) -> list[float]:
         """A deterministic vector for ``text``, so determinism and the cache are testable.

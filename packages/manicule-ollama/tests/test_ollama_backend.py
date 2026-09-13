@@ -531,3 +531,54 @@ async def test_health_reports_rather_than_raises_whatever_the_server_does(
     assert not report.ok
     assert "exceeds the context length" in report.detail
     await embedder.teardown()
+
+
+async def test_a_moved_digest_stops_embedding_rather_than_only_being_reported(
+    vocabulary: Path, counter: Callable[[str], int]
+) -> None:
+    """Ingest and retrieval call `embed` directly and never read a health report.
+
+    So a check that noticed an `ollama pull` and let embedding continue would watch vectors
+    from the new model being appended to the old model's index between health sweeps — under a
+    fingerprint that says the model did not change, which is exactly what makes it unrecoverable
+    by inspection. The first observation is final.
+    """
+    server = FakeOllama(count=counter)
+    embedder = await ready(server, vocabulary)
+    assert await embedder.embed(["alpha beta"])
+
+    server.digest = "e" * 64
+    assert not (await embedder.health()).ok
+
+    with pytest.raises(ConfigError, match="Embedding stops here"):
+        await embedder.embed(["gamma delta"])
+    await embedder.teardown()
+
+
+async def test_setup_refuses_a_non_finite_probe_rather_than_comparing_it(
+    vocabulary: Path, counter: Callable[[str], int]
+) -> None:
+    """`abs(nan - 1.0) > tolerance` is **false**, so a NaN passes a tolerance check.
+
+    Without a finiteness test first, this backend would record `normalized=True` about a vector
+    that has no length at all — the comparison does not fail, it simply does not fire. The
+    later guard in `_finish` would catch it on a real embedding, which is after the fingerprint
+    has been trusted.
+    """
+    with pytest.raises(ConfigError, match="non-finite component"):
+        await ready(FakeOllama(count=counter, non_finite=True), vocabulary)
+
+
+async def test_a_component_that_is_not_a_number_becomes_this_packages_error(
+    vocabulary: Path, counter: Callable[[str], int]
+) -> None:
+    """Everything this client raises is one of its own errors, so the backend's mapping covers it.
+
+    A `null` inside the array would otherwise arrive as a bare `TypeError` from inside a
+    comprehension — a traceback from a library the operator did not choose, in the middle of an
+    ingest, saying nothing about which server sent what.
+    """
+    # Raised by the dimension probe, which is the first vector this backend ever reads — so
+    # the refusal lands at construction, before a fingerprint exists to be wrong about.
+    with pytest.raises(OllamaUnavailableError, match="not a number"):
+        await ready(FakeOllama(count=counter, null_component=True), vocabulary)
