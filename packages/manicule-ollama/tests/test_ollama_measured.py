@@ -55,17 +55,39 @@ pytestmark = pytest.mark.anyio
 OLLAMA_URL_ENV: Final = "OLLAMA_TEST_URL"
 """Where a real Ollama is. Unset means "skip this file"."""
 
-REQUIRE_OLLAMA_ENV: Final = "REQUIRE_OLLAMA"
-"""Set to any non-empty value to turn this suite's skips into failures. CI would set it."""
+REQUIRE_OLLAMA_ENV: Final = "REQUIRE_OLLAMA_MODELS"
+"""Which served models must be present, rather than whether any must be.
 
-OLLAMA_REQUIRED: Final = bool(os.environ.get(REQUIRE_OLLAMA_ENV, "").strip())
-"""Read at import, before any fixture has had a chance to touch the environment.
+The same shape as ``REQUIRE_EMBEDDING_MODELS`` and for the same reason: the models this backend
+was written against are not equally cheap to check. ``nomic-embed-text`` is 274 MB and a
+2048-token context, which a CPU runner embeds in seconds; ``qwen3-embedding:0.6b`` is 639 MB
+and a 32768-token context, whose full-length probe took 40 seconds on an M-series laptop with
+the model already resident. A boolean switch would make CI either skip both or pay for both.
+So CI names the one it seeded, and the other is exercised opportunistically wherever it is
+already served.
 
 Named outside manicule's ``MANICULE_`` namespace deliberately: ``manicule_environment`` deletes
 every variable with that prefix before each test, so a switch named that way would be scrubbed
 before it was read and the job would go green having skipped everything. That exact failure is
 recorded in ``docs/embeddings.md`` §7, found by reading a green CI log.
 """
+
+REQUIRED_MODELS: Final[frozenset[str]] = frozenset(
+    name.strip() for name in os.environ.get(REQUIRE_OLLAMA_ENV, "").replace(",", " ").split()
+)
+"""Read at import, before any fixture has had a chance to touch the environment."""
+
+
+def is_required(model: str) -> bool:
+    """Whether a missing ``model`` is a failure rather than a skip.
+
+    Matched on the name as configured *and* on the ``:latest`` Ollama appends to a bare one, so
+    a job naming ``nomic-embed-text`` arms the case whatever the server calls it.
+    """
+    return bool(
+        REQUIRED_MODELS
+        & {model, model.split(":", maxsplit=1)[0], f"{model.split(':', maxsplit=1)[0]}:latest"}
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,15 +155,24 @@ def server_url() -> str | None:
     return os.environ.get(OLLAMA_URL_ENV, "").strip() or None
 
 
-def require_server() -> str:
+def require_ollama() -> str:
+    """The server's URL — or skip, or fail when a job has named a model it must serve.
+
+    Named after this backend rather than generically, and that is not style.
+    ``tests/test_ci_switches`` decides which modules a ``REQUIRE_*`` switch governs by searching
+    every test file for the *names* of the gate functions that skip or fail — so a gate here
+    sharing a name with another support module's gate reports this file as governed by that
+    module's switch, which is exactly the kind of wrong mapping that check exists to catch.
+    """
     url = server_url()
     if url:
         return url
     detail = f"{OLLAMA_URL_ENV} is not set, so no Ollama server is available"
-    if OLLAMA_REQUIRED:
+    if REQUIRED_MODELS:
         pytest.fail(
-            f"{detail}, and {REQUIRE_OLLAMA_ENV} is set. Every claim this backend makes is "
-            f"about a server; with none of them checked the suite certifies nothing."
+            f"{detail}, and {REQUIRE_OLLAMA_ENV} names {sorted(REQUIRED_MODELS)}. Every claim "
+            f"this backend makes is about a server; with none of them checked the suite "
+            f"certifies nothing."
         )
     pytest.skip(detail)
 
@@ -150,7 +181,7 @@ async def embedder_for(
     served: Served, *, cache_entries: int = 10_000, **overrides: object
 ) -> OllamaEmbedder:
     """A set-up embedder, or a skip naming the model this machine's server does not hold."""
-    url = require_server()
+    url = require_ollama()
     config = OllamaEmbedderConfig.model_validate(
         {
             "base_url": url,
@@ -166,8 +197,10 @@ async def embedder_for(
         resolved = resolve(client, served.model, config)
     except ConfigError as exc:
         await client.aclose()
-        if OLLAMA_REQUIRED:
-            pytest.fail(f"{url} cannot serve {served.model!r}: {exc}")
+        if is_required(served.model):
+            pytest.fail(
+                f"{url} cannot serve {served.model!r}, which {REQUIRE_OLLAMA_ENV} names: {exc}"
+            )
         pytest.skip(f"{url} does not serve {served.model!r}: {exc}")
     except OllamaUnavailableError as exc:
         await client.aclose()
@@ -251,7 +284,7 @@ async def test_the_declared_context_is_not_the_served_one(served: Served) -> Non
     request carrying ``num_ctx`` is served at ``num_ctx`` and a request without one is not
     guaranteed to be.
     """
-    url = require_server()
+    url = require_ollama()
     client = OllamaClient(url, timeout_s=300.0)
     try:
         long_text = " ".join(["paragraph"] * (served.context_length * 2))
@@ -286,7 +319,7 @@ async def test_truncation_is_real_and_is_what_truncate_false_prevents(served: Se
     The same text with ``truncate: false`` is a refusal, which is the only difference between
     those two outcomes and the reason every request this backend sends carries the flag.
     """
-    url = require_server()
+    url = require_ollama()
     client = OllamaClient(url, timeout_s=300.0)
     try:
         num_ctx = min(512, served.context_length)
@@ -430,7 +463,7 @@ async def test_two_models_on_one_server_are_two_vector_spaces() -> None:
     backend's name, so these fingerprints cannot equal one from any other runtime even by
     accident, and an index built with one of these models refuses vectors from the other.
     """
-    require_server()
+    require_ollama()
     first = await embedder_for(MODELS[0])
     try:
         second = await embedder_for(MODELS[1])
@@ -458,8 +491,9 @@ def test_the_skip_switch_is_outside_maniculess_own_namespace() -> None:
     assert not OLLAMA_URL_ENV.startswith("MANICULE_")
 
 
+@pytest.mark.parametrize("served", MODELS, ids=lambda item: item.model)
 async def test_the_whole_system_wires_to_this_backend_through_ordinary_discovery(
-    tmp_path: Path,
+    served: Served, tmp_path: Path
 ) -> None:
     """The claim with the most downstream consequence, checked all the way through.
 
@@ -479,7 +513,7 @@ async def test_the_whole_system_wires_to_this_backend_through_ordinary_discovery
     * metadata-only rebuild planning derives byte-identical identity from the recorded
       declaration, with no server contacted.
     """
-    url = require_server()
+    url = require_ollama()
     from manicule.config.settings import (  # noqa: PLC0415
         EmbeddingSettings,
         PluginSettings,
@@ -491,7 +525,6 @@ async def test_the_whole_system_wires_to_this_backend_through_ordinary_discovery
     from manicule.ingest.workers import worker_config  # noqa: PLC0415
     from manicule.plugins import discover  # noqa: PLC0415
 
-    served = MODELS[0]
     settings = Settings(
         data_dir=tmp_path / "data",
         cache_dir=tmp_path / "cache",
@@ -512,7 +545,12 @@ async def test_the_whole_system_wires_to_this_backend_through_ordinary_discovery
     found = discover()
     container = Container(settings, found.registry, discovery=found)
     try:
-        embedder = container.get(keys.EMBEDDER)
+        try:
+            embedder = container.get(keys.EMBEDDER)
+        except ConfigError as exc:
+            if is_required(served.model):
+                raise
+            pytest.skip(f"{url} does not serve {served.model!r}: {exc}")
         assert isinstance(embedder, OllamaEmbedder)
 
         chunker = container.get(keys.CHUNKER)
