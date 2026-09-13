@@ -131,9 +131,9 @@ heading path — copying long passages forward spends context on text you have a
 
 READ_ONLY_NOTICE = """\
 
-## This server is read-only
+## This server is read-only, apart from `document_create`
 
-It is being served over a socket, so it offers the tools that read, plus `document_create`.
+It is being served over a socket, so it offers the tools that read, plus that one.
 Indexing a directory, deleting, syncing a source, writing configuration and enabling a plugin
 are **not** absent by accident and are not behind a permission you can be granted: they are not
 registered on this server at all.

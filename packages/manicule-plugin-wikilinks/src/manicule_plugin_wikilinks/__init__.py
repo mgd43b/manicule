@@ -262,10 +262,7 @@ class WikilinkMiddleware(Middleware):
             return
         slugs = await self._index()
         if self._resolvable(document):
-            # `setdefault`, matching the index build: a document arriving now does not displace
-            # one that already holds its slug, so which of two documents sharing a stem is the
-            # target does not depend on the order a sync happened to reach them.
-            slugs.setdefault(slug_of(document), document.id)
+            await self._claim(slugs, slug_of(document), document.id)
         await self._write_outbound(document, chunks, slugs)
         await self._write_inbound(document, chunks)
 
@@ -334,6 +331,27 @@ class WikilinkMiddleware(Middleware):
                     await self._relate(chunk.id, entry, _RELATION_OF[link.shape])
 
     # --- internals ---------------------------------------------------------------------------
+
+    async def _claim(self, slugs: dict[str, str], slug: str, document_id: str) -> None:
+        """Record ``document_id`` as what ``slug`` resolves to, unless something live holds it.
+
+        **Not a plain ``setdefault``**, and the difference is a rename. The index is built once
+        per pipeline and kept current incrementally, so an entry made at startup outlives the
+        document it names: delete ``a.md``, write the same fact as ``b.md``, and a
+        ``setdefault`` keeps pointing ``b`` at the deleted document — every link to it silently
+        resolves to nothing until the process restarts. Not a plain assignment either, because
+        two *live* documents can share a stem and last-writer-wins would make the graph depend
+        on the order a sync happened to reach them.
+
+        So the incumbent is displaced only when it is gone. The liveness question costs one small
+        query, and only when a slug is already taken by a different document.
+        """
+        incumbent = slugs.get(slug)
+        if incumbent == document_id:
+            return
+        if incumbent is not None and await self._entry_chunk(incumbent) is not None:
+            return
+        slugs[slug] = document_id
 
     def _resolvable(self, document: Document) -> bool:
         """Whether a link may name ``document`` at all.
@@ -434,14 +452,18 @@ class WikilinkPlugin:
     def register(self, registry: ComponentRegistry) -> None:
         registry.add(
             keys.MIDDLEWARE.named("wikilinks"),
-            _build,
+            build_middleware,
             config_model=WikilinkConfig,
             summary="Writes chunk relations for [[wikilinks]], in both directions.",
         )
 
 
-def _build(context: BuildContext) -> WikilinkMiddleware:
+def build_middleware(context: BuildContext) -> WikilinkMiddleware:
     """Factory. Resolves the one dependency, and refuses a store that cannot carry edges.
+
+    Public, unlike the example plugin's, because the refusal below is behavior with a test of its
+    own: a store that cannot carry edges has to be told so at construction, naming what is
+    missing, rather than producing an attribute error somewhere unrelated much later.
 
     Refused rather than duck-typed: this writes rows keyed on chunks in a table with foreign
     keys, and guessing that an unknown store means the same thing by ``relate`` is how edges end
@@ -493,6 +515,7 @@ __all__ = [
     "WikilinkConfig",
     "WikilinkMiddleware",
     "WikilinkPlugin",
+    "build_middleware",
     "rules_digest",
     "slug_of",
 ]

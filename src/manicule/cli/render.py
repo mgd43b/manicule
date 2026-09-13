@@ -459,19 +459,27 @@ def render_document_created(out: Console, payload: r.DocumentCreated) -> None:
 
     The path leads because it is the durable half: on success it says where the corpus grew,
     and on a write the index declined it is the only way back to content the caller has already
-    handed over. The failure's own sentence is printed by the envelope above this; what would
-    be unhelpful here is a renderer that showed a path only when everything worked.
+    handed over. A renderer that showed a path only when everything worked would be unhelpful in
+    exactly the case the path matters most.
+
+    ``detail`` is printed on **both** outcomes, and that is not symmetry for its own sake:
+    :func:`~manicule.cli.main.print_envelope` renders a payload *instead of* the error whenever
+    one is retained, so this is the only place a human is told why. It carries two different
+    sentences — why the document is not indexed, and why an indexed one is not in its collection
+    — and dropping either would leave a visible "(not added)" with nothing saying what happened.
     """
     verb = "replaced" if payload.overwritten else "wrote"
     out.print(f"{verb} [bold]{escape(payload.path)}[/bold]")
     if not payload.indexed:
         out.print("[yellow]the file is on disk and is not indexed; it was not removed[/yellow]")
-        return
-    member = payload.collection if payload.member else f"{payload.collection} (not added)"
-    out.print(
-        f"[dim]{payload.document_id} · {payload.chunks} chunk(s) · "
-        f"{escape(member)} · {payload.elapsed_ms} ms[/dim]"
-    )
+    else:
+        member = payload.collection if payload.member else f"{payload.collection} (not added)"
+        out.print(
+            f"[dim]{payload.document_id} · {payload.chunks} chunk(s) · "
+            f"{escape(member)} · {payload.elapsed_ms} ms[/dim]"
+        )
+    if payload.detail:
+        out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
 
 
 def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:

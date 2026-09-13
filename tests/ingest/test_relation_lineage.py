@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, override
 
 import pytest
 
+from manicule.core.content import DocumentStatus
 from manicule.core.errors import MiddlewareViolationError
 from manicule.core.fingerprints import (
     EXTRACTION_DISABLED,
@@ -228,3 +229,28 @@ async def test_a_document_the_current_extractor_has_scanned_is_not_selected_agai
     assert len(await reindex.select(store, relation_fingerprint=corrected)) == 1, (
         "changing a rule must re-select the corpus it has moved past"
     )
+
+
+async def test_a_document_whose_parse_failed_records_no_extractor() -> None:
+    """The one case where the hooks return and the fingerprint must still not be written.
+
+    ``after_store`` runs for a failed document — that is existing behavior and the hooks are
+    entitled to see it — so "the chain returned" is not the right condition. A failed re-ingest
+    also must not demote a working document, so the row the store holds is frequently the
+    *previous*, still-indexed publication: stamping it would claim the current extractor had
+    scanned content it never saw, and take the document out of the next repair for it.
+    """
+    extractor = Extractor()
+    store = fakes.MemoryIngestStore()
+    pipeline, _, _ = build(
+        store=store,
+        middleware=[extractor],
+        parsers={"lines": fakes.ExplodingParser()},
+    )
+    await pipeline.run(fakes.DictConnector({"note": PROSE}))
+
+    document = await store.find_document("memory", "note")
+    assert document is not None
+    assert document.status is DocumentStatus.FAILED
+    assert extractor.seen == [document.id], "the hooks still saw it"
+    assert store.relation_lineage_by_id.get(document.id) is None

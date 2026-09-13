@@ -526,3 +526,33 @@ def test_the_three_envelope_surfaces_author_identically(
     assert _comparable(from_tool) == _comparable(from_http)
     assert from_tool["ok"] is True
     assert from_tool["op"] == "document_create"
+
+
+def test_the_terminal_is_told_why_a_kept_file_is_not_indexed(
+    monkeypatch: pytest.MonkeyPatch, root: Path
+) -> None:
+    """Human output, not ``--json``, and it is the only place the reason reaches a person.
+
+    ``print_envelope`` renders a retained payload *instead of* the error whenever one is
+    attached, so a renderer that showed the path and dropped ``detail`` would leave somebody
+    looking at a file on disk with nothing saying what went wrong — the exact moment the
+    sentence is worth having.
+    """
+    service = asyncio.run(service_for(settings_for(root), fails=True))
+
+    async def dispatch(command: Command) -> Envelope:
+        return await run_op(
+            command.op, service.workspace, lambda: commands.run(service, command, commands.silent)
+        )
+
+    monkeypatch.setattr(cli, "_dispatch", dispatch)
+    result = CliRunner().invoke(
+        cli.app, ["document", "create", COLLECTION, "retry_policy"], input=BODY
+    )
+
+    assert result.exit_code == 1
+    # The filename rather than the whole path: a terminal wraps an absolute one, and what is
+    # being asserted is that the renderer reached for it at all.
+    assert "retry_policy.md" in result.output
+    assert "is not indexed" in result.output
+    assert "the embedder declined" in result.output

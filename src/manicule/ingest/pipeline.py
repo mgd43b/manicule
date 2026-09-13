@@ -4556,6 +4556,14 @@ class IngestPipeline:
         A document with no links records the fingerprint all the same, because the hooks
         succeeded: an empty result is a derived result, and the alternative is re-selecting every
         link-free document in the corpus on every repair for ever.
+
+        **A failed document records nothing**, and that is a narrower rule than "the hooks
+        returned". One of this method's callers reaches it on the failure path — the hooks see a
+        document whose parse produced nothing, which is deliberate and unchanged — and the row
+        the store holds for it is frequently the *previous*, still-indexed publication, because a
+        failed re-ingest must not demote a working document. Stamping there would claim the
+        current extractor had scanned content it never saw, which is exactly the "reports itself
+        current" state the column exists to prevent.
         """
         try:
             await self._middleware.after_store(document)
@@ -4568,7 +4576,7 @@ class IngestPipeline:
             else:
                 await self._store.annotate(document.id, updates)
             return
-        if self._relation_lineage is not None:
+        if self._relation_lineage is not None and document.status is not DocumentStatus.FAILED:
             await self._store.set_lineage(
                 document.id, chunk_fp=None, embed_fp=None, relation_fp=self._relation_lineage
             )

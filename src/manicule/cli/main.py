@@ -1035,8 +1035,15 @@ def _authored_body(file: Path | None) -> str:
     JSON that may cross a socket to a server, and a *path* in it would be resolved in whichever
     process ran the command — which is the wrong one whenever the server is not on this machine.
     The body travels; the path does not.
+
+    **A terminal is told what it is waiting for.** Reading standard input with nothing piped in
+    looks exactly like a hang, and the recovery — an end-of-file — is not something somebody
+    guesses at. The notice goes to stderr, so ``--json`` output stays a single document on
+    stdout and a pipeline is unaffected.
     """
     if file is None or str(file) == "-":
+        if sys.stdin.isatty():
+            typer.echo("reading the document from standard input; end it with Ctrl-D", err=True)
         return sys.stdin.read()
     return Path(file).expanduser().read_text(encoding="utf-8")
 

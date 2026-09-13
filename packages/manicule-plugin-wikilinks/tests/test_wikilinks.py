@@ -7,22 +7,27 @@ row that survived the foreign keys, the workspace check and the idempotence the 
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from manicule_plugin_wikilinks import (
     EXTRACTOR,
     WikilinkConfig,
     WikilinkMiddleware,
+    build_middleware,
     rules_digest,
     slug_of,
 )
 from manicule_plugin_wikilinks.links import Shape, links_in, normalize
 
+from manicule.config.settings import Settings
 from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import BlockKind, Chunk, Document, DocumentStatus
+from manicule.core.errors import ConfigError
 from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.core.organization import ChunkRelationType
+from manicule.plugins.registry import BuildContext
 from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
 
 if TYPE_CHECKING:
@@ -386,3 +391,73 @@ async def test_a_document_outside_the_scope_does_not_become_a_target_by_arriving
 
     chunks = await store.document_chunks(source.id)
     assert await edges(store, chunks[0]) == []
+
+
+async def test_a_slug_freed_by_a_delete_is_claimed_by_what_takes_it_next(
+    store: SqliteDocStore,
+) -> None:
+    """A link written **after** a rename resolves to the document that now holds the slug.
+
+    The index is built once per pipeline and kept current incrementally, so an entry made at
+    startup outlives the document it names. A plain ``setdefault`` therefore kept pointing at the
+    deleted document: every link written afterwards resolved to nothing until the process
+    restarted — silently, because an unresolved link is a legitimate state that looks exactly
+    like this.
+
+    The inbound pass does not rescue this direction. It runs when a *target* is published, and
+    the target here was published before the new linker existed.
+    """
+    # Two filenames that normalize to one slug, so the second is a genuinely different document
+    # with a different id — which is what a rename is, and what a same-path rewrite is not.
+    old_target = await seed(store, "project_backoff", "Back off exponentially.")
+    hook = middleware(store)
+    await hook.after_store(old_target)
+
+    await store.delete_document(old_target.id)
+    renamed = await seed(store, "project-backoff", "Back off exponentially. Now renamed.")
+    assert renamed.id != old_target.id, "a rename is a new document, or this proves nothing"
+    await hook.after_store(renamed)
+
+    linker = await seed(store, "project_retry", "See [[project_backoff]].")
+    await hook.after_store(linker)
+
+    chunks = await store.document_chunks(linker.id)
+    renamed_chunks = await store.document_chunks(renamed.id)
+    assert await edges(store, chunks[0]) == [
+        (chunks[0].id, renamed_chunks[0].id, ChunkRelationType.MENTIONS.value)
+    ]
+
+
+def test_the_factory_builds_against_a_real_store(store: SqliteDocStore, tmp_path: Path) -> None:
+    """The registered factory is exercised, because nothing else in this file reaches it.
+
+    Two things it decides are invisible from the middleware's own tests: that a real
+    :class:`~manicule.storage.docstore.SqliteDocStore` satisfies ``RelationCorpus`` — a runtime
+    protocol check that would be a ``TypeError`` at the first startup if the protocol were shaped
+    wrongly — and that a store which does not gets a refusal naming what is missing rather than
+    an attribute error somewhere unrelated, much later.
+    """
+
+    class Resolver:
+        def __init__(self, component: object) -> None:
+            self._component = component
+
+        def get(self, key: object) -> Any:
+            del key
+            return self._component
+
+    def context(component: object) -> BuildContext:
+        return BuildContext(
+            settings=Settings(),
+            config=WikilinkConfig(),
+            data_dir=tmp_path,
+            cache_dir=tmp_path,
+            components=cast("Any", Resolver(component)),
+        )
+
+    built = build_middleware(context(store))
+    assert isinstance(built, WikilinkMiddleware)
+    assert built.name == "wikilinks"
+
+    with pytest.raises(ConfigError, match="relate"):
+        build_middleware(context(object()))
