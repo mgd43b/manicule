@@ -272,6 +272,36 @@ offline bundle, and the `BAAI/bge-m3` ONNX weights. The final build stage runs `
 `init`, an index and a search **with `--network=none`**, so an image that would have fetched
 anything on first use fails to build.
 
+**There is a published image, so most deployments need not build one.** Every release pushes
+`ghcr.io/mgd43b/manicule`, built by [the release workflow](../.github/workflows/release.yml)
+from the tag it names:
+
+```sh
+docker pull ghcr.io/mgd43b/manicule:0.1.16   # a release, and it never moves
+docker pull ghcr.io/mgd43b/manicule:latest   # whatever the newest release is
+```
+
+The version tag is the version PyPI has and `manicule --version` prints, without the `v` the
+git tag carries. `latest` is moved only by the newest release: the release workflow's
+`workflow_dispatch` hatch can rebuild and republish *any* existing tag, and when the tag it is
+given is not the newest it deliberately leaves `latest` where it was. Recovering a failed
+upload cannot walk a deployment that tracks `latest` backwards onto an older release.
+
+**amd64 only.** There is no arm64 image and no manifest list, so an Apple silicon host pulls this
+under emulation and indexes slowly. Nothing builds this `Dockerfile` on arm64 — not CI, not the
+release — so whether it builds there is untested rather than known, and the two places it would
+fail are the ones that are platform-specific: the grammar bundle compiles and hashes a library per
+platform, and the `embeddings` extra resolves onnxruntime. A Mac wants the native install with
+`manicule-mlx` rather than any image regardless, for the reason the ONNX note below gives.
+
+Pin the version — or the digest, which `docker inspect` will give you — for anything whose
+behavior you would want to reproduce. `latest` is a convenience for trying it.
+
+Building it yourself stays a first-class path and is the only one for a modified tree:
+`docker compose build`, or `docker build .`. The published image is that build, of the released
+source, with `org.opencontainers.image.version` and `.revision` labels naming the release and
+the commit it came from.
+
 What that buys, and what it costs:
 
 - **No network at run time.** `HF_HUB_OFFLINE=1` is set in the image and the grammar bundle is
@@ -384,6 +414,10 @@ manicule is **MIT**, so publishing an image built from it obliges you to little:
 copyright notice and the license text with it. Modifications need not be published. The
 `Dockerfile` here builds an MIT image — it installs the `onnx` embedding backend, and nothing in
 its dependency closure is copyleft.
+
+`ghcr.io/mgd43b/manicule` is that image: the shipped `Dockerfile`, unmodified, with neither
+`manicule-mlx` nor the `rerank` extra in it. Redistributing it carries the same short
+obligations as redistributing your own build of it.
 
 **Two things in an image can still carry terms of their own, and neither is manicule.**
 

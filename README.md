@@ -598,6 +598,15 @@ The last thing the build does is run `doctor`, index a corpus and search it **wi
 switched off**, so an image that would have fetched something on first use fails to build
 instead.
 
+Every release publishes that image, so you need not build it:
+
+```bash
+docker pull ghcr.io/mgd43b/manicule:latest             # amd64; pin the version for real use
+docker run --rm ghcr.io/mgd43b/manicule:latest doctor
+```
+
+Building it yourself is the path for a modified tree, and the only one for arm64:
+
 ```bash
 docker compose build                                   # ~2.3 GB of model weights, once
 docker compose run --rm manicule doctor

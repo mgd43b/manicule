@@ -229,11 +229,373 @@ jobs:
           packages-dir: dist/manicule-mlx
           skip-existing: true
 
-  # Last, and only once both uploads succeeded: the assets on the GitHub Release should describe
-  # a release that actually reached PyPI.
+  # **The third distribution, and the only one that is not a Python package.** Gated exactly as
+  # `build` is — a release-please release, or a named tag on `workflow_dispatch` — but a sibling of
+  # it rather than a child, for two reasons. The image installs manicule from the source in the
+  # checkout and never from PyPI, so it has nothing to wait for; and it is far the slowest job in
+  # a release (2.3 GB of model weights, then a whole offline index-and-search in the final stage),
+  # so queueing it behind two uploads would add ten minutes for an ordering that buys nothing.
+  #
+  # The `skipped`-propagates-transitively trap the publish jobs carry a paragraph about cannot
+  # reach this one: `always()` is in the `if` and the condition is `build`'s own rather than a
+  # result read off a job that may have been skipped. If a release happened, this runs — and if
+  # the push fails the run is red, which is the property `attach` has to exist to provide for the
+  # uploads.
+  #
+  # **amd64 only, and deliberately.** This is a public repository, so it cannot use the ARC
+  # runners, and arm64 on a GitHub-hosted runner means qemu — an hour or more to emulate a build
+  # whose long pole is 2.3 GB of ONNX weights, for what is currently a convenience image. The
+  # runner is amd64 and a plain `docker build` produces a single-platform image for it; when
+  # there is a reason to ship arm64, that is a `buildx` matrix and a manifest list, not a flag.
+  #
+  # **The package is meant to be public, and nothing here can make it so.** ghcr creates a new
+  # package *private* even for a public repository, and package visibility is not settable by a
+  # workflow's `GITHUB_TOKEN` — so the first release to run this job publishes an image that only
+  # the owner can pull, and `README.md` and `docs/deployment.md` §5 both document a pull that fails
+  # for everybody else until somebody flips it by hand, once, at
+  # `github.com/users/mgd43b/packages/container/manicule/settings` → Change visibility → Public.
+  # It is recorded here rather than in a release checklist because this file is what a reader of
+  # those two documents is sent to, and a one-time manual step outside version control is precisely
+  # the kind of thing that is remembered until it is not.
+  publish-container:
+    name: publish container
+    needs: release-please
+    if: ${{ always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    # **Serialized, because every guarantee below is a check followed by a write.** Two releases
+    # merged minutes apart overlap for the whole length of this job — it is twenty-odd minutes of
+    # image build — and two concurrent runs would each read a registry state that the other then
+    # changes: both find a version tag absent and both push, or the older one wins the race to
+    # `latest` and a deployment tracking it rolls back. Neither is fixable inside one run, because
+    # a registry push is not a compare-and-swap.
+    #
+    # `cancel-in-progress: false` — the default, but stated, because cancelling is the wrong answer
+    # here. The queued run is a *different release* that also has to publish; it waits rather than
+    # being dropped.
+    concurrency:
+      group: publish-container
+      cancel-in-progress: false
+    env:
+      # The image name, once. It derives only from the `github` context, so unlike `VERSION` — which
+      # reads a step output and cannot be hoisted — it belongs here rather than in four step blocks.
+      IMAGE: ghcr.io/${{ github.repository }}
+      # Read by the three steps that ask GitHub something. Through `env` rather than interpolated
+      # into a script, like every other value this job hands to the shell.
+      REPO: ${{ github.repository }}
+      # **`UV_FROZEN` on the job, and ci.yml is the reason it is needed at all.** That workflow sets
+      # it once for every job; release.yml does not, and cannot — the `release-please` job runs
+      # `uv lock` deliberately, to put the version bump and the re-lock in one reviewed commit.
+      #
+      # Without it `uv sync` below would *repair* a stale lockfile in place rather than refuse it,
+      # which is the exact behavior the re-lock comment above describes going unnoticed for three
+      # releases. Here it would be worse than noise: the repaired `uv.lock` sits in the build
+      # context, `docker build` copies it in, and the published image resolves from a lockfile the
+      # release tag does not contain. The Dockerfile's own `UV_FROZEN=1` cannot catch that, because
+      # the file was already rewritten before the build saw it.
+      UV_FROZEN: "1"
+    permissions:
+      # `packages: write` to push to ghcr.io, and nothing wider. `contents: read` is for the
+      # checkout and for the release lookup below.
+      contents: read
+      packages: write
+    steps:
+      - name: which tag is being published, and what the image will be called
+        id: resolve
+        env:
+          TAG: ${{ inputs.tag || needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          # The `v` is stripped, so the image tag is the version PyPI has and `manicule --version`
+          # prints rather than the git tag. It is also what every base image in the Dockerfile
+          # does — `python:3.14`, not `python:v3.14`.
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # **`workflow_dispatch` takes a string, and `actions/checkout` will resolve a branch just as
+      # happily as a tag.** The comment at the top of this file says the hatch "cannot invent a
+      # version — the tag has to be there to check out", and for the PyPI half that holds up on its
+      # own: dispatching `main` builds wheels versioned from `pyproject.toml`, and the "exactly the
+      # four expected ones" assertion rejects them because the filenames do not carry `main`.
+      #
+      # A registry has no such opinion. `docker push …:main` would succeed, and publish an image
+      # built from an unreleased branch under a tag that looks like a release. So the contract the
+      # comment claims is checked here rather than assumed: the shape of a release tag, and the
+      # existence of `refs/tags/<it>` specifically, which a branch or a bare sha cannot satisfy.
+      - name: the ref being published must be a release tag that exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "refusing to publish from '${TAG}': that is not a vX.Y.Z release tag." >&2
+            exit 1
+          fi
+          # `git/ref/tags/<tag>` resolves tags and nothing else, so `main` fails here with a 404
+          # rather than becoming an image.
+          gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.sha' > /dev/null
+          echo "${TAG} is a release tag."
+
+      # **Whether this release is the newest one, which is the only thing that may move `latest`.**
+      # PyPI needs no equivalent of this step because it orders versions itself: republishing an
+      # old tag there cannot change what `pip install manicule` resolves to. A registry tag is a
+      # bare mutable pointer with no ordering at all, so the `workflow_dispatch` escape hatch —
+      # which names *any* existing tag — could otherwise walk `latest` backwards onto an old
+      # release, and every cluster tracking it would roll back at its next pull.
+      #
+      # Asking which release is newest rather than keying off the event is what keeps the recovery
+      # case working: a dispatch that republishes the current release is exactly when `latest` is
+      # missing and needs setting, and `github.event_name` cannot tell that apart from a dispatch
+      # against v0.1.5. Failing closed on a lookup that errors is deliberate — an unanswerable
+      # "is this the newest" must not be resolved by guessing yes.
+      - name: does this release get `latest`
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          newest="$(gh release view --repo "${REPO}" --json tagName --jq .tagName)"
+          echo "newest release: ${newest}"
+          echo "publishing:     ${TAG}"
+          if [ "${newest}" = "${TAG}" ]; then
+            echo "move=true" >> "$GITHUB_OUTPUT"
+            echo "-> this is the newest release; it takes \`latest\`."
+          else
+            echo "move=false" >> "$GITHUB_OUTPUT"
+            echo "-> a republish of an older tag; \`latest\` is left where it is."
+          fi
+
+      # The tag, not `main`. A release image must be built from the source the release names, and
+      # on the push path `main` has already moved on by at least release-please's own commit.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - name: the commit the image is built from
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # Pinned for the same reason the two jobs above pin it: the interpreter that resolves a
+          # release's lockfile is a decision, not whatever ubuntu-latest moved to this month. With
+          # `requires-python = ">=3.14"` uv has to provision one regardless, so this costs nothing.
+          python-version: "3.14"
+          enable-cache: true
+
+      # --- the grammar pack, staged exactly as ci.yml's `container` job stages it -------------
+      #
+      # Deliberately the same approach and the same cache key, not a variation on it. The reason
+      # the staging exists is in ci.yml at length: `tree-sitter-language-pack` ships no grammars
+      # in its wheel, the Dockerfile would otherwise fetch a third-party release on every build,
+      # and when that host dropped transfers three times in an hour nothing in the repository
+      # could be merged. A release is the single worst moment to reintroduce that dependency.
+      #
+      # Sharing the key with ci.yml is the point rather than a coincidence: CI runs on every push
+      # to `main`, so by the time a release runs the pack is almost always already cached in
+      # `main`'s scope and this fetches nothing at all.
+      - run: uv sync --extra parsers
+      - name: what the staged grammars would be valid for
+        id: grammars
+        run: >-
+          uv run --extra parsers python -c
+          "import hashlib;
+          from manicule.parsers import grammars;
+          declared = ','.join(grammars.DECLARED_LANGUAGES);
+          print(f'pack={grammars.pack_version()}');
+          print(f'languages={hashlib.sha256(declared.encode()).hexdigest()[:12]}')"
+          >> "$GITHUB_OUTPUT"
+      - name: restore the grammar pack
+        id: staged
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: >-
+            container-grammars-${{ runner.os }}-${{ runner.arch }}-${{
+            steps.grammars.outputs.pack }}-${{ steps.grammars.outputs.languages }}
+      - name: stage the grammar pack the image is built from
+        env:
+          # On a restored cache nothing should be downloaded, and pointing the manifest at the
+          # discard port is what makes that a demonstrated fact rather than an assumption.
+          TREE_SITTER_LANGUAGE_PACK_MANIFEST_URL: >-
+            ${{ steps.staged.outputs.cache-hit == 'true'
+            && 'http://127.0.0.1:9/manicule-ci-must-not-download.json' || '' }}
+        run: >-
+          uv run --extra parsers python -c
+          "import shutil;
+          from pathlib import Path;
+          from manicule.parsers import grammars;
+          print('seeded:', grammars.prefetch(grammars.DECLARED_LANGUAGES));
+          missing = grammars.missing_grammars(grammars.DECLARED_LANGUAGES);
+          assert not missing, f'grammars still missing after the pre-seed: {missing}';
+          staged = Path('.ci/grammars') / grammars.pack_version();
+          shutil.copytree(grammars.cache_directory(), staged, dirs_exist_ok=True);
+          print('staged', len(list(staged.iterdir())), 'libraries in', staged)"
+      - name: keep the grammar pack for the next run
+        if: steps.staged.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: >-
+            container-grammars-${{ runner.os }}-${{ runner.arch }}-${{
+            steps.grammars.outputs.pack }}-${{ steps.grammars.outputs.languages }}
+
+      # --- build, assert, then push ------------------------------------------------------------
+      #
+      # `docker login` rather than `docker/login-action`, because this is one line and a third
+      # party action in a job holding `packages: write` is a supply-chain decision that should buy
+      # something. `--password-stdin` keeps the token out of the process arguments.
+      - name: log in to ghcr.io
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
+
+      # The Dockerfile already carries `title`, `description`, `source` and `licenses`; `version`
+      # and `revision` are the two that cannot be written there, and they are the two that let
+      # somebody holding a running container map it back to a commit.
+      #
+      # Tagged with the version here and *not* with `latest`: the image is asserted below before
+      # any pointer is moved onto it.
+      - name: build the image (the offline smoke test runs inside it)
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          REVISION: ${{ steps.revision.outputs.sha }}
+        run: |
+          set -euo pipefail
+          docker build --progress=plain \
+            --tag "${IMAGE}:${VERSION}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${REVISION}" \
+            .
+
+      # The same two assertions ci.yml makes on every pull request, repeated here against the
+      # artifact that is about to be published rather than a rebuild of it. They cost two seconds
+      # and they run *before* the push, so an image that would hand a cluster a root process or a
+      # world-readable corpus directory is never in the registry to be pulled.
+      - name: the image being published does not run as root
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          uid=$(docker run --rm --entrypoint id "${IMAGE}:${VERSION}" -u)
+          echo "uid: ${uid}"
+          test "${uid}" -ne 0
+      - name: the data directory the image ships is 0700
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mode=$(docker run --rm --entrypoint stat "${IMAGE}:${VERSION}" -c '%a %U' /data)
+          echo "/data: ${mode}"
+          test "${mode}" = "700 manicule"
+
+      # **A version tag is never overwritten, which is this half's `skip-existing`.** The PyPI jobs
+      # get that property from PyPI itself: `skip-existing: true` passes over a filename that is
+      # already there, and the registry it uploads to *refuses* a changed artifact under a version
+      # it already has — so, as the comment on it says, a republish "cannot quietly ship a
+      # rebuild". A container registry refuses nothing. `docker push` onto an existing tag simply
+      # moves it.
+      #
+      # That matters because `workflow_dispatch` exists to re-run a release, and a rebuild is never
+      # byte-identical: a newer `python:3.14-slim-bookworm` base, differently resolved wheels, a
+      # different digest. Silently replacing a published `0.1.16` would break the one promise a
+      # version tag makes, and docs/deployment.md §5 makes that promise in as many words.
+      #
+      # So the existing tag is checked for and skipped rather than clobbered, which still leaves the
+      # case the hatch is actually for — a push that failed, where the tag is simply not there —
+      # working exactly as before. `latest` is decided separately and deliberately: recovering a
+      # `latest` that never got moved is itself a reason to dispatch, so it is moved even when the
+      # version tag was already published.
+      - name: push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          MOVE_LATEST: ${{ steps.latest.outputs.move }}
+        run: |
+          set -euo pipefail
+
+          # **"Is that tag published" has three answers, not two.** `docker manifest inspect`
+          # exiting non-zero was originally read as "absent", which quietly folds a network blip, an
+          # expired token and a GHCR 500 into the one answer that causes an overwrite. A confirmed
+          # not-found is the only thing that may authorize a push, so anything else stops the job:
+          # a release that fails here is recoverable, and one that overwrote a published version is
+          # not.
+          #
+          # `name unknown` is in the set because the *package* does not exist until the first release
+          # creates it, and that is a definitive absence rather than a transient one. `denied` and
+          # `unauthorized` are deliberately *not*: with a `packages: write` token that just logged in
+          # successfully they most likely also mean "no such package", but they are the two strings a
+          # real credential failure produces, and guessing wrong there is the overwrite this whole
+          # branch exists to prevent. If a first release ever stops here, the message it prints is
+          # the thing to read.
+          if inspect=$(docker manifest inspect "${IMAGE}:${VERSION}" 2>&1); then
+            echo "${IMAGE}:${VERSION} is already published; leaving it exactly as it is."
+            published=skipped
+          elif printf '%s' "${inspect}" | grep -qiE 'manifest unknown|not found|no such manifest|name unknown'; then
+            docker push "${IMAGE}:${VERSION}"
+            published=pushed
+          else
+            echo "cannot tell whether ${IMAGE}:${VERSION} is already published, so nothing is" >&2
+            echo "pushed. The registry said:" >&2
+            printf '%s\n' "${inspect}" >&2
+            exit 1
+          fi
+
+          if [ "${MOVE_LATEST}" = "true" ]; then
+            # **Re-read which release is newest, immediately before the write.** The decision taken
+            # at the top of this job is twenty minutes stale by now, and the `concurrency` group is
+            # what makes this the *last* twenty minutes rather than a window somebody else is also
+            # writing in — but queue order across runs is not a promise GitHub makes, so the check
+            # is repeated here where it is cheap and the answer is current.
+            newest="$(gh release view --repo "${REPO}" --json tagName --jq .tagName)"
+            if [ "${newest}" != "${TAG}" ]; then
+              echo "${newest} was released while this image built; leaving \`latest\` on it."
+              moved=no
+            else
+              # **`latest` must be the bytes that are published under the version tag, and on the
+              # skipped path the local image is not those bytes.** The build ran regardless, so a
+              # `docker tag` here would point `latest` at a fresh rebuild — which this job documents
+              # as never byte-identical — while `:${VERSION}` keeps the image it already had.
+              # Recovering a missing `latest` would then have introduced exactly the divergence the
+              # never-overwrite rule above exists to prevent. Pulling first replaces the local tag
+              # with the published digest, so both names resolve to one image — and that image
+              # passed the two assertions above in the run that published it.
+              if [ "${published}" = "skipped" ]; then
+                docker pull "${IMAGE}:${VERSION}"
+              fi
+              docker tag "${IMAGE}:${VERSION}" "${IMAGE}:latest"
+              docker push "${IMAGE}:latest"
+              moved=yes
+            fi
+          else
+            moved=no
+          fi
+          {
+            echo "### Container"
+            echo
+            echo '```'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo '```'
+            if [ "${published}" = "skipped" ]; then
+              echo
+              echo "That tag was already published; it was left untouched."
+            fi
+            echo
+            if [ "${moved}" = "yes" ]; then
+              echo "\`latest\` now points at \`${VERSION}\`."
+            else
+              echo "\`latest\` was left where it was."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Last, and only once every publish succeeded: the assets on the GitHub Release should describe
+  # a release that actually reached PyPI and ghcr.io.
   attach:
     name: attach to the release
-    needs: [build, publish-manicule, publish-manicule-mlx]
+    needs: [build, publish-manicule, publish-manicule-mlx, publish-container]
     # Deliberately `always()` rather than inheriting, so that this job *runs* when a publish did
     # not — and fails. A skipped publish is not an error to GitHub, so without a job that turns
     # "nothing was uploaded" into a red run, a release that published nothing reports success.
@@ -242,17 +604,23 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: both uploads must have succeeded
+      # The container is in here for the same reason the two uploads are. Its job failing already
+      # turns the run red, but that alone would leave a Release carrying a full set of assets and
+      # describing a version whose image was never published — complete to everybody reading it.
+      # A release is complete or it is not.
+      - name: every publish must have succeeded
         run: |
           set -euo pipefail
           manicule="${{ needs['publish-manicule'].result }}"
           mlx="${{ needs['publish-manicule-mlx'].result }}"
+          container="${{ needs['publish-container'].result }}"
           echo "manicule: ${manicule}"
           echo "manicule-mlx: ${mlx}"
-          if [ "${manicule}" != "success" ] || [ "${mlx}" != "success" ]; then
+          echo "container: ${container}"
+          if [ "${manicule}" != "success" ] || [ "${mlx}" != "success" ] || [ "${container}" != "success" ]; then
             echo "a distribution did not publish; the release is incomplete." >&2
             echo "Nothing is attached to the release, because the assets on a GitHub Release" >&2
-            echo "must describe a release that actually reached PyPI." >&2
+            echo "must describe a release that actually reached PyPI and ghcr.io." >&2
             exit 1
           fi
 
