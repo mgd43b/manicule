@@ -461,3 +461,40 @@ def test_the_factory_builds_against_a_real_store(store: SqliteDocStore, tmp_path
 
     with pytest.raises(ConfigError, match="relate"):
         build_middleware(context(object()))
+
+
+async def test_a_linker_outside_the_scope_still_reaches_a_target_inside_it(
+    store: SqliteDocStore,
+) -> None:
+    """`sources` bounds link *targets*. It does not decide who may link to them.
+
+    A wiki page containing `[[project_backoff]]` is a legitimate edge when the memory it names
+    is in scope, and `_write_outbound` writes it from that end. Filtering the inbound search by
+    the target's sources excluded exactly those linkers, so the same edge existed or did not
+    depending on which document happened to be stored second.
+    """
+    linker = Document(
+        id=document_id(DEFAULT_WORKSPACE, "wiki", "/wiki/runbook.md"),
+        source="wiki",
+        source_id="/wiki/runbook.md",
+        uri="file:///wiki/runbook.md",
+        title="runbook.md",
+        content_hash=content_hash("wiki-linker"),
+        media_type="text/markdown",
+        status=DocumentStatus.INDEXED,
+    )
+    await store.upsert_document(linker)
+    await store.replace_chunks(
+        linker.id, [a_chunk(linker, 0, "See [[project_backoff]] for the schedule.")]
+    )
+    hook = middleware(store, sources=("memories",))
+    await hook.after_store(linker)
+
+    target = await seed(store, "project_backoff", "Back off exponentially.")
+    await hook.after_store(target)
+
+    chunks = await store.document_chunks(linker.id)
+    target_chunks = await store.document_chunks(target.id)
+    assert await edges(store, chunks[0]) == [
+        (chunks[0].id, target_chunks[0].id, ChunkRelationType.MENTIONS.value)
+    ]

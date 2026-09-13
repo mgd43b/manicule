@@ -320,8 +320,16 @@ class WikilinkMiddleware(Middleware):
         # words is also what makes the hyphen and underscore spellings one query rather than
         # two: both tokenize identically, which is the same normalization `normalize` performs,
         # arrived at by the index rather than by this module.
+        # **No scope on this search, and that is not the same question `_scope` answers.**
+        # ``sources`` bounds which documents may be link *targets*; the chunks this is looking
+        # for belong to the documents doing the *linking*, and a wiki page linking into the
+        # memory corpus is a legitimate edge whose target is in scope. Filtering here by the
+        # target's sources excluded exactly those linkers, so an edge `_write_outbound` would
+        # have written from the other end went missing until that document was next scanned —
+        # the two directions disagreeing about one edge. `search_lexical` is workspace-scoped by
+        # the store handle regardless, which is the restriction that does belong here.
         for candidate in await self._store.search_lexical(
-            " ".join(words), self._config.inbound_limit, self._scope()
+            " ".join(words), self._config.inbound_limit
         ):
             chunk = candidate.chunk
             if chunk.document_id == document.id:

@@ -1046,7 +1046,16 @@ def _authored_body(file: Path | None) -> str:
         if sys.stdin.isatty():
             typer.echo("reading the document from standard input; end it with Ctrl-D", err=True)
         return sys.stdin.read()
-    return Path(file).expanduser().read_text(encoding="utf-8")
+    path = Path(file).expanduser()
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        # A usage error rather than a traceback. This runs in the command callback, before
+        # anything has an envelope to fail into: `main` hands control to Typer, which converts
+        # nothing a callback raises, so an unreadable `--file` printed a stack trace naming a
+        # line of manicule for what is a mistyped path or a file in another encoding.
+        msg = f"cannot read the document from {path}: {exc}"
+        raise typer.BadParameter(msg, param_hint="--file") from exc
 
 
 @document_app.command("list")

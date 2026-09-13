@@ -588,6 +588,16 @@ class SqliteDocStore(
         row.chunk_fp = chunk_fp
         row.embed_fp = embed_fp
         row.parse_fp = parse_fp
+        # **Cleared here, stamped later, and the gap between the two is the point.** This
+        # publication replaces the document's chunks, and `chunk_relations` cascades from them —
+        # so the edges an extractor derived are gone the moment this commits, while the hooks
+        # that would rebuild them run afterwards, in `after_store`. Carrying the previous value
+        # through would leave a window in which the document claims edges it no longer has, and
+        # anything that ended the run inside that window — a failing hook, a killed process —
+        # would leave the claim standing for ever, because the repair selects on this column and
+        # the old value can equal the current one. `NULL` is the fail-safe direction: the worst
+        # a cleared lineage costs is one document rescanned that did not need it.
+        row.relation_fp = None
         await session.flush()
         return Commit(committed=True, stored=to_document(row))
 

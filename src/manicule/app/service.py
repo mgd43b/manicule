@@ -2314,22 +2314,30 @@ class ApplicationService:
             )
             raise PolicyError(msg) from exc
 
-        report = await self.index_path(target, source=authoring.source)
-        documents = await self._backend.documents()
-        stored = await documents.get_document(identifier)
-        indexed = stored is not None and stored.status is DocumentStatus.INDEXED
-        member, detail = False, "" if indexed else _not_indexed(report, stored)
-        if indexed:
-            try:
+        # **Everything after the write is inside this.** The file exists from here on, so the
+        # contract is that a caller is told where it is whatever happens next — and `run_op`
+        # can only retain a payload for a result that is *returned*. An exception escaping
+        # instead produces a failure envelope with `data: null`, which loses the one thing the
+        # caller cannot reconstruct. Indexing, the read-back, the membership write and the chunk
+        # count can each raise a storage error, so all four are in here rather than the one that
+        # looked most likely to.
+        indexed, member, detail, chunks = False, False, "", 0
+        try:
+            report = await self.index_path(target, source=authoring.source)
+            documents = await self._backend.documents()
+            stored = await documents.get_document(identifier)
+            indexed = stored is not None and stored.status is DocumentStatus.INDEXED
+            detail = "" if indexed else _not_indexed(report, stored)
+            if indexed:
+                chunks = len(await documents.document_chunks(identifier))
                 await self.collection_add(found.id, [identifier])
-            except ManiculeError as exc:
-                # Reported rather than raised, because by here the file is on disk **and** in the
-                # index: raising would replace a result naming a document that exists with an
-                # error naming nothing, and the caller would have no handle on the thing it just
-                # created. `member` is the field that says which of the two writes happened.
-                detail = f"indexed, and not added to collection {collection!r}: {exc}"
-            else:
                 member = True
+        except (ManiculeError, ValueError, OSError, SQLAlchemyError) as exc:
+            # The same three types `run_op` treats as outcomes rather than defects, plus the one
+            # the store raises. A defect still propagates: this is not a bare `except`, and a bug
+            # in manicule dressed as a tidy result is a bug nobody fixes.
+            detail = _kept(target, indexed, member, collection, exc)
+            member = False if not indexed else member
         return r.DocumentCreated(
             document_id=identifier,
             path=str(target),
@@ -2340,7 +2348,7 @@ class ApplicationService:
             indexed=indexed,
             member=member,
             overwritten=conflict is not None,
-            chunks=len(await documents.document_chunks(identifier)) if indexed else 0,
+            chunks=chunks,
             detail=detail,
             elapsed_ms=_millis(started),
         )
@@ -6982,6 +6990,24 @@ def _write_authored(target: Path, content: str, *, replace: bool) -> None:
     flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if replace else os.O_EXCL)
     with os.fdopen(os.open(target, flags, 0o644), "w", encoding="utf-8", newline="\n") as handle:
         handle.write(content)
+
+
+def _kept(target: Path, indexed: bool, member: bool, collection: str, exc: Exception) -> str:
+    """What to say about a file that is on disk after something downstream of it raised.
+
+    Two sentences rather than one, because the caller's next move differs. A document that never
+    reached the index is waiting for a sync; one that is indexed and outside its collection is
+    findable but unscoped, and the fix is a ``collection add`` rather than a re-index. The
+    exception's own text carries the cause in both.
+
+    Named separately from :func:`_not_indexed`, which explains a *reported* failure — an ingest
+    that declined and said so. This explains an exception, and the two read differently to
+    somebody deciding what to do.
+    """
+    failure = f"{type(exc).__name__}: {exc}"
+    if indexed and not member:
+        return f"indexed, and not added to collection {collection!r}: {failure}"
+    return f"{target} is on disk and was not indexed: {failure}"
 
 
 def _not_indexed(report: r.IngestReport, stored: Document | None) -> str:

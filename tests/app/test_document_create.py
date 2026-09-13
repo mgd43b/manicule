@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 from typer.testing import CliRunner
 
 import manicule.cli.main as cli
@@ -552,14 +553,17 @@ def test_the_terminal_is_told_why_a_kept_file_is_not_indexed(
         )
 
     monkeypatch.setattr(cli, "_dispatch", dispatch)
+    # Rich wraps to the terminal's width, and a runner's is narrower than a developer's — so an
+    # assertion on a path is an assertion about where the wrap fell. This one failed in CI and
+    # not locally, having split `retry_policy.md` across two lines. Pinning the width makes the
+    # output a function of the renderer rather than of the machine.
+    monkeypatch.setenv("COLUMNS", "200")
     result = CliRunner().invoke(
         cli.app, ["document", "create", COLLECTION, "retry_policy"], input=BODY
     )
 
     assert result.exit_code == 1
-    # The filename rather than the whole path: a terminal wraps an absolute one, and what is
-    # being asserted is that the renderer reached for it at all.
-    assert "retry_policy.md" in result.output
+    assert str(root / COLLECTION / "retry_policy.md") in result.output
     assert "is not indexed" in result.output
     assert "the embedder declined" in result.output
 
@@ -657,3 +661,55 @@ async def test_a_source_with_no_ceiling_declares_none(root: Path) -> None:
     )
 
     assert created.indexed is True
+
+
+async def test_a_storage_failure_after_the_write_still_reports_the_path(root: Path) -> None:
+    """The contract is the path, not the happy path.
+
+    `run_op` can only retain a payload for a result that is **returned**: an exception escaping
+    `document_create` produces a failure envelope with `data: null`, which loses the one thing
+    the caller cannot reconstruct — where the file it just sent ended up. Indexing, the
+    read-back, the membership write and the chunk count can each raise a storage error, so this
+    drives the first of them and asserts the result still names the file.
+    """
+    service = await service_for(settings_for(root))
+    backend = service.backend
+    assert isinstance(backend, FakeBackend)
+
+    async def explode(*args: object, **kwargs: object) -> RunReport:
+        del args, kwargs
+        msg = "the database went away"
+        raise SQLAlchemyError(msg)
+
+    backend.ingestion_.index_path = explode
+
+    created = await service.document_create(collection=COLLECTION, slug="retry_policy", body=BODY)
+
+    assert created.indexed is False
+    assert created.path == str(root / COLLECTION / "retry_policy.md")
+    assert "the database went away" in created.detail
+    assert (root / COLLECTION / "retry_policy.md").read_text(encoding="utf-8") == BODY
+
+
+async def test_the_kept_file_survives_a_storage_failure_as_an_envelope(root: Path) -> None:
+    """And it reaches a caller as `ok: false` with the payload attached, not as a bare error."""
+    service = await service_for(settings_for(root))
+    backend = service.backend
+    assert isinstance(backend, FakeBackend)
+
+    async def explode(*args: object, **kwargs: object) -> RunReport:
+        del args, kwargs
+        msg = "the database went away"
+        raise SQLAlchemyError(msg)
+
+    backend.ingestion_.index_path = explode
+
+    envelope = await run_op(
+        "document_create",
+        service.workspace,
+        lambda: service.document_create(collection=COLLECTION, slug="retry_policy", body=BODY),
+    )
+    body = envelope.as_json()
+
+    assert body["ok"] is False
+    assert body["data"]["path"] == str(root / COLLECTION / "retry_policy.md")
