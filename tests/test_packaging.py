@@ -834,8 +834,8 @@ def _model_cache_copy() -> str:
     code = [
         line for line in DOCKERFILE.read_text().splitlines() if not line.lstrip().startswith("#")
     ]
-    # Continuations joined, because the `RUN` keyword and the `cp` this reads for sit on
-    # different physical lines of one instruction.
+    # Continuations joined first: one `RUN` instruction spans several physical lines, with the
+    # `RUN` keyword on the first and the `cp` this reads for on the last.
     instructions: list[str] = []
     for line in code:
         if instructions and instructions[-1].endswith("\\"):
@@ -861,19 +861,30 @@ def test_the_image_ships_only_the_hub_cache_out_of_the_download() -> None:
     bump. It is the one thing #356 could not fix: `rewrite-timestamp` rewrites tar headers, and
     this timestamp is in a file's name and body.
 
-    Asserted against the bulk copy specifically, because that is the shape this regresses to —
-    `cp -a /tmp/hf/. "${HF_HOME}/"` reads like a tidier spelling of the same thing and is how
-    it was written for five releases.
+    Asserted as an allowlist — `hub` is the only source this instruction may copy from — rather
+    than against the one spelling that caused it. Naming `cp -a /tmp/hf/.` alone would leave
+    `cp -a /tmp/hf/hub … && cp -a /tmp/hf/xet …` passing, which puts the same bytes back by
+    another route; the property worth holding is that nothing but `hub` is copied at all.
     """
     copy = _model_cache_copy()
 
-    assert "/tmp/hf/hub" in copy, (  # noqa: S108 - read out of the Dockerfile, never opened
-        f"the model cache must be copied into the image as `hub/` alone — the rest of an "
-        f"`HF_HOME` is download scratch, and `xet/logs/` in it is named and filled with the "
-        f"wall clock, which resets the 1.36 GB layer's digest every release. Found:\n{copy}"
+    # Bare path arguments only: `target=/tmp/hf` and `HF_HOME=/tmp/hf` are the cache mount and
+    # the download's own environment, neither of which puts anything in the image, and both of
+    # which are a token that starts with its own key rather than with the path.
+    download = "/tmp/hf"  # noqa: S108 - read out of the Dockerfile, never opened by this process
+    sources = sorted(
+        {
+            argument
+            for token in copy.split()
+            if (argument := token.strip("\"'")).startswith(download)
+        }
     )
-    assert not re.search(r"cp\s+-a\s+/tmp/hf/\.", copy), (
-        f"the model step copies all of `/tmp/hf`, which ships `$HF_HOME/xet/logs/"
-        f"xet_<wall clock>_<pid>.log` inside the model layer and makes it a new blob every "
-        f"release. Copy `/tmp/hf/hub` instead. Found:\n{copy}"
+
+    assert sources == [f"{download}/hub"], (
+        f"the model step must copy `/tmp/hf/hub` out of the download and nothing else. Every "
+        f"other path in an `HF_HOME` is scratch, and `xet/logs/` in it is named and filled with "
+        f"the wall clock, which resets the 1.36 GB layer's digest every release and costs every "
+        f"node a full re-pull. `cp -a /tmp/hf/.` is how it was written for five releases; a "
+        f"second source beside `hub` is the same regression by another route. Found {sources} "
+        f"in:\n{copy}"
     )
