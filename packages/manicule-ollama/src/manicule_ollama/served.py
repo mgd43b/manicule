@@ -239,6 +239,16 @@ def resolve(
     ``embedding_length`` and it is read and cross-checked, but the vector table is created from
     what came back in an actual response.
 
+    **All three block, and that is now somebody else's problem to schedule.** This is a
+    synchronous factory path by the container's contract — a component has no identity until
+    these have answered, and ``Factory`` returns a component rather than an awaitable so that
+    a factory can resolve its dependencies inline. What used to follow from that was a stall:
+    :meth:`~manicule.container.Container.aget` called the factory on the event loop, so an
+    unreachable server held the whole process for a connect timeout and then a request
+    timeout. ``aget`` now builds on a worker thread, so the blocking costs this construction
+    and nothing else. Nothing here needs to change for that, and nothing here may assume
+    otherwise: no main thread, and no running loop to reach for.
+
     Raises:
         ConfigError: The server does not hold this model, its metadata is unusable, the
             configured tokenizer is missing, or the declared and measured widths disagree.

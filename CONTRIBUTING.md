@@ -235,6 +235,12 @@ own so a change to its rules makes the corpus visibly stale rather than quietly 
   startup, with both versions named.
 - Register factories, not instances. Keep heavy imports inside the factory so an installed
   plugin nobody has configured costs one cheap import.
+- **A factory may block, and it runs on a worker thread.** `Container.aget` builds through
+  `asyncio.to_thread`, so construction-time I/O — opening a database, reading a model card,
+  asking a server what it is serving — costs its own construction rather than stalling the
+  event loop for everything else in the process. One factory runs at a time, so a factory
+  needs no locking of its own; what it must not do is assume it is on the main thread, or
+  reach for the running event loop. Anything that needs `await` still belongs in `setup`.
 - Parsers declare their media types at registration, not only on the class. Routing a
   document reads the declaration, so choosing one parser does not construct the rest — and
   a parser that disagrees with its own declaration is caught the first time it is used.
