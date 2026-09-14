@@ -75,7 +75,7 @@ from manicule.storage.vector_schema import (
     LANG_COLUMN,
     space_name,
 )
-from manicule.storage.vectors import workspace_vector_directory
+from manicule.storage.vector_paths import workspace_vector_directory
 from manicule.testing.contracts import (
     assert_protocol_signatures,
     assert_vector_store_is_dimension_agnostic,

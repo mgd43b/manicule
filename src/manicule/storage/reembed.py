@@ -57,11 +57,13 @@ from manicule.storage import models
 from manicule.storage.engine import sqlite_busy
 from manicule.storage.rows import to_chunk, to_document
 from manicule.storage.types import utcnow
+from manicule.storage.vector_paths import generation_pin
 from manicule.storage.vector_schema import CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN
-from manicule.storage.vectors import LanceVectorStore, generation_pin
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+
+    from manicule.storage.vectors import LanceVectorStore
 
 _RUN = TypeAdapter(ReembedRun)
 _COMMITMENT = TypeAdapter(ReembedCommitment)
@@ -1471,6 +1473,8 @@ class LanceShadowGenerations:
                 return removed
 
     def _store(self, generation_id: str) -> LanceVectorStore:
+        from manicule.storage.vectors import LanceVectorStore  # noqa: PLC0415
+
         return self._stores.setdefault(
             generation_id, LanceVectorStore(self.directory(generation_id))
         )

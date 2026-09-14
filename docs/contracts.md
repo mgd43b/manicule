@@ -91,6 +91,13 @@ VectorStore
     upsert(chunks: list[Chunk], vectors: list[Vector]) -> None
     search(vector: Vector, k: int, filter: Filter|None) -> list[Candidate]
 
+    # Optional capabilities, each detected separately. A backend implements the ones
+    # it has; nothing requires all four, and a store with none is not degraded.
+    AnnIndexMaintenance           # ann_index_state, build_ann_index
+    VectorIntegrityMaintenance    # checksum_coverage, backfill_checksums
+    PublicationAwareVectorStore   # publications: count, validate, copy, retire
+    PublicationBoundVectorStore   # the above, following the durable pointer
+
 DocStore
     # documents, chunks, lexical search, sync state
 
@@ -131,6 +138,18 @@ document ids asks for a `CollectionStore` and cannot reach a document's chunks w
 it was given. Joining the *implementation* is what keeps the workspace boundary in one place —
 `SqliteDocStore` has one constructor, one session factory and one tenancy check however many
 contracts it satisfies. See [`storage.md`](storage.md) §11.
+
+**A vector store's optional capabilities are asked of the object, never of the module that
+would implement one.** The four above are separate `runtime_checkable` protocols rather than
+methods on `VectorStore` for the reason the lifecycle hooks are separate — a networked backend
+that builds no ANN index and holds no shadow generations should report no index state rather
+than an empty one, and should not carry four methods that can only refuse. The rule about
+*how* they are detected is newer and was learned expensively: a caller asks
+`isinstance(store, PublicationAwareVectorStore)`, and must not import a backend's classes to
+`isinstance` against those instead. Importing `manicule.storage.vectors` loads LanceDB's native
+extension, which is compiled around AVX2 — so on a host without it, a Qdrant installation took
+`SIGILL` while finding out it had not configured LanceDB. See [`storage.md`](storage.md) §6.7;
+`tests/test_import_boundary.py` holds the line.
 
 **`VersionStore.resolve_citation` takes the document as well as the chunk, and the reason is
 the anchor rule.** `chunks.id` is derived from `(document_id, position, text)`, so a chunk that

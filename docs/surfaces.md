@@ -39,12 +39,20 @@ with the same type, message and hint.
 | `manicule.api` | Route, authenticate, decide a status code, frame a stream | Anything the CLI may not |
 | `manicule.web` | Render an envelope as HTML, escape it, choose a template | Anything the CLI may not — and it adds no operation of its own |
 | `manicule.app.service` | Everything else | Import a database, a model runtime or a web framework |
-| `manicule.app.runtime` | Build components, own the lifecycle | Decide anything a surface could ask about |
+| `manicule.app.runtime` | Build components, own the lifecycle | Decide anything a surface could ask about, or import a backend it was not configured to build |
 
 The service is written against the protocols in `manicule.app.ports`, so the suites drive it
 against components that break their half of the bargain — a store that ignores its workspace,
 a retriever that returns another tenant's chunk. That is the only way the guards can be
 watched firing.
+
+The runtime's second "may not" is newer than the first, and it is there because building
+components looks like a license to import them. It is not: the runtime may import the backend
+the configuration selected, and no other. Deciding between two backends by importing both and
+asking `isinstance` made a Qdrant installation load LanceDB's native extension on every start,
+which on a host without AVX2 is `SIGILL` rather than a slow import — see
+[`storage.md`](storage.md) §6.7. A capability is asked of the object through a protocol in
+`manicule.core.protocols`; `tests/test_import_boundary.py` fails the build otherwise.
 
 ---
 

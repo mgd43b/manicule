@@ -407,6 +407,105 @@ def test_registering_the_built_in_stores_loads_no_database() -> None:
     )
 
 
+LANCE_MODULES = ("lancedb", "pyarrow", "manicule.storage.vectors")
+"""The embedded backend's module, its native extension, and the columnar library beneath it.
+
+``manicule.storage.vectors`` is in the list rather than only ``lancedb`` because it is the
+module a backend-agnostic path would name, and importing it is what performs the ``dlopen``.
+Naming both means the failure says which line to look at rather than only that something
+loaded a database.
+"""
+
+
+def _modules_added_by_a_qdrant_runtime() -> set[str]:
+    """Drive a Qdrant-configured runtime through its backend-agnostic paths, in a fresh process.
+
+    A subprocess is not stylistic here, it is the only way the question can be asked. Pytest
+    imports every module under ``testpaths`` during collection, and several vector tests import
+    ``manicule.storage.vectors`` at module scope — so by the time this file runs, an in-process
+    check finds the module loaded, passes when the file is run alone, and fails under the full
+    suite. The interpreter has to be new.
+
+    No Qdrant server is involved. ``Runtime.vectors`` is deliberately unprepared, so the store
+    is constructed without dialing anything, which is the same property
+    ``build_qdrant_vector_store`` is written to have.
+
+    ``Runtime(settings)`` rather than ``Runtime.open()``: ``open`` calls ``load_settings()``,
+    which would read the developer's own configuration into an isolated subprocess and make the
+    result depend on the machine.
+    """
+    script = (
+        "import asyncio, json, sys, tempfile\n"
+        "from pathlib import Path\n"
+        "before = set(sys.modules)\n"
+        "from manicule.app.runtime import Runtime\n"
+        "from manicule.config.settings import Settings\n"
+        "async def main():\n"
+        "    with tempfile.TemporaryDirectory() as tmp:\n"
+        "        settings = Settings.model_validate({\n"
+        '            "data_dir": str(Path(tmp) / "data"),\n'
+        '            "storage": {\n'
+        '                "vector_db": "qdrant",\n'
+        '                "vector_db_url": "http://127.0.0.1:6333",\n'
+        "            },\n"
+        "        })\n"
+        "        async with Runtime(settings) as runtime:\n"
+        "            await runtime.vectors()\n"
+        "            maintenance = await runtime.maintenance()\n"
+        "            await maintenance.vector_index_state()\n"
+        "            await runtime.vector_directory()\n"
+        "            ingestion = await runtime.ingestion()\n"
+        '            await ingestion.reembed_status("no-such-run")\n'
+        "            await runtime.invalidate_derived_runtime()\n"
+        "asyncio.run(main())\n"
+        "print(json.dumps(sorted(set(sys.modules) - before)))\n"
+    )
+    completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    added: list[str] = json.loads(completed.stdout)
+    return set(added)
+
+
+@pytest.mark.contract
+def test_a_qdrant_runtime_never_loads_the_embedded_backend() -> None:
+    """Configuring one vector store must not load the other — at runtime, not just at discovery.
+
+    ``test_registering_the_built_in_stores_loads_no_database`` makes this claim about plugin
+    discovery, and discovery was never where it broke. The application runtime decided whether a
+    store wanted the publication-following wrapper by importing the Lance classes and asking
+    ``isinstance``, which meant a Qdrant installation imported LanceDB in order to be told that
+    it had not configured LanceDB.
+
+    On most hardware that is an unnecessary import. On a CPU without AVX2 it is ``SIGILL``:
+    LanceDB's native extension is compiled for instructions the processor does not have, so the
+    process died with exit 132 immediately after the bind banner, and ``manicule doctor`` died
+    the same way. The Qdrant backend was unusable on precisely the hardware that most needs it —
+    ``docs/deployment.md`` §5.3 ships an image for that host.
+
+    Every path driven here is one a Qdrant installation reaches normally: the first ``vectors()``
+    call, the index-state report behind ``index_status``, the vector directory, the *ungated*
+    ``reembed_status`` that three surfaces expose, and the shutdown that runs on every exit. A
+    capability is asked of the object through a protocol in ``manicule.core.protocols``; the
+    backend's module is imported only once its own store is what the container built.
+    """
+    loaded = _modules_added_by_a_qdrant_runtime()
+    leaked = sorted(
+        name
+        for name in LANCE_MODULES
+        if any(module == name or module.startswith(f"{name}.") for module in loaded)
+    )
+    assert leaked == [], (
+        f"a runtime configured for Qdrant loaded {', '.join(leaked)}. A backend-agnostic path "
+        f"must not import a backend's extension module to ask what a store is — narrow with a "
+        f"protocol from manicule.core.protocols, and import the backend inside the branch that "
+        f"has already established it is the one configured"
+    )
+
+
 @pytest.mark.contract
 def test_the_parsing_plugin_registers_through_the_public_entry_point() -> None:
     """The built-in parsers take the same route a third-party plugin takes.

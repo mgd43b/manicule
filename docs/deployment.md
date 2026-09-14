@@ -515,6 +515,18 @@ setting means what it says. A provider this image cannot satisfy — `mlx` — s
 startup by name, listing what is installed, which is the better failure and needed no
 pre-empting.
 
+**On this host the vector backend is a second decision, and it used to be a fatal one.** AVX2
+is missing for the embedder and for everything else in the process, and LanceDB's extension
+module is compiled around it — so `import lancedb` on an Ivy Bridge Xeon is `SIGILL`, not a
+slow import. Setting `storage.vector_db = "qdrant"` is the supported answer (§6.5), and until
+0.1.22 it did not work: `manicule.app.runtime` imported the Lance classes to decide whether a
+store wanted the publication-following wrapper, so the process died with exit 132 just after
+the bind banner and `manicule doctor` died the same way, both while configured for a backend
+that needs none of it. The backend-agnostic paths now ask the store what it can do through a
+protocol, and `tests/test_import_boundary.py` fails the build if one of them loads LanceDB
+again. Note that the extension still has to be *installed* — the `storage` extra carries
+LanceDB and PyArrow alongside the relational store — it simply is no longer imported.
+
 **The tokenizer is the part that needs a decision.** Ollama serves GGUF and exposes no
 tokenizer, while manicule counts tokens to place chunk boundaries and to refuse text the model
 would truncate, so `tokenizer` is required and has no default

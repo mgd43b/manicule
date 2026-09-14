@@ -298,11 +298,11 @@ class Runtime:
             try:
                 vectors = self._slots.get("vectors")
                 if vectors is not None and vectors.value is not None:
-                    from manicule.storage.vectors import (  # noqa: PLC0415
-                        PublishedLanceVectorStore,
+                    from manicule.core.protocols import (  # noqa: PLC0415
+                        PublicationBoundVectorStore,
                     )
 
-                    if isinstance(vectors.value, PublishedLanceVectorStore):
+                    if isinstance(vectors.value, PublicationBoundVectorStore):
                         await vectors.value.teardown()
             except Exception as vector_error:
                 if close_error is None:
@@ -404,7 +404,7 @@ class Runtime:
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import VECTORS_DIRNAME  # noqa: PLC0415
-        from manicule.storage.vectors import workspace_vector_directory  # noqa: PLC0415
+        from manicule.storage.vector_paths import workspace_vector_directory  # noqa: PLC0415
 
         await self.documents()
         root = self._settings.data_dir / VECTORS_DIRNAME
@@ -442,9 +442,9 @@ class Runtime:
             await cast("IngestPipeline", pipeline.value).aclose()
         vectors = self._slots.get("vectors")
         if vectors is not None and vectors.value is not None:
-            from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
+            from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
 
-            if isinstance(vectors.value, PublishedLanceVectorStore):
+            if isinstance(vectors.value, PublicationBoundVectorStore):
                 await vectors.value.teardown()
         for slot in ("pipeline", "prepared_vectors", "vectors", "retriever", "answerer"):
             self._slots.pop(slot, None)
@@ -687,17 +687,15 @@ class Runtime:
         return at != head_revision()
 
     async def _build_vectors(self) -> VectorStore:
-        from manicule.storage.vectors import (  # noqa: PLC0415
-            LanceVectorStore,
-            PublishedLanceVectorStore,
-        )
+        from manicule.core.protocols import PublicationAwareVectorStore  # noqa: PLC0415
 
         await self.documents()
         store = await self._container.aget(keys.VECTOR_STORE)
-        if isinstance(store, LanceVectorStore):
+        if isinstance(store, PublicationAwareVectorStore):
             from sqlalchemy import select  # noqa: PLC0415
 
             from manicule.storage import models  # noqa: PLC0415
+            from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
 
             async with self.require_engine().connect() as connection:
                 row = (
@@ -1627,11 +1625,11 @@ class _Ingestion:
         )
 
     async def _require_reembed_backend(self) -> None:
+        from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
         from manicule.ingest.reembed import ReembedError  # noqa: PLC0415
-        from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
 
         vectors = await self._runtime.vectors()
-        if not isinstance(vectors, PublishedLanceVectorStore):
+        if not isinstance(vectors, PublicationBoundVectorStore):
             raise ReembedError(
                 f"durable re-embedding requires the built-in SQLite/Lance vector backend, and "
                 f"storage.vector_db is {self._runtime.settings.storage.vector_db!r}. No other "
@@ -2428,16 +2426,13 @@ class _Maintenance:
 
         async def settle():  # noqa: ANN202
             from manicule.app.ports import ResetOutcome  # noqa: PLC0415
-            from manicule.storage.vectors import (  # noqa: PLC0415
-                PublishedLanceVectorStore,
-                generation_pin,
-                reset_vector_directory,
-            )
+            from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
+            from manicule.storage.vector_paths import generation_pin  # noqa: PLC0415
 
             directory = await self._runtime.vector_directory()
             async with generation_pin(directory, exclusive=True):
                 vectors = await self._runtime.vectors()
-                if not isinstance(vectors, PublishedLanceVectorStore):
+                if not isinstance(vectors, PublicationBoundVectorStore):
                     raise ManiculeError(
                         "derived reset requires the built-in publication-aware vector backend"
                     )
@@ -2467,6 +2462,10 @@ class _Maintenance:
                 remove_store = prepared.vector_namespace != "legacy" or other_legacy == 0
                 physical_removed = False
                 if remove_store:
+                    from manicule.storage.vectors import (  # noqa: PLC0415
+                        reset_vector_directory,
+                    )
+
                     await vectors.teardown()
                     physical_removed = await reset_vector_directory(
                         directory, legacy_root=prepared.vector_namespace == "legacy"

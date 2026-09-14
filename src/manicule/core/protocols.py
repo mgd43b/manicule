@@ -482,6 +482,99 @@ class VectorIntegrityMaintenance(Protocol):
 
 
 @runtime_checkable
+class PublicationAwareVectorStore(Protocol):
+    """Optionally groups its rows into publications it can count, validate, copy and retire.
+
+    Optional on the same terms as :class:`AnnIndexMaintenance`: the capability belongs to a
+    backend that holds several physical publications of one logical chunk, not to every
+    backend. A store without it is not a degraded store — it holds exactly one row per chunk,
+    which is why it has nothing to name. ``docs/storage.md`` §6.5 is the lifecycle these
+    methods serve.
+
+    **This protocol exists so that asking the question does not cost a native library.** The
+    publication surface is LanceDB's, and :mod:`manicule.storage.vectors` imports ``lancedb``
+    at module scope — so a backend-agnostic path that narrowed with
+    ``isinstance(store, LanceVectorStore)`` had to dlopen LanceDB's extension to find out that
+    the answer was no. On a CPU without AVX2 that is not a slow import but a ``SIGILL``, which
+    made the Qdrant backend unusable on the hardware it exists to serve. A capability is asked
+    of the object, never of the module that would implement it.
+    """
+
+    async def publication_row_count(self, publication_id: str) -> int:
+        """How many rows one publication holds, for validation and for cleanup accounting."""
+        ...
+
+    async def delete_publication(self, publication_id: str) -> int:
+        """Retire one publication's rows, reporting how many there were."""
+        ...
+
+    async def prepare_publication_validation(self, publication_id: str) -> None:
+        """Make whatever a completeness check needs selective enough to run repeatedly."""
+        ...
+
+    async def publication_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        """Whether every one of ``chunks`` is present in ``publication_id``'s space."""
+        ...
+
+    async def publication_page_is_complete(
+        self,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        embedding_fingerprint: str,
+    ) -> bool:
+        """The same question over one page, so a corpus of any size stays constant-memory."""
+        ...
+
+    async def copy_publication(
+        self,
+        source_publication_id: str,
+        target_publication_id: str,
+        chunks: Sequence[Chunk],
+    ) -> None:
+        """Carry ``chunks`` into a second publication without re-embedding them."""
+        ...
+
+
+@runtime_checkable
+class PublicationBoundVectorStore(PublicationAwareVectorStore, Protocol):
+    """A publication-aware handle that follows the durable pointer between operations.
+
+    The narrower capability, and the one the application runtime hands out: it resolves which
+    physical generation is live by reading the pointer the document store owns, so a caller
+    holds a handle to "this workspace's vectors" rather than to a directory. Extends
+    :class:`PublicationAwareVectorStore` the way :class:`TokenStateEmbedder` extends
+    :class:`Embedder` — the same subject, asked for more.
+
+    The ``vector_table`` argument each deletion takes is what makes it *bound*: cleanup names
+    the generation it believes it is deleting from, and a handle that has since followed the
+    pointer elsewhere refuses rather than deleting the wrong generation's rows.
+
+    Durable re-embedding's shadow generations are this capability, which is why a re-embed on a
+    backend without it is refused by name rather than half-performed — ``docs/storage.md``
+    §6.5, and §6.7 for the backend that does not have it.
+    """
+
+    async def teardown(self) -> None:
+        """Release the handle's open resources without disturbing what is on disk."""
+        ...
+
+    async def delete_bound_chunks(self, vector_table: str | None, vector_ids: Sequence[str]) -> int:
+        """Delete rows by id from the named generation, refusing if this handle has moved."""
+        ...
+
+    async def delete_bound_publication(self, vector_table: str | None, publication_id: str) -> int:
+        """Retire a whole publication from the named generation, under the same refusal."""
+        ...
+
+
+@runtime_checkable
 class DocStore(Protocol):
     """Relational storage: documents, chunks, lexical search, sync state.
 
