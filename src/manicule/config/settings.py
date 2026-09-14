@@ -831,11 +831,12 @@ class EmbeddingSettings(Section):
         "Apple Silicon, and it is a separate install — ``manicule-mlx``, which is "
         "GPL-3.0-or-later where manicule is MIT. Switching between them never re-embeds: "
         "``backend`` is excluded from the embedding fingerprint's identity, and the two agree "
-        "to cosine 0.99999998. Both embed **in this process**, which needs the hardware they are "
-        "built around — Apple silicon, or a CPU with AVX2. A host with neither embeds on a "
-        "server instead: ``ollama``, from ``manicule-ollama`` in ``packages/``, which is a "
-        "separate install and a separate vector space, because nothing has measured a served "
-        "model against these two.",
+        "to cosine 0.99999998. Both embed **in this process**, and ``onnx`` runs on any CPU — "
+        "without AVX2 it takes onnxruntime's slower kernels rather than refusing. ``ollama`` "
+        "is the third option and a different kind: the model runs on a server, which is worth "
+        "it where in-process embedding is too slow to be practical and not otherwise. It is a "
+        "separate install — ``manicule-ollama`` in ``packages/`` — and a separate vector "
+        "space, because nothing has measured a served model against these two.",
     )
     model: str = Field(default="BAAI/bge-m3", min_length=1)
     revision: str | None = Field(default=None, min_length=1)

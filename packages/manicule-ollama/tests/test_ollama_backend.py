@@ -580,5 +580,40 @@ async def test_a_component_that_is_not_a_number_becomes_this_packages_error(
     """
     # Raised by the dimension probe, which is the first vector this backend ever reads — so
     # the refusal lands at construction, before a fingerprint exists to be wrong about.
-    with pytest.raises(OllamaUnavailableError, match="not a number"):
+    with pytest.raises(OllamaUnavailableError, match="A vector is a list of numbers"):
         await ready(FakeOllama(count=counter, null_component=True), vocabulary)
+
+
+async def test_a_boolean_component_is_refused_rather_than_coerced(
+    vocabulary: Path, counter: Callable[[str], int]
+) -> None:
+    """`float(True)` is `1.0`, so a JSON `true` would become a perfectly plausible component.
+
+    Which is the whole problem: nothing downstream could tell it from a real one. The type is
+    checked before the conversion rather than the conversion being allowed to fail, because for
+    a boolean it does not fail.
+    """
+    with pytest.raises(OllamaUnavailableError, match="bool"):
+        await ready(FakeOllama(count=counter, boolean_component=True), vocabulary)
+
+
+async def test_normalization_is_checked_on_every_setup_not_only_an_uncached_one(
+    vocabulary: Path, counter: Callable[[str], int], tmp_path: Path
+) -> None:
+    """The hole the ceiling cache opened, and the reason that cache needed a second look.
+
+    `_verify_the_limit_is_reachable` is where the norm was checked, and it returns early once
+    the ceiling is recorded — so on every start after the first, nothing inspected a vector
+    before ingest did. A server that stopped normalizing between runs would then be met by
+    `_finish`, which normalizes rather than refuses, and `normalized=True` would go on being
+    recorded about vectors that were not.
+    """
+    server = FakeOllama(count=counter)
+    cache = tmp_path / "cache"
+
+    first = await _setup_with_cache(server, vocabulary, cache)
+    await first.teardown()
+
+    server.normalize = False
+    with pytest.raises(ConfigError, match="not 1"):
+        await _setup_with_cache(server, vocabulary, cache)

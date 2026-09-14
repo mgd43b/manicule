@@ -231,7 +231,14 @@ async def embedder_for(
         batch_size=4,
         cache_entries=cache_entries,
     )
-    await embedder.setup()
+    try:
+        await embedder.setup()
+    except BaseException:
+        # The caller never receives this embedder, so its own `finally` cannot reach it — and
+        # tokenizer or context validation raising here is the *expected* path in several cases
+        # below, not an exotic one. Without this the connection pool outlives every such test.
+        await embedder.teardown()
+        raise
     return embedder
 
 

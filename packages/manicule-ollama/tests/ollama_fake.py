@@ -121,6 +121,13 @@ class FakeOllama:
     null_component: bool = False
     """Whether a vector arrives with a ``null`` in it, rather than a number."""
 
+    boolean_component: bool = False
+    """Whether a vector arrives with a JSON ``true`` in it.
+
+    Separate from :attr:`null_component` because the two fail differently: ``float(None)``
+    raises and ``float(True)`` returns ``1.0``, so only one of them is caught by letting the
+    conversion fail."""
+
     tags_error: str = ""
     """If set, ``/api/tags`` answers 400 with this message instead of a listing.
 
@@ -206,6 +213,8 @@ class FakeOllama:
             vectors = [[float("nan"), *row[1:]] for row in vectors]
         if self.null_component:
             vectors = [[None, *row[1:]] for row in vectors]
+        if self.boolean_component:
+            vectors = [cast("list[float | None]", [True, *row[1:]]) for row in vectors]
         payload: dict[str, object] = {
             "model": self.model,
             "embeddings": vectors[:-1] if self.short_answer and len(vectors) > 1 else vectors,

@@ -467,6 +467,11 @@ class OllamaEmbedder(Lifecycle):
         specials = self.card.special_token_count
         for probe in TOKENIZER_PROBES:
             result = await self._request([probe])
+            # **Here rather than only in the context check**, because that one returns early
+            # when the ceiling is already recorded — so on every start after the first, nothing
+            # would have inspected a vector before ingest did, and `_finish` normalizes rather
+            # than refuses. These probes are being embedded anyway; the check is free.
+            self._require_unit_norm(result.vectors)
             expected = self.count_tokens(probe) + specials
             if result.prompt_eval_count < 0:
                 msg = (

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Final, cast
+from typing import Final, cast
 
 import httpx
 
@@ -416,7 +416,9 @@ def _embed_result(body: Mapping[str, object], model: str, base_url: str) -> Embe
                 f"backend does not understand rather than a value to coerce."
             )
         try:
-            vectors.append([float(cast("Any", value)) for value in cast("list[object]", row)])
+            vectors.append(
+                [_component(value, index, model, base_url) for value in cast("list[object]", row)]
+            )
         except (TypeError, ValueError, OverflowError) as exc:
             # A `null`, a string, or a number no float can hold, somewhere inside the array.
             # Everything this module raises is one of its own two errors precisely so the
@@ -429,6 +431,25 @@ def _embed_result(body: Mapping[str, object], model: str, base_url: str) -> Embe
             ) from exc
     count = body.get("prompt_eval_count")
     return EmbedResult(vectors=vectors, prompt_eval_count=count if isinstance(count, int) else -1)
+
+
+def _component(value: object, index: int, model: str, base_url: str) -> float:
+    """One number out of a returned vector, with the two non-numbers that ``float`` accepts.
+
+    ``float("1.5")`` and ``float(True)`` both succeed, so a component arriving as a string or a
+    JSON ``true`` would be *coerced* rather than refused — and 1.0 is a perfectly plausible
+    component. The type is checked before the conversion so that a server sending something
+    other than numbers is a refusal rather than a vector nobody can tell apart from a real one.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        msg = (
+            f"{base_url}/api/embed returned {type(value).__name__} as a component of vector "
+            f"{index} for {model!r}. A vector is a list of numbers; `float()` would accept a "
+            f"string or a boolean and turn it into a plausible component, so this is refused "
+            f"rather than coerced."
+        )
+        raise OllamaUnavailableError(msg)
+    return float(value)
 
 
 def _error_text(response: httpx.Response) -> str:

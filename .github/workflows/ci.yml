@@ -298,6 +298,14 @@ jobs:
   ollama:
     name: embedding backend (ollama)
     runs-on: ubuntu-latest
+    # The only job here with a bound of its own, and the only one that needs one: every other
+    # network fetch in this workflow goes through a client that already has timeouts —
+    # `huggingface_hub` for the weights, the bounded `curl` in `docs`, the Docker daemon — while
+    # this one asks a *model registry* for several hundred megabytes through a step written
+    # here. `release.yml` uses the same knob for the same reason. Generous rather than tight:
+    # the pull measured 14s against a warm registry, and the number that matters is the one a
+    # stalled transfer hits, not the one a slow day hits.
+    timeout-minutes: 20
     services:
       ollama:
         # Pinned rather than `latest`, for the reason the Qdrant service is: what is under test
@@ -308,7 +316,16 @@ jobs:
         ports:
           - 11434:11434
     steps:
+      # `persist-credentials: false` because this job runs pull-request-controlled code twice
+      # over — `uv sync` executes build hooks, and `pytest` is the pull request's own tests —
+      # and `actions/checkout` otherwise leaves `GITHUB_TOKEN` in `.git/config` where that code
+      # can read it. Nothing here performs an authenticated Git operation, so there is nothing
+      # to lose by dropping it. The same is true of every other job in this file and they do not
+      # set it; that is a workflow-wide posture question rather than something this change can
+      # honestly claim to have fixed, so it is raised rather than half-applied elsewhere.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -326,11 +343,20 @@ jobs:
           exit 1
       # Pulled here rather than by a test. A test that downloads on first run is a test that
       # fails when a registry does, and the failure would be attributed to the backend.
+      #
+      # Bounded the way the `docs` job bounds its download, and for the reason measured there:
+      # a plain `--retry` does not retry a transfer that drops mid-body, and with no speed floor
+      # a stalled one is not noticed until `--max-time` expires. This reaches a third-party
+      # model registry, so both are live failure modes rather than theoretical ones.
       - name: pull the embedding model
         run: |
-          curl -fsS http://localhost:11434/api/pull \
-            -d '{"model": "nomic-embed-text"}' -o /dev/null
-          curl -fsS http://localhost:11434/api/tags
+          set -euo pipefail
+          curl --fail --silent --show-error \
+               --retry 3 --retry-all-errors \
+               --connect-timeout 20 --max-time 600 --speed-limit 1024 --speed-time 60 \
+               --data '{"model": "nomic-embed-text"}' \
+               --output /dev/null http://localhost:11434/api/pull
+          curl --fail --silent --show-error --max-time 30 http://localhost:11434/api/tags
       - name: pytest (ollama)
         env:
           OLLAMA_TEST_URL: http://localhost:11434
