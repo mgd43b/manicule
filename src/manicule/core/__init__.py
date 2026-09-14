@@ -101,6 +101,7 @@ from manicule.core.organization import (
     Restoration,
     Tag,
     TrashEntry,
+    directory_prefix,
 )
 from manicule.core.protocols import (
     Chunker,
@@ -243,6 +244,7 @@ __all__ = [
     "Watermark",
     "chunk_id",
     "content_hash",
+    "directory_prefix",
     "document_id",
     "is_located",
     "require_within_context",

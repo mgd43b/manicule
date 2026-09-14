@@ -407,31 +407,212 @@ async def test_removing_a_document_a_rule_still_selects_leaves_it_a_member(
     }
 
 
+# --- a directory is a collection --------------------------------------------------------------
+
+
+async def test_a_prefix_rule_holds_a_directory_however_a_document_got_there(
+    store: SqliteDocStore,
+) -> None:
+    """The gap this field exists to close, stated as the corpus sees it.
+
+    ``authoring.collections`` says a collection name is also the directory its documents land
+    in, but only ``document_create`` acted on it, by writing a membership row per document it
+    wrote. A file that arrived any other way — a sync over a tree git pulled, an editor, a
+    write whose ingest failed and that a later sync picked up — joined nothing, and a
+    collection-scoped search just returned less. With a prefix the directory is the membership,
+    so the second document here is a member without anybody adding it.
+    """
+    corpus = await _corpus(store)
+    collection = await store.create_collection(
+        "alpha", rule=CollectionRule(uri_prefixes=frozenset({"/alpha"}))
+    )
+    assert {document.id for document in await store.collection_documents(collection.id)} == {
+        corpus[ALPHA_ONLY].id
+    }
+
+    latecomer = await store.upsert_document(
+        make_document(source="fs", source_id="alpha/runbook.md", uri="file:///alpha/runbook.md")
+    )
+
+    assert {document.id for document in await store.collection_documents(collection.id)} == {
+        corpus[ALPHA_ONLY].id,
+        latecomer.id,
+    }
+    assert [held.id for held in await store.collections_for(latecomer.id)] == [collection.id]
+
+
+async def test_a_prefix_stops_at_the_directory_it_names(store: SqliteDocStore) -> None:
+    """``alpha/`` must not also select ``alpha-archive/``, and only the trailing slash stops it.
+
+    This is the failure a plain string prefix would introduce, and it fails in the widening
+    direction — a collection quietly containing a neighboring directory's documents, with
+    nothing to see. ``directory_prefix`` appends the separator on the way in so the boundary is
+    in the text being compared rather than in somebody's intent.
+    """
+    inside = await store.upsert_document(
+        make_document(source="fs", source_id="alpha/deploy.md", uri="file:///alpha/deploy.md")
+    )
+    neighbor = await store.upsert_document(
+        make_document(
+            source="fs", source_id="alpha-archive/old.md", uri="file:///alpha-archive/old.md"
+        )
+    )
+    collection = await store.create_collection(
+        "alpha", rule=CollectionRule(uri_prefixes=frozenset({"/alpha"}))
+    )
+
+    assert {document.id for document in await store.collection_documents(collection.id)} == {
+        inside.id
+    }
+    assert await store.collections_for(neighbor.id) == []
+
+
+async def test_a_prefix_does_not_fold_case(store: SqliteDocStore) -> None:
+    """Two directories differing only in case are two directories, and a rule must agree.
+
+    Written because the obvious spelling of this predicate is ``LIKE``, and SQLite folds ASCII
+    case in ``LIKE`` by default — so ``file:///Alpha/`` would have selected ``file:///alpha/``
+    on any case-sensitive filesystem. That is the same silent widening as the boundary above,
+    arriving from a different direction, and it is why ``_under`` compares rather than matches.
+    """
+    lower = await store.upsert_document(
+        make_document(source="fs", source_id="alpha/deploy.md", uri="file:///alpha/deploy.md")
+    )
+    upper = await store.upsert_document(
+        make_document(source="fs", source_id="Alpha/deploy.md", uri="file:///Alpha/deploy.md")
+    )
+    collection = await store.create_collection(
+        "Alpha", rule=CollectionRule(uri_prefixes=frozenset({"/Alpha"}))
+    )
+
+    assert {document.id for document in await store.collection_documents(collection.id)} == {
+        upper.id
+    }
+    assert await store.collections_for(lower.id) == []
+
+
+async def test_a_prefix_narrows_the_other_selectors_rather_than_widening_them(
+    store: SqliteDocStore,
+) -> None:
+    """Fields AND, values within a field OR — the convention every other selector follows.
+
+    Worth pinning for this field specifically because it is the first one whose clause is
+    itself a disjunction of compound terms, so a misplaced ``or_`` would make a rule *wider*
+    when a second field was added to it — the one direction a membership bug is invisible in.
+    """
+    markdown = await store.upsert_document(
+        make_document(
+            source="fs",
+            source_id="alpha/deploy.md",
+            uri="file:///alpha/deploy.md",
+            media_type="text/markdown",
+        )
+    )
+    other_type = await store.upsert_document(
+        make_document(
+            source="fs",
+            source_id="alpha/diagram.svg",
+            uri="file:///alpha/diagram.svg",
+            media_type="image/svg+xml",
+        )
+    )
+    other_place = await store.upsert_document(
+        make_document(
+            source="fs",
+            source_id="beta/oncall.md",
+            uri="file:///beta/oncall.md",
+            media_type="text/markdown",
+        )
+    )
+    collection = await store.create_collection(
+        "alpha markdown",
+        rule=CollectionRule(
+            uri_prefixes=frozenset({"/alpha", "/gamma"}),
+            media_types=frozenset({"text/markdown"}),
+        ),
+    )
+
+    assert {document.id for document in await store.collection_documents(collection.id)} == {
+        markdown.id
+    }
+    for excluded in (other_type, other_place):
+        assert await store.collections_for(excluded.id) == []
+
+
+async def test_a_prefix_rule_selects_nothing_from_another_workspace(
+    engine: AsyncEngine, store: SqliteDocStore
+) -> None:
+    """The scope a stored rule deliberately cannot carry, asked of the new selector.
+
+    A path is the one selector whose values plausibly collide across tenants — two workspaces
+    indexing the same tree is ordinary, where two workspaces sharing a tag id is not. The
+    workspace predicate lives on the query rather than in ``rule_clause``, and this is the test
+    that says the arrangement holds for a prefix too.
+    """
+    await store.upsert_document(
+        make_document(source="fs", source_id="alpha/deploy.md", uri="file:///alpha/deploy.md")
+    )
+    collection = await store.create_collection(
+        "alpha", rule=CollectionRule(uri_prefixes=frozenset({"/alpha"}))
+    )
+    # Through its own store, and built with its own workspace id: `upsert_document` writes the
+    # handle's workspace onto the row, so a document built with this one's id would be a local
+    # row wearing a foreign-looking name and the test would pass against broken code.
+    stranger = SqliteDocStore(engine, workspace_id="other-tenant")
+    await stranger.ensure_workspace()
+    outsider = await stranger.upsert_document(
+        make_document(
+            source="fs",
+            source_id="alpha/deploy.md",
+            workspace_id="other-tenant",
+            uri="file:///alpha/deploy.md",
+        )
+    )
+
+    members = {document.id for document in await store.collection_documents(collection.id)}
+
+    assert outsider.id not in members
+    assert await stranger.collections_for(outsider.id) == []
+
+
 # --- what a rule cannot say -------------------------------------------------------------------
 
 
-async def test_a_rule_cannot_name_a_path_or_carry_an_expression(store: SqliteDocStore) -> None:
+async def test_a_rule_names_a_path_without_ever_reaching_one(store: SqliteDocStore) -> None:
     """Path traversal and expression execution are unreachable, not merely filtered.
 
     ``CollectionRule`` is a closed model of set-valued fields, and ``rule_clause`` is the one
-    function that turns it into SQL. There is no free-text field to smuggle a path through and
-    nothing is ever evaluated as code, so neither attack has a surface to land on — which is a
-    stronger statement than "the validator rejects it" and the reason this test asserts on the
-    *shape of the model* rather than on a list of blocked strings.
+    function that turns it into SQL. There is no free-text field to smuggle an expression
+    through and nothing is ever evaluated as code, so that attack has no surface to land on —
+    which is a stronger statement than "the validator rejects it" and the reason this test
+    asserts on the *shape of the model* rather than on a list of blocked strings.
+
+    **``uri_prefixes`` is the field this test asked for an argument about, so here it is.** A
+    prefix genuinely is a path, and it is still not a traversal surface, because nothing
+    anywhere dereferences it: it is normalized lexically, stored as text, and compared against
+    a column as a bound parameter. No ``open``, no ``resolve``, no ``stat`` — ``directory_prefix``
+    is careful to use ``normpath`` rather than ``Path.resolve`` for exactly this reason, and the
+    collapsing that does happen means ``..`` cannot even be expressed. Had one survived, the
+    worst a prefix can do is *select among rows this workspace has already indexed*, because
+    selecting is not reading: a rule decides which stored documents answer a query and never
+    decides what may be opened. That is why this field is matched against ``documents.uri``
+    with ``>=`` and ``<`` rather than being handed to anything that takes a path.
     """
     del store
     fields = set(CollectionRule.model_fields)
     assert fields == {
         "sources",
+        "uri_prefixes",
         "media_types",
         "tag_ids",
         "updated_after",
         "updated_before",
     }, (
         f"CollectionRule grew a field: {sorted(fields)}. Every field here is matched against "
-        f"a column by equality or set membership. A field carrying a path or an expression "
-        f"would need its own argument about traversal and evaluation, and this test is where "
-        f"that argument gets written down."
+        f"a column by equality, set membership or a prefix range. A field carrying an "
+        f"expression, or a path this product would ever *open*, would need its own argument "
+        f"about traversal and evaluation, and this test is where that argument gets written "
+        f"down."
     )
 
     for hostile in ("../../etc/passwd", "'; DROP TABLE documents; --", "__import__('os')"):
@@ -442,6 +623,64 @@ async def test_a_rule_cannot_name_a_path_or_carry_an_expression(store: SqliteDoc
         assert hostile not in rendered, (
             f"{hostile!r} was interpolated into the SQL text rather than bound as a parameter"
         )
+        # The same strings are not even constructible as prefixes: none of them names a
+        # location, so the field refuses them before binding is the question.
+        with pytest.raises(ValueError, match=r"absolute path|not an empty string"):
+            CollectionRule(uri_prefixes=frozenset({hostile}))
+
+    # Absolute, so it gets past the validator — and is still data.
+    smuggled = "/corpus/'; DROP TABLE documents; --"
+    rendered = str(rule_clause(CollectionRule(uri_prefixes=frozenset({smuggled}))))
+    assert "DROP TABLE" not in rendered
+
+
+async def test_a_prefix_cannot_climb_out_of_the_directory_it_names() -> None:
+    """``..`` is collapsed on the way in, so a stored rule never carries a traversal.
+
+    Not a security boundary — see the test above for why a prefix has nothing to traverse —
+    but a correctness one: an uncollapsed ``..`` would be stored as text no URI can ever equal,
+    so the rule would select nothing and say nothing, which is the failure mode this whole
+    field exists to remove.
+    """
+    rule = CollectionRule(uri_prefixes=frozenset({"/corpus/journals/../../etc"}))
+
+    assert rule.uri_prefixes == frozenset({"file:///etc/"})
+
+
+@pytest.mark.parametrize(
+    ("written", "stored"),
+    [
+        ("/corpus/journals", "file:///corpus/journals/"),
+        ("/corpus/journals/", "file:///corpus/journals/"),
+        ("/corpus//journals/.", "file:///corpus/journals/"),
+        ("  /corpus/journals  ", "file:///corpus/journals/"),
+        ("/corpus/my journals", "file:///corpus/my%20journals/"),
+        ("file:///corpus/journals", "file:///corpus/journals/"),
+        ("https://wiki.example/spaces/RUN", "https://wiki.example/spaces/RUN/"),
+    ],
+)
+async def test_a_prefix_is_stored_in_the_form_the_column_holds(written: str, stored: str) -> None:
+    """Normalized on the way in, because every one of these spellings otherwise matches nothing.
+
+    ``documents.uri`` holds ``Path.as_uri()``, so a bare path never meets a row and a
+    hand-written ``file://`` string gets the percent-encoding wrong on the first directory with
+    a space in its name. Normalizing at *evaluation* instead would leave an operator reading
+    back a prefix that is not the one being matched, so it happens where the rule is built.
+    """
+    assert CollectionRule(uri_prefixes=frozenset({written})).uri_prefixes == frozenset({stored})
+
+
+@pytest.mark.parametrize("written", ["", "   ", "corpus/journals", "./journals", "C:/corpus"])
+async def test_a_prefix_that_names_no_location_is_refused(written: str) -> None:
+    """Relative to nothing is not a location, and a rule is re-run where nobody chose the cwd.
+
+    ``C:/corpus`` is in here for a reason that looks like pedantry and is not: ``urlsplit``
+    reads a Windows drive letter as a one-character scheme, so without a length floor it would
+    be stored as a URI prefix no connector can ever write — refused loudly here instead of
+    selecting nothing quietly forever.
+    """
+    with pytest.raises(ValueError, match=r"absolute path|not an empty string"):
+        CollectionRule(uri_prefixes=frozenset({written}))
 
 
 async def test_an_empty_rule_is_refused_rather_than_matching_everything() -> None:

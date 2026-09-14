@@ -71,6 +71,32 @@ def normalize_name(name: str) -> str:
     return collapsed
 
 
+def _under(prefix: str) -> ColumnElement[bool]:
+    """Documents whose URI sits beneath this prefix, as a range rather than a ``LIKE``.
+
+    **A comparison, because ``LIKE`` is not case-sensitive and this has to be.** SQLite folds
+    ASCII case in ``LIKE`` unless told otherwise, so on a case-sensitive filesystem holding both
+    ``Journals/`` and ``journals/`` one prefix would select the other's documents — a silent
+    widening, which is the failure this field exists to remove rather than relocate. ``>=`` and
+    ``<`` use the column's ``BINARY`` collation and mean exactly what they say. Nothing needs
+    escaping either: a prefix containing ``%`` or ``_`` is ordinary text to a comparison and a
+    wildcard to a pattern.
+
+    **And the range is what the index can seek.** ``ix_documents_workspace_id_uri`` already
+    exists, and SQLite's ``LIKE`` optimization does not apply to it — that needs the index
+    collation to agree with ``case_sensitive_like``, which is off — so a pattern would scan
+    every document in the workspace where this seeks.
+
+    The upper bound is the prefix with its last character incremented. Every prefix ends in
+    ``/`` (:func:`~manicule.core.organization.directory_prefix` is what guarantees it, on the
+    way in), so that character is always ``0x2F`` and its successor always ``0x30``: the
+    increment is total here rather than merely usually defined, and UTF-8 preserves code point
+    order, so the bound means the same thing to SQLite's byte comparison as it does here.
+    """
+    ceiling = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+    return and_(models.Document.uri >= prefix, models.Document.uri < ceiling)
+
+
 def rule_clause(rule: CollectionRule) -> ColumnElement[bool]:
     """The SQL predicate a rule stands for, over ``documents``.
 
@@ -84,6 +110,11 @@ def rule_clause(rule: CollectionRule) -> ColumnElement[bool]:
     clauses: list[ColumnElement[bool]] = []
     if rule.sources:
         clauses.append(models.Document.source.in_(sorted(rule.sources)))
+    if rule.uri_prefixes:
+        # Disjunction within the field, like every other set-valued selector. `or_` is safe to
+        # splat here where `and_` above is not: it is only reached when the set is non-empty,
+        # and an empty `or_` renders false rather than true.
+        clauses.append(or_(*(_under(prefix) for prefix in sorted(rule.uri_prefixes))))
     if rule.media_types:
         clauses.append(models.Document.media_type.in_(sorted(rule.media_types)))
     if rule.updated_after is not None:
