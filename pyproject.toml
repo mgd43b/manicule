@@ -128,6 +128,25 @@ generation = [     # #7
   # installing only the generation extra gets a working estimator.
   "tiktoken>=0.8",
 ]
+ollama = [
+  # The embedding backend whose model is a *service*. It ships as its own distribution —
+  # `manicule-ollama`, in packages/ — and this extra is the edge that puts it in an install,
+  # exactly as `qdrant` is the edge that puts the network-backed vector store in one.
+  #
+  # **The asymmetry with `manicule-mlx` is the interesting part, and it inverts.** MLX is
+  # excluded from the container because there is no Linux image in which it is a valid answer:
+  # `mlx-embeddings` is marked for Apple silicon and resolves to nothing there, so shipping it
+  # would put a backend in the image that refuses at setup. An HTTP client is valid *precisely*
+  # in a container — a pod that cannot embed well next to a GPU node that can is the deployment
+  # this backend was written for, and the image is the one place an operator cannot install it
+  # afterwards. So the backend that is wrong for the image is the in-process one.
+  #
+  # MIT, so unlike the MLX split this is a packaging boundary rather than a licensing one:
+  # `tests/test_license_boundary.py` has nothing to say about it, and the reason it is not
+  # simply an extra's worth of dependencies is that a served model brings an HTTP client and a
+  # deployment topology an in-process installation should not have to resolve.
+  "manicule-ollama",
+]
 connectors = [     # #9
   # One HTTP client, async, with a pluggable transport. The transport seam is why this is the
   # choice: the connector suites run against a synthetic Confluence built on
@@ -217,7 +236,7 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #1
 # the documented install does not have, which is the kind of drift nobody notices until an
 # operator reports a command missing from one of them.
 all = [
-  "manicule[storage,qdrant,embeddings,ingest,parsers,retrieval,generation,connectors,serve]",
+  "manicule[storage,qdrant,embeddings,ingest,parsers,retrieval,generation,connectors,serve,ollama]",
 ]
 
 # The built-in parsers and the chunker register the same way a third-party plugin does, through

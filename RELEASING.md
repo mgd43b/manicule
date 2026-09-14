@@ -8,20 +8,28 @@ OIDC, no API token, nothing to leak from this repository's secrets.
 Nothing is triggered by pushing a tag. A tag is how a release is *recorded*; making it the
 trigger would let a hand-pushed tag publish a version no release PR ever reviewed.
 
-## Two distributions, one version
+## Three distributions, one version
 
 | | License | What it is |
 |:---|:---|:---|
 | [`manicule`](https://pypi.org/project/manicule/) | MIT | The program |
 | [`manicule-mlx`](https://pypi.org/project/manicule-mlx/) | GPL-3.0-or-later | The Metal backend for Apple silicon |
+| [`manicule-ollama`](https://pypi.org/project/manicule-ollama/) | MIT | The embedding backend that runs its model on an Ollama server |
 
-They are separate distributions because they are separately licensed — `manicule-mlx` links
-`mlx-embeddings`, which is GPL-3.0 — and that is the whole reason the second package exists
-rather than being an extra. See [README §License](README.md#license).
+They are separate distributions for two different reasons, and the difference matters when a
+fourth is proposed. `manicule-mlx` is separate because it is separately licensed — it links
+`mlx-embeddings`, which is GPL-3.0 — so it could not be an extra of an MIT project.
+`manicule-ollama` is MIT and *could* have been an extra's worth of dependencies; it is separate
+because its model is a remote service, and the HTTP client and deployment topology that come
+with that should not be imposed on an installation embedding in process. See
+[README §License](README.md#license).
 
-They are versioned **in lockstep**: one release PR bumps both, and release-please rewrites
-`packages/manicule-mlx/pyproject.toml` through the `extra-files` entry in
-[`release-please-config.json`](release-please-config.json). `manicule_mlx`'s plugin manifest pins
+**Only `manicule-ollama` is reachable from `manicule[all]`**, through the `ollama` extra, which
+is why it publishes before `manicule` does — see below. `manicule-mlx` is installed by name.
+
+They are versioned **in lockstep**: one release PR bumps all three, and release-please rewrites
+both `packages/manicule-mlx/pyproject.toml` and `packages/manicule-ollama/pyproject.toml` through
+the `extra-files` entries in [`release-please-config.json`](release-please-config.json). `manicule_mlx`'s plugin manifest pins
 a `core_version` range against manicule, so one number answering "which mlx goes with which
 manicule" is worth more than an independent cadence for a package that has no independent
 purpose.
@@ -51,8 +59,9 @@ optional and the order is the order they block in.
    not permitted to create or approve pull requests`. No `permissions:` block in a workflow can
    override this; it is a repository setting.
 
-2. **GitHub → Settings → Environments:** create two, named exactly **`pypi`** and
-   **`pypi-mlx`**. Optionally add required reviewers, which makes each publish pause for a human.
+2. **GitHub → Settings → Environments:** create three, named exactly **`pypi`**, **`pypi-mlx`**
+   and **`pypi-ollama`**. Optionally add required reviewers, which makes each publish pause for
+   a human.
 
 3. **PyPI:** register a *pending* publisher for **`manicule`** at
    <https://pypi.org/manage/account/publishing/> → GitHub:
@@ -65,7 +74,8 @@ optional and the order is the order they block in.
    | Workflow name | `release.yml` |
    | Environment name | `pypi` |
 
-4. **PyPI, again:** the same form for **`manicule-mlx`**, with environment name **`pypi-mlx`**.
+4. **PyPI, again:** the same form for **`manicule-mlx`**, with environment name **`pypi-mlx`**,
+   and once more for **`manicule-ollama`**, with environment name **`pypi-ollama`**.
 
    **The environment must differ, and that is the whole reason the two packages publish from
    separate jobs.** A *pending* publisher's claim set has to be unique — the OIDC `sub` reads
@@ -121,13 +131,25 @@ reviewed commit.
 
 Worth knowing, because these are the failures that stop a release halfway rather than after it:
 
-- `uv build --package manicule` and `--package manicule-mlx` — explicitly, one at a time.
-  `packages/` also holds two plugin distributions that are test fixtures, one of which is
-  deliberately hostile, and naming the packages is what keeps them off PyPI.
-- The four artifacts are exactly the expected wheel and sdist for the tag, per distribution.
-- Both wheels install into a clean environment with `[all]` and `manicule --version` runs.
+- `uv build --package manicule`, `--package manicule-mlx` and `--package manicule-ollama` —
+  explicitly, one at a time. `packages/` also holds three plugin distributions that are test
+  fixtures, one of which is deliberately hostile, and naming the packages is what keeps them off
+  PyPI.
+- The six artifacts are exactly the expected wheel and sdist for the tag, per distribution. A
+  `workflow_dispatch` naming a tag from before a distribution was versioned in lockstep fails
+  here, with both version numbers printed — correctly, because that release never referenced it.
+- The wheels install into a clean environment with `[all]` and `manicule --version` runs. The
+  `manicule-ollama` artifact is resolved from the build directory rather than from PyPI, so what
+  is checked is this tag's backend against this tag's core rather than whatever the last release
+  left behind.
 
-The build happens **once**, in its own job, and the two publish jobs upload what it produced
+**`manicule-ollama` publishes before `manicule`, and that ordering is load-bearing.**
+`manicule[all]` requires it, so a core that reached PyPI while the backend was still uploading
+would advertise a documented install that cannot resolve — and an upload cannot be retracted, so
+the release going red afterwards would not undo it. `manicule-mlx` stays parallel because nothing
+requires it.
+
+The build happens **once**, in its own job, and the three publish jobs upload what it produced
 rather than each rebuilding. What reaches PyPI under both names is then demonstrably the same set
 of files rather than two builds that ought to agree. `attach` runs last, so the assets on a
 GitHub Release describe a release that actually reached PyPI.
@@ -136,7 +158,9 @@ The same checks run on every pull request as the `dist` job in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml), plus two the release job does not repeat:
 that a bare install — no extras — prints an install hint and exits 1 instead of raising, and that
 `manicule-mlx` actually claims the `mlx` slot in the entry-point group. A backend that installs
-without registering is invisible at run time and raises nothing.
+without registering is invisible at run time and raises nothing — and the same is asserted of
+`manicule[all]` for `ollama`, and of the container image for every plugin it is built with,
+because the image is the one artifact an operator cannot add a backend to afterwards.
 
 ## What is not published
 

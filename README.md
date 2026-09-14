@@ -751,6 +751,7 @@ What that means:
 |:---|:---|:---|
 | `uv pip install manicule` | An MIT program, with `onnx` as the embedding backend. Runs everywhere | MIT |
 | `uv pip install manicule manicule-mlx` | Faster on Apple silicon | GPL-3.0 on your machine |
+| `uv pip install manicule manicule-ollama` | Embedding on an Ollama server, for a host that is the wrong place to embed in process. In `manicule[all]` and in the container image | MIT |
 
 Running it obliges you to nothing; the GPL's obligations attach to *distribution*. A plugin that
 imports `manicule_mlx` is very likely a derivative work of it. A plugin that does not, is not.

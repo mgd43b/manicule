@@ -1456,6 +1456,7 @@ all = [
     { name = "jinja2" },
     { name = "lancedb" },
     { name = "litellm" },
+    { name = "manicule-ollama" },
     { name = "markdown-it-py" },
     { name = "nbformat" },
     { name = "numpy" },
@@ -1499,6 +1500,9 @@ generation = [
 ingest = [
     { name = "psutil" },
     { name = "watchfiles" },
+]
+ollama = [
+    { name = "manicule-ollama" },
 ]
 parsers = [
     { name = "markdown-it-py" },
@@ -1571,7 +1575,8 @@ requires-dist = [
     { name = "jinja2", marker = "extra == 'serve'", specifier = ">=3.1" },
     { name = "lancedb", marker = "extra == 'storage'", specifier = ">=0.17" },
     { name = "litellm", marker = "extra == 'generation'", specifier = ">=1.83" },
-    { name = "manicule", extras = ["storage", "qdrant", "embeddings", "ingest", "parsers", "retrieval", "generation", "connectors", "serve"], marker = "extra == 'all'", editable = "." },
+    { name = "manicule", extras = ["storage", "qdrant", "embeddings", "ingest", "parsers", "retrieval", "generation", "connectors", "serve", "ollama"], marker = "extra == 'all'", editable = "." },
+    { name = "manicule-ollama", marker = "extra == 'ollama'", editable = "packages/manicule-ollama" },
     { name = "markdown-it-py", marker = "extra == 'parsers'", specifier = ">=3.0" },
     { name = "nbformat", marker = "extra == 'parsers'", specifier = ">=5.10" },
     { name = "numpy", marker = "extra == 'embeddings'", specifier = ">=2.0" },
@@ -1605,7 +1610,7 @@ requires-dist = [
     { name = "watchfiles", marker = "extra == 'ingest'", specifier = ">=0.24" },
     { name = "websockets", marker = "extra == 'serve'", specifier = ">=13.0" },
 ]
-provides-extras = ["storage", "qdrant", "embeddings", "ingest", "parsers", "retrieval", "rerank", "generation", "connectors", "browser-auth", "serve", "all"]
+provides-extras = ["storage", "qdrant", "embeddings", "ingest", "parsers", "retrieval", "rerank", "generation", "ollama", "connectors", "browser-auth", "serve", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1656,7 +1661,7 @@ requires-dist = [
 
 [[package]]
 name = "manicule-ollama"
-version = "0.1.0"
+version = "0.1.19"
 source = { editable = "packages/manicule-ollama" }
 dependencies = [
     { name = "httpx" },

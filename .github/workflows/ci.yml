@@ -652,6 +652,32 @@ jobs:
             steps.grammars.outputs.pack }}-${{ steps.grammars.outputs.languages }}
       - name: docker build (the offline smoke test runs inside it)
         run: docker build --progress=plain --tag manicule:ci .
+      # **The check that would have caught 0.1.19, and the reason it is here rather than in the
+      # suite.** `manicule-ollama` was in the tag, in the workspace and in `uv.lock`, and every
+      # test passed — because the dev group puts it on the test runner, so `pytest` and
+      # `pyright` both saw a backend the *image* did not have. The container is the only
+      # environment in which it was missing and nothing looked there, so a packaging change that
+      # shipped nothing reported green all the way to a published release.
+      #
+      # Asserted against the built image rather than against the Dockerfile's arguments,
+      # deliberately: reading `EXTRAS` back would check that the line says what it says. What is
+      # wanted is the entry-point set the running program actually discovers, which is the thing
+      # an operator's `[embedding] provider = "ollama"` resolves through.
+      #
+      # A superset check, not equality: a plugin added to the image later should not have to
+      # edit this list, while one that silently *stops* shipping fails here by name.
+      - name: the shipped image registers the plugins it is built with
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /opt/manicule/venv/bin/python manicule:ci -c "
+          from importlib.metadata import entry_points
+          expected = {'connectors', 'embedding', 'generation', 'ollama', 'parsing', 'retrieval', 'storage'}
+          found = {e.name for e in entry_points(group='manicule.plugins')}
+          print('registered:', sorted(found))
+          missing = sorted(expected - found)
+          assert not missing, f'the image does not register {missing}; it registers {sorted(found)}'
+          "
+
       - name: the shipped image does not run as root
         run: |
           uid=$(docker run --rm --entrypoint id manicule:ci -u)
@@ -816,6 +842,13 @@ jobs:
       - name: build the Metal backend distribution
         run: uv build --package manicule-mlx --out-dir dist-mlx
 
+      # The served backend, built here for the same reason and needed for one more: it is in
+      # `manicule[all]`, so the documented install below cannot resolve without it. Building it
+      # and resolving from the local directory is what keeps that install a check of *this*
+      # tree rather than of whatever the last release put on PyPI.
+      - name: build the served backend distribution
+        run: uv build --package manicule-ollama --out-dir dist-ollama
+
       # The templates, the static assets and the migrations are not Python, and hatchling
       # includes them because they sit under `src/manicule/`, not because anything says so. A
       # build backend or a layout change that stopped including them would leave a wheel that
@@ -906,9 +939,20 @@ jobs:
         run: |
           set -euo pipefail
           uv venv --python 3.14 /tmp/all
-          uv pip install --python /tmp/all/bin/python "$(echo dist/*.whl)[all]"
+          uv pip install --python /tmp/all/bin/python \
+            --find-links dist-ollama "$(echo dist/*.whl)[all]"
           /tmp/all/bin/manicule --version
           /tmp/all/bin/manicule --help > /dev/null
+          # `all` carries the served backend, so the install is only documented if it arrives.
+          # Checked through the entry-point group rather than the import, because registration
+          # is what `[embedding] provider = "ollama"` resolves through and a distribution can
+          # install perfectly while registering nothing.
+          /tmp/all/bin/python - <<'PY'
+          from importlib.metadata import entry_points
+          names = sorted(e.name for e in entry_points(group="manicule.plugins"))
+          print(names)
+          assert "ollama" in names, f"manicule[all] did not register the ollama plugin: {names}"
+          PY
 
       # And the Apple silicon install, which is the pair rather than either one. What is checked
       # on Linux is that the two resolve together and that `manicule-mlx` claims the `mlx` slot
@@ -919,6 +963,7 @@ jobs:
           set -euo pipefail
           uv venv --python 3.14 /tmp/pair
           uv pip install --python /tmp/pair/bin/python \
+            --find-links dist-ollama \
             "$(echo dist/*.whl)[all]" "$(echo dist-mlx/*.whl)"
           /tmp/pair/bin/manicule --version
           /tmp/pair/bin/python - <<'PY'

@@ -83,13 +83,19 @@ not.
 
 ## Installation
 
-Not on PyPI yet. Install from the repository:
+It comes with `manicule[all]`, and with the container image, because the image is the one place
+an operator cannot add a backend afterwards:
 
 ```bash
-uv pip install "manicule[all]" ./packages/manicule-ollama
+uv tool install "manicule[all]"     # or just the backend: manicule[ollama]
 ```
 
 MIT, like manicule itself. Unlike `manicule-mlx` — whose separate distribution is a licensing
 consequence — this one is separate because its model is a remote service, and the HTTP client
 and deployment topology that come with that should not be imposed on an installation embedding
 in process.
+
+The same asymmetry decides what the container carries. `manicule-mlx` is excluded from it
+because there is no Linux image in which Metal is a valid answer; this one is included because
+an HTTP client is valid *precisely* in a container — a pod that cannot embed well beside a GPU
+node that can is the deployment it was written for.
