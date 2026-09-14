@@ -1020,6 +1020,10 @@ async def _assert_rule_membership(store: CollectionStore, subject: Document | No
     await _assert_prefix_membership(store, subject)
 
 
+_SEPARABLE_SEGMENT = 2
+"""Characters a final path segment needs before a prefix can be cut to stop inside it."""
+
+
 async def _assert_prefix_membership(store: CollectionStore, subject: Document) -> None:
     """Check that a prefix rule selects by location, and stops at the directory it names.
 
@@ -1051,9 +1055,16 @@ async def _assert_prefix_membership(store: CollectionStore, subject: Document) -
 
     # The subject's own uri with its last character dropped. That is a *string* prefix of the
     # uri and not a *directory* prefix of it — it stops mid-segment — so a store comparing text
-    # without a boundary reports the subject here and is wrong in the widening direction. Built
-    # this way rather than from a sibling directory because it holds whatever shape the
-    # subject's uri has, including one with no directory part to shave.
+    # without a boundary reports the subject here and is wrong in the widening direction.
+    #
+    # It only stops mid-segment when there are at least two characters after the final
+    # separator, and both shorter cases would make this probe name a real ancestor and fail a
+    # *correct* store: a uri ending in ``/`` truncates back to the same directory, and a
+    # one-character final segment truncates to the parent. There is no prefix that distinguishes
+    # the two implementations for such a subject, so the probe is skipped rather than inverted.
+    _, _, final = subject.uri.rpartition("/")
+    if len(final) < _SEPARABLE_SEGMENT:
+        return
     truncated = subject.uri[:-1]
     widened = await store.create_collection(
         "conformance-prefix-boundary", rule=CollectionRule(uri_prefixes=frozenset({truncated}))

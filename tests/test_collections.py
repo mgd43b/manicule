@@ -850,3 +850,31 @@ async def test_the_too_large_refusal_tells_the_caller_what_to_do(
         "the refusal points at an internal regime that is not implemented for collection "
         "filters, so it names a remedy the caller cannot reach"
     )
+
+
+async def test_the_conformance_boundary_probe_holds_for_any_uri_shape(
+    store: SqliteDocStore,
+) -> None:
+    """The shipped contract must not fail a store that is right.
+
+    ``_assert_prefix_membership`` probes the directory boundary by shaving one character off the
+    subject's uri, which stops mid-segment and therefore separates a correct store from one
+    comparing raw text. It only stops mid-segment when the final segment has two characters to
+    spare: a uri ending in ``/`` shaves back to the same directory, and a one-character final
+    segment shaves to the parent — and in both cases the probe names a genuine ancestor, so a
+    *correct* store reports the subject and the contract fails an implementation that is right.
+
+    Both shapes are ordinary — a crawled ``…/docs/`` and a file called ``b`` — so this runs the
+    real suite against each rather than reasoning about it.
+    """
+    # The private helper deliberately, not `assert_collection_store_contract`: the shape of the
+    # subject's uri is the whole variable here, and the public entry point chooses its own.
+    from manicule.testing.contracts import (  # noqa: PLC0415
+        _assert_prefix_membership,  # pyright: ignore[reportPrivateUsage] - the unit under test
+    )
+
+    for source_id, uri in (("docs", "https://example.com/docs/"), ("a/b", "file:///a/b")):
+        subject = await store.upsert_document(
+            make_document(source="fs", source_id=source_id, uri=uri)
+        )
+        await _assert_prefix_membership(store, subject)

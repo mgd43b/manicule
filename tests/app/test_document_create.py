@@ -805,6 +805,29 @@ async def test_doctor_reports_a_configured_collection_the_workspace_does_not_hav
     )
 
 
+async def test_a_collection_name_that_is_not_a_path_segment_is_diagnosed_not_raised(
+    root: Path,
+) -> None:
+    """A blank name took the whole diagnosis down, because a check reached `normalize_name`.
+
+    `authoring.collections` has no model-level validation — the single-path-segment rule is
+    enforced by `document_create` at call time — so a diagnostic reading it meets whatever is in
+    the file. `find_collection` normalizes, and normalizing a blank name raises, so `doctor`
+    propagated a `ValueError` and reported none of its other checks. The name is now held to
+    `document_create`'s own rule first, and a name that breaks it is the finding rather than the
+    end of the diagnosis.
+    """
+    settings = settings_for(root).model_copy(
+        update={"authoring": AuthoringSettings(source=SOURCE, collections=("  ", "a/b"))}
+    )
+
+    check = _authoring_check(await (await service_for(settings, existing=())).doctor())
+
+    assert check.state == "failing"
+    assert check.facts["malformed"] == ["  ", "a/b"]
+    assert "single path segment" in check.detail
+
+
 async def test_an_unusable_authoring_source_is_reported_rather_than_raised(root: Path) -> None:
     """A diagnostic that cannot run is a diagnosis, never an exception out of ``doctor``.
 

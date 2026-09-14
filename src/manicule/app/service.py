@@ -3202,7 +3202,7 @@ class ApplicationService:
                 state="ok",
                 detail="authoring is off; `authoring.source` and `authoring.collections` are "
                 "not both set",
-                facts={"collections": []},
+                facts={"collections": [], "malformed": [], "missing": [], "uncovered": []},
             )
         try:
             connector = await self._filesystem_source(authoring.source, require_profiles=False)
@@ -3212,17 +3212,33 @@ class ApplicationService:
                 state="failing",
                 detail=f"`authoring.source` names {authoring.source!r}, which cannot be used "
                 f"as a filesystem source: {exc}",
-                facts={"source": authoring.source, "collections": []},
+                facts={
+                    "source": authoring.source,
+                    "collections": list(authoring.collections),
+                    "malformed": [],
+                    "missing": [],
+                    "uncovered": [],
+                },
                 remedy="manicule config show",
             )
         store = await self._backend.organization()
         # `find_collection` rather than a dict over `list_collections`, so the name resolves
         # through the same normalization `document_create` resolves through. A check that
         # matched names its own way could report a collection missing that authoring finds.
+        malformed: list[str] = []
         missing: list[str] = []
         uncovered: list[str] = []
         identifiers: dict[str, str] = {}
         for name in authoring.collections:
+            # Held to `document_create`'s own rule, and *before* anything is looked up. A name
+            # that is blank or carries a separator is one this operation would refuse anyway,
+            # and it would otherwise reach `normalize_name` — which raises on a blank, out of a
+            # diagnostic, taking every other check in the diagnosis with it.
+            try:
+                _require_segment(name, "collection name")
+            except ValueError:
+                malformed.append(name)
+                continue
             found = await store.find_collection(name)
             if found is None:
                 missing.append(name)
@@ -3236,9 +3252,21 @@ class ApplicationService:
             "source": authoring.source,
             "root": str(connector.root),
             "collections": list(authoring.collections),
+            "malformed": list(malformed),
             "missing": list(missing),
             "uncovered": list(uncovered),
         }
+        if malformed:
+            named = ", ".join(repr(name) for name in malformed)
+            return r.Check(
+                name="authoring",
+                state="failing",
+                detail=f"`authoring.collections` names {named}, which is not a single path "
+                f"segment. A name there is a directory beneath the root as well as a scope, so "
+                f"authoring into it refuses rather than writing.",
+                facts=facts,
+                remedy="manicule config show",
+            )
         if missing:
             named = ", ".join(repr(name) for name in missing)
             return r.Check(
