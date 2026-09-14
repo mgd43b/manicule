@@ -279,6 +279,90 @@ jobs:
           REQUIRE_QDRANT: "1"
         run: uv run pytest tests/test_storage_qdrant.py -q -rs
 
+  # The embedding backend whose model is a *service*, and the only suite here that cannot be
+  # checked without one. `manicule-ollama` makes six claims about a server it does not control
+  # — the vocabulary it counts with, the context actually served, that `truncate: false` is
+  # honored, the vector width, normalization, finiteness — and a synthetic transport can show
+  # the refusals but not that a real Ollama behaves the way those refusals assume. The
+  # measurement that matters most is the vocabulary: the backend names a Hugging Face tokenizer
+  # for a model served out of a GGUF, and only a real server's `prompt_eval_count` can say
+  # whether the two agree.
+  #
+  # `REQUIRE_OLLAMA_MODELS` names a model rather than setting a flag, for the reason
+  # `REQUIRE_EMBEDDING_MODELS` does: the two models this backend was written against are not
+  # equally cheap. `nomic-embed-text` is 274 MB with a 2048-token context, which this runner
+  # embeds in seconds. `qwen3-embedding:0.6b` is 639 MB with a 32768-token context whose
+  # full-length probe took 40 seconds on a laptop with the model already resident, and on a
+  # CPU-only runner it would dominate the job. So the small one is seeded and enforced, and
+  # the large one is exercised opportunistically wherever it is already served.
+  ollama:
+    name: embedding backend (ollama)
+    runs-on: ubuntu-latest
+    # The only job here with a bound of its own, and the only one that needs one: every other
+    # network fetch in this workflow goes through a client that already has timeouts —
+    # `huggingface_hub` for the weights, the bounded `curl` in `docs`, the Docker daemon — while
+    # this one asks a *model registry* for several hundred megabytes through a step written
+    # here. `release.yml` uses the same knob for the same reason. Generous rather than tight:
+    # the pull measured 14s against a warm registry, and the number that matters is the one a
+    # stalled transfer hits, not the one a slow day hits.
+    timeout-minutes: 20
+    services:
+      ollama:
+        # Pinned rather than `latest`, for the reason the Qdrant service is: what is under test
+        # is an interaction with a server's wire behavior — including the `truncate` flag and
+        # the `num_ctx` option — and "it passed against whatever was published that morning" is
+        # not a result anybody can reproduce.
+        image: ollama/ollama:0.34.0
+        ports:
+          - 11434:11434
+    steps:
+      # `persist-credentials: false` because this job runs pull-request-controlled code twice
+      # over — `uv sync` executes build hooks, and `pytest` is the pull request's own tests —
+      # and `actions/checkout` otherwise leaves `GITHUB_TOKEN` in `.git/config` where that code
+      # can read it. Nothing here performs an authenticated Git operation, so there is nothing
+      # to lose by dropping it. The same is true of every other job in this file and they do not
+      # set it; that is a workflow-wide posture question rather than something this change can
+      # honestly claim to have fixed, so it is raised rather than half-applied elsewhere.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --all-extras
+      # The service container being up is the container, not the server inside it. Polling the
+      # endpoint the tests will use turns a slow start into a wait rather than into a
+      # connection error attributed to whichever test ran first.
+      - name: wait for ollama
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:11434/api/tags >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "ollama did not answer /api/tags within 60s" >&2
+          exit 1
+      # Pulled here rather than by a test. A test that downloads on first run is a test that
+      # fails when a registry does, and the failure would be attributed to the backend.
+      #
+      # Bounded the way the `docs` job bounds its download, and for the reason measured there:
+      # a plain `--retry` does not retry a transfer that drops mid-body, and with no speed floor
+      # a stalled one is not noticed until `--max-time` expires. This reaches a third-party
+      # model registry, so both are live failure modes rather than theoretical ones.
+      - name: pull the embedding model
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+               --retry 3 --retry-all-errors \
+               --connect-timeout 20 --max-time 600 --speed-limit 1024 --speed-time 60 \
+               --data '{"model": "nomic-embed-text"}' \
+               --output /dev/null http://localhost:11434/api/pull
+          curl --fail --silent --show-error --max-time 30 http://localhost:11434/api/tags
+      - name: pytest (ollama)
+        env:
+          OLLAMA_TEST_URL: http://localhost:11434
+          REQUIRE_OLLAMA_MODELS: nomic-embed-text
+        run: uv run pytest packages/manicule-ollama/tests -q -rs
+
   # A model edited without a migration and a downgrade that has never run both look exactly
   # like a healthy repository. Its own job so a drifted schema is distinguishable from a
   # failing test at a glance. Closes #18.

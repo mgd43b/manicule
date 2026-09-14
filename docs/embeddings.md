@@ -267,7 +267,7 @@ the platform argument is what remains, and it favors MLX on Apple Silicon.
 
 **The maturity objection is not withdrawn, it is converted into a test.** `mlx-embeddings` is
 version **0.1.0** and gives the same attribute different meanings on different architectures
-(§3.2). That is exactly the profile that produces silent wrongness — so §3.4 makes the second
+(§3.2). That is exactly the profile that produces silent wrongness — so §3.3 makes the second
 backend the mechanism that catches it, rather than a fallback nobody runs.
 
 ### 3.2 What the backend does per architecture, measured
@@ -344,6 +344,58 @@ nothing, and the fast path on Apple hardware already exists — it is called MLX
 
 That is the Apple-hardware principle in operative form. Throughput may differ by machine.
 Vectors may not.
+
+### 3.4 The third runtime is not in-process, and pays for it in measurement
+
+Both backends above satisfy "no server to operate", and that property is worth a great deal —
+it is why the choice between them is about throughput rather than about topology. It is also
+not the right answer on every machine. MLX needs Apple silicon, and onnxruntime's fast CPU
+kernels are built around AVX2, so a host without either is left embedding on the slow path
+whatever it installs. `manicule-ollama` is the answer for that deployment: the forward pass
+moves to an Ollama server, usually a GPU node already running one for generation.
+
+It is a **tier B** backend — the server pools, so the reduction actually applied cannot be
+verified by inspection — and `Embedder` calls tier B "the floor rather than the norm". What
+follows is the price of admission, and it is deliberately larger than either in-process
+backend pays.
+
+| | in-process (`onnx`, `mlx`) | served (`ollama`) |
+|---|---|---|
+| Pooling | manicule's, from asserted 3-D token states | the server's, recorded and unverifiable |
+| Dimension | read from the model's declaration | **measured from a returned vector**, cross-checked against the GGUF |
+| Sequence limit | read from the repository | **the limit asked for**, then checked against the server |
+| Tokenizer | the model's own, in the repository | configuration, **checked against `prompt_eval_count`** |
+| Over-long input | refused by our tokenizer | refused by our tokenizer *and* by `truncate: false` |
+| `weights_identity` | the artifact, per §5 | `artifact:ollama:<model>@sha256:<digest>:prefix=none` |
+
+**The declared context is not the served one, and the gap is silent.** Measured against a
+server holding `qwen3-embedding:0.6b`, whose GGUF declares a 32768-token context: an
+`/api/embed` carrying no options was served at **4096**, and a longer input came back as a
+well-formed, correctly normalized vector built from its first 4095 tokens. So the backend sends
+`num_ctx` on every request and derives `max_sequence_length` from the number it sent. The
+reserve it holds back is one token, because the two models measured disagree about the last
+one — `qwen3-embedding:0.6b` accepted 32767 at `num_ctx=32768` and refused 32768, while
+`nomic-embed-text` accepted exactly 2048 at 2048 — and understating by one refuses a chunk that
+would have fitted, where overstating by one indexes a chunk as its opening.
+
+**`truncate: false` is what converts the silent failure into a loud one**, and it is the single
+assumption the backend rests on, so setup proves it rather than trusting it: a probe past the
+served context must come back a 400. A server that answers it instead is refused at startup,
+because on that server every over-long chunk becomes a plausible vector and nothing raises.
+
+**The tokenizer is configuration, and configuration is not a measurement until it is checked.**
+Ollama serves GGUF and exposes no tokenizer, while manicule counts tokens to place chunk
+boundaries and to refuse text the model would truncate — and `manicule.ingest.workers` hands
+isolated parse workers a real `tokenizer.json` or they chunk provisionally and ingest refuses
+the result. So `tokenizer` is required, has no default, and is verified at setup against the
+server's own `prompt_eval_count`, one probe per request. Exact agreement on both models across
+English, Spanish, source code and CJK-with-emoji; one token of disagreement is a refusal.
+
+**No parity claim is made, and none is asserted.** §3.3 earns something for MLX; there is no
+equivalent here and no attempt to imply one. `weights_identity` carries the backend's name, so
+a fingerprint this backend produces cannot equal one from any other runtime even by accident —
+which is what "portability is an allowlisted measurement, not an inference from a model name"
+means when applied to a runtime nobody has measured against the reference.
 
 ### 3.5 MLX keeps every buffer it has finished with, and `ps` cannot see them
 
@@ -712,6 +764,14 @@ passes and nobody should meet it by accident.
   process grows by tens of gigabytes — measured, 1.59 → 1.30 GiB of RSS across a 2.45 → 25.0
   GiB rise in physical footprint. The default cache limit is very nearly the whole machine.
   §3.5.
+- **A served model's declared context is not the one it is served at.** Ollama applies its own
+  `num_ctx` default, measured at 4096 against a GGUF declaring 32768, and truncates the rest
+  with no error. Every request from `manicule-ollama` carries the `num_ctx` its limit was
+  derived from, and `truncate: false` besides. §3.4.
+- **Two GGUFs disagree about the last token of their context.** `qwen3-embedding:0.6b` refuses
+  a request of exactly `num_ctx` tokens and `nomic-embed-text` accepts one; nothing in either
+  declaration says which. Derived limits reserve a token, which is the direction that costs a
+  chunk rather than a corpus. §3.4.
 - **The Hugging Face cache follows `XDG_CACHE_HOME`.** The suite redirects that per test, so a
   model sitting on disk becomes invisible and every model suite skips — green, having checked
   nothing. `tests/conftest.py` pins `HF_HUB_CACHE` for the session, the same hazard the
@@ -758,6 +818,48 @@ a documented property of a self-hosted tool rather than a defect.
 | Ticket | What | Why not here |
 |---|---|---|
 | [#6](https://github.com/mgd43b/manicule/issues/6) | **BGE-M3 learned-sparse leg** as an alternative to FTS5 BM25 (§1.4) | A retrieval feature, and retrieval features earn their place with a measured improvement on #15. Labeled `needs-evidence`. Neither backend exposes the head today, so it is a runtime change as well as a retrieval one |
+| — | **Asymmetric query/document prefixes.** `nomic-embed-text` is trained with `search_query:`/`search_document:` and Qwen3-Embedding with a query-side instruction; applying one, or failing to, changes the vector for the same text and degrades retrieval with nothing raised | Two halves, and both belong in core. See §9.1 |
+
+### 9.1 Where a prefix scheme has to live, and the two places it must not
+
+**It cannot live in a backend.** `Embedder.embed` is the only entry point, and
+`ingest/embedding.py` and `retrieval/dense.py` call it identically — so a backend cannot tell
+which side it is serving, and a rule invented inside one is a retrieval decision hidden in a
+plugin.
+
+**It has to be an identity field, and a core-owned one.** `EmbedFingerprint` has no field for
+the scheme, although §4.3 already nets a "document-side instruction prefix" out of the budget
+and §8 already names a prefix among the things that change the vector for the same text. The
+tempting shortcut is the one `manicule-ollama` takes for itself: a term inside
+`weights_identity`, which that backend writes as `…:prefix=none`. **That does not generalize,
+and reading it as though it did is the trap.** `weights_identity` is supplied by whichever
+backend built the fingerprint, so a scheme adopted in core would change what `onnx` and `mlx`
+embed while their `weights_identity` — `artifact:onnx:hf:…`, or the `qualified:` form for a
+parity-qualified pair — recorded nothing. Their fingerprints would go on matching an index
+built before the change while their vectors stopped belonging in it, which is the exact failure
+the marker avoids for the one backend that writes it. `EmbedFingerprint.identity()` also *pops*
+`weights_identity` when it is empty, so the term is not even uniformly present: a backend
+recording nothing has a different canonical form from one recording `prefix=none`.
+
+So the fix is an entry in `IDENTITY_FIELDS` owned by core, which covers every backend by
+construction rather than by each one remembering to describe itself.
+
+**And it must not ride on `ChunkFingerprint.embed_text_middleware`, which is the mechanism it
+most resembles.** That field is already in its fingerprint's identity and already means
+"something rewrote the embedded text", so it looks like the obvious home. It is not, and the
+reason is an asymmetry rather than a technicality:
+
+- `embed_text_middleware` describes a rewrite of text that is **stored**. The vector store
+  derives `embedding_input_identity` from it per chunk and keeps it beside the vector, which is
+  how reuse is decided ([`storage.md`](storage.md) §6.2).
+- A **query** prefix has no stored counterpart. A query is not a chunk, has no row, and is
+  never compared against one — so there is nothing for `embedding_input_identity` to key on.
+
+Which means middleware can express the document half and cannot express the query half. Doing
+the expressible half alone is *worse than doing neither*: these models are asymmetric, and a
+corpus embedded with `search_document:` against queries embedded bare is a retrieval regression
+introduced by the change meant to fix one. The two sides have to move together, under one
+identity, and the only place that can be is the embedding fingerprint.
 
 ## 10. Checklist against ticket #3
 

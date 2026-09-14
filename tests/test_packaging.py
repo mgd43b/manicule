@@ -440,6 +440,16 @@ def test_every_workspace_member_is_classified() -> None:
         "manicule-plugin-example",
         "manicule-plugin-hostile",
         "manicule-plugin-wikilinks",
+        # Held back for a reason that is about *this repository's* release plumbing rather
+        # than about the package. Publishing a second distribution costs a `uv build` line,
+        # an artifact assertion, a publish job, the release gate's `needs` list, a
+        # release-please `extra-files` entry so its version tracks manicule's — and a PyPI
+        # *trusted publisher* registered against a GitHub environment that does not exist
+        # yet. Adding the workflow half without the PyPI half does not produce a package; it
+        # produces a release job that fails after `manicule` has already been published,
+        # which is the worst of the three available states. So it ships from the repository
+        # and from source until that environment exists.
+        "manicule-ollama",
     }
 
     assert members == (set(PUBLISHED) - {"manicule"}) | withheld, (

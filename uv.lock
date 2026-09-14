@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 members = [
     "manicule",
     "manicule-mlx",
+    "manicule-ollama",
     "manicule-plugin-example",
     "manicule-plugin-hostile",
     "manicule-plugin-wikilinks",
@@ -1544,6 +1545,7 @@ dev = [
     { name = "httpx2" },
     { name = "manicule", extra = ["browser-auth", "connectors", "embeddings", "generation", "ingest", "parsers", "qdrant", "retrieval", "serve", "storage"] },
     { name = "manicule-mlx" },
+    { name = "manicule-ollama" },
     { name = "manicule-plugin-example" },
     { name = "manicule-plugin-hostile" },
     { name = "manicule-plugin-wikilinks" },
@@ -1620,6 +1622,7 @@ dev = [
     { name = "manicule", extras = ["serve"], editable = "." },
     { name = "manicule", extras = ["storage"], editable = "." },
     { name = "manicule-mlx", editable = "packages/manicule-mlx" },
+    { name = "manicule-ollama", editable = "packages/manicule-ollama" },
     { name = "manicule-plugin-example", editable = "packages/manicule-plugin-example" },
     { name = "manicule-plugin-hostile", editable = "packages/manicule-plugin-hostile" },
     { name = "manicule-plugin-wikilinks", editable = "packages/manicule-plugin-wikilinks" },
@@ -1649,6 +1652,21 @@ requires-dist = [
     { name = "manicule", editable = "." },
     { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.1.0" },
     { name = "numpy", specifier = ">=2.0" },
+]
+
+[[package]]
+name = "manicule-ollama"
+version = "0.1.0"
+source = { editable = "packages/manicule-ollama" }
+dependencies = [
+    { name = "httpx" },
+    { name = "manicule", extra = ["embeddings"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.28" },
+    { name = "manicule", extras = ["embeddings"], editable = "." },
 ]
 
 [[package]]

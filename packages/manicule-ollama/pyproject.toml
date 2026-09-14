@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manicule-ollama"
+version = "0.1.0"
+description = "Embedding backend for manicule that runs the model on an Ollama server."
+readme = "README.md"
+# MIT, like manicule itself. Unlike `manicule-mlx` this package carries no copyleft
+# dependency and could have shipped in-tree; it is a separate distribution because it is the
+# only embedder whose model is a *remote service*, so it brings an HTTP client and a
+# deployment topology that an installation embedding in-process should not have to resolve.
+license = "MIT"
+requires-python = ">=3.14"
+authors = [{ name = "manicule contributors" }]
+keywords = ["manicule", "embeddings", "ollama"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+
+dependencies = [
+  # The tokenizer half of this backend is manicule's own: `FastTokenizer`, `EmbeddingCache`
+  # and the `ModelCard` this package fills in from the server rather than from a repository.
+  # The extra is what carries `tokenizers` and `huggingface-hub`, and both are load-bearing
+  # here — see `served.py` for why a tokenizer is not optional for a backend whose runtime
+  # has none to offer.
+  "manicule[embeddings]>=0.1,<0.2",
+  # The same async client the connectors use, and chosen for the same property: the
+  # transport is pluggable, so this package's suite drives a synthetic Ollama over
+  # `httpx.MockTransport` and exercises the real request-building and error-mapping code
+  # rather than a mock of it. BSD-3-Clause.
+  "httpx>=0.28",
+]
+
+# The same public entry-point group every plugin uses, built-in or not. The name here must
+# equal `PluginManifest.name` — the registry rejects the mismatch rather than resolving it.
+[project.entry-points."manicule.plugins"]
+ollama = "manicule_ollama:PLUGIN"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manicule_ollama"]
+
+# There is deliberately no `[tool.pyright]` section here, for the reason `manicule-mlx`'s
+# pyproject.toml records: pyright reads one configuration for the whole checked tree. There is
+# also no *execution environment* for this package in the root pyproject.toml, and that
+# absence is the point — `manicule-mlx` needs one because MLX cannot be imported on the Linux
+# runner at all. Everything this package imports ships type information, so it is checked
+# under the same strict mode as `src/manicule`, with nothing relaxed.
