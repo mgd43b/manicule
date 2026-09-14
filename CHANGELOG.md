@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.21](https://github.com/mgd43b/manicule/compare/v0.1.20...v0.1.21) (2026-09-14)
+
+
+### Features
+
+* **embedding:** core-owned query/document prefixes, and an ollama backend usable in the container ([#354](https://github.com/mgd43b/manicule/issues/354)) ([eed3337](https://github.com/mgd43b/manicule/commit/eed33378c8e4c19d75ce1c6f2dcbbbd07c40e6cc))
+
 ## [0.1.20](https://github.com/mgd43b/manicule/compare/v0.1.19...v0.1.20) (2026-09-14)
 
 
