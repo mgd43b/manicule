@@ -11,11 +11,21 @@ live in :mod:`manicule.storage.config`. SQLAlchemy, Alembic, LanceDB, PyArrow an
 ``manicule doctor``, a plugin listing, a completion script — does not pay for them. An
 installation that leaves the default therefore never imports a network client.
 
-The converse is **not** true and is worth stating rather than implying: a Qdrant installation
-still has LanceDB on disk and still imports it. The relational store is not optional, the
-``storage`` extra carries both, and ``manicule.app.runtime`` names the Lance classes to decide
-whether a store wants the publication-following wrapper. What the deferral buys is that
-discovery loads neither database, not that either one can be left uninstalled.
+A Qdrant installation still has LanceDB **on disk**, and that part is worth stating rather
+than implying: the relational store is not optional and the ``storage`` extra carries
+SQLAlchemy, Alembic, LanceDB and PyArrow together, so there is no supported way to install
+manicule without the embedded backend present. What a Qdrant installation no longer does is
+*import* it.
+
+That distinction used to be lost, and the cost was not a slow start. ``manicule.app.runtime``
+decided whether a store wanted the publication-following wrapper by importing the Lance
+classes and asking ``isinstance``, so every Qdrant process imported LanceDB in order to be
+told it had not configured LanceDB — and on a CPU without AVX2 that import is ``SIGILL``
+rather than a delay, which left the networked backend unusable on the hardware it exists to
+serve. The capability is now asked of the store itself, through
+:class:`~manicule.core.protocols.PublicationAwareVectorStore`, and a backend's module is
+imported only once its own store is what the container built.
+``tests/test_import_boundary.py`` holds both halves of that line.
 
 The relational store owns its engine, and the engine is reachable through
 :attr:`~manicule.storage.scoped.WorkspaceScoped.engine`. That is deliberate: migrations,

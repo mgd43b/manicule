@@ -1637,6 +1637,19 @@ written from the same object by the same rules: `id`, `chunk_id`, `publication_i
 read-side integrity verdict live in `manicule.storage.vector_schema`, which imports no database
 — so an installation configured for Qdrant does not need LanceDB and PyArrow on disk to know
 what a row is called, and the two backends cannot drift into answering one question two ways.
+`manicule.storage.vector_paths` holds the rest of what is true without an engine: which
+directory a workspace's vectors live in, and the cross-process pin that keeps a generation
+there.
+
+**The rule reaches past the row's field names, and it did not always.** A path belonging to
+neither backend — opening the store, reporting index state, computing a vector directory,
+refusing a re-embed — asks what a store *can do* through a protocol in
+`manicule.core.protocols`, never by importing a backend's classes to `isinstance` against
+them. `manicule.app.runtime` used to do the latter, and the cost was not an unnecessary
+import: LanceDB's extension module is compiled around AVX2, so on a host without it every
+Qdrant process took `SIGILL` on its way to being told that it had not configured LanceDB.
+`tests/test_import_boundary.py` now drives a Qdrant-configured runtime through those paths and
+fails if `lancedb` reaches `sys.modules` at all.
 
 **A collection name carries both scopes, because Qdrant has one flat namespace.** Where the
 embedded store gets a workspace's isolation from a directory and a fingerprint's from a table
@@ -1683,7 +1696,9 @@ a half-created one is a corpus that silently gets slower rather than a failure a
   empty one (§6.2.2 is the reason that distinction is kept).
 - **No shadow generations, and therefore no durable re-embedding.** §6.5's replacement is a
   directory swap behind a SQLite pointer, and `manicule.app.runtime` refuses a durable re-embed
-  by name on any backend that does not implement it. Refusing is the whole of the design here: a
+  by name on any backend that does not implement it — literally, by asking whether the store
+  satisfies `PublicationBoundVectorStore` rather than by naming the class that does. Refusing
+  is the whole of the design here: a
   half-built generation mechanism on a second engine is how two stores come to disagree about
   which generation is live.
 - **No atomic insert-if-absent.** §6.4 keys a physical row by publication plus chunk so that

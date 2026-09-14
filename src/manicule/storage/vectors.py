@@ -55,14 +55,10 @@ document is the thing that has to change if they are wrong:
 from __future__ import annotations
 
 import asyncio
-import fcntl
-import hashlib
-import os
 import re
 import shutil
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final
 
@@ -107,6 +103,7 @@ from manicule.core.embedding import (
 from manicule.core.errors import VectorStoreStateError
 from manicule.core.ids import vector_id
 from manicule.core.retrieval import Candidate, Filter
+from manicule.storage.vector_paths import generation_pin, workspace_vector_directory
 from manicule.storage.vector_schema import (
     CHECKSUM_COLUMN,
     CHECKSUM_VERSION_COLUMN,
@@ -185,42 +182,6 @@ _FOREIGN_INDEX_DETAIL: Final = (
 
 class VectorStoreReprepareRequiredError(VectorStoreStateError):
     """The live publication moved to a vector space this handle has not prepared."""
-
-
-_EXCLUSIVE_PINS: ContextVar[frozenset[Path]] = ContextVar(
-    "manicule_exclusive_vector_pins", default=frozenset()
-)
-
-
-@asynccontextmanager
-async def generation_pin(directory: Path, *, exclusive: bool = False) -> AsyncGenerator[None]:
-    """Cross-process pin preventing cleanup from deleting a generation during an operation."""
-    resolved = await asyncio.to_thread(directory.resolve)
-    if resolved in _EXCLUSIVE_PINS.get():
-        yield
-        return
-    pins = directory.parent / ".pins"
-    pins.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(pins / f"{directory.name}.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-    try:
-        while True:
-            try:
-                fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                await asyncio.sleep(0.01)
-        token = None
-        if exclusive:
-            token = _EXCLUSIVE_PINS.set(_EXCLUSIVE_PINS.get() | {resolved})
-        try:
-            yield
-        finally:
-            if token is not None:
-                _EXCLUSIVE_PINS.reset(token)
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
 
 
 def quote(value: str) -> str:
@@ -2157,12 +2118,6 @@ def _published_generation_key(pointer: str | None) -> str:
             "searching or writing vectors"
         )
     return pointer
-
-
-def workspace_vector_directory(root: Path, workspace_id: str) -> Path:
-    """Opaque, stable physical namespace for one workspace's independent vector identity."""
-    digest = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()
-    return root / "workspaces" / digest
 
 
 async def reset_vector_directory(directory: Path, *, legacy_root: bool) -> bool:
