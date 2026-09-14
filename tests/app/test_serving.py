@@ -259,6 +259,24 @@ def test_serving_unauthenticated_is_announced_and_names_the_flag() -> None:
     assert "author" in written, written
 
 
+def test_a_half_configured_install_is_not_warned_about_writes_it_cannot_take() -> None:
+    """A source with no collections is not authoring, so nothing may say it can be written into.
+
+    ``AuthoringSettings.configured`` is ``source and collections`` precisely because half of it
+    is a state people reach, and in that state ``document_create`` refuses every call naming the
+    settings it needs. A banner keyed off the source alone announces an exposure that does not
+    exist — and ``doctor`` reports the same condition from ``configured``, so the two would
+    disagree about one installation.
+
+    That matters more here than it looks: this is the warning an operator is meant to read on the
+    installs where it *is* true, and a line that cries wolf is one they learn to skip.
+    """
+    written = _announced(loopback=False, unauthenticated=True, authoring="")
+
+    assert "--no-authentication" in written, "the flag itself is still announced"
+    assert "author" not in written, written
+
+
 def test_the_ordinary_banner_makes_no_claim_about_authentication() -> None:
     """The control, without which the assertions above pass against a banner that always warns.
 

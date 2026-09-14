@@ -264,9 +264,17 @@ async def _serve(
             web=web if api else None,
             unauthenticated=unauthenticated,
             # Named in the banner rather than described, because "this can be written into" is
-            # the fact an operator needs and "which corpus" is the fact they act on. Empty when
-            # authoring is unconfigured, where there is nothing to warn about.
-            authoring=runtime.settings.authoring.source if unauthenticated else "",
+            # the fact an operator needs and "which corpus" is the fact they act on.
+            #
+            # `configured` rather than `source`, and the difference is a real installation: a
+            # source with no collections is *not* authoring — `document_create` refuses every
+            # call naming the settings it needs — so keying off the source alone warns about an
+            # exposure that does not exist. `doctor` reports the same condition from the same
+            # property, and a banner that disagreed with it would be the one an operator learns
+            # to skip.
+            authoring=runtime.settings.authoring.source
+            if unauthenticated and runtime.settings.authoring.configured
+            else "",
         )
         pid = write_pidfile(
             runtime.settings.data_dir,
