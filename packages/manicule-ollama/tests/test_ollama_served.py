@@ -647,3 +647,25 @@ def test_a_tokenizer_that_is_not_on_this_machine_names_this_backends_own_setting
     assert "--backend ollama" in message
     assert "`weights`" not in message
     assert "embedding.model" not in message
+
+
+def test_a_configured_limit_is_capped_in_the_units_it_is_written_in(vocabulary: Path) -> None:
+    """The ceiling an operator is told about has to be one they can act on.
+
+    ``max_sequence_length`` is written as the server's context less the reserve and the special
+    tokens — a figure an operator can derive — and the document prefix is charged *after* it.
+    Comparing the post-prefix number and then reporting it as the maximum would refuse a
+    setting that fits, and the remedy it gave would cost the prefix's worth of context on every
+    chunk from then on.
+    """
+    server = FakeOllama()
+    _, bare, _ = build(server, vocabulary)
+    ceiling = bare.card.max_sequence_length
+
+    _, at_ceiling, _ = build(server, vocabulary, PrefixScheme.NOMIC, max_sequence_length=ceiling)
+
+    assert at_ceiling.document_prefix_tokens > 0
+    assert at_ceiling.card.max_sequence_length == ceiling - at_ceiling.document_prefix_tokens
+
+    with pytest.raises(ConfigError, match="reads at most"):
+        build(server, vocabulary, PrefixScheme.NOMIC, max_sequence_length=ceiling + 1)

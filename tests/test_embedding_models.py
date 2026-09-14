@@ -813,3 +813,16 @@ def test_a_local_directory_tokenizer_needs_no_fetch(
     write_tokenizer(directory / "tokenizer.json")
 
     assert main(["--backend", "ollama", "--tokenizer", str(directory)]) == 0
+
+
+def test_a_tokenizer_flag_on_a_backend_that_has_no_use_for_one_is_refused() -> None:
+    """Ignored, it would fetch the model's own repository and report success over the top.
+
+    `mlx` and `onnx` read their tokenizer from `--model`'s repository, so `--tokenizer` names
+    nothing they can act on — and a seeding step that silently fetched something other than
+    what it was asked for is how an air-gapped host ends up missing the one file it needed.
+    """
+    from tools.prefetch_embedding_models import main  # noqa: PLC0415 - a tool, not a package
+
+    assert main(["--backend", "onnx", "--tokenizer", "acme/tokenizer"]) == 1
+    assert main(["--backend", "mlx", "--tokenizer-revision", "a" * 40]) == 1

@@ -756,9 +756,15 @@ def _usable_length(
     the reason :func:`manicule.embedding.cards._resolve_length` gives: ``max_sequence_length``
     means what is left for a chunk's own text, and an operator setting it can know their
     model's limit and their server's context without also netting out a prefix manicule chose.
+
+    **The ceiling is compared in the units the setting is written in**, which is the number
+    before the prefix is charged. Comparing the post-prefix figure and then reporting it as the
+    maximum would be a refusal whose own remedy is wrong: an operator told the limit is
+    ``derived`` would set exactly that and silently forfeit the prefix's worth of context,
+    every chunk, for ever.
     """
-    derived = num_ctx - CONTEXT_RESERVE - specials - document_prefix_tokens
-    if derived <= 0:
+    ceiling = num_ctx - CONTEXT_RESERVE - specials
+    if ceiling - document_prefix_tokens <= 0:
         msg = (
             f"{info.model!r} served at num_ctx={num_ctx} has no room for content: a reserve of "
             f"{CONTEXT_RESERVE}, {specials} special tokens and a "
@@ -766,17 +772,23 @@ def _usable_length(
         )
         raise ConfigError(msg)
     if override is None:
-        return derived
-    usable = override - document_prefix_tokens
-    if usable > derived or usable <= 0:
+        return ceiling - document_prefix_tokens
+    if override > ceiling:
         msg = (
             f"`max_sequence_length` is {override} but {info.model!r} served at "
-            f"num_ctx={num_ctx} reads at most {derived} content tokens "
-            f"({num_ctx} - {CONTEXT_RESERVE} reserved - {specials} special - "
-            f"{document_prefix_tokens} prefix). Unlike a model "
+            f"num_ctx={num_ctx} reads at most {ceiling} content tokens "
+            f"({num_ctx} - {CONTEXT_RESERVE} reserved - {specials} special). Unlike a model "
             f"repository, which may simply fail to declare its limit, this number was derived "
             f"from what the server reports — so raising it past the derivation cannot reveal "
             f"capacity, only hide truncation. Lower it, or raise `num_ctx`."
+        )
+        raise ConfigError(msg)
+    usable = override - document_prefix_tokens
+    if usable <= 0:
+        msg = (
+            f"`max_sequence_length` is {override} and the configured prefix scheme puts a "
+            f"{document_prefix_tokens}-token prefix in front of every chunk, which leaves "
+            f"nothing for the chunk. Raise it, or choose a different `embedding.prefix_scheme`."
         )
         raise ConfigError(msg)
     return usable

@@ -237,6 +237,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             tokenizer, tokenizer_revision = configured_ollama_tokenizer()
         return for_ollama(tokenizer, tokenizer_revision)
 
+    # Refused rather than ignored, the way configuration is. These name a tokenizer for a
+    # served model, and the backend being seeded loads its vocabulary from the model's own
+    # repository — so accepting them here would take an argument, fetch something else, and
+    # print `fetched:` over the top of it.
+    if arguments.tokenizer or arguments.tokenizer_revision:
+        print(
+            "error: --tokenizer and --tokenizer-revision are only meaningful with "
+            "`--backend ollama`; mlx and onnx read the tokenizer from --model's own repository.",
+            file=sys.stderr,
+        )
+        return 1
+
     if arguments.backend is not None:
         for_backend(arguments.model, arguments.backend)
         print(f"fetched: {arguments.model} ({arguments.backend})")

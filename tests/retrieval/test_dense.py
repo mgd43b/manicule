@@ -402,7 +402,7 @@ async def test_the_stage_contract_holds(store: SqliteDocStore) -> None:
             "query\nQuery:authentication",
         ),
     ],
-    ids=lambda value: value if isinstance(value, str) and " " not in value else "",
+    ids=["none", "nomic", "qwen3"],
 )
 async def test_a_query_reaches_the_model_behind_the_query_side_prefix(
     store: SqliteDocStore, scheme: PrefixScheme, expected: str
