@@ -2914,7 +2914,13 @@ class ApplicationService:
         return r.Diagnosis(state=worst, checks=tuple(checks))
 
     def _configuration_check(self) -> r.Check:
-        problems = self.settings.policy_problems()
+        # The same flag the runtime was opened with, so this does not repeat as a *configuration*
+        # problem the thing the `transport` check reports better — with the word "deliberately"
+        # on it and a remedy that fits. One finding for one condition; two would train an
+        # operator to skim the pair, and the one worth reading is the one that would be skimmed.
+        problems = self.settings.policy_problems(
+            allow_unauthenticated=self._serving_unauthenticated
+        )
         if not problems:
             return r.Check(
                 name="configuration",

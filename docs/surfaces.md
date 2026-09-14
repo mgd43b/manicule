@@ -968,6 +968,15 @@ refuses to build an unauthenticated one whose address is not loopback. That one 
 something other than `manicule start` is doing the listening — a container entry point, a
 production ASGI server, a hand-written uvicorn call.
 
+And there is a **third**, which fires before either: `Settings.policy_problems` carries the same
+condition and `build_container` raises on it, so a wide `security.transport.bind_host` with
+`security.auth.mode = none` refuses at `Runtime.open` — before an address has been resolved or
+an application built, and for every command rather than only for serving. It is the earliest of
+the three and the one an operator meets first, which is why `--no-authentication` has to reach
+it: a flag that satisfied the bind but not the preflight would refuse to start the deployment it
+was written for, with a message about a configuration file rather than about the argument meant
+to answer it.
+
 ### 6.1 MCP over a socket carries the read-only tools, and one named write when it is authenticated
 
 The endpoint is `/mcp` on the same port, and a client is configured with the trailing slash:

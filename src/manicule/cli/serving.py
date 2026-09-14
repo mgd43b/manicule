@@ -103,9 +103,9 @@ def serve_forever(
     host: str | None,
     port: int | None,
     allow_public: bool,
-    allow_unauthenticated: bool,
     overrides: Mapping[str, Any],
     json_output: bool,
+    allow_unauthenticated: bool = False,
     mcp_only: bool = False,
     web: bool = True,
 ) -> int:
@@ -116,9 +116,12 @@ def serve_forever(
     reported the same way every other failure is.
 
     ``allow_unauthenticated`` is ``--no-authentication``, and it satisfies the third of those
-    three rather than skipping the policy. It is carried to the bind, to the application, and
-    to the service — the last so ``manicule doctor`` run *inside* this process can say that
-    serving unauthenticated was deliberate rather than only that it is happening.
+    three rather than skipping the policy. It is carried to the **runtime** — the earliest
+    refusal, in ``build_container`` — and then to the bind, to the application, and to the
+    service, the last so ``manicule doctor`` run *inside* this process can say that serving
+    unauthenticated was deliberate rather than only that it is happening. It defaults to
+    ``False`` because this function is public and a caller written before it existed must keep
+    getting the authenticated behavior rather than a ``TypeError``.
 
     ``--transport http`` serves the **HTTP API, the browser surface and MCP together**, on one
     port; ``--mcp-only`` serves MCP alone over that socket. ``stdio`` is MCP whatever else was
@@ -198,7 +201,12 @@ async def _serve(
     # otherwise reach the terminal as a traceback rather than as the one-line refusal the lock
     # was written to produce.
     try:
-        runtime = Runtime.open(**overrides)
+        # The flag reaches the runtime because `build_container` refuses a wide bind with no
+        # authentication *before* anything resolves an address — earlier than `resolve_bind`
+        # and earlier than `build_app`. Without it here the escape hatch works only when the
+        # host is overridden on the command line, and not for the configured host the
+        # deployment documents describe, which is the case it exists for.
+        runtime = Runtime.open(allow_unauthenticated=allow_unauthenticated, **overrides)
         runtime.acquire()
     except InstanceLockedError as exc:
         # Named ahead of the general clause and given its own status, because this is the one
@@ -340,8 +348,8 @@ async def serve_over_a_socket(
     host: str | None,
     port: int | None,
     allow_public: bool,
-    allow_unauthenticated: bool,
     web: bool,
+    allow_unauthenticated: bool = False,
 ) -> None:
     """Serve the HTTP API, the browser surface and MCP from one process, and stop them in order.
 

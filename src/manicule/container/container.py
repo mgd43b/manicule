@@ -754,6 +754,7 @@ def build_container(
     settings: Settings,
     *,
     discovery: Discovery | None = None,
+    allow_unauthenticated: bool = False,
 ) -> Container:
     """Discover plugins, verify the configuration against them, and return the container.
 
@@ -769,7 +770,10 @@ def build_container(
         enabled=None if enabled is None else frozenset(enabled),
         disabled=frozenset(settings.plugins.disabled),
     )
-    problems = [*settings.policy_problems(), *check_wiring(settings, found.registry)]
+    problems = [
+        *settings.policy_problems(allow_unauthenticated=allow_unauthenticated),
+        *check_wiring(settings, found.registry),
+    ]
     if problems:
         joined = "\n  - ".join(problems)
         msg = f"manicule cannot start:\n  - {joined}"
