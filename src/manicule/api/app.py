@@ -214,7 +214,11 @@ def frame_policy(origins: tuple[str, ...]) -> str:
 
 
 def build_app(
-    service: ApplicationService, *, bind: Bind | None = None, web: bool = True
+    service: ApplicationService,
+    *,
+    bind: Bind | None = None,
+    web: bool = True,
+    allow_unauthenticated: bool = False,
 ) -> FastAPI:
     """Mount every route group over ``service`` and return the application.
 
@@ -229,10 +233,18 @@ def build_app(
             false. It is a parameter rather than a setting because the flag exists to *reduce*
             what a running process exposes, and a reduction that a configuration file could
             undo is not one.
+        allow_unauthenticated: ``manicule serve --no-authentication``. A parameter rather than
+            a setting for the opposite reason to ``web`` and the same reason as
+            :func:`~manicule.app.bind.resolve_bind`'s ``allow_public``: it *increases* what a
+            process exposes, so it must take a person at a terminal rather than a file. It
+            widens one refusal and not the other: it admits an unauthenticated application on
+            a routable address, and :func:`~manicule.app.bind.require_authoring_authentication`
+            below still refuses one that would serve authoring — which is what keeps
+            ``POST /api/v1/documents`` out of reach of an anonymous administrator.
 
     Raises:
         PolicyError: The application would serve an unauthenticated surface on something that
-            is not loopback.
+            is not loopback, and nobody said on the command line that they meant it.
     """
     # The browser surface, imported here rather than at module scope. Its pages are routes
     # over the same dependencies this package defines, so importing it from the top would make
@@ -247,7 +259,7 @@ def build_app(
     )
 
     settings = service.settings
-    _require_auth_for_wide_bind(service, bind)
+    _require_auth_for_wide_bind(service, bind, allow_unauthenticated=allow_unauthenticated)
     # Beside it rather than in `manicule.api.serve`, on that function's own reasoning: this
     # decides whether an *application* may exist, so it fires when a container entry point or a
     # production ASGI server is doing the listening. Stricter than the line above, because it
@@ -505,7 +517,9 @@ def _op_of(request: Request) -> str:
     return name or "request"
 
 
-def _require_auth_for_wide_bind(service: ApplicationService, bind: Bind | None) -> None:
+def _require_auth_for_wide_bind(
+    service: ApplicationService, bind: Bind | None, *, allow_unauthenticated: bool = False
+) -> None:
     """Refuse to build an unauthenticated application that is not loopback-only.
 
     The second of two refusals, and deliberately not the same code as the first.
@@ -514,11 +528,18 @@ def _require_auth_for_wide_bind(service: ApplicationService, bind: Bind | None) 
     somebody else's server is doing the listening. A caller that has already decided an
     address passes it, because a command-line ``--host`` can name one configuration does not.
 
+    **``allow_unauthenticated`` has to reach here as well as the bind**, and the reason is this
+    function's own: two refusals that a command line can satisfy only one of is a flag that
+    appears to work and then fails one layer down, with a message about a decision the operator
+    already made. It stays a separate parameter rather than being read off ``bind`` because this
+    fires for callers that never resolved one.
+
     Raises:
-        PolicyError: Authentication is off and the address is not loopback.
+        PolicyError: Authentication is off, the address is not loopback, and nobody said on the
+            command line that they meant it.
     """
     settings = service.settings
-    if settings.security.auth.mode is not AuthMode.NONE:
+    if settings.security.auth.mode is not AuthMode.NONE or allow_unauthenticated:
         return
     host = bind.host if bind is not None else settings.security.transport.bind_host
     if is_loopback(host):
@@ -526,7 +547,8 @@ def _require_auth_for_wide_bind(service: ApplicationService, bind: Bind | None) 
     msg = (
         f"refusing to build an HTTP API bound to {host!r} with security.auth.mode set to "
         f"'none'. Anything that can reach the port could read the whole index. Set "
-        f"security.auth.mode to 'api_key' or 'oauth', or leave the bind on 127.0.0.1."
+        f"security.auth.mode to 'api_key' or 'oauth', leave the bind on 127.0.0.1, or pass "
+        f"--no-authentication to serve it unauthenticated deliberately."
     )
     raise PolicyError(msg)
 

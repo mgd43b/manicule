@@ -200,19 +200,36 @@ configuration flag:
 | Transport | Surface |
 |---|---|
 | stdio | everything, including `document_create` |
-| socket | the read-only set **plus `document_create`**, and nothing else that mutates |
+| socket, authenticated | the read-only set **plus `document_create`**, and nothing else that mutates |
+| socket, unauthenticated | the read-only set, and **nothing** that mutates |
 
 The property that mattered is that the absence of every *other* write tool stays **mechanical
 rather than reasoned**, and it does. `_Registrar.tool` registers a tool only when its
-`readOnlyHint` is true or its name is in `manicule.mcp.server.NETWORK_AUTHORING` — a frozenset
-holding one name — so there is no handler behind any other write tool on a socket. An absence, not
-a refusal. `tests/api/test_routes.py` asserts the surface as a set operation: the published set
-*is* the read-only set plus that constant, so a second write tool cannot drift in behind the first.
+`readOnlyHint` is true or its name is in the set `manicule.mcp.server.network_authoring` returns
+— `NETWORK_AUTHORING`, a frozenset holding one name, or nothing at all — so there is no handler
+behind any other write tool on a socket. An absence, not a refusal.
+`tests/api/test_routes.py` asserts both rows as set operations: the published set *is* the
+read-only set plus that constant, or the read-only set exactly, so a second write tool cannot
+drift in behind the first and the first cannot survive the credential going away.
 
-This needs no flag guarding it because the gate is already one layer up. `resolve_bind` refuses a
-non-loopback bind unless an operator named a host, passed an explicit opt-in and switched
-authentication on. A `network_authoring: false` knob would only make the deployment that always
-sets it one way carry a setting nobody else ever changes.
+**The third row is the one that had to be added**, and it is the answer to a question this
+section originally settled the other way. It used to say the surface needed no flag guarding it
+because `resolve_bind` refuses a non-loopback bind unless an operator named a host, passed an
+explicit opt-in and switched authentication on — the gate was one layer up, and a
+`network_authoring: false` knob would only be a setting nobody changes. The gate is still one
+layer up and there is still no knob, but `--no-authentication` ([`surfaces.md`
+§6](surfaces.md#6-where-a-server-listens)) means the third of those three can now be satisfied
+by an argument, so "authentication is on" stopped being something this table could assume.
+
+The fix is not a knob and not a guard. **Authoring's presence on a socket is a function of
+whether that socket is authenticated**, which is what `network_authoring` computes and the only
+place the question is asked. Without a credential there is nothing to tell one caller from
+another: `manicule.api.security.Principal` resolves an anonymous caller to `admin`, so
+`require_network_member`'s member floor is cleared by everybody and anything that can route to
+the port could write into this corpus. Given what the corpus *is* — read back as standing
+instructions, which the last paragraph of this section is about — that is an injection channel
+rather than a privacy question, and the answer to an injection channel is that the tool is not
+there, never that a check refuses it.
 
 Two constraints ride along and both are enforced:
 
@@ -224,6 +241,15 @@ Two constraints ride along and both are enforced:
   container entry point or a production ASGI server is doing the listening. The condition is
   authoring being *configured* rather than the tool existing, so an installation that never wanted
   it is not asked to turn authentication on for a feature it does not use.
+
+  **`--no-authentication` does not waive it**, and this is where that escape hatch stops. It
+  satisfies a condition about *reading* an index; this is about *writing* into a corpus read
+  back as standing instructions. Waiving it would also only have closed one door: the same
+  operation is `POST /api/v1/documents` on the HTTP surface, whose member floor an anonymous
+  administrator clears, and narrowing the MCP surface does not reach that route. So an
+  installation that wants authoring served over a network wants an API key, and the refusal
+  names it. Between the two rules there is no configuration of manicule in which an
+  unauthenticated socket can be written to.
 - **Scope is a configured writable collection**, not any collection the workspace holds. Creating a
   collection is therefore not also the act of granting write access to it.
 

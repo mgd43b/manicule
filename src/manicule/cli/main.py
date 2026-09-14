@@ -2315,6 +2315,13 @@ def start(
             help="Say explicitly that a non-loopback bind is intended. Needs auth as well.",
         ),
     ] = False,
+    no_authentication: Annotated[
+        bool,
+        typer.Option(
+            "--no-authentication",
+            help="Serve with no authentication at all. MCP here then carries no write tool.",
+        ),
+    ] = False,
     no_web: Annotated[bool, typer.Option("--no-web", help="Do not serve the web UI.")] = False,
 ) -> None:
     """Serve manicule: the HTTP API, the browser surface and MCP together, or MCP alone.
@@ -2323,15 +2330,29 @@ def start(
     HTTP API has no stdio form. ``--transport http`` serves the **HTTP API, the browser surface
     and MCP** on one port, with MCP at ``/mcp/``; add ``--mcp-only`` to serve MCP alone there.
 
-    **MCP over a socket carries the read-only tools only**, whichever of those two modes you
-    are in. Indexing, deleting, syncing, writing configuration and enabling a plugin are not
-    registered on it — over stdio they are unreachable from a network by construction, and a
-    socket has to replace that property rather than assume it. They stay on this command line,
-    on stdio, and on the control socket a served manicule answers write commands on.
+    **MCP over a socket carries the read-only tools, plus ``document_create`` when the socket
+    is authenticated**, whichever of those two modes you are in. Indexing, deleting, syncing,
+    writing configuration and enabling a plugin are not registered on it — over stdio they are
+    unreachable from a network by construction, and a socket has to replace that property
+    rather than assume it. They stay on this command line, on stdio, and on the control socket
+    a served manicule answers write commands on.
 
     Either way the address goes through one bind policy: loopback unless a non-loopback host
     is configured **and** ``--allow-public-bind`` is passed **and** authentication is on. Any
     one missing is a refusal naming which.
+
+    ``--no-authentication`` is the way past that third condition and nothing else — a wide bind
+    still needs ``--allow-public-bind`` beside it. Pass it for a private single-operator
+    install on a network you trust, where an API key between a person and their own index is
+    ceremony. It is a flag rather than a setting because no file should be able to put an
+    unauthenticated listener on a network, it is said out loud at startup, and ``manicule
+    doctor`` reports it for as long as it holds.
+
+    **It buys a surface that reads.** Without authentication nothing can tell one caller from
+    another, so ``document_create`` is not registered and MCP over that socket reads and nothing
+    else — and an installation that has configured authoring still refuses to serve a socket
+    unauthenticated, however it was asked. Everything else this process serves is reachable by
+    an anonymous administrator on that address, so it is for a network you own.
 
     ``--no-web`` leaves the browser surface unmounted, so every ``/ui`` path answers 404 and
     the process serves the JSON API and MCP. It applies to ``--transport http`` without
@@ -2345,6 +2366,7 @@ def start(
             host=host,
             port=port,
             allow_public=allow_public_bind,
+            allow_unauthenticated=no_authentication,
             overrides=STATE.overrides,
             json_output=STATE.json_output,
             mcp_only=mcp_only,

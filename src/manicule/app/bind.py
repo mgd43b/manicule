@@ -13,10 +13,29 @@ refuses by default. A wide bind needs **all three** of:
 2. ``allow_public``, which no configuration file can set and no default supplies — the caller
    passes it, and the only caller that does is a command-line flag a person typed;
 3. authentication switched on, because a routable address without it is the defect this whole
-   module exists to avoid.
+   module exists to avoid — **or** ``allow_unauthenticated``, which is argv for the same reason
+   the second is.
 
 Any one missing is a refusal naming which. None of the three can be reached by omission: the
 absent value in each case is the safe one.
+
+**The third condition has a way out and the second does not, which is the asymmetry to
+understand.** ``--no-authentication`` exists for the deployment manicule is actually for — one
+operator, one corpus, a private network they own — where demanding an API key is ceremony
+between a person and their own index. It is on the command line for the reason ``allow_public``
+is: a setting that could grant it would make an unauthenticated listener reachable by editing a
+file, and the whole point is that it takes a person at a terminal. It does not make the bind
+safe and does not pretend to. What it buys is that the choice is recorded in the command that
+made it, said out loud at startup, and reported by ``manicule doctor`` as a finding for as long
+as it holds.
+
+**And it costs the network surface its one write.** With authentication off every anonymous
+caller resolves to an administrator — see :mod:`manicule.api.security` — so a socket carrying
+``document_create`` unauthenticated is a corpus that anything able to route to the port may
+write into, and that corpus is read back by assistants as standing instructions. So
+:func:`manicule.mcp.server.network_authoring` is empty whenever authentication is off: MCP over
+a socket is the read-only set and nothing else. That is not a mitigation bolted on beside the
+flag, it is what makes the flag admissible at all.
 
 Stdio transports never come here at all, and that is the point of
 :func:`stdio` — a bind decision that is not made cannot be made wrongly, so the MCP server's
@@ -25,7 +44,9 @@ default mode has no address to get wrong.
 :func:`require_authoring_authentication` is the one rule here that is stricter than the three
 above: a socket carrying ``document_create`` needs authentication even on loopback, because
 "reachable only from this machine" is a weaker statement about a write into a corpus than it is
-about a read out of one.
+about a read out of one. ``allow_unauthenticated`` does **not** waive it: accepting an index
+anyone can read is not the same as accepting a corpus anyone can write, and that refusal covers
+``POST /api/v1/documents`` as well as the MCP tool, where narrowing the MCP surface would not.
 """
 
 from __future__ import annotations
@@ -114,6 +135,19 @@ def require_authoring_authentication(settings: Settings) -> None:
     accepts connections and declines the one operation somebody deployed it for — discovered by a
     client, at the far end, after a turn has been spent on it.
 
+    **``--no-authentication`` does not waive this, and that is the one place the escape hatch
+    stops.** It satisfies :func:`resolve_bind`'s third condition, which is a statement about
+    *reading* an index; this is a statement about writing into a corpus that assistants read
+    back as standing instructions, and no argument makes an anonymous caller safe to hand that
+    to. Waiving it would also only close one door: ``document_create`` is on the HTTP surface as
+    ``POST /api/v1/documents`` as well, asking for a member floor that an anonymous
+    administrator clears, so a flag that let this application be built would have opened a write
+    path that emptying the MCP surface does not touch. An operator who wants authoring served
+    over a network wants an API key, and this is where they are told so.
+
+    Args:
+        settings: Configuration. ``authoring.configured`` and ``security.auth.mode`` decide.
+
     Raises:
         PolicyError: Authoring is configured and ``security.auth.mode`` is ``none``.
     """
@@ -125,8 +159,10 @@ def require_authoring_authentication(settings: Settings) -> None:
         f"that corpus, and `security.auth.mode` is 'none', so anything that can reach the port "
         f"can call it — on loopback that is every process and every page on this machine. Set "
         f"security.auth.mode to 'api_key' or 'oauth', or clear `authoring.source` and "
-        f"`authoring.collections` to serve this installation read-only. Authoring over stdio "
-        f"needs none of this: a pipe has no port."
+        f"`authoring.collections` to serve this installation read-only. --no-authentication "
+        f"does not waive this: it says you accept an index anyone can read, which is not the "
+        f"same as a corpus anyone can write. Authoring over stdio needs none of this: a pipe "
+        f"has no port."
     )
     raise PolicyError(msg)
 
@@ -147,6 +183,7 @@ def resolve_bind(
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
+    allow_unauthenticated: bool = False,
 ) -> Bind:
     """Decide where to listen, refusing anything wide that was not asked for three times.
 
@@ -159,6 +196,12 @@ def resolve_bind(
         allow_public: The operator's explicit opt-in. **Not a setting.** A file that could
             grant this would make a wide bind reachable by editing configuration, and the
             whole point is that it takes a person at a terminal.
+        allow_unauthenticated: The other explicit opt-in, and **not a setting** for exactly
+            the same reason: a configuration key granting this would put an unauthenticated
+            listener one file edit away. It satisfies the third condition rather than removing
+            it, and satisfies only that one — a wide bind still needs ``allow_public`` beside
+            it, because "I accept no authentication" and "I meant to bind the network" are two
+            statements and neither implies the other.
 
     Returns:
         The decided address.
@@ -186,10 +229,12 @@ def resolve_bind(
             f"you mean it; there is no setting that grants this, because a wide bind should "
             f"take a person rather than a file"
         )
-    if settings.security.auth.mode is AuthMode.NONE:
+    if settings.security.auth.mode is AuthMode.NONE and not allow_unauthenticated:
         problems.append(
             "security.auth.mode is 'none', so anything that can reach the port could read "
-            "the whole index. Set security.auth.mode to 'api_key' or 'oauth' first"
+            "the whole index. Set security.auth.mode to 'api_key' or 'oauth' first, or pass "
+            "--no-authentication to say you accept that; there is no setting that grants it "
+            "either"
         )
     if problems:
         joined = "\n  - ".join(problems)

@@ -495,6 +495,45 @@ async def test_doctor_names_an_unauthenticated_public_bind_as_failing(
     transport = next(check for check in diagnosis.checks if check.name == "transport")
     assert transport.state == "failing"
     assert "security.auth.mode" in transport.detail
+    assert transport.facts["serving_unauthenticated"] is False, (
+        "a diagnosis produced outside a serving process cannot know a flag was passed, and "
+        "claiming otherwise would let configuration look like a decision somebody made"
+    )
+
+
+async def test_doctor_reports_a_deliberate_unauthenticated_bind_as_a_finding(
+    backend: FakeBackend,
+) -> None:
+    """``--no-authentication`` changes what the check says, and **not** that it is a finding.
+
+    **Still failing, and that is the decision.** An unauthenticated index on a routable address
+    is the same exposure whether or not somebody meant it, so a check that softened to ``ok``
+    because an argument was typed would be reporting an intention rather than a state — and the
+    one check an operator most needs to keep reading is the one that would have gone quiet.
+
+    What deliberateness earns is the wording and the remedy. There is no point telling somebody
+    to bind loopback when they passed an argument saying they did not want to, so the remedy
+    becomes the other way out: configure authentication. A deployment that has chosen this
+    excludes the check by ``name``, which is what ``docs/deployment.md`` §2 already says ``name``
+    is for.
+    """
+    backend.settings = Settings(
+        security={"transport": {"bind_host": "0.0.0.0"}}  # pyright: ignore[reportArgumentType]  # noqa: S104 - the subject of the check
+    )
+    service = ApplicationService(backend, serving_unauthenticated=True)
+
+    diagnosis = await service.doctor()
+
+    transport = next(check for check in diagnosis.checks if check.name == "transport")
+    assert transport.state == "failing"
+    assert transport.facts["serving_unauthenticated"] is True
+    assert "deliberately" in transport.detail
+    assert "--no-authentication" in transport.detail
+    assert transport.remedy, "a failing transport check without a remedy tells nobody what to do"
+    assert "bind_host 127.0.0.1" not in transport.remedy, (
+        "the remedy still says to bind loopback, which is the one thing the operator said with "
+        "an argument that they did not want"
+    )
 
 
 async def test_doctor_fails_on_a_data_directory_other_accounts_can_read(

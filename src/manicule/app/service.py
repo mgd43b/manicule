@@ -717,8 +717,27 @@ a pattern — one directory, one exporter, one space — without turning a diagn
 class ApplicationService:
     """Every operation, over a backend that supplies the parts."""
 
-    def __init__(self, backend: Backend) -> None:
+    def __init__(self, backend: Backend, *, serving_unauthenticated: bool = False) -> None:
         self._backend = backend
+        self._serving_unauthenticated = serving_unauthenticated
+        """Whether this process is serving without authentication, deliberately.
+
+        Both halves: ``--no-authentication`` was passed **and** ``security.auth.mode`` is
+        ``none``. The flag on an installation that has authentication configured buys nothing,
+        and reporting it as though it did would put a finding in front of an operator who has
+        none.
+
+        **A constructor argument rather than something read from settings**, because half of it
+        is not in settings and must not be: the flag is argv precisely so that no file can grant
+        an unauthenticated listener. :meth:`doctor` is the only reader — it is what lets a
+        diagnosis produced *inside* a serving process say that this was deliberate, where the
+        same check run from a fresh ``manicule doctor`` can only report what the configuration
+        says. Those two answers differ, and both are honest.
+
+        Default ``False``, so every other construction — a test, a command at a terminal, the
+        control socket's handler — reports the configuration's own answer.
+        """
+
         self._authoring = asyncio.Lock()
         """Serializes :meth:`document_create` within this process.
 
@@ -2921,6 +2940,10 @@ class ApplicationService:
             "bind_host": transport.bind_host,
             "loopback": transport.is_loopback,
             "auth_mode": mode.value,
+            # Argv as well as configuration, so it is true only of a diagnosis produced inside
+            # a process that was started with the flag. A fresh `manicule doctor` reads the same
+            # settings and reports `false`, which is the honest answer to what a file can say.
+            "serving_unauthenticated": self._serving_unauthenticated,
         }
         if transport.is_loopback:
             return r.Check(
@@ -2928,6 +2951,26 @@ class ApplicationService:
                 state="ok",
                 detail=f"bound to {transport.bind_host}, reachable only from this machine",
                 facts=facts,
+            )
+        if mode is AuthMode.NONE and self._serving_unauthenticated:
+            # **Still failing, and that is the decision rather than an oversight.** An
+            # unauthenticated index on a routable address is the same exposure whether or not
+            # somebody meant it, and a check that softened because the operator typed a flag
+            # would be reporting an intention instead of a state. What deliberateness changes is
+            # the sentence and the remedy: there is no point telling somebody to bind loopback
+            # when they passed an argument saying they did not want to. A deployment that has
+            # chosen this excludes the check by `name`, which is what `name` is for.
+            return r.Check(
+                name="transport",
+                state="failing",
+                detail=(
+                    f"serving unauthenticated, deliberately: this process was started with "
+                    f"--no-authentication and is bound to {transport.bind_host!r}. Anything "
+                    f"that can route to the port is an administrator here, and MCP on it "
+                    f"carries no write tool."
+                ),
+                facts=facts,
+                remedy="manicule config set security.auth.mode api_key",
             )
         if mode is AuthMode.NONE:
             return r.Check(

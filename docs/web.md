@@ -183,7 +183,11 @@ rather than a JSON envelope in a browser window.
 
 That is a real limitation rather than a bug, and the configuration this surface is *for* is the
 one manicule ships as: one person, on loopback, with `auth.mode = none`, where the caller is the
-operator at this machine and holds the authority the command line already gives them. An
+operator at this machine and holds the authority the command line already gives them. Serving
+that same unauthenticated surface off loopback takes `manicule serve --no-authentication`
+alongside `--allow-public-bind` ([`deployment.md` §4](deployment.md#4-binding-a-port)), and it
+hands every caller on that address the same authority — so it is for a network an operator owns,
+and `--no-web` is worth considering beside it. An
 interactive login belongs to team mode ([#13](https://github.com/mgd43b/manicule/issues/13)),
 where the session, its revocation and its CSRF story can be designed together instead of one of
 the three arriving on its own.

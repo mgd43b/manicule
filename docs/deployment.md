@@ -245,9 +245,12 @@ default, **and the browser surface at `/ui`**
 ([#12](https://github.com/mgd43b/manicule/issues/12)) **and MCP at `/mcp/`** on the same socket.
 There is no separate UI server, no separate MCP server and no second port.
 
-MCP served that way carries the **read-only tools only** — every mutating tool is absent from it
-rather than refused on it, for the reason `docs/surfaces.md` §6.1 gives. Over stdio, where one
-client talks to one process down a pipe, the whole surface is offered.
+MCP served that way carries the **read-only tools, plus `document_create` when the socket is
+authenticated** — every other mutating tool is absent from it rather than refused on it, for the
+reason [`surfaces.md` §6.1](surfaces.md#61-mcp-over-a-socket-carries-the-read-only-tools-and-one-named-write-when-it-is-authenticated)
+gives. With `security.auth.mode` set to `none` that one write is absent too, so an
+unauthenticated socket reads and cannot be written to at all. Over stdio, where one client talks
+to one process down a pipe, the whole surface is offered.
 
 The browser surface is for the loopback, single-operator installation. A browser cannot attach a
 header to a page load and this build has no session cookie, so with `security.auth.mode` set to
@@ -276,15 +279,40 @@ manicule refuses the software half of this on its own. `manicule.app.bind.resolv
 three separate things before it will bind anywhere but loopback: a non-loopback host somebody
 wrote into configuration, `--allow-public-bind` on the command line where no config file can
 supply it, and `security.auth.mode` set to something other than `none`. Any one missing is a
-refusal, and `manicule doctor` reports a non-loopback bind as failing when authentication is
-off.
+refusal.
+
+`manicule doctor`'s `transport` check reports what that produced: `ok` for a loopback bind,
+`degraded` for a non-loopback bind with authentication on — reachable from the network, which
+you meant, and worth saying — and `failing` for a non-loopback bind with authentication off.
+
+**A private installation on a trusted network can serve unauthenticated on purpose**, with
+`--no-authentication` beside `--allow-public-bind`. Both are required and neither implies the
+other. It is an argument rather than a setting for the reason `--allow-public-bind` is: a
+configuration key granting it would put an unauthenticated listener one file edit away, in a
+file that gets copied between machines. Three consequences to plan for.
+
+- **The socket carries no write tool at all.** `document_create` is not registered without
+  authentication, because an anonymous caller on that socket is an *administrator* — there is no
+  credential, so there is nothing to tell one caller from another.
+- **An installation with authoring configured still refuses to start this way.** The flag says
+  an index may be read by anyone; it does not say a corpus may be written by anyone, and that
+  refusal covers `POST /api/v1/documents` as well as the MCP tool. Serving authoring over a
+  network wants an API key.
+- **The `transport` check stays `failing`**, reworded to say this is deliberate. The exposure is
+  the same whether or not somebody meant it, so the health gate below must exclude the check by
+  `name` rather than expect it to pass.
+
+What it does not bound is the rest of the HTTP API. Every route this process serves is reachable
+by an anonymous administrator on that address — `config_set`, `plugin_add`, `index_path` and the
+rest — so this is for a network an operator owns, and `--no-web` is worth considering beside it.
 
 **In a container the two decisions compose, and both are yours.** A loopback bind *inside* a
 container is reachable only from inside it — `-p` forwards to the container's routable
 address, not to its `127.0.0.1` — so publishing anything at all means the container-side bind
-was already widened, which means manicule's three refusals were already satisfied and
-authentication is already on. What `-p` then decides is which of the **host's** interfaces see
-it, and `-p PORT:PORT` decides all of them. The guard inside the container cannot make that
+was already widened, which means manicule's three refusals were already satisfied: either
+authentication is on, or `--no-authentication` is in the command that started it. What `-p`
+then decides is which of the **host's** interfaces see it, and `-p PORT:PORT` decides all of
+them. The guard inside the container cannot make that
 choice for you and does not try to.
 
 ---

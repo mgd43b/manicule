@@ -8,15 +8,18 @@ client and one process, so a write tool on it is unreachable from a network by c
 ``http`` exists for a client that cannot spawn a process, and it goes through
 :func:`~manicule.app.bind.resolve_bind` like every other server in this project. A
 non-loopback bind needs a host somebody wrote down, an explicit opt-in the caller passes, and
-authentication switched on. Any one missing is a refusal.
+authentication switched on — or a second opt-in saying the operator accepts serving without it.
+Any one missing is a refusal.
 
-**And it carries the read-only tools, plus exactly one write.** Binding a socket removes the
-property stdio had, so something has to replace it: :func:`~manicule.mcp.server.build_server` is
-asked for the read-only surface, which registers a tool only when its ``readOnlyHint`` is true or
-its name is in :data:`~manicule.mcp.server.NETWORK_AUTHORING`. That set holds ``document_create``
-and nothing else. Every other write tool stays on stdio, on the command line, and on the control
-socket of #139 — every one of them a place where a person is present or a process is the writer.
-See :data:`NETWORK_SURFACE_IS_READ_ONLY`, and
+**And it carries the read-only tools, plus exactly one write — while it is authenticated.**
+Binding a socket removes the property stdio had, so something has to replace it:
+:func:`~manicule.mcp.server.build_server` is asked for the read-only surface, which registers a
+tool only when its ``readOnlyHint`` is true or its name is in
+:func:`~manicule.mcp.server.network_authoring`. That set holds ``document_create`` and nothing
+else, and it is empty whenever ``security.auth.mode`` is ``none`` — so ``--no-authentication``
+buys a socket that reads and cannot be written to at all. Every other write tool stays on stdio,
+on the command line, and on the control socket of #139 — every one of them a place where a
+person is present or a process is the writer. See :data:`NETWORK_SURFACE_IS_READ_ONLY`, and
 :func:`~manicule.app.bind.require_authoring_authentication` for the one thing a socket
 carrying authoring must have.
 
@@ -116,6 +119,7 @@ def address_for(
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
+    allow_unauthenticated: bool = False,
 ) -> ServerAddress:
     """Decide where the server will listen, before starting anything.
 
@@ -138,8 +142,16 @@ def address_for(
     # Before the bind, so an installation that cannot legitimately serve authoring is refused
     # for that reason rather than for whichever of the address checks it happens to also fail.
     # Reached only here, past the stdio branch above: a pipe has no port for anything to reach.
+    # `allow_unauthenticated` is deliberately not passed on: it satisfies a condition about
+    # reading, and this one is about writing. See that function.
     require_authoring_authentication(service.settings)
-    bind = resolve_bind(service.settings, host=host, port=port, allow_public=allow_public)
+    bind = resolve_bind(
+        service.settings,
+        host=host,
+        port=port,
+        allow_public=allow_public,
+        allow_unauthenticated=allow_unauthenticated,
+    )
     return ServerAddress(
         transport="http",
         host=bind.host,
@@ -156,6 +168,7 @@ async def serve(
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
+    allow_unauthenticated: bool = False,
 ) -> None:
     """Run the server until it is stopped.
 
@@ -163,7 +176,12 @@ async def serve(
     socket exists rather than after one has been listening for a moment.
     """
     address = address_for(
-        service, transport=transport, host=host, port=port, allow_public=allow_public
+        service,
+        transport=transport,
+        host=host,
+        port=port,
+        allow_public=allow_public,
+        allow_unauthenticated=allow_unauthenticated,
     )
     server = surface(service, transport=transport).server
     if address.transport == "stdio":

@@ -333,8 +333,8 @@ shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifec
 
 | Surface | Started by | Shape |
 |:---|:---|:---|
-| **MCP** | `manicule start --mcp-only` | 45 tools over stdio, which opens no socket; 27 at `/mcp/` when served over a port — the read-only ones, plus `document_create` |
-| **Command line** | `manicule <command>` | 27 commands; `--json` anywhere data is emitted |
+| **MCP** | `manicule start --mcp-only` | 45 tools over stdio, which opens no socket; at `/mcp/` when served over a port, the read-only ones — 27 with `document_create` on an authenticated socket, 26 without it on an unauthenticated one |
+| **Command line** | `manicule <command>` | 32 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 12 areas of server-rendered HTML, 11 in the navigation |
 
@@ -345,7 +345,7 @@ show what that envelope said rather than anything it worked out for itself.
 
 ### The command line
 
-Twenty-eight commands; `manicule --help` lists them. Under `--json` the result envelope is the
+Thirty-two commands; `manicule --help` lists them. Under `--json` the result envelope is the
 whole of stdout — no prose, no progress, nothing else — and a failure is that same envelope with
 `"ok": false`, a typed `error` and a non-zero exit status. So `jq` reads well-formed JSON whether
 the command succeeded or not.
@@ -399,11 +399,13 @@ caches it — and when there is no browser surface to redirect to, it says so an
 process *is* serving. `docs/surfaces.md` §6.3.
 
 **MCP is served from that same process and port**, at `/mcp/`, and it carries the **read-only
-tools plus `document_create`** — every other write tool is not registered on it rather than
-refused, so there is no handler behind `document_delete` or `connector_sync` there at all.
-Authoring is the one exception because it is bounded by configuration an operator wrote rather
-than by arguments a caller sends, it is off until that configuration exists, and a socket serving
-it without authentication refuses to start. Over stdio, where one client talks to one process down
+tools, plus `document_create` when this installation is authenticated** — every other write tool
+is not registered on it rather than refused, so there is no handler behind `document_delete` or
+`connector_sync` there at all. Authoring is the one exception because it is bounded by
+configuration an operator wrote rather than by arguments a caller sends, it is off until that
+configuration exists, and a socket serving it without authentication refuses to start. With
+`security.auth.mode` set to `none` that exception is empty too, so the socket carries the reads
+and nothing else. Over stdio, where one client talks to one process down
 a pipe, the whole surface is offered. `docs/surfaces.md` §6.1 says why.
 
 `/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
@@ -498,7 +500,7 @@ Four refusals are worth knowing before you call it:
 | **Unconfigured** | Both settings empty is the default, and means authoring is off. The tool is offered on every surface and refuses every call, naming the settings it needs. |
 | **An unlisted collection** | Refused even when the workspace has it — so creating a collection is not also the act of granting write access to it. |
 | **A slug already taken** | Refused unless `overwrite` is passed, and the refusal names the document that holds it. A file nothing has indexed counts as holding it too. |
-| **A socket with no authentication** | Refuses to *start*, loopback included. Authoring is the one write tool served over a socket, and a corpus read back as standing instructions is not something to serve unauthenticated. |
+| **A socket with no authentication** | Refuses to *start*, loopback included. Authoring is the one write tool served over a socket, and a corpus read back as standing instructions is not something to serve unauthenticated. `--no-authentication` does not waive this: it says an index may be read by anyone, not that a corpus may be written by anyone. An unauthenticated socket also publishes no `document_create` at all. |
 
 If the file is written and the index then declines it, **the file is kept** and the result says
 so with the path — the content is not lost, and a later sync indexes it.
@@ -673,7 +675,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/container` | Typed resolution and lifecycle. Assembled at startup, injected |
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
-| `src/manicule/cli` | Twenty-eight commands over that service, and nothing else |
+| `src/manicule/cli` | Thirty-two commands over that service, and nothing else |
 | `src/manicule/mcp` | Forty-five MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/extension` | A Chrome extension that hands this browser's Confluence session to a local manicule. No build step |
@@ -689,7 +691,9 @@ are called unattended, so that is not a distinction worth risking.
 **Nothing binds a network socket unless it is asked to.** The MCP server speaks stdio by default,
 which opens no socket at all; every HTTP bind goes through one policy that starts at loopback,
 and widening it takes an address somebody wrote down, an explicit flag no config file can supply,
-and authentication switched on. Any one missing is a refusal. That is a claim about what
+and authentication switched on — or a second flag, also reachable from no config file, saying the
+operator accepts serving without it. Any one missing is a refusal, and the socket that second flag
+produces carries no write tool at all. That is a claim about what
 listens, not about what this process dials: a `qdrant` vector store reaches out to
 `storage.vector_db_url` the same way a remote generator or a connector does, and it is
 `Settings.policy_problems()` — not this rule — that refuses the connection when the data

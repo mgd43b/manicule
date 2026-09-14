@@ -45,6 +45,7 @@ from manicule.app.served import ControlHandler, Scheduler, Serving, announce
 from manicule.app.service import ApplicationService
 from manicule.cli import render
 from manicule.config.loader import load_settings
+from manicule.config.settings import AuthMode
 from manicule.connectors.sessions import SESSIONS
 from manicule.core.errors import InstanceLockedError, ManiculeError
 from manicule.mcp.serve import address_for, serve
@@ -52,6 +53,7 @@ from manicule.mcp.serve import address_for, serve
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Generator, Mapping
 
+    from manicule.config.settings import Settings
     from manicule.mcp.serve import Transport
 
 EX_TEMPFAIL = 75
@@ -101,6 +103,7 @@ def serve_forever(
     host: str | None,
     port: int | None,
     allow_public: bool,
+    allow_unauthenticated: bool,
     overrides: Mapping[str, Any],
     json_output: bool,
     mcp_only: bool = False,
@@ -111,6 +114,11 @@ def serve_forever(
     The address is decided and announced **first**. A refusal — a non-loopback bind that was
     not asked for three separate times — happens here, before a socket exists, and is
     reported the same way every other failure is.
+
+    ``allow_unauthenticated`` is ``--no-authentication``, and it satisfies the third of those
+    three rather than skipping the policy. It is carried to the bind, to the application, and
+    to the service — the last so ``manicule doctor`` run *inside* this process can say that
+    serving unauthenticated was deliberate rather than only that it is happening.
 
     ``--transport http`` serves the **HTTP API, the browser surface and MCP together**, on one
     port; ``--mcp-only`` serves MCP alone over that socket. ``stdio`` is MCP whatever else was
@@ -134,6 +142,7 @@ def serve_forever(
                 host=host,
                 port=port,
                 allow_public=allow_public,
+                allow_unauthenticated=allow_unauthenticated,
                 overrides=overrides,
                 json_output=json_output,
                 mcp_only=mcp_only,
@@ -144,12 +153,40 @@ def serve_forever(
         return 130
 
 
+def serving_unauthenticated(
+    settings: Settings, *, transport: Transport, allow_unauthenticated: bool
+) -> bool:
+    """Whether this process is about to serve without authentication, deliberately.
+
+    **Three things, not one**, and each is load-bearing:
+
+    * the operator passed ``--no-authentication``;
+    * authentication really is off — the flag buys nothing on an installation that has some,
+      and a banner or a ``doctor`` finding there would put a warning in front of somebody with
+      no exposure, which is how warnings stop being read;
+    * and there is a **socket**. ``doctor``'s finding says this process "is bound to" an address
+      and that callers "can route to the port", and on stdio both are false: a pipe has no port,
+      and ``security.transport.bind_host`` is then a setting nothing acted on.
+
+    A named function rather than an expression inline, because two readers ask this question —
+    the startup banner and the service's own answer to ``doctor`` — and two expressions of one
+    rule are free to disagree. It also makes the third condition assertable, which is the one
+    that was missing.
+    """
+    return (
+        allow_unauthenticated
+        and transport != "stdio"
+        and settings.security.auth.mode is AuthMode.NONE
+    )
+
+
 async def _serve(
     *,
     transport: Transport,
     host: str | None,
     port: int | None,
     allow_public: bool,
+    allow_unauthenticated: bool,
     overrides: Mapping[str, Any],
     json_output: bool,
     mcp_only: bool,
@@ -176,11 +213,20 @@ async def _serve(
         _report(failed("start", "unknown", error_info(exc)), json_output)
         return EX_CONFIG
     async with runtime:
-        service = ApplicationService(runtime)
+        unauthenticated = serving_unauthenticated(
+            runtime.settings, transport=transport, allow_unauthenticated=allow_unauthenticated
+        )
+        service = ApplicationService(runtime, serving_unauthenticated=unauthenticated)
         api = transport == "http" and not mcp_only
         try:
             address = (
-                _api_address(service, host=host, port=port, allow_public=allow_public)
+                _api_address(
+                    service,
+                    host=host,
+                    port=port,
+                    allow_public=allow_public,
+                    allow_unauthenticated=allow_unauthenticated,
+                )
                 if api
                 else address_for(
                     service,
@@ -188,6 +234,7 @@ async def _serve(
                     host=host,
                     port=port,
                     allow_public=allow_public,
+                    allow_unauthenticated=allow_unauthenticated,
                 )
             )
         except ManiculeError as exc:
@@ -207,6 +254,7 @@ async def _serve(
             json_output,
             stderr=True,
             web=web if api else None,
+            unauthenticated=unauthenticated,
         )
         pid = write_pidfile(
             runtime.settings.data_dir,
@@ -221,7 +269,12 @@ async def _serve(
         try:
             if api:
                 await serve_over_a_socket(
-                    service, host=host, port=port, allow_public=allow_public, web=web
+                    service,
+                    host=host,
+                    port=port,
+                    allow_public=allow_public,
+                    allow_unauthenticated=allow_unauthenticated,
+                    web=web,
                 )
             else:
                 await _serve_a_protocol(
@@ -230,6 +283,7 @@ async def _serve(
                     host=host,
                     port=port,
                     allow_public=allow_public,
+                    allow_unauthenticated=allow_unauthenticated,
                 )
         except AlreadyServingError as exc:
             # Something answers on the control socket. Rare once the lock has been taken — the
@@ -258,6 +312,7 @@ async def _serve_a_protocol(
     host: str | None,
     port: int | None,
     allow_public: bool,
+    allow_unauthenticated: bool,
 ) -> None:
     """Serve MCP alone — over stdio, or over a socket with ``--mcp-only``.
 
@@ -269,7 +324,14 @@ async def _serve_a_protocol(
     editor spawns and the one nobody is watching.
     """
     async with _writing(service):
-        await serve(service, transport=transport, host=host, port=port, allow_public=allow_public)
+        await serve(
+            service,
+            transport=transport,
+            host=host,
+            port=port,
+            allow_public=allow_public,
+            allow_unauthenticated=allow_unauthenticated,
+        )
 
 
 async def serve_over_a_socket(
@@ -278,6 +340,7 @@ async def serve_over_a_socket(
     host: str | None,
     port: int | None,
     allow_public: bool,
+    allow_unauthenticated: bool,
     web: bool,
 ) -> None:
     """Serve the HTTP API, the browser surface and MCP from one process, and stop them in order.
@@ -295,7 +358,14 @@ async def serve_over_a_socket(
     """
     from manicule.api.serve import server_for  # noqa: PLC0415 - heavy, and only this path serves
 
-    transport = server_for(service, host=host, port=port, allow_public=allow_public, web=web)
+    transport = server_for(
+        service,
+        host=host,
+        port=port,
+        allow_public=allow_public,
+        allow_unauthenticated=allow_unauthenticated,
+        web=web,
+    )
     stop = asyncio.Event()
     impatient = asyncio.Event()
 
@@ -425,6 +495,7 @@ def _api_address(
     host: str | None,
     port: int | None,
     allow_public: bool,
+    allow_unauthenticated: bool,
 ) -> ServerAddress:
     """Where the HTTP API will listen, decided before anything is built.
 
@@ -433,7 +504,13 @@ def _api_address(
     """
     from manicule.api.serve import address_for as api_address_for  # noqa: PLC0415 - heavy
 
-    _, address = api_address_for(service, host=host, port=port, allow_public=allow_public)
+    _, address = api_address_for(
+        service,
+        host=host,
+        port=port,
+        allow_public=allow_public,
+        allow_unauthenticated=allow_unauthenticated,
+    )
     return address
 
 
@@ -509,13 +586,19 @@ def _report(
     *,
     stderr: bool = False,
     web: bool | None = None,
+    unauthenticated: bool = False,
 ) -> None:
     out = render.console(stderr=stderr or not envelope.ok)
     if json_output:
         out.print_json(data=envelope.as_json())
         return
     if envelope.ok and envelope.data is not None:
-        render.render_address(out, ServerAddress.model_validate(envelope.data), web=web)
+        render.render_address(
+            out,
+            ServerAddress.model_validate(envelope.data),
+            web=web,
+            unauthenticated=unauthenticated,
+        )
         return
     if envelope.error is not None:
         render.render_error(out, envelope.op, envelope.error)
@@ -528,5 +611,6 @@ __all__ = [
     "running_address",
     "serve_forever",
     "serve_over_a_socket",
+    "serving_unauthenticated",
     "stop_running",
 ]

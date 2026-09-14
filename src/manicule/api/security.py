@@ -12,11 +12,21 @@ because a rule implemented in a surface is a rule the other surfaces do not have
 route asks for the least it needs. Reads take a viewer; writes take a member; anything that
 changes what the installation *is* takes an admin.
 
-**Unauthenticated means loopback.** When ``security.auth.mode`` is ``none`` there is no
-credential to check, and the caller is whoever is sitting at this machine — the same authority
-the command line has. That is only tolerable because a non-loopback bind with no auth is
-refused twice: by :func:`~manicule.app.bind.resolve_bind` before a socket exists, and by
+**Unauthenticated means loopback, unless an operator said otherwise at a terminal.** When
+``security.auth.mode`` is ``none`` there is no credential to check, and the caller is whoever is
+sitting at this machine — the same authority the command line has. That is tolerable because a
+non-loopback bind with no auth is refused twice: by
+:func:`~manicule.app.bind.resolve_bind` before a socket exists, and by
 :func:`~manicule.api.app.build_app` before an application exists.
+
+``manicule serve --no-authentication`` satisfies both refusals, and it is the one case where
+the assumption above does not hold: the anonymous administrator below is then anything that can
+route to the port. **What keeps that bounded is that the surface shrinks rather than the check
+loosening.** No route gains a guard for this, because a guard is a thing to get wrong on one
+route; instead :func:`~manicule.mcp.server.network_authoring` publishes no write tool on an
+unauthenticated socket, so the authority an anonymous administrator holds over MCP is the
+authority to read. The HTTP route groups are the surface where that flag is genuinely a decision
+about exposure, and it is the operator's to make with the flag's name in their shell history.
 """
 
 from __future__ import annotations
@@ -87,6 +97,11 @@ class Principal:
         **admin**, because it is the operator at a loopback socket and they already have the
         command line. An unauthenticated principal on an installation *with* auth configured
         never reaches a route at all — :func:`require` refuses first.
+
+        ``--no-authentication`` is the case where "at a loopback socket" stops being true, and
+        this property is deliberately unchanged by it. A role that read the bind would be a
+        second authorization rule, disagreeing with this one on whichever surface forgot to
+        consult it; the module docstring says where the bound is kept instead.
         """
         if not self.identity.authenticated:
             return Role.ADMIN if self.identity.mode == AuthMode.NONE.value else Role.VIEWER

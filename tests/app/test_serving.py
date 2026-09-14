@@ -22,19 +22,25 @@ import inspect
 import io
 import textwrap
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
+from unittest import mock
 
 import pytest
 from fastapi.testclient import TestClient
 from rich.console import Console
+from typer.testing import CliRunner
 
 from manicule.api.app import build_app
 from manicule.api.serve import TRANSPORT as API_TRANSPORT
 from manicule.app.results import ServerAddress
 from manicule.app.service import ApplicationService
 from manicule.cli import main as cli_main
-from manicule.cli import render
+from manicule.cli import render, serving
+from manicule.config.settings import Settings
 from tests.api.support import LOCAL_PEER, backend_with_a_document
+
+if TYPE_CHECKING:
+    from manicule.mcp.serve import Transport
 
 NOT_FOUND = 404
 OK = 200
@@ -209,6 +215,70 @@ def test_the_renderer_names_the_surface_the_transport_says_it_is() -> None:
     assert "MCP server" not in written, "the API server was announced as an MCP server"
 
 
+def _announced(*, loopback: bool, unauthenticated: bool) -> str:
+    """The start banner, rendered as an operator's terminal would receive it."""
+    console = Console(file=io.StringIO(), width=100, no_color=True, highlight=False)
+    render.render_address(
+        console,
+        ServerAddress(
+            transport=API_TRANSPORT,
+            host="127.0.0.1" if loopback else "0.0.0.0",  # noqa: S104 - the address being announced
+            port=8765,
+            loopback=loopback,
+        ),
+        unauthenticated=unauthenticated,
+    )
+    return cast("io.StringIO", console.file).getvalue()
+
+
+def test_serving_unauthenticated_is_announced_and_names_the_flag() -> None:
+    """A server that asks callers for nothing says so, in the words that produced it.
+
+    **The flag is named because that is the fix.** An operator who did not mean this removes an
+    argument from the command they just ran; a warning that described the state without naming
+    the argument would send them to the configuration file, where this is deliberately not.
+
+    The other two lines are the consequences that surprise people. Without a credential there is
+    no viewer — every caller is an administrator — and the socket carries no write tool, so an
+    operator who had configured authoring learns that here rather than from a client reporting
+    an unknown tool several minutes later.
+    """
+    written = _announced(loopback=False, unauthenticated=True)
+
+    assert "--no-authentication" in written, written
+    assert "administrator" in written, written
+    assert "document_create" in written, (
+        "the banner does not say the socket lost its one write, so the operator who configured "
+        "authoring finds out from a client instead"
+    )
+
+
+def test_the_ordinary_banner_makes_no_claim_about_authentication() -> None:
+    """The control, without which the assertions above pass against a banner that always warns.
+
+    A warning printed on every start is a warning nobody reads, which would cost exactly the
+    thing the test above is for.
+    """
+    written = _announced(loopback=True, unauthenticated=False)
+
+    assert "--no-authentication" not in written, written
+    assert "administrator" not in written, written
+
+
+def test_the_warning_is_printed_on_loopback_too() -> None:
+    """Loopback changes the sentence, not whether it is said.
+
+    ``--no-authentication`` on loopback is the transport somebody is most likely to try it on
+    first, and it is not inert there: it waives the authoring refusal, so that socket loses its
+    write as well. A flag that printed nothing on the bind people reach for first is a flag whose
+    effect they discover later, on the bind where it matters.
+    """
+    written = _announced(loopback=True, unauthenticated=True)
+
+    assert "--no-authentication" in written, written
+    assert "this machine" in written, written
+
+
 def test_the_mirrored_transport_constant_agrees_with_the_api() -> None:
     """``render`` names the API's transport without importing FastAPI to learn it.
 
@@ -229,3 +299,85 @@ def test_the_help_text_for_no_web_is_not_the_old_claim() -> None:
         "`manicule start --help` still claims the web UI is not built"
     )
     assert Path(cli_main.__file__).exists()
+
+
+def test_the_no_authentication_flag_reaches_the_bind_policy() -> None:
+    """The flag is declared, typed, and arrives as ``allow_unauthenticated``.
+
+    **The name a person types and the name the policy reads are deliberately different**, and
+    that gap is exactly what this pins. ``--no-authentication`` says what an operator is
+    choosing; ``allow_unauthenticated`` says what the bind is being permitted. A rename on
+    either side that did not reach the other would leave a flag Typer accepts and nothing acts
+    on — which is the failure ``_swallowed_options`` above exists for, and which that check
+    cannot see here because the parameter *is* passed on, to a function called under a name this
+    module does not resolve.
+    """
+    captured: dict[str, object] = {}
+
+    def capture(**arguments: object) -> int:
+        captured.update(arguments)
+        return 0
+
+    with mock.patch("manicule.cli.serving.serve_forever", capture):
+        result = CliRunner().invoke(
+            cli_main.app, ["serve", "--allow-public-bind", "--no-authentication"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured["allow_unauthenticated"] is True
+    assert captured["allow_public"] is True
+
+
+def test_the_two_flags_are_independent_at_the_command_line() -> None:
+    """Neither flag implies the other, asserted where an operator types them.
+
+    The bind policy keeps them separate (``tests/app/test_bind.py``) and this is the other end of
+    that: a command line naming one must not arrive with both set. Otherwise an operator asking
+    for a private unauthenticated install would get a public one from the only argument offered.
+    """
+    captured: dict[str, object] = {}
+
+    def capture(**arguments: object) -> int:
+        captured.update(arguments)
+        return 0
+
+    with mock.patch("manicule.cli.serving.serve_forever", capture):
+        CliRunner().invoke(cli_main.app, ["serve", "--no-authentication"])
+
+    assert captured["allow_unauthenticated"] is True
+    assert captured["allow_public"] is False
+
+
+UNAUTHENTICATED = Settings(security={"auth": {"mode": "none"}})  # pyright: ignore[reportArgumentType]
+AUTHENTICATED = Settings(security={"auth": {"mode": "api_key"}})  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize(
+    ("settings", "transport", "flag", "expected", "why"),
+    [
+        (UNAUTHENTICATED, "http", True, True, "the case the flag exists for"),
+        (UNAUTHENTICATED, "http", False, False, "nobody asked"),
+        (AUTHENTICATED, "http", True, False, "the flag buys nothing where there is a key"),
+        (UNAUTHENTICATED, "stdio", True, False, "a pipe has no port to be reachable on"),
+    ],
+)
+def test_serving_unauthenticated_needs_the_flag_the_mode_and_a_socket(
+    settings: Settings, transport: str, flag: bool, expected: bool, why: str
+) -> None:
+    """All three, and the third is the one that is easy to leave out.
+
+    ``doctor``'s finding says this process "is bound to" an address and that callers "can route
+    to the port". On **stdio** both are false whatever ``security.transport.bind_host`` holds —
+    that setting is one nothing acted on — so a state computed from the flag and the mode alone
+    would have a serving process assert a bind it never made. The middle row is the other
+    direction: a warning shown to an operator who has a key and therefore no exposure is how
+    warnings stop being read.
+
+    One function rather than an expression at each site, because the banner and the service's
+    answer to ``doctor`` both ask this and two expressions of one rule are free to disagree.
+    """
+    decided = serving.serving_unauthenticated(
+        settings, transport=cast("Transport", transport), allow_unauthenticated=flag
+    )
+
+    assert decided is expected, why
