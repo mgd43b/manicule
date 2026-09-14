@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.22](https://github.com/mgd43b/manicule/compare/v0.1.21...v0.1.22) (2026-09-14)
+
+
+### Bug Fixes
+
+* keep backend-agnostic paths free of LanceDB so Qdrant runs without AVX2 ([#358](https://github.com/mgd43b/manicule/issues/358)) ([36c2dc9](https://github.com/mgd43b/manicule/commit/36c2dc985fc32f5917448ae64b948ba85138b8b3))
+* **release:** make the image's layers reproducible so releases share the model layer ([#356](https://github.com/mgd43b/manicule/issues/356)) ([2912b88](https://github.com/mgd43b/manicule/commit/2912b88084918591010fe766d70f9fde6468dc7f))
+* **runtime:** require the configured backend, not just the protocol, before Lance-specific work ([#359](https://github.com/mgd43b/manicule/issues/359)) ([bbb0df8](https://github.com/mgd43b/manicule/commit/bbb0df85d07299036520e79faccfc8f93c16b2d0))
+
 ## [0.1.21](https://github.com/mgd43b/manicule/compare/v0.1.20...v0.1.21) (2026-09-14)
 
 
