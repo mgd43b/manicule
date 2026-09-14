@@ -3000,6 +3000,10 @@ class ApplicationService:
             # a process that was started with the flag. A fresh `manicule doctor` reads the same
             # settings and reports `false`, which is the honest answer to what a file can say.
             "serving_unauthenticated": self._serving_unauthenticated,
+            # Whether that unauthenticated surface can be *written* into, which is a different
+            # exposure from one that reads and is the one a monitor most wants to select on.
+            "unauthenticated_authoring": self._serving_unauthenticated
+            and self.settings.authoring.configured,
         }
         if loopback:
             return r.Check(
@@ -3022,8 +3026,12 @@ class ApplicationService:
                 detail=(
                     f"serving unauthenticated, deliberately: this process was started with "
                     f"--no-authentication and is bound to {bound!r}. Anything that can route "
-                    f"to the port is an administrator here, and MCP on it carries no write "
-                    f"tool."
+                    f"to the port is an administrator here"
+                    + (
+                        f", and may author into {self.settings.authoring.source!r}."
+                        if self.settings.authoring.configured
+                        else "."
+                    )
                 ),
                 facts=facts,
                 remedy="manicule config set security.auth.mode api_key",

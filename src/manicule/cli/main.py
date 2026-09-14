@@ -2322,7 +2322,7 @@ def start(
         bool,
         typer.Option(
             "--no-authentication",
-            help="Serve with no authentication at all. MCP here then carries no write tool.",
+            help="Serve with no authentication at all. Any caller is then an administrator.",
         ),
     ] = False,
     no_web: Annotated[bool, typer.Option("--no-web", help="Do not serve the web UI.")] = False,
@@ -2351,11 +2351,14 @@ def start(
     unauthenticated listener on a network, it is said out loud at startup, and ``manicule
     doctor`` reports it for as long as it holds.
 
-    **It buys a surface that reads.** Without authentication nothing can tell one caller from
-    another, so ``document_create`` is not registered and MCP over that socket reads and nothing
-    else — and an installation that has configured authoring still refuses to serve a socket
-    unauthenticated, however it was asked. Everything else this process serves is reachable by
-    an anonymous administrator on that address, so it is for a network you own.
+    **It buys the whole surface, authoring included, and that is the point.** The deployment
+    this exists for is manicule serving a corpus to assistants running no manicule of their own,
+    where authoring is the capability the socket is for — a read-only surface would make it
+    pointless. Without authentication nothing can tell one caller from another, so every caller
+    is an administrator: anything that can route to the port can search, and can write into the
+    configured authoring source, over MCP and over ``POST /api/v1/documents`` alike. That is
+    accepted rather than mitigated. Pass it only where you own the network in front of this
+    process, and read the line the startup banner prints naming the corpus.
 
     ``--no-web`` leaves the browser surface unmounted, so every ``/ui`` path answers 404 and
     the process serves the JSON API and MCP. It applies to ``--transport http`` without

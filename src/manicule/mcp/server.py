@@ -24,17 +24,15 @@ bind that was not asked for three separate times.
 carries — see :func:`hints`. They are a description, never a permission: a client decides what
 it will call, and nothing here consults them.
 
-**Over a socket, the mutating tools are not registered at all — with one named exception, and
-only while the socket is authenticated.** Over stdio they are unreachable from a network by
-construction — stdin and stdout are a pipe — and moving MCP onto a socket destroys that property
-unless something replaces it. What replaces it is ``read_only=True``: :func:`build_server`
-consults the very hints above and never calls ``@mcp.tool`` for a tool whose ``readOnlyHint`` is
-not true and whose name is not in :func:`network_authoring`, so every other write tool is absent
-from ``tools/list``, absent from ``tools/call``, and absent from the process's dispatch table for
-that server object. That is the same kind of guarantee ``tests/api/test_routes.py`` keeps for the
-HTTP surface, made the same way: **structurally, not by a check a caller could be granted an
-exception to.** With ``security.auth.mode`` set to ``none`` the exception itself is empty, so an
-unauthenticated socket carries the reads and nothing else.
+**Over a socket, the mutating tools are not registered at all — with one named exception.**
+Over stdio they are unreachable from a network by construction — stdin and stdout are a pipe —
+and moving MCP onto a socket destroys that property unless something replaces it. What replaces
+it is ``read_only=True``: :func:`build_server` consults the very hints above and never calls
+``@mcp.tool`` for a tool whose ``readOnlyHint`` is not true and whose name is not in
+:data:`NETWORK_AUTHORING`, so every other write tool is absent from ``tools/list``, absent from
+``tools/call``, and absent from the process's dispatch table for that server object. That is
+the same kind of guarantee ``tests/api/test_routes.py`` keeps for the HTTP surface, made the
+same way: **structurally, not by a check a caller could be granted an exception to.**
 
 The classification is read from the registrations and from nowhere else, so a tool added
 tomorrow is excluded until somebody writes down what it does — the safe direction, and the same
@@ -52,7 +50,6 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from manicule.app.dispatch import run_op
-from manicule.config.settings import AuthMode
 from manicule.core.organization import CollectionRule
 from manicule.core.version import CORE_VERSION
 
@@ -61,7 +58,6 @@ if TYPE_CHECKING:
 
     from manicule.app.results import Payload
     from manicule.app.service import ApplicationService
-    from manicule.config.settings import Settings
 
 SERVER_NAME = "manicule"
 
@@ -158,35 +154,6 @@ says about scoping a question and reading `ok` is true of this one too.
 It exists so that "I cannot do that" is a sentence the assistant can say **before** calling
 something that is not there. A client that discovers the absence from an unknown-tool error has
 already spent a turn on it, and the obvious recovery from an unknown tool is to try another name.
-
-:data:`UNAUTHENTICATED_NOTICE` is the same paragraph for the surface that carries no write at
-all. Two constants rather than one with a conditional sentence in it, because each is a whole
-message an assistant reads once and neither has to describe the other.
-"""
-
-UNAUTHENTICATED_NOTICE = """\
-
-## This server is read-only
-
-It is being served over a socket with no authentication, so it offers the tools that read and
-nothing else. Indexing a directory, deleting, syncing a source, writing configuration, enabling
-a plugin and authoring a document are **not** absent by accident and are not behind a permission
-you can be granted: they are not registered on this server at all.
-
-`document_create` is absent for a reason worth knowing rather than working around. With no
-authentication this server cannot tell one caller from another, so a write into a corpus that is
-read back as standing instructions would be a write anybody who can reach this port could make.
-
-The rest are reachable where a person is present — `manicule <command>` at a terminal, or an MCP
-client that launches `manicule serve` over stdio, which carries the whole surface including
-authoring. If a task needs one, say which command it needs and stop; there is nothing here to
-retry.
-"""
-"""What a server with no write at all tells a client, in place of :data:`READ_ONLY_NOTICE`.
-
-Says *why* ``document_create`` is missing, because this is the one surface where an assistant
-could reasonably have been told by an operator that authoring is available. Being told the
-reason is what stops it reporting a broken installation.
 """
 
 
@@ -319,49 +286,21 @@ write on it sits behind a door that is already locked — and the deployment thi
 manicule serving a corpus from elsewhere with no manicule process on the laptop at all, which a
 read-only network surface would make pointless.
 
-**Authentication is the lock on that door, so this set is conditional on it.** Read
-:func:`network_authoring` rather than this constant: it returns nothing at all when
-``security.auth.mode`` is ``none``, which is what keeps the paragraph above true once
-``--no-authentication`` exists. This is the set of writes a socket carries *when the door is
-locked*; unlocked, there is no set.
+**``--no-authentication`` unlocks that door, and this set does not change when it does.** An
+operator who passes it has asserted that the network in front of this process is one they own —
+a private LAN, or a cluster behind an ingress that authenticates for us — and the capability the
+socket exists to serve is authoring: assistants writing memories into a corpus from machines
+that run no manicule of their own. A read-only surface there would make the deployment pointless,
+which is the same sentence this docstring already used about a read-only network surface. What
+carries the weight instead is that the flag is argv, said out loud at startup naming the corpus,
+and reported by ``manicule doctor`` as a finding for as long as it holds. The risk is accepted
+rather than mitigated, and :mod:`manicule.app.bind` says so in those words.
 
 The property that must not be lost is that the absence of every *other* write tool stays
 **mechanical rather than reasoned**. It does: :class:`_Registrar` still admits a tool only when
 its ``readOnlyHint`` is true or its name is in the set it was given, so there is no handler
 behind any other write tool's name on a socket — an absence, not a refusal.
 """
-
-
-def network_authoring(settings: Settings) -> frozenset[str]:
-    """The writes a socket carries: :data:`NETWORK_AUTHORING`, or nothing without authentication.
-
-    **One rule, and it is a set operation rather than a guard.** ``document_create`` is not
-    published-and-refused on an unauthenticated socket; it is not published. That is the same
-    shape as every *other* write tool's absence from the network surface, and it is deliberate
-    that the escape hatch did not introduce a second shape — a guard can be wrong about a
-    caller, and a tool that was never registered cannot be called by anybody.
-
-    **Why authentication is the condition.** With ``security.auth.mode`` set to ``none`` there
-    is no credential, and :class:`manicule.api.security.Principal` resolves an anonymous caller
-    to :attr:`~manicule.api.security.Role.ADMIN` — the operator at a loopback socket, which is
-    what that mode assumed. :func:`require_network_member` asks for a member floor and an
-    administrator clears it, so authentication being off does not merely widen who may author,
-    it removes the question. Anything that can route to the port could then write a document
-    into a corpus that assistants read back as standing instructions. That is an injection
-    channel rather than a privacy problem, which is why it is answered by taking the tool off
-    the surface rather than by documenting a risk.
-
-    Loopback does not earn an exception here, for
-    :func:`~manicule.app.bind.require_authoring_authentication`'s reason: on a laptop "only from
-    this machine" includes every process on it and every page a browser has open.
-
-    Stdio never reaches this. It carries the whole surface because a pipe between one client and
-    one process has no port for anything to reach, and :class:`_Registrar` admits everything
-    when it was not asked for the read-only surface.
-    """
-    if settings.security.auth.mode is AuthMode.NONE:
-        return frozenset()
-    return NETWORK_AUTHORING
 
 
 async def require_network_member(service: ApplicationService) -> None:
@@ -450,17 +389,9 @@ class _Registrar:
     fails on both, rather than passing on whichever surface happened to drop it.
     """
 
-    def __init__(self, mcp: FastMCP, *, read_only: bool, authoring: frozenset[str]) -> None:
+    def __init__(self, mcp: FastMCP, *, read_only: bool) -> None:
         self._mcp = mcp
         self._read_only = read_only
-        self._authoring = authoring
-        """The writes this surface admits beside the reads. :func:`network_authoring` decides.
-
-        Passed in rather than read from :data:`NETWORK_AUTHORING` here, because whether a socket
-        carries a write depends on whether it is authenticated, and a registrar that reached for
-        the constant would answer that question the same way on both.
-        """
-
         self.named: dict[str, ToolAnnotations] = {}
         """Every tool this module registered, and what each says it does."""
 
@@ -480,17 +411,16 @@ class _Registrar:
         convenient way. :func:`hints` makes all four required, so this cannot fire today; it is
         the direction the code fails in if that ever stops being true.
 
-        :func:`network_authoring` is the one way past that test, and it is a membership check
-        against a set this registrar was handed rather than a flag on a registration. A tool
-        that carried its own "but I am allowed on a socket" argument would put the decision at
-        forty-five call sites; here the whole of it is one frozenset a reader can hold in their
-        head and a test can assert as a set operation. On an unauthenticated surface that set is
-        empty, so the test has nothing to go past.
+        :data:`NETWORK_AUTHORING` is the one way past that test, and it is a membership check
+        against a named set rather than a flag on a registration. A tool that carried its own
+        "but I am allowed on a socket" argument would put the decision at forty-five call sites;
+        here the whole of it is one frozenset a reader can hold in their head and a test can
+        assert as a set operation.
         """
 
         def register(function: Tool) -> Tool:
             self.named[function.__name__] = annotations
-            admitted = annotations.read_only_hint is True or function.__name__ in self._authoring
+            admitted = annotations.read_only_hint is True or function.__name__ in NETWORK_AUTHORING
             if self._read_only and not admitted:
                 return function
             self.carried.add(function.__name__)
@@ -751,19 +681,12 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             does not report itself read-only. All three are startup failures rather than tests,
             because each is a surface nothing describes.
     """
-    # The writes this surface admits, decided from the settings this service was built over
-    # rather than from the constant: an unauthenticated socket carries none. See
-    # :func:`network_authoring`. Decided before the server, because it also decides which
-    # notice the server's own instructions carry — a client told that `document_create` is here
-    # and then given an unknown-tool error has spent a turn finding out.
-    authoring = network_authoring(service.settings)
-    notice = READ_ONLY_NOTICE if authoring else UNAUTHENTICATED_NOTICE
     mcp: FastMCP = FastMCP(
         name=SERVER_NAME,
         version=CORE_VERSION,
-        instructions=INSTRUCTIONS + notice if read_only else INSTRUCTIONS,
+        instructions=INSTRUCTIONS + READ_ONLY_NOTICE if read_only else INSTRUCTIONS,
     )
-    register = _Registrar(mcp, read_only=read_only, authoring=authoring)
+    register = _Registrar(mcp, read_only=read_only)
 
     async def dispatch(op: str, call: Callable[[], Awaitable[Payload]]) -> dict[str, Any]:
         return (await run_op(op, service.workspace, call)).as_json()
@@ -1473,13 +1396,11 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             *collections,
         )
     }
-    _check_wiring(register, declared, read_only=read_only, authoring=authoring)
+    _check_wiring(register, declared, read_only=read_only)
     return Surface(server=mcp, tools=tuple(sorted(register.carried)))
 
 
-def _check_wiring(
-    register: _Registrar, declared: set[str], *, read_only: bool, authoring: frozenset[str]
-) -> None:
+def _check_wiring(register: _Registrar, declared: set[str], *, read_only: bool) -> None:
     """The two startup failures, out of :func:`build_surface` so that it stays readable.
 
     Raises:
@@ -1503,13 +1424,12 @@ def _check_wiring(
     if not read_only:
         return
     reads = {name for name in register.named if register.named[name].read_only_hint is True}
-    expected = reads | authoring
+    expected = reads | NETWORK_AUTHORING
     if register.carried != expected:  # pragma: no cover - `_Registrar.tool` decides both sides
-        beside = f"plus {sorted(authoring)}" if authoring else "and no write at all"
         extra = sorted(register.carried - expected)
         missing = sorted(expected - register.carried)
         msg = (
-            f"the network MCP surface is not the read-only set {beside}. "
+            f"the network MCP surface is not the read-only set plus {sorted(NETWORK_AUTHORING)}. "
             f"Carried and not admitted: {extra or 'none'}. Admitted and not carried: "
             f"{missing or 'none'}. That surface is served over a socket, so anything in the "
             f"first list is a write operation reachable from the network."
@@ -1524,11 +1444,9 @@ __all__ = [
     "READ_ONLY_NOTICE",
     "SERVER_NAME",
     "TOOL_NAMES",
-    "UNAUTHENTICATED_NOTICE",
     "Surface",
     "build_server",
     "build_surface",
     "hints",
-    "network_authoring",
     "require_network_member",
 ]

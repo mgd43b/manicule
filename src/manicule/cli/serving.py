@@ -263,6 +263,10 @@ async def _serve(
             stderr=True,
             web=web if api else None,
             unauthenticated=unauthenticated,
+            # Named in the banner rather than described, because "this can be written into" is
+            # the fact an operator needs and "which corpus" is the fact they act on. Empty when
+            # authoring is unconfigured, where there is nothing to warn about.
+            authoring=runtime.settings.authoring.source if unauthenticated else "",
         )
         pid = write_pidfile(
             runtime.settings.data_dir,
@@ -595,6 +599,7 @@ def _report(
     stderr: bool = False,
     web: bool | None = None,
     unauthenticated: bool = False,
+    authoring: str = "",
 ) -> None:
     out = render.console(stderr=stderr or not envelope.ok)
     if json_output:
@@ -606,6 +611,7 @@ def _report(
             ServerAddress.model_validate(envelope.data),
             web=web,
             unauthenticated=unauthenticated,
+            authoring=authoring,
         )
         return
     if envelope.error is not None:

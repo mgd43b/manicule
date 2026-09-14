@@ -142,9 +142,7 @@ def address_for(
     # Before the bind, so an installation that cannot legitimately serve authoring is refused
     # for that reason rather than for whichever of the address checks it happens to also fail.
     # Reached only here, past the stdio branch above: a pipe has no port for anything to reach.
-    # `allow_unauthenticated` is deliberately not passed on: it satisfies a condition about
-    # reading, and this one is about writing. See that function.
-    require_authoring_authentication(service.settings)
+    require_authoring_authentication(service.settings, allow_unauthenticated=allow_unauthenticated)
     bind = resolve_bind(
         service.settings,
         host=host,

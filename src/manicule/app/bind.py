@@ -29,13 +29,21 @@ safe and does not pretend to. What it buys is that the choice is recorded in the
 made it, said out loud at startup, and reported by ``manicule doctor`` as a finding for as long
 as it holds.
 
-**And it costs the network surface its one write.** With authentication off every anonymous
-caller resolves to an administrator — see :mod:`manicule.api.security` — so a socket carrying
-``document_create`` unauthenticated is a corpus that anything able to route to the port may
-write into, and that corpus is read back by assistants as standing instructions. So
-:func:`manicule.mcp.server.network_authoring` is empty whenever authentication is off: MCP over
-a socket is the read-only set and nothing else. That is not a mitigation bolted on beside the
-flag, it is what makes the flag admissible at all.
+**And it carries a risk that is accepted rather than mitigated, which is the part to read
+twice.** With authentication off every anonymous caller resolves to an administrator — see
+:mod:`manicule.api.security` — so a socket serving ``document_create`` unauthenticated is a
+corpus that anything able to route to the port may write into, over MCP and over
+``POST /api/v1/documents`` alike. That corpus is read back by assistants as standing
+instructions, so a write into it places text in front of future sessions on machines that never
+touched this deployment.
+
+**That is served anyway, deliberately**, because it is the capability the flag exists for:
+assistants writing memories into a corpus from machines running no manicule of their own, and a
+read-only surface would make that deployment pointless. The operator passing this flag is
+asserting that the network in front of the process is one they own — a private LAN, or a cluster
+behind an ingress that authenticates for us. manicule cannot verify that assertion, exactly as it
+cannot verify ``allow_public``; what it can do is refuse to let a *file* make it, say so at
+startup naming the corpus, and report it from ``manicule doctor`` for as long as it holds.
 
 Stdio transports never come here at all, and that is the point of
 :func:`stdio` — a bind decision that is not made cannot be made wrongly, so the MCP server's
@@ -44,9 +52,9 @@ default mode has no address to get wrong.
 :func:`require_authoring_authentication` is the one rule here that is stricter than the three
 above: a socket carrying ``document_create`` needs authentication even on loopback, because
 "reachable only from this machine" is a weaker statement about a write into a corpus than it is
-about a read out of one. ``allow_unauthenticated`` does **not** waive it: accepting an index
-anyone can read is not the same as accepting a corpus anyone can write, and that refusal covers
-``POST /api/v1/documents`` as well as the MCP tool, where narrowing the MCP surface would not.
+about a read out of one. ``allow_unauthenticated`` waives it, and that waiver is the whole
+point of the flag rather than a hole in it: the refusal exists so nobody serves authoring
+unauthenticated *without meaning to*, and an operator who typed the argument means to.
 """
 
 from __future__ import annotations
@@ -112,7 +120,9 @@ class Bind:
         return f"{self.host}:{self.port} ({scope})"
 
 
-def require_authoring_authentication(settings: Settings) -> None:
+def require_authoring_authentication(
+    settings: Settings, *, allow_unauthenticated: bool = False
+) -> None:
     """Refuse to serve authoring over a socket without authentication.
 
     Called by every path that puts a server on a port —
@@ -135,23 +145,30 @@ def require_authoring_authentication(settings: Settings) -> None:
     accepts connections and declines the one operation somebody deployed it for — discovered by a
     client, at the far end, after a turn has been spent on it.
 
-    **``--no-authentication`` does not waive this, and that is the one place the escape hatch
-    stops.** It satisfies :func:`resolve_bind`'s third condition, which is a statement about
-    *reading* an index; this is a statement about writing into a corpus that assistants read
-    back as standing instructions, and no argument makes an anonymous caller safe to hand that
-    to. Waiving it would also only close one door: ``document_create`` is on the HTTP surface as
-    ``POST /api/v1/documents`` as well, asking for a member floor that an anonymous
-    administrator clears, so a flag that let this application be built would have opened a write
-    path that emptying the MCP surface does not touch. An operator who wants authoring served
-    over a network wants an API key, and this is where they are told so.
+    **``--no-authentication`` waives it, and the waiver is the point rather than a hole.** This
+    refusal exists so that nobody serves authoring unauthenticated *by omission* — a corpus read
+    back as standing instructions is not something to expose by forgetting a setting. An operator
+    who typed the argument has not forgotten anything: they are asserting the network in front of
+    this process is one they own, which is the deployment authoring was built for. The default is
+    unchanged, so every installation that says nothing still gets the refusal.
+
+    The waiver is honest about its size. It opens ``document_create`` on the socket **and**
+    ``POST /api/v1/documents`` on the HTTP surface, whose member floor an anonymous administrator
+    clears — one decision, both doors, said plainly here and at startup rather than mitigated on
+    one surface and quiet about the other.
 
     Args:
         settings: Configuration. ``authoring.configured`` and ``security.auth.mode`` decide.
+        allow_unauthenticated: The operator's explicit opt-in, from the command line. **Not a
+            setting**, for the reason :func:`resolve_bind` gives about ``allow_public``.
 
     Raises:
-        PolicyError: Authoring is configured and ``security.auth.mode`` is ``none``.
+        PolicyError: Authoring is configured, ``security.auth.mode`` is ``none``, and nobody said
+            on the command line that they meant it.
     """
     if not settings.authoring.configured or settings.security.auth.mode is not AuthMode.NONE:
+        return
+    if allow_unauthenticated:
         return
     msg = (
         f"refusing to serve on a socket with authoring configured and no authentication. "
@@ -159,10 +176,10 @@ def require_authoring_authentication(settings: Settings) -> None:
         f"that corpus, and `security.auth.mode` is 'none', so anything that can reach the port "
         f"can call it — on loopback that is every process and every page on this machine. Set "
         f"security.auth.mode to 'api_key' or 'oauth', or clear `authoring.source` and "
-        f"`authoring.collections` to serve this installation read-only. --no-authentication "
-        f"does not waive this: it says you accept an index anyone can read, which is not the "
-        f"same as a corpus anyone can write. Authoring over stdio needs none of this: a pipe "
-        f"has no port."
+        f"`authoring.collections` to serve this installation read-only. Pass "
+        f"--no-authentication to serve it anyway on a network you own: the socket then carries "
+        f"document_create, and anything that can route to the port may call it. Authoring over "
+        f"stdio needs none of this: a pipe has no port."
     )
     raise PolicyError(msg)
 

@@ -237,10 +237,10 @@ def build_app(
             a setting for the opposite reason to ``web`` and the same reason as
             :func:`~manicule.app.bind.resolve_bind`'s ``allow_public``: it *increases* what a
             process exposes, so it must take a person at a terminal rather than a file. It
-            widens one refusal and not the other: it admits an unauthenticated application on
-            a routable address, and :func:`~manicule.app.bind.require_authoring_authentication`
-            below still refuses one that would serve authoring — which is what keeps
-            ``POST /api/v1/documents`` out of reach of an anonymous administrator.
+            widens both refusals below, and knowingly: the application it admits serves
+            ``POST /api/v1/documents`` to an anonymous administrator, because that is the same
+            decision as serving ``document_create`` over the socket and is taken once rather
+            than mitigated on one surface and left quiet on the other.
 
     Raises:
         PolicyError: The application would serve an unauthenticated surface on something that
@@ -266,7 +266,7 @@ def build_app(
     # refuses a loopback bind too — `document_create` is mounted at `/mcp/` here, and a write
     # into a corpus reachable by every process on the machine is not made safe by the port
     # being local.
-    require_authoring_authentication(settings)
+    require_authoring_authentication(settings, allow_unauthenticated=allow_unauthenticated)
 
     # Built before the application, because the application needs its lifespan. FastMCP's ASGI
     # app owns a session manager that has to be started and stopped, and a mount does not run a

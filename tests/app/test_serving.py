@@ -215,7 +215,7 @@ def test_the_renderer_names_the_surface_the_transport_says_it_is() -> None:
     assert "MCP server" not in written, "the API server was announced as an MCP server"
 
 
-def _announced(*, loopback: bool, unauthenticated: bool) -> str:
+def _announced(*, loopback: bool, unauthenticated: bool, authoring: str = "memories") -> str:
     """The start banner, rendered as an operator's terminal would receive it."""
     console = Console(file=io.StringIO(), width=100, no_color=True, highlight=False)
     render.render_address(
@@ -227,6 +227,7 @@ def _announced(*, loopback: bool, unauthenticated: bool) -> str:
             loopback=loopback,
         ),
         unauthenticated=unauthenticated,
+        authoring=authoring,
     )
     return cast("io.StringIO", console.file).getvalue()
 
@@ -247,10 +248,15 @@ def test_serving_unauthenticated_is_announced_and_names_the_flag() -> None:
 
     assert "--no-authentication" in written, written
     assert "administrator" in written, written
-    assert "document_create" in written, (
-        "the banner does not say the socket lost its one write, so the operator who configured "
-        "authoring finds out from a client instead"
+    assert "writes             " in written or "writes  " in written, (
+        "the writes line is not padded to the signpost column, which happens when Rich markup "
+        "is put in the label: ljust counts characters Rich then strips"
     )
+    assert "memories" in written, (
+        "the banner does not name the corpus this bind can be written into, which is the fact "
+        "the warning exists for — an operator is told the risk, not left to infer it"
+    )
+    assert "author" in written, written
 
 
 def test_the_ordinary_banner_makes_no_claim_about_authentication() -> None:

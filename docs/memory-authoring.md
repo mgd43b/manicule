@@ -200,8 +200,7 @@ configuration flag:
 | Transport | Surface |
 |---|---|
 | stdio | everything, including `document_create` |
-| socket, authenticated | the read-only set **plus `document_create`**, and nothing else that mutates |
-| socket, unauthenticated | the read-only set, and **nothing** that mutates |
+| socket | the read-only set **plus `document_create`**, and nothing else that mutates |
 
 The property that mattered is that the absence of every *other* write tool stays **mechanical
 rather than reasoned**, and it does. `_Registrar.tool` registers a tool only when its
@@ -242,14 +241,13 @@ Two constraints ride along and both are enforced:
   authoring being *configured* rather than the tool existing, so an installation that never wanted
   it is not asked to turn authentication on for a feature it does not use.
 
-  **`--no-authentication` does not waive it**, and this is where that escape hatch stops. It
-  satisfies a condition about *reading* an index; this is about *writing* into a corpus read
-  back as standing instructions. Waiving it would also only have closed one door: the same
-  operation is `POST /api/v1/documents` on the HTTP surface, whose member floor an anonymous
-  administrator clears, and narrowing the MCP surface does not reach that route. So an
-  installation that wants authoring served over a network wants an API key, and the refusal
-  names it. Between the two rules there is no configuration of manicule in which an
-  unauthenticated socket can be written to.
+  **`--no-authentication` waives it**, and the waiver is the point rather than a hole in it.
+  The refusal exists so that nobody serves authoring unauthenticated *by omission*; an operator
+  who typed the argument is asserting the network in front of the process is one they own — a
+  private LAN, or a cluster behind an ingress that authenticates for us. That is the target
+  deployment: MCP over HTTPS behind a PKI, with no manicule on the laptop at all. It opens both
+  doors at once, `document_create` and `POST /api/v1/documents`, because they are the same write
+  and an anonymous administrator clears the member floor on either.
 - **Scope is a configured writable collection**, not any collection the workspace holds. Creating a
   collection is therefore not also the act of granting write access to it.
 

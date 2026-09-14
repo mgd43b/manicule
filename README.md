@@ -333,7 +333,7 @@ shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifec
 
 | Surface | Started by | Shape |
 |:---|:---|:---|
-| **MCP** | `manicule start --mcp-only` | 45 tools over stdio, which opens no socket; at `/mcp/` when served over a port, the read-only ones — 27 with `document_create` on an authenticated socket, 26 without it on an unauthenticated one |
+| **MCP** | `manicule start --mcp-only` | 45 tools over stdio, which opens no socket; 27 at `/mcp/` when served over a port — the read-only ones, plus `document_create` |
 | **Command line** | `manicule <command>` | 32 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 12 areas of server-rendered HTML, 11 in the navigation |
@@ -500,7 +500,7 @@ Four refusals are worth knowing before you call it:
 | **Unconfigured** | Both settings empty is the default, and means authoring is off. The tool is offered on every surface and refuses every call, naming the settings it needs. |
 | **An unlisted collection** | Refused even when the workspace has it — so creating a collection is not also the act of granting write access to it. |
 | **A slug already taken** | Refused unless `overwrite` is passed, and the refusal names the document that holds it. A file nothing has indexed counts as holding it too. |
-| **A socket with no authentication** | Refuses to *start*, loopback included. Authoring is the one write tool served over a socket, and a corpus read back as standing instructions is not something to serve unauthenticated. `--no-authentication` does not waive this: it says an index may be read by anyone, not that a corpus may be written by anyone. An unauthenticated socket also publishes no `document_create` at all. |
+| **A socket with no authentication** | Refuses to *start*, loopback included — so a corpus is never exposed by forgetting a setting. `manicule serve --no-authentication` waives it deliberately, for a network you own: the socket then serves authoring to anything that can route to it, and says so at startup naming the corpus. |
 
 If the file is written and the index then declines it, **the file is kept** and the result says
 so with the path — the content is not lost, and a later sync indexes it.
@@ -692,8 +692,9 @@ are called unattended, so that is not a distinction worth risking.
 which opens no socket at all; every HTTP bind goes through one policy that starts at loopback,
 and widening it takes an address somebody wrote down, an explicit flag no config file can supply,
 and authentication switched on — or a second flag, also reachable from no config file, saying the
-operator accepts serving without it. Any one missing is a refusal, and the socket that second flag
-produces carries no write tool at all. That is a claim about what
+operator accepts serving without it. Any one missing is a refusal, and what that second flag
+produces is a surface anyone who can route to it may read *and* author into, which is the
+deployment it exists for and is said out loud at startup. That is a claim about what
 listens, not about what this process dials: a `qdrant` vector store reaches out to
 `storage.vector_db_url` the same way a remote generator or a connector does, and it is
 `Settings.policy_problems()` — not this rule — that refuses the connection when the data

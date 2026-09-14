@@ -970,15 +970,15 @@ authentication" and "I meant to put this on the network" are two statements, so
 somebody who wanted a private unauthenticated one.
 
 **It is loud rather than silent, in two places.** The start banner names the flag, says that
-every caller is an administrator, and says what the socket lost — see §6.1. And `manicule
-doctor`'s `transport` check stays **failing**, reworded to say that this is deliberate: an
-unauthenticated index on a routable address is the same exposure whether or not somebody meant
-it, so a check that softened to `ok` because an argument was typed would be reporting an
-intention rather than a state. A deployment that has chosen this excludes the check by `name`,
-which is what `name` is for — `docs/deployment.md` §2.
+every caller is an administrator, and — when authoring is configured — names the corpus they can
+write into. And `manicule doctor`'s `transport` check stays **failing**, reworded to say that
+this is deliberate: an unauthenticated index on a routable address is the same exposure whether
+or not somebody meant it, so a check that softened to `ok` because an argument was typed would be
+reporting an intention rather than a state. A deployment that has chosen this excludes the check
+by `name`, which is what `name` is for — `docs/deployment.md` §2.
 
-It costs the socket its one write, which §6.1 covers — and it does **not** buy an
-unauthenticated installation that serves authoring: that is refused however it is asked.
+**It serves the whole surface, authoring included.** That is the capability it exists for, and
+§6.1 says why a read-only version of it would be pointless.
 
 There is a **second** refusal, and it is deliberately not the same code. `resolve_bind` decides
 an address; `manicule.api.app.build_app` decides whether an *application* may exist at all, and
@@ -995,7 +995,7 @@ it: a flag that satisfied the bind but not the preflight would refuse to start t
 was written for, with a message about a configuration file rather than about the argument meant
 to answer it.
 
-### 6.1 MCP over a socket carries the read-only tools, and one named write when it is authenticated
+### 6.1 MCP over a socket carries the read-only tools and one named write
 
 The endpoint is `/mcp` on the same port, and a client is configured with the trailing slash:
 `http://127.0.0.1:8765/mcp/`. A **path rather than a second port**, because one port is one bind
@@ -1028,49 +1028,26 @@ write tool cannot drift in behind it. The transport still decides the surface: r
 locally and you get the local one, run it on a network and you get the network one, with no new
 mode and no flag.
 
-**And the exception is conditional on authentication.** `manicule.mcp.server.network_authoring`
-is what the registrar actually reads, and it returns nothing at all when `security.auth.mode` is
-`none` — so an unauthenticated socket is the read-only set and *nothing else*, asserted as the
-same set operation with the other operand empty.
+**And the exception is not conditional on authentication.** `security.auth.mode` decides *who
+may call* `document_create` — `manicule.mcp.server.require_network_member` enforces a member
+floor — and never whether the socket carries it. Those were briefly one question, and the answer
+made the deployment authoring exists for impossible: manicule serving a memory corpus to
+assistants on machines running no manicule of their own, which could search it and not write to
+it. A read-only network surface makes that deployment pointless, which is the sentence this
+section already used about the read-only surface generally.
 
-The reason is not tidiness. Without a credential there is nothing to tell one caller from
-another, so `manicule.api.security.Principal` resolves an anonymous caller to **admin** — right
-for the operator at a loopback socket, which is what that mode assumed — and
-`require_network_member`'s member floor is cleared by everybody. A `document_create` published
-there would be callable by anything that can route to the port, writing into a corpus that
-assistants read back as standing instructions. That is an **injection channel rather than a
-privacy question**, and it is answered by taking the tool off the surface rather than by adding
-a guard: a guard can be wrong about a caller, and a tool that was never registered cannot be
-called by anybody.
+**What that costs on an unauthenticated bind is worth stating plainly.** Without a credential
+there is nothing to tell one caller from another, so `manicule.api.security.Principal` resolves
+an anonymous caller to **admin** — right for the operator at a loopback socket, which is what
+that mode assumed — and the member floor is cleared by everybody. On a bind widened with
+`--no-authentication`, anything that can route to the port can therefore write into a corpus that
+assistants read back as standing instructions, over the mount and over `POST /api/v1/documents`
+alike. It is the same write through two doors, and the flag opens both or neither.
 
-It is decided by `security.auth.mode` alone, so it is the same surface on loopback, and
-`--no-authentication` cannot widen it. **Nor does that flag waive
-`require_authoring_authentication`**: an installation with authoring configured still refuses to
-serve a socket unauthenticated, however it was asked. The flag says an operator accepts an index
-anyone can read, which is not the same as a corpus anyone can write — and waiving the refusal
-would have closed only one door anyway, because `document_create` is also `POST
-/api/v1/documents`, whose member floor an anonymous administrator clears. Narrowing the MCP
-surface does not reach that route; the refusal does.
-
-So the two rules are complementary rather than redundant. The refusal keeps an unauthenticated
-socket from ever *having* authoring to serve; the narrowing means that even with authoring
-unconfigured, no write tool is published on one. The server also says so to the client: an
-unauthenticated socket's instructions say `document_create` is absent and why, so an assistant
-told by its operator that authoring works can tell this apart from a broken install.
-
-Three things make that a different decision from the tools above rather than a hole in the same
-rule. It is **bounded**: one document, to one workspace, in one of a configured set of
-collections, beneath one configured connector's root, at a path the caller never supplies — where
-`index_path` walks any directory the process can read and `config_set` rewrites the configuration
-the server is running from. It is **off by default**: an installation that has not set
-`authoring.source` and `authoring.collections` has no authoring at all, and the tool refuses every
-call naming those settings. And it is **behind a door that is already locked**: `resolve_bind`
-admits a non-loopback bind only with a host somebody wrote down, an explicit opt-in and
-authentication on, while `manicule.app.bind.require_authoring_authentication` refuses *any*
-socket — loopback included — that would serve configured authoring without authentication. It has
-two callers, because a socket carries the tool two ways: `manicule.mcp.serve.address_for` for
-`--mcp-only`, and `manicule.api.app.build_app` for everything else, the second so the refusal
-fires when a container entry point or a production ASGI server is doing the listening.
+That risk is **accepted rather than mitigated**, by a person typing an argument no configuration
+file can supply, on a network they are asserting they own. What manicule does about it is refuse
+to let a file make that assertion, name the corpus in the startup banner at the moment it becomes
+true, and report it from `manicule doctor` as a failing finding for as long as it holds.
 
 The extra care is not proportional to the tool's size, and the reason is worth stating: a memory
 corpus is read as *instructions*. Guidance recalled out of it is treated as standing direction by
@@ -1275,8 +1252,9 @@ mounted routes and fails on a name that is not an operation.
 With `security.auth.mode = none` there is no credential and the caller is treated as the
 operator — which is tolerable because that configuration is refused twice on anything but
 loopback (§6), and reachable off loopback only by a person typing `--no-authentication`. On
-that bind the "operator" is anything that can route to the port, which is the exposure the flag
-buys and the reason the socket's MCP surface carries no write while it holds.
+that bind the "operator" is anything that can route to the port — able to read the index and to
+author into the configured source. That is the exposure the flag buys, named at startup and
+reported by `manicule doctor` for as long as it holds.
 
 ### 9.3 Whose address a request has
 
