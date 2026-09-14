@@ -826,3 +826,58 @@ def test_a_tokenizer_flag_on_a_backend_that_has_no_use_for_one_is_refused() -> N
 
     assert main(["--backend", "onnx", "--tokenizer", "acme/tokenizer"]) == 1
     assert main(["--backend", "mlx", "--tokenizer-revision", "a" * 40]) == 1
+
+
+def test_the_ollama_prefetch_mode_reads_the_tokenizer_out_of_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-flag route is the one an operator and an init job actually run.
+
+    `--tokenizer` exists for an image build, which has no config file yet. Everywhere else the
+    point of this mode is that it seeds exactly what the running backend will load, by reading
+    the same `[plugins.config."embedder.ollama"]` entry — so a regression in that lookup breaks
+    the documented workflow while every flag-driven test here still passes.
+    """
+    from tools.prefetch_embedding_models import main  # noqa: PLC0415 - an operator/CI script
+
+    seen: list[tuple[str, list[str], str | None]] = []
+
+    def fake_fetch(repo: str, patterns: list[str], revision: str | None) -> Path:
+        seen.append((repo, patterns, revision))
+        return Path("/nowhere")
+
+    revision = "b" * 40
+    monkeypatch.setattr("tools.prefetch_embedding_models.fetch", fake_fetch)
+    monkeypatch.setattr(
+        "tools.prefetch_embedding_models.configured_ollama_tokenizer",
+        lambda: ("Qwen/Qwen3-Embedding-0.6B", revision),
+    )
+
+    code = main(["--backend", "ollama"])
+
+    assert code == 0
+    assert seen == [("Qwen/Qwen3-Embedding-0.6B", ["tokenizer.json"], revision)]
+
+
+def test_the_configured_tokenizer_lookup_reads_the_backends_own_settings_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """And the lookup itself, against a real config file rather than a stubbed accessor.
+
+    The test above proves the wiring from `main` to the fetch; this proves the half it stubs.
+    Between them nothing is left where the settings key could be misspelled and every test
+    still pass — which is the failure mode, because the key is a string in two places.
+    """
+    from tools.prefetch_embedding_models import configured_ollama_tokenizer  # noqa: PLC0415
+
+    revision = "c" * 40
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[plugins.config."embedder.ollama"]\n'
+        'tokenizer = "Qwen/Qwen3-Embedding-0.6B"\n'
+        f'tokenizer_revision = "{revision}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MANICULE_CONFIG_FILE", str(config))
+
+    assert configured_ollama_tokenizer() == ("Qwen/Qwen3-Embedding-0.6B", revision)

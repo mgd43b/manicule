@@ -602,11 +602,22 @@ it is the one that produces a corpus-wide refusal. `test_a_chunk_sized_to_the_bu
 real capacity — widening a limit to clear a false refusal is how this becomes silent truncation
 instead.
 
-The **query** side is not netted out of anything, and is not checked. A query is not a chunk:
-it has no stored row, no budget, and in practice no length — Qwen3-Embedding's instruction is
-about twenty tokens against a context measured in thousands. What would make this matter is a
-query long enough to overflow on its own, which is unguarded today with or without a prefix,
-so the prefix does not introduce the gap and this section does not claim to close it.
+The **query** side is not netted out of anything, and this section said it "is not checked",
+which was wrong twice over. A query is not a chunk — it has no stored row, no `token_count`
+and no chunker budget — so core never calls `require_within_context` on one. But
+`Embedder.embed` is the only entry point, and every shipped backend's raw-input guard runs on
+whatever it is handed: `PooledEmbedder._tokenize` and `OllamaEmbedder._require_within_limit`
+both measure the prefixed query exactly as they measure a prefixed chunk, against
+`ModelCard.input_capacity`. So an over-long query is **refused, by name, at search time** —
+loudly, which is the direction that matters, because the alternative at that boundary is a
+vector built from the query's opening words.
+
+What is genuinely absent is anything that *sizes* a query in advance, the way the chunker
+sizes a chunk. Nothing trims one, warns about one, or reports the limit before the search that
+hits it, and a corpus's own budget says nothing about how long a person's question may be.
+Qwen3-Embedding's instruction is about twenty tokens against a context measured in thousands,
+so the prefix does not make this reachable where it was not before — but the refusal is the
+guard, not a gap this section is leaving open.
 
 The definition still matters, because it is what a future model will need: `bge-base-en-v1.5`
 at 512 has **510** usable, so a 512-token budget would overflow by exactly the special tokens
@@ -1007,4 +1018,5 @@ unfinished:
 | §9.1 | filed, with the design argued | built — a core `prefix_scheme` identity field, applied at both call sites, and `manicule-ollama`'s local `prefix=none` marker retired because core now carries what it stood in for |
 | §4.3 | the document-prefix term was notional; BGE-M3 has none | counted with the model's own tokenizer and subtracted, from a configured `max_sequence_length` as well as a derived one |
 | §4.3 | one number was going to do both jobs | two: `max_sequence_length` for a chunk's own text, `ModelCard.input_capacity` for what the model reads with the prefix on it. Review caught the first cut charging the prefix twice, which refused every chunk sized to its own budget |
+| §4.3 | "the query side … is not checked" | it is, by every backend's raw-input guard, against `input_capacity`. Only `require_within_context` skips it. Review caught the claim; what is actually absent is anything that *sizes* a query in advance |
 | §10 | `PooledEmbedder.embed_chunks` "is the path re-embed uses" | it is not, and has not been; re-embed goes through `manicule.ingest.embedding`, which is also the only path that prefixes |
