@@ -174,6 +174,29 @@ def test_the_preflight_refuses_a_configured_wide_bind_and_the_flag_clears_it() -
     assert settings.policy_problems(allow_unauthenticated=True) == []
 
 
+@pytest.mark.parametrize("host", sorted(LOOPBACK_HOSTS))
+def test_one_definition_of_loopback_answers_the_bind_and_the_preflight(host: str) -> None:
+    """Two sets said what "loopback" means, and they disagreed.
+
+    ``TransportSettings.is_loopback`` held ``127.0.0.1``, ``::1`` and ``localhost``;
+    :data:`LOOPBACK_HOSTS` also holds ``::ffff:127.0.0.1`` and matches after stripping and
+    lowercasing. **A host in the gap was loopback to the bind and routable to the preflight**,
+    so ``security.transport.bind_host = "::ffff:127.0.0.1"`` with no authentication made
+    ``policy_problems`` raise out of ``build_container`` — refusing to start *every* command,
+    not only a server, over an address that reaches nothing but this machine, and one
+    ``resolve_bind`` would have bound with no flag at all.
+
+    Parametrized over the set itself rather than over a literal list, so a host added to the
+    bind policy later is covered here without anybody remembering, which is the property that
+    was missing when the second set was written.
+    """
+    settings = Settings(security={"transport": {"bind_host": host}})  # pyright: ignore[reportArgumentType]
+
+    assert settings.security.transport.is_loopback, "the preflight disagrees with the bind policy"
+    assert resolve_bind(settings).loopback
+    assert settings.policy_problems() == []
+
+
 def test_neither_flag_is_reachable_from_configuration() -> None:
     """The reason both are arguments: **no settings key can supply either of them.**
 

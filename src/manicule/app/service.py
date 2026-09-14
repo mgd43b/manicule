@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from manicule.app import results as r
+from manicule.app.bind import is_loopback
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
 from manicule.config.loader import load_settings
 from manicule.config.profiles import profile_config
@@ -2976,8 +2977,6 @@ class ApplicationService:
         )
 
     def _transport_check(self) -> r.Check:
-        from manicule.app.bind import is_loopback  # noqa: PLC0415 - one rule about loopback
-
         transport = self.settings.security.transport
         mode = self.settings.security.auth.mode
         # **The address this process actually took, when it knows one.** `--host` is argv, so a
