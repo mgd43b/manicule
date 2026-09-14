@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from manicule.app import results as r
+from manicule.app.bind import is_loopback
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
 from manicule.config.loader import load_settings
 from manicule.config.profiles import profile_config
@@ -738,6 +739,18 @@ class ApplicationService:
         control socket's handler — reports the configuration's own answer.
         """
 
+        self._serving_host: str | None = None
+        """The address this process actually bound, once it has decided one.
+
+        ``None`` until :meth:`serving_on` says otherwise, and ``None`` forever in a process that
+        serves nothing — which is every construction but one, and is why :meth:`doctor` falls
+        back to the configured host rather than guessing.
+
+        **Set after construction rather than passed in**, and that is forced rather than chosen:
+        the MCP address is decided by :func:`manicule.mcp.serve.address_for`, which counts the
+        tools on the surface and therefore needs this service to exist first.
+        """
+
         self._authoring = asyncio.Lock()
         """Serializes :meth:`document_create` within this process.
 
@@ -752,6 +765,33 @@ class ApplicationService:
         the exclusive create in :func:`_write_authored`, which is what makes the default refusal
         atomic rather than merely checked.
         """
+
+    def serving_on(self, host: str) -> None:
+        """Record the address this process bound, for :meth:`doctor` to judge instead of the file.
+
+        ``--host`` and a caller-supplied ``host=`` are argv and arguments, so neither reaches
+        ``security.transport.bind_host``. A ``transport`` check reading configuration therefore
+        reports "reachable only from this machine" about a process answering the network — the
+        one direction that check must never be wrong in, and the reason this exists.
+
+        **Called from the two functions that *decide* an address**, not from the ones that serve:
+        :func:`manicule.api.serve.address_for` and :func:`manicule.mcp.serve.address_for`. That
+        placement is the point. Every path reaches a bind through one of them — the command line,
+        an embedder calling ``manicule.api.serve.serve``, a production ASGI server building the
+        application — so a serving path added tomorrow records its address without anybody
+        remembering to, which is the difference between a guarantee and a convention. Recording
+        at the decision rather than at the listen also means the API health route and the MCP
+        ``doctor`` tool describe the same address the process is about to answer on.
+
+        Idempotent, and called more than once on the ordinary path: a server resolves its address
+        once to announce it and again to bind it, with the same inputs and therefore the same
+        answer.
+
+        Stdio records nothing. It took no address, and its ``ServerAddress`` carries ``host=""``,
+        which is in ``EVERY_INTERFACE`` rather than ``LOOPBACK_HOSTS`` — so recording it would
+        have a process with no socket at all diagnosed as a wide bind.
+        """
+        self._serving_host = host
 
     @property
     def backend(self) -> Backend:
@@ -2939,23 +2979,33 @@ class ApplicationService:
     def _transport_check(self) -> r.Check:
         transport = self.settings.security.transport
         mode = self.settings.security.auth.mode
-        # The bind host and the authentication mode, and neither is a secret: a host is an
-        # address this machine already answers on, and the mode is which *kind* of credential
-        # is demanded rather than any credential itself.
+        # **The address this process actually took, when it knows one.** `--host` is argv, so a
+        # server started with `--host 0.0.0.0` leaves `bind_host` at the configured default and
+        # a check reading configuration reports "reachable only from this machine" about a
+        # process answering the network. That is the one direction this check must never be
+        # wrong in, and it is the same reason the flag itself is argv: what a file says and what
+        # a process did are two facts, and only one of them is the exposure.
+        bound = self._serving_host if self._serving_host is not None else transport.bind_host
+        loopback = is_loopback(bound)
+        # None of this is a secret: a host is an address this machine already answers on, and
+        # the mode is which *kind* of credential is demanded rather than any credential itself.
         facts: dict[str, JsonValue] = {
-            "bind_host": transport.bind_host,
-            "loopback": transport.is_loopback,
+            "bind_host": bound,
+            "loopback": loopback,
             "auth_mode": mode.value,
+            # What configuration says, kept beside what the process did, because an operator
+            # reading a diagnosis that disagrees with their file needs to see both to act.
+            "configured_bind_host": transport.bind_host,
             # Argv as well as configuration, so it is true only of a diagnosis produced inside
             # a process that was started with the flag. A fresh `manicule doctor` reads the same
             # settings and reports `false`, which is the honest answer to what a file can say.
             "serving_unauthenticated": self._serving_unauthenticated,
         }
-        if transport.is_loopback:
+        if loopback:
             return r.Check(
                 name="transport",
                 state="ok",
-                detail=f"bound to {transport.bind_host}, reachable only from this machine",
+                detail=f"bound to {bound}, reachable only from this machine",
                 facts=facts,
             )
         if mode is AuthMode.NONE and self._serving_unauthenticated:
@@ -2971,9 +3021,9 @@ class ApplicationService:
                 state="failing",
                 detail=(
                     f"serving unauthenticated, deliberately: this process was started with "
-                    f"--no-authentication and is bound to {transport.bind_host!r}. Anything "
-                    f"that can route to the port is an administrator here, and MCP on it "
-                    f"carries no write tool."
+                    f"--no-authentication and is bound to {bound!r}. Anything that can route "
+                    f"to the port is an administrator here, and MCP on it carries no write "
+                    f"tool."
                 ),
                 facts=facts,
                 remedy="manicule config set security.auth.mode api_key",
@@ -2983,8 +3033,8 @@ class ApplicationService:
                 name="transport",
                 state="failing",
                 detail=(
-                    f"security.transport.bind_host is {transport.bind_host!r} with no "
-                    f"authentication. Bind 127.0.0.1, or set security.auth.mode."
+                    f"bound to {bound!r} with no authentication. Bind 127.0.0.1, or set "
+                    f"security.auth.mode."
                 ),
                 facts=facts,
                 remedy="manicule config set security.transport.bind_host 127.0.0.1",
@@ -2993,7 +3043,7 @@ class ApplicationService:
             name="transport",
             state="degraded",
             detail=(
-                f"bound to {transport.bind_host}, which is reachable from the network. "
+                f"bound to {bound}, which is reachable from the network. "
                 f"Authentication is on ({mode.value})."
             ),
             facts=facts,

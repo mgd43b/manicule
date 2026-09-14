@@ -443,7 +443,23 @@ class TransportSettings(Section):
 
     @property
     def is_loopback(self) -> bool:
-        return self.bind_host in {"127.0.0.1", "::1", "localhost"}
+        """Whether ``bind_host`` reaches only this machine.
+
+        **Delegated to the bind policy rather than answered here**, because this was a second
+        set and the two disagreed. This one held ``127.0.0.1``, ``::1`` and ``localhost``;
+        :data:`manicule.app.bind.LOOPBACK_HOSTS` also holds ``::ffff:127.0.0.1`` and matches
+        after stripping and lowercasing. So a configured ``::ffff:127.0.0.1`` was loopback to
+        :func:`~manicule.app.bind.resolve_bind`, which would have bound it with no flag at all,
+        and routable to :meth:`Settings.policy_problems` — which raises out of
+        ``build_container`` and therefore refused to start *every* command, not only a server,
+        over an address that reaches nothing but this machine.
+
+        Imported inside the property because :mod:`manicule.app.bind` imports this module: the
+        cycle is real at import time and gone by the time anything asks the question.
+        """
+        from manicule.app.bind import is_loopback  # noqa: PLC0415 - cycle: bind imports this
+
+        return is_loopback(self.bind_host)
 
 
 class AtRestSettings(Section):

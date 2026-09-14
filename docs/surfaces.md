@@ -821,10 +821,28 @@ Checks: `configuration`, `transport`, `plugins`, `storage`, `permissions`, `inde
 `transport` reports the bind: `ok` for loopback, `degraded` for a non-loopback bind with
 authentication on, and `failing` for one without it — including when `--no-authentication` made
 that deliberate, where the wording says so and the remedy becomes "configure authentication"
-rather than "bind loopback". Its `facts` carry `bind_host`, `loopback`, `auth_mode` and
-`serving_unauthenticated`; the last is read from how *this process* was started, so it is `true`
-only in a diagnosis produced inside a serving process and `false` from a fresh `manicule
-doctor`, which can only report what configuration says.
+rather than "bind loopback".
+
+**It judges the address this process actually took**, not the one configuration holds. `--host`
+is a command-line option, so a server started with `--host 0.0.0.0` leaves
+`security.transport.bind_host` at its configured default — and a check reading configuration
+would report "reachable only from this machine" about a process answering the network. `facts`
+carry both: `bind_host` and `loopback` describe what was bound, `configured_bind_host` what the
+file says. A process that bound nothing — `manicule doctor` at a terminal, or a stdio server —
+has no address to prefer, so it is diagnosed from configuration, which is then the only honest
+answer.
+
+The address is recorded by the two functions that *decide* one, `manicule.api.serve.address_for`
+and `manicule.mcp.serve.address_for`, rather than by whichever code goes on to listen. Every
+serving path reaches a bind through one of them — the command line, an embedder calling
+`manicule.api.serve.serve`, a production ASGI server building the application — so a path added
+later records its address without anybody remembering to, and the API health route and the MCP
+`doctor` tool describe the same address the process answers on. A refused bind records nothing,
+because it decided none.
+
+`serving_unauthenticated` is read the same way, from how *this process* was started, so it is
+`true` only in a diagnosis produced inside a serving process and `false` from a fresh `manicule
+doctor`.
 
 **`name` is the stable identifier.** It is what a monitor selects on, so it is chosen once and
 does not move with the wording. `detail` is the sentence a person reads and is free to be
