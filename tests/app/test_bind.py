@@ -146,6 +146,34 @@ def test_a_wide_unauthenticated_bind_is_possible_when_both_flags_are_passed() ->
     assert bind.every_interface
 
 
+def test_the_preflight_refuses_a_configured_wide_bind_and_the_flag_clears_it() -> None:
+    """**The third reader of this rule, and the one that fires first.**
+
+    ``resolve_bind`` is not the only place a wide unauthenticated bind is refused.
+    ``Settings.policy_problems`` carries the same condition, ``build_container`` raises on it,
+    and ``Runtime.open`` reaches that before any address is resolved — so a flag that satisfied
+    the bind and not the preflight would refuse to start the deployment it was written for,
+    with a message about configuration rather than about the argument that was meant to answer
+    it.
+
+    **Asserted against a host in *configuration*, not one on the command line**, because that is
+    exactly where the gap was: `--host` leaves `bind_host` at the loopback default, so the
+    preflight stays silent and every check passes while the documented case — a wide
+    `security.transport.bind_host` in a file, which is what `docs/deployment.md` §4 describes —
+    fails. A test that overrode the host would have been green against the bug.
+    """
+    settings = Settings(security={"transport": {"bind_host": EVERYWHERE}})  # pyright: ignore[reportArgumentType]
+
+    refused = settings.policy_problems()
+    assert any("security.auth.mode" in problem for problem in refused), refused
+    assert any("--no-authentication" in problem for problem in refused), (
+        "the preflight refuses without naming the argument that answers it, so an operator "
+        "reading it is sent to the configuration file the flag deliberately is not in"
+    )
+
+    assert settings.policy_problems(allow_unauthenticated=True) == []
+
+
 def test_neither_flag_is_reachable_from_configuration() -> None:
     """The reason both are arguments: **no settings key can supply either of them.**
 

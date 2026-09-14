@@ -1625,11 +1625,24 @@ class Settings(BaseSettings):
 
     # --- policy -------------------------------------------------------------------------
 
-    def policy_problems(self) -> list[str]:
+    def policy_problems(self, *, allow_unauthenticated: bool = False) -> list[str]:
         """Configurations that are individually valid and jointly wrong.
 
         Checked once at startup, before anything is constructed, so an impossible setup fails
         immediately instead of at the first request that happens to exercise it.
+
+        Args:
+            allow_unauthenticated: ``manicule serve --no-authentication``, carried here from
+                argv. **This is the third reader of one rule**, beside
+                :func:`~manicule.app.bind.resolve_bind` and
+                :func:`~manicule.api.app._require_auth_for_wide_bind`, and it is the earliest:
+                it fires in ``build_container`` before a bind is resolved or an application
+                built. An escape hatch that reached the other two and not this one would be a
+                flag that could not start the very deployment it was written for — a wide
+                ``bind_host`` in a configuration file, which is how the deployment documents
+                describe it. It stays a parameter rather than a setting for this method's own
+                reason: this asks whether a *file* is runnable, and the answer depends on one
+                thing a file is deliberately not allowed to say.
         """
         problems: list[str] = []
 
@@ -1672,11 +1685,16 @@ class Settings(BaseSettings):
                 )
 
         transport = self.security.transport
-        if not transport.is_loopback and self.security.auth.mode is AuthMode.NONE:
+        if (
+            not transport.is_loopback
+            and self.security.auth.mode is AuthMode.NONE
+            and not allow_unauthenticated
+        ):
             problems.append(
                 f"security.transport.bind_host is {transport.bind_host!r} with "
                 f"security.auth.mode 'none'. An unauthenticated index on a routable address "
-                f"is readable by anyone who can reach it. Bind 127.0.0.1, or enable auth."
+                f"is readable by anyone who can reach it. Bind 127.0.0.1, enable auth, or "
+                f"pass --no-authentication to say you accept it."
             )
 
         problems.extend(self._redaction_problems())

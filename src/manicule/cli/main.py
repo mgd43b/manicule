@@ -2312,7 +2312,10 @@ def start(
         bool,
         typer.Option(
             "--allow-public-bind",
-            help="Say explicitly that a non-loopback bind is intended. Needs auth as well.",
+            help=(
+                "Say explicitly that a non-loopback bind is intended. Needs authentication, "
+                "or --no-authentication, as well."
+            ),
         ),
     ] = False,
     no_authentication: Annotated[
