@@ -65,7 +65,14 @@ if TYPE_CHECKING:
     from manicule.core.ann import AnnIndexBuild, AnnIndexState
     from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
     from manicule.core.fingerprints import GlossaryFingerprint
-    from manicule.core.protocols import Connector, Embedder, Generator, Parser, VectorStore
+    from manicule.core.protocols import (
+        Connector,
+        Embedder,
+        Generator,
+        Parser,
+        PublicationBoundVectorStore,
+        VectorStore,
+    )
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
@@ -687,11 +694,24 @@ class Runtime:
         return at != head_revision()
 
     async def _build_vectors(self) -> VectorStore:
+        """Wrap the embedded store in the handle that follows SQLite's publication pointer.
+
+        Two conditions, and they are not redundant. The configured backend has to be the
+        built-in embedded one, because the wrapper resolves a *Lance directory* — a store that
+        merely groups its rows into publications would be handed a path it never wrote. And the
+        store has to actually offer the publication surface, because the name in the
+        configuration only says which component was asked for, not what a plugin registered
+        under it. Neither question imports LanceDB to ask it: ``manicule.storage.config`` is a
+        pydantic module, and the protocol lives in core.
+        """
         from manicule.core.protocols import PublicationAwareVectorStore  # noqa: PLC0415
+        from manicule.storage.config import VECTOR_STORE_NAME  # noqa: PLC0415
 
         await self.documents()
         store = await self._container.aget(keys.VECTOR_STORE)
-        if isinstance(store, PublicationAwareVectorStore):
+        if self._settings.storage.vector_db == VECTOR_STORE_NAME and isinstance(
+            store, PublicationAwareVectorStore
+        ):
             from sqlalchemy import select  # noqa: PLC0415
 
             from manicule.storage import models  # noqa: PLC0415
@@ -1054,6 +1074,35 @@ class _ContainerChain:
 
     def resolve(self, media_type: str) -> tuple[str, ...]:
         return tuple(self.container.parser_chain_names(media_type))
+
+
+async def _publication_bound_vectors(runtime: Runtime) -> PublicationBoundVectorStore | None:
+    """The vector handle, but only when durable generations are genuinely available.
+
+    Two operations depend on this — a durable re-embed and a derived reset — and both refuse
+    rather than half-perform when the answer is ``None``. They ask through one function because
+    the question has two halves and getting either alone wrong is a real failure.
+
+    The configured name has to be the built-in embedded backend, because what these operations
+    go on to do is not backend-agnostic: they build ``LanceShadowGenerations`` over a Lance
+    directory and delete it. A third-party store that satisfied the protocol structurally would
+    otherwise pass a capability check and then have its reset manipulate Lance's on-disk
+    generations instead of its own.
+
+    And the handle still has to satisfy the protocol, because the configured name says only
+    which component was asked for, not what a plugin registered under it.
+
+    Neither half imports LanceDB to ask: ``manicule.storage.config`` is pydantic and the
+    protocol lives in core. That matters because the import is ``SIGILL`` on a CPU without AVX2,
+    which is what made the refusal itself unreachable there — ``tests/test_import_boundary.py``.
+    """
+    from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
+    from manicule.storage.config import VECTOR_STORE_NAME  # noqa: PLC0415
+
+    if runtime.settings.storage.vector_db != VECTOR_STORE_NAME:
+        return None
+    vectors = await runtime.vectors()
+    return vectors if isinstance(vectors, PublicationBoundVectorStore) else None
 
 
 class _Ingestion:
@@ -1625,11 +1674,17 @@ class _Ingestion:
         )
 
     async def _require_reembed_backend(self) -> None:
-        from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
+        """Refuse a durable re-embed on anything but the built-in embedded backend.
+
+        The configured-name half of this check is not belt-and-braces. What the refusal guards
+        is not "can this handle answer publication questions" but the orchestration behind it,
+        which builds ``LanceShadowGenerations`` over a Lance directory outright — so a store
+        that satisfied the protocol structurally and was configured as something else would pass
+        a capability check and then have its re-embed run against Lance storage.
+        """
         from manicule.ingest.reembed import ReembedError  # noqa: PLC0415
 
-        vectors = await self._runtime.vectors()
-        if not isinstance(vectors, PublicationBoundVectorStore):
+        if await _publication_bound_vectors(self._runtime) is None:
             raise ReembedError(
                 f"durable re-embedding requires the built-in SQLite/Lance vector backend, and "
                 f"storage.vector_db is {self._runtime.settings.storage.vector_db!r}. No other "
@@ -2426,13 +2481,12 @@ class _Maintenance:
 
         async def settle():  # noqa: ANN202
             from manicule.app.ports import ResetOutcome  # noqa: PLC0415
-            from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
             from manicule.storage.vector_paths import generation_pin  # noqa: PLC0415
 
             directory = await self._runtime.vector_directory()
             async with generation_pin(directory, exclusive=True):
-                vectors = await self._runtime.vectors()
-                if not isinstance(vectors, PublicationBoundVectorStore):
+                vectors = await _publication_bound_vectors(self._runtime)
+                if vectors is None:
                     raise ManiculeError(
                         "derived reset requires the built-in publication-aware vector backend"
                     )

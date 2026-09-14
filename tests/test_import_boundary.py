@@ -456,6 +456,16 @@ def _modules_added_by_a_qdrant_runtime() -> set[str]:
         "            await runtime.vector_directory()\n"
         "            ingestion = await runtime.ingestion()\n"
         '            await ingestion.reembed_status("no-such-run")\n'
+        "            refused = ''\n"
+        "            try:\n"
+        "                await maintenance.reset_derived()\n"
+        "            except Exception as error:\n"
+        "                refused = str(error)\n"
+        "            if 'publication-aware' not in refused:\n"
+        "                raise AssertionError(\n"
+        "                    'reset_derived did not refuse the qdrant backend, so the import '\n"
+        "                    'check below never reached its guard: ' + (refused or 'it returned')\n"
+        "                )\n"
         "            await runtime.invalidate_derived_runtime()\n"
         "asyncio.run(main())\n"
         "print(json.dumps(sorted(set(sys.modules) - before)))\n"
@@ -488,7 +498,9 @@ def test_a_qdrant_runtime_never_loads_the_embedded_backend() -> None:
 
     Every path driven here is one a Qdrant installation reaches normally: the first ``vectors()``
     call, the index-state report behind ``index_status``, the vector directory, the *ungated*
-    ``reembed_status`` that three surfaces expose, and the shutdown that runs on every exit. A
+    ``reembed_status`` that three surfaces expose, the derived reset — which must refuse, and is
+    asserted to, so that a green run means the guard was reached rather than that nothing ran —
+    and the shutdown that runs on every exit. A
     capability is asked of the object through a protocol in ``manicule.core.protocols``; the
     backend's module is imported only once its own store is what the container built.
     """

@@ -70,3 +70,9 @@ async def generation_pin(directory: Path, *, exclusive: bool = False) -> AsyncGe
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+__all__ = [
+    "generation_pin",
+    "workspace_vector_directory",
+]

@@ -37,7 +37,11 @@ from manicule.core.embedding import (
     embedding_input_identity,
 )
 from manicule.core.errors import FingerprintMismatchError, VectorStoreStateError
-from manicule.core.protocols import VectorStore
+from manicule.core.protocols import (
+    PublicationAwareVectorStore,
+    PublicationBoundVectorStore,
+    VectorStore,
+)
 from manicule.core.retrieval import Filter
 from manicule.storage.engine import VECTORS_DIRNAME
 from manicule.storage.vector_schema import (
@@ -171,6 +175,41 @@ async def test_the_store_satisfies_the_vector_store_protocol(store: LanceVectorS
     """
     assert isinstance(store, VectorStore)
     assert_protocol_signatures(store, VectorStore)
+
+
+@pytest.mark.contract
+def test_the_two_handles_carry_the_publication_capabilities_the_runtime_dispatches_on(
+    tmp_path: Path,
+) -> None:
+    """The exact classification ``manicule.app.runtime`` relies on, pinned in both directions.
+
+    The runtime asks these two protocols three questions on the paths every installation takes:
+    whether to wrap a freshly built store in the publication-following handle, whether a durable
+    re-embed may run, and whether a derived reset may proceed. It asks the object rather than
+    importing the Lance classes to ``isinstance`` against, because that import dlopens a native
+    extension built around AVX2 and is ``SIGILL`` on a host without it.
+
+    Which makes the split load-bearing rather than tidy. The plain store groups rows into
+    publications; only the published handle follows SQLite's pointer and takes a
+    ``vector_table`` on each deletion, so only it may be handed to the teardown and reset paths.
+    Assert the negative too: a plain store that started matching the bound protocol would be
+    torn down as though it owned a pointer it does not have.
+
+    Both protocols are signature-checked, and separately, because ``assert_protocol_signatures``
+    reads ``vars(protocol)`` — the derived protocol's own members only. Checking the bound one
+    alone would validate three methods and silently skip the six it inherits, which is where a
+    rename would hide.
+    """
+    plain = LanceVectorStore(tmp_path / "vectors")
+
+    assert isinstance(plain, PublicationAwareVectorStore)
+    assert not isinstance(plain, PublicationBoundVectorStore)
+    assert_protocol_signatures(plain, PublicationAwareVectorStore)
+
+    assert issubclass(PublishedLanceVectorStore, PublicationAwareVectorStore)
+    assert issubclass(PublishedLanceVectorStore, PublicationBoundVectorStore)
+    assert_protocol_signatures(PublishedLanceVectorStore, PublicationAwareVectorStore)
+    assert_protocol_signatures(PublishedLanceVectorStore, PublicationBoundVectorStore)
 
 
 @pytest.mark.contract

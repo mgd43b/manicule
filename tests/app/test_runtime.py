@@ -474,6 +474,12 @@ async def test_custom_vector_backend_reset_refuses_before_relational_retirement(
     await store.replace_chunks(document.id, [make_chunk(document, 0, "preserve me")])
 
     class CustomBackendRuntime:
+        # Configured for the built-in backend on purpose, so the refusal under test is the one
+        # made about the *handle* rather than the one made about the configured name. A store
+        # registered under `lancedb` that is not the publication-following handle is exactly
+        # the case the isinstance half exists to catch.
+        settings = Settings()
+
         @asynccontextmanager
         async def derived_mutation_guard(self) -> AsyncGenerator[None]:
             yield
@@ -493,6 +499,130 @@ async def test_custom_vector_backend_reset_refuses_before_relational_retirement(
 
     assert await store.get_document(document.id) is not None
     assert await store.count_chunks() == 1
+
+
+async def test_reset_refuses_a_publication_shaped_store_on_a_non_lance_backend(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    """Satisfying the protocol is not enough; the configured backend has to be the Lance one.
+
+    ``isinstance`` against a ``runtime_checkable`` protocol checks that methods exist by name and
+    nothing about what they do, so a third-party store offering a publication surface of its own
+    matches ``PublicationBoundVectorStore`` structurally. What reset goes on to do after the
+    check is not backend-agnostic — it builds ``LanceShadowGenerations`` over a Lance directory
+    and then deletes that directory — so passing on the protocol alone would mean a custom
+    backend's reset manipulating Lance's on-disk generations while its own storage kept every
+    row it was asked to drop.
+
+    The store here is deliberately a *good* structural match. The refusal has to come from the
+    configured name.
+    """
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    store = cast("Any", await runtime.documents())
+    document = make_document(source_id="publication-shaped-preserved")
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "preserve me")])
+
+    class PublicationShapedStore:
+        """Every method ``PublicationBoundVectorStore`` declares, and none of Lance's storage."""
+
+        async def teardown(self) -> None: ...
+        async def publication_row_count(self, publication_id: str) -> int: ...
+        async def delete_publication(self, publication_id: str) -> int: ...
+        async def prepare_publication_validation(self, publication_id: str) -> None: ...
+        async def publication_is_complete(self, *args: Any, **kwargs: Any) -> bool: ...
+        async def publication_page_is_complete(self, *args: Any, **kwargs: Any) -> bool: ...
+        async def copy_publication(self, *args: Any, **kwargs: Any) -> None: ...
+        async def delete_bound_chunks(self, *args: Any, **kwargs: Any) -> int: ...
+        async def delete_bound_publication(self, *args: Any, **kwargs: Any) -> int: ...
+
+    assert isinstance(PublicationShapedStore(), PublicationBoundVectorStore), (
+        "this store must match the protocol, or the test is asserting the wrong refusal"
+    )
+
+    class QdrantConfiguredRuntime:
+        settings = Settings.model_validate(
+            {"storage": {"vector_db": "qdrant", "vector_db_url": "http://127.0.0.1:6333"}}
+        )
+
+        @asynccontextmanager
+        async def derived_mutation_guard(self) -> AsyncGenerator[None]:
+            yield
+
+        async def documents(self) -> object:
+            return store
+
+        async def vector_directory(self) -> Path:
+            return tmp_path / "qdrant-configured-vectors"
+
+        async def vectors(self) -> object:
+            return PublicationShapedStore()
+
+    maintenance = _Maintenance(cast("Runtime", QdrantConfiguredRuntime()))
+    with pytest.raises(ManiculeError, match="publication-aware vector backend"):
+        await maintenance.reset_index()
+
+    assert await store.get_document(document.id) is not None
+    assert await store.count_chunks() == 1
+
+
+async def test_a_publication_shaped_third_party_store_is_handed_back_unwrapped(
+    manicule_environment: Path,
+) -> None:
+    """``_build_vectors`` wraps for the configured backend, not for whatever matches the shape.
+
+    The wrapper it would otherwise construct is ``PublishedLanceVectorStore``, which resolves a
+    *Lance directory* and follows SQLite's publication pointer into it. Handing it a store that
+    merely answers the same method names means every read and write meant for that backend goes
+    to a directory it never wrote — silently, because the store the container actually built is
+    discarded at that point.
+
+    ``isinstance`` against a ``runtime_checkable`` protocol cannot tell the two apart: it matches
+    on method names and nothing else, and the plugin API accepts third-party ``VectorStore``
+    factories. So the configured name is the half that decides, and this is the test that holds
+    it — the real Qdrant store cannot, because it does not implement the publication surface at
+    all and would be refused by the protocol check on its own.
+    """
+    from manicule.core.protocols import PublicationAwareVectorStore  # noqa: PLC0415
+
+    class PublicationShapedStore:
+        """Structurally publication-aware, and not Lance. The case the name check exists for."""
+
+        async def ensure_ready(self, *args: Any, **kwargs: Any) -> None: ...
+        async def fingerprint(self) -> None: ...
+        async def upsert(self, *args: Any, **kwargs: Any) -> None: ...
+        async def stored_vectors(self, *args: Any, **kwargs: Any) -> dict[str, Any]: ...
+        async def search(self, *args: Any, **kwargs: Any) -> list[Any]: ...
+        async def delete_document(self, document_id: str) -> None: ...
+        async def count(self) -> int: ...
+        async def teardown(self) -> None: ...
+        async def publication_row_count(self, publication_id: str) -> int: ...
+        async def delete_publication(self, publication_id: str) -> int: ...
+        async def prepare_publication_validation(self, publication_id: str) -> None: ...
+        async def publication_is_complete(self, *args: Any, **kwargs: Any) -> bool: ...
+        async def publication_page_is_complete(self, *args: Any, **kwargs: Any) -> bool: ...
+        async def copy_publication(self, *args: Any, **kwargs: Any) -> None: ...
+
+    built = PublicationShapedStore()
+    assert isinstance(built, PublicationAwareVectorStore), (
+        "this store must match the protocol, or the test is not asserting what it claims"
+    )
+
+    discovery = discover()
+    discovery.registry.bind("third-party").add(keys.VECTOR_STORE.named("memory"), lambda _: built)
+
+    settings = Settings(data_dir=manicule_environment / "data")
+    # Not a `Literal` member: a third-party backend is exactly what this guards, and the field
+    # only enumerates the two that ship. `tests/retrieval/test_retriever.py` does the same.
+    settings.storage.vector_db = "memory"  # pyright: ignore[reportAttributeAccessIssue]
+
+    async with Runtime(settings, discovery=discovery) as opened:
+        assert await opened.vectors() is built
 
 
 async def test_a_backup_is_taken_and_names_what_it_contains(
