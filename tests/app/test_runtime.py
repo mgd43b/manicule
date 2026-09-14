@@ -571,6 +571,60 @@ async def test_reset_refuses_a_publication_shaped_store_on_a_non_lance_backend(
     assert await store.count_chunks() == 1
 
 
+async def test_a_publication_shaped_third_party_store_is_handed_back_unwrapped(
+    manicule_environment: Path,
+) -> None:
+    """``_build_vectors`` wraps for the configured backend, not for whatever matches the shape.
+
+    The wrapper it would otherwise construct is ``PublishedLanceVectorStore``, which resolves a
+    *Lance directory* and follows SQLite's publication pointer into it. Handing it a store that
+    merely answers the same method names means every read and write meant for that backend goes
+    to a directory it never wrote — silently, because the store the container actually built is
+    discarded at that point.
+
+    ``isinstance`` against a ``runtime_checkable`` protocol cannot tell the two apart: it matches
+    on method names and nothing else, and the plugin API accepts third-party ``VectorStore``
+    factories. So the configured name is the half that decides, and this is the test that holds
+    it — the real Qdrant store cannot, because it does not implement the publication surface at
+    all and would be refused by the protocol check on its own.
+    """
+    from manicule.core.protocols import PublicationAwareVectorStore  # noqa: PLC0415
+
+    class PublicationShapedStore:
+        """Structurally publication-aware, and not Lance. The case the name check exists for."""
+
+        async def ensure_ready(self, *args: Any, **kwargs: Any) -> None: ...
+        async def fingerprint(self) -> None: ...
+        async def upsert(self, *args: Any, **kwargs: Any) -> None: ...
+        async def stored_vectors(self, *args: Any, **kwargs: Any) -> dict[str, Any]: ...
+        async def search(self, *args: Any, **kwargs: Any) -> list[Any]: ...
+        async def delete_document(self, document_id: str) -> None: ...
+        async def count(self) -> int: ...
+        async def teardown(self) -> None: ...
+        async def publication_row_count(self, publication_id: str) -> int: ...
+        async def delete_publication(self, publication_id: str) -> int: ...
+        async def prepare_publication_validation(self, publication_id: str) -> None: ...
+        async def publication_is_complete(self, *args: Any, **kwargs: Any) -> bool: ...
+        async def publication_page_is_complete(self, *args: Any, **kwargs: Any) -> bool: ...
+        async def copy_publication(self, *args: Any, **kwargs: Any) -> None: ...
+
+    built = PublicationShapedStore()
+    assert isinstance(built, PublicationAwareVectorStore), (
+        "this store must match the protocol, or the test is not asserting what it claims"
+    )
+
+    discovery = discover()
+    discovery.registry.bind("third-party").add(keys.VECTOR_STORE.named("memory"), lambda _: built)
+
+    settings = Settings(data_dir=manicule_environment / "data")
+    # Not a `Literal` member: a third-party backend is exactly what this guards, and the field
+    # only enumerates the two that ship. `tests/retrieval/test_retriever.py` does the same.
+    settings.storage.vector_db = "memory"  # pyright: ignore[reportAttributeAccessIssue]
+
+    async with Runtime(settings, discovery=discovery) as opened:
+        assert await opened.vectors() is built
+
+
 async def test_a_backup_is_taken_and_names_what_it_contains(
     runtime: Runtime, manicule_environment: Path
 ) -> None:
