@@ -102,6 +102,55 @@ def test_both_flags_build_a_wide_unauthenticated_application() -> None:
     assert app.title == "manicule"
 
 
+async def _transport_facts(service: ApplicationService) -> dict[str, object]:
+    """The ``transport`` check's facts, through ``doctor`` rather than the private method.
+
+    What is under test is the diagnosis a caller receives — over the API health route, the MCP
+    tool, or the command line — so the assertion goes through the operation all three call.
+    """
+    diagnosis = await service.doctor()
+    return dict(next(check for check in diagnosis.checks if check.name == "transport").facts)
+
+
+async def test_deciding_an_address_records_it_for_the_diagnosis() -> None:
+    """Every serving path reaches a bind through ``address_for``, so recording lives there.
+
+    **Not in the command line.** This entry point is public: an embedder calls
+    ``manicule.api.serve.serve``, a production ASGI server builds the application itself, and
+    both expose ``doctor`` at ``GET /api/v1/health``. A recording wired into ``manicule serve``
+    would leave every one of those describing ``security.transport.bind_host`` — which a
+    caller-supplied ``host=`` never touches — so the health route of a server answering
+    ``0.0.0.0`` would report "reachable only from this machine".
+
+    Asserted through the ``transport`` check rather than on the attribute, because what is under
+    test is the diagnosis a caller receives.
+    """
+    backend, _ = backend_with_a_document()
+    service = ApplicationService(backend)
+
+    address_for(service, host=WIDE, allow_public=True, allow_unauthenticated=True)
+
+    facts = await _transport_facts(service)
+    assert facts["bind_host"] == WIDE
+    assert facts["loopback"] is False
+    assert facts["configured_bind_host"] == "127.0.0.1"
+
+
+async def test_a_refused_address_records_nothing() -> None:
+    """A bind that was never decided is not a bind, and must not be diagnosed as one.
+
+    Without this the recording could be moved above ``resolve_bind`` and every refusal test
+    would still pass, while a process that refused to start described an exposure it never had.
+    """
+    backend, _ = backend_with_a_document()
+    service = ApplicationService(backend)
+
+    with pytest.raises(PolicyError):
+        address_for(service, host=WIDE, allow_public=True)
+
+    assert (await _transport_facts(service))["bind_host"] == "127.0.0.1"
+
+
 def test_a_command_line_host_that_is_loopback_builds() -> None:
     """The other direction: a decided loopback address is allowed even with no auth."""
     backend, _ = backend_with_a_document()

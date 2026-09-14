@@ -152,6 +152,11 @@ def address_for(
         allow_public=allow_public,
         allow_unauthenticated=allow_unauthenticated,
     )
+    # Recorded at the decision, for the reason :func:`manicule.api.serve.address_for` gives: this
+    # transport publishes the `doctor` tool, and `--host` never reaches configuration. Below the
+    # stdio branch, so a pipe records nothing — it took no address, and a `ServerAddress` for it
+    # carries `host=""`, which is in `EVERY_INTERFACE` rather than `LOOPBACK_HOSTS`.
+    service.serving_on(bind.host)
     return ServerAddress(
         transport="http",
         host=bind.host,

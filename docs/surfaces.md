@@ -832,6 +832,14 @@ file says. A process that bound nothing — `manicule doctor` at a terminal, or 
 has no address to prefer, so it is diagnosed from configuration, which is then the only honest
 answer.
 
+The address is recorded by the two functions that *decide* one, `manicule.api.serve.address_for`
+and `manicule.mcp.serve.address_for`, rather than by whichever code goes on to listen. Every
+serving path reaches a bind through one of them — the command line, an embedder calling
+`manicule.api.serve.serve`, a production ASGI server building the application — so a path added
+later records its address without anybody remembering to, and the API health route and the MCP
+`doctor` tool describe the same address the process answers on. A refused bind records nothing,
+because it decided none.
+
 `serving_unauthenticated` is read the same way, from how *this process* was started, so it is
 `true` only in a diagnosis produced inside a serving process and `false` from a fresh `manicule
 doctor`.

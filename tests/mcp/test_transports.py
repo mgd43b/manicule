@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import pytest
 
+from manicule.app.results import Check
 from manicule.config.settings import AuthMode, AuthoringSettings, AuthSettings, Settings
 from manicule.core.errors import PolicyError
 from manicule.mcp.serve import NETWORK_SURFACE_IS_READ_ONLY, address_for, surface
@@ -27,6 +28,9 @@ from tests.app.fakes import FakeBackend
 from tests.mcp.test_annotations import MUTATIONS
 
 from manicule.app.service import ApplicationService  # isort: skip
+
+
+EVERYWHERE = "0.0.0.0"  # noqa: S104 - the address whose exposure is the subject
 
 
 @pytest.fixture
@@ -147,6 +151,40 @@ def test_a_socket_serving_authoring_without_authentication_refuses_to_start(
     # same test so that a refusal widened to every transport fails here rather than being
     # discovered by somebody whose editor stopped being able to spawn manicule.
     assert address_for(configured, transport="stdio").transport == "stdio"
+
+
+async def test_deciding_a_socket_address_records_it_and_a_pipe_records_nothing(
+    service: ApplicationService,
+) -> None:
+    """The MCP half of the same rule, and the stdio case that must stay silent.
+
+    This transport publishes the ``doctor`` tool, so a client asking it about a server started
+    with ``--host 0.0.0.0`` would otherwise be told the process is reachable only from the
+    machine it is on.
+
+    The pipe is asserted in the same test because it is the way this goes wrong: a
+    ``ServerAddress`` for stdio carries ``host=""``, which is in ``EVERY_INTERFACE`` rather than
+    ``LOOPBACK_HOSTS``, so a recording placed above the stdio branch would diagnose a process
+    with no socket at all as a wide bind — reporting the loudest possible finding about the
+    quietest possible transport.
+    """
+    address_for(
+        service, transport="http", host=EVERYWHERE, allow_public=True, allow_unauthenticated=True
+    )
+    assert (await _transport_check(service)).facts["bind_host"] == EVERYWHERE
+
+    piped = ApplicationService(FakeBackend())
+    address_for(piped, transport="stdio")
+    check = await _transport_check(piped)
+    assert check.state == "ok"
+    assert check.facts["bind_host"] == "127.0.0.1"
+    assert check.facts["loopback"] is True
+
+
+async def _transport_check(service: ApplicationService) -> Check:
+    """The ``transport`` check, through ``doctor`` — the operation every surface actually calls."""
+    diagnosis = await service.doctor()
+    return next(check for check in diagnosis.checks if check.name == "transport")
 
 
 def test_a_socket_without_authoring_configured_still_starts_unauthenticated(

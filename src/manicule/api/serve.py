@@ -81,6 +81,10 @@ def address_for(
     refusal without opening a socket. A bind decided only inside the call that performs it is
     a bind nobody can assert on.
 
+    Also records the decided address on ``service``, for
+    :meth:`~manicule.app.service.ApplicationService.doctor` — see
+    :meth:`~manicule.app.service.ApplicationService.serving_on`.
+
     Raises:
         PolicyError: The address is not loopback and something required to widen it is
             missing. The message names which. Authoring's own refusal is not here: it belongs
@@ -94,6 +98,13 @@ def address_for(
         allow_public=allow_public,
         allow_unauthenticated=allow_unauthenticated,
     )
+    # **Recorded here, where the address is decided, rather than by whoever serves it.** This
+    # application exposes `doctor` at `GET /api/v1/health`, and `--host` never touches
+    # `security.transport.bind_host` — so a diagnosis reading configuration describes the wrong
+    # address for every caller that passed one. Putting it at the decision means no serving path
+    # can forget: the command line, an embedder calling `serve`, and a production ASGI server
+    # building the application all arrive through this function.
+    service.serving_on(bind.host)
     return bind, ServerAddress(
         transport=TRANSPORT,
         host=bind.host,

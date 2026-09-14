@@ -747,8 +747,7 @@ class ApplicationService:
 
         **Set after construction rather than passed in**, and that is forced rather than chosen:
         the MCP address is decided by :func:`manicule.mcp.serve.address_for`, which counts the
-        tools on the surface and therefore needs this service to exist first. Write-once, from
-        the one place that knows.
+        tools on the surface and therefore needs this service to exist first.
         """
 
         self._authoring = asyncio.Lock()
@@ -769,15 +768,27 @@ class ApplicationService:
     def serving_on(self, host: str) -> None:
         """Record the address this process bound, for :meth:`doctor` to judge instead of the file.
 
-        ``--host`` is argv, so a server started with ``--host 0.0.0.0`` leaves
-        ``security.transport.bind_host`` at its configured default. A ``transport`` check reading
-        configuration then reports "reachable only from this machine" about a process answering
-        the network — the one direction that check must never be wrong in, and the reason this
-        exists.
+        ``--host`` and a caller-supplied ``host=`` are argv and arguments, so neither reaches
+        ``security.transport.bind_host``. A ``transport`` check reading configuration therefore
+        reports "reachable only from this machine" about a process answering the network — the
+        one direction that check must never be wrong in, and the reason this exists.
 
-        Called by ``manicule serve`` once the address is decided and before the socket opens.
-        Nothing else calls it, and a process that never does is diagnosed from its configuration,
-        which is the honest answer when no address was taken.
+        **Called from the two functions that *decide* an address**, not from the ones that serve:
+        :func:`manicule.api.serve.address_for` and :func:`manicule.mcp.serve.address_for`. That
+        placement is the point. Every path reaches a bind through one of them — the command line,
+        an embedder calling ``manicule.api.serve.serve``, a production ASGI server building the
+        application — so a serving path added tomorrow records its address without anybody
+        remembering to, which is the difference between a guarantee and a convention. Recording
+        at the decision rather than at the listen also means the API health route and the MCP
+        ``doctor`` tool describe the same address the process is about to answer on.
+
+        Idempotent, and called more than once on the ordinary path: a server resolves its address
+        once to announce it and again to bind it, with the same inputs and therefore the same
+        answer.
+
+        Stdio records nothing. It took no address, and its ``ServerAddress`` carries ``host=""``,
+        which is in ``EVERY_INTERFACE`` rather than ``LOOPBACK_HOSTS`` — so recording it would
+        have a process with no socket at all diagnosed as a wide bind.
         """
         self._serving_host = host
 
