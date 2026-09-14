@@ -65,9 +65,16 @@ so applying one — or failing to — changes the vector for the same text. mani
 query/document distinction to hang that on: `Embedder.embed` is the only entry point, and
 ingest and dense retrieval call it identically, so a backend cannot tell which side it is
 serving. Inventing a rule here would put a retrieval decision inside a plugin and leave it out
-of the fingerprint entirely. So this backend applies nothing and *says so in the identity*: the
-`prefix=none` term is what makes a future prefix mechanism a fingerprint change and a re-embed
-rather than a silent quality regression.
+of the fingerprint entirely. So this backend applies nothing and says so in its identity, as
+`…:prefix=none`.
+
+That term protects **this backend and no other**, which is worth being precise about because
+the generous reading is wrong. `weights_identity` is written by whichever backend built the
+fingerprint, so a scheme adopted in core would change what `onnx` and `mlx` embed while their
+identities recorded nothing — their fingerprints would go on matching an index their vectors no
+longer belonged in. The general fix is a core-owned entry in `EmbedFingerprint.IDENTITY_FIELDS`;
+`docs/embeddings.md` §9.1 has it, along with why `ChunkFingerprint.embed_text_middleware` looks
+like the home for it and is not.
 
 **It cannot be told how to pool.** The server pools. Configuration's `pooling` is consulted
 only when the GGUF declares none, and a setting that contradicts the GGUF is refused — because

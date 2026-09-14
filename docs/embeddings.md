@@ -818,7 +818,48 @@ a documented property of a self-hosted tool rather than a defect.
 | Ticket | What | Why not here |
 |---|---|---|
 | [#6](https://github.com/mgd43b/manicule/issues/6) | **BGE-M3 learned-sparse leg** as an alternative to FTS5 BM25 (§1.4) | A retrieval feature, and retrieval features earn their place with a measured improvement on #15. Labeled `needs-evidence`. Neither backend exposes the head today, so it is a runtime change as well as a retrieval one |
-| — | **Asymmetric query/document prefixes.** `nomic-embed-text` is trained with `search_query:`/`search_document:` and Qwen3-Embedding with a query-side instruction; applying one, or failing to, changes the vector for the same text and degrades retrieval with nothing raised | It cannot live in a backend. `Embedder.embed` is the only entry point and `ingest/embedding.py` and `retrieval/dense.py` call it identically, so a backend cannot tell which side it is serving — and `EmbedFingerprint` has no field for the scheme, although §4.3 already nets a "document-side instruction prefix" out of the budget and §8 already names a prefix as something that changes the vector. Both halves belong in core: a way to say which side is being embedded, and a term in identity so that adopting a scheme is a re-embed rather than a silent quality change. `manicule-ollama` applies nothing and records `prefix=none` inside `weights_identity`, which is what makes that future change a fingerprint mismatch |
+| — | **Asymmetric query/document prefixes.** `nomic-embed-text` is trained with `search_query:`/`search_document:` and Qwen3-Embedding with a query-side instruction; applying one, or failing to, changes the vector for the same text and degrades retrieval with nothing raised | Two halves, and both belong in core. See §9.1 |
+
+### 9.1 Where a prefix scheme has to live, and the two places it must not
+
+**It cannot live in a backend.** `Embedder.embed` is the only entry point, and
+`ingest/embedding.py` and `retrieval/dense.py` call it identically — so a backend cannot tell
+which side it is serving, and a rule invented inside one is a retrieval decision hidden in a
+plugin.
+
+**It has to be an identity field, and a core-owned one.** `EmbedFingerprint` has no field for
+the scheme, although §4.3 already nets a "document-side instruction prefix" out of the budget
+and §8 already names a prefix among the things that change the vector for the same text. The
+tempting shortcut is the one `manicule-ollama` takes for itself: a term inside
+`weights_identity`, which that backend writes as `…:prefix=none`. **That does not generalize,
+and reading it as though it did is the trap.** `weights_identity` is supplied by whichever
+backend built the fingerprint, so a scheme adopted in core would change what `onnx` and `mlx`
+embed while their `weights_identity` — `artifact:onnx:hf:…`, or the `qualified:` form for a
+parity-qualified pair — recorded nothing. Their fingerprints would go on matching an index
+built before the change while their vectors stopped belonging in it, which is the exact failure
+the marker avoids for the one backend that writes it. `EmbedFingerprint.identity()` also *pops*
+`weights_identity` when it is empty, so the term is not even uniformly present: a backend
+recording nothing has a different canonical form from one recording `prefix=none`.
+
+So the fix is an entry in `IDENTITY_FIELDS` owned by core, which covers every backend by
+construction rather than by each one remembering to describe itself.
+
+**And it must not ride on `ChunkFingerprint.embed_text_middleware`, which is the mechanism it
+most resembles.** That field is already in its fingerprint's identity and already means
+"something rewrote the embedded text", so it looks like the obvious home. It is not, and the
+reason is an asymmetry rather than a technicality:
+
+- `embed_text_middleware` describes a rewrite of text that is **stored**. The vector store
+  derives `embedding_input_identity` from it per chunk and keeps it beside the vector, which is
+  how reuse is decided ([`storage.md`](storage.md) §6.2).
+- A **query** prefix has no stored counterpart. A query is not a chunk, has no row, and is
+  never compared against one — so there is nothing for `embedding_input_identity` to key on.
+
+Which means middleware can express the document half and cannot express the query half. Doing
+the expressible half alone is *worse than doing neither*: these models are asymmetric, and a
+corpus embedded with `search_document:` against queries embedded bare is a retrieval regression
+introduced by the change meant to fix one. The two sides have to move together, under one
+identity, and the only place that can be is the embedding fingerprint.
 
 ## 10. Checklist against ticket #3
 

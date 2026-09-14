@@ -78,11 +78,24 @@ text. manicule has no query/document distinction to hang that on:
 backend cannot tell which side it is serving. Inventing a rule here would put a retrieval
 decision inside a plugin and leave it out of the fingerprint entirely.
 
-So the honest thing is to apply nothing and to *say so in the identity*. The day manicule grows
-a prefix mechanism, this term becomes the scheme's name, every stored identity stops matching,
-and the corpus is re-embedded — which is the correct cost, because the vectors really would be
-different. ``docs/embeddings.md`` §8 already names a prefix as something that changes the
-vector for the same text; this is the field that was missing.
+**What this term protects is this backend, and only this backend.** That is worth saying
+plainly, because the obvious reading is wrong and the wrong reading is the dangerous one.
+:attr:`~manicule.core.embedding.EmbedFingerprint.weights_identity` is supplied by whichever
+backend built the fingerprint, so a scheme adopted in *core* would move what ``onnx`` and
+``mlx`` embed while their ``weights_identity`` — ``artifact:onnx:hf:…``, or the ``qualified:``
+form for a parity-qualified pair — said nothing had changed. Their fingerprints would match an
+index built before the change while their vectors no longer belonged in it: exactly the silent
+regression this term avoids here, occurring everywhere else.
+
+It is not even a uniform marker. :meth:`EmbedFingerprint.identity` *pops* ``weights_identity``
+when it is empty, so a backend that records nothing has a different canonical form from one
+that records ``prefix=none`` — the absence of the term does not read as "no prefix", it reads
+as a different shape of identity.
+
+So this is a local guarantee and must not be mistaken for the general one. The general fix is a
+**core-owned field in** :attr:`EmbedFingerprint.IDENTITY_FIELDS`, which covers every backend by
+construction rather than by each one remembering to describe itself. ``docs/embeddings.md`` §9
+carries that, including why the mechanism it most resembles is not its home.
 """
 
 CONTEXT_RESERVE: Final = 1
@@ -307,7 +320,10 @@ def weights_identity(model: str, digest: str) -> str:
         fingerprint mismatch instead of a silently mixed index.
 
     the prefix scheme
-        what was done to the text before the model saw it. See :data:`_PREFIX_SCHEME`.
+        what was done to the text before the model saw it — nothing, today. It is here so that
+        adopting one later invalidates *these* vectors, and it does not and cannot do the same
+        for any other backend: see :data:`_PREFIX_SCHEME` for why that is core's problem rather
+        than a thing each backend can solve for itself.
     """
     return f"artifact:{BACKEND}:{model}@sha256:{digest}:{_PREFIX_SCHEME}"
 
