@@ -54,7 +54,15 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/manicule/venv \
 # torch, it is gigabytes, and the retrieval profiles reach a cross-encoder through a seam that
 # is simply unfilled without it. `embeddings` resolves to onnxruntime here — mlx-embeddings is
 # marked for Apple Silicon in pyproject.toml and does not install on Linux at all.
-ARG EXTRAS="--extra storage --extra qdrant --extra embeddings --extra parsers --extra retrieval --extra generation --extra connectors --extra ingest --extra serve"
+#
+# `ollama` is here and `manicule-mlx` is not, and the reasoning inverts rather than differing:
+# MLX is excluded because there is no Linux container in which it is a valid answer, while an
+# HTTP client is valid *precisely* in a container — a pod that cannot embed well beside a GPU
+# node that can is the deployment that backend exists for. The image is also the one place an
+# operator cannot install it afterwards, which is what left `manicule-ollama` unusable in
+# 0.1.19: the package was in the tag and in the workspace, declared only in the `dev` group,
+# and this line installs with `--no-dev`.
+ARG EXTRAS="--extra storage --extra qdrant --extra embeddings --extra parsers --extra retrieval --extra generation --extra connectors --extra ingest --extra serve --extra ollama"
 
 WORKDIR /src
 
