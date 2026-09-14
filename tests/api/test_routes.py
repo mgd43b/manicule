@@ -30,11 +30,14 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from manicule.api.app import MCP_PATH, ROUTE_GROUPS, build_app
+from manicule.app.bind import Bind
 from manicule.app.service import ApplicationService
+from manicule.config.settings import AuthMode
 from manicule.core.errors import PolicyError
 from manicule.mcp.server import NETWORK_AUTHORING, TOOL_NAMES, build_server
 from tests.api.live import mounted
 from tests.api.support import app_for, backend_with_a_document, client_for, envelope
+from tests.mcp.test_annotations import MUTATIONS
 from tests.routing_support import Reach, classify, walk_routes
 
 if TYPE_CHECKING:
@@ -634,15 +637,47 @@ to catch a collapse, not to track the size of the surface.
 """
 
 
-async def _network_tools(backend: FakeBackend) -> dict[str, Tool]:
+EVERYWHERE = "0.0.0.0"  # noqa: S104 - named once, so the literal is explained once
+
+AUTHENTICATED = {"security": {"auth": {"mode": "api_key"}}}
+"""Settings for a socket that carries its one write.
+
+**Named because it is now a precondition rather than a detail.**
+``manicule.mcp.server.network_authoring`` returns nothing when ``security.auth.mode`` is
+``none``, so a surface built over default settings is the read-only set and *only* that. Every
+assertion below about ``document_create`` being present is an assertion about an authenticated
+socket, and passing these overrides is what makes it one.
+"""
+
+
+async def _network_tools(
+    backend: FakeBackend, *, credential: dict[str, str] | None = None
+) -> dict[str, Tool]:
     """``tools/list`` as a client of the mounted endpoint receives it.
 
     Over the protocol rather than off ``manicule.mcp.server``'s registrar, because what is under
     test is what a caller on the socket can reach. A surface computed correctly and mounted
     wrongly is the failure this is for, and reading the registrar would report it as fine.
+
+    ``credential`` is needed on an authenticated mount and must be absent from an unauthenticated
+    one — the guard refuses an anonymous caller wherever a key is configured, so a test that
+    forgot it would see an empty surface and read it as an absence.
     """
-    async with mounted(backend) as client:
+    async with mounted(backend, credential=credential) as client:
         return {tool.name: tool for tool in await client.list_tools()}
+
+
+async def _authenticated_socket() -> tuple[FakeBackend, dict[str, str]]:
+    """A backend whose socket carries its one write, and a viewer key that may list it.
+
+    A *viewer* deliberately: the surface a socket publishes is the same for every role — the
+    mount's guard asks for a viewer because it carries the read surface — so listing as the
+    least-privileged caller is the honest way to ask what is published. Who may *call*
+    ``document_create`` is a separate question, and ``_authored_as`` is where it is asked.
+    """
+    backend, _ = backend_with_a_document(**AUTHENTICATED)
+    issued = await ApplicationService(backend).api_key_create("viewer-key", role="viewer")
+    return backend, {"X-API-Key": issued.secret}
 
 
 @pytest.mark.parametrize(("name", "why"), ABSENT_TOOLS)
@@ -682,8 +717,8 @@ async def test_every_read_only_tool_is_offered_on_the_network_mcp_surface() -> N
     *that* subtraction is the claim: the two lists together are the surface, so a tool added
     tomorrow lands in one of them or fails the test after this one.
     """
-    backend, _ = backend_with_a_document()
-    published = await _network_tools(backend)
+    backend, credential = await _authenticated_socket()
+    published = await _network_tools(backend, credential=credential)
     expected = sorted(set(TOOL_NAMES) - {name for name, _ in ABSENT_TOOLS})
     assert sorted(published) == expected
     assert len(published) >= MINIMUM_TOOLS, (
@@ -701,8 +736,8 @@ async def test_the_absent_tools_and_the_offered_ones_are_the_whole_surface() -> 
     assertion here green — each is a statement about the tools it names, and an unnamed one is
     named nowhere.
     """
-    backend, _ = backend_with_a_document()
-    published = set(await _network_tools(backend))
+    backend, credential = await _authenticated_socket()
+    published = set(await _network_tools(backend, credential=credential))
     absent = {name for name, _ in ABSENT_TOOLS}
     assert published | absent == set(TOOL_NAMES)
     assert published & absent == set()
@@ -721,8 +756,8 @@ async def test_every_published_tool_reads_or_is_the_one_named_write() -> None:
     test is a second place the set is decided and the two would agree until somebody edited one.
     What this file writes out instead is the *equality* below, which is the claim worth pinning.
     """
-    backend, _ = backend_with_a_document()
-    for name, tool in (await _network_tools(backend)).items():
+    backend, credential = await _authenticated_socket()
+    for name, tool in (await _network_tools(backend, credential=credential)).items():
         assert tool.annotations is not None, f"{name} publishes no annotations"
         if name in NETWORK_AUTHORING:
             assert tool.annotations.read_only_hint is False, (
@@ -745,20 +780,59 @@ async def test_the_network_surface_is_the_reads_plus_exactly_one_named_write() -
     The read-only set is derived from the published annotations of the **whole** surface rather
     than from ``ABSENT_TOOLS``, so this does not compare one hand-maintained list against another.
     """
-    backend, _ = backend_with_a_document()
-    async with Client(build_server(ApplicationService(backend))) as client:
-        everything = {tool.name: tool.annotations for tool in await client.list_tools()}
-    reads = {
-        name
-        for name, annotations in everything.items()
-        if annotations is not None and annotations.read_only_hint is True
-    }
-    published = set(await _network_tools(backend))
-    assert published == reads | NETWORK_AUTHORING
+    backend, credential = await _authenticated_socket()
+    published = set(await _network_tools(backend, credential=credential))
+    assert published == await _reads_on_the_whole_surface(backend) | NETWORK_AUTHORING
     assert {"document_create"} == NETWORK_AUTHORING, (
         "the network surface grew a second write tool. That is a decision with its own threat "
         "model — see docs/surfaces.md — not a line to update until this passes."
     )
+
+
+async def test_the_network_surface_without_authentication_is_the_reads_and_nothing_else() -> None:
+    """The same set operation with the other operand empty, which is the whole of the rule.
+
+    **Asserted as a set operation for the reason the test above is**, and the pair is the point:
+    one names the surface an authenticated socket carries, this one names the surface an
+    unauthenticated socket carries, and neither writes out a tool list that could be edited until
+    it matched. A write admitted here tomorrow — authoring, or anything let through by some other
+    route — fails with both sides printed.
+
+    **Why this is a set operation rather than a guard.** Without authentication there is no
+    credential, so ``manicule.api.security.Principal.role`` resolves an anonymous caller to
+    ``admin`` and ``require_network_member``'s member floor is cleared by everyone. A
+    ``document_create`` published here would therefore be callable by anything that can route to
+    the port, writing into a corpus that assistants read back as standing instructions. That is
+    an injection channel rather than a privacy question, and the answer to it is that the tool is
+    not registered — an absence, which no header, middleware or setting can be granted an
+    exception to.
+
+    ``--no-authentication`` is what makes this reachable on a routable address, and it changes
+    nothing here: this surface is decided by ``security.auth.mode`` alone, so it is the same
+    surface on loopback, and the flag cannot widen it.
+    """
+    backend, _ = backend_with_a_document()
+    assert backend.settings.security.auth.mode is AuthMode.NONE
+    published = set(await _network_tools(backend))
+    assert published == await _reads_on_the_whole_surface(backend)
+    assert not published & set(MUTATIONS), sorted(published & set(MUTATIONS))
+
+
+async def _reads_on_the_whole_surface(backend: FakeBackend) -> set[str]:
+    """Every tool that reports itself read-only, read off the **whole** surface.
+
+    Derived from the published annotations rather than from ``ABSENT_TOOLS``, so the tests above
+    do not compare one hand-maintained list against another. Over stdio, because that is the
+    surface that carries everything and is therefore the only one that can be asked what the
+    complete classification is.
+    """
+    async with Client(build_server(ApplicationService(backend))) as client:
+        everything = {tool.name: tool.annotations for tool in await client.list_tools()}
+    return {
+        name
+        for name, annotations in everything.items()
+        if annotations is not None and annotations.read_only_hint is True
+    }
 
 
 def test_an_application_serving_authoring_without_authentication_refuses_to_be_built() -> None:
@@ -781,6 +855,49 @@ def test_an_application_serving_authoring_without_authentication_refuses_to_be_b
 
     with pytest.raises(PolicyError, match="authoring"):
         build_app(ApplicationService(backend))
+
+
+def test_the_no_authentication_flag_does_not_buy_an_unauthenticated_authoring_application() -> None:
+    """The escape hatch stops at the write, on **this** surface as well as on the MCP one.
+
+    **This is the test that stops the surface narrowing from being cosmetic.** Emptying
+    ``network_authoring`` takes ``document_create`` off the MCP socket; the same operation is
+    ``POST /api/v1/documents`` here, and its ``MemberPrincipal`` floor is cleared by an anonymous
+    caller because ``auth.mode = none`` resolves one to an administrator. So an application built
+    unauthenticated with authoring configured would carry an anonymous write into the corpus
+    through a door the MCP surface does not control — and every assertion about the MCP surface
+    would still be green.
+
+    ``allow_unauthenticated`` is passed here, which is the point: it satisfies the *bind*, and
+    this refusal is not a bind check.
+    """
+    from manicule.config.settings import AuthoringSettings  # noqa: PLC0415
+
+    backend, _ = backend_with_a_document()
+    backend.settings = backend.settings.model_copy(
+        update={"authoring": AuthoringSettings(source="memories", collections=("memory",))}
+    )
+
+    with pytest.raises(PolicyError, match="authoring"):
+        build_app(ApplicationService(backend), allow_unauthenticated=True)
+
+
+def test_an_unauthenticated_wide_application_is_built_and_can_write_nowhere() -> None:
+    """The positive control for the pair above, and the shape of what the flag actually buys.
+
+    An application that refused to be built however it was asked would satisfy both refusal
+    tests, so this is the one that says the escape hatch opens. What it opens is a **read**
+    surface: authoring is unconfigured — it has to be, or the refusal above fires — so
+    ``document_create`` writes nowhere on either surface, and the MCP mount does not publish it
+    at all.
+    """
+    backend, _ = backend_with_a_document()
+    assert backend.settings.authoring.configured is False
+
+    wide = Bind(EVERYWHERE, 8765, loopback=False, every_interface=True)
+    app = build_app(ApplicationService(backend), bind=wide, allow_unauthenticated=True)
+
+    assert app.title == "manicule"
 
 
 def test_an_application_without_authoring_configured_is_built_unauthenticated() -> None:
@@ -857,8 +974,8 @@ async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> 
     handshake the connection used — MCP SDK v2's ``server/discover`` leaves ``initialize_result``
     unset — so this stays a claim about what a client receives.
     """
-    backend, _ = backend_with_a_document()
-    async with mounted(backend) as client:
+    backend, credential = await _authenticated_socket()
+    async with mounted(backend, credential=credential) as client:
         instructions = client.instructions
     assert instructions is not None, "the server sent no instructions"
     assert "read-only" in instructions, instructions
@@ -869,4 +986,29 @@ async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> 
     )
     assert "## Scope every question to a collection" in instructions, (
         "the read-only notice replaced the ordinary instructions instead of being added to them"
+    )
+
+
+async def test_an_unauthenticated_socket_tells_a_client_why_authoring_is_not_here() -> None:
+    """The notice describes the surface that was actually built, not the one usually built.
+
+    A client told ``document_create`` is available and then given an unknown-tool error has spent
+    a turn finding out, and the obvious recovery from an unknown tool is to try another name —
+    which is why the instructions are chosen alongside the surface rather than fixed. The
+    *reason* is in the text because this is the one surface where an operator may have told an
+    assistant that authoring works; being told why it is missing is what stops it reporting a
+    broken installation.
+    """
+    backend, _ = backend_with_a_document()
+    async with mounted(backend) as client:
+        instructions = client.instructions
+    assert instructions is not None, "the server sent no instructions"
+    assert "read-only" in instructions, instructions
+    assert "manicule serve" in instructions, instructions
+    assert "authentication" in instructions, (
+        "the notice does not say why this socket carries no write, so an assistant told that "
+        "authoring is configured has no way to distinguish this from a broken installation"
+    )
+    assert "## Scope every question to a collection" in instructions, (
+        "the notice replaced the ordinary instructions instead of being added to them"
     )

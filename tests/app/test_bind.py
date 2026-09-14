@@ -5,6 +5,12 @@ omissions or configuration edits that produces an unauthenticated listener on a 
 address.** Three separate things must be true, each of which fails safe when absent, and each
 one is asserted here on its own.
 
+"Configuration edits" is the load-bearing half of that sentence now that
+``--no-authentication`` exists. An unauthenticated listener on a routable address *is*
+reachable — by a person typing two flags — and the property is that it is reachable no other
+way: not by a settings file, not by an environment variable, not by a default, and not by
+either flag alone. The tests below assert each flag's insufficiency separately for that reason.
+
 The last test is the one that catches the failure nobody sees coming: a future server that
 binds a literal address instead of going through :func:`~manicule.app.bind.resolve_bind`. No
 amount of testing this module would notice that, so the source tree itself is checked.
@@ -15,9 +21,10 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args
 
 import pytest
+from pydantic import BaseModel
 
 from manicule.app.bind import (
     EVERY_INTERFACE,
@@ -26,7 +33,7 @@ from manicule.app.bind import (
     is_loopback,
     resolve_bind,
 )
-from manicule.config.settings import Settings
+from manicule.config.settings import AuthMode, Settings
 from manicule.core.errors import PolicyError
 
 if TYPE_CHECKING:
@@ -80,12 +87,96 @@ def test_a_non_loopback_host_is_refused_without_the_explicit_flag(host: str) -> 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.0.2.10"])  # noqa: S104 - the point is refusing these
 def test_a_non_loopback_host_is_refused_without_authentication(host: str) -> None:
-    """The flag on its own is not enough. This is the defect the module exists to prevent."""
+    """The flag on its own is not enough. This is the defect the module exists to prevent.
+
+    The refusal names both ways out — configure authentication, or say on the command line that
+    you accept there is none — because an operator who has read this far has already decided
+    which of the two they want, and being told only one of them sends them to look for the other.
+    """
     settings = Settings(security={"transport": {"bind_host": host}})  # pyright: ignore[reportArgumentType]
     with pytest.raises(PolicyError) as caught:
         resolve_bind(settings, allow_public=True)
     message = str(caught.value)
     assert "security.auth.mode" in message
+    assert "--no-authentication" in message
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.0.2.10"])  # noqa: S104 - the point is refusing these
+def test_accepting_no_authentication_does_not_also_ask_for_the_wide_bind(host: str) -> None:
+    """``--no-authentication`` satisfies the third condition and only the third.
+
+    **The two flags are two statements and neither implies the other.** "I accept that there is
+    no authentication" is a claim about credentials; "I meant to put this on the network" is a
+    claim about reach. Folding them into one flag would mean an operator who wanted a private
+    unauthenticated install got a public one by typing the only argument on offer.
+
+    So the refusal here still names ``--allow-public-bind``, and it is the assertion rather than
+    the exception's mere existence: a ``resolve_bind`` that took the new flag as permission for
+    everything would raise nothing at all and this test would be the only thing that noticed.
+    """
+    settings = Settings(security={"transport": {"bind_host": host}})  # pyright: ignore[reportArgumentType]
+    with pytest.raises(PolicyError) as caught:
+        resolve_bind(settings, allow_unauthenticated=True)
+    message = str(caught.value)
+    assert "--allow-public-bind" in message
+    assert "security.auth.mode" not in message, (
+        "the refusal still complains about authentication after the operator said they accept "
+        "there is none, which is a refusal an operator cannot act on"
+    )
+
+
+def test_a_wide_unauthenticated_bind_is_possible_when_both_flags_are_passed() -> None:
+    """The escape hatch, and the positive control for the two tests above.
+
+    Without this, a ``resolve_bind`` that refused every unauthenticated wide bind however it was
+    asked would satisfy both of them — an escape hatch that does not open is indistinguishable
+    from one that is not there, and every refusal assertion would still be green.
+
+    ``security.auth.mode`` stays ``none`` here rather than being configured, which is the whole
+    case: this is the bind that was impossible before, reached with no configuration change at
+    all and two arguments on one command line.
+    """
+    settings = Settings(security={"transport": {"bind_host": EVERYWHERE}})  # pyright: ignore[reportArgumentType]
+    assert settings.security.auth.mode is AuthMode.NONE
+
+    bind = resolve_bind(settings, allow_public=True, allow_unauthenticated=True)
+
+    assert bind.host == EVERYWHERE
+    assert not bind.loopback
+    assert bind.every_interface
+
+
+def test_neither_flag_is_reachable_from_configuration() -> None:
+    """The reason both are arguments: **no settings key can supply either of them.**
+
+    This is the claim ``resolve_bind``'s docstring makes about ``allow_public`` — "a file that
+    could grant this would make a wide bind reachable by editing configuration" — asserted for
+    both, because a flag granting no authentication is that same hole one layer over and would
+    be worth more to whoever found it.
+
+    Asserted against the settings model itself rather than by trying to guess key names: every
+    field manicule has is reachable from a file, so a field that mentions either escape hatch is
+    one somebody could write down. ``Settings`` is walked to its leaves because a section added
+    tomorrow is where this would land.
+    """
+    forbidden = ("allow_public", "allow_unauthenticated", "no_authentication", "allow_public_bind")
+    seen: set[type[BaseModel]] = set()
+
+    def walk(model: type[BaseModel], path: str) -> None:
+        if model in seen:
+            return
+        seen.add(model)
+        for name, field in model.model_fields.items():
+            assert name not in forbidden, (
+                f"`{path}.{name}` is a settings field, so a configuration file can grant it. "
+                f"Widening a bind or serving unauthenticated must take a person at a terminal."
+            )
+            for candidate in get_args(field.annotation) or (field.annotation,):
+                if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                    walk(candidate, f"{path}.{name}")
+
+    walk(Settings, "settings")
+    assert len(seen) > 1, "no nested settings sections were walked, so this checked almost nothing"
 
 
 def test_the_refusal_lists_everything_that_is_missing_at_once() -> None:

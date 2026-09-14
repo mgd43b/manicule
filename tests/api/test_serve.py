@@ -84,6 +84,24 @@ def test_building_the_application_refuses_a_wide_bind_that_was_asked_for_without
         application(ApplicationService(backend), host=WIDE, allow_public=True)
 
 
+def test_both_flags_build_a_wide_unauthenticated_application() -> None:
+    """The escape hatch has to clear **both** refusals, and this is where that is proved.
+
+    ``application`` passes ``allow_unauthenticated`` to the bind *and* to ``build_app``, because
+    they refuse separately and a flag that satisfied only the first would be a flag that appears
+    to work and then fails one layer down — with a message about a decision the operator has
+    already made. The previous test is the same call without the flag, so the pair is what says
+    the argument is doing the work rather than the configuration.
+    """
+    backend, _ = backend_with_a_document()
+    app, address = application(
+        ApplicationService(backend), host=WIDE, allow_public=True, allow_unauthenticated=True
+    )
+    assert address.host == WIDE
+    assert not address.loopback
+    assert app.title == "manicule"
+
+
 def test_a_command_line_host_that_is_loopback_builds() -> None:
     """The other direction: a decided loopback address is allowed even with no auth."""
     backend, _ = backend_with_a_document()

@@ -1185,7 +1185,12 @@ def _signpost(out: Console, label: str, target: str) -> None:
 
 
 def render_address(
-    out: Console, payload: r.ServerAddress, *, web: bool | None = None, stopped: bool = False
+    out: Console,
+    payload: r.ServerAddress,
+    *,
+    web: bool | None = None,
+    stopped: bool = False,
+    unauthenticated: bool = False,
 ) -> None:
     """Where the server is listening, and which surface is on it.
 
@@ -1205,6 +1210,13 @@ def render_address(
     address reads the same whether a server has just arrived at it or just left it. Without
     this, ``manicule stop`` printed a start banner — "HTTP API on http://127.0.0.1:8765 (this
     machine only)", then the URLs of a browser surface that is no longer there.
+
+    ``unauthenticated`` is the third, and it is the same kind of fact as ``web``: whether this
+    process was started with ``--no-authentication``, which is argv and is therefore recorded
+    nowhere an address can be read from. It prints the one thing an operator most needs to see
+    in the seconds after typing that flag — including what it cost them, since a socket serving
+    without authentication carries no write tool and an operator who configured authoring would
+    otherwise find that out from a client.
     """
     if stopped:
         where = "stdio" if payload.transport == "stdio" else f"http://{payload.host}:{payload.port}"
@@ -1212,6 +1224,8 @@ def render_address(
         out.print(f"stopped {what} [dim]that was on {where}[/dim]")
         return
     if payload.transport == "stdio":
+        # No socket, so `--no-authentication` bought nothing here and claiming otherwise would
+        # be a warning about a risk this transport does not have.
         out.print(f"MCP server on stdio, {payload.tools} tool(s). [dim]No socket is open.[/dim]")
         return
     where = f"http://{payload.host}:{payload.port}"
@@ -1221,6 +1235,8 @@ def render_address(
         out.print(f"{what} on {where} [dim](this machine only)[/dim]")
     else:
         out.print(f"[red]{what} on {where} — reachable from the network[/red]")
+    if unauthenticated:
+        _unauthenticated_warning(out, loopback=payload.loopback)
     if not serves_api:
         # `--mcp-only`. The bare address above is not what a client is configured with, and
         # until this line the trailing-slash endpoint appeared in no output at all — so the
@@ -1238,6 +1254,31 @@ def render_address(
     # a client had the port and had to know the path.
     _signpost(out, "MCP endpoint", f"{where}{frontdoor.MCP_ENDPOINT}")
     _signpost(out, "API documentation", f"{where}{frontdoor.DOCS}")
+
+
+def _unauthenticated_warning(out: Console, *, loopback: bool) -> None:
+    """Say, at the moment it becomes true, that this server asks callers for nothing.
+
+    Three lines and each earns its place. The first names the flag, because the fix for an
+    operator who did not mean this is to remove it from the command they just ran — and a
+    warning that describes a state without naming the argument that produced it sends them to
+    the configuration file, where this is not. The second says who a caller is, which is the
+    part that surprises people: with no credential there is no viewer, only an administrator.
+    The third says what it cost, so that authoring's absence from the socket is something the
+    operator was told rather than something a client discovers.
+
+    Loopback changes the second line rather than removing the warning. A flag that produced no
+    output on the transport somebody is most likely to try it on first is a flag whose effect
+    they learn about later, on the bind where it matters.
+    """
+    reach = (
+        "every process and every browser page on this machine"
+        if loopback
+        else "anything that can route to this port"
+    )
+    out.print("[red]serving with no authentication (--no-authentication)[/red]")
+    _signpost(out, "callers", f"{reach}, each of them an administrator here")
+    _signpost(out, "MCP here", "read-only — document_create is not served without authentication")
 
 
 def render_upgrade(out: Console, payload: r.UpgradeReport) -> None:

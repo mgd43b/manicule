@@ -97,8 +97,11 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   since changed — read back from the chunks already stored, so it runs no parser, fetches
   nothing and produces no vector.
 - `plugin list --registry` — browse the community listing, when configuration allows it.
-- `start --transport` and `start --allow-public-bind` — the second is the only way to bind a
-  non-loopback address, and no configuration file can supply it.
+- `start --transport`, `start --host`, `start --allow-public-bind` and
+  `start --no-authentication` — the last two are the only way to bind a non-loopback address
+  without authentication, both are needed together, and no configuration file can supply either.
+  `--no-authentication` also takes `document_create` off the socket, because an anonymous caller
+  on an unauthenticated one is an administrator.
 - `ask --repl` — the interactive prompt, which is also what `ask` with no question does at a
   terminal.
 - `reset-derived`, `cleanup-derived-generations`, `release-source-history`, and
@@ -374,8 +377,8 @@ is a feature list entry, not a feature.
 ### Added, because the settings above could not do their job without them
 
 - `security.transport.bind_host` / `port` / `trusted_proxies` — loopback by default, and
-  binding wider requires authentication to be enabled. Enforced at startup, not documented
-  and hoped for.
+  binding wider requires authentication to be enabled, or `--no-authentication` on the command
+  line where no setting can supply it. Enforced at startup, not documented and hoped for.
 - `storage.retain_source_bytes` — keeps fetched bytes so re-parsing never means re-fetching,
   and so an anchor can be verified against the document it was made from.
 - `storage.checksum_backfill_batch` — rows one pass of the vector-checksum backfill rewrites.

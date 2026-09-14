@@ -250,7 +250,7 @@ for reading.
 
 ## 4. The operations
 
-Forty-four MCP tools and thirty-two CLI commands. They are not a one-to-one mapping: some
+Forty-five MCP tools and thirty-two CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -807,7 +807,16 @@ behavior actually wants — `manicule_version` and the envelope's `version` both
 release whether or not anything changed.
 
 Checks: `configuration`, `transport`, `plugins`, `storage`, `permissions`, `index`, `grammars`,
-`vocabularies`, `models`, and `component:<kind>:<name>` for anything already constructed.
+`vocabularies`, `models`, `connectors`, `sessions`, `glossary`, `vector_integrity`, and
+`component:<kind>:<name>` for anything already constructed.
+
+`transport` reports the bind: `ok` for loopback, `degraded` for a non-loopback bind with
+authentication on, and `failing` for one without it — including when `--no-authentication` made
+that deliberate, where the wording says so and the remedy becomes "configure authentication"
+rather than "bind loopback". Its `facts` carry `bind_host`, `loopback`, `auth_mode` and
+`serving_unauthenticated`; the last is read from how *this process* was started, so it is `true`
+only in a diagnosis produced inside a serving process and `false` from a fresh `manicule
+doctor`, which can only report what configuration says.
 
 **`name` is the stable identifier.** It is what a monitor selects on, so it is chosen once and
 does not move with the wording. `detail` is the sentence a person reads and is free to be
@@ -903,7 +912,8 @@ is unreachable from a network by construction.
 1. a host that is not loopback — and the configured default is `127.0.0.1`, so this is always
    something a person wrote down;
 2. `--allow-public-bind`, which no configuration file can set and no default supplies;
-3. `security.auth.mode` set to something other than `none`.
+3. `security.auth.mode` set to something other than `none`, **or** `--no-authentication`, which
+   no configuration file can set either.
 
 Any one missing is a refusal naming which. None of the three can be reached by omission: the
 absent value in each case is the safe one.
@@ -913,13 +923,44 @@ policy is not merely "refuse everything", and reads the source tree to check tha
 but the bind policy names an all-interfaces address**. That last one is what survives a future
 server that binds a literal instead of asking.
 
+#### `--no-authentication`, and why it is an argument
+
+The third condition is the only one with a way out, and it is there for the installation
+manicule is actually for: one operator, one corpus, a private network they own, where an API key
+between a person and their own index is ceremony. Without it that deployment either edits no
+configuration and cannot serve, or turns on authentication it has no use for.
+
+**It is a command-line argument rather than a setting, for the same reason `--allow-public-bind`
+is.** A configuration key granting this would put an unauthenticated listener one file edit
+away — in a file that is copied between machines, templated by a deployment tool and committed
+to a repository — and the whole point is that it takes a person at a terminal. There is no
+`security.auth.allow_unauthenticated`, and `tests/app/test_bind.py` walks every settings field
+to assert there never is one.
+
+**Both flags are required, and neither implies the other.** "I accept that there is no
+authentication" and "I meant to put this on the network" are two statements, so
+`--no-authentication` satisfies the third condition and only the third: a wide bind still needs
+`--allow-public-bind` beside it. Folding them into one argument would hand a public bind to
+somebody who wanted a private unauthenticated one.
+
+**It is loud rather than silent, in two places.** The start banner names the flag, says that
+every caller is an administrator, and says what the socket lost — see §6.1. And `manicule
+doctor`'s `transport` check stays **failing**, reworded to say that this is deliberate: an
+unauthenticated index on a routable address is the same exposure whether or not somebody meant
+it, so a check that softened to `ok` because an argument was typed would be reporting an
+intention rather than a state. A deployment that has chosen this excludes the check by `name`,
+which is what `name` is for — `docs/deployment.md` §2.
+
+It costs the socket its one write, which §6.1 covers — and it does **not** buy an
+unauthenticated installation that serves authoring: that is refused however it is asked.
+
 There is a **second** refusal, and it is deliberately not the same code. `resolve_bind` decides
 an address; `manicule.api.app.build_app` decides whether an *application* may exist at all, and
 refuses to build an unauthenticated one whose address is not loopback. That one fires even when
 something other than `manicule start` is doing the listening — a container entry point, a
 production ASGI server, a hand-written uvicorn call.
 
-### 6.1 MCP over a socket carries the read-only tools and one named write
+### 6.1 MCP over a socket carries the read-only tools, and one named write when it is authenticated
 
 The endpoint is `/mcp` on the same port, and a client is configured with the trailing slash:
 `http://127.0.0.1:8765/mcp/`. A **path rather than a second port**, because one port is one bind
@@ -952,6 +993,36 @@ write tool cannot drift in behind it. The transport still decides the surface: r
 locally and you get the local one, run it on a network and you get the network one, with no new
 mode and no flag.
 
+**And the exception is conditional on authentication.** `manicule.mcp.server.network_authoring`
+is what the registrar actually reads, and it returns nothing at all when `security.auth.mode` is
+`none` — so an unauthenticated socket is the read-only set and *nothing else*, asserted as the
+same set operation with the other operand empty.
+
+The reason is not tidiness. Without a credential there is nothing to tell one caller from
+another, so `manicule.api.security.Principal` resolves an anonymous caller to **admin** — right
+for the operator at a loopback socket, which is what that mode assumed — and
+`require_network_member`'s member floor is cleared by everybody. A `document_create` published
+there would be callable by anything that can route to the port, writing into a corpus that
+assistants read back as standing instructions. That is an **injection channel rather than a
+privacy question**, and it is answered by taking the tool off the surface rather than by adding
+a guard: a guard can be wrong about a caller, and a tool that was never registered cannot be
+called by anybody.
+
+It is decided by `security.auth.mode` alone, so it is the same surface on loopback, and
+`--no-authentication` cannot widen it. **Nor does that flag waive
+`require_authoring_authentication`**: an installation with authoring configured still refuses to
+serve a socket unauthenticated, however it was asked. The flag says an operator accepts an index
+anyone can read, which is not the same as a corpus anyone can write — and waiving the refusal
+would have closed only one door anyway, because `document_create` is also `POST
+/api/v1/documents`, whose member floor an anonymous administrator clears. Narrowing the MCP
+surface does not reach that route; the refusal does.
+
+So the two rules are complementary rather than redundant. The refusal keeps an unauthenticated
+socket from ever *having* authoring to serve; the narrowing means that even with authoring
+unconfigured, no write tool is published on one. The server also says so to the client: an
+unauthenticated socket's instructions say `document_create` is absent and why, so an assistant
+told by its operator that authoring works can tell this apart from a broken install.
+
 Three things make that a different decision from the tools above rather than a hole in the same
 rule. It is **bounded**: one document, to one workspace, in one of a configured set of
 collections, beneath one configured connector's root, at a path the caller never supplies — where
@@ -970,8 +1041,9 @@ The extra care is not proportional to the tool's size, and the reason is worth s
 corpus is read as *instructions*. Guidance recalled out of it is treated as standing direction by
 whatever recalled it, so writing into one is the ability to place text in front of future
 sessions. That is why the default is off, why the scope is a configured collection rather than any
-collection the workspace holds, and why the authentication refusal is a startup failure rather
-than a per-call check.
+collection the workspace holds, why the authentication refusal is a startup failure rather
+than a per-call check, and why the one escape hatch from that refusal removes the tool instead
+of relaxing the check.
 
 That is the same guarantee `tests/api/test_routes.py` keeps for the HTTP route table, kept the
 same way and asserted in the same file: `ABSENT` names the operations with no route, and
@@ -986,8 +1058,8 @@ exception rather than a membership rule, it holds one tool, and the equality ass
 surface is written out in `tests/api/test_routes.py` where both halves can be read together. There
 is still no setting that grants an exception — a structural guarantee traded for a configuration
 one is a guarantee that fails silently. The server also *says* so: the read-only surface's
-instructions tell a client which write tools are not there, that `document_create` is, and where
-the rest are — so "I cannot do that" is available before a turn is spent discovering it.
+instructions tell a client which write tools are not there, whether `document_create` is, and
+where the rest are — so "I cannot do that" is available before a turn is spent discovering it.
 
 **Nothing about a call outlives it.** The mount is stateless and answers with JSON rather than an
 event stream, so there is no session identifier, no server-side session table, and no connection
@@ -1166,8 +1238,10 @@ refusals would be unjoinable to one of successes. `tests/api/test_contract.py` e
 mounted routes and fails on a name that is not an operation.
 
 With `security.auth.mode = none` there is no credential and the caller is treated as the
-operator — which is only tolerable because that configuration cannot be reached from anywhere
-but loopback, refused twice (§6).
+operator — which is tolerable because that configuration is refused twice on anything but
+loopback (§6), and reachable off loopback only by a person typing `--no-authentication`. On
+that bind the "operator" is anything that can route to the port, which is the exposure the flag
+buys and the reason the socket's MCP surface carries no write while it holds.
 
 ### 9.3 Whose address a request has
 

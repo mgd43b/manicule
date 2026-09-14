@@ -45,7 +45,8 @@ services:
     # Deliberately no `ports:`. The default command serves MCP over stdio, which opens no
     # socket at all. `manicule start --transport http` serves the HTTP API, and publishing
     # that is an operator's decision: docs/deployment.md §4 says what it costs, and manicule
-    # refuses a non-loopback bind without authentication either way.
+    # refuses a non-loopback bind unless authentication is on or `--no-authentication` is in
+    # the command that started it — never because of anything written in a file.
 
   # A local Qdrant, for trying `storage.vector_db = "qdrant"` without a server already running
   # somewhere else. Gated behind a compose profile rather than added to the default service

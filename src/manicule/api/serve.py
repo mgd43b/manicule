@@ -73,6 +73,7 @@ def address_for(
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
+    allow_unauthenticated: bool = False,
 ) -> tuple[Bind, ServerAddress]:
     """Decide where the API will listen, before starting anything.
 
@@ -86,7 +87,13 @@ def address_for(
             to :func:`~manicule.api.app.build_app`, which fires even when something other than
             this function is doing the listening.
     """
-    bind = resolve_bind(service.settings, host=host, port=port, allow_public=allow_public)
+    bind = resolve_bind(
+        service.settings,
+        host=host,
+        port=port,
+        allow_public=allow_public,
+        allow_unauthenticated=allow_unauthenticated,
+    )
     return bind, ServerAddress(
         transport=TRANSPORT,
         host=bind.host,
@@ -106,6 +113,7 @@ def application(
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
+    allow_unauthenticated: bool = False,
     web: bool = True,
 ) -> tuple[FastAPI, ServerAddress]:
     """The application and the address it is about to be served on.
@@ -116,8 +124,15 @@ def application(
 
     ``web`` is passed straight through: ``--no-web`` has to reach the mount to mean anything.
     """
-    bind, address = address_for(service, host=host, port=port, allow_public=allow_public)
-    return build_app(service, bind=bind, web=web), address
+    bind, address = address_for(
+        service,
+        host=host,
+        port=port,
+        allow_public=allow_public,
+        allow_unauthenticated=allow_unauthenticated,
+    )
+    app = build_app(service, bind=bind, web=web, allow_unauthenticated=allow_unauthenticated)
+    return app, address
 
 
 class Server(uvicorn.Server):
@@ -156,6 +171,7 @@ def server_for(
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
+    allow_unauthenticated: bool = False,
     web: bool = True,
 ) -> Server:
     """The HTTP server, configured and not yet listening.
@@ -164,7 +180,14 @@ def server_for(
     transport down is the last step of an order the caller owns, and a function that both started
     and finished the server would give it no handle to do that with.
     """
-    app, address = application(service, host=host, port=port, allow_public=allow_public, web=web)
+    app, address = application(
+        service,
+        host=host,
+        port=port,
+        allow_public=allow_public,
+        allow_unauthenticated=allow_unauthenticated,
+        web=web,
+    )
     if address.port is None:  # pragma: no cover - resolve_bind always decides a port
         from manicule.core.errors import PolicyError  # noqa: PLC0415
 
@@ -193,6 +216,7 @@ async def serve(
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
+    allow_unauthenticated: bool = False,
     web: bool = True,
 ) -> None:
     """Run the HTTP API until it is stopped.
@@ -201,7 +225,15 @@ async def serve(
     it — the suites, and anybody embedding manicule. ``manicule serve`` uses
     :func:`server_for` instead, because it does have something to shut down around it.
     """
-    await server_for(service, host=host, port=port, allow_public=allow_public, web=web).serve()
+    server = server_for(
+        service,
+        host=host,
+        port=port,
+        allow_public=allow_public,
+        allow_unauthenticated=allow_unauthenticated,
+        web=web,
+    )
+    await server.serve()
 
 
 __all__ = [
