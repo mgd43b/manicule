@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.20](https://github.com/mgd43b/manicule/compare/v0.1.19...v0.1.20) (2026-09-14)
+
+
+### Bug Fixes
+
+* **packaging:** ship manicule-ollama in the image and publish it to PyPI ([#352](https://github.com/mgd43b/manicule/issues/352)) ([6030415](https://github.com/mgd43b/manicule/commit/60304151e1468a8debf47f1996c753563338e201))
+
 ## [0.1.19](https://github.com/mgd43b/manicule/compare/v0.1.18...v0.1.19) (2026-09-14)
 
 
