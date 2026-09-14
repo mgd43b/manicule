@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import yaml
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
@@ -710,3 +711,58 @@ def test_every_all_extra_install_resolves_from_the_wheels_being_tested() -> None
         "they resolve a workspace member from an index instead of from this tree:\n  "
         + "\n  ".join(installs)
     )
+
+
+def _publish_container_build_step() -> dict[str, Any]:
+    """The `release.yml` step that builds the image that gets published."""
+    workflow = cast(dict[str, Any], yaml.safe_load(RELEASE_WORKFLOW.read_text()))
+    steps = cast(list[dict[str, Any]], workflow["jobs"]["publish-container"]["steps"])
+    for step in steps:
+        if "offline smoke test runs inside it" in str(step.get("name", "")):
+            return step
+    msg = "release.yml has no image-build step in publish-container"
+    raise AssertionError(msg)
+
+
+def test_the_published_image_is_built_with_reproducible_layer_timestamps() -> None:
+    """Without this the 1.36 GB model layer is a new blob every release, and every node re-pulls it.
+
+    The layer's content is byte-identical between releases — same pinned revisions, same
+    content-addressed filenames — but BuildKit takes each file's mtime from the filesystem, and
+    `prefetch_embedding_models.py` downloads 2.3 GB at a different instant on every run. That
+    lands in the tar headers, so the blob digest moves and a node pulling the next version
+    fetches the whole thing again. Measured across 0.1.17-0.1.21: five releases, five digests,
+    all 1361.8 MB, with every mtime equal to its build time.
+    """
+    step = _publish_container_build_step()
+    run = str(step["run"])
+
+    assert "docker buildx build" in run, (
+        "the published image must be built with `docker buildx build`: the daemon's built-in "
+        "builder has no `rewrite-timestamp`, so the layer timestamps stay as-downloaded"
+    )
+    assert "rewrite-timestamp=true" in run, (
+        "the image build must pass `rewrite-timestamp=true`, which is what normalizes the "
+        "mtimes that otherwise make a byte-identical model layer a new blob every release"
+    )
+
+
+def test_the_image_builds_against_a_source_date_epoch_that_never_moves() -> None:
+    """A per-release epoch would defeat the whole thing while looking like best practice.
+
+    The reproducible-builds convention is to set `SOURCE_DATE_EPOCH` to the commit timestamp.
+    Here that is exactly wrong: every layer's timestamps — and so every layer's digest — would
+    move with it, and no release would share anything with the one before. Measured: identical
+    content under two different epochs produces two different digests. So it is a literal, and
+    this test is what stops somebody "fixing" it into an expression.
+    """
+    step = _publish_container_build_step()
+    epoch = str(cast(dict[str, Any], step.get("env", {})).get("SOURCE_DATE_EPOCH", ""))
+
+    assert epoch, "the image build must set SOURCE_DATE_EPOCH, or timestamps are not rewritten"
+    assert "${{" not in epoch, (
+        f"SOURCE_DATE_EPOCH is {epoch!r}, which is computed per run. It has to be a constant: "
+        f"a value that moves every release moves every layer digest with it, which is the "
+        f"re-pull this setting exists to prevent."
+    )
+    assert epoch.strip().isdigit(), f"SOURCE_DATE_EPOCH must be a plain epoch, got {epoch!r}"

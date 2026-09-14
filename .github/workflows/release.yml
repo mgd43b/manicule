@@ -604,14 +604,42 @@ jobs:
       #
       # Tagged with the version here and *not* with `latest`: the image is asserted below before
       # any pointer is moved onto it.
+      # **A builder that can rewrite timestamps, which is what makes the 1.36 GB model layer
+      # shared between releases rather than re-pulled on every node.** `docker build` uses the
+      # daemon's built-in builder, and that one has no `rewrite-timestamp`; a `docker-container`
+      # builder does.
+      - name: a builder that can produce reproducible layers
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      # `SOURCE_DATE_EPOCH` is a **constant**, and that is the whole point of it rather than an
+      # oversight. The usual reproducible-builds convention sets it to the commit timestamp,
+      # which would be a different value every release — and every layer's timestamps, and
+      # therefore every layer's digest, would move with it. Measured: same content under two
+      # different epochs produces two different digests. Pinned here, the layers that did not
+      # change keep the digests they had, and a node pulling 0.1.22 skips what it already has
+      # from 0.1.21.
+      #
+      # The date itself is arbitrary and is never to be bumped. What it costs is that every
+      # file in the image is dated 2023-11-14 rather than the build time; what that would
+      # otherwise have bought — mapping a running container back to a commit — is carried by
+      # the two labels below, which is what they are for.
       - name: build the image (the offline smoke test runs inside it)
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
           REVISION: ${{ steps.revision.outputs.sha }}
+          SOURCE_DATE_EPOCH: "1700000000"
         run: |
           set -euo pipefail
-          docker build --progress=plain \
-            --tag "${IMAGE}:${VERSION}" \
+          # `--output type=docker` rather than `--push`: the image is loaded into the daemon so
+          # that the two assertions below run against the artifact itself, and the push stays a
+          # separate step *after* them. `rewrite-timestamp=true` is what normalizes the mtimes
+          # BuildKit would otherwise take from the filesystem — for the model layer, the moment
+          # `prefetch_embedding_models.py` happened to download 2.3 GB, which is a different
+          # instant on every run and was making a byte-identical layer a new blob every release.
+          docker buildx build --progress=plain \
+            --output "type=docker,name=${IMAGE}:${VERSION},rewrite-timestamp=true" \
             --label "org.opencontainers.image.version=${VERSION}" \
             --label "org.opencontainers.image.revision=${REVISION}" \
             .
