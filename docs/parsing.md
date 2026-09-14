@@ -102,6 +102,12 @@ counted with the model's own tokenizer and subtracted where the card is read
 query, so the scheme is core's and is applied at the two call sites that know which side they
 are serving (§9.1). What reaches this budget is the same either way.
 
+One thing this section's number is **not**: what a backend compares the finished input
+against. That is `ModelCard.input_capacity`, larger by exactly the prefix, because by then the
+prefix is on the string. Chunking wants the smaller of the two and every check on a chunk's
+own text wants it too; using it on the prefixed input charges the prefix twice and refuses the
+chunks this budget produced.
+
 ### 1.2 Count with the embedder's tokenizer, never an estimator
 
 A budget enforced against a hard model limit must be measured with the tokenizer that

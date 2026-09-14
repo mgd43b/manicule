@@ -16,12 +16,15 @@ the document half and never the query half — is the wrong home.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import pytest
 
 from manicule.config.settings import EmbeddingSettings, Settings
+from manicule.core.anchors import Unlocated
+from manicule.core.content import Chunk
 from manicule.core.embedding import PrefixScheme, embedding_input_identity
+from manicule.core.errors import ContextOverflowError
 from manicule.core.protocols import Embedder
 from manicule.embedding.cards import load_tokenizer, read_card
 from manicule.embedding.config import EmbedderConfig
@@ -29,14 +32,30 @@ from manicule.embedding.plugin import read_embedder_card
 from manicule.ingest.embedding import embed_chunks
 from manicule.plugins import BuildContext
 from manicule.testing import write_model
+from tests.embedding_fakes import StubEmbedder
 from tests.fakes import HashEmbedder
 from tests.storage_helpers import make_chunk, make_document
 
-if TYPE_CHECKING:
-    from manicule.core.content import Chunk
-
 SAME_TEXT = "how does authentication work"
 """One string, embedded on both sides, because that is the case the asymmetry is about."""
+
+
+def _sized_chunk(text: str, token_count: int) -> Chunk:
+    """A chunk whose ``embed_text`` is exactly ``text``, with no breadcrumb in front of it.
+
+    ``make_chunk`` adds a heading breadcrumb, which is right for the tests about *what* gets
+    prefixed and wrong for the ones about *how long* the result is: the breadcrumb would make
+    the measured length something other than the budget under test.
+    """
+    return Chunk(
+        id="sized",
+        document_id="doc",
+        text=text,
+        embed_text=text,
+        anchor=Unlocated(reason="synthetic"),
+        position=0,
+        token_count=token_count,
+    )
 
 
 def _chunks(*texts: str) -> list[Chunk]:
@@ -239,3 +258,55 @@ def test_a_stored_vector_is_not_reused_when_the_scheme_moves() -> None:
     assert embedding_input_identity(
         same_text, document_id="doc-1", embed=bare
     ) != embedding_input_identity(same_text, document_id="doc-1", embed=prefixed)
+
+
+# --- the prefix is charged once, not twice ---------------------------------------------------
+
+
+async def test_a_chunk_sized_to_the_budget_survives_its_own_prefix(tmp_path: Path) -> None:
+    """The budget the chunker is handed has to be one the backend will actually accept.
+
+    Two numbers are in play and collapsing them charges the prefix twice.
+    `max_sequence_length` is what is left for a chunk's own text once the document prefix has
+    been netted out; `ModelCard.input_capacity` is what the model reads, prefix included. The
+    backend's raw-input guard sees the *prefixed* string, so measuring it against the reduced
+    number refuses a chunk sized to exactly the budget that produced it — and the corpus this
+    matters for is the ordinary one, where most chunks sit near the limit.
+    """
+    write_model(tmp_path / "model")
+    card = read_card(str(tmp_path / "model"), prefix_scheme=PrefixScheme.NOMIC)
+    embedder = StubEmbedder(card)
+    await embedder.setup()
+    try:
+        budget = card.max_sequence_length
+        text = " ".join(["alpha"] * budget)
+        assert embedder.count_tokens(text) == budget
+        assert card.document_prefix_tokens > 0
+        assert card.input_capacity == budget + card.document_prefix_tokens
+
+        vectors = await embed_chunks(embedder, [_sized_chunk(text, budget)])
+
+        assert len(vectors) == 1
+    finally:
+        await embedder.teardown()
+
+
+async def test_a_chunk_past_the_budget_is_still_refused(tmp_path: Path) -> None:
+    """The guard that was double-charging still has to fire when it should.
+
+    Widening a limit to fix a false refusal is the obvious way to turn one bug into a worse
+    one: past the model's real capacity the input is truncated with nothing raised, and the
+    stored vector describes an opening fragment while its chunk claims all of its text.
+    """
+    write_model(tmp_path / "model")
+    card = read_card(str(tmp_path / "model"), prefix_scheme=PrefixScheme.NOMIC)
+    embedder = StubEmbedder(card)
+    await embedder.setup()
+    try:
+        over = card.input_capacity + 1
+        text = " ".join(["alpha"] * over)
+
+        with pytest.raises(ContextOverflowError):
+            await embedder.embed([PrefixScheme.NOMIC.document(text)])
+    finally:
+        await embedder.teardown()

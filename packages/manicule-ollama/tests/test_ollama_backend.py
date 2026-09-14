@@ -26,6 +26,7 @@ from manicule_ollama.config import OllamaEmbedderConfig
 from manicule_ollama.served import resolve
 from ollama_fake import DIGEST, MODEL, SPECIAL_TOKENS, FakeOllama, config_payload
 
+from manicule.core.embedding import PrefixScheme
 from manicule.core.errors import ConfigError, ContextOverflowError
 from manicule.core.protocols import Embedder, TokenStateEmbedder
 from manicule.embedding.runtimes.tokenization import FastTokenizer
@@ -58,14 +59,19 @@ def counter(vocabulary: Path) -> Callable[[str], int]:
     return count
 
 
-def make(server: FakeOllama, vocabulary: Path, **overrides: object) -> OllamaEmbedder:
+def make(
+    server: FakeOllama,
+    vocabulary: Path,
+    prefix_scheme: PrefixScheme = PrefixScheme.NONE,
+    **overrides: object,
+) -> OllamaEmbedder:
     """Resolve and construct, without setting up — so a setup failure is the assertion."""
     config = OllamaEmbedderConfig.model_validate(
         config_payload(tokenizer=str(vocabulary), **overrides)
     )
     transport = server.transport()
     client = OllamaClient(config.base_url, transport=transport, async_transport=transport)
-    served = resolve(client, server.model, config)
+    served = resolve(client, server.model, config, prefix_scheme)
     return OllamaEmbedder(
         served,
         client,
@@ -75,8 +81,13 @@ def make(server: FakeOllama, vocabulary: Path, **overrides: object) -> OllamaEmb
     )
 
 
-async def ready(server: FakeOllama, vocabulary: Path, **overrides: object) -> OllamaEmbedder:
-    embedder = make(server, vocabulary, **overrides)
+async def ready(
+    server: FakeOllama,
+    vocabulary: Path,
+    prefix_scheme: PrefixScheme = PrefixScheme.NONE,
+    **overrides: object,
+) -> OllamaEmbedder:
+    embedder = make(server, vocabulary, prefix_scheme, **overrides)
     await embedder.setup()
     return embedder
 
@@ -661,3 +672,26 @@ async def test_the_configured_prefix_scheme_reaches_the_built_embedder(
     assert embedder.fingerprint.prefix_scheme is PrefixScheme.NOMIC
     assert isinstance(embedder, OllamaEmbedder)
     await embedder.teardown()
+
+
+async def test_a_chunk_sized_to_the_budget_survives_its_own_prefix(
+    vocabulary: Path, counter: Callable[[str], int]
+) -> None:
+    """The served backend's raw-input guard sees prefixed text; the budget it gets does not.
+
+    ``max_sequence_length`` is what a chunk's own text may occupy once the document prefix has
+    been netted out of the served context, and :attr:`ModelCard.input_capacity` is what the
+    server will read with that prefix in front of it. Comparing the prefixed string against the
+    reduced number charges the prefix twice, and refuses exactly the chunks an ordinary corpus
+    is full of — the ones sized to the budget the chunker was handed.
+    """
+    embedder = await ready(FakeOllama(count=counter), vocabulary, PrefixScheme.NOMIC)
+    try:
+        budget = embedder.card.max_sequence_length
+        text = " ".join(["alpha"] * budget)
+        assert embedder.count_tokens(text) == budget
+        assert embedder.card.document_prefix_tokens > 0
+
+        assert await embedder.embed([PrefixScheme.NOMIC.document(text)])
+    finally:
+        await embedder.teardown()

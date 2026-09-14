@@ -306,7 +306,12 @@ class PooledEmbedder(Lifecycle, ABC):
         opening fragment while its caller believed it described the whole text.
         """
         encoded = self._tokenizer.encode_batch(texts)
-        limit = self.fingerprint.max_sequence_length
+        # `input_capacity`, not `max_sequence_length`: by the time text reaches here the
+        # document half of the prefix scheme is already in front of it (`ingest/embedding.py`),
+        # and `max_sequence_length` is what is left for a chunk *after* that prefix is charged.
+        # Comparing the prefixed string against the reduced number charges the prefix twice and
+        # refuses a chunk sized to the very budget the chunker was handed.
+        limit = self.card.input_capacity
         specials = self.card.special_token_count
         # From the mask, never from ``len(ids)``. The batch is padded to its longest member, so
         # every row's id list is that length — measuring it would report the longest text's size

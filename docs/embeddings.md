@@ -585,6 +585,23 @@ would make one setting mean different things depending on another. A scheme whos
 consumed the whole context is refused at startup by name, rather than becoming a per-chunk
 refusal about the chunk.
 
+**That makes two numbers, and they are not interchangeable.** `ModelCard.input_capacity` is
+the second: what the model reads *with* the prefix in front of it, which is
+`max_sequence_length` plus what the document prefix cost. The distinction is which moment is
+being asked about. The chunker's budget and `require_within_context` measure a chunk's own
+text, before anything is prepended, and belong to `max_sequence_length`. A backend's raw-input
+guard — `PooledEmbedder._tokenize`, `OllamaEmbedder._require_within_limit` — sees the string
+that is about to go to the model, prefix included, and belongs to `input_capacity`.
+
+Collapsing them charges the prefix twice, and the first implementation did. The failure is not
+an edge case: a chunk sized to exactly the budget the chunker was handed was refused by the
+backend that was handed the same number, so an ordinary corpus — most chunks near the limit —
+could not be embedded at all under any scheme with a document prefix. It is worth stating
+plainly because the reduced number reads like the safe one to compare everything against, and
+it is the one that produces a corpus-wide refusal. `test_a_chunk_sized_to_the_budget_survives_its_own_prefix` exists on both paths, and its sibling holds the guard to still firing past the
+real capacity — widening a limit to clear a false refusal is how this becomes silent truncation
+instead.
+
 The **query** side is not netted out of anything, and is not checked. A query is not a chunk:
 it has no stored row, no budget, and in practice no length — Qwen3-Embedding's instruction is
 about twenty tokens against a context measured in thousands. What would make this matter is a
@@ -890,7 +907,7 @@ a documented property of a self-hosted tool rather than a defect.
 | Ticket | What | Why not here |
 |---|---|---|
 | [#6](https://github.com/mgd43b/manicule/issues/6) | **BGE-M3 learned-sparse leg** as an alternative to FTS5 BM25 (§1.4) | A retrieval feature, and retrieval features earn their place with a measured improvement on #15. Labeled `needs-evidence`. Neither backend exposes the head today, so it is a runtime change as well as a retrieval one |
-| — | ~~**Asymmetric query/document prefixes.**~~ **Built.** `EmbedFingerprint.prefix_scheme`, applied at `ingest/embedding.py` and `retrieval/dense.py`, configured as `[embedding] prefix_scheme`. §9.1 is the design and still describes what shipped |
+| — | ~~**Asymmetric query/document prefixes.**~~ **Built.** `EmbedFingerprint.prefix_scheme`, applied at `ingest/embedding.py` and `retrieval/dense.py`, configured as `[embedding] prefix_scheme` | Nothing: it landed. §9.1 is the design and still describes what shipped |
 
 ### 9.1 Where a prefix scheme has to live, and the two places it must not
 
@@ -989,4 +1006,5 @@ unfinished:
 | §7 | five traps | nine; four of the new ones only appear when the code runs, and one only in CI |
 | §9.1 | filed, with the design argued | built — a core `prefix_scheme` identity field, applied at both call sites, and `manicule-ollama`'s local `prefix=none` marker retired because core now carries what it stood in for |
 | §4.3 | the document-prefix term was notional; BGE-M3 has none | counted with the model's own tokenizer and subtracted, from a configured `max_sequence_length` as well as a derived one |
+| §4.3 | one number was going to do both jobs | two: `max_sequence_length` for a chunk's own text, `ModelCard.input_capacity` for what the model reads with the prefix on it. Review caught the first cut charging the prefix twice, which refused every chunk sized to its own budget |
 | §10 | `PooledEmbedder.embed_chunks` "is the path re-embed uses" | it is not, and has not been; re-embed goes through `manicule.ingest.embedding`, which is also the only path that prefixes |

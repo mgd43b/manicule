@@ -402,7 +402,11 @@ class OllamaEmbedder(Lifecycle):
         drifted from the model — and it is the difference between a refusal and a corpus of
         vectors describing opening fragments. Neither replaces the other.
         """
-        limit = self.fingerprint.max_sequence_length
+        # The card's `input_capacity` rather than the fingerprint's `max_sequence_length`: the
+        # strings here already carry whichever half of the prefix scheme applies, and
+        # `max_sequence_length` is the budget left for a chunk once the document half has been
+        # charged. Comparing the prefixed text against it would charge the prefix twice.
+        limit = self.card.input_capacity
         lengths = [self.count_tokens(text) for text in texts]
         oversized = [(index, length) for index, length in enumerate(lengths) if length > limit]
         if not oversized:
@@ -563,7 +567,7 @@ class OllamaEmbedder(Lifecycle):
         ):
             return
 
-        limit = self.fingerprint.max_sequence_length
+        limit = self.card.input_capacity
         try:
             result = await self._request([self._text_of_length(limit)])
         except ContextOverflowError as exc:

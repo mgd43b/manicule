@@ -116,7 +116,41 @@ class ModelCard(BaseModel):
         description="How many tokens the tokenizer wraps every input in. Measured by encoding "
         "the empty string, not counted off a list of names.",
     )
+    document_prefix_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="What :attr:`prefix_scheme`'s document side costs under this vocabulary, "
+        "already subtracted from :attr:`max_sequence_length`. Recorded rather than only "
+        "spent, because the two numbers answer different questions and a backend that had "
+        "only the difference would charge the prefix twice — see :attr:`input_capacity`.",
+    )
     path: Path = Field(description="Local directory holding the declaration files.")
+
+    @property
+    def input_capacity(self) -> int:
+        """Content tokens the model will read, **before** any prefix is charged.
+
+        The number a backend's raw-input guard compares against, and the one thing
+        :attr:`max_sequence_length` cannot also be. The two are different questions asked at
+        different moments:
+
+        :attr:`max_sequence_length`
+            how long a *chunk's own text* may be. The chunker's budget is held to it and
+            :func:`~manicule.core.embedding.require_within_context` checks stored chunks
+            against it, both measuring text that has not been prefixed yet.
+
+        :attr:`input_capacity`
+            how long the string handed to the model may be. By then the document half of
+            :attr:`prefix_scheme` is in front of it, so the allowance is larger by exactly
+            what that prefix cost.
+
+        Collapsing them charges the prefix twice, and the failure is not subtle: a chunk
+        sized to the budget the chunker was given is refused by the backend that was given
+        the same number, so a corpus whose chunks are near the limit cannot be embedded at
+        all. A query is bounded by this too, which is right — its own prefix is drawn from
+        the same allowance, and the model has no more room for one than for the other.
+        """
+        return self.max_sequence_length + self.document_prefix_tokens
 
     def fingerprint(
         self, *, backend: str, weights_ref: str = "", weights_identity: str = ""
@@ -226,6 +260,7 @@ def _read_card_at(
         tokenizer_id=public_model_id,
         max_sequence_length=usable,
         special_token_count=specials,
+        document_prefix_tokens=prefix_tokens,
         path=path,
     )
 

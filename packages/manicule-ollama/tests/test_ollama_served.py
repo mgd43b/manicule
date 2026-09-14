@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import huggingface_hub
 import pytest
 from manicule_ollama.client import OllamaClient
 from manicule_ollama.config import OllamaEmbedderConfig
@@ -105,9 +106,9 @@ def test_a_document_prefix_is_charged_to_the_usable_limit(vocabulary: Path) -> N
     _, bare, _ = build(FakeOllama(), vocabulary)
     _, prefixed, _ = build(FakeOllama(), vocabulary, PrefixScheme.NOMIC)
 
-    assert prefixed.document_prefix_tokens > 0
+    assert prefixed.card.document_prefix_tokens > 0
     assert prefixed.card.max_sequence_length == (
-        bare.card.max_sequence_length - prefixed.document_prefix_tokens
+        bare.card.max_sequence_length - prefixed.card.document_prefix_tokens
     )
 
 
@@ -116,7 +117,7 @@ def test_a_query_only_scheme_costs_the_document_budget_nothing(vocabulary: Path)
     _, bare, _ = build(FakeOllama(), vocabulary)
     _, prefixed, _ = build(FakeOllama(), vocabulary, PrefixScheme.QWEN3)
 
-    assert prefixed.document_prefix_tokens == 0
+    assert prefixed.card.document_prefix_tokens == 0
     assert prefixed.card.max_sequence_length == bare.card.max_sequence_length
 
 
@@ -621,8 +622,14 @@ def test_two_writers_do_not_share_one_temporary_file(vocabulary: Path, tmp_path:
     )
 
 
+def _refuses_to_download(*_args: object, **_kwargs: object) -> str:
+    """A ``snapshot_download`` that always fails, so the refusal path is the one under test."""
+    msg = "simulated: offline mode is enabled"
+    raise OSError(msg)
+
+
 def test_a_tokenizer_that_is_not_on_this_machine_names_this_backends_own_settings(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The refusal an operator actually hits in a container, and it used to misdirect them.
 
@@ -631,9 +638,15 @@ def test_a_tokenizer_that_is_not_on_this_machine_names_this_backends_own_setting
     refused outright by this backend's own validator — so an operator who followed the default
     advice would be told their configuration was invalid by the very next error. What is
     missing is a ``tokenizer.json``, and ``tokenizer`` is the setting that supplies it.
+
+    The fetch is made to fail by replacing ``snapshot_download`` rather than by redirecting
+    ``HF_HOME``. ``huggingface_hub`` reads its cache path into module constants at import time,
+    so an assignment made after some earlier test imported it leaves the real cache in force —
+    and a machine with that tokenizer already seeded would then resolve it and never reach the
+    refusal under test. The same import-time trap ``hub.PROGRESS_ENV`` documents.
     """
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _refuses_to_download)
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty-cache"))
     config = OllamaEmbedderConfig.model_validate(
         config_payload(tokenizer="Qwen/Qwen3-Embedding-0.6B", tokenizer_revision="a" * 40)
     )
@@ -664,8 +677,8 @@ def test_a_configured_limit_is_capped_in_the_units_it_is_written_in(vocabulary: 
 
     _, at_ceiling, _ = build(server, vocabulary, PrefixScheme.NOMIC, max_sequence_length=ceiling)
 
-    assert at_ceiling.document_prefix_tokens > 0
-    assert at_ceiling.card.max_sequence_length == ceiling - at_ceiling.document_prefix_tokens
+    assert at_ceiling.card.document_prefix_tokens > 0
+    assert at_ceiling.card.max_sequence_length == ceiling - at_ceiling.card.document_prefix_tokens
 
     with pytest.raises(ConfigError, match="reads at most"):
         build(server, vocabulary, PrefixScheme.NOMIC, max_sequence_length=ceiling + 1)

@@ -112,14 +112,6 @@ class ServedModel:
     num_ctx: int
     """The context this backend asks the server for, in total tokens. Sent on every request."""
 
-    document_prefix_tokens: int
-    """What :attr:`ModelCard.prefix_scheme`'s document side costs under this vocabulary.
-
-    Measured here and recorded in the declaration because deriving it again needs the
-    tokenizer, and the metadata-only path may not read one it does not already have — the
-    same reason :attr:`ServedDeclaration.special_token_count` is stored rather than recomputed.
-    """
-
     configured_name: str
     """What configuration called this model, which is **not** what identity calls it.
 
@@ -294,13 +286,13 @@ def resolve(
         tokenizer_id=tokenizer_id,
         max_sequence_length=usable,
         special_token_count=specials,
+        document_prefix_tokens=prefix_tokens,
         path=tokenizer_path,
     )
     return ServedModel(
         card=card,
         info=info,
         num_ctx=num_ctx,
-        document_prefix_tokens=prefix_tokens,
         configured_name=model,
         weights_ref=f"{BACKEND}:{info.model}@sha256:{info.digest}",
         weights_identity=weights_identity(info.model, info.digest),
@@ -310,7 +302,7 @@ def resolve(
 def weights_identity(model: str, digest: str) -> str:
     """The stable identity of the executable artifact behind these vectors.
 
-    Three terms, and each one is here because leaving it out would let two different vector
+    Two terms, and each one is here because leaving it out would let two different vector
     spaces share an identity:
 
     ``ollama``
@@ -370,7 +362,7 @@ def record(served: ServedModel, client: OllamaClient, cache_dir: Path) -> Served
         tokenizer_id=served.card.tokenizer_id,
         special_token_count=served.card.special_token_count,
         prefix_scheme=served.card.prefix_scheme,
-        document_prefix_tokens=served.document_prefix_tokens,
+        document_prefix_tokens=served.card.document_prefix_tokens,
         num_ctx=served.num_ctx,
         max_sequence_length=served.card.max_sequence_length,
     )
