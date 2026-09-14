@@ -168,9 +168,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # whatever the day's HEAD happened to be. Calling the tool rather than restating its patterns
 # also keeps this from being a second copy of the file list that could drift from the first.
 ENV HF_HOME=/opt/manicule/models
+# **`hub/` alone, and the narrowing is the point of this line.** It used to copy all of
+# `/tmp/hf`, and an `HF_HOME` holds more than the cache: `huggingface-hub` depends on `hf_xet`
+# on every architecture this image is built for, and a Xet download also writes `$HF_HOME/xet`,
+# whose `logs/` keeps a JSON-lines trace of the transfer — named `xet_<wall clock>_<pid>.log`,
+# and about 135 KB of microsecond-stamped lines inside. The name and the contents are both
+# different on every build by construction, so the 1.36 GB model layer took a fresh digest
+# every release and every node re-pulled it for a version bump.
+#
+# That survived #356 because #356 fixed the other half, and fixed it correctly. Reading the two
+# published layers: all sixty-seven entries — paths, sizes, modes, ownership, and every single
+# mtime — are identical between 0.1.22 and 0.1.23 except this one log. `rewrite-timestamp`
+# normalizes tar headers, which is what it is for; a timestamp written into a file's *name and
+# body* is not a header, and the only answer to one is not to ship the file.
+#
+# Named rather than pruned afterwards, because an allowlist and a blocklist fail in opposite
+# directions: `rm -rf`-ing today's scratch directories ships whatever `hf_xet` writes next,
+# while naming what the runtime reads ships nothing new. If this ever narrows too far, the
+# `--network=none` smoke test below is what says so — it resolves this snapshot under
+# `HF_HUB_OFFLINE=1` and runs a real index and a real search through it.
 RUN --mount=type=cache,target=/tmp/hf \
     HF_HOME=/tmp/hf python tools/prefetch_embedding_models.py --backend onnx \
-    && mkdir -p "${HF_HOME}" && cp -a /tmp/hf/. "${HF_HOME}/"
+    && mkdir -p "${HF_HOME}" && cp -a /tmp/hf/hub "${HF_HOME}/hub"
 
 # --- tiktoken vocabularies ---
 #

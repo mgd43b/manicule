@@ -821,3 +821,59 @@ def test_the_image_builds_against_a_source_date_epoch_that_never_moves() -> None
         f"expression computed per run, or simply a different instant — moves every layer "
         f"digest and costs every node one full 1.74 GB re-pull."
     )
+
+
+def _model_cache_copy() -> str:
+    """The Dockerfile instruction that puts the fetched weights into the image.
+
+    Read out of the code rather than matched in the file's text, for the reason
+    `test_the_image_does_not_pin_the_embedding_provider_in_the_environment` gives: the comment
+    above this instruction explains what it must *not* copy and names those paths, so a bare
+    substring search finds the prose and never reads the `cp` at all.
+    """
+    code = [
+        line for line in DOCKERFILE.read_text().splitlines() if not line.lstrip().startswith("#")
+    ]
+    # Continuations joined, because the `RUN` keyword and the `cp` this reads for sit on
+    # different physical lines of one instruction.
+    instructions: list[str] = []
+    for line in code:
+        if instructions and instructions[-1].endswith("\\"):
+            instructions[-1] = instructions[-1][:-1] + " " + line.strip()
+        else:
+            instructions.append(line)
+
+    matches = [line for line in instructions if "prefetch_embedding_models" in line]
+    assert len(matches) == 1, (
+        f"expected exactly one Dockerfile instruction calling prefetch_embedding_models.py; "
+        f"found {len(matches)}"
+    )
+    return matches[0]
+
+
+def test_the_image_ships_only_the_hub_cache_out_of_the_download() -> None:
+    """Anything else in an `HF_HOME` is scratch, and one piece of it is a per-build timestamp.
+
+    `huggingface-hub` depends on `hf_xet`, and a Xet download writes `$HF_HOME/xet/logs/` —
+    a trace named `xet_<wall clock>_<pid>.log` holding ~135 KB of microsecond-stamped JSON
+    lines. Copying the whole `HF_HOME` carried that into the 1.36 GB model layer, which gave
+    the layer a new digest on every release and cost every node a full re-pull for a version
+    bump. It is the one thing #356 could not fix: `rewrite-timestamp` rewrites tar headers, and
+    this timestamp is in a file's name and body.
+
+    Asserted against the bulk copy specifically, because that is the shape this regresses to —
+    `cp -a /tmp/hf/. "${HF_HOME}/"` reads like a tidier spelling of the same thing and is how
+    it was written for five releases.
+    """
+    copy = _model_cache_copy()
+
+    assert "/tmp/hf/hub" in copy, (  # noqa: S108 - read out of the Dockerfile, never opened
+        f"the model cache must be copied into the image as `hub/` alone — the rest of an "
+        f"`HF_HOME` is download scratch, and `xet/logs/` in it is named and filled with the "
+        f"wall clock, which resets the 1.36 GB layer's digest every release. Found:\n{copy}"
+    )
+    assert not re.search(r"cp\s+-a\s+/tmp/hf/\.", copy), (
+        f"the model step copies all of `/tmp/hf`, which ships `$HF_HOME/xet/logs/"
+        f"xet_<wall clock>_<pid>.log` inside the model layer and makes it a new blob every "
+        f"release. Copy `/tmp/hf/hub` instead. Found:\n{copy}"
+    )

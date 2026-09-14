@@ -383,12 +383,20 @@ What that buys, and what it costs:
   download it, and so every node re-pulled 1.7 GB for a version bump.
 
   The release build sets `SOURCE_DATE_EPOCH` to a constant and exports with
-  `rewrite-timestamp=true`, which normalizes those mtimes; a version bump now moves the layers
-  that changed and leaves the model layer alone. The constant is deliberate and is not to be
-  set to the commit timestamp, the usual convention — that is a different value every release,
-  and it would move every digest with it. The cost is that files in the image are dated
+  `rewrite-timestamp=true`, which normalizes those mtimes. The constant is deliberate and is
+  not to be set to the commit timestamp, the usual convention — that is a different value every
+  release, and it would move every digest with it. The cost is that files in the image are dated
   2023-11-14; `org.opencontainers.image.version` and `.revision` are what map a running
   container back to a commit, which is what those labels are for.
+
+  That was necessary and not sufficient, and 0.1.22 → 0.1.23 is what showed it: still 1.36 GB
+  re-pulled, with the two layers differing by four compressed bytes. Reading the tar headers out
+  of both, sixty-six of the sixty-seven entries are identical down to the mtime — the
+  normalization works — and the sixty-seventh is `xet/logs/xet_<wall clock>_<pid>.log`, a
+  135 KB transfer trace `hf_xet` writes beside the cache and the build then copied in with it.
+  A timestamp in a file's *name and body* is not a tar header and no exporter can rewrite it, so
+  the image now copies `hub/` out of the download and leaves the scratch behind. Both halves are
+  load-bearing: restore either and the layer moves again.
 
 **Why the default stays `lancedb`, here specifically.** The `--network=none` smoke test below
 is an assertion about the configuration this image actually ships with, not about every
