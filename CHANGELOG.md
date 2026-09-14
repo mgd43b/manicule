@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.23](https://github.com/mgd43b/manicule/compare/v0.1.22...v0.1.23) (2026-09-14)
+
+
+### Bug Fixes
+
+* **serve:** let --no-authentication reach the preflight that refuses first ([#361](https://github.com/mgd43b/manicule/issues/361)) ([5caf16b](https://github.com/mgd43b/manicule/commit/5caf16b50a53a4129313a3906f01f885d0425330))
+
 ## [0.1.22](https://github.com/mgd43b/manicule/compare/v0.1.21...v0.1.22) (2026-09-14)
 
 
