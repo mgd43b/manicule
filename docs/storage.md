@@ -1696,9 +1696,13 @@ a half-created one is a corpus that silently gets slower rather than a failure a
   empty one (§6.2.2 is the reason that distinction is kept).
 - **No shadow generations, and therefore no durable re-embedding.** §6.5's replacement is a
   directory swap behind a SQLite pointer, and `manicule.app.runtime` refuses a durable re-embed
-  by name on any backend that does not implement it — literally, by asking whether the store
-  satisfies `PublicationBoundVectorStore` rather than by naming the class that does. Refusing
-  is the whole of the design here: a
+  by name on any backend that does not implement it — by asking whether `storage.vector_db` is
+  the embedded backend *and* whether the handle satisfies `PublicationBoundVectorStore`, rather
+  than by naming the class that does. Both halves, because neither is sufficient: the protocol
+  alone would admit a third-party store that happens to offer a publication surface, and what
+  the refusal guards is not the question but the orchestration behind it, which builds shadow
+  generations over a Lance directory outright. The configured name alone would trust a name
+  over what a plugin actually registered under it. Refusing is the whole of the design here: a
   half-built generation mechanism on a second engine is how two stores come to disagree about
   which generation is live.
 - **No atomic insert-if-absent.** §6.4 keys a physical row by publication plus chunk so that

@@ -45,6 +45,8 @@ from manicule.core.ids import vector_id
 from manicule.core.lifecycle import HealthState
 from manicule.core.protocols import (
     AnnIndexMaintenance,
+    PublicationAwareVectorStore,
+    PublicationBoundVectorStore,
     VectorIntegrityMaintenance,
     VectorStore,
 )
@@ -219,6 +221,24 @@ def test_the_store_declines_the_capabilities_it_does_not_have(store: QdrantVecto
     """
     assert not isinstance(store, AnnIndexMaintenance)
     assert isinstance(store, VectorIntegrityMaintenance)
+
+
+def test_the_store_does_not_claim_the_publication_capabilities(store: QdrantVectorStore) -> None:
+    """The negative half of the check the runtime makes on every start, asserted here.
+
+    ``manicule.app.runtime`` decides whether a store wants the publication-following wrapper,
+    whether a durable re-embed can run, and whether a derived reset may proceed, by asking
+    whether the store satisfies these two protocols. It asks the object rather than importing
+    LanceDB's classes to ``isinstance`` against, because that import is ``SIGILL`` on a CPU
+    without AVX2 — which made this backend unusable on the hardware it exists to serve.
+
+    So a false here is load-bearing. ``teardown`` is the trap: this store has one, and a
+    protocol shaped around it would match, and the runtime would then close a client the
+    container had already torn down. What actually separates the two is the publication surface,
+    which this store has none of — ``docs/storage.md`` §6.7 is why it has none.
+    """
+    assert not isinstance(store, PublicationAwareVectorStore)
+    assert not isinstance(store, PublicationBoundVectorStore)
 
 
 # --- naming and identity -------------------------------------------------------------------

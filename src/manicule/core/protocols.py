@@ -1341,6 +1341,8 @@ __all__ = [
     "Generator",
     "Middleware",
     "Parser",
+    "PublicationAwareVectorStore",
+    "PublicationBoundVectorStore",
     "Reranker",
     "RetrievalStage",
     "TagStore",

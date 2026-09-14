@@ -151,6 +151,16 @@ extension, which is compiled around AVX2 — so on a host without it, a Qdrant i
 `SIGILL` while finding out it had not configured LanceDB. See [`storage.md`](storage.md) §6.7;
 `tests/test_import_boundary.py` holds the line.
 
+**A capability check answers what a store can do, never which backend it is, and the two are
+not interchangeable.** `isinstance` against a `runtime_checkable` protocol matches on method
+*names* — never signatures, never behavior — so a third-party store offering a publication
+surface of its own satisfies `PublicationBoundVectorStore` structurally. That is correct for
+calling a method through the protocol, and wrong for deciding to run backend-specific work:
+a durable re-embed and a derived reset go on to build shadow generations over a Lance directory
+and delete it, so they ask `storage.vector_db` as well, and refuse unless both halves agree.
+The rule is that a capability check licenses a capability call, and only the configured backend
+licenses reaching into that backend's storage.
+
 **`VersionStore.resolve_citation` takes the document as well as the chunk, and the reason is
 the anchor rule.** `chunks.id` is derived from `(document_id, position, text)`, so a chunk that
 survives a re-parse unchanged keeps its id and one whose text moved does not — the old id
