@@ -290,7 +290,12 @@ jobs:
   # Each job also holds `id-token: write` alone rather than the whole workflow holding it.
   publish-manicule:
     name: publish manicule
-    needs: build
+    # **`publish-manicule-ollama` and not just `build`.** `manicule[all]` requires that package,
+    # so a `manicule` on PyPI while the backend was still uploading would advertise a documented
+    # install that cannot resolve — and an upload cannot be retracted, so `attach` going red
+    # afterwards does not undo it. Ordering the two closes the window rather than reporting it.
+    # `manicule-mlx` is deliberately not in this list: nothing requires it, so it stays parallel.
+    needs: [build, publish-manicule-ollama]
     # **`skipped` propagates transitively through `needs`.** On a manual republish
     # `release-please` is skipped; `build` overrides that with `always()` and succeeds — and
     # without this line the default `success()` still evaluates the *whole* upstream graph, sees
@@ -299,7 +304,9 @@ jobs:
     #
     # `needs['publish-…']` in bracket form wherever a job id is read below: a hyphen inside an
     # expression is parsed as subtraction, so `needs.publish-manicule.result` is not a lookup.
-    if: ${{ always() && needs.build.result == 'success' }}
+    if: >-
+      ${{ always() && needs.build.result == 'success'
+      && needs['publish-manicule-ollama'].result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
