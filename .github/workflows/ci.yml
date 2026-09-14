@@ -963,6 +963,7 @@ jobs:
           set -euo pipefail
           uv venv --python 3.14 /tmp/pair
           uv pip install --python /tmp/pair/bin/python \
+            --find-links dist-ollama \
             "$(echo dist/*.whl)[all]" "$(echo dist-mlx/*.whl)"
           /tmp/pair/bin/manicule --version
           /tmp/pair/bin/python - <<'PY'

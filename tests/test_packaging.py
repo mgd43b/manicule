@@ -659,3 +659,35 @@ def test_images_are_rewritten_to_raw_urls(pyproject: dict[str, Any]) -> None:
         "no image was rewritten to a raw URL, so the image substitution matched nothing. Either "
         "README.md no longer embeds a repository image, or the pattern has stopped matching it."
     )
+
+
+def test_every_all_extra_install_resolves_from_the_wheels_being_tested() -> None:
+    """`manicule[all]` must not reach an index for a distribution this tree also builds.
+
+    The failure this pins is one CI found rather than review: `all` gained `ollama`, and three
+    separate steps install `manicule[all]` — two in `ci.yml` and one in `release.yml`. Two were
+    given `--find-links` and the third was not, so it went looking for `manicule-ollama` on PyPI,
+    where the first release including it had not happened yet. It failed loudly, which was luck:
+    once the package *is* published, the same omission resolves the **previous** release's
+    backend against this tree's core and passes, and the step goes on reporting that the
+    documented install works while checking a pair that was never built together.
+
+    So every `[all]` install is held to resolving the workspace's own distributions from the
+    directory they were just built into. A fourth published backend added the same way fails
+    here rather than six months later.
+    """
+    installs: list[str] = []
+    for workflow in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        text = workflow.read_text(encoding="utf-8")
+        # The whole `uv pip install` invocation, continuations included, so the flags and the
+        # `[all]` they belong to are read together rather than as separate lines.
+        for match in re.finditer(r"uv pip install(?:[^\n]*\\\n)*[^\n]*", text):
+            command = match.group(0)
+            if "[all]" in command and "--find-links" not in command:
+                installs.append(f"{workflow.name}: {' '.join(command.split())}")
+
+    assert installs == [], (
+        "these install `manicule[all]` without pointing at the locally built distributions, so "
+        "they resolve a workspace member from an index instead of from this tree:\n  "
+        + "\n  ".join(installs)
+    )
