@@ -390,6 +390,11 @@ is a feature list entry, not a feature.
 - `plugins.config` — per-component settings, validated against each component's own model.
 - `embedding.cache_entries` — keyed by model identity, so a model change can never serve
   vectors made by the previous one.
+- `embedding.prefix_scheme` — the asymmetric query/document prefixes a model was trained with
+  (`none`, `nomic`, `qwen3`). One setting rather than two, because the two sides have to move
+  together, and in core rather than in a backend because a backend cannot tell a document from
+  a query. It is part of the embedding fingerprint, so changing it costs a re-embed rather than
+  quietly mixing two vector spaces.
 - `llm.generator` — which registered generator **component** to build, separate from
   `llm.provider`, which names the **vendor**. The two answer different questions and
   conflating them made the default configuration unrunnable: one implementation reaches every

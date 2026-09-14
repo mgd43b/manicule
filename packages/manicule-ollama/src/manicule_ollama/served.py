@@ -44,7 +44,7 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from manicule.core.embedding import EmbedFingerprint, Pooling
+from manicule.core.embedding import EmbedFingerprint, Pooling, PrefixScheme
 from manicule.core.errors import ConfigError
 from manicule.embedding.cards import ModelCard
 from manicule_ollama.client import (
@@ -64,38 +64,6 @@ Narrower than :data:`manicule.embedding.cards.CARD_FILES` on purpose. A reposito
 not running that checkpoint — it is running whatever GGUF somebody converted and pushed to
 Ollama. Reading a pooling mode or a width from the repository would be reading a second model's
 declaration and attributing it to this one.
-"""
-
-_PREFIX_SCHEME: Final = "prefix=none"
-"""What this backend does to a text before embedding it, recorded inside the identity.
-
-Nothing, today — and that is a statement rather than an omission. ``nomic-embed-text`` is
-trained with asymmetric ``search_query:``/``search_document:`` prefixes and Qwen3-Embedding
-with a query-side instruction, so applying one, or failing to, changes the vector for the same
-text. manicule has no query/document distinction to hang that on:
-:meth:`~manicule.core.protocols.Embedder.embed` is the only entry point and both
-:mod:`manicule.ingest.embedding` and :mod:`manicule.retrieval.dense` call it the same way, so a
-backend cannot tell which side it is serving. Inventing a rule here would put a retrieval
-decision inside a plugin and leave it out of the fingerprint entirely.
-
-**What this term protects is this backend, and only this backend.** That is worth saying
-plainly, because the obvious reading is wrong and the wrong reading is the dangerous one.
-:attr:`~manicule.core.embedding.EmbedFingerprint.weights_identity` is supplied by whichever
-backend built the fingerprint, so a scheme adopted in *core* would move what ``onnx`` and
-``mlx`` embed while their ``weights_identity`` — ``artifact:onnx:hf:…``, or the ``qualified:``
-form for a parity-qualified pair — said nothing had changed. Their fingerprints would match an
-index built before the change while their vectors no longer belonged in it: exactly the silent
-regression this term avoids here, occurring everywhere else.
-
-It is not even a uniform marker. :meth:`EmbedFingerprint.identity` *pops* ``weights_identity``
-when it is empty, so a backend that records nothing has a different canonical form from one
-that records ``prefix=none`` — the absence of the term does not read as "no prefix", it reads
-as a different shape of identity.
-
-So this is a local guarantee and must not be mistaken for the general one. The general fix is a
-**core-owned field in** :attr:`EmbedFingerprint.IDENTITY_FIELDS`, which covers every backend by
-construction rather than by each one remembering to describe itself. ``docs/embeddings.md`` §9
-carries that, including why the mechanism it most resembles is not its home.
 """
 
 CONTEXT_RESERVE: Final = 1
@@ -143,6 +111,14 @@ class ServedModel:
 
     num_ctx: int
     """The context this backend asks the server for, in total tokens. Sent on every request."""
+
+    document_prefix_tokens: int
+    """What :attr:`ModelCard.prefix_scheme`'s document side costs under this vocabulary.
+
+    Measured here and recorded in the declaration because deriving it again needs the
+    tokenizer, and the metadata-only path may not read one it does not already have — the
+    same reason :attr:`ServedDeclaration.special_token_count` is stored rather than recomputed.
+    """
 
     configured_name: str
     """What configuration called this model, which is **not** what identity calls it.
@@ -203,6 +179,17 @@ class ServedDeclaration(BaseModel):
 
     tokenizer_id: str
     special_token_count: int
+    prefix_scheme: PrefixScheme = PrefixScheme.NONE
+    """The scheme in force when this was measured. A changed one is a refusal, not a re-derivation.
+
+    It is here for the same reason :attr:`tokenizer_id` is: its document side is charged to
+    :attr:`max_sequence_length`, counting it needs the vocabulary, and reading a vocabulary may
+    need a download — which a metadata-only path must not do.
+    """
+
+    document_prefix_tokens: int = Field(default=0, ge=0)
+    """What that scheme's document side cost under this vocabulary, so it need not be recounted."""
+
     num_ctx: int
     max_sequence_length: int = Field(gt=0)
     ceiling_verified: bool = False
@@ -240,7 +227,12 @@ class ServedDeclaration(BaseModel):
         )
 
 
-def resolve(client: OllamaClient, model: str, config: OllamaEmbedderConfig) -> ServedModel:
+def resolve(
+    client: OllamaClient,
+    model: str,
+    config: OllamaEmbedderConfig,
+    prefix_scheme: PrefixScheme = PrefixScheme.NONE,
+) -> ServedModel:
     """Read the server, measure what it does, and settle this model's identity.
 
     Three round trips: ``/api/tags`` for the digest, ``/api/show`` for the architecture's
@@ -259,13 +251,27 @@ def resolve(client: OllamaClient, model: str, config: OllamaEmbedderConfig) -> S
         ConfigError: The server does not hold this model, its metadata is unusable, the
             configured tokenizer is missing, or the declared and measured widths disagree.
         OllamaUnavailableError: The server could not be reached.
+
+    ``prefix_scheme`` is core's rather than this backend's, and defaults to ``none`` so that the
+    many callers that do not care about it read plainly. What keeps the one caller that must
+    care honest is a test rather than the signature:
+    ``test_the_configured_prefix_scheme_reaches_the_built_embedder`` builds through the plugin
+    factory and asserts the setting arrives, which is the wiring a required argument would only
+    have type-checked.
     """
     info = client.describe(model)
     tokenizer_path, tokenizer_id = _resolve_tokenizer(config)
     specials = _special_token_count(tokenizer_path)
+    prefix_tokens = _document_prefix_tokens(tokenizer_path, prefix_scheme)
     pooling = _pooling(info, config.pooling)
     num_ctx = _num_ctx(info, config.num_ctx)
-    usable = _usable_length(info, num_ctx, specials, config.max_sequence_length)
+    usable = _usable_length(
+        info,
+        num_ctx,
+        specials,
+        config.max_sequence_length,
+        document_prefix_tokens=prefix_tokens,
+    )
 
     probe = client.embed_sync(
         model, ["dimension probe"], num_ctx=num_ctx, keep_alive=config.keep_alive
@@ -284,6 +290,7 @@ def resolve(client: OllamaClient, model: str, config: OllamaEmbedderConfig) -> S
         architecture=info.architecture,
         dimension=dimension,
         pooling=pooling,
+        prefix_scheme=prefix_scheme,
         tokenizer_id=tokenizer_id,
         max_sequence_length=usable,
         special_token_count=specials,
@@ -293,6 +300,7 @@ def resolve(client: OllamaClient, model: str, config: OllamaEmbedderConfig) -> S
         card=card,
         info=info,
         num_ctx=num_ctx,
+        document_prefix_tokens=prefix_tokens,
         configured_name=model,
         weights_ref=f"{BACKEND}:{info.model}@sha256:{info.digest}",
         weights_identity=weights_identity(info.model, info.digest),
@@ -319,13 +327,18 @@ def weights_identity(model: str, digest: str) -> str:
         (:mod:`manicule.embedding.artifacts`). The digest is what makes that a loud
         fingerprint mismatch instead of a silently mixed index.
 
-    the prefix scheme
-        what was done to the text before the model saw it — nothing, today. It is here so that
-        adopting one later invalidates *these* vectors, and it does not and cannot do the same
-        for any other backend: see :data:`_PREFIX_SCHEME` for why that is core's problem rather
-        than a thing each backend can solve for itself.
+    **A third term used to be here, and its removal is the point.** This string once ended
+    ``:prefix=none``, a marker saying that this backend prepended nothing before embedding. It
+    was a local stand-in for something core did not yet have, and it could never have been more
+    than that: ``weights_identity`` is supplied by whichever backend built the fingerprint, so
+    ``onnx`` and ``mlx`` recorded no such term and a scheme adopted in core would have moved
+    what they embedded while their identities said nothing had changed. Core now owns the
+    question — :attr:`~manicule.core.embedding.EmbedFingerprint.prefix_scheme` is an identity
+    field on every fingerprint whoever built it — so keeping the term would record the same
+    fact twice, in a field that cannot be trusted to agree with the one that decides.
+    ``docs/embeddings.md`` §9.1 has the full argument.
     """
-    return f"artifact:{BACKEND}:{model}@sha256:{digest}:{_PREFIX_SCHEME}"
+    return f"artifact:{BACKEND}:{model}@sha256:{digest}"
 
 
 # --- persistence, for metadata-only planning ---------------------------------------------
@@ -356,6 +369,8 @@ def record(served: ServedModel, client: OllamaClient, cache_dir: Path) -> Served
         pooling_type=served.info.pooling_type,
         tokenizer_id=served.card.tokenizer_id,
         special_token_count=served.card.special_token_count,
+        prefix_scheme=served.card.prefix_scheme,
+        document_prefix_tokens=served.document_prefix_tokens,
         num_ctx=served.num_ctx,
         max_sequence_length=served.card.max_sequence_length,
     )
@@ -432,7 +447,11 @@ def mark_ceiling_verified(cache_dir: Path, base_url: str, model: str) -> None:
 
 
 def cached_fingerprint(
-    cache_dir: Path, base_url: str, model: str, config: OllamaEmbedderConfig
+    cache_dir: Path,
+    base_url: str,
+    model: str,
+    config: OllamaEmbedderConfig,
+    prefix_scheme: PrefixScheme = PrefixScheme.NONE,
 ) -> EmbedFingerprint:
     """Rebuild the configured identity from disk, with the network structurally out of reach.
 
@@ -449,12 +468,15 @@ def cached_fingerprint(
     rather than assumed. The **width** was measured from a real vector, so the recorded one is
     used; nothing in configuration can change it. The **vocabulary** decides the special-token
     count, and reading a new one may need a download, so a ``tokenizer`` that has changed since
-    the record was written is a refusal rather than a re-derivation.
+    the record was written is a refusal rather than a re-derivation. The **prefix scheme** is
+    the same shape of fact for the same reason: its document side comes off the usable limit
+    and counting it needs that vocabulary, so a scheme that has moved since the record was
+    written is refused here too.
 
     Raises:
         ConfigError: Nothing usable has been recorded for this server and model, the configured
-            tokenizer is not the one the record was measured with, or the configuration in
-            force is one this model cannot serve.
+            tokenizer or prefix scheme is not the one the record was measured with, or the
+            configuration in force is one this model cannot serve.
     """
     declaration = _read(declaration_path(cache_dir, base_url, model))
     if declaration is None:
@@ -478,6 +500,16 @@ def cached_fingerprint(
         )
         raise ConfigError(msg)
 
+    if prefix_scheme != declaration.prefix_scheme:
+        msg = (
+            f"the recorded declaration for {model!r} was measured under prefix scheme "
+            f"{declaration.prefix_scheme.value!r} and configuration now names "
+            f"{prefix_scheme.value!r}. The document side of a scheme is charged to the usable "
+            f"limit, counting it needs the vocabulary, and reading one may need a download — "
+            f"which a metadata-only path must not do. Run once against the server."
+        )
+        raise ConfigError(msg)
+
     info = declaration.as_info()
     num_ctx = _num_ctx(info, config.num_ctx)
     return EmbedFingerprint(
@@ -486,9 +518,14 @@ def cached_fingerprint(
         dimension=declaration.measured_dimension,
         pooling=_pooling(info, config.pooling),
         normalized=True,
+        prefix_scheme=prefix_scheme,
         tokenizer_id=declaration.tokenizer_id,
         max_sequence_length=_usable_length(
-            info, num_ctx, declaration.special_token_count, config.max_sequence_length
+            info,
+            num_ctx,
+            declaration.special_token_count,
+            config.max_sequence_length,
+            document_prefix_tokens=declaration.document_prefix_tokens,
         ),
         backend=BACKEND,
         weights_ref=f"{BACKEND}:{declaration.model}@sha256:{declaration.digest}",
@@ -558,6 +595,16 @@ def _resolve_tokenizer(config: OllamaEmbedderConfig) -> tuple[Path, str]:
 
     The identity comes from :func:`tokenizer_identity`, which is the half planning can compute
     without a network; this adds the half that may need one.
+
+    **The refusal names this backend's own settings**, because the default one names two an
+    operator here cannot use. :func:`~manicule.embedding.runtimes.hub.snapshot` otherwise
+    suggests pointing ``embedding.model`` or a backend's ``weights`` at a local directory —
+    but ``embedding.model`` is the name of a model on the *server*, and ``weights`` is refused
+    outright by :class:`~manicule_ollama.config.OllamaEmbedderConfig`, so an operator who
+    followed that advice would be told their configuration was invalid by the next error. What
+    is missing is a ``tokenizer.json``, and ``tokenizer`` is the setting that supplies it —
+    from a directory, which is what a container with a read-only model cache wants, since a
+    local path is answered here without ``huggingface_hub`` being imported at all.
     """
     identity = tokenizer_identity(config)
     local = Path(config.tokenizer).expanduser()
@@ -566,7 +613,23 @@ def _resolve_tokenizer(config: OllamaEmbedderConfig) -> tuple[Path, str]:
 
     from manicule.embedding.runtimes.hub import snapshot  # noqa: PLC0415 - an embeddings extra
 
-    return snapshot(config.tokenizer, TOKENIZER_FILES, config.tokenizer_revision), identity
+    return (
+        snapshot(
+            config.tokenizer,
+            TOKENIZER_FILES,
+            config.tokenizer_revision,
+            # A bare setting name: `snapshot` puts it into "point <setting> at a local
+            # directory holding them", so anything with a trailing clause reads as nonsense
+            # there. What makes the advice usable here is that `tokenizer` really does accept a
+            # directory, which is the route a read-only model cache leaves open.
+            setting=f'`[plugins.config."embedder.{BACKEND}"] tokenizer`',
+            remedy=(
+                f"uv run tools/prefetch_embedding_models.py --backend {BACKEND} "
+                f"--tokenizer {config.tokenizer} --tokenizer-revision {config.tokenizer_revision}"
+            ),
+        ),
+        identity,
+    )
 
 
 def _special_token_count(tokenizer_path: Path) -> int:
@@ -679,28 +742,58 @@ def _num_ctx(info: ServedModelInfo, configured: int | None) -> int:
     return configured
 
 
-def _usable_length(info: ServedModelInfo, num_ctx: int, specials: int, override: int | None) -> int:
-    """Usable **content** tokens: the served context, less a reserve, less special tokens."""
-    derived = num_ctx - CONTEXT_RESERVE - specials
+def _usable_length(
+    info: ServedModelInfo,
+    num_ctx: int,
+    specials: int,
+    override: int | None,
+    *,
+    document_prefix_tokens: int = 0,
+) -> int:
+    """Usable **content** tokens: the served context, less a reserve, specials, and the prefix.
+
+    The document-side prefix comes off both the derived number and a configured override, for
+    the reason :func:`manicule.embedding.cards._resolve_length` gives: ``max_sequence_length``
+    means what is left for a chunk's own text, and an operator setting it can know their
+    model's limit and their server's context without also netting out a prefix manicule chose.
+    """
+    derived = num_ctx - CONTEXT_RESERVE - specials - document_prefix_tokens
     if derived <= 0:
         msg = (
             f"{info.model!r} served at num_ctx={num_ctx} has no room for content: a reserve of "
-            f"{CONTEXT_RESERVE} and {specials} special tokens leave nothing to embed."
+            f"{CONTEXT_RESERVE}, {specials} special tokens and a "
+            f"{document_prefix_tokens}-token document prefix leave nothing to embed."
         )
         raise ConfigError(msg)
     if override is None:
         return derived
-    if override > derived:
+    usable = override - document_prefix_tokens
+    if usable > derived or usable <= 0:
         msg = (
             f"`max_sequence_length` is {override} but {info.model!r} served at "
             f"num_ctx={num_ctx} reads at most {derived} content tokens "
-            f"({num_ctx} - {CONTEXT_RESERVE} reserved - {specials} special). Unlike a model "
+            f"({num_ctx} - {CONTEXT_RESERVE} reserved - {specials} special - "
+            f"{document_prefix_tokens} prefix). Unlike a model "
             f"repository, which may simply fail to declare its limit, this number was derived "
             f"from what the server reports — so raising it past the derivation cannot reveal "
             f"capacity, only hide truncation. Lower it, or raise `num_ctx`."
         )
         raise ConfigError(msg)
-    return override
+    return usable
+
+
+def _document_prefix_tokens(tokenizer_path: Path, scheme: PrefixScheme) -> int:
+    """What ``scheme``'s document side costs under this vocabulary, in content tokens.
+
+    Counted with the same tokenizer the backend counts chunks with, because the number is
+    subtracted from a limit that tokenizer's counts are compared against — and a prefix
+    measured under a different vocabulary would be a reservation of the wrong size.
+    """
+    if not scheme.document_prefix:
+        return 0
+    from manicule.embedding.runtimes.tokenization import FastTokenizer  # noqa: PLC0415
+
+    return len(FastTokenizer(tokenizer_path / "tokenizer.json").content_ids(scheme.document_prefix))
 
 
 def _measured_dimension(probe: EmbedResult, info: ServedModelInfo, base_url: str) -> int:

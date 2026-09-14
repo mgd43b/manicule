@@ -177,7 +177,21 @@ async def embed_checked_chunks(
         batch = [chunks[index] for index in positions]
         if on_batch is not None:
             on_batch(batch)
-        produced = await embedder.embed([chunk.embed_text for chunk in batch])
+        # **The document half of the prefix scheme is applied here, and nowhere below.**
+        # `Embedder.embed` is the only entry point a backend has, and `retrieval/dense.py`
+        # calls it with a query in exactly the same shape — so a backend cannot tell which
+        # side it is serving, and a prefix invented inside one would be a retrieval decision
+        # hidden in a plugin (`docs/embeddings.md` §9.1). Applying it above the embedder also
+        # keeps the embedding cache honest without a special case: that cache is keyed on the
+        # string handed to `embed`, so a document and a query that are the same text land on
+        # different keys by construction rather than by anyone remembering to separate them.
+        #
+        # The budget was already paid for. The scheme's document prefix is subtracted from
+        # `max_sequence_length` when the fingerprint is built, so the `require_within_context`
+        # calls above — which measure the *unprefixed* text — are comparing against what is
+        # actually left for it.
+        scheme = embedder.fingerprint.prefix_scheme
+        produced = await embedder.embed([scheme.document(chunk.embed_text) for chunk in batch])
         if len(produced) != len(batch):
             msg = (
                 f"the embedder returned {len(produced)} vector(s) for {len(batch)} chunk(s). "

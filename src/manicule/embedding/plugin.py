@@ -72,6 +72,7 @@ def read_embedder_card(context: BuildContext) -> tuple[ModelCard, EmbedderConfig
         revision=revision,
         pooling_override=settings.pooling,
         max_sequence_length_override=settings.max_sequence_length,
+        prefix_scheme=embedding.prefix_scheme,
     )
     return card, settings
 
@@ -121,6 +122,7 @@ def embedder_metadata_factory(provider: str) -> MetadataFactory:
                 revision=revision,
                 pooling_override=settings.pooling,
                 max_sequence_length_override=settings.max_sequence_length,
+                prefix_scheme=embedding.prefix_scheme,
             )
             artifact = describe_artifact(
                 provider,

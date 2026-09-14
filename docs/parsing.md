@@ -91,9 +91,16 @@ the argument that survives the model landscape moving.
 
 **This requires something of [#3](https://github.com/mgd43b/manicule/issues/3):**
 `EmbedFingerprint` must carry `max_sequence_length` — the effective one, already net of
-any instruction prefix the backend prepends (EmbeddingGemma's `search_document: ` and the
-E5 family's `passage: ` both consume real tokens) — and must expose the model's own
-tokenizer for counting. Both are stated in §1.2 and §1.7.
+any instruction prefix prepended before the model reads a chunk (`nomic-embed-text`'s
+`search_document: ` and the E5 family's `passage: ` both consume real tokens) — and must
+expose the model's own tokenizer for counting. Both are stated in §1.2 and §1.7.
+
+It is net of one as of `[embedding] prefix_scheme`: the configured scheme's document prefix is
+counted with the model's own tokenizer and subtracted where the card is read
+([`embeddings.md`](embeddings.md) §4.3). Note the correction in that sentence — the prefix is
+*not* something a backend prepends, and could not be. A backend cannot tell a chunk from a
+query, so the scheme is core's and is applied at the two call sites that know which side they
+are serving (§9.1). What reaches this budget is the same either way.
 
 ### 1.2 Count with the embedder's tokenizer, never an estimator
 

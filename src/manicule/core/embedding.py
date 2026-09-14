@@ -361,6 +361,101 @@ class Pooling(StrEnum):
     NONE = "none"
 
 
+class PrefixScheme(StrEnum):
+    """What a model wants prepended to a text — and it is not the same on both sides.
+
+    Several retrieval models are trained asymmetrically: a document and a query that happen to
+    be the same string are meant to be embedded *differently*, and the difference is a literal
+    prefix. ``nomic-embed-text`` is trained with ``search_document:`` and ``search_query:``;
+    Qwen3-Embedding takes an instruction on the query side and nothing on the document side.
+    Applying one, or failing to, changes the vector for the same text and degrades retrieval
+    with nothing raised.
+
+    **This belongs to core, and cannot belong to a backend.**
+    :meth:`~manicule.core.protocols.Embedder.embed` is the only entry point, and
+    :mod:`manicule.ingest.embedding` and :mod:`manicule.retrieval.dense` call it identically —
+    so a backend cannot tell which side it is serving, and a rule invented inside one would be
+    a retrieval decision hidden in a plugin that no other backend obeys. The scheme is chosen
+    here, applied at those two call sites, and recorded in
+    :attr:`EmbedFingerprint.prefix_scheme`, which is an identity field because changing it
+    changes every vector. ``docs/embeddings.md`` §9.1 carries the full argument, including why
+    ``weights_identity`` and :attr:`~manicule.core.fingerprints.ChunkFingerprint.\
+embed_text_middleware` are both the wrong home — the second because it can express the
+    document half and not the query half, and half of an asymmetric scheme is worse than none
+    of it.
+
+    **A closed set, rather than two free-text settings.** A prefix is not a preference: it is
+    the convention the weights were trained under, and there is one right answer per model. A
+    mistyped free-text prefix would be recorded faithfully in the fingerprint and would build a
+    corpus in a space nothing else shares — a silent loss wearing the clothes of a valid
+    setting. Adding a scheme costs a member here, an entry in :data:`PREFIXES`, and one
+    re-embed for anyone adopting it.
+
+    **Both sides always move together.** That is the property the closed set exists to
+    guarantee, and it is why the pair is one value rather than a document setting beside a
+    query setting that can disagree.
+    """
+
+    NONE = "none"
+    """No prefix on either side.
+
+    The default, and correct for a symmetric model — ``BAAI/bge-m3``, which manicule ships, is
+    trained without one.
+    """
+
+    NOMIC = "nomic"
+    """``nomic-embed-text``'s ``search_document: ``/``search_query: `` pair.
+
+    Documented in the model card rather than declared in the repository: its
+    ``config_sentence_transformers.json`` carries no ``prompts`` object at all, which is why
+    manicule cannot read this off the model and an operator has to name it.
+    """
+
+    QWEN3 = "qwen3"
+    """Qwen3-Embedding's query-side instruction, and nothing on the document side.
+
+    Taken verbatim from the ``prompts.query`` string the model publishes in its
+    ``config_sentence_transformers.json``, trailing colon and all: the query text follows the
+    colon directly, with no space, because that is what the published prompt does.
+    """
+
+    @property
+    def document_prefix(self) -> str:
+        """What precedes a stored chunk's text. Counts against the sequence budget."""
+        return PREFIXES[self][0]
+
+    @property
+    def query_prefix(self) -> str:
+        """What precedes a search query's text."""
+        return PREFIXES[self][1]
+
+    def document(self, text: str) -> str:
+        """``text`` as the document side of this scheme wants the model to read it."""
+        return f"{self.document_prefix}{text}"
+
+    def query(self, text: str) -> str:
+        """``text`` as the query side of this scheme wants the model to read it."""
+        return f"{self.query_prefix}{text}"
+
+
+PREFIXES: Final[Mapping[PrefixScheme, tuple[str, str]]] = {
+    PrefixScheme.NONE: ("", ""),
+    PrefixScheme.NOMIC: ("search_document: ", "search_query: "),
+    PrefixScheme.QWEN3: (
+        "",
+        "Instruct: Given a web search query, retrieve relevant passages that answer the query"
+        "\nQuery:",
+    ),
+}
+"""``(document, query)`` for every scheme, which is the whole of what a scheme *is*.
+
+Beside the enumeration rather than inside it so that the strings are readable as a table —
+what the two sides of a scheme are is the thing somebody reading this needs to see at once,
+and a scheme whose halves were declared apart from each other would be one somebody could
+change by half. ``test_every_prefix_scheme_names_both_sides`` holds the two in step.
+"""
+
+
 class TokenStates(BaseModel):
     """Pre-pooled per-token hidden states for a batch of texts — the tier A payload.
 
@@ -406,6 +501,23 @@ class EmbedFingerprint(Fingerprint):
     **:attr:`weights_ref` is provenance, while :attr:`weights_identity` is compatibility.**
     The former records the exact repository commit or local digest that executed. The latter
     is equal across backends only for a pinned pair that the parity suite qualifies.
+
+    **:attr:`prefix_scheme` is identity, and is popped at :attr:`PrefixScheme.NONE`** — for a
+    different reason from :attr:`weights_identity`, which is popped because a fingerprint
+    written before that field existed has nothing to record. This one is popped because
+    recording it would force a re-embed that changes no vector, which is the same objection
+    that keeps :attr:`max_sequence_length` out of identity altogether. ``none`` means nothing
+    was prepended on either side, so vectors made under it are byte-identical to vectors made
+    before the field existed, and they are interchangeable in fact as well as in name. The
+    canonical bytes name the vector table, so an identity that moved here would rebuild every
+    corpus in existence to recompute what it already holds.
+
+    The non-uniformity ``docs/embeddings.md`` §9.1 objects to is a different shape and is not
+    reintroduced: what was wrong with a marker inside ``weights_identity`` is that *one backend*
+    wrote it and the others did not, so the presence of the term depended on who built the
+    fingerprint rather than on what was done to the text. Here the **value** decides, identically
+    for every backend, and the value is read back out of the fingerprint by the two call sites
+    that apply it — so a scheme that is recorded is applied, and one that is applied is recorded.
     """
 
     IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = (
@@ -414,6 +526,7 @@ class EmbedFingerprint(Fingerprint):
         "dimension",
         "pooling",
         "normalized",
+        "prefix_scheme",
         "tokenizer_id",
         "weights_identity",
     )
@@ -427,6 +540,16 @@ class EmbedFingerprint(Fingerprint):
     dimension: int = Field(gt=0, description="Read from the model. Never a literal.")
     pooling: Pooling
     normalized: bool = Field(description="Whether vectors are L2-normalized on output.")
+    prefix_scheme: PrefixScheme = Field(
+        default=PrefixScheme.NONE,
+        description="Which asymmetric query/document prefix was applied, from "
+        ":class:`PrefixScheme`. Part of identity because the prefix changes the vector for "
+        "the same text: a corpus embedded with ``search_document:`` and searched with bare "
+        "queries retrieves worse than one embedded with neither, and nothing raises. The "
+        "default both parses a fingerprint stored before this field existed and canonicalizes "
+        "to the same bytes it did — see :meth:`identity`, which omits ``none`` precisely so "
+        "that an index holding unprefixed vectors is not asked to rebuild them.",
+    )
 
     tokenizer_id: str = Field(
         default="",
@@ -469,18 +592,40 @@ class EmbedFingerprint(Fingerprint):
 
     @override
     def identity(self) -> dict[str, JsonValue]:
-        """Compatibility fields, omitting the marker absent from legacy/plugin fingerprints."""
+        """Compatibility fields, omitting the two whose default means "nothing was done".
+
+        ``weights_identity`` goes when empty because legacy and plugin fingerprints record no
+        marker at all. ``prefix_scheme`` goes at ``none`` because ``none`` produces the same
+        vectors as a build that had never heard of the field — so keeping it would make every
+        existing index refuse a runtime that agrees with it, and charge a corpus-wide re-embed
+        to recompute identical numbers. See the class docstring for why this is not the
+        non-uniformity ``docs/embeddings.md`` §9.1 rules out.
+        """
         identity = super().identity()
         if not self.weights_identity:
             identity.pop("weights_identity")
+        if self.prefix_scheme is PrefixScheme.NONE:
+            identity.pop("prefix_scheme")
         return identity
 
     @override
     def describe(self) -> str:
-        """A one-line human-readable form, for error messages and diagnostics."""
+        """A one-line human-readable form, for error messages and diagnostics.
+
+        The prefix scheme appears only when there is one, because it is the field most likely
+        to be the *sole* difference between two fingerprints — the same model, the same
+        weights, a prefix adopted — and a mismatch message whose two halves read identically
+        tells an operator nothing about why their index was refused.
+        """
         revision = f"@{self.revision}" if self.revision else ""
         norm = "normalized" if self.normalized else "unnormalized"
-        return f"{self.model_id}{revision} ({self.dimension}d, {self.pooling.value}, {norm})"
+        # `is not NONE` rather than a truth test: `PrefixScheme` is a `StrEnum`, so every
+        # member including NONE is a non-empty string and therefore truthy.
+        scheme = self.prefix_scheme
+        prefix = f", {scheme.value} prefixes" if scheme is not PrefixScheme.NONE else ""
+        return (
+            f"{self.model_id}{revision} ({self.dimension}d, {self.pooling.value}, {norm}{prefix})"
+        )
 
 
 class IndexFingerprints(BaseModel):
@@ -1020,6 +1165,7 @@ def require_within_context(
 
 __all__ = [
     "EMBEDDING_IDENTITY_VERSION",
+    "PREFIXES",
     "UNRECORDED_CHECKSUM",
     "UNRECORDED_IDENTITY",
     "VECTOR_CHECKSUM_DOMAINS",
@@ -1028,6 +1174,7 @@ __all__ = [
     "IndexFingerprints",
     "NDArrayLike",
     "Pooling",
+    "PrefixScheme",
     "StoredVector",
     "TokenStates",
     "Vector",

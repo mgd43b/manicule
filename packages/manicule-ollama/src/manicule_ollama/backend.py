@@ -177,10 +177,17 @@ class OllamaEmbedder(Lifecycle):
     ) -> list[Vector]:
         """Embed stored chunks, refusing any the model cannot read in full.
 
-        **This is the path re-embed uses**, and the reason the check lives here rather than in
-        the chunker alone. Re-embedding reads stored ``embed_text`` without re-chunking, so the
-        chunker's budget refusal never runs; and a sequence limit that *fell* — which on this
-        backend is one ``num_ctx`` away, or one ``ollama pull`` of a model with a shorter
+        **The budget guard, not the ingest path.** Every route that embeds stored chunks goes
+        through :func:`manicule.ingest.embedding.embed_chunks`, which makes the same checks and
+        then applies the document half of
+        :attr:`~manicule.core.embedding.EmbedFingerprint.prefix_scheme` — which this method
+        cannot, because a backend has no way to tell a document from a query. So this is what
+        :func:`manicule.testing.assert_refuses_oversized_chunks` holds this backend to, and not
+        a shortcut into an index.
+
+        The check exists because re-embedding reads stored ``embed_text`` without re-chunking,
+        so the chunker's budget refusal never runs; and a sequence limit that *fell* — which on
+        this backend is one ``num_ctx`` away, or one ``ollama pull`` of a model with a shorter
         context — leaves the embedding fingerprint identical, so no comparison fires either.
         """
         measured = [

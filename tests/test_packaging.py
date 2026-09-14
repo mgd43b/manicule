@@ -138,6 +138,25 @@ def test_the_image_installs_what_the_documented_install_installs() -> None:
     )
 
 
+def test_the_image_does_not_pin_the_embedding_provider_in_the_environment() -> None:
+    """If it did, `[embedding] provider` in `/data/config.toml` would silently stop choosing the
+    backend, leaving the `ollama` extra this image ships for exactly that purpose unreachable.
+    """
+    # Comment lines excluded: the Dockerfile's own explanation of why this is unset names the
+    # variable, and a bare substring search would find that prose and never see the real ENV
+    # block at all.
+    code_lines = [
+        line for line in DOCKERFILE.read_text().splitlines() if not line.lstrip().startswith("#")
+    ]
+    assert not any("MANICULE_EMBEDDING__PROVIDER" in line for line in code_lines), (
+        "the Dockerfile sets MANICULE_EMBEDDING__PROVIDER. The environment outranks "
+        "/data/config.toml in manicule's settings sources, so this pins the backend and makes "
+        "`[embedding] provider` unsettable from the config file — silently, since `onnx` is a "
+        "registered provider and resolves cleanly. The field already defaults to `onnx`; remove "
+        "the variable instead of restoring it."
+    )
+
+
 def _qdrant_service_image(path: Path, job: str | None) -> str:
     """The image `services.qdrant.image` names in a parsed document, not in its prose.
 

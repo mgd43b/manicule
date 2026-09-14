@@ -930,9 +930,13 @@ A stored vector may be reused **if and only if all three hold**:
 1. **The same complete embedding fingerprint** — `EmbedFingerprint.canonical()`, which is
    manicule's own definition of vector-space compatibility. The fields are
    `EmbedFingerprint.IDENTITY_FIELDS` and are named here as it names them: `model_id`,
-   `revision`, `dimension`, `pooling`, `normalized`, `tokenizer_id`, `weights_identity`.
+   `revision`, `dimension`, `pooling`, `normalized`, `prefix_scheme`, `tokenizer_id`,
+   `weights_identity`.
    `weights_identity` is the exact artifact identity, shared across runtimes only by an
-   explicitly pinned parity-qualified built-in pair. Deferring to that tuple
+   explicitly pinned parity-qualified built-in pair. `prefix_scheme` is the asymmetric
+   query/document prefix applied on both sides of retrieval, which changes the vector for the
+   same text and is therefore not reusable across a change to it
+   ([`embeddings.md`](embeddings.md) §9.1). Deferring to that tuple
    rather than describing it is deliberate — a prose list is a second definition, and the one
    that goes stale is always the prose.
 2. **The same embedding input, for that document** — the exact post-middleware `embed_text`,
@@ -1318,7 +1322,17 @@ keys on model identity:
 decide comparability — in the canonical form pinned in §4.6, compared for byte equality. Not
 field-by-field, so a field added to that subset later cannot be silently ignored by a
 comparison that predates it. As shipped in `manicule.core.embedding`, identity is `model_id`,
-`revision`, `dimension`, `pooling`, `normalized`, `tokenizer_id` and `weights_identity`.
+`revision`, `dimension`, `pooling`, `normalized`, `prefix_scheme`, `tokenizer_id` and
+`weights_identity`.
+
+`prefix_scheme` is the most recent addition and the one that moves without anything else
+moving: the same weights, the same revision, the same tokenizer, with `search_document:` now
+in front of every chunk. Like `weights_identity` it is popped at its default, and for a reason
+worth stating because the opposite looks more rigorous: `none` prepends nothing, so its vectors
+are byte-identical to those an index already holds, and recording it would rename every vector
+table in existence to charge a re-embed that recomputes the same numbers. Adopting a scheme
+does change the vectors, does change the canonical form, and does cost one
+`reindex --re-embed` — which is the whole of what this field is for.
 
 **Three fields are recorded but deliberately excluded.** `max_sequence_length` is out because including it would force a full re-embed
 whenever the limit *rises*, which changes nothing about the stored vectors; what matters is

@@ -617,3 +617,47 @@ async def test_normalization_is_checked_on_every_setup_not_only_an_uncached_one(
     server.normalize = False
     with pytest.raises(ConfigError, match="not 1"):
         await _setup_with_cache(server, vocabulary, cache)
+
+
+async def test_the_configured_prefix_scheme_reaches_the_built_embedder(
+    monkeypatch: pytest.MonkeyPatch, vocabulary: Path, tmp_path: Path
+) -> None:
+    """The one wiring that decides whether ``[embedding] prefix_scheme`` is in force at all.
+
+    The scheme is core's: it is applied by ``manicule.ingest.embedding`` and
+    ``manicule.retrieval.dense``, and both read it back off *this* fingerprint. So a factory
+    that dropped the setting on the way through would not produce wrong vectors — it would
+    produce an embedder that honestly records ``none`` and quietly never prefixes anything,
+    which is a setting that appears to be in force and is not. Asserted through the factory
+    rather than through ``resolve``, because the gap this closes is the wiring between them.
+    """
+    from manicule_ollama import build_ollama  # noqa: PLC0415
+    from manicule_ollama.client import OllamaClient  # noqa: PLC0415
+
+    from manicule.config.settings import EmbeddingSettings, Settings  # noqa: PLC0415
+    from manicule.core.embedding import PrefixScheme  # noqa: PLC0415
+    from manicule.plugins import BuildContext  # noqa: PLC0415
+
+    server = FakeOllama()
+
+    def served_client(base_url: str, **kwargs: object) -> OllamaClient:
+        transport = server.transport()
+        return OllamaClient(base_url, transport=transport, async_transport=transport, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr("manicule_ollama.client.OllamaClient", served_client)
+    settings = Settings(
+        embedding=EmbeddingSettings(model=server.model, prefix_scheme=PrefixScheme.NOMIC)
+    )
+    context = BuildContext(
+        settings=settings,
+        config=OllamaEmbedderConfig.model_validate(config_payload(tokenizer=str(vocabulary))),
+        data_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        components=None,  # pyright: ignore[reportArgumentType] - unused by this factory
+    )
+
+    embedder = build_ollama(context)
+
+    assert embedder.fingerprint.prefix_scheme is PrefixScheme.NOMIC
+    assert isinstance(embedder, OllamaEmbedder)
+    await embedder.teardown()

@@ -48,6 +48,7 @@ from manicule.config.providers import (
 )
 from manicule.core.acquisition import SnapshotPromotionPolicy
 from manicule.core.ann import MINIMUM_ANN_INDEX_THRESHOLD
+from manicule.core.embedding import PrefixScheme
 from manicule.core.errors import PolicyError
 from manicule.core.retrieval import RetrievalProfile
 
@@ -840,6 +841,18 @@ class EmbeddingSettings(Section):
     )
     model: str = Field(default="BAAI/bge-m3", min_length=1)
     revision: str | None = Field(default=None, min_length=1)
+    prefix_scheme: PrefixScheme = Field(
+        default=PrefixScheme.NONE,
+        description="The asymmetric query/document prefixes this model was trained with. "
+        "``none`` — the default, and right for ``BAAI/bge-m3``, which was trained without "
+        "any. ``nomic`` is ``search_document: ``/``search_query: `` and is what makes "
+        "``nomic-embed-text`` usable; ``qwen3`` is Qwen3-Embedding's query-side instruction. "
+        "It sits here rather than under a backend because both sides have to move together "
+        "and a backend cannot tell which side it is serving — so it is chosen once, applied "
+        "at ingest and at query, and recorded in the embedding fingerprint. Changing it "
+        "costs a full re-embed, for the same reason changing the model does: every stored "
+        "vector was computed from different text.",
+    )
     batch_size: int = Field(default=32, ge=1)
     cache_entries: int = Field(
         default=10_000,

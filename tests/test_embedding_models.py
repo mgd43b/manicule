@@ -641,3 +641,175 @@ def test_a_model_this_machine_does_not_have_refuses_with_the_pre_seed_named(
     assert "manicule-tests/no-such-model" in message
     assert "tools/prefetch_embedding_models.py" in message
     assert OFFLINE_ENV in message
+
+
+def _failing_download(*_args: object, **_kwargs: object) -> str:
+    """A stand-in for ``huggingface_hub.snapshot_download`` that always refuses, offline."""
+    raise OSError("simulated: the hub did not answer")
+
+
+def test_the_offline_sentence_only_appears_when_the_switch_is_actually_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal that blames a deployment choice nobody made sends an operator looking for a
+    setting that was never in force. The unfixed code asserted ``HF_HUB_OFFLINE`` was the cause
+    of every failed fetch, whether or not it was set — this is what breaks without the check
+    against ``os.environ``.
+    """
+    import huggingface_hub  # noqa: PLC0415 - kept out of this suite's own import time
+
+    from manicule.embedding.runtimes.hub import (  # noqa: PLC0415 - an embeddings extra
+        OFFLINE_ENV,
+        ModelUnavailableError,
+        snapshot,
+    )
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _failing_download)
+
+    monkeypatch.delenv(OFFLINE_ENV, raising=False)
+    with pytest.raises(ModelUnavailableError) as not_set:
+        snapshot("manicule-tests/no-such-model", ["*.json"])
+    assert OFFLINE_ENV not in str(not_set.value), (
+        "the switch was named even though it was never set — an operator would go looking for "
+        "a deployment choice that does not exist"
+    )
+
+    monkeypatch.setenv(OFFLINE_ENV, "1")
+    with pytest.raises(ModelUnavailableError) as set_case:
+        snapshot("manicule-tests/no-such-model", ["*.json"])
+    assert OFFLINE_ENV in str(set_case.value), "the one case the sentence exists for lost it"
+
+
+def test_the_offline_sentence_never_carries_the_switch_s_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naming the switch is the diagnosis; its contents are somebody's environment, and this
+    output is made for pasting into an issue.
+    """
+    import huggingface_hub  # noqa: PLC0415
+
+    from manicule.embedding.runtimes.hub import (  # noqa: PLC0415 - an embeddings extra
+        OFFLINE_ENV,
+        ModelUnavailableError,
+        snapshot,
+    )
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _failing_download)
+    private_value = "1-and-something-nobody-meant-to-share"
+    monkeypatch.setenv(OFFLINE_ENV, private_value)
+
+    with pytest.raises(ModelUnavailableError) as raised:
+        snapshot("manicule-tests/no-such-model", ["*.json"])
+
+    message = str(raised.value)
+    assert private_value not in message, "an environment variable's value reached the refusal"
+    assert OFFLINE_ENV in message, "the switch that caused this has to be named"
+
+
+def test_a_caller_naming_its_own_setting_and_remedy_replaces_the_default_wording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``manicule-ollama`` fetches a tokenizer, not weights, and its own config validator
+    refuses ``weights`` outright — the default remedy would send an operator to set something
+    that fails the moment they try.
+    """
+    import huggingface_hub  # noqa: PLC0415
+
+    from manicule.embedding.runtimes.hub import ModelUnavailableError, snapshot  # noqa: PLC0415
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _failing_download)
+
+    with pytest.raises(ModelUnavailableError) as raised:
+        snapshot(
+            "acme/tokenizer",
+            ["tokenizer.json"],
+            setting="the ollama embedder's `tokenizer`",
+            remedy="uv run tools/prefetch_embedding_models.py --backend ollama",
+        )
+
+    message = str(raised.value)
+    assert "the ollama embedder's `tokenizer`" in message
+    assert "uv run tools/prefetch_embedding_models.py --backend ollama" in message
+    assert "embedding.model" not in message, "the default setting leaked past the caller's own"
+    assert "a backend's `weights`" not in message, "the default remedy leaked past the caller's own"
+
+
+# --- the ollama prefetch mode ----------------------------------------------------------------
+
+
+def test_the_ollama_prefetch_mode_fetches_only_tokenizer_json_at_the_given_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``manicule-ollama`` loads nothing else from the tokenizer repository; fetching more would
+    be reading files a served backend never opens.
+    """
+    from tools.prefetch_embedding_models import main  # noqa: PLC0415 - an operator/CI script
+
+    seen: list[tuple[str, list[str], str | None]] = []
+
+    def fake_fetch(repo: str, patterns: list[str], revision: str | None) -> Path:
+        seen.append((repo, patterns, revision))
+        return Path("/nowhere")
+
+    monkeypatch.setattr("tools.prefetch_embedding_models.fetch", fake_fetch)
+
+    revision = "a" * 40
+    code = main(
+        ["--backend", "ollama", "--tokenizer", "acme/tok", "--tokenizer-revision", revision]
+    )
+
+    assert code == 0
+    assert seen == [("acme/tok", ["tokenizer.json"], revision)]
+
+
+def test_the_ollama_prefetch_mode_refuses_an_unpinned_repository_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A branch or tag can move the vocabulary without moving the name, and every chunk boundary
+    in a corpus was measured against one exact commit — the same reasoning
+    ``served.tokenizer_identity`` gives, reused here rather than re-derived.
+    """
+    from tools.prefetch_embedding_models import main  # noqa: PLC0415 - an operator/CI script
+
+    code = main(["--backend", "ollama", "--tokenizer", "acme/tok"])
+
+    assert code == 1
+    assert "tokenizer_revision" in capsys.readouterr().err
+
+
+def test_the_ollama_prefetch_mode_refuses_when_nothing_names_a_tokenizer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Ollama exposes no tokenizer of its own, so a script given neither a flag nor a
+    configuration entry has nothing to fetch and must say so, naming both routes, rather than
+    guess one.
+    """
+    from tools.prefetch_embedding_models import main  # noqa: PLC0415 - an operator/CI script
+
+    code = main(["--backend", "ollama"])
+
+    message = capsys.readouterr().err
+    assert code == 1
+    assert "--tokenizer" in message
+    assert "embedder.ollama" in message
+    assert "Qwen/Qwen3-Embedding-0.6B" in message
+    assert "nomic-ai/nomic-embed-text-v1.5" in message
+
+
+def test_a_local_directory_tokenizer_needs_no_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tokenizer already on disk is not a repository id, and asking the hub about it would be
+    the download this whole feature exists to avoid.
+    """
+    from tools.prefetch_embedding_models import main  # noqa: PLC0415 - an operator/CI script
+
+    def fail_if_called(*_args: object, **_kwargs: object) -> Path:
+        raise AssertionError("a local tokenizer directory should never be fetched")
+
+    monkeypatch.setattr("tools.prefetch_embedding_models.fetch", fail_if_called)
+
+    directory = tmp_path / "tokenizer-dir"
+    write_tokenizer(directory / "tokenizer.json")
+
+    assert main(["--backend", "ollama", "--tokenizer", str(directory)]) == 0

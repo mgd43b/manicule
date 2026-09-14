@@ -240,6 +240,15 @@ own so a change to its rules makes the corpus visibly stale rather than quietly 
   a parser that disagrees with its own declaration is caught the first time it is used.
 - Declare a `config_model`. Settings written for a component with no model are rejected
   rather than ignored.
+- **An embedder records `[embedding] prefix_scheme` on its fingerprint, and never applies a
+  prefix itself.** Building the fingerprint through `ModelCard.fingerprint()` does both for
+  you, which is why the two shipped backends and `manicule-ollama` all go that way. A backend
+  that constructs `EmbedFingerprint` directly must carry the setting across, because core reads
+  the scheme back off the fingerprint to decide what to prepend — so one that records `none`
+  makes a configured scheme silently not in force, and one that prepends inside `embed` doubles
+  whatever core already added. Nothing enforces this from outside the plugin:
+  `Embedder.embed` cannot tell a document from a query, which is the reason the scheme is
+  core's in the first place (`docs/embeddings.md` §9.1).
 - Run the conformance suites from `manicule.testing` against your components.
 
 ### Plugins run with full privileges

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Final, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from manicule.core.embedding import EmbedFingerprint, Pooling
+from manicule.core.embedding import EmbedFingerprint, Pooling, PrefixScheme
 from manicule.core.errors import ConfigError
 
 if TYPE_CHECKING:
@@ -94,10 +94,21 @@ class ModelCard(BaseModel):
     dimension: int = Field(gt=0)
     pooling: Pooling
     tokenizer_id: str = Field(min_length=1)
+    prefix_scheme: PrefixScheme = Field(
+        default=PrefixScheme.NONE,
+        description="The asymmetric query/document prefixes configuration selected. On the "
+        "card because a repository declares nothing manicule can read it off — the model "
+        "that most needs one, ``nomic-embed-text``, publishes no ``prompts`` object at all — "
+        "and because it is what nets the document side out of "
+        ":attr:`max_sequence_length`. Carrying it here rather than passing it separately to "
+        ":meth:`fingerprint` is what makes the recorded scheme and the budget it paid for "
+        "unable to disagree.",
+    )
     max_sequence_length: int = Field(
         gt=0,
         description="**Usable content tokens**: the declared sequence length, capped by what "
-        "the position embeddings can address, minus the special tokens the tokenizer adds. "
+        "the position embeddings can address, minus the special tokens the tokenizer adds, "
+        "minus the document-side prefix :attr:`prefix_scheme` prepends. "
         "Not ``max_position_embeddings``, which for BGE-M3 is 8194 against 8190 usable.",
     )
     special_token_count: int = Field(
@@ -114,6 +125,11 @@ class ModelCard(BaseModel):
 
         ``normalized`` is always ``True``: normalization is applied in
         :mod:`manicule.embedding.pooling` rather than read from the model's declared pipeline.
+
+        :attr:`prefix_scheme` is taken from the card rather than accepted here, so that the
+        scheme recorded in the fingerprint is necessarily the one whose document prefix was
+        already charged to :attr:`max_sequence_length`. A backend that could pass one would be
+        a backend that could pass a different one.
         """
         return EmbedFingerprint(
             model_id=self.model_id,
@@ -121,6 +137,7 @@ class ModelCard(BaseModel):
             dimension=self.dimension,
             pooling=self.pooling,
             normalized=True,
+            prefix_scheme=self.prefix_scheme,
             tokenizer_id=self.tokenizer_id,
             max_sequence_length=self.max_sequence_length,
             backend=backend,
@@ -135,6 +152,7 @@ def read_card(
     revision: str | None = None,
     pooling_override: Pooling | None = None,
     max_sequence_length_override: int | None = None,
+    prefix_scheme: PrefixScheme = PrefixScheme.NONE,
 ) -> ModelCard:
     """Read a model's declaration, downloading only the metadata files.
 
@@ -144,7 +162,11 @@ def read_card(
         pooling_override: Used **only** when the repository declares no pooling. Supplying one
             that contradicts the repository is refused rather than obeyed.
         max_sequence_length_override: Likewise, and in the same units as
-            :attr:`ModelCard.max_sequence_length` — usable content tokens.
+            :attr:`ModelCard.max_sequence_length` — usable content tokens. It is what the
+            model can read, so the document-side prefix is charged against it here rather
+            than expected to have been subtracted by whoever wrote the setting.
+        prefix_scheme: The asymmetric prefixes configuration selected, whose document side
+            is subtracted from the usable length.
 
     Raises:
         ConfigError: The repository declares nothing usable and configuration supplied
@@ -157,6 +179,7 @@ def read_card(
         resolved,
         pooling_override=pooling_override,
         max_sequence_length_override=max_sequence_length_override,
+        prefix_scheme=prefix_scheme,
     )
 
 
@@ -167,6 +190,7 @@ def _read_card_at(
     *,
     pooling_override: Pooling | None,
     max_sequence_length_override: int | None,
+    prefix_scheme: PrefixScheme,
 ) -> ModelCard:
     """Interpret one already-resolved declaration directory."""
     config = read_json(path / "config.json", model_id)
@@ -176,7 +200,15 @@ def _read_card_at(
     dimension = _resolve_dimension(model_id, config, pooling_config)
     tokenizer = _load_tokenizer(path, model_id)
     specials = tokenizer.special_token_count()
-    usable = _resolve_length(model_id, path, config, specials, max_sequence_length_override)
+    prefix_tokens = len(tokenizer.content_ids(prefix_scheme.document_prefix))
+    usable = _resolve_length(
+        model_id,
+        path,
+        config,
+        specials,
+        max_sequence_length_override,
+        document_prefix_tokens=prefix_tokens,
+    )
 
     public_model_id = (
         f"local-model:{resolved}"
@@ -190,6 +222,7 @@ def _read_card_at(
         architecture=str(config.get("model_type") or "unknown"),
         dimension=dimension,
         pooling=pooling,
+        prefix_scheme=prefix_scheme,
         tokenizer_id=public_model_id,
         max_sequence_length=usable,
         special_token_count=specials,
@@ -203,6 +236,7 @@ def read_cached_card(
     revision: str | None = None,
     pooling_override: Pooling | None = None,
     max_sequence_length_override: int | None = None,
+    prefix_scheme: PrefixScheme = PrefixScheme.NONE,
 ) -> ModelCard:
     """Read a model declaration already on disk, with network access structurally disabled."""
     local = Path(model_id).expanduser()
@@ -212,6 +246,7 @@ def read_cached_card(
             revision=revision,
             pooling_override=pooling_override,
             max_sequence_length_override=max_sequence_length_override,
+            prefix_scheme=prefix_scheme,
         )
     from manicule.embedding.runtimes.hub import cached_snapshot  # noqa: PLC0415
 
@@ -228,6 +263,7 @@ def read_cached_card(
         resolved,
         pooling_override=pooling_override,
         max_sequence_length_override=max_sequence_length_override,
+        prefix_scheme=prefix_scheme,
     )
 
 
@@ -404,6 +440,8 @@ def _resolve_length(
     config: dict[str, object],
     special_token_count: int,
     override: int | None,
+    *,
+    document_prefix_tokens: int,
 ) -> int:
     """Usable content tokens: declared length, capped by positional capacity, less specials.
 
@@ -411,9 +449,15 @@ def _resolve_length(
     RoBERTa-family models by the padding offset; and many repositories ship
     ``sentence_bert_config.json`` configured well below what the architecture allows, in which
     case the shipped number is the one that truncates.
+
+    ``document_prefix_tokens`` comes off **both** branches, the configured override included.
+    The override is documented as the model's limit less the special tokens *it* wraps every
+    input in — an operator reading their model's declaration can know that number, and cannot
+    be expected to also net out a prefix manicule decided to prepend. Charging it here is what
+    keeps ``max_sequence_length`` meaning one thing: what is left for a chunk's own text.
     """
     if override is not None:
-        return override
+        return _less_prefix(model_id, override, document_prefix_tokens)
 
     sbert = read_json_if_present(path / "sentence_bert_config.json")
     declared = sbert.get("max_seq_length")
@@ -437,7 +481,25 @@ def _resolve_length(
             f"{special_token_count} special tokens leaves nothing to embed."
         )
         raise ConfigError(msg)
-    return usable
+    return _less_prefix(model_id, usable, document_prefix_tokens)
+
+
+def _less_prefix(model_id: str, usable: int, document_prefix_tokens: int) -> int:
+    """``usable`` with the document-side prefix charged to it, refusing if nothing is left.
+
+    A prefix long enough to consume a model's whole context is a configuration error rather
+    than a very small budget: every chunk would be refused later, one at a time, by a message
+    about the chunk instead of about the setting that made it impossible.
+    """
+    remaining = usable - document_prefix_tokens
+    if remaining <= 0:
+        msg = (
+            f"{model_id} has no room for content: {usable} usable tokens against a "
+            f"{document_prefix_tokens}-token document prefix leaves nothing to embed. "
+            f"Choose a different `embedding.prefix_scheme`, or a model with a longer context."
+        )
+        raise ConfigError(msg)
+    return remaining
 
 
 def _position_capacity(config: dict[str, object]) -> int:

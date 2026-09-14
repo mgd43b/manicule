@@ -10,7 +10,7 @@ from typing import cast
 
 import pytest
 
-from manicule.core.embedding import EmbedFingerprint, Pooling
+from manicule.core.embedding import PREFIXES, EmbedFingerprint, Pooling, PrefixScheme
 from manicule.core.errors import FingerprintMismatchError
 from manicule.core.fingerprints import (
     PROVISIONAL_TOKENIZER_PREFIX,
@@ -69,12 +69,135 @@ def test_different_executed_weight_artifacts_refuse_reuse() -> None:
         {"normalized": False},
         {"revision": "abc123"},
         {"tokenizer_id": "other/tokenizer"},
+        {"prefix_scheme": PrefixScheme.NOMIC},
     ],
     ids=lambda d: next(iter(d)),
 )
 def test_every_identity_field_invalidates_an_index(difference: dict[str, object]) -> None:
     with pytest.raises(FingerprintMismatchError):
         embed().require_match(embed(**difference))
+
+
+def test_adopting_a_prefix_scheme_invalidates_an_index() -> None:
+    """The same model with prefixes adopted is a different vector space, and must refuse.
+
+    Nothing else in the fingerprint moves when a scheme is configured — same weights, same
+    revision, same tokenizer — so without this field the new vectors would be written straight
+    into the table holding the old ones and every query would be ranked against a mixture.
+    """
+    bare = embed()
+    prefixed = embed(prefix_scheme=PrefixScheme.NOMIC)
+
+    assert bare.model_id == prefixed.model_id
+    assert bare.weights_identity == prefixed.weights_identity
+    with pytest.raises(FingerprintMismatchError, match="prefix_scheme"):
+        bare.require_match(prefixed)
+
+
+def test_two_prefix_schemes_are_two_vector_spaces() -> None:
+    """`nomic` and `qwen3` disagree on both halves; neither is a substitute for the other."""
+    assert not embed(prefix_scheme=PrefixScheme.NOMIC).matches(
+        embed(prefix_scheme=PrefixScheme.QWEN3)
+    )
+
+
+def test_the_default_prefix_scheme_is_left_out_of_identity() -> None:
+    """``none`` means nothing was prepended, which is what every index already holds.
+
+    Recording it would charge a corpus-wide re-embed to recompute byte-identical vectors — the
+    objection that keeps ``max_sequence_length`` out of identity entirely — and would do it to
+    every corpus in existence at once, because the canonical bytes name the vector table.
+    """
+    assert embed().prefix_scheme is PrefixScheme.NONE
+    assert "prefix_scheme" not in embed().identity()
+    assert "prefix_scheme" not in embed().canonical()
+    assert "prefix_scheme" in embed(prefix_scheme=PrefixScheme.NOMIC).identity()
+
+
+def test_an_index_built_before_the_prefix_scheme_is_not_a_damaged_one() -> None:
+    """The migration this field deliberately does not require.
+
+    A ``_manicule_meta`` row holds a fingerprint *and* the canonical string beside it, and
+    refuses the directory when the two disagree — with a message saying the row was edited or
+    half-written and should be restored from a backup. An identity field that appeared at its
+    default would make that accusation against every LanceDB directory on earth, for a change
+    that altered no vector.
+    """
+    legacy_json = (
+        '{"model_id":"m","dimension":8,"pooling":"mean","normalized":true,'
+        '"max_sequence_length":512,"tokenizer_id":""}'
+    )
+    legacy_canonical = (
+        '{"dimension":8,"model_id":"m","normalized":true,"pooling":"mean","revision":null,'
+        '"tokenizer_id":""}'
+    )
+    stored = EmbedFingerprint.model_validate_json(legacy_json)
+
+    assert stored.prefix_scheme is PrefixScheme.NONE
+    assert stored.canonical() == legacy_canonical
+    stored.require_match(embed(tokenizer_id="", max_sequence_length=512, dimension=8, model_id="m"))
+
+
+def test_a_fingerprint_stored_before_the_prefix_scheme_refuses_once_one_is_adopted() -> None:
+    """Which is the whole point: the field costs nothing until it means something."""
+    legacy = EmbedFingerprint.model_validate_json(
+        '{"model_id":"m","dimension":8,"pooling":"mean","normalized":true,'
+        '"max_sequence_length":512}'
+    )
+
+    with pytest.raises(FingerprintMismatchError, match="prefix_scheme"):
+        legacy.require_match(legacy.model_copy(update={"prefix_scheme": PrefixScheme.NOMIC}))
+
+
+def test_a_prefix_mismatch_does_not_describe_itself_twice_the_same_way() -> None:
+    """The one field that can differ while everything else reads identically.
+
+    ``require_match`` prints both fingerprints, and two identical-looking lines is what an
+    operator would otherwise be given to explain why their index was refused.
+    """
+    bare = embed()
+    prefixed = embed(prefix_scheme=PrefixScheme.NOMIC)
+
+    assert bare.describe() != prefixed.describe()
+    assert "nomic" in prefixed.describe()
+    assert "none" not in bare.describe()
+
+
+def test_every_prefix_scheme_names_both_sides() -> None:
+    """A member with no entry would prefix nothing while claiming to, under its own identity."""
+    assert set(PREFIXES) == set(PrefixScheme)
+
+
+def test_only_the_empty_scheme_leaves_both_sides_bare() -> None:
+    """A scheme that prefixed neither side would be ``none`` wearing a different name.
+
+    Two names for one vector space is a fingerprint that refuses an index it agrees with.
+    """
+    for scheme in PrefixScheme:
+        prefixed = bool(scheme.document_prefix) or bool(scheme.query_prefix)
+        assert prefixed is (scheme is not PrefixScheme.NONE), scheme
+
+
+def test_a_scheme_prepends_and_does_not_otherwise_touch_the_text() -> None:
+    """The text has to survive verbatim: a prefix is a prefix, not a rewrite."""
+    for scheme in PrefixScheme:
+        assert scheme.document("hello") == f"{scheme.document_prefix}hello"
+        assert scheme.query("hello") == f"{scheme.query_prefix}hello"
+
+
+def test_the_published_prefixes_are_the_ones_the_models_were_trained_with() -> None:
+    """Pinned literally, because a plausible-looking variant embeds into a space of its own.
+
+    Both were read from what the model publishes: nomic's from its model card, Qwen3's from
+    the ``prompts.query`` string in its ``config_sentence_transformers.json`` — trailing colon
+    and no space, which is what makes this worth asserting rather than eyeballing.
+    """
+    assert PREFIXES[PrefixScheme.NOMIC] == ("search_document: ", "search_query: ")
+    assert PREFIXES[PrefixScheme.QWEN3] == (
+        "",
+        "Instruct: Given a web search query, retrieve relevant passages that answer the query"
+        "\nQuery:",
+    )
 
 
 def test_pooling_alone_is_enough_to_invalidate() -> None:
