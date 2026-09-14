@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.19](https://github.com/mgd43b/manicule/compare/v0.1.18...v0.1.19) (2026-09-14)
+
+
+### Performance Improvements
+
+* **ci:** run each test shard in parallel, and read the pins rather than the prose ([#347](https://github.com/mgd43b/manicule/issues/347)) ([c420935](https://github.com/mgd43b/manicule/commit/c420935f7aef8fa1600d81db2295c7a2328524f9))
+* **tests:** migrate the database once and copy it, rather than per test ([#351](https://github.com/mgd43b/manicule/issues/351)) ([3724d91](https://github.com/mgd43b/manicule/commit/3724d912b84490122679f5f9da4f3371726cc409))
+
 ## [0.1.18](https://github.com/mgd43b/manicule/compare/v0.1.17...v0.1.18) (2026-09-13)
 
 
