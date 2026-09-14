@@ -518,8 +518,8 @@ pre-empting.
 **On this host the vector backend is a second decision, and it used to be a fatal one.** AVX2
 is missing for the embedder and for everything else in the process, and LanceDB's extension
 module is compiled around it — so `import lancedb` on an Ivy Bridge Xeon is `SIGILL`, not a
-slow import. Setting `storage.vector_db = "qdrant"` is the supported answer (§6.5), and until
-0.1.22 it did not work: `manicule.app.runtime` imported the Lance classes to decide whether a
+slow import. Setting `storage.vector_db = "qdrant"` is the supported answer (§6.5), and through
+0.1.21 it did not work: `manicule.app.runtime` imported the Lance classes to decide whether a
 store wanted the publication-following wrapper, so the process died with exit 132 just after
 the bind banner and `manicule doctor` died the same way, both while configured for a backend
 that needs none of it. The backend-agnostic paths now ask the store what it can do through a
