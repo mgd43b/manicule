@@ -18,7 +18,7 @@ import pytest
 
 from manicule.testing.fixtures import manicule_environment, model_cache, settings
 from tests.corpus import build_all
-from tests.storage_helpers import data_dir, engine, store
+from tests.storage_helpers import data_dir, engine, migrated_template, store
 
 __all__ = [
     "color_environment",
@@ -28,6 +28,7 @@ __all__ = [
     "grammar_cache",
     "grammar_fetch_never_sleeps",
     "manicule_environment",
+    "migrated_template",
     "model_cache",
     "settings",
     "store",

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import shutil
 from typing import TYPE_CHECKING
 
+import pytest
 import pytest_asyncio
+from sqlalchemy import text
 
 from manicule.core.anchors import HeadingAnchor, Unlocated
 from manicule.core.content import (
@@ -18,7 +22,7 @@ from manicule.core.content import (
 from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.core.ids import chunk_id, content_hash, document_id
 from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
-from manicule.storage.engine import create_engine
+from manicule.storage.engine import create_engine, database_path, prepare_data_dir
 from manicule.storage.migrator import upgrade
 
 if TYPE_CHECKING:
@@ -33,11 +37,58 @@ async def data_dir(tmp_path: Path) -> Path:
     return tmp_path / "data"
 
 
+async def _build_template(directory: Path) -> None:
+    """Migrate one database to head and leave nothing in its write-ahead log.
+
+    The checkpoint is what makes the file copyable: SQLite keeps committed pages in the
+    ``-wal`` until one, so copying the database alone before it would hand back a schema
+    missing whatever the last revisions wrote.
+    """
+    built = create_engine(directory)
+    try:
+        await upgrade(built)
+        async with built.connect() as connection:
+            await connection.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+    finally:
+        await built.dispose()
+
+
+@pytest.fixture(scope="session")
+def migrated_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One database at head, built once, for :func:`engine` to copy.
+
+    **Replaying 33 revisions per test was 34% of this suite.** 834 tests take a migrated
+    database and every one of them produced the same schema the same way, at 0.42s against the
+    0.004s a file copy costs — 120x, and the whole of it setup rather than anything a test
+    asserts. Alembic still runs; it runs once.
+
+    Nothing is given up. A test gets its own file, containing the same tables and the same
+    ``alembic_version`` as before, so isolation and the schema under test are unchanged. The
+    migration *path* is not what this fixture ever exercised — ``test_storage_migrations.py``
+    upgrades and downgrades every revision explicitly, and the suites that need a database at
+    some older revision call ``upgrade(engine, revision=...)`` themselves and are untouched.
+
+    Session-scoped, which under ``pytest-xdist`` means once per worker: four builds of 0.46s
+    against the 349s of replay they replace. Synchronous on purpose — ``asyncio_default_fixture
+    _loop_scope`` is ``function``, so a session-scoped *async* fixture would outlive the loop it
+    was made on; ``asyncio.run`` here owns a loop that ends with the build.
+    """
+    directory = tmp_path_factory.mktemp("migrated-template")
+    asyncio.run(_build_template(directory))
+    return database_path(directory)
+
+
 @pytest_asyncio.fixture
-async def engine(data_dir: Path) -> AsyncIterator[AsyncEngine]:
-    """A migrated database in a fresh data directory."""
+async def engine(data_dir: Path, migrated_template: Path) -> AsyncIterator[AsyncEngine]:
+    """A migrated database in a fresh data directory.
+
+    Copied from :func:`migrated_template` rather than migrated in place. ``prepare_data_dir``
+    runs first so the directory is the ``0700`` the product makes rather than whatever the
+    umask says, and ``copy2`` carries the database's own mode across with it.
+    """
+    prepare_data_dir(data_dir)
+    shutil.copy2(migrated_template, database_path(data_dir))
     built = create_engine(data_dir)
-    await upgrade(built)
     try:
         yield built
     finally:
