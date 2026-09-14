@@ -264,6 +264,16 @@ async def _serve(
             web=web if api else None,
             unauthenticated=unauthenticated,
         )
+        # After the address is decided, before the socket opens. `doctor` inside this process
+        # then judges the address this process took rather than the one configuration holds —
+        # they differ whenever `--host` was passed, which is exactly when it matters.
+        #
+        # Nothing is recorded for stdio, and the guard is on the transport rather than on the
+        # host being empty: a stdio address carries `host=""`, which is in `EVERY_INTERFACE`
+        # rather than `LOOPBACK_HOSTS`, so recording it would have `doctor` call a process with
+        # no socket at all a wide bind.
+        if address.transport != "stdio":
+            service.serving_on(address.host)
         pid = write_pidfile(
             runtime.settings.data_dir,
             transport=address.transport,

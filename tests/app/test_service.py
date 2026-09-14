@@ -536,6 +536,52 @@ async def test_doctor_reports_a_deliberate_unauthenticated_bind_as_a_finding(
     )
 
 
+async def test_doctor_judges_the_address_this_process_took_not_the_one_configured(
+    backend: FakeBackend,
+) -> None:
+    """``--host`` is argv, so configuration does not know where this process is listening.
+
+    **The one direction this check must never be wrong in.** ``manicule serve --host 0.0.0.0
+    --allow-public-bind --no-authentication`` leaves ``security.transport.bind_host`` at its
+    configured default, so a check reading configuration reported ``ok`` — "reachable only from
+    this machine" — about a process answering the whole network with no credential. That is the
+    finding inverted: the loudest case produced the quietest output.
+
+    Both facts are kept, because an operator whose diagnosis disagrees with their file needs to
+    see both to act on either.
+    """
+    service = ApplicationService(backend, serving_unauthenticated=True)
+    service.serving_on("0.0.0.0")  # noqa: S104 - the address whose exposure is the subject
+
+    diagnosis = await service.doctor()
+
+    transport = next(check for check in diagnosis.checks if check.name == "transport")
+    assert transport.state == "failing"
+    assert transport.facts["bind_host"] == "0.0.0.0"  # noqa: S104 - as above
+    assert transport.facts["loopback"] is False
+    assert transport.facts["configured_bind_host"] == "127.0.0.1"
+
+
+async def test_doctor_reads_configuration_when_this_process_bound_nothing(
+    backend: FakeBackend,
+) -> None:
+    """The other half: no address taken means the file is the only honest answer.
+
+    Without this, the check above could be satisfied by always reporting a wide bind, and a
+    ``manicule doctor`` at a terminal — which serves nothing — would describe an exposure that
+    does not exist. ``serving_on`` is never called here, which is every construction but one.
+    """
+    backend.settings = Settings(
+        security={"transport": {"bind_host": "192.0.2.10"}, "auth": {"mode": "api_key"}}  # pyright: ignore[reportArgumentType]
+    )
+
+    diagnosis = await ApplicationService(backend).doctor()
+
+    transport = next(check for check in diagnosis.checks if check.name == "transport")
+    assert transport.facts["bind_host"] == "192.0.2.10"
+    assert transport.state == "degraded", "a wide bind with authentication on is not a failure"
+
+
 async def test_doctor_fails_on_a_data_directory_other_accounts_can_read(
     backend: FakeBackend, tmp_path: Path
 ) -> None:

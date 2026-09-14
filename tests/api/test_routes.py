@@ -882,14 +882,19 @@ def test_the_no_authentication_flag_does_not_buy_an_unauthenticated_authoring_ap
         build_app(ApplicationService(backend), allow_unauthenticated=True)
 
 
-def test_an_unauthenticated_wide_application_is_built_and_can_write_nowhere() -> None:
+def test_an_unauthenticated_wide_application_is_built_without_authoring_on_either_surface() -> None:
     """The positive control for the pair above, and the shape of what the flag actually buys.
 
     An application that refused to be built however it was asked would satisfy both refusal
-    tests, so this is the one that says the escape hatch opens. What it opens is a **read**
-    surface: authoring is unconfigured — it has to be, or the refusal above fires — so
-    ``document_create`` writes nowhere on either surface, and the MCP mount does not publish it
-    at all.
+    tests, so this is the one that says the escape hatch opens.
+
+    **What it opens is not a read-only application, and this test does not claim it is.** It was
+    called "can write nowhere", which was false and is the kind of name that becomes evidence:
+    `build_app` still mounts the admin route table, and ``auth.mode = none`` makes an anonymous
+    caller an administrator, so `config_set`, `plugin_add` and the rest stay callable. The
+    narrowing is scoped to one write — the one into a corpus read back as standing instructions
+    — and the name now says exactly that much. Whether the rest of the HTTP surface should
+    shrink too is an open decision, not something asserted here.
     """
     backend, _ = backend_with_a_document()
     assert backend.settings.authoring.configured is False
