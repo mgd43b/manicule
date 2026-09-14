@@ -344,6 +344,21 @@ What that buys, and what it costs:
 - **No published port.** The image `EXPOSE`s nothing and the compose file declares no
   `ports:`, because the default command serves MCP over stdio. Publishing one is an operator's
   decision, and §4 is what it costs.
+- **Upgrading pulls what changed, not the whole image.** The embedding model is 1.36 GB of the
+  1.74 GB, and it is the same 1.36 GB in every release — the revisions are pinned and the
+  files inside a Hugging Face cache are named after their own hashes. What that is worth
+  depends entirely on the layer being *byte*-identical and not merely equivalent, because a
+  registry shares blobs by digest: between 0.1.17 and 0.1.21, five releases produced five
+  digests for identical content, every file's mtime being the moment that build happened to
+  download it, and so every node re-pulled 1.7 GB for a version bump.
+
+  The release build sets `SOURCE_DATE_EPOCH` to a constant and exports with
+  `rewrite-timestamp=true`, which normalizes those mtimes; a version bump now moves the layers
+  that changed and leaves the model layer alone. The constant is deliberate and is not to be
+  set to the commit timestamp, the usual convention — that is a different value every release,
+  and it would move every digest with it. The cost is that files in the image are dated
+  2023-11-14; `org.opencontainers.image.version` and `.revision` are what map a running
+  container back to a commit, which is what those labels are for.
 
 **Why the default stays `lancedb`, here specifically.** The `--network=none` smoke test below
 is an assertion about the configuration this image actually ships with, not about every

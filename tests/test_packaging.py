@@ -710,3 +710,114 @@ def test_every_all_extra_install_resolves_from_the_wheels_being_tested() -> None
         "they resolve a workspace member from an index instead of from this tree:\n  "
         + "\n  ".join(installs)
     )
+
+
+def _publish_container_steps() -> list[dict[str, Any]]:
+    """The steps of the job that builds and pushes the published image."""
+    import yaml  # noqa: PLC0415 - a test-only dependency, kept out of this module's import cost
+
+    workflow = cast(dict[str, Any], yaml.safe_load(RELEASE_WORKFLOW.read_text()))
+    return cast(list[dict[str, Any]], workflow["jobs"]["publish-container"]["steps"])
+
+
+def _publish_container_build_step() -> dict[str, Any]:
+    """The `release.yml` step that builds the image that gets published."""
+    for step in _publish_container_steps():
+        if "offline smoke test runs inside it" in str(step.get("name", "")):
+            return step
+    msg = "release.yml has no image-build step in publish-container"
+    raise AssertionError(msg)
+
+
+def _image_build_command() -> str:
+    """The build step's shell, **with its comment lines removed**.
+
+    Asserting against the raw `run` block would be the shape of test this repository has been
+    bitten by before: the step explains itself in comments, those comments name the very
+    options under test, and a check that searched the whole block would stay green while the
+    option it was written to protect was deleted from the command.
+    """
+    run = str(_publish_container_build_step()["run"])
+    return "\n".join(line for line in run.splitlines() if not line.lstrip().startswith("#"))
+
+
+def _build_output_argument() -> str:
+    """The value of the build command's `--output`, which is where the exporter is configured."""
+    command = _image_build_command()
+    match = re.search(r"--output\s+[\"']?([^\"'\\\n]+)", command)
+    assert match, f"the image build passes no --output:\n{command}"
+    return match.group(1)
+
+
+SOURCE_DATE_EPOCH = "1700000000"
+"""The epoch the published image is built against. **This value is never to change.**
+
+It is what every layer's timestamps are rewritten to, so moving it moves every layer digest
+and every node re-pulls the whole 1.74 GB image once — which is the cost this whole mechanism
+exists to avoid. There is no reason to prefer one instant over another, and every reason to
+keep the one already published.
+"""
+
+
+def test_the_published_image_is_built_with_reproducible_layer_timestamps() -> None:
+    """Without this the 1.36 GB model layer is a new blob every release, and every node re-pulls it.
+
+    The layer's content is byte-identical between releases — same pinned revisions, same
+    content-addressed filenames — but BuildKit takes each file's mtime from the filesystem, and
+    `prefetch_embedding_models.py` downloads 2.3 GB at a different instant on every run. That
+    lands in the tar headers, so the blob digest moves and a node pulling the next version
+    fetches the whole thing again. Measured across 0.1.17-0.1.21: five releases, five digests,
+    all 1361.8 MB, with every mtime equal to its build time.
+    """
+    command = _image_build_command()
+
+    assert "docker buildx build" in command, (
+        "the published image must be built with `docker buildx build`: the daemon's built-in "
+        "builder has no `rewrite-timestamp`, so the layer timestamps stay as-downloaded"
+    )
+    assert "rewrite-timestamp=true" in _build_output_argument(), (
+        "the build's `--output` must set `rewrite-timestamp=true`, which is what normalizes "
+        "the mtimes that otherwise make a byte-identical model layer a new blob every release"
+    )
+
+
+def test_the_release_builds_on_a_builder_that_can_rewrite_timestamps() -> None:
+    """`rewrite-timestamp` is an exporter option the daemon's own builder does not have.
+
+    Asserting the command alone would leave this half unguarded: drop the `docker-container`
+    driver and `docker buildx build` quietly falls back to the daemon builder, where the
+    option is not supported and the layers go back to carrying their download times.
+    """
+    drivers = [
+        str(cast(dict[str, Any], step.get("with", {})).get("driver", ""))
+        for step in _publish_container_steps()
+        if "setup-buildx-action" in str(step.get("uses", ""))
+    ]
+
+    assert "docker-container" in drivers, (
+        f"publish-container must set up a `docker-container` builder before building; "
+        f"found drivers {drivers}"
+    )
+
+
+def test_the_image_builds_against_a_source_date_epoch_that_never_moves() -> None:
+    """A per-release epoch would defeat the whole thing while looking like best practice.
+
+    The reproducible-builds convention is to set `SOURCE_DATE_EPOCH` to the commit timestamp.
+    Here that is exactly wrong: every layer's timestamps — and so every layer's digest — would
+    move with it, and no release would share anything with the one before. Measured: identical
+    content under two different epochs produces two different digests.
+
+    So the value is asserted exactly rather than merely checked for being a number. A different
+    literal is the same failure as an expression, only quieter: it would pass a shape check and
+    reset every published digest once.
+    """
+    step = _publish_container_build_step()
+    epoch = str(cast(dict[str, Any], step.get("env", {})).get("SOURCE_DATE_EPOCH", ""))
+
+    assert epoch == SOURCE_DATE_EPOCH, (
+        f"SOURCE_DATE_EPOCH is {epoch!r} and must be {SOURCE_DATE_EPOCH!r}. It is read from the "
+        f"environment by buildx and rewritten into every layer, so any other value — an "
+        f"expression computed per run, or simply a different instant — moves every layer "
+        f"digest and costs every node one full 1.74 GB re-pull."
+    )
