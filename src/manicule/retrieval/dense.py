@@ -139,7 +139,21 @@ class DenseStage:
             )
             return list(candidates)
 
-        vector = (await self._embedder.embed([query.text]))[0]
+        # **The query half of the prefix scheme, and it has to be here.** Several retrieval
+        # models are trained asymmetrically — `nomic-embed-text` with
+        # `search_query:`/`search_document:`, Qwen3-Embedding with a query-side instruction —
+        # so the same string embedded as a query and as a document is meant to produce
+        # different vectors. The embedder cannot make that distinction: `Embedder.embed` is
+        # its only entry point and `ingest/embedding.py` calls it identically.
+        #
+        # Doing only the document half would be worse than doing neither, because a corpus
+        # embedded with `search_document:` and searched with bare queries retrieves worse than
+        # one embedded with neither and nothing raises. That is why the scheme is one value in
+        # the embedding fingerprint rather than a middleware on the ingest side: a query has no
+        # stored row for `embedding_input_identity` to key on, so middleware could express the
+        # document half and could never express this one (`docs/embeddings.md` §9.1).
+        scheme = self._embedder.fingerprint.prefix_scheme
+        vector = (await self._embedder.embed([scheme.query(query.text)]))[0]
         fraction, measured = await self._live_fraction(query)
         over_fetch = derive_over_fetch(k, fraction, config)
 

@@ -31,6 +31,7 @@ from manicule.core.embedding import (
     VECTOR_CHECKSUM_VERSION,
     EmbedFingerprint,
     Pooling,
+    PrefixScheme,
     StoredVector,
     Vector,
     VectorState,
@@ -188,18 +189,32 @@ class HashEmbedder:
     whether anything downstream had assumed a common one.
     """
 
-    def __init__(self, dimension: int = 5, model_id: str = "fake/embedder") -> None:
+    def __init__(
+        self,
+        dimension: int = 5,
+        model_id: str = "fake/embedder",
+        prefix_scheme: PrefixScheme = PrefixScheme.NONE,
+    ) -> None:
         self.fingerprint = EmbedFingerprint(
             model_id=model_id,
             dimension=dimension,
             pooling=Pooling.MEAN,
             normalized=True,
+            prefix_scheme=prefix_scheme,
             tokenizer_id="whitespace",
             max_sequence_length=128,
             backend="fake",
         )
+        self.seen: list[str] = []
+        """Every string handed to :meth:`embed`, in order.
+
+        A prefix is applied *above* the embedder, so what a backend receives is the only place
+        the document and query halves are observable at all — there is no other seam between
+        the caller's text and the forward pass.
+        """
 
     async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        self.seen.extend(texts)
         dimension = self.fingerprint.dimension
         return [[((hash(text) >> (i * 3)) % 100) / 100 for i in range(dimension)] for text in texts]
 

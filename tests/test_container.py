@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import Callable
 from typing import override
@@ -624,3 +625,86 @@ def test_a_complete_configuration_builds(settings: Settings) -> None:
     container = build_container(settings, discovery=Discovery(registry=registry))
     assert isinstance(container.get(keys.EMBEDDER), Embedder)
     assert container.describe() == ["embedder:onnx"]
+
+
+async def test_a_blocking_factory_does_not_stall_the_event_loop() -> None:
+    """A factory that blocks must cost its own construction, not everything else in the process.
+
+    `get` is synchronous by contract so a factory can resolve dependencies inline, and the
+    contract says anything needing `await` belongs in `setup`. What it cannot say is that a
+    factory does no I/O: a served embedder has no identity until it has asked the server what
+    it is holding, so `manicule_ollama.build_ollama` really does make network calls during
+    construction. Awaited on the loop that is up to a two-minute stall against an unreachable
+    server, with no other task running — a health probe, a request in flight, a cancellation.
+
+    The assertion is a handshake rather than a stopwatch, because a stopwatch would pass on a
+    fast machine for the wrong reason: the factory blocks until another coroutine releases it,
+    so it can only finish if the loop kept running while the factory was inside it. On the
+    loop, the release never arrives and the wait times out.
+    """
+    settings = Settings()
+    registry = ComponentRegistry()
+    entered = threading.Event()
+    released = threading.Event()
+    observed: list[bool] = []
+
+    def blocking_factory(_: BuildContext) -> Embedder:
+        entered.set()
+        observed.append(released.wait(timeout=2))
+        return HashEmbedder()
+
+    registry.add(keys.EMBEDDER.named("onnx"), blocking_factory)
+    container = Container(settings, registry)
+
+    async def release_once_the_factory_is_inside() -> None:
+        # Waited for in a thread rather than polled: `entered` is set from the worker thread
+        # the factory runs on, which an `asyncio.Event` could not be woken from safely.
+        await asyncio.to_thread(entered.wait, 2)
+        released.set()
+
+    async with asyncio.TaskGroup() as group:
+        group.create_task(release_once_the_factory_is_inside())
+        embedder = await container.aget(keys.EMBEDDER)
+
+    assert isinstance(embedder, HashEmbedder)
+    assert observed == [True], (
+        "the factory was never released, so no other task ran while it was blocking — "
+        "construction is back on the event loop"
+    )
+
+
+async def test_threaded_construction_still_builds_one_component_at_a_time() -> None:
+    """The lock is what lets `get` keep the single thread its bookkeeping assumes.
+
+    `_resolving` is a cycle-detection stack and `_instances`/`_order`/`_pending` are mutated
+    without locking, all written for a method with no await point inside it. Two concurrent
+    threaded builds would interleave those, so concurrency here would be a corruption bug
+    rather than a speed-up. Distinct keys, because one key is built once and cached — four
+    `aget`s for the same component would prove nothing.
+    """
+    settings = Settings()
+    registry = ComponentRegistry()
+    concurrent = 0
+    peak = 0
+    guard = threading.Lock()
+
+    def counting_factory(_: BuildContext) -> Parser:
+        nonlocal concurrent, peak
+        with guard:
+            concurrent += 1
+            peak = max(peak, concurrent)
+        time.sleep(0.02)
+        with guard:
+            concurrent -= 1
+        return LineParser()
+
+    names = ("alpha", "beta", "gamma", "delta")
+    for name in names:
+        registry.add(keys.PARSER.named(name), counting_factory, media_types={MEDIA_TYPE})
+    container = Container(settings, registry)
+
+    async with asyncio.TaskGroup() as group:
+        for name in names:
+            group.create_task(container.aget(keys.PARSER.named(name)))
+
+    assert peak == 1, f"{peak} factories ran at once; construction must stay serialized"

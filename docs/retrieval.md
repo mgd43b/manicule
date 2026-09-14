@@ -462,10 +462,14 @@ tenancy live on `documents`, in the authoritative store, and copying them into a
 creates a value that can disagree. So `VectorStore.search(v, k)` returns `k` rows of which an
 unknown number are invisible, and the join that removes them necessarily runs afterwards.
 
-The dense stage is therefore three operations that are one stage:
+The dense stage is therefore three operations that are one stage, and the first of them is
+where a query acquires its side of the embedding model's prefix scheme. `Embedder.embed` is the
+only entry point a backend has and ingest calls it identically, so nothing below this line can
+tell a query from a document; a model trained with `search_query:`/`search_document:` is
+therefore served correctly here or nowhere ([`embeddings.md`](embeddings.md) §9.1).
 
 ```
-embed(query)                                  # cached by fingerprint + text
+embed(prefix_scheme.query(query))             # cached by fingerprint + the prefixed text
   → VectorStore.search(v, k′, pushdown)       # k′ > k, see §4.3
   → hydrating join through documents          # workspace, deleted_at, status, publication
   → k live candidates, scored by cosine

@@ -131,6 +131,16 @@ class Container:
         self._resolving: list[str] = []
         self._metadata: dict[tuple[ComponentKind, str], object] = {}
         self._metadata_resolving: list[str] = []
+        self._building = asyncio.Lock()
+        """Serializes threaded construction, so :meth:`get` keeps the one thread it assumes.
+
+        :meth:`aget` builds on a worker thread and therefore reintroduces a race :meth:`get`
+        never had: ``_resolving`` is a cycle-detection *stack*, and ``_instances``,
+        ``_order`` and ``_pending`` are plain containers mutated without locking, all written
+        for a method that has no await point inside it. Holding this for the build restores
+        exactly the serialization the synchronous path had — one construction at a time, in
+        order — while the thread is what keeps the event loop free.
+        """
 
     # --- resolution -----------------------------------------------------------------
 
@@ -140,6 +150,12 @@ class Container:
         Synchronous, so a factory can resolve its dependencies inline. Anything needing
         ``await`` belongs in :meth:`~manicule.core.lifecycle.Lifecycle.setup`, which the
         container calls in dependency order.
+
+        **Reached from :meth:`aget` this runs on a worker thread**, which is how a factory's
+        blocking work stays off the event loop. Nothing here is locked and none of it needs to
+        be: ``aget`` serializes construction, so this method keeps the one-at-a-time execution
+        its bookkeeping is written for. A factory must not assume the main thread, and must
+        not reach for a running loop — there is not one where it is running.
         """
         resolved = self._resolve_name(key)
         slot = (resolved.kind, resolved.name or "")
@@ -173,8 +189,31 @@ class Container:
         return instance
 
     async def aget[T](self, key: ComponentKey[T]) -> T:
-        """Resolve ``key`` and make sure it, and anything it needed, has been set up."""
-        instance = self.get(key)
+        """Resolve ``key`` and make sure it, and anything it needed, has been set up.
+
+        **Construction runs on a worker thread**, which is what keeps a factory's blocking
+        work off the event loop. :meth:`get` is synchronous by contract so that a factory can
+        resolve its dependencies inline, and that contract says anything needing ``await``
+        belongs in :meth:`~manicule.core.lifecycle.Lifecycle.setup`. What it cannot say is
+        that a factory does no I/O at all: opening a database, reading a model card and — for
+        a served embedder — asking the server what it is holding are all construction-time
+        work, because the component has no identity until they are done.
+
+        Awaited on the loop, that work stalls everything else in the process. Measured
+        against an unreachable Ollama server, ``manicule_ollama.build_ollama`` blocks for its
+        connect timeout and then its request timeout, up to two minutes during which no other
+        task runs — a health probe, a request in flight, a cancellation. Offloading here
+        fixes it for **every** backend rather than asking each one to remember, which matters
+        because the ones most likely to block are the ones somebody writes out of tree.
+
+        Blocking a pool thread is honest: construction really is synchronous, the lock keeps
+        it one-at-a-time, and the loop is free meanwhile. The alternative — an async factory
+        protocol — would make ``Factory`` return an awaitable and break every plugin that
+        resolves a dependency inline, which is the shape the synchronous contract exists to
+        allow.
+        """
+        async with self._building:
+            instance = await asyncio.to_thread(self.get, key)
         await self._setup_pending()
         return instance
 

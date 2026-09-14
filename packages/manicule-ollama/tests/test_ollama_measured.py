@@ -41,7 +41,7 @@ from manicule_ollama.client import OllamaClient, OllamaContextOverflowError, Oll
 from manicule_ollama.config import OllamaEmbedderConfig
 from manicule_ollama.served import CONTEXT_RESERVE, record, resolve
 
-from manicule.core.embedding import Pooling, Vector
+from manicule.core.embedding import Pooling, PrefixScheme, Vector
 from manicule.core.errors import ConfigError, ContextOverflowError
 from manicule.core.protocols import Embedder, TokenStateEmbedder
 from manicule.testing import (
@@ -383,7 +383,11 @@ async def test_the_declaration_matches_what_the_server_actually_does(served: Ser
             served.context_length - CONTEXT_RESERVE - served.special_tokens
         )
         assert fingerprint.weights_identity.startswith("artifact:ollama:")
-        assert fingerprint.weights_identity.endswith(":prefix=none")
+        # Two terms and no third: the `:prefix=none` marker this string once carried is core's
+        # `EmbedFingerprint.prefix_scheme` now, and a backend recording it again would be
+        # describing the same fact in the one field the other backends cannot be compared on.
+        assert "prefix" not in fingerprint.weights_identity
+        assert fingerprint.prefix_scheme is PrefixScheme.NONE
         assert fingerprint.revision is not None
         assert fingerprint.revision.startswith("sha256:")
 

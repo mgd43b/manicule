@@ -21,6 +21,7 @@ import contextlib
 import os
 from collections.abc import Generator, Sequence
 from pathlib import Path
+from typing import Final
 
 from manicule.core.errors import ManiculeError
 
@@ -39,12 +40,41 @@ class ModelUnavailableError(ManiculeError):
 
     Raised where the fetch happens rather than left to the hub's own exception, because the
     hub's is written for somebody debugging a download and this one is read by somebody whose
-    *search* did not answer. It carries the repository, what was being fetched and the
-    pre-seed that supplies it.
+    *search* did not answer. It carries the repository, what was being fetched, the command
+    that seeds it deliberately, and the configuration a local directory could satisfy instead —
+    the last two named by :func:`snapshot`'s caller, defaulting to the pre-seed every install
+    already runs and the two settings that route to it for manicule's own backends.
     """
 
 
-def snapshot(repo: str, patterns: Sequence[str], revision: str | None = None) -> Path:
+DEFAULT_SETTING: Final = "`embedding.model` (or a backend's `weights`)"
+"""What :func:`snapshot` names by default as the setting a local directory can be put under.
+
+Right for the two backends manicule ships, both of which read a model's own repository or an
+explicit ``weights`` override. Wrong for a backend with neither: :class:`OllamaEmbedderConfig
+<manicule_ollama.config.OllamaEmbedderConfig>` refuses ``weights`` outright, because the weights
+are the server's business, not this process's — so a caller fetching something else through
+:func:`snapshot` names its own setting instead of repeating this one.
+"""
+
+DEFAULT_REMEDY: Final = "uv run tools/prefetch_embedding_models.py"
+"""What :func:`snapshot` names by default as the command that seeds this deliberately.
+
+Right for manicule's own two backends, which this invocation seeds without any flags. A caller
+whose fetch this script reaches through a different flag — ``--backend ollama``, say — names its
+own instead, so the refusal tells an operator the command that actually fetches the file that is
+missing rather than one that would fetch something else.
+"""
+
+
+def snapshot(
+    repo: str,
+    patterns: Sequence[str],
+    revision: str | None = None,
+    *,
+    setting: str = DEFAULT_SETTING,
+    remedy: str = DEFAULT_REMEDY,
+) -> Path:
     """Download ``patterns`` from ``repo`` and return the local directory holding them.
 
     Args:
@@ -52,6 +82,16 @@ def snapshot(repo: str, patterns: Sequence[str], revision: str | None = None) ->
         patterns: Glob patterns to fetch. Always narrowed: a model repository holds several
             formats of the same weights, and fetching all of them costs gigabytes to use one.
         revision: A commit, branch or tag.
+        setting: The configuration a caller could point at a local directory instead of
+            fetching, named the way an operator would type it. Defaults to the two settings
+            that route to this function for manicule's own backends; a caller fetching
+            something neither of those names — :mod:`manicule_ollama` fetches a tokenizer, and
+            its own config validator refuses `weights` outright — passes its own instead of
+            pointing an operator at a setting that would be rejected the moment they set it.
+        remedy: The command that seeds this deliberately, quoted in the refusal exactly as
+            typed. Defaults to the seeding script every install already runs unflagged; a
+            caller whose fetch needs a flag of its own to reach — ``--backend ollama``, say —
+            names its own invocation instead.
 
     Returns:
         The snapshot directory. Its name is the resolved commit when the download went through
@@ -74,7 +114,9 @@ def snapshot(repo: str, patterns: Sequence[str], revision: str | None = None) ->
         # fails span the hub's own hierarchy, `requests`, and the filesystem, with no common
         # base. Enumerating them means the one that was left out escapes as a library
         # traceback in the middle of a query, which is the thing being fixed.
-        raise ModelUnavailableError(_unavailable(repo, patterns, exc)) from exc
+        raise ModelUnavailableError(
+            _unavailable(repo, patterns, exc, setting=setting, remedy=remedy)
+        ) from exc
 
 
 PROGRESS_ENV = "HF_HUB_DISABLE_PROGRESS_BARS"
@@ -207,20 +249,36 @@ def cached_snapshot(repo: str, patterns: Sequence[str], revision: str | None = N
         return None
 
 
-def _unavailable(repo: str, patterns: Sequence[str], exc: Exception) -> str:
-    """What a query says when the model it needs was never put on this machine."""
-    return (
+def _unavailable(
+    repo: str, patterns: Sequence[str], exc: Exception, *, setting: str, remedy: str
+) -> str:
+    """What a query says when the model it needs was never put on this machine.
+
+    The offline sentence is conditional on :data:`OFFLINE_ENV` actually being set — checked
+    against ``os.environ`` rather than asserted, because a fetch also fails this way when the
+    hub was allowed to look and the network simply did not answer, and telling an operator their
+    own deployment choice caused a refusal it did not cause sends them looking for a setting
+    that was never in force. **The variable's value is never printed**, only its name: the value
+    is somebody's environment, and an operator reads this precisely to paste it somewhere.
+    """
+    message = (
         f"the model files for {repo!r} ({', '.join(patterns)}) are not on this machine and "
         f"could not be fetched: {exc}. manicule does not carry model weights; they are "
         f"pre-seeded, which on most installs happens during the first `manicule index`. "
-        f"Seed them deliberately with `uv run tools/prefetch_embedding_models.py`, point "
-        f"`embedding.model` (or a backend's `weights`) at a local directory holding them, or "
-        f"see docs/deployment.md §5.1 for a host with no network. {OFFLINE_ENV} being set "
-        f"means the hub was never allowed to look."
+        f"Seed them deliberately with `{remedy}`, point {setting} at a local directory holding "
+        f"them, or see docs/deployment.md §5.1 for a host with no network."
     )
+    if OFFLINE_ENV in os.environ:
+        message += (
+            f" {OFFLINE_ENV} is set, which is why the hub was never allowed to look — that is "
+            f"a deployment choice, not a failure to reach the network."
+        )
+    return message
 
 
 __all__ = [
+    "DEFAULT_REMEDY",
+    "DEFAULT_SETTING",
     "OFFLINE_ENV",
     "PROGRESS_ENV",
     "ModelUnavailableError",

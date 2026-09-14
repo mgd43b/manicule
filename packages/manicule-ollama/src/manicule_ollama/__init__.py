@@ -81,7 +81,7 @@ def build_ollama(context: BuildContext) -> Embedder:
         timeout_s=config.timeout_s,
         connect_timeout_s=config.connect_timeout_s,
     )
-    served = resolve(client, embedding.model, config)
+    served = resolve(client, embedding.model, config, embedding.prefix_scheme)
     record(served, client, context.cache_dir)
     return OllamaEmbedder(
         served,
@@ -110,8 +110,13 @@ def ollama_metadata(context: MetadataContext) -> EmbedFingerprint:
             f"ollama embedder metadata expected {OllamaEmbedderConfig.__name__}, got "
             f"{type(config).__name__}"
         )
+    embedding = context.settings.embedding
     return cached_fingerprint(
-        context.cache_dir, config.base_url, context.settings.embedding.model, config
+        context.cache_dir,
+        config.base_url,
+        embedding.model,
+        config,
+        embedding.prefix_scheme,
     )
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import huggingface_hub
 import pytest
 from manicule_ollama.client import OllamaClient
 from manicule_ollama.config import OllamaEmbedderConfig
@@ -23,8 +24,9 @@ from manicule_ollama.served import (
 )
 from ollama_fake import ARCHITECTURE, DIGEST, MODEL, SPECIAL_TOKENS, FakeOllama, config_payload
 
-from manicule.core.embedding import Pooling
+from manicule.core.embedding import Pooling, PrefixScheme
 from manicule.core.errors import ConfigError
+from manicule.embedding.runtimes.hub import ModelUnavailableError
 from manicule.testing import write_tokenizer
 
 
@@ -37,13 +39,18 @@ def vocabulary(tmp_path: Path) -> Path:
     return directory
 
 
-def build(server: FakeOllama, vocabulary: Path, **overrides: object):  # noqa: ANN201
+def build(  # noqa: ANN201
+    server: FakeOllama,
+    vocabulary: Path,
+    prefix_scheme: PrefixScheme = PrefixScheme.NONE,
+    **overrides: object,
+):
     """Resolve ``server``'s model against a local tokenizer, returning client and model."""
     config = OllamaEmbedderConfig.model_validate(
         config_payload(tokenizer=str(vocabulary), **overrides)
     )
     client = OllamaClient(config.base_url, transport=server.transport())
-    return client, resolve(client, server.model, config), config
+    return client, resolve(client, server.model, config, prefix_scheme), config
 
 
 # --- identity ------------------------------------------------------------------------------
@@ -58,12 +65,60 @@ def test_the_identity_carries_the_backend_and_the_servers_own_digest(vocabulary:
     the name is inside the string and nothing else can produce it. The digest is in there too,
     and separately in `revision`, because a re-pull is the one way these vectors change under
     an unchanged model name.
+
+    **Two terms, and no third.** This string once ended ``:prefix=none``, a marker this backend
+    kept for itself while core had no field for the question. Core owns it now, on every
+    fingerprint whoever built it, so a third term here would record the same fact twice — in a
+    field ``onnx`` and ``mlx`` do not write, and therefore one nothing can be compared across.
     """
     _, served, _ = build(FakeOllama(), vocabulary)
 
-    assert served.weights_identity == (f"artifact:ollama:{MODEL}@sha256:{DIGEST}:prefix=none")
+    assert served.weights_identity == f"artifact:ollama:{MODEL}@sha256:{DIGEST}"
+    assert "prefix" not in served.weights_identity
     assert served.fingerprint.backend == "ollama"
     assert served.fingerprint.revision == f"sha256:{DIGEST}"
+
+
+def test_the_prefix_scheme_moves_the_identity_without_touching_the_artifact(
+    vocabulary: Path,
+) -> None:
+    """Adopting a scheme must invalidate these vectors — through core's field, not this string.
+
+    The distinction is the whole of §9.1. Recording it in ``weights_identity`` would protect
+    this backend and silently fail to protect ``onnx`` and ``mlx``, whose identities are built
+    from an artifact reference that knows nothing about prefixes.
+    """
+    _, bare, _ = build(FakeOllama(), vocabulary)
+    _, prefixed, _ = build(FakeOllama(), vocabulary, PrefixScheme.NOMIC)
+
+    assert bare.weights_identity == prefixed.weights_identity
+    assert prefixed.fingerprint.prefix_scheme is PrefixScheme.NOMIC
+    assert not bare.fingerprint.matches(prefixed.fingerprint)
+
+
+def test_a_document_prefix_is_charged_to_the_usable_limit(vocabulary: Path) -> None:
+    """Otherwise a full chunk plus its prefix overflows the served context and is truncated.
+
+    ``truncate: false`` makes that loud on this backend rather than silent, which is better —
+    but a corpus that refuses every full-length chunk at ingest is still a corpus that cannot
+    be built, and the number the chunker was handed is what decided how long chunks are.
+    """
+    _, bare, _ = build(FakeOllama(), vocabulary)
+    _, prefixed, _ = build(FakeOllama(), vocabulary, PrefixScheme.NOMIC)
+
+    assert prefixed.card.document_prefix_tokens > 0
+    assert prefixed.card.max_sequence_length == (
+        bare.card.max_sequence_length - prefixed.card.document_prefix_tokens
+    )
+
+
+def test_a_query_only_scheme_costs_the_document_budget_nothing(vocabulary: Path) -> None:
+    """Qwen3 instructs the query and not the document, so the chunk budget must not shrink."""
+    _, bare, _ = build(FakeOllama(), vocabulary)
+    _, prefixed, _ = build(FakeOllama(), vocabulary, PrefixScheme.QWEN3)
+
+    assert prefixed.card.document_prefix_tokens == 0
+    assert prefixed.card.max_sequence_length == bare.card.max_sequence_length
 
 
 def test_a_re_pull_under_the_same_name_is_a_different_vector_space(vocabulary: Path) -> None:
@@ -367,6 +422,44 @@ def test_the_recorded_declaration_rebuilds_the_same_fingerprint_offline(
     assert replayed.max_sequence_length == served.fingerprint.max_sequence_length
 
 
+def test_a_prefixed_declaration_replays_its_budget_without_the_vocabulary(
+    vocabulary: Path, tmp_path: Path
+) -> None:
+    """Counting a prefix needs the tokenizer, which a metadata-only path may not read.
+
+    So the cost is recorded beside the special-token count and replayed from the record, the
+    same way. Recomputing it here would either contact a repository or guess, and a planner
+    that guessed the budget would authorize a rebuild the live embedder then refuses partway.
+    """
+    client, served, config = build(FakeOllama(), vocabulary, PrefixScheme.NOMIC)
+    cache = tmp_path / "cache"
+    record(served, client, cache)
+
+    replayed = cached_fingerprint(cache, client.base_url, MODEL, config, PrefixScheme.NOMIC)
+
+    assert replayed.prefix_scheme is PrefixScheme.NOMIC
+    assert replayed.canonical() == served.fingerprint.canonical()
+    assert replayed.max_sequence_length == served.fingerprint.max_sequence_length
+
+
+def test_a_prefix_scheme_that_has_moved_since_the_record_is_refused(
+    vocabulary: Path, tmp_path: Path
+) -> None:
+    """A refusal rather than a re-derivation, for the reason a changed tokenizer is.
+
+    Deriving the new budget means counting the new prefix under this model's vocabulary, and
+    reading a vocabulary may need a download — which is the thing a metadata-only path exists
+    to avoid. Silently replaying the old budget would be worse than either: the planner would
+    believe a limit the live embedder no longer has.
+    """
+    client, served, config = build(FakeOllama(), vocabulary)
+    cache = tmp_path / "cache"
+    record(served, client, cache)
+
+    with pytest.raises(ConfigError, match="prefix scheme"):
+        cached_fingerprint(cache, client.base_url, MODEL, config, PrefixScheme.NOMIC)
+
+
 def test_planning_refuses_rather_than_contacting_the_server(
     vocabulary: Path, tmp_path: Path
 ) -> None:
@@ -527,3 +620,65 @@ def test_two_writers_do_not_share_one_temporary_file(vocabulary: Path, tmp_path:
     assert cached_fingerprint(cache, client.base_url, MODEL, config).canonical() == (
         served.fingerprint.canonical()
     )
+
+
+def _refuses_to_download(*_args: object, **_kwargs: object) -> str:
+    """A ``snapshot_download`` that always fails, so the refusal path is the one under test."""
+    msg = "simulated: offline mode is enabled"
+    raise OSError(msg)
+
+
+def test_a_tokenizer_that_is_not_on_this_machine_names_this_backends_own_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal an operator actually hits in a container, and it used to misdirect them.
+
+    ``snapshot`` defaults to suggesting ``embedding.model`` or a backend's ``weights``. Here
+    both are wrong: ``embedding.model`` names a model on the *server*, and ``weights`` is
+    refused outright by this backend's own validator — so an operator who followed the default
+    advice would be told their configuration was invalid by the very next error. What is
+    missing is a ``tokenizer.json``, and ``tokenizer`` is the setting that supplies it.
+
+    The fetch is made to fail by replacing ``snapshot_download`` rather than by redirecting
+    ``HF_HOME``. ``huggingface_hub`` reads its cache path into module constants at import time,
+    so an assignment made after some earlier test imported it leaves the real cache in force —
+    and a machine with that tokenizer already seeded would then resolve it and never reach the
+    refusal under test. The same import-time trap ``hub.PROGRESS_ENV`` documents.
+    """
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _refuses_to_download)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    config = OllamaEmbedderConfig.model_validate(
+        config_payload(tokenizer="Qwen/Qwen3-Embedding-0.6B", tokenizer_revision="a" * 40)
+    )
+    client = OllamaClient(config.base_url, transport=FakeOllama().transport())
+
+    with pytest.raises(ModelUnavailableError) as refusal:
+        resolve(client, MODEL, config)
+
+    message = str(refusal.value)
+    assert "tokenizer" in message
+    assert "--backend ollama" in message
+    assert "`weights`" not in message
+    assert "embedding.model" not in message
+
+
+def test_a_configured_limit_is_capped_in_the_units_it_is_written_in(vocabulary: Path) -> None:
+    """The ceiling an operator is told about has to be one they can act on.
+
+    ``max_sequence_length`` is written as the server's context less the reserve and the special
+    tokens — a figure an operator can derive — and the document prefix is charged *after* it.
+    Comparing the post-prefix number and then reporting it as the maximum would refuse a
+    setting that fits, and the remedy it gave would cost the prefix's worth of context on every
+    chunk from then on.
+    """
+    server = FakeOllama()
+    _, bare, _ = build(server, vocabulary)
+    ceiling = bare.card.max_sequence_length
+
+    _, at_ceiling, _ = build(server, vocabulary, PrefixScheme.NOMIC, max_sequence_length=ceiling)
+
+    assert at_ceiling.card.document_prefix_tokens > 0
+    assert at_ceiling.card.max_sequence_length == ceiling - at_ceiling.card.document_prefix_tokens
+
+    with pytest.raises(ConfigError, match="reads at most"):
+        build(server, vocabulary, PrefixScheme.NOMIC, max_sequence_length=ceiling + 1)

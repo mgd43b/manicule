@@ -359,9 +359,12 @@ The container puts its config file in the data directory too — `MANICULE_CONFI
 is `/data/cache` for the same reason; that subdirectory is regenerable and is the one thing
 under `/data` that is safe to delete.
 
-**The backend is ONNX.** MLX is Apple silicon and no Linux container can use it. That changes
-throughput and does not change output — the `backend parity (macOS)` CI job compares vectors
-from both backends precisely so that this sentence can be a guarantee rather than a hope.
+**ONNX is the default**, and the shipped, network-free configuration above is proven against it
+specifically. MLX is Apple silicon and no Linux container can use it. `ollama` is installed in
+the image too and selectable from `/data/config.toml` — it moves the forward pass to a server
+rather than running it in this process, and §5.3 covers what its own setup needs. Switching between ONNX and MLX changes throughput and does not change output — the
+`backend parity (macOS)` CI job compares vectors from both backends precisely so that sentence
+can be a guarantee rather than a hope.
 
 **Run MCP natively rather than in the container.** MCP over stdio means the client owns the
 process, and putting `docker compose run` in that position adds failure modes the assistant
@@ -446,6 +449,14 @@ huggingface.co otherwise spends half a minute in what looks like a hang. A model
 neither cached nor reachable now refuses naming the pre-seed rather than surfacing the hub's
 own exception mid-query.
 
+**A served backend needs one small file instead**, and it is the same mechanism with a
+different artifact: `manicule-ollama` runs no weights in this process, so what it cannot do
+without is a `tokenizer.json`. `uv run tools/prefetch_embedding_models.py --backend ollama`
+fetches exactly that, reading `tokenizer` and `tokenizer_revision` out of the configuration the
+backend itself reads, and `tokenizer` accepts a directory wherever a repository id is accepted.
+§5.3 has the container version of this, where the model cache is read-only and the directory is
+usually the answer.
+
 **Nothing on the query path downloads silently.** A vocabulary that was never seeded is a
 refusal while retrieval is being assembled — naming the encoding, the cache that was read and
 where a bundle was looked for — rather than a download at the first question. A model that is
@@ -478,6 +489,66 @@ obligations as redistributing your own build of it.
 
 See [`LICENSE`](../LICENSE), and take advice if you are packaging manicule together with
 anything copyleft.
+
+### 5.3 Embedding on a GPU node, from a pod that cannot embed well
+
+The image ships `manicule-ollama` for one deployment shape: a host with neither Apple silicon
+nor AVX2, next to a node already running Ollama. Selecting it is ordinary configuration —
+
+```toml
+[embedding]
+provider = "ollama"
+model = "qwen3-embedding:0.6b"
+prefix_scheme = "qwen3"        # what this model was trained with; see embeddings.md §9.1
+
+[plugins.config."embedder.ollama"]
+base_url = "http://ollama.internal:11434"
+tokenizer = "/models/qwen3-embedding"
+```
+
+— and it is ordinary configuration only because the image no longer pins
+`MANICULE_EMBEDDING__PROVIDER`. It used to, and the environment outranks the config file in
+manicule's settings sources, so `provider = "ollama"` in `/data/config.toml` was read, ignored,
+and never mentioned: `onnx` is a real backend, so it resolved cleanly and embedding carried on
+in-process. The image now leaves the field at its own default, which is `onnx` anyway, so the
+setting means what it says. A provider this image cannot satisfy — `mlx` — still fails at
+startup by name, listing what is installed, which is the better failure and needed no
+pre-empting.
+
+**The tokenizer is the part that needs a decision.** Ollama serves GGUF and exposes no
+tokenizer, while manicule counts tokens to place chunk boundaries and to refuse text the model
+would truncate, so `tokenizer` is required and has no default
+([`embeddings.md`](embeddings.md) §3.4). Inside this image a repository id usually cannot
+satisfy it: `HF_HUB_OFFLINE=1` is set and `HF_HOME` is a baked image path that a hardened
+deployment mounts read-only, so a repository that was not pre-seeded at build time can be
+neither fetched nor cached. Two routes, and the first is the one to reach for:
+
+- **Mount a directory holding `tokenizer.json`** and point `tokenizer` at it. A few megabytes,
+  no revision — a local vocabulary is identified by the digest of its bytes — and no network:
+  a path short-circuits before `huggingface_hub` is imported at all, which is also what keeps
+  the hub's own resolution-cache writes off a read-only filesystem.
+- **Bake a cache** on a machine that has a network, and copy it to `HF_HOME`:
+
+  ```bash
+  uv run tools/prefetch_embedding_models.py --backend ollama \
+      --tokenizer Qwen/Qwen3-Embedding-0.6B --tokenizer-revision <40-character commit>
+  ```
+
+  With no flags it reads `tokenizer` and `tokenizer_revision` out of the configuration the
+  running backend reads, so an image build passes them and an operator seeding their own cache
+  does not.
+
+Whichever route, the tokenizer is checked rather than believed: setup compares its counts
+against the server's own `prompt_eval_count`, one probe per request, and one token of
+disagreement is a refusal. A tokenizer that cannot be resolved is also a refusal — at
+construction, naming `tokenizer`, both routes above, and `HF_HUB_OFFLINE` when that is why
+nothing was fetched.
+
+Two things this backend does not change: `MANICULE_CACHE_DIR` under `/data` is where it writes
+the small declaration it plans from later, so it composes with a read-only root filesystem
+already; and the `--network=none` guarantee in §5 is about the *shipped* configuration, which
+is ONNX. Embedding over HTTP is a network call by construction, and choosing it is choosing
+that.
 
 ---
 

@@ -215,11 +215,15 @@ COPY --from=build /opt/manicule/tiktoken /opt/manicule/tiktoken
 # scary-looking line about nothing.
 COPY --from=build --chown=manicule:manicule /opt/manicule/models /opt/manicule/models
 
-# `MANICULE_EMBEDDING__PROVIDER=onnx` is set here even though `manicule init` would choose it
-# anyway, so that the image is correct before anybody has run `init`. It is worth knowing that
-# the environment outranks the config file in manicule's settings sources, so this cannot be
-# changed with `manicule config set` from inside the container — which is the right way round:
-# `mlx` is Apple silicon and there is no Linux container in which it is a valid answer.
+# Deliberately not `MANICULE_EMBEDDING__PROVIDER=onnx` here. `EmbeddingSettings.provider`
+# already defaults to `"onnx"` (settings.py), so the image is correct before anybody has run
+# `init` without this line doing anything. Setting it anyway would cost something real: the
+# environment outranks the config file in manicule's settings sources, so an operator writing
+# `[embedding] provider = "ollama"` into `/data/config.toml` would be silently ignored — and
+# this image ships `--extra ollama` precisely so that setting works (see `ARG EXTRAS` above).
+# A provider this image cannot satisfy, `mlx`, does not need pre-empting here either: it is not
+# installed, so selecting it fails at startup with the registry naming what is available, which
+# is a better failure than a variable that forecloses it silently.
 ENV PATH=/opt/manicule/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/home/manicule \
@@ -228,8 +232,7 @@ ENV PATH=/opt/manicule/venv/bin:$PATH \
     TIKTOKEN_CACHE_DIR=/opt/manicule/tiktoken \
     MANICULE_DATA_DIR=/data \
     MANICULE_CACHE_DIR=/data/cache \
-    MANICULE_CONFIG_FILE=/data/config.toml \
-    MANICULE_EMBEDDING__PROVIDER=onnx
+    MANICULE_CONFIG_FILE=/data/config.toml
 
 # `0700`, set here rather than left to the daemon's umask, and owned by the account that will
 # write to it. A named volume mounted over this path inherits both. docs/deployment.md says

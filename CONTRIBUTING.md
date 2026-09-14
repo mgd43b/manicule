@@ -235,11 +235,26 @@ own so a change to its rules makes the corpus visibly stale rather than quietly 
   startup, with both versions named.
 - Register factories, not instances. Keep heavy imports inside the factory so an installed
   plugin nobody has configured costs one cheap import.
+- **A factory may block, and it runs on a worker thread.** `Container.aget` builds through
+  `asyncio.to_thread`, so construction-time I/O — opening a database, reading a model card,
+  asking a server what it is serving — costs its own construction rather than stalling the
+  event loop for everything else in the process. One factory runs at a time, so a factory
+  needs no locking of its own; what it must not do is assume it is on the main thread, or
+  reach for the running event loop. Anything that needs `await` still belongs in `setup`.
 - Parsers declare their media types at registration, not only on the class. Routing a
   document reads the declaration, so choosing one parser does not construct the rest — and
   a parser that disagrees with its own declaration is caught the first time it is used.
 - Declare a `config_model`. Settings written for a component with no model are rejected
   rather than ignored.
+- **An embedder records `[embedding] prefix_scheme` on its fingerprint, and never applies a
+  prefix itself.** Building the fingerprint through `ModelCard.fingerprint()` does both for
+  you, which is why the two shipped backends and `manicule-ollama` all go that way. A backend
+  that constructs `EmbedFingerprint` directly must carry the setting across, because core reads
+  the scheme back off the fingerprint to decide what to prepend — so one that records `none`
+  makes a configured scheme silently not in force, and one that prepends inside `embed` doubles
+  whatever core already added. Nothing enforces this from outside the plugin:
+  `Embedder.embed` cannot tell a document from a query, which is the reason the scheme is
+  core's in the first place (`docs/embeddings.md` §9.1).
 - Run the conformance suites from `manicule.testing` against your components.
 
 ### Plugins run with full privileges

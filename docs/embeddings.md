@@ -195,6 +195,7 @@ already on disk. No schema change is required to support plurality, and none is 
 [embedding]
 model = "BAAI/bge-m3"          # the default
 provider = "onnx"              # the default; "mlx" needs `manicule-mlx` installed
+prefix_scheme = "none"         # the default; "nomic" and "qwen3" are the other two (§9.1)
 
 [plugins.config."embedder.onnx"]
 weights = ""                   # the artifact to execute, when it is not the model's own repo
@@ -224,6 +225,26 @@ than the earlier wording here, that such a model "must supply its own fingerprin
 must supply them only where its repository declares nothing, and a setting that *contradicts* a
 declaration is refused rather than obeyed: a setting that overrules how the weights were
 trained is worse than one that is ignored, because it succeeds.
+
+`prefix_scheme` is the one setting here that is a property of how the weights were *trained*
+rather than of how they are run, and it is a closed set rather than two free-text prefixes.
+There is one right answer per model — `nomic-embed-text` wants `search_document: ` and
+`search_query: `, Qwen3-Embedding wants its published query instruction and nothing on the
+document side — and a mistyped prefix would be recorded faithfully in the fingerprint and would
+build a corpus in a space nothing else shares. It is core's rather than a backend's for the
+reason §9.1 gives, and it is `[embedding]` rather than `[plugins.config."embedder.*"]` for the
+same one: a value each backend supplied separately is a value that could differ between two
+backends of one model.
+
+**It is not read off the model, and that is a measurement rather than a preference.**
+Everything else in this section comes from the model's own repository, which is stronger than a
+table. A prefix convention cannot: `nomic-ai/nomic-embed-text-v1.5` publishes a
+`config_sentence_transformers.json` with no `prompts` object at all — the convention lives in
+its model card, in prose — so the model that most needs a scheme is precisely the one whose
+repository declares nothing to read. Qwen3-Embedding does declare `prompts`, and
+`manicule-ollama` could not read it anyway: it serves GGUF and fetches only a `tokenizer.json`,
+because reading a checkpoint's declaration and attributing it to whatever somebody converted
+and pushed to Ollama is the trap §3.4 exists to avoid. So it is named, not inferred.
 
 There is no `normalize` setting. Normalization is always applied (§4.2), so there is nothing to
 configure and no way to configure it wrongly.
@@ -366,7 +387,7 @@ backend pays.
 | Sequence limit | read from the repository | **the limit asked for**, then checked against the server |
 | Tokenizer | the model's own, in the repository | configuration, **checked against `prompt_eval_count`** |
 | Over-long input | refused by our tokenizer | refused by our tokenizer *and* by `truncate: false` |
-| `weights_identity` | the artifact, per §5 | `artifact:ollama:<model>@sha256:<digest>:prefix=none` |
+| `weights_identity` | the artifact, per §5 | `artifact:ollama:<model>@sha256:<digest>` |
 
 **The declared context is not the served one, and the gap is silent.** Measured against a
 server holding `qwen3-embedding:0.6b`, whose GGUF declares a 32768-token context: an
@@ -554,6 +575,50 @@ number, and it must be the *usable* one:
 For BGE-M3: an 8192 limit, no instruction prefix, XLM-RoBERTa wraps with `<s>` and `</s>`, so
 **usable ≈ 8190**. The 512-token budget clears it by a factor of sixteen.
 
+**The prefix term is now real rather than notional** (§9.1). `read_card` counts the configured
+scheme's document prefix with the model's own tokenizer and subtracts it, and the served
+backend does the same arithmetic against `num_ctx`. It comes off a *configured*
+`max_sequence_length` as well as a derived one, because that setting is documented as the
+model's limit less the special tokens it wraps every input in — a number an operator can read
+off their model's declaration — and expecting them to also net out a prefix manicule chose
+would make one setting mean different things depending on another. A scheme whose prefix
+consumed the whole context is refused at startup by name, rather than becoming a per-chunk
+refusal about the chunk.
+
+**That makes two numbers, and they are not interchangeable.** `ModelCard.input_capacity` is
+the second: what the model reads *with* the prefix in front of it, which is
+`max_sequence_length` plus what the document prefix cost. The distinction is which moment is
+being asked about. The chunker's budget and `require_within_context` measure a chunk's own
+text, before anything is prepended, and belong to `max_sequence_length`. A backend's raw-input
+guard — `PooledEmbedder._tokenize`, `OllamaEmbedder._require_within_limit` — sees the string
+that is about to go to the model, prefix included, and belongs to `input_capacity`.
+
+Collapsing them charges the prefix twice, and the first implementation did. The failure is not
+an edge case: a chunk sized to exactly the budget the chunker was handed was refused by the
+backend that was handed the same number, so an ordinary corpus — most chunks near the limit —
+could not be embedded at all under any scheme with a document prefix. It is worth stating
+plainly because the reduced number reads like the safe one to compare everything against, and
+it is the one that produces a corpus-wide refusal. `test_a_chunk_sized_to_the_budget_survives_its_own_prefix` exists on both paths, and its sibling holds the guard to still firing past the
+real capacity — widening a limit to clear a false refusal is how this becomes silent truncation
+instead.
+
+The **query** side is not netted out of anything, and this section said it "is not checked",
+which was wrong twice over. A query is not a chunk — it has no stored row, no `token_count`
+and no chunker budget — so core never calls `require_within_context` on one. But
+`Embedder.embed` is the only entry point, and every shipped backend's raw-input guard runs on
+whatever it is handed: `PooledEmbedder._tokenize` and `OllamaEmbedder._require_within_limit`
+both measure the prefixed query exactly as they measure a prefixed chunk, against
+`ModelCard.input_capacity`. So an over-long query is **refused, by name, at search time** —
+loudly, which is the direction that matters, because the alternative at that boundary is a
+vector built from the query's opening words.
+
+What is genuinely absent is anything that *sizes* a query in advance, the way the chunker
+sizes a chunk. Nothing trims one, warns about one, or reports the limit before the search that
+hits it, and a corpus's own budget says nothing about how long a person's question may be.
+Qwen3-Embedding's instruction is about twenty tokens against a context measured in thousands,
+so the prefix does not make this reachable where it was not before — but the refusal is the
+guard, not a gap this section is leaving open.
+
 The definition still matters, because it is what a future model will need: `bge-base-en-v1.5`
 at 512 has **510** usable, so a 512-token budget would overflow by exactly the special tokens
 and lose the tail of every full chunk — with the refusal firing on shipped defaults. The
@@ -568,7 +633,8 @@ silent truncation, so the type does not permit expressing it.
 ## 5. `EmbedFingerprint`
 
 The type ships in `manicule.core.embedding`. Its identity set is `model_id`, `revision`,
-`dimension`, `pooling`, `normalized`, `tokenizer_id`, `weights_identity`, compared as canonical bytes
+`dimension`, `pooling`, `normalized`, `prefix_scheme`, `tokenizer_id`, `weights_identity`,
+compared as canonical bytes
 ([`storage.md`](storage.md) §4.6). For BGE-M3:
 
 ```
@@ -577,12 +643,36 @@ revision            <commit sha, pinned>
 dimension           1024
 pooling             cls
 normalized          true
+prefix_scheme       none      # identity when set; popped at `none` — §9.1
 tokenizer_id        BAAI/bge-m3
 max_sequence_length 8190      # recorded, excluded from identity
 backend             mlx|onnx  # recorded, excluded from identity — §3.3
 weights_ref         hf:mlx-community/bge-m3-mlx-fp16@<commit> # exact provenance, excluded
 weights_identity    qualified:BAAI/bge-m3:sha256:<pair digest> # identity — §1.0
 ```
+
+**`prefix_scheme` is popped at `none`, and the reasoning here moved during implementation.**
+The first cut recorded it always, on the argument that §9.1 objects to a term that is sometimes
+absent. Writing it down made the cost visible and the argument wrong. `none` means nothing was
+prepended on either side, so its vectors are byte-identical to vectors made before the field
+existed — and the canonical bytes name the vector table, so recording it would have refused
+every corpus in existence and charged each one a full re-embed to recompute numbers it already
+held. That is precisely the objection that keeps `max_sequence_length` out of identity
+altogether: an identity field must not force a re-embed that changes nothing.
+
+It would also have been worse than a slow migration. A LanceDB `_manicule_meta` row stores the
+fingerprint *and* the canonical string beside it, and refuses a directory whose two halves
+disagree — with a message saying the row was edited or half-written and the directory should be
+restored from a backup. Adding a field at its default makes that accusation against every
+existing directory, for a change that altered no vector. The refusal is correct code meeting a
+migration it was never told about, which is the kind of thing only running the case finds.
+
+§9.1's objection survives intact, because it is about a different shape. What was wrong with a
+marker inside `weights_identity` is that *one backend* wrote it and the others did not, so
+whether the term appeared depended on who built the fingerprint rather than on what was done to
+the text. Here the value decides, identically for every backend, and the same field the two
+call sites read to apply a prefix is the one identity records — so a scheme that is applied is
+recorded, and one that is recorded is applied.
 
 **`revision` is pinned rather than left unset.** The type permits `None` and records it
 faithfully, but an unpinned model is one whose weights can change under a corpus without the
@@ -804,6 +894,16 @@ would repopulate the new table with old-space vectors **and report success**.
 the pre-middleware text. A middleware installation would otherwise make the cache return
 vectors computed from different text.
 
+**Queries are cached by the same rule, and the prefix scheme is why that is safe.** A query is
+embedded through `Embedder.embed` like anything else, so it lands in this cache too — and under
+an asymmetric scheme a document and a query of identical text must not share a vector. They
+cannot, because the prefix is applied *above* the embedder (§9.1) and the key is whatever
+reached it: `search_document: how does auth work` and `search_query: how does auth work` are
+two keys. There is no query/document term in the key and there does not need to be one, which
+is worth saying because adding one would look like the careful thing to do and would in fact be
+a second, weaker copy of a separation the call sites already guarantee. Under `prefix_scheme =
+"none"` the two genuinely are one input and sharing the vector is correct.
+
 **Not keyed by workspace or document**, which would destroy the deduplication that makes the
 cache worth having, exactly where hit rates are highest: repeated boilerplate, the same
 attachment reachable from forty pages. A cache hit reveals nothing — the caller already holds
@@ -818,9 +918,25 @@ a documented property of a self-hosted tool rather than a defect.
 | Ticket | What | Why not here |
 |---|---|---|
 | [#6](https://github.com/mgd43b/manicule/issues/6) | **BGE-M3 learned-sparse leg** as an alternative to FTS5 BM25 (§1.4) | A retrieval feature, and retrieval features earn their place with a measured improvement on #15. Labeled `needs-evidence`. Neither backend exposes the head today, so it is a runtime change as well as a retrieval one |
-| — | **Asymmetric query/document prefixes.** `nomic-embed-text` is trained with `search_query:`/`search_document:` and Qwen3-Embedding with a query-side instruction; applying one, or failing to, changes the vector for the same text and degrades retrieval with nothing raised | Two halves, and both belong in core. See §9.1 |
+| — | ~~**Asymmetric query/document prefixes.**~~ **Built.** `EmbedFingerprint.prefix_scheme`, applied at `ingest/embedding.py` and `retrieval/dense.py`, configured as `[embedding] prefix_scheme` | Nothing: it landed. §9.1 is the design and still describes what shipped |
 
 ### 9.1 Where a prefix scheme has to live, and the two places it must not
+
+**Implemented.** What follows is the argument that decided it, unchanged, because it is still
+what the code is answerable to. What it settled: `PrefixScheme` and
+`EmbedFingerprint.prefix_scheme` in `manicule.core.embedding`, in `IDENTITY_FIELDS`; the
+document half applied in `manicule.ingest.embedding.embed_checked_chunks` and the query half in
+`manicule.retrieval.dense.DenseStage.run`, both reading the scheme off the embedder's own
+fingerprint; `[embedding] prefix_scheme` as the setting; and `manicule-ollama`'s
+`:prefix=none` marker removed from its `weights_identity`, since keeping it would record the
+same fact twice in the field this section says cannot carry it.
+
+Two sentences below are therefore in the wrong tense now, and are left that way rather than
+quietly corrected: `EmbedFingerprint` **had** no field for the scheme, and `manicule-ollama`
+**took** the `weights_identity` shortcut. Both are what made the argument, and an argument
+edited to match its own outcome stops being checkable. One thing it did not anticipate is in
+§5: the field is popped from identity at `none`, because recording a default that prepends
+nothing would charge every existing corpus a re-embed for vectors it already holds.
 
 **It cannot live in a backend.** `Embedder.embed` is the only entry point, and
 `ingest/embedding.py` and `retrieval/dense.py` call it identically — so a backend cannot tell
@@ -874,8 +990,15 @@ identity, and the only place that can be is the embedding fingerprint.
 - **Multilingual** — absorbs [#31](https://github.com/mgd43b/manicule/issues/31).
 - **The cache is keyed on the canonical fingerprint** — §8, and `NameKeyedCache` in the test
   fakes shows what the alternative serves.
-- **`require_within_context` on every path that embeds chunks** — `PooledEmbedder.embed_chunks`,
-  which is the path re-embed uses, held to it by `assert_refuses_oversized_chunks`.
+- **`require_within_context` on every path that embeds chunks** — `manicule.ingest.embedding`,
+  which is the path first ingest, `reindex --repair` and `reindex --re-embed` all take, with
+  `PooledEmbedder.embed_chunks` held to the same check by `assert_refuses_oversized_chunks` as
+  the per-backend guard. The two were described here as one, and they are not: only the first
+  applies the document prefix, and a caller who took the second for the ingest path would build
+  an index whose vectors are missing it.
+- **Asymmetric prefixes are core's, and both sides move together** — §9.1, with
+  `prefix_scheme` in identity so adopting one invalidates the vectors it changes, and its
+  document side charged to the chunk budget (§4.3).
 
 ### 10.1 What implementation changed in this document
 
@@ -892,3 +1015,8 @@ unfinished:
 | §5 | `architecture` "raised, not added" | settled against, with the reason |
 | §5 | two non-identity fields | three: `weights_ref` added |
 | §7 | five traps | nine; four of the new ones only appear when the code runs, and one only in CI |
+| §9.1 | filed, with the design argued | built — a core `prefix_scheme` identity field, applied at both call sites, and `manicule-ollama`'s local `prefix=none` marker retired because core now carries what it stood in for |
+| §4.3 | the document-prefix term was notional; BGE-M3 has none | counted with the model's own tokenizer and subtracted, from a configured `max_sequence_length` as well as a derived one |
+| §4.3 | one number was going to do both jobs | two: `max_sequence_length` for a chunk's own text, `ModelCard.input_capacity` for what the model reads with the prefix on it. Review caught the first cut charging the prefix twice, which refused every chunk sized to its own budget |
+| §4.3 | "the query side … is not checked" | it is, by every backend's raw-input guard, against `input_capacity`. Only `require_within_context` skips it. Review caught the claim; what is actually absent is anything that *sizes* a query in advance |
+| §10 | `PooledEmbedder.embed_chunks` "is the path re-embed uses" | it is not, and has not been; re-embed goes through `manicule.ingest.embedding`, which is also the only path that prefixes |

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from manicule.core.content import DocumentStatus
+from manicule.core.embedding import PrefixScheme
 from manicule.core.retrieval import Candidate, Filter, Query
 from manicule.retrieval.config import DenseConfig
 from manicule.retrieval.dense import DenseStage, derive_over_fetch
@@ -66,10 +67,14 @@ async def _corpus(store: SqliteDocStore, engine: AsyncEngine) -> tuple[list[Chun
 
 
 def _stage(
-    store: SqliteDocStore, vectors: ListVectorStore, *, config: DenseConfig | None = None
+    store: SqliteDocStore,
+    vectors: ListVectorStore,
+    *,
+    config: DenseConfig | None = None,
+    embedder: HashEmbedder | None = None,
 ) -> DenseStage:
     return DenseStage(
-        embedder=HashEmbedder(),
+        embedder=embedder or HashEmbedder(),
         vectors=vectors,
         docstore=store,
         profiles=profiles(**SMALL),
@@ -384,3 +389,37 @@ async def test_the_stage_contract_holds(store: SqliteDocStore) -> None:
         a_query(),
         [Candidate(chunk=only, score=1.0, scores={"lexical": 1.0})],
     )
+
+
+@pytest.mark.parametrize(
+    ("scheme", "expected"),
+    [
+        (PrefixScheme.NONE, "authentication"),
+        (PrefixScheme.NOMIC, "search_query: authentication"),
+        (
+            PrefixScheme.QWEN3,
+            "Instruct: Given a web search query, retrieve relevant passages that answer the "
+            "query\nQuery:authentication",
+        ),
+    ],
+    ids=["none", "nomic", "qwen3"],
+)
+async def test_a_query_reaches_the_model_behind_the_query_side_prefix(
+    store: SqliteDocStore, scheme: PrefixScheme, expected: str
+) -> None:
+    """This leg is the only place a query is embedded, so it is the only place this can happen.
+
+    An embedder cannot apply it for us: ``embed`` is its whole interface and ingest calls it
+    with a document in exactly the same shape. Leaving the query bare while the corpus carried
+    ``search_document:`` would be a retrieval regression introduced by the change meant to fix
+    one, and every symptom of it — worse answers — is invisible from here.
+    """
+    document = make_document(source_id="live")
+    await store.upsert_document(document)
+    only = make_chunk(document, 0, "authentication live")
+    await store.replace_chunks(document.id, [only])
+    embedder = HashEmbedder(prefix_scheme=scheme)
+
+    await _stage(store, ListVectorStore([only]), embedder=embedder).run(a_query(), [])
+
+    assert embedder.seen == [expected]

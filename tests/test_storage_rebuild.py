@@ -2234,12 +2234,20 @@ async def test_multi_source_generation_resumes_and_publishes_once_atomically(
         now=NOW,
     )
 
-    resumed_at = NOW + timedelta(seconds=2)
+    # Anchored on the real clock, as every other test in this file that reaches
+    # `copy_checkpointed_vectors` anchors its own, and for the reason spelled out in
+    # `test_expired_owner_is_fenced_after_takeover`: that method fences each replay page
+    # against the **real** clock rather than an injected one, so a lease measured from the
+    # frozen `NOW` is only live while the wall clock happens to still be inside it. This one
+    # was `NOW + 30 days`, which bought thirty days from 2026-08-15 and then began failing
+    # every run — on `main`, for every pull request, with nothing about the failure naming a
+    # date. A window is not a fix for the wrong anchor; the anchor is the fix.
+    resumed_at = datetime.now(UTC) + timedelta(minutes=10)
     resumed = await rebuilds.claim_generation(
         plan.generation_id,
         "resumed-worker",
         now=resumed_at,
-        expires_at=resumed_at + timedelta(days=30),
+        expires_at=resumed_at + timedelta(minutes=5),
     )
     assert resumed.next_sequence == 1
     assert resumed.predecessor_vector_publication_id == first.vector_publication_id

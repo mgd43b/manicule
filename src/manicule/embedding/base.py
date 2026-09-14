@@ -180,12 +180,22 @@ class PooledEmbedder(Lifecycle, ABC):
     ) -> list[Vector]:
         """Embed stored chunks, refusing any the model cannot read in full.
 
-        **This is the path re-embed uses**, and the reason the check lives here rather than in
-        the chunker alone. Re-embedding reads stored ``embed_text`` without re-chunking, so the
-        chunker's budget refusal never runs; and a sequence limit that *fell* leaves the
-        embedding fingerprint identical, so no comparison fires either. Everything past the
-        limit would be dropped in silence, and each stored vector would describe an opening
-        fragment while its chunk still claimed all of its text.
+        **The budget guard, not the ingest path.** Every route that embeds stored chunks —
+        first ingest, ``reindex --repair``, ``reindex --re-embed`` — goes through
+        :func:`manicule.ingest.embedding.embed_chunks`, which makes the same
+        :func:`~manicule.core.embedding.require_within_context` calls and then applies the
+        document half of :attr:`~manicule.core.embedding.EmbedFingerprint.prefix_scheme`
+        before the model sees anything. This method does not, because a backend cannot know
+        which side of retrieval it is serving. So it is what
+        :func:`manicule.testing.assert_refuses_oversized_chunks` holds every backend to, and
+        is not a shortcut into an index: chunks embedded through here under a configured
+        scheme would be missing their prefix and would not belong beside the ones that have it.
+
+        The check exists at all because re-embedding reads stored ``embed_text`` without
+        re-chunking, so the chunker's budget refusal never runs; and a sequence limit that
+        *fell* leaves the embedding fingerprint identical, so no comparison fires either.
+        Everything past the limit would be dropped in silence, and each stored vector would
+        describe an opening fragment while its chunk still claimed all of its text.
         """
         measured = [
             chunk.model_copy(update={"token_count": self.count_tokens(chunk.embed_text)})
@@ -296,7 +306,12 @@ class PooledEmbedder(Lifecycle, ABC):
         opening fragment while its caller believed it described the whole text.
         """
         encoded = self._tokenizer.encode_batch(texts)
-        limit = self.fingerprint.max_sequence_length
+        # `input_capacity`, not `max_sequence_length`: by the time text reaches here the
+        # document half of the prefix scheme is already in front of it (`ingest/embedding.py`),
+        # and `max_sequence_length` is what is left for a chunk *after* that prefix is charged.
+        # Comparing the prefixed string against the reduced number charges the prefix twice and
+        # refuses a chunk sized to the very budget the chunker was handed.
+        limit = self.card.input_capacity
         specials = self.card.special_token_count
         # From the mask, never from ``len(ids)``. The batch is padded to its longest member, so
         # every row's id list is that length — measuring it would report the longest text's size
