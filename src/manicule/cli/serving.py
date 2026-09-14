@@ -53,6 +53,7 @@ from manicule.mcp.serve import address_for, serve
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Generator, Mapping
 
+    from manicule.config.settings import Settings
     from manicule.mcp.serve import Transport
 
 EX_TEMPFAIL = 75
@@ -152,6 +153,33 @@ def serve_forever(
         return 130
 
 
+def serving_unauthenticated(
+    settings: Settings, *, transport: Transport, allow_unauthenticated: bool
+) -> bool:
+    """Whether this process is about to serve without authentication, deliberately.
+
+    **Three things, not one**, and each is load-bearing:
+
+    * the operator passed ``--no-authentication``;
+    * authentication really is off — the flag buys nothing on an installation that has some,
+      and a banner or a ``doctor`` finding there would put a warning in front of somebody with
+      no exposure, which is how warnings stop being read;
+    * and there is a **socket**. ``doctor``'s finding says this process "is bound to" an address
+      and that callers "can route to the port", and on stdio both are false: a pipe has no port,
+      and ``security.transport.bind_host`` is then a setting nothing acted on.
+
+    A named function rather than an expression inline, because two readers ask this question —
+    the startup banner and the service's own answer to ``doctor`` — and two expressions of one
+    rule are free to disagree. It also makes the third condition assertable, which is the one
+    that was missing.
+    """
+    return (
+        allow_unauthenticated
+        and transport != "stdio"
+        and settings.security.auth.mode is AuthMode.NONE
+    )
+
+
 async def _serve(
     *,
     transport: Transport,
@@ -185,12 +213,8 @@ async def _serve(
         _report(failed("start", "unknown", error_info(exc)), json_output)
         return EX_CONFIG
     async with runtime:
-        # The flag *and* the state, because `--no-authentication` on an installation that has
-        # authentication configured buys nothing and must not be reported as though it did.
-        # Decided once here and used twice: the banner and the service's own answer to `doctor`
-        # would otherwise be two expressions of the same rule, free to disagree.
-        unauthenticated = (
-            allow_unauthenticated and runtime.settings.security.auth.mode is AuthMode.NONE
+        unauthenticated = serving_unauthenticated(
+            runtime.settings, transport=transport, allow_unauthenticated=allow_unauthenticated
         )
         service = ApplicationService(runtime, serving_unauthenticated=unauthenticated)
         api = transport == "http" and not mcp_only
@@ -587,5 +611,6 @@ __all__ = [
     "running_address",
     "serve_forever",
     "serve_over_a_socket",
+    "serving_unauthenticated",
     "stop_running",
 ]

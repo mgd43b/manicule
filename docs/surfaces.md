@@ -1201,7 +1201,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | auth | `GET /auth/providers`, `GET /auth/session`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}` |
 | workbench | `GET /api/v1/workbench?document_id=…` |
 | websocket chat | `WS /api/v1/chat/ws` |
-| mcp | `POST /mcp/` — the read-only tool surface of §6.1, plus `document_create` |
+| mcp | `POST /mcp/` — the read-only tool surface of §6.1, plus `document_create` when this installation is authenticated |
 
 Plus the embeddable widget: `GET /widget/widget.js` and a static page at `GET /widget`, and the
 browser surface at `/ui` — twelve areas of server-rendered HTML over the same service, mounted on

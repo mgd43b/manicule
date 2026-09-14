@@ -22,7 +22,7 @@ import inspect
 import io
 import textwrap
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest import mock
 
 import pytest
@@ -35,8 +35,12 @@ from manicule.api.serve import TRANSPORT as API_TRANSPORT
 from manicule.app.results import ServerAddress
 from manicule.app.service import ApplicationService
 from manicule.cli import main as cli_main
-from manicule.cli import render
+from manicule.cli import render, serving
+from manicule.config.settings import Settings
 from tests.api.support import LOCAL_PEER, backend_with_a_document
+
+if TYPE_CHECKING:
+    from manicule.mcp.serve import Transport
 
 NOT_FOUND = 404
 OK = 200
@@ -344,20 +348,36 @@ def test_the_two_flags_are_independent_at_the_command_line() -> None:
     assert captured["allow_public"] is False
 
 
-def test_the_flag_reports_nothing_when_authentication_is_configured() -> None:
-    """The flag is inert where it buys nothing, and says so by saying nothing.
+UNAUTHENTICATED = Settings(security={"auth": {"mode": "none"}})  # pyright: ignore[reportArgumentType]
+AUTHENTICATED = Settings(security={"auth": {"mode": "api_key"}})  # pyright: ignore[reportArgumentType]
 
-    ``--no-authentication`` on an installation with ``auth.mode = api_key`` changes no refusal:
-    the bind was already permitted and callers still present a key. A banner or a `doctor`
-    finding there would put a warning in front of an operator who has no exposure, which is how
-    warnings stop being read. So the state is the **conjunction** of the flag and the mode, and
-    `_serve` decides it once for both readers rather than each computing its own.
+
+@pytest.mark.parametrize(
+    ("settings", "transport", "flag", "expected", "why"),
+    [
+        (UNAUTHENTICATED, "http", True, True, "the case the flag exists for"),
+        (UNAUTHENTICATED, "http", False, False, "nobody asked"),
+        (AUTHENTICATED, "http", True, False, "the flag buys nothing where there is a key"),
+        (UNAUTHENTICATED, "stdio", True, False, "a pipe has no port to be reachable on"),
+    ],
+)
+def test_serving_unauthenticated_needs_the_flag_the_mode_and_a_socket(
+    settings: Settings, transport: str, flag: bool, expected: bool, why: str
+) -> None:
+    """All three, and the third is the one that is easy to leave out.
+
+    ``doctor``'s finding says this process "is bound to" an address and that callers "can route
+    to the port". On **stdio** both are false whatever ``security.transport.bind_host`` holds —
+    that setting is one nothing acted on — so a state computed from the flag and the mode alone
+    would have a serving process assert a bind it never made. The middle row is the other
+    direction: a warning shown to an operator who has a key and therefore no exposure is how
+    warnings stop being read.
+
+    One function rather than an expression at each site, because the banner and the service's
+    answer to ``doctor`` both ask this and two expressions of one rule are free to disagree.
     """
-    console = Console(file=io.StringIO(), width=100, no_color=True, highlight=False)
-    render.render_address(
-        console,
-        ServerAddress(transport=API_TRANSPORT, host="127.0.0.1", port=8765, loopback=True),
-        unauthenticated=False,
+    decided = serving.serving_unauthenticated(
+        settings, transport=cast("Transport", transport), allow_unauthenticated=flag
     )
 
-    assert "--no-authentication" not in cast("io.StringIO", console.file).getvalue()
+    assert decided is expected, why

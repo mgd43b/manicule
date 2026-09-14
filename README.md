@@ -399,11 +399,13 @@ caches it — and when there is no browser surface to redirect to, it says so an
 process *is* serving. `docs/surfaces.md` §6.3.
 
 **MCP is served from that same process and port**, at `/mcp/`, and it carries the **read-only
-tools plus `document_create`** — every other write tool is not registered on it rather than
-refused, so there is no handler behind `document_delete` or `connector_sync` there at all.
-Authoring is the one exception because it is bounded by configuration an operator wrote rather
-than by arguments a caller sends, it is off until that configuration exists, and a socket serving
-it without authentication refuses to start. Over stdio, where one client talks to one process down
+tools, plus `document_create` when this installation is authenticated** — every other write tool
+is not registered on it rather than refused, so there is no handler behind `document_delete` or
+`connector_sync` there at all. Authoring is the one exception because it is bounded by
+configuration an operator wrote rather than by arguments a caller sends, it is off until that
+configuration exists, and a socket serving it without authentication refuses to start. With
+`security.auth.mode` set to `none` that exception is empty too, so the socket carries the reads
+and nothing else. Over stdio, where one client talks to one process down
 a pipe, the whole surface is offered. `docs/surfaces.md` §6.1 says why.
 
 `/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
