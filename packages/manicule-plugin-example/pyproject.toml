@@ -9,7 +9,7 @@ description = "Reference plugin: the smallest complete example of every extensio
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.14"
-dependencies = ["manicule"]
+dependencies = ["manicule>=0.1,<0.3"]
 
 # This is the entire registration mechanism. A third-party plugin is this file, with a
 # different name.

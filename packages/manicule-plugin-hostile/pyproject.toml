@@ -9,7 +9,7 @@ description = "Parsers that hang and allocate without bound, so isolation can be
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.14"
-dependencies = ["manicule"]
+dependencies = ["manicule>=0.1,<0.3"]
 
 # Registered through the same public entry-point group every plugin uses. That is the point:
 # the parse workers build parsers by discovery, so a parser reachable any other way would
