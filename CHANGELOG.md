@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.4](https://github.com/mgd43b/manicule/compare/v0.2.3...v0.2.4) (2026-09-15)
+
+
+### Features
+
+* **collections:** report a corpus no collection holds ([#382](https://github.com/mgd43b/manicule/issues/382)) ([572f3eb](https://github.com/mgd43b/manicule/commit/572f3eb32b54145e77e668ea4a972d8a45fc50f4))
+* **connectors:** give the filesystem connector an exclude, as git-site has ([#383](https://github.com/mgd43b/manicule/issues/383)) ([3bd76db](https://github.com/mgd43b/manicule/commit/3bd76dbd80abfb353402688cae19f3e485e37290))
+
+
+### Bug Fixes
+
+* **rebuild:** stop an incremental snapshot retiring documents it never named ([#384](https://github.com/mgd43b/manicule/issues/384)) ([7489400](https://github.com/mgd43b/manicule/commit/74894000d1cf9dc322b5f089ce7253ee99e88f4d))
+* **storage:** reset a derived index on every configured vector backend ([#381](https://github.com/mgd43b/manicule/issues/381)) ([93745d8](https://github.com/mgd43b/manicule/commit/93745d88557357675c7ec5e29f8c83c0c3b539aa))
+
 ## [0.2.3](https://github.com/mgd43b/manicule/compare/v0.2.2...v0.2.3) (2026-09-15)
 
 
