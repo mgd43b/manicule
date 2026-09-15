@@ -2084,6 +2084,31 @@ async def test_doctor_reports_an_unreadable_store_as_unknown_not_as_no_collectio
     assert "could not be examined" in check.detail
 
 
+async def test_doctor_never_reports_more_uncollected_documents_than_documents(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Three statements, no lock across them, and a sentence that must stay possible.
+
+    A document indexed between the total and the uncollected count leaves the second above the
+    first, and the finding then reads "3 of 2 document(s)" — an impossible number in the output
+    an operator pastes into an issue. Reconciling costs one figure being a moment stale in a
+    race nobody will see; taking a lock to make a diagnostic self-consistent would not.
+    """
+    _two_documents(backend)
+    # A collection has to exist, or the empty-collection-table finding answers first and the
+    # sentence under test is never reached. It holds nothing, so every document is uncollected.
+    await backend.organization_.create_collection("alpha")
+    # A third document the organization store can see and the document store cannot: what the
+    # two counts see either side of an insert, so uncollected (3) exceeds the total (2).
+    extra = make_document(backend.workspace, source_id="third")
+    backend.organization_.documents[extra.id] = extra
+
+    check = _check(await service.doctor(), "collection-membership")
+
+    assert check.facts["uncollected"] == check.facts["documents"] == 2
+    assert "2 of 2 document(s)" in check.detail
+
+
 def _two_documents(backend: FakeBackend) -> tuple[Document, Document]:
     """The fixture's document plus a second one, visible to both stores.
 

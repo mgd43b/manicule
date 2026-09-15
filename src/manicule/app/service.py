@@ -3479,6 +3479,13 @@ class ApplicationService:
                 detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
                 facts={"error_type": type(exc).__name__},
             )
+        # Reconciled rather than reported raw, on :meth:`_placement`'s grounds: these are three
+        # statements with no lock across them, and a document indexed between the two counts
+        # leaves `uncollected` above `total`. The sentences below would then read "3 of 2
+        # document(s)", and an impossible number in the output an operator pastes into an issue
+        # costs more than one figure being a moment stale in a race nobody will see. Taking a
+        # lock to make a diagnostic self-consistent would be the tail wagging the dog.
+        uncollected = min(uncollected, total)
         facts: dict[str, JsonValue] = {
             "documents": total,
             "collections": len(collections),
