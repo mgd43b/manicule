@@ -54,7 +54,7 @@ from tests.app.fakes import FakeBackend, FakeIngestion, FakeStore, make_chunk, m
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from manicule.app.ports import Watching
+    from manicule.app.ports import Organizing, Watching
     from manicule.app.results import Envelope
 
 WORKSPACE = "default"
@@ -858,6 +858,43 @@ async def test_a_collection_selecting_its_own_directory_is_quiet(root: Path) -> 
     assert check.state == "ok"
     assert check.facts["uncovered"] == []
     assert check.remedy == ""
+
+
+async def test_doctor_survives_storage_it_cannot_read(root: Path) -> None:
+    """A diagnosis is worth most when storage is what is broken, so it must not need storage.
+
+    ``authoring`` is the one check that reaches the organization store, and it did so unbounded:
+    a database that will not open, a schema behind its migration or a disk that has gone away
+    propagated out of ``_authoring_check`` and took the **whole** diagnosis with it. That is the
+    worst possible moment to lose ``doctor`` — it is what an operator runs precisely when storage
+    is the problem, and the ``storage`` check that would have said so never got to run.
+
+    So the two calls that touch the store are bounded, and the failure is reported as ``unknown``
+    rather than ``failing``, for the reason ``_permissions_check`` gives about a path it cannot
+    examine: "could not be read" is not "is misconfigured", and reporting it as the latter sends
+    somebody to fix authoring when the database is what needs attention.
+
+    The assertion that matters is the last one. A diagnosis that lost every other check would
+    still satisfy the first three.
+    """
+    backend = await backend_for(settings_for(root))
+
+    async def unreadable() -> Organizing:
+        raise SQLAlchemyError("the database is locked")
+
+    # The store is reached through the backend's own accessor, so replacing that is what a
+    # database that will not open looks like from inside `doctor`.
+    backend.organization = unreadable
+
+    diagnosis = await ApplicationService(backend).doctor()
+
+    check = _authoring_check(diagnosis)
+    assert check.state == "unknown"
+    assert check.facts["error_type"] == "SQLAlchemyError"
+    assert "could not be read" in check.detail
+    assert {"configuration", "transport", "storage"} <= {c.name for c in diagnosis.checks}, (
+        "one unreadable store took other checks out of the diagnosis with it"
+    )
 
 
 async def test_doctor_reports_a_configured_collection_the_workspace_does_not_have(
