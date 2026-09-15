@@ -26,6 +26,7 @@ import re
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 
 from manicule.config.settings import RedactionMethod, RedactionSettings
 from manicule.core.errors import ConfigError, RedactionError
@@ -343,12 +344,35 @@ async def _in_daemon_thread[T](work: Callable[[], T]) -> T:
         try:
             outcome = work()
         except BaseException as exc:  # noqa: BLE001 - relayed to the awaiting side verbatim
-            loop.call_soon_threadsafe(_set_exception, finished, exc)
+            _relay(loop, partial(_set_exception, finished, exc))
         else:
-            loop.call_soon_threadsafe(_set_result, finished, outcome)
+            _relay(loop, partial(_set_result, finished, outcome))
 
     threading.Thread(target=settle, name="manicule-redaction", daemon=True).start()
     return await finished
+
+
+def _relay(loop: asyncio.AbstractEventLoop, settle: Callable[[], None]) -> None:
+    """Hand an outcome back to the loop, accepting that the loop may already be gone.
+
+    **A closed loop is an expected end state here rather than an anomaly**, and that follows
+    from the reason this thread is a daemon at all: the work it runs is a regex that may not
+    terminate, so nothing waits for it. A caller that was canceled, timed out, or simply
+    finished takes its loop with it, and this thread then wakes up holding a result nobody is
+    waiting for.
+
+    ``call_soon_threadsafe`` raises ``RuntimeError`` in exactly that case. Left to propagate it
+    becomes an *unhandled thread exception*, which is attributed to whichever unrelated piece of
+    work happens to be running when the interpreter notices — under ``filterwarnings = ["error"]``
+    that is a failure in a test that never touched redaction, which is how this was found.
+
+    There is nothing to report to and nothing to clean up: ``finished`` belongs to the closed
+    loop, and the awaiting side is already gone.
+    """
+    try:
+        loop.call_soon_threadsafe(settle)
+    except RuntimeError:
+        return
 
 
 def _set_result[T](future: asyncio.Future[T], value: T) -> None:

@@ -2122,6 +2122,62 @@ class VectorChecksumReport(Payload):
     detail: str = Field(default="", description="What happened, or why nothing did.")
 
 
+class VectorMigrationReport(Payload):
+    """What moving a corpus between vector backends did, or would do.
+
+    Counts and names only. The collection is named because an operator has just created it and
+    will want to look at it; nothing else here identifies a document, a chunk or a vector, which
+    is what keeps this safe on the surfaces that can ask for it.
+    """
+
+    source: str = Field(
+        default="",
+        description="The backend the vectors were read from, as ``storage.vector_db`` names it.",
+    )
+    destination: str = Field(
+        default="",
+        description="The backend they were written to, as ``storage.vector_db`` names it.",
+    )
+    storage_name: str = Field(
+        default="",
+        description="What the destination calls the place they landed — a collection, a table "
+        "— in its own namespace, so an operator can go and look at it.",
+    )
+    generation: str = Field(
+        default="",
+        description="The source generation that was read. ``legacy`` is the published root; a "
+        "``reembed-…`` pointer is the generation a durable re-embed swapped in.",
+    )
+    dimension: int = Field(default=0, ge=0, description="Vector width both sides agreed on.")
+    source_rows: int = Field(
+        default=0,
+        ge=0,
+        description="Rows the source holds. Every row, including any belonging to a retired "
+        "publication nothing has swept yet. So it sits at or above the number of live vectors "
+        "and never below: a ``source_rows`` under ``expected_rows`` is a real shortfall, while "
+        "the reverse proves nothing on its own.",
+    )
+    expected_rows: int = Field(
+        default=0,
+        ge=0,
+        description="Chunks a search could legitimately return, which is what the index owes "
+        "rows for. Soft-deleted documents' chunks are excluded, because the index is correct "
+        "not to hold them and counting them would report a healthy corpus as short. Compared "
+        "against ``source_rows`` rather than against what was written, since a copy can be "
+        "faithful to a source that is itself short of the corpus and those are different "
+        "repairs.",
+    )
+    copied: int = Field(default=0, ge=0, description="Vectors written to the destination.")
+    unverified: int = Field(
+        default=0,
+        ge=0,
+        description="Vectors carried that record no checksum, because they predate the "
+        "integrity contract. Carried with the absence intact rather than given one here.",
+    )
+    dry_run: bool = True
+    detail: str = Field(default="", description="What happened, or what would.")
+
+
 class IndexStatus(Payload):
     """What is in the index, and whether it is coherent.
 

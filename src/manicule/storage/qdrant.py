@@ -1,6 +1,6 @@
 """Qdrant behind :class:`~manicule.core.protocols.VectorStore`.
 
-``docs/storage.md`` §6.3 is the design this implements, and §6.2 is the one it mirrors: the
+``docs/storage.md`` §6.7 is the design this implements, and §6.2 is the one it mirrors: the
 row a Lance table holds in columns, a Qdrant collection holds in a point's payload, under the
 same names, written from the same object by the same rules. Everything that is a property of
 *manicule* rather than of an engine — the field names, the filter fields a store may answer,
@@ -59,6 +59,15 @@ can replace would be describing a mechanism that is not there. Nor does it imple
 shadow-generation surface re-embedding needs: ``manicule.app.runtime`` refuses a durable
 re-embed on any backend that does not, by name, and that refusal is the honest answer rather
 than a half-built one.
+
+It does implement :class:`~manicule.core.protocols.AdoptingVectorStore`, which is how a corpus
+reaches this backend without being embedded again (§6.8). The row an embedded directory holds is
+the row this store holds, so a migration is a copy rather than a conversion — and the reason
+adoption is a capability of its own rather than a use of :meth:`QdrantVectorStore.upsert` is
+that ``upsert`` derives the checksum and the embedding identity as it writes. Deriving them is
+right for a vector that has just come from an embedder and wrong for one that has come from
+another store, where a recomputed digest would describe whatever arrived and certify a vector
+that had already drifted.
 
 It does implement :class:`~manicule.core.protocols.ResettableVectorStore`, and that one is not
 optional in practice. A derived reset deletes rows by id, which needs nothing from a backend,
@@ -325,6 +334,16 @@ class QdrantVectorStore:
         """
         return self._workspace
 
+    def storage_name(self, fingerprint: EmbedFingerprint) -> str:
+        """Which collection this workspace's vectors for ``fingerprint`` live in.
+
+        The same arithmetic :meth:`upsert` and :meth:`search` use, exposed because an operation
+        that reports on a collection has to name it. A migration that said only "the vectors
+        were copied" would leave the operator to reconstruct the name from a prefix, a
+        truncated digest and a fingerprint hash in order to look at what they had just made.
+        """
+        return self._collection(fingerprint)
+
     async def ensure_ready(
         self, fingerprint: EmbedFingerprint, *, embed_text_middleware: Sequence[str] = ()
     ) -> None:
@@ -426,6 +445,65 @@ class QdrantVectorStore:
                 points=points[start : start + UPSERT_BATCH],
                 wait=True,
             )
+
+    async def rows_in_space(self, fingerprint: EmbedFingerprint) -> int:
+        """How many points the collection for ``fingerprint`` holds, recorded or not.
+
+        Deliberately not :meth:`count`, which resolves the collection through the fingerprint
+        record: a workspace whose record has gone while its collection has not would answer
+        zero there and answer honestly here. Naming the collection from the argument is what
+        makes the difference, and it is the question a migration's preflight is actually
+        asking.
+        """
+        collection = self._collection(fingerprint)
+        if not await self._client.collection_exists(collection):
+            return 0
+        return int((await self._client.count(collection_name=collection, exact=True)).count)
+
+    async def adopt_rows(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Store rows another backend already holds, carrying every recorded field across.
+
+        The write half of a backend migration (``docs/storage.md`` §6.8). It takes rows in the
+        shape :mod:`manicule.storage.vector_schema` names — which is the shape the embedded
+        store's own inspection read produces — and writes each one as the point it would have
+        been had it been written here in the first place.
+
+        **Every field is carried, not recomputed, and the checksum is why.** :meth:`upsert`
+        builds a payload from a :class:`~manicule.core.content.Chunk` and hashes the vector it
+        is about to store, which is right when the vector has just come from an embedder.
+        Here the vector has come from another store, and recomputing its digest would hash
+        whatever arrived — so a source row whose numbers had drifted would be written with a
+        fresh checksum describing the drift, and the corruption would read as verified
+        afterwards. Carrying the recorded pair keeps the digest a statement about the vector
+        the embedder produced rather than about the bytes this method happened to receive, and
+        leaves :meth:`checksum_coverage` able to notice the difference. The caller verifies
+        before offering a row; this refuses to launder one that was not.
+
+        ``embed_identity`` is carried for a second-order version of the same reason. It is
+        derived from the configured ``embed_text`` middleware, so recomputing it here would
+        silently produce a different identity on an installation whose middleware moved since
+        the rows were first written — and the reuse lookup that exists to avoid re-embedding
+        would then miss every row this moved.
+
+        Returns:
+            How many points were written.
+
+        Raises:
+            ValueError: A row carries no id, no vector, or a vector of the wrong dimension.
+            VectorStoreStateError: If :meth:`ensure_ready` has not run.
+        """
+        fingerprint = self._ready()
+        if not rows:
+            return 0
+        points = [self._adopted_point(row, fingerprint) for row in rows]
+        collection = self._collection(fingerprint)
+        for start in range(0, len(points), UPSERT_BATCH):
+            await self._client.upsert(
+                collection_name=collection,
+                points=points[start : start + UPSERT_BATCH],
+                wait=True,
+            )
+        return len(points)
 
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> Mapping[str, StoredVector]:
         """What this store holds for each of ``chunks``, and whether it can still be used.
@@ -1010,6 +1088,68 @@ class QdrantVectorStore:
                 IDENTITY_COLUMN: self._identity_of(chunk, fingerprint),
                 CHECKSUM_COLUMN: vector_checksum(values),
                 CHECKSUM_VERSION_COLUMN: VECTOR_CHECKSUM_VERSION,
+            },
+        )
+
+    def _adopted_point(
+        self, row: Mapping[str, Any], fingerprint: EmbedFingerprint
+    ) -> models.PointStruct:
+        """One point rebuilt from another backend's row. See :meth:`adopt_rows`.
+
+        The dimension is checked here rather than trusted from the source's metadata, because
+        this is the last place the two can still be compared: past it the values are a payload
+        on a server that will accept whatever width the collection was made with.
+        """
+        row_id = str(row.get(ID_COLUMN) or "")
+        if not row_id:
+            msg = (
+                "a row offered for adoption carries no physical id. The id is what the point "
+                "id is derived from, so a row without one cannot be addressed in the "
+                "destination at all."
+            )
+            raise ValueError(msg)
+        stored = row.get(VECTOR_COLUMN)
+        if stored is None:
+            msg = (
+                f"row {row_id!r} was offered for adoption with no vector. A row whose numbers "
+                f"are absent is not a row this can carry across; the source needs repairing "
+                f"before the corpus is moved."
+            )
+            raise ValueError(msg)
+        chunk_json = str(row.get(CHUNK_COLUMN) or "")
+        if not chunk_json:
+            msg = (
+                f"row {row_id!r} was offered for adoption with no chunk beside its vector. The "
+                f"chunk travels with the vector because a search returns one without a database "
+                f"behind it, so a point stored without it is one every search that ranks it "
+                f"fails on, in another process and long after this reported success."
+            )
+            raise ValueError(msg)
+        values = [float(value) for value in stored]
+        if len(values) != fingerprint.dimension:
+            msg = (
+                f"row {row_id!r} carries a {len(values)}-dimension vector but the destination "
+                f"was built for {fingerprint.dimension}. Both sides took their width from a "
+                f"fingerprint, so a disagreement here means the two stores were prepared for "
+                f"different models."
+            )
+            raise ValueError(msg)
+        checksum, version = checksum_of(dict(row))
+        return models.PointStruct(
+            id=point_id_for(row_id),
+            vector=values,
+            payload={
+                ID_COLUMN: row_id,
+                CHUNK_ID_COLUMN: str(row.get(CHUNK_ID_COLUMN) or ""),
+                PUBLICATION_COLUMN: str(row.get(PUBLICATION_COLUMN) or LEGACY_PUBLICATION),
+                DOCUMENT_ID_COLUMN: str(row.get(DOCUMENT_ID_COLUMN) or ""),
+                KIND_COLUMN: str(row.get(KIND_COLUMN) or ""),
+                LANG_COLUMN: row.get(LANG_COLUMN),
+                POSITION_COLUMN: int(row.get(POSITION_COLUMN) or 0),
+                CHUNK_COLUMN: chunk_json,
+                IDENTITY_COLUMN: str(row.get(IDENTITY_COLUMN) or UNRECORDED_IDENTITY),
+                CHECKSUM_COLUMN: checksum,
+                CHECKSUM_VERSION_COLUMN: version,
             },
         )
 

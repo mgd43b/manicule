@@ -375,7 +375,9 @@ re-embedding, collections, versions and audit records have one implementation, a
 alternative in configuration would advertise support that does not exist. `storage.vector_db`
 is not closed the same way — `lancedb` (embedded, the default) and `qdrant` (a server, dialed
 through `storage.vector_db_url` and configured under `storage.qdrant`) are both real, because
-the two differ in where the index lives rather than in what it holds.
+the two differ in where the index lives rather than in what it holds. That is also what makes
+the setting changeable after the fact: `manicule migrate-vectors` carries an existing index
+across without loading an embedder, because the row on either side is the same row.
 
 **No encryption-at-rest switch.** A setting that raises "not implemented" when you turn it on
 is a feature list entry, not a feature.

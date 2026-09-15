@@ -22,13 +22,24 @@ import asyncio
 import fcntl
 import hashlib
 import os
+import re
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
+
+from manicule.core.errors import VectorStoreStateError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
     from pathlib import Path
+
+GENERATIONS_DIRNAME: Final = "generations"
+"""Where a workspace's non-published generations sit, beside its published one."""
+
+LEGACY_GENERATION: Final = "legacy"
+"""The generation name for the published root — the directory a first ingest creates."""
+
+_GENERATION_POINTER = re.compile(r"reembed-[A-Za-z0-9._-]+")
 
 _EXCLUSIVE_PINS: ContextVar[frozenset[Path]] = ContextVar(
     "manicule_exclusive_vector_pins", default=frozenset()
@@ -39,6 +50,40 @@ def workspace_vector_directory(root: Path, workspace_id: str) -> Path:
     """Opaque, stable physical namespace for one workspace's independent vector identity."""
     digest = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()
     return root / "workspaces" / digest
+
+
+def published_generation_key(pointer: str | None) -> str:
+    """Map a database pointer to one safe local directory component.
+
+    ``index_state.vector_table`` is an opaque token to everything that swaps it (the publish
+    compare-and-set treats it as a string), and a directory name to everything that reads it
+    here. Anything that is not a ``reembed-…`` generation is the published root, including the
+    ``chunks__<fp8>`` a Qdrant-configured installation writes there — which is why the test is
+    for the prefix rather than for ``None``.
+
+    Raises:
+        VectorStoreStateError: The pointer claims to be a generation and is not a name a
+            directory component may take. Refused rather than sanitized: a pointer that reached
+            this in a shape nothing writes is damaged index state, and the repair is to look at
+            it rather than to have a path guessed from it.
+    """
+    if pointer is None or not pointer.startswith("reembed-"):
+        return LEGACY_GENERATION
+    if _GENERATION_POINTER.fullmatch(pointer) is None:
+        raise VectorStoreStateError(
+            "the published vector generation pointer is invalid; repair index state before "
+            "searching or writing vectors"
+        )
+    return pointer
+
+
+def generation_directory(root: Path, generation: str) -> Path:
+    """Where one generation's vectors sit under a workspace's vector root.
+
+    The published generation is the root itself rather than a child of it, because it is what a
+    first ingest creates and generations came later (``docs/storage.md`` §6.5).
+    """
+    return root if generation == LEGACY_GENERATION else root / GENERATIONS_DIRNAME / generation
 
 
 @asynccontextmanager
@@ -73,6 +118,10 @@ async def generation_pin(directory: Path, *, exclusive: bool = False) -> AsyncGe
 
 
 __all__ = [
+    "GENERATIONS_DIRNAME",
+    "LEGACY_GENERATION",
+    "generation_directory",
     "generation_pin",
+    "published_generation_key",
     "workspace_vector_directory",
 ]

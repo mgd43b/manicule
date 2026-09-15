@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from manicule.generation.answering import SupportsAnswer as Answering
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping, Sequence
+    from collections.abc import Callable, Collection, Mapping, Sequence
     from datetime import datetime
     from pathlib import Path
 
@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
+    from manicule.storage.vector_migration import VectorMigration
 
 
 @runtime_checkable
@@ -129,6 +130,16 @@ class DocumentSurface(Protocol):
         ...
 
     async def count_chunks(self, document_id: str | None = None) -> int: ...
+
+    async def live_chunk_count(self) -> int:
+        """Chunks a search in this workspace could legitimately return.
+
+        Narrower than :meth:`count_chunks`, which counts soft-deleted documents' chunks too.
+        The two are not interchangeable and the difference is not cosmetic: anything comparing
+        the corpus against a derived index wants this one, because a trashed document's chunks
+        are rows the index is *correct* not to hold.
+        """
+        ...
 
     async def delete_document(self, document_id: str) -> None: ...
 
@@ -419,6 +430,20 @@ class Maintenance(Protocol):
 
         Returns ``None`` on a store without the capability, on the same terms as
         :meth:`vector_checksum_coverage`.
+        """
+        ...
+
+    async def migrate_vectors(
+        self, *, report: Callable[[str], None] | None = None, dry_run: bool = True
+    ) -> VectorMigration:
+        """Carry the embedded index's vectors into the configured Qdrant collection.
+
+        No ``None`` return, unlike the capability-shaped methods above, and the difference is
+        deliberate: those ask a store whether it can do something, while this is an operation
+        between two named backends that either applies or refuses with a reason. A ``None``
+        here would have to stand for four unrelated situations — not configured for Qdrant, no
+        embedded directory, a generation still in flight, a destination already populated — and
+        each of them is something an operator has to be told in words.
         """
         ...
 

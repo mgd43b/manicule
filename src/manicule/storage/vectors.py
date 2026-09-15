@@ -55,7 +55,6 @@ document is the thing that has to change if they are wrong:
 from __future__ import annotations
 
 import asyncio
-import re
 import shutil
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -103,7 +102,13 @@ from manicule.core.embedding import (
 from manicule.core.errors import VectorStoreStateError
 from manicule.core.ids import vector_id
 from manicule.core.retrieval import Candidate, Filter
-from manicule.storage.vector_paths import generation_pin, workspace_vector_directory
+from manicule.storage.vector_paths import (
+    GENERATIONS_DIRNAME,
+    generation_directory,
+    generation_pin,
+    published_generation_key,
+    workspace_vector_directory,
+)
 from manicule.storage.vector_schema import (
     CHECKSUM_COLUMN,
     CHECKSUM_VERSION_COLUMN,
@@ -1761,10 +1766,8 @@ class PublishedLanceVectorStore:
         while True:
             binding = await self._binding()
             pointer, _namespace, _epoch = binding
-            key = _published_generation_key(pointer)
-            directory = (
-                self._directory / "generations" / key if key != "legacy" else self._directory
-            )
+            key = published_generation_key(pointer)
+            directory = generation_directory(self._directory, key)
             async with generation_pin(self._directory):
                 if await self._binding() != binding:
                     continue
@@ -1905,8 +1908,8 @@ class PublishedLanceVectorStore:
         is the authority for which physical directory received the namespace; following the
         current pointer here would delete a same-named namespace from the wrong generation.
         """
-        key = _published_generation_key(vector_table)
-        directory = self._directory / "generations" / key if key != "legacy" else self._directory
+        key = published_generation_key(vector_table)
+        directory = generation_directory(self._directory, key)
         store = self._stores.setdefault(key, LanceVectorStore(directory))
         async with self._existing_operation_pin(directory) as exists:
             if not exists:
@@ -1919,8 +1922,8 @@ class PublishedLanceVectorStore:
         """Delete exact staged/live rows from the physical generation recorded before reset."""
         if not vector_ids:
             return 0
-        key = _published_generation_key(vector_table)
-        directory = self._directory / "generations" / key if key != "legacy" else self._directory
+        key = published_generation_key(vector_table)
+        directory = generation_directory(self._directory, key)
         store = self._stores.setdefault(key, LanceVectorStore(directory))
         async with self._existing_operation_pin(directory) as exists:
             if not exists:
@@ -1984,10 +1987,8 @@ class PublishedLanceVectorStore:
         while True:
             binding = await self._binding()
             pointer, namespace, epoch = binding
-            key = _published_generation_key(pointer)
-            directory = (
-                self._directory / "generations" / key if key != "legacy" else self._directory
-            )
+            key = published_generation_key(pointer)
+            directory = generation_directory(self._directory, key)
             async with generation_pin(self._directory):
                 current_binding = await self._binding()
                 if current_binding != binding:
@@ -2108,18 +2109,6 @@ class PublishedLanceVectorStore:
         return store
 
 
-def _published_generation_key(pointer: str | None) -> str:
-    """Map a database pointer to one safe local directory component."""
-    if pointer is None or not pointer.startswith("reembed-"):
-        return "legacy"
-    if re.fullmatch(r"reembed-[A-Za-z0-9._-]+", pointer) is None:
-        raise VectorStoreStateError(
-            "the published vector generation pointer is invalid; repair index state before "
-            "searching or writing vectors"
-        )
-    return pointer
-
-
 async def reset_vector_directory(directory: Path, *, legacy_root: bool) -> bool:
     """Remove one workspace's physical identity after all exact row cleanup has settled.
 
@@ -2138,7 +2127,7 @@ async def reset_vector_directory(directory: Path, *, legacy_root: bool) -> bool:
             await connection.drop_table(str(name))
     finally:
         connection.close()
-    generations = directory / "generations"
+    generations = directory / GENERATIONS_DIRNAME
     if generations.exists():
         await asyncio.to_thread(shutil.rmtree, generations)
     workspace_root = directory / "workspaces"

@@ -57,7 +57,7 @@ from manicule.storage import models
 from manicule.storage.engine import sqlite_busy
 from manicule.storage.rows import to_chunk, to_document
 from manicule.storage.types import utcnow
-from manicule.storage.vector_paths import generation_pin
+from manicule.storage.vector_paths import GENERATIONS_DIRNAME, generation_pin
 from manicule.storage.vector_schema import CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN
 
 if TYPE_CHECKING:
@@ -72,7 +72,6 @@ _INSPECTION = TypeAdapter(ShadowInspection)
 _SNAPSHOT_DOCUMENT = TypeAdapter(SnapshotDocument)
 _SNAPSHOT_CHUNK = TypeAdapter(SnapshotChunk)
 _LIVE = TypeAdapter(LivePublication)
-GENERATIONS_DIRNAME: Final = "generations"
 SNAPSHOT_PAGE: Final = 256
 
 

@@ -34,7 +34,7 @@ from manicule.connectors.enriched import AdapterOutcome
 from manicule.connectors.filesystem import ENRICHED_KEY
 from manicule.core.ann import AnnIndex, AnnIndexState, AnnLifecycle
 from manicule.core.content import Chunk, Document, DocumentStatus
-from manicule.core.embedding import VectorChecksumCoverage
+from manicule.core.embedding import IndexFingerprints, VectorChecksumCoverage
 from manicule.core.errors import ConfigError, UnknownEntityError
 from manicule.core.ids import document_id
 from manicule.core.organization import CollectionRule
@@ -3201,6 +3201,45 @@ async def test_doctor_exposes_no_checksum_value_or_chunk_identifier(
     assert all(isinstance(value, (int, bool)) for value in check.facts.values())
 
 
+async def test_doctor_reports_a_generation_pointer_stranded_by_a_backend_change(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The state a backend change without a migration leaves, named where somebody will see it.
+
+    A ``reembed-…`` pointer names a directory under the embedded store's root, and only the
+    embedded store has generations. Left after a move, it makes every surface reporting which
+    space is live report a directory the configured backend has never heard of — and the first
+    thing that refuses outright is a derived reset, which is a worse place to learn it.
+    """
+    backend.settings = Settings.model_validate(
+        {"storage": {"vector_db": "qdrant", "vector_db_url": "http://127.0.0.1:6333"}}
+    )
+    backend.store.index_fingerprints_ = IndexFingerprints(vector_table="reembed-run-1")
+
+    diagnosis = await service.doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vector_backend")
+
+    assert check.state == "degraded"
+    assert check.remedy == "manicule migrate-vectors"
+    assert check.facts["vector_table"] == "reembed-run-1"
+
+
+async def test_doctor_accepts_a_generation_pointer_on_the_backend_that_has_generations(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The other half: on the embedded store the same pointer is exactly correct.
+
+    Without this the check would be a rule against ``reembed-`` pointers rather than a rule
+    about the pair, and every installation that had ever re-embedded would read as degraded.
+    """
+    backend.store.index_fingerprints_ = IndexFingerprints(vector_table="reembed-run-1")
+
+    diagnosis = await service.doctor()
+    check = next(check for check in diagnosis.checks if check.name == "vector_backend")
+
+    assert check.state == "ok"
+
+
 async def test_the_checksum_command_plans_before_it_writes(service: ApplicationService) -> None:
     """The default is the one that writes nothing, like every other boundary here."""
     report = await service.vector_checksum()
@@ -3568,3 +3607,43 @@ async def test_the_content_checks_degraded_count_carries_the_bound_as_well(
     assert check.facts["truncated"] is True
     assert check.facts["examined"] == bound
     assert f"among the first {bound} documents examined" in check.detail
+
+
+async def test_a_migration_does_not_call_a_trashed_documents_chunks_missing(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Soft-deleted chunks are rows the index is *correct* not to hold.
+
+    `count_chunks` includes them and `live_chunk_count` does not, and the shortfall sentence
+    outranks every other thing the report can say — so reaching for the wrong one makes a
+    healthy corpus with a full trash announce that part of it is already missing, and then
+    recommends `manicule index`, which cannot embed a trashed document's chunks and would
+    therefore never clear the message.
+    """
+    # Two live chunks and eighteen belonging to trashed documents. The index holds two vectors
+    # and is entirely correct; only a caller reading the wider count sees a shortfall.
+    backend.store.live_chunks = 2
+    backend.store.total_chunks = 20
+
+    report = await service.migrate_vectors()
+
+    assert report.expected_rows == 2
+    assert report.source_rows == 2
+    assert "already missing" not in report.detail, report.detail
+
+
+async def test_a_migration_reports_a_source_that_is_genuinely_short(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The other half, so the correction above did not simply delete the warning.
+
+    Retired publications only ever *add* rows to the source, so a source holding fewer rows
+    than the corpus has live chunks is a real shortfall in the one direction this can prove.
+    """
+    backend.store.live_chunks = 9
+    backend.store.total_chunks = 9
+
+    report = await service.migrate_vectors()
+
+    assert report.expected_rows == 9
+    assert "already missing" in report.detail

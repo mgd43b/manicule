@@ -28,6 +28,7 @@ from manicule.testing import (
     assert_pipeline_enforces_scope,
     assert_refuses_oversized_chunks,
     assert_retrieval_stage_contract,
+    assert_vector_store_adopts_rows_verbatim,
     assert_vector_store_is_dimension_agnostic,
     assert_vector_store_records_vector_checksums,
     assert_vector_store_rejects_foreign_vectors,
@@ -39,6 +40,7 @@ from tests.fakes import (
     BanningLocalOnly,
     BlockChunker,
     BlockRewritingMiddleware,
+    DerivingVectorStore,
     EagerWatermarkConnector,
     FixedDimensionVectorStore,
     ForgetfulConnector,
@@ -55,6 +57,7 @@ from tests.fakes import (
     PrehashingVectorStore,
     RawVectorStage,
     RedactingMiddleware,
+    RehashingVectorStore,
     SilentParser,
     TextRewritingMiddleware,
     TopKStage,
@@ -249,6 +252,32 @@ async def test_a_store_that_hashes_the_argument_rather_than_the_stored_vector_is
     chunks = make_chunks(make_document())
     with pytest.raises(AssertionError, match="rescaled"):
         await assert_vector_store_records_vector_checksums(PrehashingVectorStore, chunks)
+
+
+async def test_a_store_that_rehashes_an_adopted_row_is_caught() -> None:
+    """The obvious implementation of adoption, and the one that launders corruption.
+
+    Recomputing the digest over the vector that arrived is what any reasonable author writes
+    first, and it produces a destination where every migrated row reads as verified — including
+    the rows whose numbers had already drifted in the source. The evidence is destroyed by the
+    operation performed to preserve it, and nothing afterwards can tell the two corpora apart.
+    """
+    chunks = make_chunks(make_document())
+    with pytest.raises(AssertionError, match="certifies the damage"):
+        await assert_vector_store_adopts_rows_verbatim(RehashingVectorStore, chunks)
+
+
+async def test_a_store_that_derives_an_adopted_rows_identity_is_caught() -> None:
+    """Passes on the installation that wrote the rows, and re-embeds the corpus on any other."""
+    chunks = make_chunks(make_document())
+    with pytest.raises(AssertionError, match="recomputed the identity"):
+        await assert_vector_store_adopts_rows_verbatim(DerivingVectorStore, chunks)
+
+
+async def test_a_store_that_adopts_rows_faithfully_passes() -> None:
+    """The suite has to be passable, or the two above prove only that it always raises."""
+    chunks = make_chunks(make_document())
+    await assert_vector_store_adopts_rows_verbatim(MemoryVectorStore, chunks)
 
 
 async def test_a_store_that_answers_reuse_on_the_chunk_id_is_caught() -> None:

@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+### An existing vector index can move to another backend without being re-embedded
+
+`manicule migrate-vectors` carries a workspace's vectors from the embedded LanceDB directory
+into the configured store, calling no embedder. Until now an installation that wanted its index
+on a server had two options and both of them threw the vectors away: re-index the corpus, or
+restore a snapshot the destination happened to have taken for itself. The vectors were sitting
+in a directory the whole time.
+
+They can be moved because the two backends already store the same row. A Lance column and a
+Qdrant payload field carry the same names, written from the same object under the same rules, so
+a migration is a read in one shape and a write in the same shape rather than a conversion. What
+that buys is the difference between a read of a directory and a forward pass of the model over
+every chunk in the corpus.
+
+The order is: set `storage.vector_db` and `storage.vector_db_url` to the destination, leave the
+`vectors/` directory where it is, then run `manicule migrate-vectors` to see what would move and
+`--yes` to move it. Configuring first is deliberate — it is what puts the data-policy refusals in
+front of the copy, so a corpus configured `local_only` is refused before a chunk of text leaves
+the machine. Afterwards, `manicule vector-checksum --verify` reads the destination, and once it
+is serving searches the `vectors/` directory is no longer read.
+
+It plans by default and the plan creates nothing at the destination, so running it to decide
+whether to migrate at all leaves an installation untouched. A good deal is refused rather than
+worked around: a destination that already holds rows, a rebuild or durable re-embed still in
+flight, a source store that records no embedding fingerprint at all, a source whose fingerprint
+disagrees with the one the corpus recorded, a destination built for a different model, and a
+copy that ends with the destination holding less than the source did.
+
+The one worth knowing about is none of those. Any row whose stored numbers no longer match the
+checksum written beside it stops the copy, rather than being carried somewhere the original is
+no longer there to be compared against — or skipped, which would leave the destination quietly
+short of a corpus nothing downstream asks about completeness.
+
+A vector's recorded checksum and embedding identity are carried rather than recomputed, which is
+what keeps both of those properties true: a recomputed checksum would describe whatever arrived
+and certify a drifted vector as intact, and a recomputed identity would make every migrated row
+miss the reuse lookup on an installation whose `embed_text` middleware had changed — re-embedding
+the corpus the migration was run to avoid re-embedding.
+
+One measured caveat, recorded because it is the kind of thing that otherwise gets rediscovered
+during an incident: a vector store whose distance is cosine may re-normalize on write, and
+whether that moves a stored `float32` depends on the implementation rather than on the vector.
+`qdrant/qdrant` does not move it — 0 of 500 random unit vectors — so a migrated corpus verifies
+against the server an installation actually runs. `qdrant-client`'s in-process mode, which is a
+test convenience and not a backend anybody serves from, moves about one vector in eleven.
+
+What ships is LanceDB to whichever adopting destination is configured, which today means
+Qdrant. The copy itself names no backend — the source is asked for one capability and the
+destination for another, both protocols — so a backend added later becomes a *destination* by
+implementing `AdoptingVectorStore` and nothing else. Becoming a *source* needs more than the
+capability, because finding the generation to read is the embedded store's own business. `storage.md` §6.8 is the design;
+§6.9 is what durable re-embedding on a networked backend would take, which is still refused and
+now says why in enough detail to be decided on.
+
 ### A corpus that belongs to no collection now says so
 
 `manicule doctor` gained a `collection-membership` check, and `connector sync`, `index` and
