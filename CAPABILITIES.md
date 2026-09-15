@@ -100,8 +100,10 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 - `start --transport`, `start --host`, `start --allow-public-bind` and
   `start --no-authentication` — the last two are the only way to bind a non-loopback address
   without authentication, both are needed together, and no configuration file can supply either.
-  `--no-authentication` also takes `document_create` off the socket, because an anonymous caller
-  on an unauthenticated one is an administrator.
+  `--no-authentication` serves the whole surface, `document_create` included: an anonymous caller
+  on an unauthenticated bind is an administrator, so anything that can route to it may *call* the
+  write. Whether that write lands is a separate question — authoring has to be configured, and an
+  installation that configured none refuses every call naming the settings it needs.
 - `ask --repl` — the interactive prompt, which is also what `ask` with no question does at a
   terminal.
 - `reset-derived`, `cleanup-derived-generations`, `release-source-history`, and
@@ -125,8 +127,10 @@ declined catch-all `run-command` surface; that item is not a registered MCP tool
 tool is *absent* from that surface rather than refused on it — see
 [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are unreachable from a
 network by construction, and a socket has to replace that property rather than assume it;
-authoring is the one exception, bounded by configuration and refused to a caller who is not an
-authenticated member.
+authoring is the one exception, bounded by configuration and gated by a **member floor** rather
+than by authentication itself. A viewer key does not clear that floor. An anonymous caller on an
+installation with `security.auth.mode = none` does, because that mode resolves them to an
+administrator — which is what `--no-authentication` on a network bind hands out.
 
 - [x] `ask`
 - [x] `collection_add`

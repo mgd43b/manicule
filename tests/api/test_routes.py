@@ -789,33 +789,29 @@ async def test_the_network_surface_is_the_reads_plus_exactly_one_named_write() -
     )
 
 
-async def test_the_network_surface_without_authentication_is_the_reads_and_nothing_else() -> None:
-    """The same set operation with the other operand empty, which is the whole of the rule.
+async def test_the_network_surface_is_the_same_set_without_authentication() -> None:
+    """The surface a socket carries is decided by the transport, never by the credential.
 
-    **Asserted as a set operation for the reason the test above is**, and the pair is the point:
-    one names the surface an authenticated socket carries, this one names the surface an
-    unauthenticated socket carries, and neither writes out a tool list that could be edited until
-    it matched. A write admitted here tomorrow — authoring, or anything let through by some other
-    route — fails with both sides printed.
+    **Asserted as the same set operation as the test above**, over an installation with
+    ``auth.mode = none``, because the pair is the claim: authentication decides *who may call*
+    ``document_create`` and never *whether it is there*. Those were briefly one question, and the
+    answer made the deployment authoring exists for impossible — assistants on machines running
+    no manicule of their own could search a memory corpus and not write to it.
 
-    **Why this is a set operation rather than a guard.** Without authentication there is no
-    credential, so ``manicule.api.security.Principal.role`` resolves an anonymous caller to
-    ``admin`` and ``require_network_member``'s member floor is cleared by everyone. A
-    ``document_create`` published here would therefore be callable by anything that can route to
-    the port, writing into a corpus that assistants read back as standing instructions. That is
-    an injection channel rather than a privacy question, and the answer to it is that the tool is
-    not registered — an absence, which no header, middleware or setting can be granted an
-    exception to.
-
-    ``--no-authentication`` is what makes this reachable on a routable address, and it changes
-    nothing here: this surface is decided by ``security.auth.mode`` alone, so it is the same
-    surface on loopback, and the flag cannot widen it.
+    The risk that comes with it is real and is accepted elsewhere: an anonymous caller on an
+    unauthenticated installation resolves to an administrator, so ``require_network_member``'s
+    floor admits everybody. That is what ``--no-authentication`` buys, and what the startup
+    banner and ``doctor`` say out loud; it is not something this surface silently prevents.
     """
     backend, _ = backend_with_a_document()
     assert backend.settings.security.auth.mode is AuthMode.NONE
+
     published = set(await _network_tools(backend))
-    assert published == await _reads_on_the_whole_surface(backend)
-    assert not published & set(MUTATIONS), sorted(published & set(MUTATIONS))
+
+    assert published == await _reads_on_the_whole_surface(backend) | NETWORK_AUTHORING
+    assert published & (set(MUTATIONS) - NETWORK_AUTHORING) == set(), sorted(
+        published & (set(MUTATIONS) - NETWORK_AUTHORING)
+    )
 
 
 async def _reads_on_the_whole_surface(backend: FakeBackend) -> set[str]:
@@ -857,19 +853,16 @@ def test_an_application_serving_authoring_without_authentication_refuses_to_be_b
         build_app(ApplicationService(backend))
 
 
-def test_the_no_authentication_flag_does_not_buy_an_unauthenticated_authoring_application() -> None:
-    """The escape hatch stops at the write, on **this** surface as well as on the MCP one.
+def test_the_no_authentication_flag_buys_an_unauthenticated_authoring_application() -> None:
+    """The HTTP half of the waiver, and it is the same decision taken once.
 
-    **This is the test that stops the surface narrowing from being cosmetic.** Emptying
-    ``network_authoring`` takes ``document_create`` off the MCP socket; the same operation is
-    ``POST /api/v1/documents`` here, and its ``MemberPrincipal`` floor is cleared by an anonymous
-    caller because ``auth.mode = none`` resolves one to an administrator. So an application built
-    unauthenticated with authoring configured would carry an anonymous write into the corpus
-    through a door the MCP surface does not control — and every assertion about the MCP surface
-    would still be green.
+    ``document_create`` reaches this surface twice — as the MCP tool on the mount, and as
+    ``POST /api/v1/documents``, whose ``MemberPrincipal`` floor an anonymous administrator
+    clears. Serving one and refusing the other would be a distinction no operator asked for and
+    no threat model supports, so the flag opens both or neither.
 
-    ``allow_unauthenticated`` is passed here, which is the point: it satisfies the *bind*, and
-    this refusal is not a bind check.
+    Without the flag it is still refused, which is the half that matters for an installation that
+    never asked: a corpus is not exposed by forgetting a setting.
     """
     from manicule.config.settings import AuthoringSettings  # noqa: PLC0415
 
@@ -879,7 +872,9 @@ def test_the_no_authentication_flag_does_not_buy_an_unauthenticated_authoring_ap
     )
 
     with pytest.raises(PolicyError, match="authoring"):
-        build_app(ApplicationService(backend), allow_unauthenticated=True)
+        build_app(ApplicationService(backend))
+
+    assert build_app(ApplicationService(backend), allow_unauthenticated=True) is not None
 
 
 def test_an_unauthenticated_wide_application_is_built_without_authoring_on_either_surface() -> None:
@@ -994,26 +989,21 @@ async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> 
     )
 
 
-async def test_an_unauthenticated_socket_tells_a_client_why_authoring_is_not_here() -> None:
-    """The notice describes the surface that was actually built, not the one usually built.
+async def test_an_unauthenticated_socket_is_told_the_same_thing_as_any_other() -> None:
+    """One notice, because there is one surface. A client is told authoring is here, and it is.
 
-    A client told ``document_create`` is available and then given an unknown-tool error has spent
-    a turn finding out, and the obvious recovery from an unknown tool is to try another name —
-    which is why the instructions are chosen alongside the surface rather than fixed. The
-    *reason* is in the text because this is the one surface where an operator may have told an
-    assistant that authoring works; being told why it is missing is what stops it reporting a
-    broken installation.
+    A second notice existed briefly, saying ``document_create`` was absent, for a surface that no
+    longer differs. A client given the wrong one of those spends a turn either calling a tool that
+    is not there or declining to call one that is.
     """
     backend, _ = backend_with_a_document()
+    assert backend.settings.security.auth.mode is AuthMode.NONE
     async with mounted(backend) as client:
         instructions = client.instructions
+
     assert instructions is not None, "the server sent no instructions"
     assert "read-only" in instructions, instructions
-    assert "manicule serve" in instructions, instructions
-    assert "authentication" in instructions, (
-        "the notice does not say why this socket carries no write, so an assistant told that "
-        "authoring is configured has no way to distinguish this from a broken installation"
-    )
-    assert "## Scope every question to a collection" in instructions, (
-        "the notice replaced the ordinary instructions instead of being added to them"
+    assert "document_create" in instructions, (
+        "an unauthenticated socket carries authoring and its instructions do not say so, so an "
+        "assistant deployed to write memories will not call the tool that is there"
     )

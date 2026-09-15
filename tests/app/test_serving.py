@@ -215,7 +215,7 @@ def test_the_renderer_names_the_surface_the_transport_says_it_is() -> None:
     assert "MCP server" not in written, "the API server was announced as an MCP server"
 
 
-def _announced(*, loopback: bool, unauthenticated: bool) -> str:
+def _announced(*, loopback: bool, unauthenticated: bool, authoring: str = "memories") -> str:
     """The start banner, rendered as an operator's terminal would receive it."""
     console = Console(file=io.StringIO(), width=100, no_color=True, highlight=False)
     render.render_address(
@@ -227,6 +227,7 @@ def _announced(*, loopback: bool, unauthenticated: bool) -> str:
             loopback=loopback,
         ),
         unauthenticated=unauthenticated,
+        authoring=authoring,
     )
     return cast("io.StringIO", console.file).getvalue()
 
@@ -247,10 +248,33 @@ def test_serving_unauthenticated_is_announced_and_names_the_flag() -> None:
 
     assert "--no-authentication" in written, written
     assert "administrator" in written, written
-    assert "document_create" in written, (
-        "the banner does not say the socket lost its one write, so the operator who configured "
-        "authoring finds out from a client instead"
+    assert "writes             " in written or "writes  " in written, (
+        "the writes line is not padded to the signpost column, which happens when Rich markup "
+        "is put in the label: ljust counts characters Rich then strips"
     )
+    assert "memories" in written, (
+        "the banner does not name the corpus this bind can be written into, which is the fact "
+        "the warning exists for — an operator is told the risk, not left to infer it"
+    )
+    assert "author" in written, written
+
+
+def test_a_half_configured_install_is_not_warned_about_writes_it_cannot_take() -> None:
+    """A source with no collections is not authoring, so nothing may say it can be written into.
+
+    ``AuthoringSettings.configured`` is ``source and collections`` precisely because half of it
+    is a state people reach, and in that state ``document_create`` refuses every call naming the
+    settings it needs. A banner keyed off the source alone announces an exposure that does not
+    exist — and ``doctor`` reports the same condition from ``configured``, so the two would
+    disagree about one installation.
+
+    That matters more here than it looks: this is the warning an operator is meant to read on the
+    installs where it *is* true, and a line that cries wolf is one they learn to skip.
+    """
+    written = _announced(loopback=False, unauthenticated=True, authoring="")
+
+    assert "--no-authentication" in written, "the flag itself is still announced"
+    assert "author" not in written, written
 
 
 def test_the_ordinary_banner_makes_no_claim_about_authentication() -> None:

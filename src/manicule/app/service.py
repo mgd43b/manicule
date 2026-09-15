@@ -3003,6 +3003,20 @@ class ApplicationService:
             # a process that was started with the flag. A fresh `manicule doctor` reads the same
             # settings and reports `false`, which is the honest answer to what a file can say.
             "serving_unauthenticated": self._serving_unauthenticated,
+            # Whether that unauthenticated surface has authoring *configured*, which is a
+            # different exposure from one that only reads and is the one a monitor most wants to
+            # select on.
+            #
+            # **Configuration rather than write-readiness, and the name says which.**
+            # `document_create` needs more than `configured`: the named collection has to exist
+            # in the store, which is an `await` this synchronous check cannot make. It would also
+            # be the wrong question. A collection that has not been created yet is one
+            # `collection_create` away, and a diagnostic that reported "no exposure" until
+            # somebody made it would go quiet exactly while an operator was setting the thing up.
+            # The exposure is that this bind would accept the write, so what is reported is that
+            # the configuration says so.
+            "unauthenticated_authoring_configured": self._serving_unauthenticated
+            and self.settings.authoring.configured,
         }
         if loopback:
             return r.Check(
@@ -3025,8 +3039,14 @@ class ApplicationService:
                 detail=(
                     f"serving unauthenticated, deliberately: this process was started with "
                     f"--no-authentication and is bound to {bound!r}. Anything that can route "
-                    f"to the port is an administrator here, and MCP on it carries no write "
-                    f"tool."
+                    f"to the port is an administrator here"
+                    + (
+                        f", and authoring is configured for "
+                        f"{self.settings.authoring.source!r}, so this bind accepts writes "
+                        f"into that corpus."
+                        if self.settings.authoring.configured
+                        else "."
+                    )
                 ),
                 facts=facts,
                 remedy="manicule config set security.auth.mode api_key",
@@ -3172,7 +3192,9 @@ class ApplicationService:
             remedy=f"chmod 0700 {where}",
         )
 
-    async def _authoring_check(self) -> r.Check:
+    async def _authoring_check(  # noqa: PLR0911 - each return is a different finding
+        self,
+    ) -> r.Check:
         """Whether every collection authoring writes into also *selects* what lands in it.
 
         ``authoring.collections`` holds one fact twice: a name is a collection, and it is the
@@ -3222,7 +3244,6 @@ class ApplicationService:
                 },
                 remedy="manicule config show",
             )
-        store = await self._backend.organization()
         # `find_collection` rather than a dict over `list_collections`, so the name resolves
         # through the same normalization `document_create` resolves through. A check that
         # matched names its own way could report a collection missing that authoring finds.
@@ -3230,25 +3251,54 @@ class ApplicationService:
         missing: list[str] = []
         uncovered: list[str] = []
         identifiers: dict[str, str] = {}
-        for name in authoring.collections:
-            # Held to `document_create`'s own rule, and *before* anything is looked up. A name
-            # that is blank or carries a separator is one this operation would refuse anyway,
-            # and it would otherwise reach `normalize_name` — which raises on a blank, out of a
-            # diagnostic, taking every other check in the diagnosis with it.
-            try:
-                _require_segment(name, "collection name")
-            except ValueError:
-                malformed.append(name)
-                continue
-            found = await store.find_collection(name)
-            if found is None:
-                missing.append(name)
-                continue
-            identifiers[name] = found.id
-            wanted = directory_prefix(str(connector.root / name))
-            rule = found.rule
-            if rule is None or not any(wanted.startswith(prefix) for prefix in rule.uri_prefixes):
-                uncovered.append(name)
+        # **Bounded, because this is the one check that reaches storage.** Opening the
+        # organization store and reading collections out of it are the two operations here that
+        # can fail for reasons that have nothing to do with authoring — a database that will not
+        # open, a schema behind its migration, a disk that has gone away. Unbounded, any of them
+        # takes the *whole* diagnosis with it, which is the worst moment to lose `doctor`: it is
+        # what an operator runs precisely when storage is the thing that is broken, and the
+        # `storage` check that would have said so never gets to run.
+        #
+        # The blank-name guard below already reasons this way about `normalize_name`; this is
+        # the same argument applied to the calls either side of it. `unknown` rather than
+        # `failing` for the reason `_permissions_check` gives: "could not be examined" is not
+        # "is broken", and reporting it as the latter sends somebody to fix authoring when the
+        # database is what needs attention.
+        try:
+            store = await self._backend.organization()
+            for name in authoring.collections:
+                # Held to `document_create`'s own rule, and *before* anything is looked up. A
+                # name that is blank or carries a separator is one this operation would refuse
+                # anyway, and it would otherwise reach `normalize_name` — which raises on a
+                # blank, out of a diagnostic, taking every other check in the diagnosis with it.
+                try:
+                    _require_segment(name, "collection name")
+                except ValueError:
+                    malformed.append(name)
+                    continue
+                found = await store.find_collection(name)
+                if found is None:
+                    missing.append(name)
+                    continue
+                identifiers[name] = found.id
+                wanted = directory_prefix(str(connector.root / name))
+                rule = found.rule
+                if rule is None or not any(
+                    wanted.startswith(prefix) for prefix in rule.uri_prefixes
+                ):
+                    uncovered.append(name)
+        except (ManiculeError, SQLAlchemyError, OSError) as exc:
+            return r.Check(
+                name="authoring",
+                state="unknown",
+                detail=f"authoring could not be checked: the collections it writes into could "
+                f"not be read ({exc})",
+                facts={
+                    "source": authoring.source,
+                    "collections": list(authoring.collections),
+                    "error_type": type(exc).__name__,
+                },
+            )
         facts: dict[str, JsonValue] = {
             "source": authoring.source,
             "root": str(connector.root),

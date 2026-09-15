@@ -1,11 +1,14 @@
 """Which tools a transport carries, decided in one place and asserted from both ends.
 
-The rule is one sentence: **an authenticated socket carries the read-only tools and one named
-write, an unauthenticated one carries the reads alone, and a pipe carries all of them.** It is
-not a setting and there is no caller entitled to a different answer — see
-:data:`~manicule.mcp.serve.NETWORK_SURFACE_IS_READ_ONLY` for the transport rule and
-:func:`~manicule.mcp.server.network_authoring` for the one exception, which is a frozenset
-conditioned on authentication rather than a flag any registration can set for itself.
+The rule is one sentence: **a socket carries the read-only tools and one named write; a pipe
+carries all of them.** It is not a setting and there is no caller entitled to a different answer
+— see :data:`~manicule.mcp.serve.NETWORK_SURFACE_IS_READ_ONLY` for the transport rule and
+:data:`~manicule.mcp.server.NETWORK_AUTHORING` for the one exception, which is a frozenset rather
+than a flag any registration can set for itself.
+
+Authentication decides *who may call* that write — ``require_network_member`` — and never
+whether it is carried. Those were briefly one question, and the answer cost the deployment
+authoring exists for: a corpus served to assistants that could be searched and not written.
 
 What is here is the rule *at the transport*. Two things it deliberately is not:
 ``tests/api/test_routes.py`` asserts the absences by name against the mounted endpoint a client
@@ -23,7 +26,7 @@ from manicule.app.results import Check
 from manicule.config.settings import AuthMode, AuthoringSettings, AuthSettings, Settings
 from manicule.core.errors import PolicyError
 from manicule.mcp.serve import NETWORK_SURFACE_IS_READ_ONLY, address_for, surface
-from manicule.mcp.server import NETWORK_AUTHORING, TOOL_NAMES, network_authoring
+from manicule.mcp.server import NETWORK_AUTHORING, TOOL_NAMES
 from tests.app.fakes import FakeBackend
 from tests.mcp.test_annotations import MUTATIONS
 
@@ -37,8 +40,8 @@ EVERYWHERE = "0.0.0.0"  # noqa: S104 - the address whose exposure is the subject
 def service() -> ApplicationService:
     """The default installation, which has **no authentication** — ``auth.mode`` defaults to none.
 
-    That was scenery before and is a precondition now: ``network_authoring`` is empty without
-    authentication, so this service's socket carries the reads and nothing else.
+    Its socket carries the same tools an authenticated one does; what differs is who may call
+    the write, which is ``require_network_member``'s question rather than the surface's.
     """
     return ApplicationService(FakeBackend())
 
@@ -88,34 +91,27 @@ def test_a_socket_carries_the_read_only_tools_and_one_named_write(
     assert carried >= NETWORK_AUTHORING, "the named write is not on the surface it is named for"
 
 
-def test_an_unauthenticated_socket_carries_no_write_at_all(service: ApplicationService) -> None:
-    """The seam with authentication off: the reads, and not one thing that writes.
+def test_an_unauthenticated_socket_carries_the_same_surface(service: ApplicationService) -> None:
+    """The surface a socket carries does not depend on whether it is authenticated.
 
-    **Asserted as a set operation**, the way the network surface is asserted everywhere else, so
-    a write let onto an unauthenticated socket by any route fails here rather than needing to be
-    named first. The same rule from the other side of the same seam as
-    ``tests/api/test_routes.py``'s pair of set-operation tests.
+    **This is the regression test for a capability, not for a guard.** The write was briefly
+    conditioned on ``security.auth.mode``, which read as prudence and was in fact a deployment
+    that could not work: manicule serving a memory corpus over a network to assistants running
+    no manicule of their own, with authoring the whole reason that socket exists. They could
+    search the corpus and not write to it.
 
-    The reason is not tidiness. With no authentication there is no credential, so an anonymous
-    caller resolves to an administrator and ``require_network_member``'s member floor is cleared
-    by everybody — a ``document_create`` published here would be callable by anything that can
-    route to the port, writing into a corpus assistants read back as standing instructions.
-
-    **Independent of the bind**, deliberately: this is the surface on loopback too, so
-    ``--no-authentication`` cannot widen it, and an unauthenticated local port carries no write
-    either. ``network_authoring`` is asserted alongside the surface so that a future change
-    making the *constant* empty — which would pass the first assertion — is told apart from this
-    one.
+    Authentication still decides *who may call* ``document_create`` — ``require_network_member``
+    — and on an unauthenticated installation the answer is everyone who can route to the port.
+    That is a risk accepted at the command line, not a hole here. What this asserts is that the
+    surface is the same set either way, so the two questions stay two questions.
     """
     assert service.settings.security.auth.mode is AuthMode.NONE
     carried = set(surface(service, transport="http").tools)
 
-    assert network_authoring(service.settings) == frozenset()
-    assert frozenset({"document_create"}) == NETWORK_AUTHORING, (
-        "the constant changed rather than the condition on it, so this test would pass against a "
-        "surface that had simply lost its one write everywhere"
+    assert carried >= NETWORK_AUTHORING, "an unauthenticated socket lost the write it serves"
+    assert carried & (set(MUTATIONS) - NETWORK_AUTHORING) == set(), sorted(
+        carried & (set(MUTATIONS) - NETWORK_AUTHORING)
     )
-    assert carried & set(MUTATIONS) == set(), sorted(carried & set(MUTATIONS))
     assert carried | set(MUTATIONS) == set(TOOL_NAMES)
 
 
@@ -194,32 +190,27 @@ def test_a_socket_without_authoring_configured_still_starts_unauthenticated(
 
     Without this, the check above would make every read-only loopback socket require an API key
     — a change to how manicule is served, imposed by a feature that installation does not use.
-    The socket that starts carries no write either way: this one is unauthenticated, so
-    ``network_authoring`` is empty and ``document_create`` is not registered on it.
+    The tool is still published; it refuses every call naming the settings it needs.
     """
     assert service.settings.authoring.configured is False
     assert address_for(service, transport="http").transport == "http"
-    assert "document_create" not in surface(service, transport="http").tools
+    assert "document_create" in surface(service, transport="http").tools
 
 
-def test_the_authoring_refusal_is_not_waived_by_the_no_authentication_flag(
+def test_the_authoring_refusal_is_waived_by_the_no_authentication_flag(
     service: ApplicationService,
 ) -> None:
-    """**This is where the escape hatch stops, and it stops on purpose.**
+    """The refusal guards against serving authoring unauthenticated **by omission**, not at all.
 
-    ``--no-authentication`` satisfies ``resolve_bind``'s third condition, which is a statement
-    about *reading* an index: an operator may decide their own corpus is readable by their own
-    network. This refusal is a statement about *writing* into a corpus that assistants read back
-    as standing instructions, and no argument makes an anonymous caller safe to hand that to.
+    Both halves are asserted together because each alone is a different product. Without the flag
+    this configuration still refuses, so an installation that says nothing cannot expose a corpus
+    by forgetting a setting. With it the server starts and the socket carries the write, which is
+    the deployment authoring was built for: assistants on machines running no manicule of their
+    own, writing memories over the network.
 
-    **Waiving it would also have closed only one door.** Emptying the MCP surface takes
-    ``document_create`` off the socket; the same operation is `POST /api/v1/documents` on the
-    HTTP surface, asking for a member floor that an anonymous administrator clears. A flag that
-    let this configuration start would therefore have opened a write path that the surface
-    narrowing does not reach — which is exactly the shape of hole that looks closed.
-
-    So an installation that wants authoring served over a network wants an API key, and the
-    refusal says so by name.
+    Who may then call it is ``require_network_member``'s question, and on this installation the
+    answer is everyone who can route to the port — accepted at the command line, and said out
+    loud at startup naming the corpus.
     """
     settings = service.settings.model_copy(
         update={"authoring": AuthoringSettings(source="memories", collections=("memory",))}
@@ -227,15 +218,12 @@ def test_the_authoring_refusal_is_not_waived_by_the_no_authentication_flag(
     configured = ApplicationService(FakeBackend(settings=settings))
     assert configured.settings.security.auth.mode is AuthMode.NONE
 
-    with pytest.raises(PolicyError, match="authoring") as caught:
-        address_for(configured, transport="http", allow_unauthenticated=True)
-    assert "--no-authentication does not waive this" in str(caught.value)
+    with pytest.raises(PolicyError, match="authoring"):
+        address_for(configured, transport="http")
 
-    # And a pipe still carries it, because a pipe has no port. Same test, so a refusal widened
-    # to every transport fails here rather than being found by somebody whose editor stopped
-    # being able to spawn manicule.
-    assert address_for(configured, transport="stdio").transport == "stdio"
-    assert "document_create" in surface(configured, transport="stdio").tools
+    waived = address_for(configured, transport="http", allow_unauthenticated=True)
+    assert waived.transport == "http"
+    assert "document_create" in surface(configured, transport="http").tools
 
 
 def test_the_announced_tool_count_is_what_the_transport_offers(

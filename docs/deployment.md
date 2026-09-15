@@ -245,12 +245,11 @@ default, **and the browser surface at `/ui`**
 ([#12](https://github.com/mgd43b/manicule/issues/12)) **and MCP at `/mcp/`** on the same socket.
 There is no separate UI server, no separate MCP server and no second port.
 
-MCP served that way carries the **read-only tools, plus `document_create` when the socket is
-authenticated** — every other mutating tool is absent from it rather than refused on it, for the
-reason [`surfaces.md` §6.1](surfaces.md#61-mcp-over-a-socket-carries-the-read-only-tools-and-one-named-write-when-it-is-authenticated)
-gives. With `security.auth.mode` set to `none` that one write is absent too, so an
-unauthenticated socket reads and cannot be written to at all. Over stdio, where one client talks
-to one process down a pipe, the whole surface is offered.
+MCP served that way carries the **read-only tools, plus `document_create`** — every other
+mutating tool is absent from it rather than refused on it, for the reason
+[`surfaces.md` §6.1](surfaces.md#61-mcp-over-a-socket-carries-the-read-only-tools-and-one-named-write)
+gives. Over stdio, where one client talks to one process down a pipe, the whole surface is
+offered.
 
 The browser surface is for the loopback, single-operator installation. A browser cannot attach a
 header to a page load and this build has no session cookie, so with `security.auth.mode` set to
@@ -293,13 +292,14 @@ other. It is an argument rather than a setting for the reason `--allow-public-bi
 configuration key granting it would put an unauthenticated listener one file edit away, in a
 file that gets copied between machines. Three consequences to plan for.
 
-- **The socket carries no write tool at all.** `document_create` is not registered without
-  authentication, because an anonymous caller on that socket is an *administrator* — there is no
-  credential, so there is nothing to tell one caller from another.
-- **An installation with authoring configured still refuses to start this way.** The flag says
-  an index may be read by anyone; it does not say a corpus may be written by anyone, and that
-  refusal covers `POST /api/v1/documents` as well as the MCP tool. Serving authoring over a
-  network wants an API key.
+- **The socket serves authoring, and anyone who can reach it may call it.** `document_create` is
+  on the mount and `POST /api/v1/documents` is on the HTTP surface, and an anonymous caller here
+  is an *administrator* — there is no credential, so there is nothing to tell one caller from
+  another. That is the capability the flag exists for and the risk it accepts: a corpus read back
+  by assistants as standing instructions, writable by anything that can route to the port. Pass
+  it only where you own the network in front of the process.
+- **Without the flag, an installation with authoring configured still refuses to start.** A
+  corpus is never exposed by forgetting a setting; it takes the argument.
 - **The `transport` check stays `failing`**, reworded to say this is deliberate. The exposure is
   the same whether or not somebody meant it, so the health gate below must exclude the check by
   `name` rather than expect it to pass.

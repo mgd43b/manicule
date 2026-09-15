@@ -1191,6 +1191,7 @@ def render_address(
     web: bool | None = None,
     stopped: bool = False,
     unauthenticated: bool = False,
+    authoring: str = "",
 ) -> None:
     """Where the server is listening, and which surface is on it.
 
@@ -1214,9 +1215,9 @@ def render_address(
     ``unauthenticated`` is the third, and it is the same kind of fact as ``web``: whether this
     process was started with ``--no-authentication``, which is argv and is therefore recorded
     nowhere an address can be read from. It prints the one thing an operator most needs to see
-    in the seconds after typing that flag — including what it cost them, since a socket serving
-    without authentication carries no write tool and an operator who configured authoring would
-    otherwise find that out from a client.
+    in the seconds after typing that flag. ``authoring`` is the configured source it names, empty
+    when this installation has none: an unauthenticated socket that can be written into is a
+    different fact from one that merely reads, and the operator is told which they have.
     """
     if stopped:
         where = "stdio" if payload.transport == "stdio" else f"http://{payload.host}:{payload.port}"
@@ -1236,7 +1237,7 @@ def render_address(
     else:
         out.print(f"[red]{what} on {where} — reachable from the network[/red]")
     if unauthenticated:
-        _unauthenticated_warning(out, loopback=payload.loopback)
+        _unauthenticated_warning(out, loopback=payload.loopback, authoring=authoring)
     if not serves_api:
         # `--mcp-only`. The bare address above is not what a client is configured with, and
         # until this line the trailing-slash endpoint appeared in no output at all — so the
@@ -1256,7 +1257,7 @@ def render_address(
     _signpost(out, "API documentation", f"{where}{frontdoor.DOCS}")
 
 
-def _unauthenticated_warning(out: Console, *, loopback: bool) -> None:
+def _unauthenticated_warning(out: Console, *, loopback: bool, authoring: str) -> None:
     """Say, at the moment it becomes true, that this server asks callers for nothing.
 
     Three lines and each earns its place. The first names the flag, because the fix for an
@@ -1264,8 +1265,13 @@ def _unauthenticated_warning(out: Console, *, loopback: bool) -> None:
     warning that describes a state without naming the argument that produced it sends them to
     the configuration file, where this is not. The second says who a caller is, which is the
     part that surprises people: with no credential there is no viewer, only an administrator.
-    The third says what it cost, so that authoring's absence from the socket is something the
-    operator was told rather than something a client discovers.
+
+    **The third is the one this warning exists for**, and it is printed only when there is a
+    corpus to name. ``--no-authentication`` serves ``document_create`` — over MCP and over
+    ``POST /api/v1/documents`` — so whatever can reach this port can write into a corpus that
+    assistants read back as standing instructions. That is the risk the flag accepts rather than
+    mitigates, and an operator is told which corpus by name at the moment it becomes true, not
+    left to infer it from a document.
 
     Loopback changes the second line rather than removing the warning. A flag that produced no
     output on the transport somebody is most likely to try it on first is a flag whose effect
@@ -1278,7 +1284,15 @@ def _unauthenticated_warning(out: Console, *, loopback: bool) -> None:
     )
     out.print("[red]serving with no authentication (--no-authentication)[/red]")
     _signpost(out, "callers", f"{reach}, each of them an administrator here")
-    _signpost(out, "MCP here", "read-only — document_create is not served without authentication")
+    if authoring:
+        # The label is plain and only the target is marked up: `_signpost` pads with `ljust`,
+        # which counts markup characters that Rich then strips — so a colored label is a
+        # column that does not line up with the ones above it.
+        # `escape` because the corpus name comes from configuration and nothing constrains it
+        # to exclude brackets: a source called `[bold]` would be read as markup and could
+        # restyle or swallow part of the one line on this banner that names an exposure.
+        corpus = escape(repr(authoring))
+        _signpost(out, "writes", f"[red]{reach} can author into {corpus}[/red]")
 
 
 def render_upgrade(out: Console, payload: r.UpgradeReport) -> None:
