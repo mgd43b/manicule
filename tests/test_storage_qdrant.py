@@ -63,6 +63,7 @@ from manicule.storage.qdrant import (
     is_cleartext_remote,
     is_local,
     meta_collection_for,
+    owns_collection,
     point_id_for,
     workspace_digest,
 )
@@ -763,6 +764,50 @@ async def test_a_reset_leaves_every_other_workspace_on_the_server_alone(
 
     assert await kept.count() == 1
     assert await kept.fingerprint() is not None, "another workspace lost its recorded model"
+
+
+async def test_a_reset_leaves_a_second_installation_whose_prefix_contains_this_one(
+    client: AsyncQdrantClient,
+) -> None:
+    """``collection_prefix`` is free text, and one installation's can contain another's.
+
+    ``docs/deployment.md`` §6.5 asks operators to give each installation its own prefix on a
+    shared server, and the cost of ignoring it has to stay what that section says it is — two
+    corpora that cannot see each other's rows — rather than one installation deleting the
+    other's. A prefix of ``<ours>_<our workspace digest>`` puts every collection the second
+    installation owns behind this one's ownership prefix, so a reset matching on the opening of
+    a name would take a stranger's corpus with it.
+
+    The second installation is built to be the worst case rather than a plausible one: nobody
+    types a workspace digest into their configuration on purpose, and a rule that only holds
+    for names nobody would choose is not a rule.
+    """
+    ours = QdrantVectorStore(
+        client, workspace_id=WORKSPACE, collection_prefix=TEST_COLLECTION_PREFIX
+    )
+    theirs = QdrantVectorStore(
+        client,
+        workspace_id="a-different-installation",
+        collection_prefix=f"{TEST_COLLECTION_PREFIX}_{workspace_digest(WORKSPACE)}",
+    )
+    for store in (ours, theirs):
+        await prepared(store)
+        await store.upsert([chunk(f"row-of-{store.workspace_id}")], [spread(4, 0)])
+    stranger = collection_for(
+        f"{TEST_COLLECTION_PREFIX}_{workspace_digest(WORKSPACE)}",
+        "a-different-installation",
+        fingerprint(4),
+    )
+    assert stranger.startswith(f"{TEST_COLLECTION_PREFIX}_{workspace_digest(WORKSPACE)}_"), (
+        "this name must open with our ownership prefix, or the test proves nothing"
+    )
+    assert not owns_collection(TEST_COLLECTION_PREFIX, WORKSPACE, stranger)
+
+    assert await ours.reset_storage() is True
+
+    assert await client.collection_exists(stranger)
+    assert await theirs.count() == 1
+    assert await theirs.fingerprint() is not None
 
 
 async def test_a_reset_reaches_a_collection_the_record_does_not_name(

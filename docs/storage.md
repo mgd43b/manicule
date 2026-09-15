@@ -1729,9 +1729,16 @@ ingest under a different embedder. `ResettableVectorStore.reset_storage` is the 
 and this store implements it — every collection whose name carries this workspace's digest, plus
 this workspace's point in the shared meta collection, which is shared and therefore keeps its
 other rows. Matched by name rather than resolved through the record, because a workspace that
-has held two embedding spaces has two collections and the record names one of them. A backend
-implementing neither this capability nor the publication surface still has its rows deleted, and
-the reset reports `vector_store_removed` false rather than implying it did more.
+has held two embedding spaces has two collections and the record names one of them — and matched
+on the *whole* name rather than its opening, because `collection_prefix` is free text and two
+installations sharing a server can choose prefixes where one contains the other. `foo` here and
+`foo_<that workspace's digest>` there puts every collection the second installation owns behind
+the first one's ownership prefix, so a reset matching on an opening would delete a stranger's
+corpus; requiring the fingerprint-space segment as well means a name counts as ours only when
+the digest is immediately followed by what the naming rule puts there. The cost of ignoring the
+advice in §6.5 stays what that section says it is. A backend implementing neither this
+capability nor the publication surface still has its rows deleted, and the reset reports
+`vector_store_removed` false rather than implying it did more.
 
 **The corpus leaves this machine, and configuration says so before it does.** The chunk travels
 with the vector (§6.2), so a vector store on another host is an egress path for document *text*

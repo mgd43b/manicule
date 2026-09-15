@@ -1970,9 +1970,13 @@ workspaces still index into and which is therefore left standing while one of th
 other backend is asked to discard its own, because manicule holds a client rather than a
 filesystem ([`storage.md`](storage.md) §6.7), and a store offering no way to be asked has its
 rows deleted and reports `vector_store_removed` false. The obsolete-generation cleanup folded
-into a reset behaves the same way: it retires each publication by name where the backend can,
-and on a backend whose whole storage is about to be discarded it does not ask, because the
-discard takes those rows with it.
+into a reset follows the same three cases: it retires each publication by name where the
+backend can; on a backend whose whole storage is about to be discarded it does not ask, because
+the discard takes those rows with it; and on one that can do neither it leaves the generation
+ledger standing and reports no publications removed. That last case is the rule the other two
+serve — a reset removes what it can and says what it removed, and the record of rows it could
+not remove is the one thing it must not delete, because that record is what a later cleanup on
+a capable backend would work from.
 
 Generation cleanup selects only `failed`, `canceled`, or superseded `published` generations.
 The newest published generation, every publication still named by a live document, and every

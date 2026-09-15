@@ -829,6 +829,36 @@ async def test_a_reset_discards_storage_rather_than_retiring_publications_first(
     assert outcome.vector_store_removed is True
 
 
+async def test_a_reset_that_cannot_discard_storage_keeps_the_ledger_naming_what_survives(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    """The mirror of the test above, and why one answer decides both halves.
+
+    Leaving a publication to the discard is only safe because the storage it lives in is about
+    to go. A backend that can neither retire a publication by name nor be asked to drop its own
+    storage gets neither deal: the generation's ledger row is the last thing that knows those
+    rows exist, and deleting it while they survive turns a cleanup somebody could still run into
+    a corpus of vectors nothing will ever name again.
+    """
+    await _stage_obsolete_generation(runtime, "abandoned-vectors")
+    backend = _UnwrappedBackendRuntime(
+        await runtime.documents(),
+        _SweepRecordingVectors(),
+        tmp_path / "unresettable",
+        vector_db="qdrant",
+    )
+
+    outcome = await _Maintenance(cast("Runtime", backend)).reset_index()
+
+    assert outcome.publications == 0
+    assert outcome.vector_store_removed is False
+    still_eligible = await _Maintenance(cast("Runtime", backend)).plan_derived_generation_cleanup()
+    assert still_eligible.eligible_items == 1, (
+        "the obsolete generation was forgotten by a reset that could not remove its rows"
+    )
+
+
 def test_an_offline_rebuild_refuses_a_backend_that_groups_no_publications(
     tmp_path: Path,
 ) -> None:

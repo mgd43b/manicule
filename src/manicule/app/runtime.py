@@ -71,6 +71,7 @@ if TYPE_CHECKING:
         Generator,
         Parser,
         PublicationBoundVectorStore,
+        ResettableVectorStore,
         VectorStore,
     )
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
@@ -1360,8 +1361,8 @@ class _Ingestion:
         blobs = await self._runtime.blobs()
         if not isinstance(blobs, BlobStore):
             raise ManiculeError("offline rebuild requires retained local source bytes")
+        self._require_publication_inventory(await self._runtime.vectors())
         vectors = await self._runtime.prepared_vectors()
-        self._require_publication_inventory(vectors)
         store = SqliteRebuildStore(
             self._runtime.require_engine(),
             workspace_id=self._runtime.workspace,
@@ -1426,6 +1427,12 @@ class _Ingestion:
         reached for a method that was not there — an ``AttributeError`` from deep inside a
         rebuild that had already parsed and embedded the corpus, rather than a refusal that
         names the backend before any of that work is done (#377).
+
+        Asked of the *unprepared* handle, which is the same object ``prepared_vectors``
+        returns and the only form of it this can be asked of without consequences:
+        preparing constructs the embedder to read its fingerprint and hands that
+        fingerprint to the store, which on a server backend creates the collection. An
+        operation about to refuse should not leave one behind.
 
         The capability, not the configured name: unlike a derived reset or a durable re-embed,
         nothing downstream of here reaches into a particular backend's storage, so a plugin that
@@ -2538,8 +2545,9 @@ class _Maintenance:
             f"{self._runtime.settings.storage.vector_db!r}, which groups no rows it can name. "
             f"Generations are written by an offline rebuild, which this backend refuses, so "
             f"reaching this means the corpus was moved between backends with a rebuild still "
-            f"pending. Reset the derived index instead — that discards the whole of this "
-            f"workspace's vector storage, these rows included."
+            f"pending. Reset the derived index instead: a backend that can discard its own "
+            f"storage takes these rows with it, and one that cannot leaves this ledger "
+            f"standing rather than deleting the record of rows it could not remove."
         )
 
     def _reset_row_deletion(
@@ -2619,7 +2627,20 @@ class _Maintenance:
         unowned = await lifecycle.clear_unowned_legacy_tombstones() if legacy_root else 0
         return removed, unowned
 
-    async def _discard_vector_storage(self, vectors: VectorStore) -> bool:
+    @staticmethod
+    def _resettable_vectors(vectors: VectorStore) -> ResettableVectorStore | None:
+        """The handle, when this backend can be asked to drop what surrounds its rows.
+
+        Resolved once and consulted for two decisions, which is why it is one function:
+        whether the obsolete-generation cleanup may leave a publication to the discard, and
+        whether the discard happens at all. Answering those two differently is exactly how a
+        ledger row naming a publication that survives comes to be deleted.
+        """
+        from manicule.core.protocols import ResettableVectorStore  # noqa: PLC0415
+
+        return vectors if isinstance(vectors, ResettableVectorStore) else None
+
+    async def _discard_vector_storage(self, vectors: ResettableVectorStore | None) -> bool:
         """Ask a backend that is not the embedded one to drop what this workspace holds.
 
         The rows themselves are already gone — the tombstone sweep above is backend-agnostic.
@@ -2630,9 +2651,7 @@ class _Maintenance:
         A store offering no such capability is not refused. Its rows have been deleted and the
         reset reports ``vector_store_removed`` false, which is the truth rather than a silence.
         """
-        from manicule.core.protocols import ResettableVectorStore  # noqa: PLC0415
-
-        if not isinstance(vectors, ResettableVectorStore):
+        if vectors is None:
             return False
         return await vectors.reset_storage()
 
@@ -2648,6 +2667,7 @@ class _Maintenance:
             async with generation_pin(directory, exclusive=True):
                 bound = await _publication_bound_vectors(self._runtime)
                 vectors = await self._runtime.vectors()
+                resettable = self._resettable_vectors(vectors)
                 retire = self._reset_row_deletion(vectors, bound)
                 prepared = await lifecycle.prepare_reset_derived()
                 vector_rows = 0
@@ -2658,9 +2678,18 @@ class _Maintenance:
                     for vector_table, vector_ids in grouped.items():
                         vector_rows += await retire(vector_table, vector_ids)
                         await lifecycle.clear_tombstones(vector_ids)
-                cleanup = await self._cleanup_derived_generations_guarded(
-                    retire_publications=bound is not None
-                )
+                # When a backend can neither retire a publication by name nor be asked to
+                # discard the storage it lives in, the generation's ledger row is the last
+                # thing that knows those rows exist, so it stays. A reset removes what it
+                # can and reports what it removed; deleting the record of what it could not
+                # remove is the one thing it must not do.
+                publications = 0
+                if bound is not None or resettable is not None:
+                    publications = (
+                        await self._cleanup_derived_generations_guarded(
+                            retire_publications=bound is not None
+                        )
+                    ).removed_items
                 await lifecycle.retire_reset_pointer()
                 if bound is not None:
                     physical_removed, unowned = await self._reset_embedded_storage(
@@ -2668,7 +2697,7 @@ class _Maintenance:
                     )
                     vector_rows += unowned
                 else:
-                    physical_removed = await self._discard_vector_storage(vectors)
+                    physical_removed = await self._discard_vector_storage(resettable)
                 fingerprints = await lifecycle.finish_reset_identity()
                 await self._runtime.invalidate_derived_runtime()
                 return ResetOutcome(
@@ -2676,7 +2705,7 @@ class _Maintenance:
                     chunks=prepared.chunks,
                     memberships=prepared.memberships,
                     vector_rows=vector_rows,
-                    publications=cleanup.removed_items,
+                    publications=publications,
                     generations_terminalized=prepared.generations_terminalized,
                     snapshots_retained=prepared.snapshots,
                     vector_store_removed=physical_removed,
