@@ -29,7 +29,7 @@ dependencies = [
   # The extra is what carries `tokenizers` and `huggingface-hub`, and both are load-bearing
   # here — see `served.py` for why a tokenizer is not optional for a backend whose runtime
   # has none to offer.
-  "manicule[embeddings]>=0.1,<0.2",
+  "manicule[embeddings]>=0.1,<0.3",
   # The same async client the connectors use, and chosen for the same property: the
   # transport is pluggable, so this package's suite drives a synthetic Ollama over
   # `httpx.MockTransport` and exercises the real request-building and error-mapping code

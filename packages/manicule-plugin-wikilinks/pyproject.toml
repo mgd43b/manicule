@@ -9,7 +9,7 @@ description = "Turns [[wikilinks]] in markdown into typed chunk relations."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.14"
-dependencies = ["manicule>=0.1,<0.2"]
+dependencies = ["manicule>=0.1,<0.3"]
 
 [project.entry-points."manicule.plugins"]
 wikilinks = "manicule_plugin_wikilinks:PLUGIN"

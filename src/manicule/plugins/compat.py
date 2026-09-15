@@ -32,7 +32,7 @@ def check_core_version(manifest: PluginManifest, core_version: str) -> str | Non
     except InvalidSpecifier:
         return (
             f"declares core_version {manifest.core_version!r}, which is not a valid PEP 440 "
-            f"specifier (for example: '>=0.1,<0.2')"
+            f"specifier (for example: '>=0.1,<0.3')"
         )
     try:
         version = Version(core_version)

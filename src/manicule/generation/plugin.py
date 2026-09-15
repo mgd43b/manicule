@@ -104,7 +104,7 @@ class GenerationPlugin:
     manifest = PluginManifest(
         name="generation",
         version="0.1.0",
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary="One generator interface for provider APIs and authenticated local CLIs.",
     )
 

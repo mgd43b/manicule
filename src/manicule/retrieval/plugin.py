@@ -127,7 +127,7 @@ class RetrievalPlugin:
     manifest = PluginManifest(
         name="retrieval",
         version="0.1.0",
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary="Hybrid retrieval: dense and BM25 legs, reciprocal rank fusion, cross-encoder.",
     )
 

@@ -232,7 +232,7 @@ class ConnectorsPlugin:
     manifest = PluginManifest(
         name="connectors",
         version="0.1.0",
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary="Sources manicule ingests from: local files, pinned Git sites, and Confluence.",
     )
 

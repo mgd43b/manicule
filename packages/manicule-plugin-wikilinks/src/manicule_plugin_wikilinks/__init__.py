@@ -459,7 +459,7 @@ class WikilinkPlugin:
     manifest = PluginManifest(
         name="wikilinks",
         version="0.1.0",
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary="Turns [[wikilinks]] in markdown into typed chunk relations.",
     )
 

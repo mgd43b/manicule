@@ -328,7 +328,7 @@ class ParsingPlugin:
     manifest = PluginManifest(
         name="parsing",
         version="0.1.0",
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary="Every built-in parser, and the structure-aware chunker.",
     )
 

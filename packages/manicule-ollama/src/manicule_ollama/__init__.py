@@ -132,7 +132,7 @@ class OllamaPlugin:
         # `manicule.chunking.tokens.SupportsTokenCount` read structurally. Those are the shapes
         # that would break here as a silently provisional chunker rather than as an import
         # error.
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary="Embedding on an Ollama server, for hosts that cannot embed in process.",
     )
 

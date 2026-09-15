@@ -62,7 +62,7 @@ class PluginManifest(BaseModel):
     core_version: str = Field(
         min_length=1,
         description="PEP 440 specifier for the manicule versions this supports, e.g. "
-        "``>=0.1,<0.2``. Checked before the plugin registers anything.",
+        "``>=0.1,<0.3``. Checked before the plugin registers anything.",
     )
     summary: str = ""
     requires: tuple[str, ...] = Field(

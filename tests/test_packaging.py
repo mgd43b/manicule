@@ -10,9 +10,11 @@ nowhere else: every other test here runs from the source tree, with the dev grou
 * The console script survives an installation without the `serve` extra. `manicule.entry` exists
   for that and would be silently pointless if the entry point were ever pointed back at
   `manicule.cli.main:main`, which is the obvious-looking simplification.
-* Every plugin admits the version that is running. All of them declare
-  `core_version=">=0.1,<0.2"`, and release-please bumping to 0.2.0 would ship a manicule whose
-  own parsers refuse to load — an entirely mechanical failure that no other test in this
+* Every plugin admits the version that is running. This is not hypothetical: they all declared
+  `core_version=">=0.1,<0.2"`, release-please bumped to 0.2.0, and `v0.2.0` was tagged with a
+  manicule whose own parsers, storage and embedder all refused to load. This test failed on that
+  release pull request, exactly as designed, and was merged past — so the check is sound and the
+  thing to protect is reading it. An entirely mechanical failure that no other test in this
   repository would notice, on the one commit nobody rehearses.
 * The release workflow builds and publishes both distributions, and no others. `manicule` is
   MIT and `manicule-mlx` is GPL-3.0-or-later; the README tells an Apple silicon reader to

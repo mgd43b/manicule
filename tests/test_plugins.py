@@ -79,7 +79,10 @@ def manifest(**overrides: object) -> PluginManifest:
     base: dict[str, object] = {
         "name": "thing",
         "version": "1.0.0",
-        "core_version": ">=0.1,<0.2",
+        # The running core, not a literal range. A pinned one rots at every minor bump — this
+        # default refused 0.2.0 and took six tests with it, for a fixture whose whole point is
+        # to be the *compatible* case. Tests that want a refusal override it, and do.
+        "core_version": f"=={CORE_VERSION}",
     }
     return PluginManifest.model_validate({**base, **overrides})
 
