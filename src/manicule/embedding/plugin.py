@@ -150,7 +150,7 @@ class EmbeddingPlugin:
     manifest = PluginManifest(
         name="embedding",
         version="0.1.0",
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary="The onnxruntime embedder, pooling in manicule's own numpy.",
     )
 

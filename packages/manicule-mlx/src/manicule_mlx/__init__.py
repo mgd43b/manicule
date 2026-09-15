@@ -71,7 +71,7 @@ class MlxPlugin:
         # against. It matters more here than for a plugin that only touches public protocols:
         # this one subclasses a base class and implements its underscore-prefixed methods, so a
         # change to that shape lands here as a broken backend rather than a missing attribute.
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary="Metal-native embedding on Apple Silicon. GPL-3.0-or-later.",
     )
 

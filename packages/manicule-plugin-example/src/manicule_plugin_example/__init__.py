@@ -123,7 +123,7 @@ class ExamplePlugin:
     manifest = PluginManifest(
         name="example",
         version="0.1.0",
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary="Reference plugin: one parser, one middleware, one retrieval stage.",
     )
 

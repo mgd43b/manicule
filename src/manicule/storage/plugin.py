@@ -189,7 +189,7 @@ class StoragePlugin:
     manifest = PluginManifest(
         name="storage",
         version="0.1.0",
-        core_version=">=0.1,<0.2",
+        core_version=">=0.1,<0.3",
         summary=(
             "SQLite for the 40 modeled relational tables and FTS5; LanceDB or Qdrant for vectors."
         ),
