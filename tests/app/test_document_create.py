@@ -729,6 +729,31 @@ async def test_a_body_the_source_would_not_index_is_refused_before_it_is_written
     assert written_under(root) == [], "nothing reaches the disk"
 
 
+async def test_a_document_written_where_the_source_never_walks_is_refused(root: Path) -> None:
+    """The ceiling's argument, made about place instead of size.
+
+    An excluded directory is worse than an oversized body, because the write *succeeds*. The
+    file lands on disk, the walk steps over it for ever, and the only thing that would ever
+    mention it again is a reconciliation reporting it as a deletion. So the refusal happens
+    while it is still an argument.
+    """
+    settings = Settings(
+        connectors={
+            SOURCE: ConnectorSettings(
+                type="filesystem", options={"root": str(root), "exclude": [f"{COLLECTION}/**"]}
+            )
+        },
+        authoring=AuthoringSettings(source=SOURCE, collections=(COLLECTION,)),
+        security=SecuritySettings(auth=AuthSettings(mode=AuthMode.API_KEY)),
+    )
+    service = await service_for(settings)
+
+    with pytest.raises(PolicyError, match="exclude"):
+        await service.document_create(collection=COLLECTION, slug="retry_policy", body=BODY)
+
+    assert written_under(root) == [], "nothing reaches the disk"
+
+
 async def test_a_source_with_no_ceiling_declares_none(root: Path) -> None:
     """`max_bytes` unset means unset. Inventing a default here would be policy nobody chose."""
     service = await service_for(settings_for(root))
@@ -832,6 +857,34 @@ async def test_doctor_names_the_collection_that_holds_its_documents_by_hand(root
     assert check.facts["uncovered"] == [COLLECTION]
     assert check.remedy.startswith("manicule collection rule set ")
     assert f"--uri-prefix {shlex.quote(str(root / COLLECTION))}" in check.remedy
+
+
+async def test_doctor_names_an_authoring_collection_its_own_source_excludes(root: Path) -> None:
+    """`failing`, and before the rule question, because this one is broken now.
+
+    An excluded directory holds no documents for a rule to select, so the `degraded` finding
+    about the rule would fire too and send an operator to fix the collection when the source is
+    what refuses. Reported at all because the alternative is learning it from the first
+    `document_create` that refuses — which is a working operation reporting a configuration
+    fault, at the worst moment to discover one.
+    """
+    settings = Settings(
+        connectors={
+            SOURCE: ConnectorSettings(
+                type="filesystem", options={"root": str(root), "exclude": [COLLECTION]}
+            )
+        },
+        authoring=AuthoringSettings(source=SOURCE, collections=(COLLECTION,)),
+        security=SecuritySettings(auth=AuthSettings(mode=AuthMode.API_KEY)),
+    )
+
+    check = _authoring_check(await (await service_for(settings)).doctor())
+
+    assert check.state == "failing"
+    assert check.facts["excluded"] == [COLLECTION]
+    assert check.facts["uncovered"] == [], "the quieter finding does not also fire"
+    assert f"{COLLECTION!r}" in check.detail
+    assert "exclude" in check.detail
 
 
 async def test_a_collection_selecting_its_own_directory_is_quiet(root: Path) -> None:

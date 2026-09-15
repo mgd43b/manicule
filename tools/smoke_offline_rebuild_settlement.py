@@ -63,6 +63,7 @@ class SmokeFilesystemConnector(FilesystemConnector):
         name: str = "local",
         include_hidden: bool = False,
         max_bytes: int | None = None,
+        exclude: Sequence[str] = (),
         profiles: Sequence[EnrichedProfile] = (DEFAULT_PROFILE,),
         configured: bool = False,
     ) -> None:
@@ -71,6 +72,7 @@ class SmokeFilesystemConnector(FilesystemConnector):
             name=name,
             include_hidden=include_hidden,
             max_bytes=max_bytes,
+            exclude=exclude,
             profiles=profiles,
             configured=configured,
         )
@@ -144,6 +146,7 @@ def _runtime(
             name=context.instance or "filesystem",
             include_hidden=config.include_hidden,
             max_bytes=config.max_bytes,
+            exclude=config.exclude,
             profiles=config.enriched_profiles,
             configured=bool(context.instance),
         )

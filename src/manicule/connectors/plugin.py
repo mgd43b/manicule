@@ -169,6 +169,7 @@ def build_filesystem(context: BuildContext) -> Connector:
         name=_source_name(context, FILESYSTEM_CONNECTOR_NAME),
         include_hidden=settings.include_hidden,
         max_bytes=settings.max_bytes,
+        exclude=settings.exclude,
         profiles=settings.enriched_profiles,
         # Only when the name came from a configured instance rather than from the fallback in
         # `_source_name`. It decides whether remediation text may name `--source <name>`, and

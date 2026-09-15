@@ -27,7 +27,7 @@ surfaces.
 
 ## 1. The first connector: `git-site`
 
-`filesystem` can already index the repository today. `git-site` adds the facts a filesystem does
+[`filesystem`](filesystem.md) can already index the repository today. `git-site` adds the facts a filesystem does
 not know:
 
 - which files are pages;

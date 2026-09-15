@@ -600,6 +600,23 @@ their paths by default; sites with custom permalinks can commit an authoritative
 See [`docs/connectors/web-crawler.md`](docs/connectors/web-crawler.md) for the manifest format,
 include/exclude rules and the operational tradeoff of disabled source-byte retention.
 
+A directory on disk is the simplest configured source, and it can be told what not to walk:
+
+```toml
+[connectors.corpus]
+type = "filesystem"
+
+[connectors.corpus.options]
+root = "/srv/corpus"
+exclude = ["archive/**"]
+```
+
+That is for material which has to stay in the directory — superseded work kept because it is the
+record of what was tried — and must never rank beside what replaced it. The alternative people
+reach for otherwise is deleting it, which is content leaving the working tree purely to keep it out
+of an index. [`docs/connectors/filesystem.md`](docs/connectors/filesystem.md) has the field table,
+and is honest about what an exclusion does *not* do to documents already indexed.
+
 An admin may also start one already-configured connector through
 `POST /api/v1/admin/connectors/{name}/sync`. The route cannot declare or reconfigure a source:
 connectors hold credentials and reach remote systems, so the complete set remains in

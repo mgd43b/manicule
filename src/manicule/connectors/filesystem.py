@@ -62,7 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final
 
-from manicule.connectors import sidecar
+from manicule.connectors import globs, sidecar
 from manicule.connectors.enriched import (
     ADAPTER_VERSION,
     DEFAULT_PROFILE,
@@ -97,6 +97,9 @@ media type left undeclared at discovery, and which files the adapter is offered 
 sets would drift, and the drift is invisible — a suffix in one and not the other is either a
 corpus that re-ingests itself for ever or a page that is never adapted.
 """
+
+_SELF: Final = PurePosixPath(".")
+"""What ``relative_to`` returns for the root compared with itself, and for nothing else."""
 
 SNAPSHOT_PATH: Final = "snapshot_path"
 """``DocRef.metadata`` key carrying the file this document was walked to.
@@ -279,6 +282,7 @@ class FilesystemConnector:
         name: str = "local",
         include_hidden: bool = False,
         max_bytes: int | None = None,
+        exclude: Sequence[str] = (),
         profiles: Sequence[EnrichedProfile] = (DEFAULT_PROFILE,),
         configured: bool = False,
     ) -> None:
@@ -290,6 +294,11 @@ class FilesystemConnector:
             name: The source name. Part of every document's identity.
             include_hidden: Whether to walk dot-files and dot-directories.
             max_bytes: Refuse a file larger than this at discovery, before it is read.
+            exclude: Root-relative POSIX globs never walked. Applied by the walk itself, which
+                is what keeps ``discover`` and ``reconcile`` from disagreeing: a path one
+                yielded and the other did not would be reported deleted on every sync, or
+                re-indexed for ever. It governs what enters the index, not what is already in
+                it — see :class:`~manicule.connectors.config.FilesystemConfig`.
             profiles: The enriched-document conventions to recognize, in precedence order. An
                 empty sequence turns adaptation off entirely, which is a real and exercised
                 configuration rather than a degenerate one: a corpus of ordinary HTML pays
@@ -306,6 +315,7 @@ class FilesystemConnector:
         self._root = root.expanduser().resolve()
         self._include_hidden = include_hidden
         self._max_bytes = max_bytes
+        self._exclude = tuple(exclude)
         self._profiles = tuple(profiles)
         self._configured = configured
         # Folded into the change token of every adaptable file, so that a new adapter version or
@@ -338,6 +348,59 @@ class FilesystemConnector:
         step declines, and report a path that is never going to be indexed.
         """
         return self._max_bytes
+
+    @property
+    def exclude(self) -> tuple[str, ...]:
+        """The globs this source never walks, in the order they were configured.
+
+        Public for the reason :attr:`max_bytes` is, and it is the same caller: authoring writes
+        a file and *then* ingests the path, so a value it cannot read back is one it cannot
+        honor — the document lands on disk and the very next step walks past it. Reading it is
+        rarely the right question, though; :meth:`excludes` is, because a pattern means nothing
+        until it is asked about a path.
+        """
+        return self._exclude
+
+    def excludes(self, path: Path) -> bool:
+        """Whether this source's configuration keeps ``path`` out of the index.
+
+        Public because it is a question asked from outside as well as in, which is the argument
+        :meth:`contains` is public for. The walk asks it of every entry it finds;
+        ``document_create`` asks it of a path it is about to write, so that a document authored
+        into an excluded directory is refused while it is still an argument rather than written
+        and then never indexed.
+
+        **An excluded directory excludes everything beneath it**, so every ancestor up to the
+        root is asked and not only the path itself — otherwise ``archive`` would keep the
+        directory out of the walk but let ``document_create`` write into it, and the two would
+        disagree about the same configuration. Both spellings of a directory are honored for the
+        same reason: ``archive`` and ``archive/**`` name one subtree, and an operator who writes
+        one meaning the other has not made an interesting mistake. The consequence, stated
+        rather than hidden, is that a pattern ending in ``/**`` also excludes a *file* of that
+        name — ``notes/**`` keeps out a file called ``notes`` as well as the directory. It is
+        the safe direction for a setting whose whole meaning is "never index this".
+
+        **The root itself is never excluded.** It is the argument rather than something found
+        beneath one, and a source configured to walk nothing at all is a sync that reports a
+        clean run over an empty corpus.
+
+        Nothing is resolved and nothing is opened: both callers already hold a path under the
+        resolved root, and this has to answer for a file that does not exist yet. A path outside
+        the root is not this connector's to exclude — :meth:`contains` is the check for that —
+        and is reported as not excluded rather than as an error.
+        """
+        if not self._exclude:
+            return False
+        try:
+            relative = PurePosixPath(path.relative_to(self._root))
+        except ValueError:
+            return False
+        return any(
+            globs.excluded(candidate, self._exclude)
+            for part in (relative, *relative.parents)
+            if part != _SELF
+            for candidate in (str(part), f"{part}/")
+        )
 
     @property
     def profiles(self) -> tuple[EnrichedProfile, ...]:
@@ -698,6 +761,9 @@ class FilesystemConnector:
         Sorted at each level rather than left to the filesystem, so two machines indexing the
         same tree ingest it in the same order — which is what makes a ``--limit`` mean the
         same thing twice.
+
+        A root that is itself a file is yielded without consulting ``exclude``. Patterns are
+        relative to the root, so there is nothing for one to name: see :meth:`excludes`.
         """
         if self._root.is_file():
             yield self._root
@@ -715,6 +781,11 @@ class FilesystemConnector:
             if entry.is_symlink():
                 # Followed nowhere. A symlink out of the tree is the same escape `fetch`
                 # refuses, and a symlink loop inside it is an infinite walk.
+                continue
+            if self.excludes(entry):
+                # Before the directory/file split, so an excluded directory is never descended
+                # into rather than being walked and then discarded a file at a time. The subtree
+                # this exists for is the one somebody kept *because* it is large.
                 continue
             if entry.is_dir():
                 if entry.name in IGNORED_DIRECTORIES:

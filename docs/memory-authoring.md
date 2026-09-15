@@ -306,6 +306,11 @@ created and re-ruled workspace objects on startup would undo it. `manicule docto
 gap instead: `failing` for a configured collection the workspace does not have, `degraded` for
 one whose rule does not select its own directory, each naming the command that fixes it.
 
+A third finding comes from the source rather than from the collection: `failing` for a collection
+whose directory the filesystem source's own `exclude` keeps out of the walk. Nothing written there
+would ever be indexed, so `document_create` into it refuses rather than writing a file the walk
+then steps over — see [`connectors/filesystem.md`](connectors/filesystem.md) §2.2 and §3.
+
 ---
 
 ## 5. The wikilink middleware

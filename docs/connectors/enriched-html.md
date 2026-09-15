@@ -159,6 +159,9 @@ representation = "application/xhtml+xml;profile=confluence-storage"
 labels = { identifier = "source_id", revision = "version" }
 ```
 
+`root` and `enriched_profiles` are the two fields this page is about. The source's other options —
+`include_hidden`, `max_bytes` and `exclude` — are in [`filesystem.md`](filesystem.md) §1.
+
 Listing a profile **replaces** the default rather than adding to it; list
 `name = "standalone-storage"` alongside to keep both. An empty list turns adaptation off, which
 is a supported configuration — it is how you establish whether an unexpected parse is the

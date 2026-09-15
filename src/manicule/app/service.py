@@ -2357,6 +2357,10 @@ class ApplicationService:
         target = await asyncio.to_thread(
             _authored_path, connector, collection=collection, slug=slug
         )
+        # After the path is derived rather than before, because `exclude` is matched against a
+        # path and a collection name is not one: a pattern may name an ancestor of this
+        # document without naming the collection directory itself.
+        _require_not_excluded(target, connector, authoring.source)
         identifier = document_id_of(self.workspace, authoring.source, str(target))
         conflict = await self._authored_conflict(target, identifier)
         if conflict is not None and not overwrite:
@@ -3199,6 +3203,13 @@ class ApplicationService:
         — joined nothing, and the corpus reported that by returning fewer results to a
         collection-scoped search. Nothing anywhere said why. This is the check that says it.
 
+        **``failing`` for a directory the source excludes.** That one is not about collections
+        at all: ``exclude`` keeps the directory out of the walk, so nothing written there is
+        ever indexed and ``document_create`` refuses outright — the same "broken now" footing a
+        missing collection is on, reached from the other side of the same operation. It is
+        asked before the rule because the two findings would otherwise both fire and the
+        quieter one names the wrong thing to fix.
+
         **``degraded``, not ``failing``, for a missing prefix.** Authoring itself works: the
         documents are indexed, searchable and correctly cited, and every document
         ``document_create`` wrote is in its collection because that operation put it there. What
@@ -3219,7 +3230,13 @@ class ApplicationService:
                 state="ok",
                 detail="authoring is off; `authoring.source` and `authoring.collections` are "
                 "not both set",
-                facts={"collections": [], "malformed": [], "missing": [], "uncovered": []},
+                facts={
+                    "collections": [],
+                    "malformed": [],
+                    "missing": [],
+                    "excluded": [],
+                    "uncovered": [],
+                },
             )
         try:
             connector = await self._filesystem_source(authoring.source, require_profiles=False)
@@ -3234,6 +3251,7 @@ class ApplicationService:
                     "collections": list(authoring.collections),
                     "malformed": [],
                     "missing": [],
+                    "excluded": [],
                     "uncovered": [],
                 },
                 remedy="manicule config show",
@@ -3243,6 +3261,7 @@ class ApplicationService:
         # matched names its own way could report a collection missing that authoring finds.
         malformed: list[str] = []
         missing: list[str] = []
+        excluded: list[str] = []
         uncovered: list[str] = []
         identifiers: dict[str, str] = {}
         # **Bounded, because this is the one check that reaches storage.** Opening the
@@ -3275,6 +3294,13 @@ class ApplicationService:
                     missing.append(name)
                     continue
                 identifiers[name] = found.id
+                # Asked before the rule, because it is the worse finding and they are not
+                # independent: a directory the source never walks holds no documents for a
+                # rule to select, so reporting the rule would send an operator to fix the
+                # collection when the source is what refuses.
+                if connector.excludes(connector.root / name):
+                    excluded.append(name)
+                    continue
                 wanted = directory_prefix(str(connector.root / name))
                 rule = found.rule
                 if rule is None or not any(
@@ -3299,6 +3325,7 @@ class ApplicationService:
             "collections": list(authoring.collections),
             "malformed": list(malformed),
             "missing": list(missing),
+            "excluded": list(excluded),
             "uncovered": list(uncovered),
         }
         if malformed:
@@ -3323,6 +3350,18 @@ class ApplicationService:
                 facts=facts,
                 remedy=f"manicule collection create {shlex.quote(missing[0])} "
                 f"--uri-prefix {shlex.quote(str(connector.root / missing[0]))}",
+            )
+        if excluded:
+            named = ", ".join(repr(name) for name in excluded)
+            patterns = ", ".join(connector.exclude)
+            return r.Check(
+                name="authoring",
+                state="failing",
+                detail=f"`authoring.collections` names {named}, whose directory the "
+                f"{authoring.source!r} source excludes ({patterns}). Authoring into it refuses "
+                f"rather than writing a document the walk would then step over.",
+                facts=facts,
+                remedy="manicule config show",
             )
         if uncovered:
             named = ", ".join(repr(name) for name in uncovered)
@@ -7212,6 +7251,36 @@ def _require_within_ceiling(content: str, connector: FilesystemConnector, source
         f"larger than {ceiling}. Written, it would be skipped at discovery and never indexed, so "
         f"it is refused before anything reaches the disk. Raise `max_bytes` on that connector, "
         f"or split the fact."
+    )
+    raise PolicyError(msg)
+
+
+def _require_not_excluded(target: Path, connector: FilesystemConnector, source: str) -> None:
+    """Refuse a path the configured source would never walk, **before** it is written.
+
+    The argument :func:`_require_within_ceiling` makes about size, made about place. ``exclude``
+    is enforced by the walk, which is right for a corpus somebody else fills — a file that
+    matches simply never becomes a document — and wrong here for the same reason a ceiling is:
+    authoring writes first and ingests second, so without this the document lands on disk, the
+    walk steps over it, and the caller is handed a path that is never going to be indexed.
+
+    Worse than the ceiling, in fact. An oversized document at least fails its own ingest; this
+    one succeeds at being written and is then invisible, and the next reconciliation over the
+    source is what would finally report it — as a deletion.
+
+    Asked of the derived target rather than of the collection name, because an excluded
+    *ancestor* excludes the file too and only the full path knows that.
+
+    Raises:
+        PolicyError: The source's ``exclude`` covers where this document would be written.
+    """
+    if not connector.excludes(target):
+        return
+    msg = (
+        f"{target} is covered by the `exclude` configured on source {source!r} "
+        f"({', '.join(connector.exclude)}). Written, it would never be walked and so never "
+        f"indexed, so it is refused before anything reaches the disk. Author into a collection "
+        f"that source indexes, or narrow the pattern that covers this one."
     )
     raise PolicyError(msg)
 

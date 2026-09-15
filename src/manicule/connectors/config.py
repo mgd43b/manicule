@@ -30,6 +30,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from manicule.connectors import globs
 from manicule.connectors.cql import is_page_id
 from manicule.connectors.enriched import DEFAULT_PROFILE, EnrichedProfile
 from manicule.connectors.pagination import origin_of
@@ -71,18 +72,6 @@ reaches no network cannot be misconfigured into trying.
 GIT_SITE_CONNECTOR_NAME = "git-site"
 """The registered name of the commit-pinned local website connector."""
 
-_MAX_SITE_GLOB_LENGTH = 1_024
-
-
-def _site_glob(value: str) -> str:
-    if not value or len(value) > _MAX_SITE_GLOB_LENGTH or value != value.strip():
-        raise ValueError("site path patterns must contain 1 to 1024 unpadded characters")
-    if "\\" in value or value.startswith("/") or "\0" in value:
-        raise ValueError("site path patterns must be repository-relative POSIX globs")
-    if any(segment in {".", ".."} for segment in value.split("/")):
-        raise ValueError("site path patterns must not contain dot or traversal segments")
-    return value
-
 
 class GitSiteConfig(BaseModel):
     """One public website whose page inputs live in a local Git repository."""
@@ -120,7 +109,7 @@ class GitSiteConfig(BaseModel):
     @field_validator("include", "exclude")
     @classmethod
     def _patterns(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(_site_glob(value) for value in values))
+        return tuple(dict.fromkeys(globs.path_glob(value) for value in values))
 
     @field_validator("route_manifest")
     @classmethod
@@ -214,6 +203,40 @@ class FilesystemConfig(BaseModel):
         ge=1,
         description="Refuse a file larger than this at discovery, before it is read.",
     )
+    exclude: tuple[str, ...] = Field(
+        default=(),
+        max_length=256,
+        description="Root-relative POSIX globs this source never walks. A pattern naming a "
+        "directory excludes everything beneath it, and ``archive`` and ``archive/**`` name the "
+        "same subtree. Applied by the walk, so discovery and reconciliation refuse the same "
+        "paths rather than disagreeing about what this source holds.",
+    )
+    """Content that must stay where it is and must not be searchable.
+
+    **Never indexed, rather than not in this collection.** The other way to keep something out
+    of a result set is a collection rule, and it answers a different question: a rule says what
+    a group is, so a document it does not select is still in the corpus and still returned by an
+    unscoped search. This says the file is not the corpus. The distinction matters for the case
+    it was written for — superseded material kept deliberately, which has to remain in the
+    directory because it is the record of what was tried, and must never rank beside what
+    replaced it.
+
+    **It stops a document being indexed; it does not delete one already indexed.** The walk is
+    where this is enforced, so a file that starts matching simply stops being discovered — and
+    nothing in the product runs a reconciliation pass today
+    (:func:`manicule.ingest.reconcile.reconcile` exists and is tested; nothing calls it). So a
+    document that was indexed before the pattern was written stays in the index, served and
+    stale, until ``manicule document delete`` removes it. Said here rather than left to be
+    discovered, because "I excluded it and it is still in my results" is the first thing this
+    setting will be blamed for, and the answer is a command rather than a defect.
+
+    **Empty by default, where :class:`GitSiteConfig` ships opinions.** A website has parts that
+    are structurally not pages; a directory somebody pointed this connector at is the corpus,
+    and a default exclusion would be this module deciding that some of it does not count.
+    :data:`~manicule.connectors.filesystem.IGNORED_DIRECTORIES` already covers the one case that
+    is never a document anywhere — version control and tool output — and it is not configuration
+    because nobody is indexing their ``.git`` on purpose.
+    """
     enriched_profiles: tuple[EnrichedProfile, ...] = Field(
         default=(DEFAULT_PROFILE,),
         description="Enriched-export conventions to recognize inside HTML files, in precedence "
@@ -235,6 +258,11 @@ class FilesystemConfig(BaseModel):
     :data:`~manicule.connectors.enriched.DEFAULT_PROFILE` alongside a new one keeps both; omitting
     it means this corpus is not the default form and should not be searched for it.
     """
+
+    @field_validator("exclude")
+    @classmethod
+    def _patterns(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(globs.path_glob(value) for value in values))
 
 
 class Deployment(StrEnum):
