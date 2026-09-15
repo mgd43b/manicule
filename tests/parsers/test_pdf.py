@@ -262,6 +262,56 @@ async def test_an_upright_page_is_the_case_where_both_transforms_agree(corpus: P
     assert abs(naive.y0 - correct.y0) < 1e-6
 
 
+async def test_every_page_the_parser_opens_it_closes_itself(
+    corpus: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pages are a resource, and leaving one for the document to reap is what broke CI.
+
+    ``pdfium.PdfDocument`` tracks its children as **weak** references and walks that set in
+    ``close()``. A page nobody closed stays in the set until the garbage collector reaches it, so
+    a collection landing during that walk drops an entry mid-iteration and the parse dies with
+    ``RuntimeError: Set changed size during iteration``. That is timing: it failed on a loaded CI
+    runner, in one shard, on a test about page rotation that has nothing to do with resource
+    lifetime — and passed everywhere else.
+
+    **The assertion is the invariant, not the race**, because the race cannot be reproduced on
+    demand and the invariant fails deterministically.
+
+    It has to distinguish *who* closed the page, which is the part that makes a naive version of
+    this test vacuous: the document closes its kids on the way out, so a leaked page reads as
+    closed once the parse is over whether or not anything leaked it. pypdfium2 passes
+    ``_by_parent=True`` on exactly that cascade, so a page closed with it false is one this
+    parser released itself — and that is the property that keeps the set from changing under the
+    walk.
+    """
+    closed_by_us: list[int] = []
+    handed_out: list[int] = []
+    take_page = pdfium.PdfDocument.__getitem__
+    close_page = pdfium.PdfPage.close
+
+    def recorded(document: pdfium.PdfDocument, index: int) -> pdfium.PdfPage:
+        page = take_page(document, index)
+        handed_out.append(id(page))
+        return page
+
+    def closing(page: pdfium.PdfPage, _by_parent: bool = False) -> object:
+        if not _by_parent:
+            closed_by_us.append(id(page))
+        return close_page(page, _by_parent)
+
+    monkeypatch.setattr(pdfium.PdfDocument, "__getitem__", recorded)
+    monkeypatch.setattr(pdfium.PdfPage, "close", closing)
+    await _blocks(raw_from(corpus / "pdf" / "upright.pdf", MEDIA_TYPE))
+
+    assert handed_out, "no page was opened, so this asserts nothing about closing one"
+    leaked = [page for page in handed_out if page not in closed_by_us]
+    assert leaked == [], (
+        f"{len(leaked)} of {len(handed_out)} page(s) were left for the document to reap. They "
+        f"stay in its weakly-referenced child set until a collection reaches them, and a "
+        f"collection during PdfDocument.close() raises 'Set changed size during iteration'."
+    )
+
+
 async def test_turning_the_page_moves_the_marker_to_a_different_edge(corpus: Path) -> None:
     """Stated as corners, so the expectation is readable without running a renderer.
 

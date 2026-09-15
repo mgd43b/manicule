@@ -271,14 +271,17 @@ class PdfParser:
             if not anchor.rects:
                 return page.text.text or None
             raw_page = document[anchor.page - 1]
-            textpage = raw_page.get_textpage()
             try:
-                pieces = [
-                    _bounded_text(textpage, denormalize_rect(rect, page.box, page.rotation))
-                    for rect in anchor.rects
-                ]
+                textpage = raw_page.get_textpage()
+                try:
+                    pieces = [
+                        _bounded_text(textpage, denormalize_rect(rect, page.box, page.rotation))
+                        for rect in anchor.rects
+                    ]
+                finally:
+                    textpage.close()
             finally:
-                textpage.close()
+                raw_page.close()
             joined = "\n".join(piece for piece in pieces if piece)
             return joined or None
 
@@ -322,18 +325,30 @@ def _open(raw: RawDocument) -> Generator[pdfium.PdfDocument]:
 
 
 def _read_page(document: pdfium.PdfDocument, index: int) -> _Page:
+    """One page, read and then **closed**.
+
+    Closing the page matters as much as closing the textpage, and for a reason that only shows
+    up under load. ``pdfium.PdfDocument`` tracks its children as weak references and walks that
+    set in ``close()``; a page left open stays in the set until the garbage collector reaches
+    it, so a collection landing *during* that walk removes an entry mid-iteration and the whole
+    parse dies with ``RuntimeError: Set changed size during iteration``. It is timing, so it
+    fails on a loaded CI runner and not on a laptop.
+    """
     page = document[index]
-    textpage = page.get_textpage()
     try:
-        text = _TextPage.read(textpage)
+        textpage = page.get_textpage()
+        try:
+            text = _TextPage.read(textpage)
+        finally:
+            textpage.close()
+        return _Page(
+            number=index + 1,
+            box=page.get_bbox(),
+            rotation=page.get_rotation(),
+            text=text,
+        )
     finally:
-        textpage.close()
-    return _Page(
-        number=index + 1,
-        box=page.get_bbox(),
-        rotation=page.get_rotation(),
-        text=text,
-    )
+        page.close()
 
 
 def _rects_for(document: pdfium.PdfDocument, page: _Page, start: int, end: int) -> tuple[Rect, ...]:
@@ -348,15 +363,18 @@ def _rects_for(document: pdfium.PdfDocument, page: _Page, start: int, end: int) 
     if count <= 0:
         return ()
     raw_page = document[page.number - 1]
-    textpage = raw_page.get_textpage()
     try:
-        # The count must be requested before any rectangle is read: reading them without it
-        # returns nothing useful, which produces empty rects — a silently page-level anchor —
-        # rather than an error.
-        total = textpage.count_rects(first, count)
-        boxes = [textpage.get_rect(index) for index in range(total)]
+        textpage = raw_page.get_textpage()
+        try:
+            # The count must be requested before any rectangle is read: reading them without it
+            # returns nothing useful, which produces empty rects — a silently page-level anchor —
+            # rather than an error.
+            total = textpage.count_rects(first, count)
+            boxes = [textpage.get_rect(index) for index in range(total)]
+        finally:
+            textpage.close()
     finally:
-        textpage.close()
+        raw_page.close()
     normalized = (normalize_rect(box, page.box, page.rotation) for box in boxes)
     return tuple(rect for rect in normalized if rect is not None)
 
