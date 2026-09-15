@@ -54,14 +54,18 @@ the one at the top and not every README beneath it. `**/` matches zero directori
 more, so `**/drafts/**` catches a top-level `drafts/` too — which is what anybody writing that
 pattern meant.
 
-One inherited sharp edge, shared with `git-site` because both read patterns the same way: **`*`
-matches across `/`**, not only within a path segment. So `*.md` is not "the Markdown files at the
-top" — it is every `.md` at any depth, `notes/deep/a.md` included. There is no way to cap the
-depth: `*/*.md` only sets a *minimum* of one directory, and still matches `notes/deep/a.md`.
+`*` stops at `/` and `**` crosses it, as in a POSIX shell. So `archive/*` is the one level and
+`archive/**` is the subtree; `*.md` is the Markdown at the top and `**/*.md` is every `.md` in the
+corpus. A pattern with no `*` at all is a literal path, which is why `README.md` names the one at
+the root and no other.
 
-The two shapes that are exact are the ones worth reaching for. A pattern with no `*` is a literal
-path, which is why `README.md` names the one at the root and no other. A directory name, with or
-without `/**`, names that subtree and nothing outside it.
+**One difference from `.gitignore`, and it is the useful one.** A `.gitignore` pattern containing
+a separator is relative to its directory, and one *without* a separator matches at any depth — so
+`README.md` there hides every README in the tree. Here there is a single rule: every pattern is
+relative to the root, as though written with a leading separator. That is what makes a `README.md`
+*about* the corpus sayable without taking the READMEs inside it. For patterns that do contain a
+separator the two agree, and a test pins that against `git check-ignore` rather than against our
+own opinion of what it does.
 
 A pattern naming a directory excludes everything beneath it, and the two spellings are the same
 thing:

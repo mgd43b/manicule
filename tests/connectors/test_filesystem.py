@@ -7,6 +7,8 @@ media type that varies with the machine, and a walk that follows a symlink out o
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -262,6 +264,108 @@ async def test_the_walk_and_authoring_ask_one_question_about_an_excluded_path(
     assert not connector.excludes(archived / "live" / "written-later.md")
     assert not connector.excludes(archived), "the root is the argument, never excluded"
     assert not connector.excludes(Path("/elsewhere/entirely.md")), "`contains` answers that"
+
+
+_GIT = shutil.which("git") or "git"
+
+_GITIGNORE_CORPUS = (
+    "btctrader/live/a.md",
+    "btctrader/archive/old.md",
+    "btctrader/archive/deep/older.md",
+    "README.md",
+    "docs/README.md",
+    "notes/keep.md",
+    "notes/deep/keep.md",
+    "notes/scratch.log",
+)
+
+_ROOTED_PATTERNS = [
+    "btctrader/archive",
+    "btctrader/archive/**",
+    "**/archive/**",
+    "**/*.log",
+    "notes/*",
+    "notes/deep",
+    "archive/*",
+    "**/deep/**",
+    "btctrader/**",
+]
+
+
+def _repository(tmp_path: Path, pattern: str) -> Path:
+    """The corpus above, in a Git repository ignoring ``pattern``. Sync: it blocks throughout."""
+    for relative in _GITIGNORE_CORPUS:
+        written = tmp_path / relative
+        written.parent.mkdir(parents=True, exist_ok=True)
+        written.write_text("x\n", encoding="utf-8")
+    root = tmp_path.resolve()
+    subprocess.run(  # noqa: S603 - test-owned fixed executable and arguments
+        [_GIT, "init", "-q", str(root)], check=True, capture_output=True
+    )
+    (root / ".gitignore").write_text(f"{pattern}\n", encoding="utf-8")
+    return root
+
+
+def _unignored(root: Path) -> list[str]:
+    """What ``git check-ignore`` leaves of the corpus, under the repository's own ignore file."""
+    return sorted(
+        relative
+        for relative in _GITIGNORE_CORPUS
+        if subprocess.run(  # noqa: S603 - test-owned fixed executable and arguments
+            [_GIT, "-C", str(root), "check-ignore", "-q", relative], check=False
+        ).returncode
+        != 0
+    )
+
+
+async def _walked(root: Path, pattern: str) -> list[str]:
+    return sorted(
+        str(Path(source_id).relative_to(root))
+        for source_id in await _discovered(FilesystemConnector(root, exclude=(pattern,)))
+    )
+
+
+@pytest.mark.parametrize("pattern", _ROOTED_PATTERNS)
+async def test_a_pattern_naming_a_path_excludes_what_gitignore_would(
+    tmp_path: Path, pattern: str
+) -> None:
+    """The semantics are not ours to invent, and this is the oracle that says whether we did.
+
+    Everybody who reaches for this setting already knows one path-pattern language, and it is
+    the one used by the repository the corpus is usually kept in — the corpus in #379 is a Git
+    checkout. A differential test rather than a table of expected answers, because a table is
+    our own opinion written down a second time and then agreeing with itself.
+
+    Every pattern here contains a separator, which is the condition under which ``.gitignore``
+    reads a pattern as relative to the directory it sits in. Slash-free patterns are where the
+    two deliberately part company, and that is the test below rather than a gap here.
+    """
+    root = _repository(tmp_path, pattern)
+
+    assert await _walked(root, pattern) == _unignored(root)
+
+
+async def test_a_pattern_is_root_relative_even_where_gitignore_would_match_at_any_depth(
+    tmp_path: Path,
+) -> None:
+    """The one deliberate divergence, pinned rather than left to be discovered.
+
+    ``.gitignore`` has two rules: a pattern with a separator is relative to the directory, and a
+    pattern without one matches at *any* depth. So ``README.md`` there hides every README in the
+    tree. Here there is one rule — every pattern is relative to the root, as though it had been
+    written with a leading separator — and that is what makes the second case in #379 sayable at
+    all: a ``README.md`` *about* the corpus, at the top, with the READMEs inside it left alone.
+
+    Asserted against git in the same breath, because "we differ from git here" is a claim that
+    rots the moment either side changes, and a comment saying so would not notice.
+    """
+    root = _repository(tmp_path, "README.md")
+
+    walked = await _walked(root, "README.md")
+
+    assert "README.md" not in walked, "the one named at the root goes"
+    assert "docs/README.md" in walked, "and the one below it stays"
+    assert "docs/README.md" not in _unignored(root), "where git would have taken it too"
 
 
 def test_filesystem_configuration_is_closed_and_canonical(tmp_path: Path) -> None:

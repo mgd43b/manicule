@@ -54,6 +54,32 @@ def test_a_pattern_does_not_match_a_path_it_merely_resembles(path: str, pattern:
     assert not globs.matches(path, pattern)
 
 
+@pytest.mark.parametrize(
+    ("pattern", "here", "deeper", "recursive"),
+    [
+        ("*.md", "retry.md", "notes/retry.md", "**/*.md"),
+        ("notes/*.md", "notes/retry.md", "notes/deep/retry.md", "notes/**/*.md"),
+        ("archive/*", "archive/old.md", "archive/deep/old.md", "archive/**"),
+    ],
+)
+def test_a_single_star_stops_at_a_separator(
+    pattern: str, here: str, deeper: str, recursive: str
+) -> None:
+    """``*`` is one path segment, which is the whole difference between a level and a subtree.
+
+    ``fnmatch`` translates ``*`` to ``.*``, which spans ``/`` — so ``archive/*`` silently meant
+    the entire subtree and ``*.md`` meant every Markdown file in the corpus. An operator who
+    writes ``archive/*`` and gets the subtree has been given something they did not ask for, and
+    on an ``exclude`` that is content disappearing from the index without being named.
+
+    ``**`` is how the subtree is asked for, and it still crosses separators — the pair is the
+    point, and a matcher with only one of them cannot express both.
+    """
+    assert globs.matches(here, pattern)
+    assert not globs.matches(deeper, pattern)
+    assert globs.matches(deeper, recursive), "and `**` is how the subtree is asked for"
+
+
 def test_no_patterns_match_nothing() -> None:
     """The default for a connector that ships none, so it is the case that runs most often."""
     assert not globs.matches_any("anything/at/all.md", ())

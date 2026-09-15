@@ -18,7 +18,9 @@ function decide a Git blob path, a walked directory and a file that does not exi
 
 from __future__ import annotations
 
-import fnmatch
+import glob
+import re
+from functools import lru_cache
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
@@ -59,16 +61,37 @@ def path_glob(value: str) -> str:
     return value
 
 
-def matches(path: str, pattern: str) -> bool:
-    """Match POSIX globs, including the useful zero-directory meaning of ``**/``.
+@lru_cache(maxsize=1_024)
+def _matcher(pattern: str) -> re.Pattern[str]:
+    """One pattern compiled, kept because every pattern is tested against every path.
 
-    ``fnmatch`` alone reads ``**/drafts/**`` as requiring at least one directory before
-    ``drafts``, so a top-level ``drafts/`` would survive a pattern written to catch drafts
-    anywhere. The second test is that missing case, and nothing else.
+    Bounded rather than unbounded: patterns come from configuration, so the live set is a
+    handful, and a cap means a caller that ever passes arbitrary text cannot grow this without
+    limit. :func:`glob.translate` sanitizes a malformed bracket expression rather than emitting
+    a regex that will not compile, so a pattern that passed :func:`path_glob` cannot raise here.
     """
-    return fnmatch.fnmatchcase(path, pattern) or (
-        pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:])
-    )
+    return re.compile(glob.translate(pattern, recursive=True, include_hidden=True, seps="/"))
+
+
+def matches(path: str, pattern: str) -> bool:
+    """Whether ``pattern`` names ``path``, reading the glob the way a POSIX shell does.
+
+    **``*`` stops at ``/`` and ``**`` crosses it.** So ``archive/*`` is the one level and
+    ``archive/**`` is the subtree, and ``*.md`` is the Markdown at the top rather than every
+    ``.md`` in the corpus. That is what anybody writing the pattern means, and it is the
+    difference between an exclusion that names a directory and one that quietly reaches into
+    every directory under it.
+
+    ``**/`` matches zero directories as well as more, so ``**/drafts/**`` catches a top-level
+    ``drafts/`` too. That used to need a special case here, spelled as a second ``fnmatch``
+    against the pattern with its ``**/`` removed; the recursive translation has the meaning
+    built in, so the special case is gone rather than merely working.
+
+    ``include_hidden`` is on because whether a dot-file is a document is the connector's
+    question, not the matcher's — the filesystem connector has a setting for it, and a glob
+    that silently refused to match ``.github/**`` would be answering it from here.
+    """
+    return _matcher(pattern).match(path) is not None
 
 
 def matches_any(path: str, patterns: Sequence[str]) -> bool:
