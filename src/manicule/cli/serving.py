@@ -116,12 +116,19 @@ def serve_forever(
     reported the same way every other failure is.
 
     ``allow_unauthenticated`` is ``--no-authentication``, and it satisfies the third of those
-    three rather than skipping the policy. It is carried to the **runtime** — the earliest
-    refusal, in ``build_container`` — and then to the bind, to the application, and to the
-    service, the last so ``manicule doctor`` run *inside* this process can say that serving
-    unauthenticated was deliberate rather than only that it is happening. It defaults to
-    ``False`` because this function is public and a caller written before it existed must keep
-    getting the authenticated behavior rather than a ``TypeError``.
+    three rather than skipping the policy. It is carried to exactly the places that refuse:
+    :func:`~manicule.app.bind.resolve_bind`, which decides an address, and
+    :func:`~manicule.api.app.build_app`, which decides whether an application may exist. It also
+    reaches the service, so ``manicule doctor`` run *inside* this process can say that serving
+    unauthenticated was deliberate rather than only that it is happening.
+
+    **Not to the runtime**, and that absence is the point rather than an omission. The bind rule
+    briefly lived in ``Settings.policy_problems`` as well, which ``build_container`` raises on
+    for *every* command — so a pod whose server runs this way could not run ``manicule doctor``
+    inside it. A rule about what may listen is enforced where something listens.
+
+    It defaults to ``False`` because this function is public and a caller written before it
+    existed must keep getting the authenticated behavior rather than a ``TypeError``.
 
     ``--transport http`` serves the **HTTP API, the browser surface and MCP together**, on one
     port; ``--mcp-only`` serves MCP alone over that socket. ``stdio`` is MCP whatever else was
