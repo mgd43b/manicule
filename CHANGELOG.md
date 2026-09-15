@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/mgd43b/manicule/compare/v0.2.0...v0.2.1) (2026-09-15)
+
+
+### Bug Fixes
+
+* **plugins:** admit manicule 0.2, which every plugin refused ([#370](https://github.com/mgd43b/manicule/issues/370)) ([14a82d5](https://github.com/mgd43b/manicule/commit/14a82d5ac6b48dc2ee512d0bd51ac0b7f720cc1a))
+
 ## [0.2.0](https://github.com/mgd43b/manicule/compare/v0.1.23...v0.2.0) (2026-09-15)
 
 
