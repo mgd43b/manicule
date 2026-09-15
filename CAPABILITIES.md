@@ -127,8 +127,10 @@ declined catch-all `run-command` surface; that item is not a registered MCP tool
 tool is *absent* from that surface rather than refused on it — see
 [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are unreachable from a
 network by construction, and a socket has to replace that property rather than assume it;
-authoring is the one exception, bounded by configuration and refused to a caller who is not an
-authenticated member.
+authoring is the one exception, bounded by configuration and gated by a **member floor** rather
+than by authentication itself. A viewer key does not clear that floor. An anonymous caller on an
+installation with `security.auth.mode = none` does, because that mode resolves them to an
+administrator — which is what `--no-authentication` on a network bind hands out.
 
 - [x] `ask`
 - [x] `collection_add`
