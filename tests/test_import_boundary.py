@@ -433,6 +433,11 @@ def _modules_added_by_a_qdrant_runtime() -> set[str]:
     ``Runtime(settings)`` rather than ``Runtime.open()``: ``open`` calls ``load_settings()``,
     which would read the developer's own configuration into an isolated subprocess and make the
     result depend on the machine.
+
+    The endpoint is a port nothing can be listening on, and that is not fussiness. Since #377 a
+    derived reset on this backend *runs*, and finishing it means dropping the collections the
+    workspace owns — so an endpoint a developer might actually have a Qdrant on would make this
+    test delete their corpus in the course of checking an import.
     """
     script = (
         "import asyncio, json, sys, tempfile\n"
@@ -446,7 +451,7 @@ def _modules_added_by_a_qdrant_runtime() -> set[str]:
         '            "data_dir": str(Path(tmp) / "data"),\n'
         '            "storage": {\n'
         '                "vector_db": "qdrant",\n'
-        '                "vector_db_url": "http://127.0.0.1:6333",\n'
+        '                "vector_db_url": "http://127.0.0.1:1",\n'
         "            },\n"
         "        })\n"
         "        async with Runtime(settings) as runtime:\n"
@@ -456,15 +461,16 @@ def _modules_added_by_a_qdrant_runtime() -> set[str]:
         "            await runtime.vector_directory()\n"
         "            ingestion = await runtime.ingestion()\n"
         '            await ingestion.reembed_status("no-such-run")\n'
-        "            refused = ''\n"
+        "            reached = ''\n"
         "            try:\n"
         "                await maintenance.reset_derived()\n"
         "            except Exception as error:\n"
-        "                refused = str(error)\n"
-        "            if 'publication-aware' not in refused:\n"
+        "                reached = type(error).__module__\n"
+        "            if not reached.startswith('qdrant_client'):\n"
         "                raise AssertionError(\n"
-        "                    'reset_derived did not refuse the qdrant backend, so the import '\n"
-        "                    'check below never reached its guard: ' + (refused or 'it returned')\n"
+        "                    'the derived reset did not get as far as the configured backend, '\n"
+        "                    'so the import check below never reached the paths it is about: '\n"
+        "                    + (reached or 'it returned')\n"
         "                )\n"
         "            await runtime.invalidate_derived_runtime()\n"
         "asyncio.run(main())\n"
@@ -498,11 +504,17 @@ def test_a_qdrant_runtime_never_loads_the_embedded_backend() -> None:
 
     Every path driven here is one a Qdrant installation reaches normally: the first ``vectors()``
     call, the index-state report behind ``index_status``, the vector directory, the *ungated*
-    ``reembed_status`` that three surfaces expose, the derived reset — which must refuse, and is
-    asserted to, so that a green run means the guard was reached rather than that nothing ran —
-    and the shutdown that runs on every exit. A
-    capability is asked of the object through a protocol in ``manicule.core.protocols``; the
-    backend's module is imported only once its own store is what the container built.
+    ``reembed_status`` that three surfaces expose, the derived reset, and the shutdown that runs
+    on every exit. A capability is asked of the object through a protocol in
+    ``manicule.core.protocols``; the backend's module is imported only once its own store is what
+    the container built.
+
+    The reset is asserted to fail *inside* ``qdrant_client``, which is what makes a green run
+    mean something. It used to be asserted to refuse — and once #377 made it run instead, an
+    assertion that it refused would have started passing for the wrong reason the moment
+    anything earlier raised, certifying a boundary no line of code had crossed. Failing at the
+    dead endpoint proves the reset went all the way to the configured backend and reached it
+    without loading the other one.
     """
     loaded = _modules_added_by_a_qdrant_runtime()
     leaked = sorted(

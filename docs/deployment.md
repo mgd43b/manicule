@@ -899,6 +899,13 @@ that, because the hydrating join admits only document ids the local authority kn
 else does. `manicule index` reports the union, and the second installation to prepare a
 workspace is refused outright when its embedder differs from the first's.
 
+What sharing a prefix does *not* do is let one installation's `reset-index` delete another's
+collections, and that holds even for the awkward case where one prefix contains the other —
+`foo` and `foo_<the first installation's workspace digest>`. A reset matches a collection's
+whole name against the naming rule above rather than its opening, so a name only belongs to a
+workspace when its digest is immediately followed by the `chunks__<fp8>` segment; another
+installation's name always has its own workspace digest in between (`storage.md` §6.7).
+
 `storage.qdrant.api_key` is a secret, and is also read from the `QDRANT_API_KEY` environment
 variable when the setting itself is left unset — so a credential need not be written into the
 config file at all.

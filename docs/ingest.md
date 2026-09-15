@@ -1694,6 +1694,17 @@ The distinction is the publication boundary. A repair deliberately commits one d
 time, while a generation rebuild keeps its document, chunk, glossary, FTS and vector output
 beside the active corpus until the complete replacement validates.
 
+That boundary is also the backend requirement, and it is asked about before the run. A rebuild
+stages its chunks into a publication of their own and proves that publication complete before
+anything is made live, so a store holding one row per chunk has nothing for it to count, copy or
+retire; `storage.vector_db = "qdrant"` is that store today. The refusal names the backend and
+happens while the plan is being assembled, rather than arriving as a missing method at the first
+validation — which is after the corpus has been parsed and embedded. It is a capability check
+and not a check on the configured name, because nothing downstream of it reaches into a
+particular backend's storage: a plugin that genuinely implements the publication surface can
+genuinely run this. Re-indexing the sources rebuilds the same derived state without a second
+generation, and is the route for a backend without one.
+
 The only source inputs are the newest promoted acquisition manifests for the workspace's
 connector scopes. The runner accepts a read-only blob source and has no connector dependency,
 fetch method or source-crawl fallback. Planning verifies every manifest once, pages them in a
@@ -1950,6 +1961,22 @@ vector handles recheck it after acquiring their physical generation pin; and the
 fingerprint/stage/publication transactions take an epoch CAS while holding SQLite's writer lock.
 The same-process mutation guard spans the complete external-vector-to-SQLite publication gap.
 Repeating a completed reset is a zero-change success.
+
+None of that turns on which vector backend is configured. The tombstone ledger is relational and
+deletion by physical row id is the one thing every store does, so the exact row cleanup above is
+the same work on any of them; what differs is the last step. The embedded backend's storage is a
+directory this runtime owns and removes itself — except the shared upgrade-era root, which other
+workspaces still index into and which is therefore left standing while one of them remains. Every
+other backend is asked to discard its own, because manicule holds a client rather than a
+filesystem ([`storage.md`](storage.md) §6.7), and a store offering no way to be asked has its
+rows deleted and reports `vector_store_removed` false. The obsolete-generation cleanup folded
+into a reset follows the same three cases: it retires each publication by name where the
+backend can; on a backend whose whole storage is about to be discarded it does not ask, because
+the discard takes those rows with it; and on one that can do neither it leaves the generation
+ledger standing and reports no publications removed. That last case is the rule the other two
+serve — a reset removes what it can and says what it removed, and the record of rows it could
+not remove is the one thing it must not delete, because that record is what a later cleanup on
+a capable backend would work from.
 
 Generation cleanup selects only `failed`, `canceled`, or superseded `published` generations.
 The newest published generation, every publication still named by a live document, and every

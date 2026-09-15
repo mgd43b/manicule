@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
 
@@ -42,6 +43,7 @@ from manicule.plugins import ENTRY_POINT_GROUP, installed_entry_points
 from manicule.plugins.manifest import ComponentKind
 from manicule.plugins.registry import discover
 from manicule.storage.config import DOC_STORE_NAME, VECTOR_STORE_NAME
+from tests.ingest import fakes
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator
@@ -459,77 +461,135 @@ async def test_resetting_an_empty_index_is_not_an_error(runtime: Runtime) -> Non
     assert reset.vectors_removed is False
 
 
-async def test_custom_vector_backend_reset_refuses_before_relational_retirement(
+class _UnwrappedBackendRuntime:
+    """A runtime whose vector handle is whatever a test hands it, rather than what it would build.
+
+    The reset path resolves four things from a runtime — the document store, the vector handle,
+    the vector directory and the derived-mutation guard — so a fake of exactly those drives it
+    honestly, and is the only way to present a handle the container would never have built. Which
+    is the case under test: a plugin registered under a backend's name, and a backend that is not
+    the embedded one.
+    """
+
+    def __init__(
+        self,
+        documents: object,
+        vectors: object,
+        directory: Path,
+        *,
+        vector_db: str = VECTOR_STORE_NAME,
+    ) -> None:
+        self.settings = (
+            Settings()
+            if vector_db == VECTOR_STORE_NAME
+            else Settings.model_validate(
+                {"storage": {"vector_db": vector_db, "vector_db_url": "http://127.0.0.1:6333"}}
+            )
+        )
+        self._documents = documents
+        self._vectors = vectors
+        self._directory = directory
+        self.invalidated = False
+
+    @asynccontextmanager
+    async def derived_mutation_guard(self) -> AsyncGenerator[None]:
+        yield
+
+    async def documents(self) -> object:
+        return self._documents
+
+    async def vectors(self) -> object:
+        return self._vectors
+
+    async def vector_directory(self) -> Path:
+        return self._directory
+
+    async def invalidate_derived_runtime(self) -> None:
+        self.invalidated = True
+
+
+class _SweepRecordingVectors(fakes.MemoryVectors):
+    """Records the row ids a reset asked it to delete, and nothing else about them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.swept: list[str] = []
+
+    @override
+    async def delete_chunks(self, chunk_ids: list[str]) -> None:
+        self.swept.extend(chunk_ids)
+        await super().delete_chunks(chunk_ids)
+
+
+async def test_a_plugin_handle_under_the_built_in_name_resets_without_reaching_lance_storage(
     runtime: Runtime,
     tmp_path: Path,
 ) -> None:
-    from contextlib import asynccontextmanager  # noqa: PLC0415
+    """The two halves of the gate disagree here, and the reset runs on the half that is true.
 
-    from tests.ingest import fakes  # noqa: PLC0415
+    ``storage.vector_db`` names the embedded backend and the handle is not the
+    publication-following one — a store some plugin registered under that name. That used to
+    refuse the reset outright, which is #377: the one operation an operator reaches for when a
+    derived index needs rebuilding was the operation an alternative backend could not run.
+
+    What must still hold is the half that was worth holding. No shadow generation tree is opened
+    and no directory is removed, because neither belongs to this store; the rows go through the
+    same deletion by row id a vector sweep uses.
+    """
     from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
 
     store = cast("Any", await runtime.documents())
-    document = make_document(source_id="custom-backend-preserved")
+    document = make_document(source_id="plugin-handle-reset")
     await store.upsert_document(document)
-    await store.replace_chunks(document.id, [make_chunk(document, 0, "preserve me")])
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "sweep me")])
 
-    class CustomBackendRuntime:
-        # Configured for the built-in backend on purpose, so the refusal under test is the one
-        # made about the *handle* rather than the one made about the configured name. A store
-        # registered under `lancedb` that is not the publication-following handle is exactly
-        # the case the isinstance half exists to catch.
-        settings = Settings()
+    vectors = _SweepRecordingVectors()
+    directory = tmp_path / "custom-vectors"
+    backend = _UnwrappedBackendRuntime(store, vectors, directory)
 
-        @asynccontextmanager
-        async def derived_mutation_guard(self) -> AsyncGenerator[None]:
-            yield
+    outcome = await _Maintenance(cast("Runtime", backend)).reset_index()
 
-        async def documents(self) -> object:
-            return store
-
-        async def vector_directory(self) -> Path:
-            return tmp_path / "custom-vectors"
-
-        async def vectors(self) -> object:
-            return fakes.MemoryVectors()
-
-    maintenance = _Maintenance(cast("Runtime", CustomBackendRuntime()))
-    with pytest.raises(ManiculeError, match="publication-aware vector backend"):
-        await maintenance.reset_index()
-
-    assert await store.get_document(document.id) is not None
-    assert await store.count_chunks() == 1
+    assert outcome.chunks == 1
+    assert outcome.vector_rows == 1, "the tombstoned row was not offered to the store"
+    assert vectors.swept, "the reset deleted no rows through the backend-agnostic surface"
+    assert outcome.vector_store_removed is False, (
+        "this store offers no way to discard its storage, and the report has to say so"
+    )
+    assert not directory.exists(), "a directory belonging to no configured backend was created"
+    assert await store.count_chunks() == 0
+    assert backend.invalidated
 
 
-async def test_reset_refuses_a_publication_shaped_store_on_a_non_lance_backend(
+async def test_a_publication_shaped_store_on_a_non_lance_backend_is_swept_rather_than_bound(
     runtime: Runtime,
     tmp_path: Path,
 ) -> None:
-    """Satisfying the protocol is not enough; the configured backend has to be the Lance one.
+    """Satisfying the protocol is not enough; the bound deletion belongs to the configured backend.
 
     ``isinstance`` against a ``runtime_checkable`` protocol checks that methods exist by name and
     nothing about what they do, so a third-party store offering a publication surface of its own
-    matches ``PublicationBoundVectorStore`` structurally. What reset goes on to do after the
-    check is not backend-agnostic — it builds ``LanceShadowGenerations`` over a Lance directory
-    and then deletes that directory — so passing on the protocol alone would mean a custom
-    backend's reset manipulating Lance's on-disk generations while its own storage kept every
-    row it was asked to drop.
+    matches ``PublicationBoundVectorStore`` structurally. The ``vector_table`` those deletions
+    take is Lance's live generation, read off SQLite's pointer — a name that means nothing to a
+    store which never wrote one, and everything to the handle that did.
 
-    The store here is deliberately a *good* structural match. The refusal has to come from the
-    configured name.
+    So the shape does not license the bound call. The reset still happens; it happens through the
+    row-id deletion every backend has, and the store here is deliberately a *good* structural
+    match so that the assertion is about the configured name and not about a missing method.
     """
-    from contextlib import asynccontextmanager  # noqa: PLC0415
-
     from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
     from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
 
     store = cast("Any", await runtime.documents())
-    document = make_document(source_id="publication-shaped-preserved")
+    document = make_document(source_id="publication-shaped-swept")
     await store.upsert_document(document)
-    await store.replace_chunks(document.id, [make_chunk(document, 0, "preserve me")])
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "sweep me too")])
 
-    class PublicationShapedStore:
+    class PublicationShapedStore(_SweepRecordingVectors):
         """Every method ``PublicationBoundVectorStore`` declares, and none of Lance's storage."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.bound: list[object] = []
 
         async def teardown(self) -> None: ...
         async def publication_row_count(self, publication_id: str) -> int: ...
@@ -538,37 +598,287 @@ async def test_reset_refuses_a_publication_shaped_store_on_a_non_lance_backend(
         async def publication_is_complete(self, *args: Any, **kwargs: Any) -> bool: ...
         async def publication_page_is_complete(self, *args: Any, **kwargs: Any) -> bool: ...
         async def copy_publication(self, *args: Any, **kwargs: Any) -> None: ...
-        async def delete_bound_chunks(self, *args: Any, **kwargs: Any) -> int: ...
-        async def delete_bound_publication(self, *args: Any, **kwargs: Any) -> int: ...
 
-    assert isinstance(PublicationShapedStore(), PublicationBoundVectorStore), (
-        "this store must match the protocol, or the test is asserting the wrong refusal"
+        async def delete_bound_chunks(self, *args: Any, **kwargs: Any) -> int:
+            self.bound.append(args)
+            return 0
+
+        async def delete_bound_publication(self, *args: Any, **kwargs: Any) -> int:
+            self.bound.append(args)
+            return 0
+
+    vectors = PublicationShapedStore()
+    assert isinstance(vectors, PublicationBoundVectorStore), (
+        "this store must match the protocol, or the test is asserting the wrong thing"
     )
 
-    class QdrantConfiguredRuntime:
-        settings = Settings.model_validate(
-            {"storage": {"vector_db": "qdrant", "vector_db_url": "http://127.0.0.1:6333"}}
-        )
+    backend = _UnwrappedBackendRuntime(
+        store, vectors, tmp_path / "qdrant-configured-vectors", vector_db="qdrant"
+    )
+    outcome = await _Maintenance(cast("Runtime", backend)).reset_index()
 
-        @asynccontextmanager
-        async def derived_mutation_guard(self) -> AsyncGenerator[None]:
-            yield
+    assert outcome.chunks == 1
+    assert vectors.bound == [], "a structural match licensed a deletion naming Lance's generation"
+    assert vectors.swept, "the rows were not deleted by the surface every backend has"
+    assert await store.count_chunks() == 0
 
-        async def documents(self) -> object:
-            return store
 
-        async def vector_directory(self) -> Path:
-            return tmp_path / "qdrant-configured-vectors"
+async def test_a_backend_that_cannot_delete_a_row_is_refused_before_anything_is_retired(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    """The one reset that still refuses, and it refuses while the index is intact.
 
-        async def vectors(self) -> object:
-            return PublicationShapedStore()
+    A store with no deletion by row id cannot have its derived index reset at all, and the order
+    is the point: retiring relational visibility first and discovering that afterwards would
+    leave an emptied catalog in front of a full vector store — a worse position than either
+    outcome the operator could have been given.
+    """
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
 
-    maintenance = _Maintenance(cast("Runtime", QdrantConfiguredRuntime()))
-    with pytest.raises(ManiculeError, match="publication-aware vector backend"):
-        await maintenance.reset_index()
+    store = cast("Any", await runtime.documents())
+    document = make_document(source_id="undeletable-backend")
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "preserve me")])
+
+    class UndeletableStore:
+        """A plugin's store that can be written to and never selectively emptied."""
+
+        async def ensure_ready(self, *args: Any, **kwargs: Any) -> None: ...
+        async def fingerprint(self) -> None: ...
+        async def upsert(self, *args: Any, **kwargs: Any) -> None: ...
+        async def stored_vectors(self, *args: Any, **kwargs: Any) -> dict[str, Any]: ...
+        async def search(self, *args: Any, **kwargs: Any) -> list[Any]: ...
+        async def count(self) -> int: ...
+
+    backend = _UnwrappedBackendRuntime(
+        store, UndeletableStore(), tmp_path / "undeletable-vectors", vector_db="qdrant"
+    )
+    with pytest.raises(ManiculeError, match="no deletion by row id"):
+        await _Maintenance(cast("Runtime", backend)).reset_index()
 
     assert await store.get_document(document.id) is not None
     assert await store.count_chunks() == 1
+
+
+async def test_a_reset_discards_the_storage_the_rows_were_deleted_from(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    """Deleting the rows is not the whole of a reset on a backend manicule only holds a client to.
+
+    What a tombstone cannot name is the storage around the rows — on a server backend, the
+    collection and the fingerprint recorded beside it. Leaving the record standing is what made
+    the next ingest under a different model refuse against an index the reset had emptied, so a
+    reset that swept the rows and stopped there was not a reset an operator could use (#377).
+    """
+    from tests.storage_helpers import make_chunk, make_document  # noqa: PLC0415
+
+    store = cast("Any", await runtime.documents())
+    document = make_document(source_id="discarded-storage")
+    await store.upsert_document(document)
+    await store.replace_chunks(document.id, [make_chunk(document, 0, "and then the collection")])
+
+    class DiscardableStore(_SweepRecordingVectors):
+        """A store that owns storage the caller cannot reach, and can be asked to drop it."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.discarded = 0
+
+        async def reset_storage(self) -> bool:
+            self.discarded += 1
+            return True
+
+    vectors = DiscardableStore()
+    backend = _UnwrappedBackendRuntime(
+        store, vectors, tmp_path / "server-backed-vectors", vector_db="qdrant"
+    )
+    outcome = await _Maintenance(cast("Runtime", backend)).reset_index()
+
+    assert vectors.discarded == 1, "the storage the rows lived in was left standing"
+    assert vectors.swept, "the rows should still go individually; the discard is what follows"
+    assert outcome.vector_store_removed is True
+    assert outcome.chunks == 1
+    assert await store.count_chunks() == 0
+
+
+async def _stage_obsolete_generation(runtime: Runtime, publication_id: str) -> None:
+    """Leave one failed rebuild generation behind, with vectors of its own to retire.
+
+    Written straight into the tables because the shape is the point and not the route: a
+    generation whose rebuild failed is obsolete, and its staged publication is rows a cleanup
+    still has to remove. Driving a rebuild to failure would establish the same two columns and
+    take a snapshot, a corpus and an embedder to do it.
+    """
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from manicule.core.acquisition import AcquisitionRunState  # noqa: PLC0415
+    from manicule.core.rebuild import RebuildState  # noqa: PLC0415
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+    await runtime.documents()
+    now = datetime.now(UTC)
+    async with session_factory(runtime.require_engine()).begin() as session:
+        session.add(
+            models.Connector(
+                id="staged", workspace_id=runtime.workspace, name="staged", type="fs", config={}
+            )
+        )
+        await session.flush()
+        session.add(
+            models.AcquisitionRun(
+                id="staged-snapshot",
+                workspace_id=runtime.workspace,
+                connector_id="staged",
+                connector_name="staged",
+                source_scope="all",
+                scope_fingerprint="scope-v1",
+                state=AcquisitionRunState.SETTLED,
+                promoted_at=now,
+                acquisition_completed_at=now,
+                membership_hash="members",
+            )
+        )
+        await session.flush()
+        session.add(
+            models.DerivedGeneration(
+                id="abandoned",
+                workspace_id=runtime.workspace,
+                snapshot_run_id="staged-snapshot",
+                snapshot_membership_hash="members",
+                expected_item_count=0,
+                target_digest="abandoned",
+                publication_identity_digest="abandoned",
+                target={},
+                state=RebuildState.FAILED,
+                vector_publication_id=publication_id,
+            )
+        )
+
+
+async def test_generation_cleanup_on_a_backend_with_no_publications_finds_nothing_to_refuse(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    """A capability nothing needs is not a capability worth refusing over.
+
+    Obsolete generations are written by an offline rebuild, so an installation that has never
+    run one has none — and the check that used to run before the walk refused the operation, and
+    every derived reset that calls it, over work that did not exist. The same shape as the bind
+    policy that refused commands which never bind (#375).
+    """
+    vectors = _SweepRecordingVectors()
+    backend = _UnwrappedBackendRuntime(
+        await runtime.documents(), vectors, tmp_path / "unpublished", vector_db="qdrant"
+    )
+
+    outcome = await _Maintenance(cast("Runtime", backend)).cleanup_derived_generations()
+
+    assert outcome.removed_items == 0
+    assert outcome.released_bytes == 0
+
+
+async def test_generation_cleanup_refuses_the_publication_it_cannot_actually_retire(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    """And when there *is* one, the refusal is still there and says which backend it is about.
+
+    Moving a check from before the walk to the row that needs it is only correct if the check
+    still fires. This is the half that proves the first test is about timing rather than about a
+    guard somebody deleted.
+    """
+    await _stage_obsolete_generation(runtime, "abandoned-vectors")
+    backend = _UnwrappedBackendRuntime(
+        await runtime.documents(),
+        _SweepRecordingVectors(),
+        tmp_path / "unpublished",
+        vector_db="qdrant",
+    )
+
+    with pytest.raises(ManiculeError, match="delete a publication by name"):
+        await _Maintenance(cast("Runtime", backend)).cleanup_derived_generations()
+
+
+async def test_a_reset_discards_storage_rather_than_retiring_publications_first(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    """The reset does not need the capability the standalone cleanup does, and must not ask.
+
+    Its next act is to discard the whole of this workspace's vector storage, which takes the
+    generation's rows with it. Asking for each publication by name first would be requests made
+    to a collection about to stop existing — and would put a refusal in front of the one
+    operation that was supposed to get an installation unstuck.
+    """
+    await _stage_obsolete_generation(runtime, "abandoned-vectors")
+
+    class DiscardingStore(_SweepRecordingVectors):
+        async def reset_storage(self) -> bool:
+            return True
+
+    backend = _UnwrappedBackendRuntime(
+        await runtime.documents(), DiscardingStore(), tmp_path / "server", vector_db="qdrant"
+    )
+
+    outcome = await _Maintenance(cast("Runtime", backend)).reset_index()
+
+    assert outcome.publications == 1, "the obsolete generation was not cleaned up relationally"
+    assert outcome.vector_store_removed is True
+
+
+async def test_a_reset_that_cannot_discard_storage_keeps_the_ledger_naming_what_survives(
+    runtime: Runtime,
+    tmp_path: Path,
+) -> None:
+    """The mirror of the test above, and why one answer decides both halves.
+
+    Leaving a publication to the discard is only safe because the storage it lives in is about
+    to go. A backend that can neither retire a publication by name nor be asked to drop its own
+    storage gets neither deal: the generation's ledger row is the last thing that knows those
+    rows exist, and deleting it while they survive turns a cleanup somebody could still run into
+    a corpus of vectors nothing will ever name again.
+    """
+    await _stage_obsolete_generation(runtime, "abandoned-vectors")
+    backend = _UnwrappedBackendRuntime(
+        await runtime.documents(),
+        _SweepRecordingVectors(),
+        tmp_path / "unresettable",
+        vector_db="qdrant",
+    )
+
+    outcome = await _Maintenance(cast("Runtime", backend)).reset_index()
+
+    assert outcome.publications == 0
+    assert outcome.vector_store_removed is False
+    still_eligible = await _Maintenance(cast("Runtime", backend)).plan_derived_generation_cleanup()
+    assert still_eligible.eligible_items == 1, (
+        "the obsolete generation was forgotten by a reset that could not remove its rows"
+    )
+
+
+def test_an_offline_rebuild_refuses_a_backend_that_groups_no_publications(
+    tmp_path: Path,
+) -> None:
+    """Named before the run, rather than found by an ``AttributeError`` in the middle of one.
+
+    A rebuild stages a whole generation into a publication of its own and proves that
+    publication complete before anything is made live, so on a store holding one row per chunk
+    the first validation reached for a method that was not there — after the corpus had been
+    parsed and embedded. The capability rather than the configured name, because nothing
+    downstream of this reaches into a particular backend's storage.
+    """
+    backend = _UnwrappedBackendRuntime(
+        None, _SweepRecordingVectors(), tmp_path / "unpublished", vector_db="qdrant"
+    )
+    ingestion = _Ingestion(cast("Runtime", backend))
+
+    with pytest.raises(ManiculeError, match="no publication to count, validate or copy"):
+        ingestion._require_publication_inventory(  # pyright: ignore[reportPrivateUsage]
+            cast("Any", _SweepRecordingVectors())
+        )
 
 
 async def test_a_publication_shaped_third_party_store_is_handed_back_unwrapped(
