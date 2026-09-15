@@ -410,6 +410,23 @@ class FakeOrganization:
             key=lambda item: item.name,
         )
 
+    async def count_uncollected(self, *, source: str | None = None) -> int:
+        """Live documents this fake's manual memberships do not cover.
+
+        Manual-only for the reason :meth:`collections_for` gives, and the complement is the
+        half of that decision worth restating: with no collections here the count is every
+        document, which is the state ``doctor``'s ``collection-membership`` check exists to
+        report and the one these tests drive it through. What the fake cannot say is whether a
+        *rule* would have selected a document — ``assert_collection_store_contract`` holds the
+        real store to that, against the same SQL clause the listings use.
+        """
+        held = {identifier for members in self.members.values() for identifier in members}
+        return sum(
+            1
+            for document in self.documents.values()
+            if document.id not in held and (source is None or document.source == source)
+        )
+
     def _require_collection(self, collection_id: str) -> DocumentCollection:
         existing = self.collections.get(collection_id)
         if existing is None:

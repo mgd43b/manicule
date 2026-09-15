@@ -162,6 +162,96 @@ async def test_a_collection_never_lists_a_member_that_is_in_the_trash(
     assert not await store.collections_for(documents[0].id)
 
 
+async def test_a_workspace_with_no_collections_reports_every_document_as_uncollected(
+    store: SqliteDocStore,
+) -> None:
+    """The state issue #378 describes, and the one an empty disjunction has to get right.
+
+    A doc store rebuilt or restored without its collections holds every document and no
+    collection, so the predicate ``count_uncollected`` negates has no terms at all. SQL renders
+    an empty ``AND`` as true and an empty ``OR`` as false, and only one of those is the answer
+    here: getting it backwards reports a corpus that belongs to nothing as fully organized,
+    which is the exact reassurance that made the incident quiet.
+    """
+    documents = await _seed(store, 3)
+
+    assert not await store.list_collections(), "the fixture was supposed to have no collections"
+    assert await store.count_uncollected() == len(documents)
+
+
+async def test_the_uncollected_count_leaves_out_the_trash(store: SqliteDocStore) -> None:
+    """A deleted document is not a document in no collection; it is not in the corpus.
+
+    The same predicate every other read here applies. Without it the number climbs with every
+    deletion and ``doctor`` reports a growing organizational problem caused by tidying up.
+    """
+    documents = await _seed(store, 2)
+    await store.soft_delete_document(documents[0].id)
+
+    assert await store.count_uncollected() == 1
+
+
+async def test_the_uncollected_count_can_be_narrowed_to_one_source(
+    store: SqliteDocStore,
+) -> None:
+    """What a sync's report needs: this source's corpus, not the workspace's.
+
+    A workspace-wide figure printed under one connector's name moves when a different connector
+    runs, which makes it a fact about something the reader was not looking at.
+    """
+    await _seed(store, 2, source="confluence")
+    await _seed(store, 1, source="filesystem")
+
+    assert await store.count_uncollected() == 3
+    assert await store.count_uncollected(source="confluence") == 2
+    assert await store.count_uncollected(source="filesystem") == 1
+
+
+async def test_a_rule_takes_documents_out_of_the_uncollected_count_without_a_membership_row(
+    store: SqliteDocStore,
+) -> None:
+    """Membership is evaluated, so the complement of it has to be evaluated too.
+
+    A count over ``collection_documents`` alone is right on a corpus filed by hand and reports
+    every rule-driven one as unorganized — and a rule is how a synced document joins anything
+    at all, since nothing in the ingest path writes a membership row.
+    """
+    documents = await _seed(store, 2, source="confluence")
+    await _seed(store, 1, source="filesystem")
+    assert await store.count_uncollected() == 3
+
+    collection = await store.create_collection(
+        "wiki", rule=CollectionRule(sources=frozenset({"confluence"}))
+    )
+
+    assert await store.count_uncollected() == 1
+    members = {document.id for document in await store.collection_documents(collection.id)}
+    assert members == {document.id for document in documents}, (
+        "the count and the listing disagree about the same rule"
+    )
+
+
+async def test_a_document_a_rule_excludes_is_still_counted_as_uncollected(
+    store: SqliteDocStore,
+) -> None:
+    """The negated predicate must be false for a non-member, never unknown.
+
+    ``count_uncollected`` negates the membership clause, and ``NOT NULL`` is ``NULL`` — a row a
+    ``WHERE`` then drops. Every column a rule reads is ``NOT NULL`` today, so a document the
+    rule excludes evaluates false and is counted. If a nullable selector is ever added to
+    ``CollectionRule``, documents start vanishing from this number instead: reported as held by
+    the very collection that excludes them.
+    """
+    await _seed(store, 1, source="confluence")
+    await _seed(store, 2, source="filesystem")
+
+    await store.create_collection("wiki", rule=CollectionRule(sources=frozenset({"confluence"})))
+
+    assert await store.count_uncollected() == 2, (
+        "documents the rule excludes were not counted, which is what a NULL predicate looks like"
+    )
+
+
 async def test_a_membership_batch_naming_a_foreign_document_writes_nothing(
     store: SqliteDocStore, engine: AsyncEngine
 ) -> None:

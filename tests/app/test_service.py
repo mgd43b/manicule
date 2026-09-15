@@ -17,11 +17,12 @@ from typing import TYPE_CHECKING, Any, cast
 import huggingface_hub
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from manicule import vocabularies
 from manicule.app import results as r
 from manicule.app import service as service_module
-from manicule.app.ports import ResetOutcome
+from manicule.app.ports import Organizing, ResetOutcome
 from manicule.app.results import CheckState
 from manicule.app.service import (
     _IDENTITY_SAMPLE,  # pyright: ignore[reportPrivateUsage]
@@ -1972,6 +1973,154 @@ async def test_a_document_in_a_collection_is_not_an_orphan(
 
     assert reported.count == 0
     assert backend.store.deleted == []
+
+
+async def test_doctor_reports_a_corpus_that_has_no_collections_at_all(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The state a document store restored without its collections leaves behind.
+
+    Every other signal says the corpus is healthy: the documents are indexed, ``index --stats``
+    counts them, the sync that wrote them reported ``outcome complete``, and an unscoped search
+    answers perfectly. Only a *scoped* search fails, and it fails by refusing a name — so an
+    operator who does not happen to scope one is looking at a corpus that is silently narrower
+    than every collection-scoped question will assume.
+    """
+    document = next(iter(backend.store.documents.values()))
+    backend.organization_.documents[document.id] = document
+
+    check = _check(await service.doctor(), "collection-membership")
+
+    assert check.state == "degraded"
+    assert check.facts["collections"] == 0
+    assert check.facts["documents"] == 1
+    assert check.facts["uncollected"] == 1
+    assert "no collections at all" in check.detail
+    # The ambiguity is named rather than resolved: this is also what a corpus nobody organizes
+    # by collection looks like, and a check that guessed which would train a reader to skim it.
+    assert "reported rather than judged" in check.detail
+    assert check.remedy == "manicule collection list"
+
+
+async def test_doctor_does_not_call_a_partly_organized_corpus_unhealthy(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Amber is reserved for the state that is never right, and this is not that state.
+
+    Collections are optional and a corpus can be partly organized on purpose — the existing
+    orphan sweep says so in as many words. A check that went amber here would put a permanent
+    warning on every corpus anybody has indexed without filing all of it, which is how an
+    operator learns to skim ``doctor``. The number is the finding, so it is in the sentence and
+    in the facts, and the state stays ``ok``.
+    """
+    held, loose = _two_documents(backend)
+    collection = await backend.organization_.create_collection("alpha")
+    await backend.organization_.add_to_collection(collection.id, [held.id])
+
+    check = _check(await service.doctor(), "collection-membership")
+
+    assert check.state == "ok"
+    assert check.facts["uncollected"] == 1
+    assert check.facts["collections"] == 1
+    assert "1 of 2 document(s) belong to none" in check.detail
+    assert "manicule collection orphans" in check.detail
+    del loose
+
+
+async def test_doctor_is_clean_once_every_document_is_held(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The control, without which the checks above prove only that the fixture was empty."""
+    first, second = _two_documents(backend)
+    collection = await backend.organization_.create_collection("alpha")
+    await backend.organization_.add_to_collection(collection.id, [first.id, second.id])
+
+    check = _check(await service.doctor(), "collection-membership")
+
+    assert check.state == "ok"
+    assert check.facts["uncollected"] == 0
+    assert "every one of 2 document(s)" in check.detail
+
+
+async def test_doctor_says_nothing_is_indexed_rather_than_nothing_is_organized(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """A fresh install has no collections and no documents, and neither is a fault.
+
+    Without this branch the empty-collection-table finding fires on every machine between
+    ``manicule init`` and the first ingest, which is the one moment a person is most likely to
+    be reading ``doctor`` for the first time.
+    """
+    backend.store.documents.clear()
+
+    check = _check(await service.doctor(), "collection-membership")
+
+    assert check.state == "ok"
+    assert check.facts["documents"] == 0
+    assert "nothing is indexed" in check.detail
+
+
+async def test_doctor_reports_an_unreadable_store_as_unknown_not_as_no_collections(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """ "Could not be examined" is not "is empty", and the two look identical from here.
+
+    A store that will not open would otherwise produce the *loudest* finding this check has —
+    "no collections at all" — about a database nothing managed to read. That sends an operator
+    to recreate collections that are still there, and it is the same distinction
+    ``_permissions_check`` draws between an exposure and a path it could not stat.
+    """
+
+    async def refuse() -> Organizing:
+        msg = "the database is locked"
+        raise SQLAlchemyError(msg)
+
+    backend.organization = refuse
+
+    check = _check(await service.doctor(), "collection-membership")
+
+    assert check.state == "unknown"
+    assert check.facts["error_type"] == "SQLAlchemyError"
+    assert "could not be examined" in check.detail
+
+
+async def test_doctor_never_reports_more_uncollected_documents_than_documents(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Three statements, no lock across them, and a sentence that must stay possible.
+
+    A document indexed between the total and the uncollected count leaves the second above the
+    first, and the finding then reads "3 of 2 document(s)" — an impossible number in the output
+    an operator pastes into an issue. Reconciling costs one figure being a moment stale in a
+    race nobody will see; taking a lock to make a diagnostic self-consistent would not.
+    """
+    _two_documents(backend)
+    # A collection has to exist, or the empty-collection-table finding answers first and the
+    # sentence under test is never reached. It holds nothing, so every document is uncollected.
+    await backend.organization_.create_collection("alpha")
+    # A third document the organization store can see and the document store cannot: what the
+    # two counts see either side of an insert, so uncollected (3) exceeds the total (2).
+    extra = make_document(backend.workspace, source_id="third")
+    backend.organization_.documents[extra.id] = extra
+
+    check = _check(await service.doctor(), "collection-membership")
+
+    assert check.facts["uncollected"] == check.facts["documents"] == 2
+    assert "2 of 2 document(s)" in check.detail
+
+
+def _two_documents(backend: FakeBackend) -> tuple[Document, Document]:
+    """The fixture's document plus a second one, visible to both stores.
+
+    ``FakeBackend`` keeps the document store's corpus and the organization store's separately,
+    so a test about membership has to put a document in both — which is what the orphan-sweep
+    tests above already do one document at a time.
+    """
+    first = next(iter(backend.store.documents.values()))
+    second = backend.store.add(make_document(backend.workspace, source_id="second"))
+    for document in (first, second):
+        backend.organization_.documents[document.id] = document
+    return (first, second)
 
 
 async def test_renaming_reports_the_new_name_and_keeps_the_id(

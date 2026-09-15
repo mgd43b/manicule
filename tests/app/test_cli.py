@@ -1914,6 +1914,59 @@ def _ingest_output(capsys: pytest.CaptureFixture[str], *, ingested: int, error: 
     return " ".join(capsys.readouterr().out.split())
 
 
+def test_the_ingest_table_says_out_loud_when_a_run_landed_outside_every_collection(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A row is not enough for the one state this pair of numbers was added for.
+
+    "503 indexed, 0 failed, outcome complete" is a table a reader skims, and every number in it
+    is correct. The finding is that a collection-scoped search over the result reaches nothing,
+    so it gets a sentence under the table rather than a row inside it.
+    """
+    render.render_ingest(
+        render.console(),
+        r.IngestReport(
+            connector="memories", discovered=503, ingested=503, collected=0, uncollected=503
+        ),
+    )
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "in collections 0" in out
+    assert "in no collection 503" in out
+    assert "belong to any collection" in out
+
+
+def test_the_ingest_table_leaves_the_rows_out_when_nothing_counted_them(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Not measured is not zero, and printing "in no collection: 0" would claim it was.
+
+    Zero documents outside a collection is the healthy answer. A path that never asked must not
+    render the healthy answer, so both rows appear together or neither does.
+    """
+    render.render_ingest(
+        render.console(), r.IngestReport(connector="local", discovered=1, ingested=1)
+    )
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "in no collection" not in out
+    assert "in collections" not in out
+
+
+def test_a_partly_filed_run_prints_the_numbers_without_the_warning(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The control. Partial coverage is ordinary, and the sentence is for none-at-all."""
+    render.render_ingest(
+        render.console(),
+        r.IngestReport(connector="local", discovered=4, ingested=4, collected=3, uncollected=1),
+    )
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "in no collection 1" in out
+    assert "belong to any collection" not in out
+
+
 def test_cli_aggregate_views_render_effective_full_inventory_authority(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -939,9 +939,21 @@ async def assert_collection_store_contract(
         "a label typed with a trailing space is a second, invisible collection",
     )
 
+    # Measured either side of the two memberships below, so the assertion is about what those
+    # memberships changed rather than about a workspace this suite did not create.
+    uncollected_before = await store.count_uncollected()
+    loose = len([held for held in (first, second) if not await store.collections_for(held)])
+
     _require(
         await store.add_to_collection(collection.id, [first, second]) == _COLLECTION_SAMPLE,
         "add_to_collection did not report two new memberships",
+    )
+    _require(
+        await store.count_uncollected() == uncollected_before - loose,
+        f"count_uncollected did not fall by the {loose} document(s) that belonged to no "
+        f"collection until they were just added to one. It is the complement of membership, "
+        f"so a second, separate reading of what membership means is one that can disagree "
+        f"with the lists — and the number nobody can check is the one that gets believed",
     )
     _require(
         await store.add_to_collection(collection.id, [first]) == 0,
@@ -977,6 +989,11 @@ async def assert_collection_store_contract(
     _require(second not in remaining, "a removed document is still a member")
 
     await _assert_rule_membership(store, subject)
+    # The document whose membership was just removed, not the one still holding it. A subject a
+    # collection already holds cannot show that the count noticed a *rule*, because it was out
+    # of the count either way — which is how the first version of this helper passed against a
+    # store that counted only the join table.
+    await _assert_uncollected_count(store, await documents.get_document(second))
 
     await store.delete_collection(collection.id)
     _require(
@@ -1019,6 +1036,51 @@ async def _assert_rule_membership(store: CollectionStore, subject: Document | No
     finally:
         await store.delete_collection(ruled.id)
     await _assert_prefix_membership(store, subject)
+
+
+async def _assert_uncollected_count(store: CollectionStore, loose: Document | None) -> None:
+    """Check that the uncollected count counts *rule* membership, and gives it back.
+
+    The assertion a store can fail while passing every other one here: counting the join table
+    alone is a count that is right on a corpus organized by hand and wrong on one organized by
+    rule — and wrong in the direction that reports documents as unheld when a scoped search
+    finds them perfectly well.
+
+    ``loose`` must be a document **no collection holds**, and the suite passes the one it has
+    just removed from the only collection it made. Run against a held document the whole check
+    is vacuous: it is out of the count before the rule exists and after, so a store that ignores
+    rules entirely produces exactly the numbers a correct one does.
+    """
+    if loose is None:  # pragma: no cover - the caller has already required it
+        return
+    _require(
+        not await store.collections_for(loose.id),
+        f"document {loose.id!r} was expected to belong to no collection, and something in this "
+        f"workspace holds it. The uncollected assertions below cannot see a rule take effect on "
+        f"a document that was already covered, so they would pass without checking anything",
+    )
+    before = await store.count_uncollected()
+    ruled = await store.create_collection(
+        "conformance-uncollected",
+        rule=CollectionRule(uri_prefixes=frozenset({_containing_directory(loose.uri)})),
+    )
+    try:
+        _require(
+            await store.count_uncollected() < before,
+            f"document {loose.id!r} belonged to no collection, a rule was created selecting "
+            f"everything under {_containing_directory(loose.uri)!r}, and count_uncollected did "
+            f"not move. A count that reads only the membership table reports every rule-driven "
+            f"corpus as unorganized — which is the exact state this number exists to tell apart "
+            f"from a real one",
+        )
+    finally:
+        await store.delete_collection(ruled.id)
+    _require(
+        await store.count_uncollected() == before,
+        "count_uncollected did not return to what it was once the collection was deleted. "
+        "Membership is evaluated rather than stored, so removing the rule removes the "
+        "membership; a count that does not come back is counting something it materialized",
+    )
 
 
 _SEPARABLE_SEGMENT = 2

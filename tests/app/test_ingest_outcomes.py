@@ -8,6 +8,7 @@ import threading
 from typing import TYPE_CHECKING, Any, Never, cast, override
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from manicule.api.envelopes import SERVICE_UNAVAILABLE, status_for
@@ -26,7 +27,7 @@ from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, C
 from manicule.ingest.pipeline import RunReport
 from manicule.mcp.server import build_server
 from tests.api.support import client_for
-from tests.app.fakes import FakeBackend, FakeStore
+from tests.app.fakes import FakeBackend, FakeStore, make_document
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -773,3 +774,169 @@ async def test_connector_metadata_and_list_share_the_closed_lifecycle_status() -
     serialized = lifecycle.model_dump_json()
     for private in ("source_id", "private-source-id", "private.invalid", "secret", "token="):
         assert private not in serialized.lower()
+
+
+# --- collection placement -----------------------------------------------------------------
+
+
+def _clean() -> RunReport:
+    """A run that went perfectly: everything discovered, everything indexed, nothing amiss."""
+    return RunReport(connector="synthetic-wiki", discovered=3, by_status={"indexed": 3})
+
+
+async def test_a_sync_reports_how_much_of_its_source_no_collection_holds() -> None:
+    """The number that makes "503 indexed, 0 failed, outcome complete" readable.
+
+    Every counter a run keeps is about what it did, and all of them can be perfect while the
+    corpus the run contributed to answers nothing a collection-scoped search asks. This is the
+    one fact in the report that is measured afterwards rather than counted during, and a run
+    that placed nothing anywhere says so in its own output instead of in a later refusal.
+    """
+    service, backend = _service(_clean())
+    for index in range(3):
+        document = backend.store.add(
+            make_document(backend.workspace, source="synthetic-wiki", source_id=f"page-{index}.md")
+        )
+        backend.organization_.documents[document.id] = document
+
+    payload = await service.connector_sync("synthetic-wiki")
+
+    assert payload.outcome == "complete"
+    assert payload.ingested == 3
+    assert payload.collected == 0
+    assert payload.uncollected == 3
+
+
+async def test_a_sync_counts_the_source_it_ran_over_and_not_the_whole_workspace() -> None:
+    """Scoped to the connector, because the report is about this source's corpus.
+
+    A workspace-wide figure would move when a second connector synced, which makes a number
+    printed under one source's name a fact about another one. The documents a run skipped as
+    unchanged stay in, though: membership is evaluated rather than stored, so they are in
+    exactly the collections the freshly indexed ones are.
+    """
+    service, backend = _service(_clean())
+    mine = backend.store.add(
+        make_document(backend.workspace, source="synthetic-wiki", source_id="mine.md")
+    )
+    theirs = backend.store.add(
+        make_document(backend.workspace, source="other-source", source_id="theirs.md")
+    )
+    for document in (mine, theirs):
+        backend.organization_.documents[document.id] = document
+    collection = await backend.organization_.create_collection("alpha")
+    await backend.organization_.add_to_collection(collection.id, [mine.id])
+
+    payload = await service.connector_sync("synthetic-wiki")
+
+    assert payload.collected == 1, "the collection holding this source's document was not seen"
+    assert payload.uncollected == 0, "another source's uncollected document was counted here"
+
+
+async def test_a_run_that_could_not_count_membership_says_so_rather_than_reporting_none_held(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``None`` rather than zero, and the sync still succeeds.
+
+    Zero documents in no collection is the *healthy* answer, so a path that failed to ask must
+    not be able to report it. And the sync itself ran, indexed a corpus and advanced its
+    watermark: failing it over a diagnostic count would report the opposite of what happened.
+    """
+    service, backend = _service(_clean())
+
+    async def refuse() -> Never:
+        msg = "the database is locked"
+        raise StorageBusyError(msg)
+
+    backend.organization = refuse
+
+    payload = await service.connector_sync("synthetic-wiki")
+
+    assert payload.outcome == "complete", "a diagnostic count failed the run it was reporting on"
+    assert payload.ingested == 3
+    assert payload.collected is None
+    assert payload.uncollected is None
+    assert "collection membership could not be counted" in caplog.text
+
+
+async def test_a_delete_racing_the_two_counts_does_not_fail_the_run_it_describes() -> None:
+    """The counts are two statements, and nothing holds a lock across them.
+
+    A document removed between the uncollected count and the total leaves the first above the
+    second, so a bare `total - uncollected` is negative. `collected` is declared `ge=0`, and
+    which way that breaks depends on how the field is set: constructed, it raises and a
+    completed sync reports a validation error instead of its result; attached with
+    `model_copy`, which does not re-validate, it serializes a negative document count into the
+    envelope. Reconciling the pair is what makes neither reachable.
+    """
+    service, backend = _service(_clean())
+    for index in range(3):
+        document = backend.store.add(
+            make_document(backend.workspace, source="synthetic-wiki", source_id=f"page-{index}.md")
+        )
+        backend.organization_.documents[document.id] = document
+    # The organization store still sees three; the document store has already lost one, which is
+    # what the two statements see either side of a delete.
+    backend.store.documents.popitem()
+
+    payload = await service.connector_sync("synthetic-wiki")
+
+    assert payload.outcome == "complete"
+    assert payload.collected == 0
+    assert payload.uncollected == 2, "the pair was not reconciled against the total it came with"
+
+
+async def test_an_import_leaves_collection_placement_unmeasured(tmp_path: Path) -> None:
+    """`connector` on an import is a run label, not a source, and zero would be a lie.
+
+    Every entry is ingested under the source the archive recorded for it, and an archive may
+    carry several; nothing is ever filed under `"import"`. Counting that name matches no
+    document and reports `0` in no collection — the *healthy* answer to a question never asked,
+    which is the confident zero `None` exists to keep out of this field.
+    """
+    service, backend = _service(
+        RunReport(connector="import", discovered=2, by_status={"indexed": 2})
+    )
+    for index in range(2):
+        document = backend.store.add(
+            make_document(backend.workspace, source="confluence", source_id=f"page-{index}.md")
+        )
+        backend.organization_.documents[document.id] = document
+    archive = tmp_path / "corpus.tar.gz"
+    archive.write_bytes(b"not read by the fake")
+
+    payload = await service.import_corpus(archive)
+
+    assert payload.ingested == 2
+    assert payload.collected is None, (
+        "an import reported a placement count for a source nothing uses"
+    )
+    assert payload.uncollected is None
+
+
+async def test_a_rule_this_build_cannot_read_does_not_fail_the_sync_it_describes() -> None:
+    """`CollectionRule` forbids unknown fields, so a newer manicule's rule raises on an older one.
+
+    Counting reads every stored rule through `model_validate`, deliberately — a hand-edited
+    `auto_rules` row should fail where it is read rather than quietly select a different set.
+    Raising out of a read is right; raising out of a completed sync, and taking the result of
+    an ingest that already happened with it, is not.
+    """
+    service, backend = _service(_clean())
+    document = backend.store.add(
+        make_document(backend.workspace, source="synthetic-wiki", source_id="page.md")
+    )
+    backend.organization_.documents[document.id] = document
+
+    async def refuse(*, source: str | None = None) -> Never:
+        del source
+        raise ValidationError.from_exception_data("CollectionRule", [])
+
+    backend.organization_.count_uncollected = refuse
+
+    payload = await service.connector_sync("synthetic-wiki")
+
+    assert payload.outcome == "complete", "a rule this build cannot read failed the run"
+    assert payload.ingested == 3
+    assert payload.collected is None
+    assert payload.uncollected is None
