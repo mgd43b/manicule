@@ -399,13 +399,13 @@ caches it — and when there is no browser surface to redirect to, it says so an
 process *is* serving. `docs/surfaces.md` §6.3.
 
 **MCP is served from that same process and port**, at `/mcp/`, and it carries the **read-only
-tools, plus `document_create` when this installation is authenticated** — every other write tool
-is not registered on it rather than refused, so there is no handler behind `document_delete` or
-`connector_sync` there at all. Authoring is the one exception because it is bounded by
-configuration an operator wrote rather than by arguments a caller sends, it is off until that
-configuration exists, and a socket serving it without authentication refuses to start. With
-`security.auth.mode` set to `none` that exception is empty too, so the socket carries the reads
-and nothing else. Over stdio, where one client talks to one process down
+tools, plus `document_create`** — every other write tool is not registered on it rather than
+refused, so there is no handler behind `document_delete` or `connector_sync` there at all.
+Authoring is the one exception because it is bounded by configuration an operator wrote rather
+than by arguments a caller sends, and it is off until that configuration exists. Authentication
+decides who may *call* that write, never whether the socket carries it; a socket serving
+configured authoring without authentication refuses to start unless `--no-authentication` says
+otherwise. Over stdio, where one client talks to one process down
 a pipe, the whole surface is offered. `docs/surfaces.md` §6.1 says why.
 
 `/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
@@ -693,8 +693,9 @@ which opens no socket at all; every HTTP bind goes through one policy that start
 and widening it takes an address somebody wrote down, an explicit flag no config file can supply,
 and authentication switched on — or a second flag, also reachable from no config file, saying the
 operator accepts serving without it. Any one missing is a refusal, and what that second flag
-produces is a surface anyone who can route to it may read *and* author into, which is the
-deployment it exists for and is said out loud at startup. That is a claim about what
+produces is a surface anyone who can route to it may read — and, where authoring is configured,
+write into. That is the deployment it exists for, and it is said out loud at startup naming the
+corpus. That is a claim about what
 listens, not about what this process dials: a `qdrant` vector store reaches out to
 `storage.vector_db_url` the same way a remote generator or a connector does, and it is
 `Settings.policy_problems()` — not this rule — that refuses the connection when the data

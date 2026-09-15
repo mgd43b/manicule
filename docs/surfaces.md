@@ -842,7 +842,16 @@ because it decided none.
 
 `serving_unauthenticated` is read the same way, from how *this process* was started, so it is
 `true` only in a diagnosis produced inside a serving process and `false` from a fresh `manicule
-doctor`.
+doctor`. `unauthenticated_authoring_configured` is that and `authoring.configured` together —
+the bind an operator most wants to find, because it accepts writes into a corpus rather than only
+reads out of one.
+
+That last one reports **configuration, not write-readiness**, and its name says so.
+`document_create` needs more than `authoring.configured`: the named collection has to exist in
+the store, which is a lookup this synchronous check cannot make. It would also be the wrong
+question — a collection nobody has created yet is one `collection_create` away, and a check that
+reported "no exposure" until somebody made it would go quiet exactly while an operator was
+setting the thing up.
 
 **`name` is the stable identifier.** It is what a monitor selects on, so it is chosen once and
 does not move with the wording. `detail` is the sentence a person reads and is free to be
@@ -1053,9 +1062,10 @@ The extra care is not proportional to the tool's size, and the reason is worth s
 corpus is read as *instructions*. Guidance recalled out of it is treated as standing direction by
 whatever recalled it, so writing into one is the ability to place text in front of future
 sessions. That is why the default is off, why the scope is a configured collection rather than any
-collection the workspace holds, why the authentication refusal is a startup failure rather
-than a per-call check, and why the one escape hatch from that refusal removes the tool instead
-of relaxing the check.
+collection the workspace holds, and why the authentication refusal is a startup failure rather
+than a per-call check. The one escape hatch from that refusal does **not** remove the tool: it
+takes an argument no file can supply, and what it produces is a socket that serves authoring to
+whoever can reach it.
 
 That is the same guarantee `tests/api/test_routes.py` keeps for the HTTP route table, kept the
 same way and asserted in the same file: `ABSENT` names the operations with no route, and
@@ -1213,7 +1223,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | auth | `GET /auth/providers`, `GET /auth/session`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}` |
 | workbench | `GET /api/v1/workbench?document_id=…` |
 | websocket chat | `WS /api/v1/chat/ws` |
-| mcp | `POST /mcp/` — the read-only tool surface of §6.1, plus `document_create` when this installation is authenticated |
+| mcp | `POST /mcp/` — the read-only tool surface of §6.1, plus `document_create`. Authentication decides who may call that write, not whether it is carried |
 
 Plus the embeddable widget: `GET /widget/widget.js` and a static page at `GET /widget`, and the
 browser surface at `/ui` — twelve areas of server-rendered HTML over the same service, mounted on

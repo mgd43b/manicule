@@ -3000,9 +3000,19 @@ class ApplicationService:
             # a process that was started with the flag. A fresh `manicule doctor` reads the same
             # settings and reports `false`, which is the honest answer to what a file can say.
             "serving_unauthenticated": self._serving_unauthenticated,
-            # Whether that unauthenticated surface can be *written* into, which is a different
-            # exposure from one that reads and is the one a monitor most wants to select on.
-            "unauthenticated_authoring": self._serving_unauthenticated
+            # Whether that unauthenticated surface has authoring *configured*, which is a
+            # different exposure from one that only reads and is the one a monitor most wants to
+            # select on.
+            #
+            # **Configuration rather than write-readiness, and the name says which.**
+            # `document_create` needs more than `configured`: the named collection has to exist
+            # in the store, which is an `await` this synchronous check cannot make. It would also
+            # be the wrong question. A collection that has not been created yet is one
+            # `collection_create` away, and a diagnostic that reported "no exposure" until
+            # somebody made it would go quiet exactly while an operator was setting the thing up.
+            # The exposure is that this bind would accept the write, so what is reported is that
+            # the configuration says so.
+            "unauthenticated_authoring_configured": self._serving_unauthenticated
             and self.settings.authoring.configured,
         }
         if loopback:
@@ -3028,7 +3038,9 @@ class ApplicationService:
                     f"--no-authentication and is bound to {bound!r}. Anything that can route "
                     f"to the port is an administrator here"
                     + (
-                        f", and may author into {self.settings.authoring.source!r}."
+                        f", and authoring is configured for "
+                        f"{self.settings.authoring.source!r}, so this bind accepts writes "
+                        f"into that corpus."
                         if self.settings.authoring.configured
                         else "."
                     )

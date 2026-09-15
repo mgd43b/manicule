@@ -2322,7 +2322,10 @@ def start(
         bool,
         typer.Option(
             "--no-authentication",
-            help="Serve with no authentication at all. Any caller is then an administrator.",
+            help=(
+                "Waive the refusals that stop an unauthenticated bind. Only does anything "
+                "with security.auth.mode = none, where every caller is an administrator."
+            ),
         ),
     ] = False,
     no_web: Annotated[bool, typer.Option("--no-web", help="Do not serve the web UI.")] = False,

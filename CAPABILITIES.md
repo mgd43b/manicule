@@ -101,7 +101,9 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   `start --no-authentication` — the last two are the only way to bind a non-loopback address
   without authentication, both are needed together, and no configuration file can supply either.
   `--no-authentication` serves the whole surface, `document_create` included: an anonymous caller
-  on an unauthenticated bind is an administrator, so anything that can route to it may author.
+  on an unauthenticated bind is an administrator, so anything that can route to it may *call* the
+  write. Whether that write lands is a separate question — authoring has to be configured, and an
+  installation that configured none refuses every call naming the settings it needs.
 - `ask --repl` — the interactive prompt, which is also what `ask` with no question does at a
   terminal.
 - `reset-derived`, `cleanup-derived-generations`, `release-source-history`, and
