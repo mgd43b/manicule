@@ -284,19 +284,24 @@ async def test_every_page_the_parser_opens_it_closes_itself(
     parser released itself — and that is the property that keeps the set from changing under the
     walk.
     """
-    closed_by_us: list[int] = []
-    handed_out: list[int] = []
+    # The page objects, not their ``id()``. CPython reuses an address once an object is freed, so
+    # a leaked page could take the id of an earlier one this parser did close and match it — the
+    # test would report no leak because two different objects briefly shared a number. Holding
+    # the objects also keeps them alive for the comparison, which is the only way "this exact
+    # page was closed by us" stays a question about identity rather than about timing.
+    closed_by_us: list[pdfium.PdfPage] = []
+    handed_out: list[pdfium.PdfPage] = []
     take_page = pdfium.PdfDocument.__getitem__
     close_page = pdfium.PdfPage.close
 
     def recorded(document: pdfium.PdfDocument, index: int) -> pdfium.PdfPage:
         page = take_page(document, index)
-        handed_out.append(id(page))
+        handed_out.append(page)
         return page
 
     def closing(page: pdfium.PdfPage, _by_parent: bool = False) -> object:
         if not _by_parent:
-            closed_by_us.append(id(page))
+            closed_by_us.append(page)
         return close_page(page, _by_parent)
 
     monkeypatch.setattr(pdfium.PdfDocument, "__getitem__", recorded)
@@ -304,7 +309,7 @@ async def test_every_page_the_parser_opens_it_closes_itself(
     await _blocks(raw_from(corpus / "pdf" / "upright.pdf", MEDIA_TYPE))
 
     assert handed_out, "no page was opened, so this asserts nothing about closing one"
-    leaked = [page for page in handed_out if page not in closed_by_us]
+    leaked = [page for page in handed_out if not any(page is closed for closed in closed_by_us)]
     assert leaked == [], (
         f"{len(leaked)} of {len(handed_out)} page(s) were left for the document to reap. They "
         f"stay in its weakly-referenced child set until a collection reaches them, and a "
