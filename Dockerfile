@@ -35,20 +35,55 @@
 
 # --- the environment, the grammars and the weights ------------------------------------------
 #
-# One builder stage, because all three want the same thing: a network, and manicule importable
-# so that what is fetched is decided by manicule's own code rather than by a list copied into
-# this file and left to drift.
+# Two builder stages out of what was one, and the seam is load-bearing rather than tidy.
+# `deps` ends with the dependency tree installed and nothing of manicule's in it; `build`
+# continues from there and adds the parts that change on every release. The runtime stage
+# copies both, in that order, which is what puts ~900 MB of dependencies in a layer a version
+# bump does not touch. Everything else about the arrangement is unchanged: one network, and
+# manicule importable so that what is fetched is decided by manicule's own code rather than by
+# a list copied into this file and left to drift.
 
 FROM ghcr.io/astral-sh/uv:0.12.13 AS uv
-FROM python:3.14-slim-bookworm AS build
+FROM python:3.14-slim-bookworm AS deps
 
 COPY --from=uv /uv /usr/local/bin/uv
 
+# **Bytecode is shipped, but never the kind with a clock in it.** `UV_COMPILE_BYTECODE=1` was
+# here, and CPython's default invalidation mode is *timestamp*: a `.pyc` header carries the
+# mtime of the source it was built from, and uv stamps installed files with the moment of the
+# install. So every one of the 10,130 `.pyc` files in this venv carried the wall clock of the
+# build that made it. Between 0.1.22 and 0.1.23, 10,140 files in the venv layer changed and
+# 10,130 of them were bytecode -- 147.6 MB re-pulled by every node for the eight `.py` files
+# that actually changed. `rewrite-timestamp` reaches none of it: the timestamp is *inside* the
+# file rather than in its tar header, which is exactly why it could not reach `xet/logs/`
+# either.
+#
+# Shipping none at all was measured and rejected. With `PYTHONDONTWRITEBYTECODE` set in the
+# runtime stage nothing is cached on the way past, so every container start and every CLI
+# invocation recompiles: the offline smoke test went from 24.0s to 43.1s, and `manicule
+# doctor` from ~1.8s to ~3.7s. That is a permanent tax on every command to fix a build-time
+# problem.
+#
+# So the bytecode is made deterministic instead, and `compileall` below is what does it --
+# PEP 552 hash-based, `unchecked` specifically. A hash-based `.pyc` records the source's hash
+# in place of its mtime, which is a property of the file rather than of the moment it was
+# written; `unchecked` then tells the interpreter to trust it without re-hashing the source on
+# every import, which is the half `checked-hash` would charge for at run time. The trade is
+# that a hand-edited `.py` inside a running container is ignored until its `.pyc` is removed.
+# For an image whose whole design is to be immutable and pre-seeded, that is not a cost.
+#
+# `PYTHONDONTWRITEBYTECODE` stays, and is not redundant with any of the above. `compileall`
+# writes through it -- it calls `py_compile` directly rather than going through the import
+# system -- but the steps further down run `python -c 'from manicule import ...'` against this
+# venv, and an ordinary *import* caches what it touches. Without this, the grammar seed, the
+# vocabulary pre-seed and the weight prefetch would each scatter freshly-stamped timestamp
+# `.pyc` files through site-packages after `compileall` had written deterministic ones, and the
+# churn would come back through a side door with nothing naming it.
 ENV UV_PROJECT_ENVIRONMENT=/opt/manicule/venv \
     UV_FROZEN=1 \
     UV_LINK_MODE=copy \
-    UV_COMPILE_BYTECODE=1 \
-    UV_PYTHON_DOWNLOADS=never
+    UV_PYTHON_DOWNLOADS=never \
+    PYTHONDONTWRITEBYTECODE=1
 
 # The extras a running installation needs, and no more. `rerank` is deliberately absent: it is
 # torch, it is gigabytes, and the retrieval profiles reach a cross-encoder through a seam that
@@ -73,6 +108,35 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY packages ./packages
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-dev --no-install-project ${EXTRAS}
+
+# Compiled here rather than left to uv, so that the bytecode for ~900 MB of dependencies is
+# written once, deterministically, and lands in *this* stage's layer. `|| true` because
+# `compileall` reports failure for any file it cannot parse, and a dependency tree this size
+# reliably contains a few -- vendored Python 2 fragments, deliberately broken test fixtures --
+# none of which this image imports. A real failure surfaces at the smoke test, which imports
+# what the image actually runs.
+RUN /opt/manicule/venv/bin/python -m compileall -q -j 0 \
+    --invalidation-mode unchecked-hash /opt/manicule/venv/lib || true
+
+# --- everything from here changes when manicule does ----------------------------------------
+#
+# The cut. Above it is ~900 MB that moves only when `uv.lock` does; below it is manicule's own
+# code, the grammar bundle and the weights. The runtime stage copies `deps` and then `build`
+# over the top, and BuildKit's `COPY` compares against what is already there and writes only
+# the files that differ -- so the second copy is manicule-sized, not venv-sized, and a release
+# that changes eight source files moves eight source files.
+#
+# This is only worth anything because the bytecode above is deterministic: measured on the
+# published 0.1.22 and 0.1.23 layers, 10,130 of the 10,140 differing files were `.pyc` carrying
+# the build's wall clock. A `deps` layer full of *those* takes a new digest on every build and
+# the seam buys nothing at all. The `compileall` above and this cut are one mechanism in two
+# places; neither works alone.
+FROM deps AS build
+
+# Re-declared because `ARG` does not cross a `FROM`. Left unset it would expand to nothing and
+# `uv sync` would quietly install none of the extras -- an image that builds, passes the smoke
+# test's default-configuration checks, and is missing every optional backend.
+ARG EXTRAS="--extra storage --extra qdrant --extra embeddings --extra parsers --extra retrieval --extra generation --extra connectors --extra ingest --extra serve --extra ollama"
 
 COPY src ./src
 COPY tools ./tools
@@ -142,6 +206,19 @@ GRAMMARS
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/manicule/venv/bin/python /build/grammars
 
+# The second pass, and **narrowed to `manicule*` for a reason that cost a rebuild to find**.
+# Pointing it at the whole venv again looks harmless -- `unchecked-hash` output is a function of
+# the source alone, so every dependency's bytecode comes back byte-identical. It is not.
+# `compileall` rewrites an up-to-date file rather than skipping it, and BuildKit's `COPY`
+# decides what changed from stat metadata rather than from content, so all 10,130 identical
+# files came back with fresh mtimes and were copied again. Measured: the overlay layer went
+# from 8.5 MB to 61.3 MB without a single byte of bytecode differing.
+#
+# So this compiles only what the `build` stage actually adds -- manicule, `manicule_ollama` and
+# the grammar bundle -- and the dependency tree keeps the bytecode `deps` wrote for it.
+RUN python -m compileall -q -j 0 --invalidation-mode unchecked-hash \
+    /opt/manicule/venv/lib/python*/site-packages/manicule* || true
+
 # --- embedding weights ---
 #
 # BAAI/bge-m3, the configured model, as its ONNX export: about 2.3 GB. Baked in rather than
@@ -168,9 +245,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # whatever the day's HEAD happened to be. Calling the tool rather than restating its patterns
 # also keeps this from being a second copy of the file list that could drift from the first.
 ENV HF_HOME=/opt/manicule/models
+# **`hub/` alone, and the narrowing is the point of this line.** It used to copy all of
+# `/tmp/hf`, and an `HF_HOME` holds more than the cache: `huggingface-hub` depends on `hf_xet`
+# on every architecture this image is built for, and a Xet download also writes `$HF_HOME/xet`,
+# whose `logs/` keeps a JSON-lines trace of the transfer — named `xet_<wall clock>_<pid>.log`,
+# and about 135 KB of microsecond-stamped lines inside. The name and the contents are both
+# different on every build by construction, so the 1.36 GB model layer took a fresh digest
+# every release and every node re-pulled it for a version bump.
+#
+# That survived #356 because #356 fixed the other half, and fixed it correctly. Reading the two
+# published layers: all sixty-seven entries — paths, sizes, modes, ownership, and every single
+# mtime — are identical between 0.1.22 and 0.1.23 except this one log. `rewrite-timestamp`
+# normalizes tar headers, which is what it is for; a timestamp written into a file's *name and
+# body* is not a header, and the only answer to one is not to ship the file.
+#
+# Named rather than pruned afterwards, because an allowlist and a blocklist fail in opposite
+# directions: `rm -rf`-ing today's scratch directories ships whatever `hf_xet` writes next,
+# while naming what the runtime reads ships nothing new. If this ever narrows too far, the
+# `--network=none` smoke test below is what says so — it resolves this snapshot under
+# `HF_HUB_OFFLINE=1` and runs a real index and a real search through it.
 RUN --mount=type=cache,target=/tmp/hf \
     HF_HOME=/tmp/hf python tools/prefetch_embedding_models.py --backend onnx \
-    && mkdir -p "${HF_HOME}" && cp -a /tmp/hf/. "${HF_HOME}/"
+    && mkdir -p "${HF_HOME}" && cp -a /tmp/hf/hub "${HF_HOME}/hub"
 
 # --- tiktoken vocabularies ---
 #
@@ -207,6 +303,12 @@ LABEL org.opencontainers.image.title="manicule" \
 RUN groupadd --gid 10001 manicule \
  && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/manicule --shell /usr/sbin/nologin manicule
 
+# Two copies of one directory, and the order is the whole point. `deps` is the dependency tree
+# and lands as its own layer; `build` is the same path with manicule, the grammar bundle and a
+# release's worth of change in it, and BuildKit writes only the files that differ from what the
+# first copy already put there. Collapse these back into one and every upgrade re-pulls ~327 MB
+# to deliver a few megabytes of Python.
+COPY --from=deps /opt/manicule/venv /opt/manicule/venv
 COPY --from=build /opt/manicule/venv /opt/manicule/venv
 COPY --from=build /opt/manicule/tiktoken /opt/manicule/tiktoken
 # Owned by the account that reads them. `huggingface_hub` keeps a small resolution cache

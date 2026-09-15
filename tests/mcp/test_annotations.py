@@ -476,6 +476,7 @@ async def test_collection_rule_mcp_schema_is_canonical_and_annotations_are_exact
     rule_schema = setting.input_schema["properties"]["rule"]
     assert set(rule_schema["properties"]) == {
         "sources",
+        "uri_prefixes",
         "media_types",
         "tag_ids",
         "updated_after",

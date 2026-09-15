@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
@@ -43,6 +44,7 @@ from manicule.container import Container
 from manicule.core.content import DocumentStatus
 from manicule.core.errors import ConfigError, PolicyError, UnknownEntityError
 from manicule.core.ids import document_id
+from manicule.core.organization import CollectionRule
 from manicule.ingest.pipeline import RunReport
 from manicule.mcp.server import build_server
 from manicule.plugins.registry import ComponentRegistry
@@ -788,3 +790,156 @@ async def test_the_kept_file_survives_a_storage_failure_as_an_envelope(root: Pat
 
     assert body["ok"] is False
     assert body["data"]["path"] == str(root / COLLECTION / "retry_policy.md")
+
+
+# --- the collection is the directory, or the diagnosis says it is not ---------------------------
+
+
+def _authoring_check(diagnosis: object) -> Any:
+    """The ``authoring`` check, or a failure naming the checks that were there instead."""
+    checks = cast("Any", diagnosis).checks
+    for check in checks:
+        if check.name == "authoring":
+            return check
+    offered = ", ".join(sorted(check.name for check in checks))
+    message = f"no check named 'authoring'; the diagnosis carried: {offered}"
+    raise AssertionError(message)
+
+
+async def test_doctor_says_nothing_about_authoring_until_it_is_configured(root: Path) -> None:
+    """Off is not a fault. An installation that never wanted authoring must not be nagged."""
+    settings = settings_for(root).model_copy(update={"authoring": AuthoringSettings()})
+    check = _authoring_check(await (await service_for(settings)).doctor())
+
+    assert check.state == "ok"
+    assert check.remedy == ""
+
+
+async def test_doctor_names_the_collection_that_holds_its_documents_by_hand(root: Path) -> None:
+    """The silence this check exists to break, with the command that ends it.
+
+    A collection authoring writes into is documented to *be* its directory, but without a rule
+    that is only true of the documents ``document_create`` wrote, because that operation adds
+    each one by hand. Anything arriving over the same tree by a sync joins nothing, and the only
+    symptom is a collection-scoped search returning fewer results — no error, no warning,
+    nothing in any log. So the check names the collection and hands over the exact command, the
+    way the connectors check does.
+    """
+    check = _authoring_check(await (await service_for(settings_for(root))).doctor())
+
+    assert check.state == "degraded"
+    assert f"{COLLECTION!r}" in check.detail
+    assert check.facts["uncovered"] == [COLLECTION]
+    assert check.remedy.startswith("manicule collection rule set ")
+    assert f"--uri-prefix {shlex.quote(str(root / COLLECTION))}" in check.remedy
+
+
+async def test_a_collection_selecting_its_own_directory_is_quiet(root: Path) -> None:
+    """And an ancestor counts, because a rule naming the root does select what is under it.
+
+    Reporting a wider rule would be a warning about nothing, and a diagnostic that second-guesses
+    what an operator meant by their own rule teaches people to skim it.
+    """
+    settings = settings_for(root, collections=(COLLECTION, "notes"))
+    backend = await backend_for(settings)
+    exact = await backend.organization_.find_collection(COLLECTION)
+    assert exact is not None
+    await backend.organization_.set_collection_rule(
+        exact.id, CollectionRule(uri_prefixes=frozenset({str(root / COLLECTION)}))
+    )
+    wider = await backend.organization_.find_collection("notes")
+    assert wider is not None
+    await backend.organization_.set_collection_rule(
+        wider.id, CollectionRule(uri_prefixes=frozenset({str(root)}))
+    )
+
+    check = _authoring_check(await ApplicationService(backend).doctor())
+
+    assert check.state == "ok"
+    assert check.facts["uncovered"] == []
+    assert check.remedy == ""
+
+
+async def test_doctor_reports_a_configured_collection_the_workspace_does_not_have(
+    root: Path,
+) -> None:
+    """``failing`` rather than ``degraded``: authoring into it refuses, so that half is broken now.
+
+    ``document_create`` raises ``UnknownEntityError`` for this and says to create the collection
+    — but only once somebody tries to write. Until then the misconfiguration is invisible, which
+    is exactly what a diagnostic is for.
+    """
+    service = await service_for(settings_for(root), existing=())
+
+    check = _authoring_check(await service.doctor())
+
+    assert check.state == "failing"
+    assert f"{COLLECTION!r}" in check.detail
+    assert check.facts["missing"] == [COLLECTION]
+    assert check.remedy == (
+        f"manicule collection create {COLLECTION} "
+        f"--uri-prefix {shlex.quote(str(root / COLLECTION))}"
+    )
+
+
+async def test_a_collection_name_that_is_not_a_path_segment_is_diagnosed_not_raised(
+    root: Path,
+) -> None:
+    """A blank name took the whole diagnosis down, because a check reached `normalize_name`.
+
+    `authoring.collections` has no model-level validation — the single-path-segment rule is
+    enforced by `document_create` at call time — so a diagnostic reading it meets whatever is in
+    the file. `find_collection` normalizes, and normalizing a blank name raises, so `doctor`
+    propagated a `ValueError` and reported none of its other checks. The name is now held to
+    `document_create`'s own rule first, and a name that breaks it is the finding rather than the
+    end of the diagnosis.
+    """
+    settings = settings_for(root).model_copy(
+        update={"authoring": AuthoringSettings(source=SOURCE, collections=("  ", "a/b"))}
+    )
+
+    check = _authoring_check(await (await service_for(settings, existing=())).doctor())
+
+    assert check.state == "failing"
+    assert check.facts["malformed"] == ["  ", "a/b"]
+    assert "single path segment" in check.detail
+
+
+async def test_an_unusable_authoring_source_is_reported_rather_than_raised(root: Path) -> None:
+    """A diagnostic that cannot run is a diagnosis, never an exception out of ``doctor``.
+
+    ``_filesystem_source`` refuses a source that is missing, disabled or not a filesystem, and
+    every one of those is a thing an operator wants reported beside the other checks rather than
+    a traceback that suppresses all of them.
+    """
+    settings = settings_for(root).model_copy(
+        update={"authoring": AuthoringSettings(source="absent", collections=(COLLECTION,))}
+    )
+
+    check = _authoring_check(await (await service_for(settings)).doctor())
+
+    assert check.state == "failing"
+    assert "'absent'" in check.detail
+
+
+async def test_a_remedy_naming_a_collection_with_a_space_is_still_one_command(
+    tmp_path: Path,
+) -> None:
+    """A remedy is a command to run, and an unquoted one silently becomes a different command.
+
+    `normalize_name` collapses runs of whitespace and keeps single spaces, so `Team A` is an
+    ordinary collection name rather than a contrived one — and a corpus root under `My
+    Documents` is just as ordinary. Unquoted, `manicule collection create Team A --uri-prefix
+    /corpus/Team A` is four arguments and creates a collection called `Team`. The check that
+    exists to hand somebody a working command must hand them a working command.
+    """
+    root = tmp_path / "My Corpus"
+    root.mkdir()
+    settings = settings_for(root, collections=("Team A",))
+    service = await service_for(settings, existing=())
+
+    check = _authoring_check(await service.doctor())
+
+    assert check.state == "failing"
+    assert check.remedy == (f"manicule collection create 'Team A' --uri-prefix '{root / 'Team A'}'")
+    assert shlex.split(check.remedy)[-1] == str(root / "Team A")

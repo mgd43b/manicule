@@ -270,6 +270,35 @@ def test_collection_rule_show_set_and_clear_have_human_and_json_output(
     assert json.loads(cleared.stdout)["data"]["rule"] is None
 
 
+def test_collection_rule_cli_takes_a_directory_as_a_path_and_stores_it_as_a_uri(
+    bound: ApplicationService,
+) -> None:
+    """The spelling an operator types is the one they already know, and it is normalized once.
+
+    ``--uri-prefix /corpus/journals`` is what somebody reaches for; ``documents.uri`` holds a
+    ``file:`` URI, so a CLI that stored the bare path would build a rule matching nothing and
+    report success. The conversion lives on the model rather than in this command, which is why
+    a relative path is refused here rather than accepted and quietly ignored.
+    """
+    del bound
+    made = run(["--json", "collection", "create", "Journals"])
+    collection_id = json.loads(made.stdout)["data"]["id"]
+
+    changed = run(
+        ["--json", "collection", "rule", "set", collection_id, "--uri-prefix", "/corpus/journals"]
+    )
+    assert changed.exit_code == 0, changed.output
+    assert json.loads(changed.stdout)["data"]["rule"]["uri_prefixes"] == [
+        "file:///corpus/journals/"
+    ]
+
+    relative = run(
+        ["--json", "collection", "rule", "set", collection_id, "--uri-prefix", "corpus/journals"]
+    )
+    assert relative.exit_code == 1
+    assert json.loads(relative.stdout)["error"]["type"] == "ValueError"
+
+
 def test_collection_rule_refuses_an_empty_or_blank_selector(bound: ApplicationService) -> None:
     del bound
     made = run(["--json", "collection", "create", "Team A"])

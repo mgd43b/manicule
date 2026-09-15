@@ -1322,6 +1322,7 @@ def rebuild_status(
 def _collection_rule_arguments(
     *,
     sources: list[str] | None,
+    uri_prefixes: list[str] | None,
     media_types: list[str] | None,
     tag_ids: list[str] | None,
     updated_after: str | None,
@@ -1332,6 +1333,8 @@ def _collection_rule_arguments(
     rule: dict[str, JsonValue] = {}
     if sources:
         rule["sources"] = cast("JsonValue", sources)
+    if uri_prefixes:
+        rule["uri_prefixes"] = cast("JsonValue", uri_prefixes)
     if media_types:
         rule["media_types"] = cast("JsonValue", media_types)
     if tag_ids:
@@ -1350,6 +1353,13 @@ def collection_create(  # noqa: PLR0917 - each selector is intentionally a first
     source: Annotated[
         list[str] | None,
         typer.Option("--source", help="Select documents from this source; repeatable."),
+    ] = None,
+    uri_prefix: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--uri-prefix",
+            help="Select documents under this directory, by absolute path or URI; repeatable.",
+        ),
     ] = None,
     media_type: Annotated[
         list[str] | None,
@@ -1377,6 +1387,7 @@ def collection_create(  # noqa: PLR0917 - each selector is intentionally a first
                 "description": description,
                 "rule": _collection_rule_arguments(
                     sources=source,
+                    uri_prefixes=uri_prefix,
                     media_types=media_type,
                     tag_ids=tag_id,
                     updated_after=updated_after,
@@ -1433,6 +1444,10 @@ def collection_rule_show(
 def collection_rule_set(  # noqa: PLR0917 - each selector is intentionally a first-class CLI option
     collection_id: Annotated[str, typer.Argument(help="The collection id.")],
     source: Annotated[list[str] | None, typer.Option("--source", help="Repeatable source.")] = None,
+    uri_prefix: Annotated[
+        list[str] | None,
+        typer.Option("--uri-prefix", help="Repeatable directory, by absolute path or URI."),
+    ] = None,
     media_type: Annotated[
         list[str] | None, typer.Option("--media-type", help="Repeatable media type.")
     ] = None,
@@ -1452,6 +1467,7 @@ def collection_rule_set(  # noqa: PLR0917 - each selector is intentionally a fir
                 "collection_id": collection_id,
                 "rule": _collection_rule_arguments(
                     sources=source,
+                    uri_prefixes=uri_prefix,
                     media_types=media_type,
                     tag_ids=tag_id,
                     updated_after=updated_after,

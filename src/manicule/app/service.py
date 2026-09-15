@@ -29,6 +29,7 @@ import logging
 import os
 import platform
 import secrets
+import shlex
 import time
 import tomllib
 from base64 import b64encode
@@ -70,6 +71,7 @@ from manicule.core.errors import (
 )
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id as document_id_of
+from manicule.core.organization import directory_prefix
 from manicule.core.rebuild import (
     RebuildLeaseConflictError,
     RebuildLeaseError,
@@ -2935,6 +2937,7 @@ class ApplicationService:
         checks.append(await self._vector_integrity_check())
         checks.append(await self._glossary_check())
         checks.append(await self._connectors_check())
+        checks.append(await self._authoring_check())
         checks.append(await self._sessions_check())
         checks.append(await self._document_identity_check())
         checks.append(await self._document_content_check())
@@ -3187,6 +3190,135 @@ class ApplicationService:
             # be read as the whole mode by everyone who did not go and check.
             facts={"path": where, "exposed": True, "exposed_bits": f"{exposed:03o}"},
             remedy=f"chmod 0700 {where}",
+        )
+
+    async def _authoring_check(self) -> r.Check:
+        """Whether every collection authoring writes into also *selects* what lands in it.
+
+        ``authoring.collections`` holds one fact twice: a name is a collection, and it is the
+        directory beneath the root that its documents land in. Only
+        :meth:`document_create` ever acted on the second half, by writing a membership row per
+        document it wrote. A file that arrived any other way — a ``connector sync`` over a tree
+        that git pulled, an editor, a write whose ingest failed and that a later sync picked up
+        — joined nothing, and the corpus reported that by returning fewer results to a
+        collection-scoped search. Nothing anywhere said why. This is the check that says it.
+
+        **``degraded``, not ``failing``, for a missing prefix.** Authoring itself works: the
+        documents are indexed, searchable and correctly cited, and every document
+        ``document_create`` wrote is in its collection because that operation put it there. What
+        is true is that the collection is not the directory it is documented to be, for anything
+        arriving by another route — the same prospective-damage reading
+        :meth:`_connectors_check` applies. A *missing collection* is `failing` on different
+        grounds: ``document_create`` into it refuses outright, so that half is broken now.
+
+        **An ancestor counts as covering.** A rule naming ``/corpus/`` does select the documents
+        under ``/corpus/journals/``, so reporting it would be a warning about nothing. Whether
+        such a rule is too *wide* is a judgment about what the operator meant, and a diagnostic
+        that guesses at intent trains people to skim it.
+        """
+        authoring = self.settings.authoring
+        if not authoring.configured:
+            return r.Check(
+                name="authoring",
+                state="ok",
+                detail="authoring is off; `authoring.source` and `authoring.collections` are "
+                "not both set",
+                facts={"collections": [], "malformed": [], "missing": [], "uncovered": []},
+            )
+        try:
+            connector = await self._filesystem_source(authoring.source, require_profiles=False)
+        except ManiculeError as exc:
+            return r.Check(
+                name="authoring",
+                state="failing",
+                detail=f"`authoring.source` names {authoring.source!r}, which cannot be used "
+                f"as a filesystem source: {exc}",
+                facts={
+                    "source": authoring.source,
+                    "collections": list(authoring.collections),
+                    "malformed": [],
+                    "missing": [],
+                    "uncovered": [],
+                },
+                remedy="manicule config show",
+            )
+        store = await self._backend.organization()
+        # `find_collection` rather than a dict over `list_collections`, so the name resolves
+        # through the same normalization `document_create` resolves through. A check that
+        # matched names its own way could report a collection missing that authoring finds.
+        malformed: list[str] = []
+        missing: list[str] = []
+        uncovered: list[str] = []
+        identifiers: dict[str, str] = {}
+        for name in authoring.collections:
+            # Held to `document_create`'s own rule, and *before* anything is looked up. A name
+            # that is blank or carries a separator is one this operation would refuse anyway,
+            # and it would otherwise reach `normalize_name` — which raises on a blank, out of a
+            # diagnostic, taking every other check in the diagnosis with it.
+            try:
+                _require_segment(name, "collection name")
+            except ValueError:
+                malformed.append(name)
+                continue
+            found = await store.find_collection(name)
+            if found is None:
+                missing.append(name)
+                continue
+            identifiers[name] = found.id
+            wanted = directory_prefix(str(connector.root / name))
+            rule = found.rule
+            if rule is None or not any(wanted.startswith(prefix) for prefix in rule.uri_prefixes):
+                uncovered.append(name)
+        facts: dict[str, JsonValue] = {
+            "source": authoring.source,
+            "root": str(connector.root),
+            "collections": list(authoring.collections),
+            "malformed": list(malformed),
+            "missing": list(missing),
+            "uncovered": list(uncovered),
+        }
+        if malformed:
+            named = ", ".join(repr(name) for name in malformed)
+            return r.Check(
+                name="authoring",
+                state="failing",
+                detail=f"`authoring.collections` names {named}, which is not a single path "
+                f"segment. A name there is a directory beneath the root as well as a scope, so "
+                f"authoring into it refuses rather than writing.",
+                facts=facts,
+                remedy="manicule config show",
+            )
+        if missing:
+            named = ", ".join(repr(name) for name in missing)
+            return r.Check(
+                name="authoring",
+                state="failing",
+                detail=f"`authoring.collections` names {named}, which this workspace does not "
+                f"have. Authoring into a collection that does not exist refuses rather than "
+                f"writing, so those names author nothing.",
+                facts=facts,
+                remedy=f"manicule collection create {shlex.quote(missing[0])} "
+                f"--uri-prefix {shlex.quote(str(connector.root / missing[0]))}",
+            )
+        if uncovered:
+            named = ", ".join(repr(name) for name in uncovered)
+            return r.Check(
+                name="authoring",
+                state="degraded",
+                detail=f"{named} holds its documents by hand rather than by rule, so a "
+                f"document that reaches its directory by sync rather than by "
+                f"`document_create` joins nothing and a collection-scoped search quietly "
+                f"returns less.",
+                facts=facts,
+                remedy=f"manicule collection rule set {shlex.quote(identifiers[uncovered[0]])} "
+                f"--uri-prefix {shlex.quote(str(connector.root / uncovered[0]))}",
+            )
+        return r.Check(
+            name="authoring",
+            state="ok",
+            detail=f"every collection under {connector.root} selects its own directory, so a "
+            f"document joins it however it arrives",
+            facts=facts,
         )
 
     async def _connectors_check(self) -> r.Check:

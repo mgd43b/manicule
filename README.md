@@ -360,10 +360,22 @@ manicule collection rule set COLLECTION_ID --source wiki-team-a
 manicule collection rule clear COLLECTION_ID
 ```
 
-Sources within a rule are alternatives; source, media-type, tag, and update-bound fields are
-combined. Manual members remain unioned with the rule. Creating, replacing, or clearing a rule
-changes only collection metadata: existing indexes adopt it immediately, with no source fetch,
-re-ingestion, chunking, or re-embedding.
+A rule can also name a directory, which is how a collection over a local corpus keeps itself
+filled — a document joins by arriving there, whether a sync, an editor or `document_create` put
+it in:
+
+```console
+manicule collection create journals --uri-prefix /corpus/journals
+```
+
+Write it as an ordinary absolute path; it is stored as the `file:` URI the connector records,
+and always with a trailing separator, so `/corpus/journals` never also selects
+`/corpus/journals-old`.
+
+Values within one field are alternatives; source, directory, media-type, tag, and update-bound
+fields are combined. Manual members remain unioned with the rule. Creating, replacing, or
+clearing a rule changes only collection metadata: existing indexes adopt it immediately, with no
+source fetch, re-ingestion, chunking, or re-embedding.
 
 <details>
 <summary><b>How a connector sync reports its outcome</b></summary>

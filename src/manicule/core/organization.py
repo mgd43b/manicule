@@ -22,9 +22,12 @@ that is :class:`CitationResolution`: a citation into a superseded version does n
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Self
+from urllib.parse import unquote, urlsplit
 
 from pydantic import (
     BaseModel,
@@ -45,6 +48,98 @@ class _Organization(BaseModel):
 
 
 # --- collections ---------------------------------------------------------------------------
+
+
+_DRIVE_LETTER = 1
+"""The longest a URI scheme may not be, because a Windows drive letter is exactly this long."""
+
+
+def directory_prefix(value: str) -> str:
+    """One entry of :attr:`CollectionRule.uri_prefixes`, in the form the clause compares.
+
+    Two normalizations, and each exists because the alternative is a rule that matches nothing
+    and says nothing about why.
+
+    **An absolute path becomes the URI the connector recorded.** ``documents.uri`` holds
+    ``Path.as_uri()`` for a filesystem source, so a rule spelled ``/corpus/journals`` would
+    never meet a row. Converting here means the recommended spelling is the one a person
+    already knows, and it is :meth:`~pathlib.Path.as_uri` doing the percent-encoding rather
+    than a hand-written ``file://`` string, which gets it wrong on the first directory with a
+    space in its name.
+
+    **A written ``file:`` URI is re-derived the same way**, rather than trusted. Having a
+    scheme is not having the right escaping: ``file:///corpus/my journals`` parses, stores, and
+    then never equals the ``file:///corpus/my%20journals`` the walk recorded. So its path is
+    unescaped and put back through :meth:`~pathlib.Path.as_uri`, which makes the two spellings
+    one and makes the operation idempotent. A ``file:`` URI carrying a host is refused instead:
+    ``file://corpus/journals`` is two slashes where three were meant, and it reads as a
+    directory while naming a machine.
+
+    **A prefix gains a trailing ``/``.** Membership is a comparison against text, so a
+    boundary that is not in the text is not in the comparison: without it ``…/journals`` also
+    selects ``…/journals-old``, silently and in the widening direction. With it, the stored
+    form is a literal prefix of exactly the URIs beneath that directory.
+
+    Every other scheme is left exactly as written. Escaping there is the source's business —
+    ``documents.uri`` holds whatever address the connector reported — and a prefix this
+    rewrote would stop matching the rows it was copied from.
+
+    Raises:
+        ValueError: The value is neither an absolute path nor a URI carrying a scheme.
+            Relative to nothing is not a location — a rule is stored and re-run later, by a
+            process whose working directory is nobody's business. Or it is a ``file:`` URI
+            naming a host rather than a local path.
+    """
+    text = value.strip()
+    if not text:
+        msg = (
+            "a collection rule uri prefix must be an absolute path or a URI, not an empty "
+            "string. Name the directory its documents sit in, such as '/corpus/journals'"
+        )
+        raise ValueError(msg)
+    if Path(text).is_absolute():
+        # Lexical, never `Path.resolve`: the rule may name a corpus that lives on the machine
+        # that will evaluate it rather than the one writing it, and resolving would consult
+        # *this* filesystem for symlinks that are not its business.
+        text = _local_uri(os.path.normpath(text), written=value)
+    else:
+        split = urlsplit(text)
+        # Longer than a drive letter, because `urlsplit` reads `C:/corpus` as the scheme `c`,
+        # and storing that would be a prefix no connector can ever write.
+        if len(split.scheme) <= _DRIVE_LETTER:
+            msg = (
+                f"collection rule uri prefix {value!r} is neither an absolute path nor a URI "
+                f"with a scheme. A prefix is matched against the location a connector "
+                f"recorded, so it has to name one: '/corpus/journals' for a local tree, or "
+                f"'https://wiki.example/spaces/RUN' for a site"
+            )
+            raise ValueError(msg)
+        if split.scheme == "file":
+            if split.netloc:
+                msg = (
+                    f"collection rule uri prefix {value!r} names the host {split.netloc!r} "
+                    f"rather than a local directory. A local path needs three slashes — "
+                    f"'file:///{split.netloc}{split.path}' — or write it as a plain path and "
+                    f"let it be converted"
+                )
+                raise ValueError(msg)
+            # `unquote` rather than `urllib.request.url2pathname`: on POSIX they agree, and
+            # `manicule.core` is not somewhere to pull the HTTP stack in for one call.
+            text = _local_uri(os.path.normpath(unquote(split.path)), written=value)
+    return text if text.endswith("/") else f"{text}/"
+
+
+def _local_uri(path: str, *, written: str) -> str:
+    """``path`` as the ``file:`` URI a filesystem connector would have recorded for it."""
+    located = Path(path)
+    if not located.is_absolute():
+        msg = (
+            f"collection rule uri prefix {written!r} does not name an absolute location. A "
+            f"prefix is matched against the address a connector recorded, and a relative one "
+            f"is an address only on the machine that typed it"
+        )
+        raise ValueError(msg)
+    return located.as_uri()
 
 
 class CollectionRule(_Organization):
@@ -71,6 +166,30 @@ class CollectionRule(_Organization):
     sources: frozenset[str] = frozenset()
     """Connector instance names, matched against ``documents.source``."""
 
+    uri_prefixes: frozenset[str] = frozenset()
+    """Directory subtrees, matched against ``documents.uri`` as a literal prefix.
+
+    **This is where "the collection is the directory" gets said once.** ``authoring.collections``
+    already holds that a collection name is also the directory beneath the root its documents
+    land in, but only :meth:`~manicule.app.service.ApplicationService.document_create` acted on
+    it, by writing a membership row per document. A file that arrived any other way — a git
+    pull, an editor, a ``connector sync`` over a tree somebody else filled — got none, and a
+    collection-scoped search returned less with nothing to say why. A prefix is that same
+    sentence in the one place membership is decided.
+
+    **It matches the address, not the identity.** ``documents.source_id`` is what a source
+    promises is stable and ``documents.uri`` is where the document sits; a rule about location
+    belongs on the location. Two consequences follow, both wanted. A document that moves
+    between directories changes collection, at read time and without re-indexing, which is what
+    a directory-shaped collection should do and what materializing membership would get wrong.
+    And a document whose sidecar manifest declares a canonical address is matched on *that*
+    address rather than on the copy's path — so a mirror is selected by the space it mirrors,
+    which is the distinction :mod:`~manicule.connectors.filesystem` draws between a mirror and
+    a directory, kept rather than contradicted.
+
+    Entries are normalized by :func:`directory_prefix`: an absolute path becomes a ``file:``
+    URI and every entry ends in ``/``. Membership in *any* of them, like :attr:`tag_ids`."""
+
     media_types: frozenset[str] = frozenset()
     tag_ids: frozenset[str] = frozenset()
     """Tags a document must carry. Membership in *any* of them, matching the disjunction-
@@ -87,7 +206,18 @@ class CollectionRule(_Organization):
             raise ValueError(msg)
         return values
 
-    @field_serializer("sources", "media_types", "tag_ids", when_used="json")
+    @field_validator("uri_prefixes")
+    @classmethod
+    def _prefixes_name_a_location(cls, values: frozenset[str]) -> frozenset[str]:
+        """Normalized on the way in, so the stored rule is the form the clause compares.
+
+        Here rather than in :func:`~manicule.storage.organization.rule_clause`, because a rule
+        is public collection metadata that round-trips through four surfaces: normalizing at
+        evaluation would show an operator a prefix that is not the one being matched.
+        """
+        return frozenset(directory_prefix(value) for value in values)
+
+    @field_serializer("sources", "media_types", "tag_ids", "uri_prefixes", when_used="json")
     def _sorted_selectors(self, values: frozenset[str]) -> list[str]:
         """Give every public surface one deterministic representation of set-valued fields."""
         return sorted(values)
@@ -410,4 +540,5 @@ __all__ = [
     "Restoration",
     "Tag",
     "TrashEntry",
+    "directory_prefix",
 ]

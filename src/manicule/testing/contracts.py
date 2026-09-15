@@ -24,6 +24,7 @@ from collections.abc import (
 )
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit, urlunsplit
 
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
@@ -1017,6 +1018,82 @@ async def _assert_rule_membership(store: CollectionStore, subject: Document | No
         )
     finally:
         await store.delete_collection(ruled.id)
+    await _assert_prefix_membership(store, subject)
+
+
+_SEPARABLE_SEGMENT = 2
+"""Characters a final path segment needs before a prefix can be cut to stop inside it."""
+
+
+def _containing_directory(uri: str) -> str:
+    """The directory ``uri`` sits in, as a prefix.
+
+    Split on the *path component* rather than on the raw string, because the last ``/`` of a
+    raw ``file:///doc.md`` is structural: cutting there leaves ``file://``, which names an
+    empty host rather than the filesystem root and is refused as a prefix. A document at the
+    root of its authority has ``/`` for a parent, and that is a real directory.
+    """
+    scheme, netloc, path, _, _ = urlsplit(uri)
+    parent = path.rsplit("/", 1)[0]
+    return urlunsplit((scheme, netloc, f"{parent}/", "", ""))
+
+
+async def _assert_prefix_membership(store: CollectionStore, subject: Document) -> None:
+    """Check that a prefix rule selects by location, and stops at the directory it names.
+
+    Held here rather than only against SQLite because the boundary is the part an
+    implementation can get wrong while passing every other assertion in this suite: a plain
+    string prefix, or a case-folding one, still reports the subject as a member and differs
+    only in what *else* it quietly sweeps up. A store that widens here widens silently.
+    """
+    directory = _containing_directory(subject.uri)
+    ruled = await store.create_collection(
+        "conformance-prefix", rule=CollectionRule(uri_prefixes=frozenset({directory}))
+    )
+    try:
+        members = {document.id for document in await store.collection_documents(ruled.id)}
+        _require(
+            subject.id in members,
+            f"a collection ruled on the prefix {directory!r} did not contain document "
+            f"{subject.id!r}, whose uri {subject.uri!r} sits under it. Membership by location "
+            f"is what lets a document join a collection by arriving rather than by being added",
+        )
+        holding = {held.id for held in await store.collections_for(subject.id)}
+        _require(
+            ruled.id in holding,
+            "collections_for missed a prefix-ruled collection, so the two directions of "
+            "membership disagree about the same document",
+        )
+    finally:
+        await store.delete_collection(ruled.id)
+
+    # The subject's own uri with its last character dropped. That is a *string* prefix of the
+    # uri and not a *directory* prefix of it — it stops mid-segment — so a store comparing text
+    # without a boundary reports the subject here and is wrong in the widening direction.
+    #
+    # It only stops mid-segment when there are at least two characters after the final
+    # separator, and both shorter cases would make this probe name a real ancestor and fail a
+    # *correct* store: a uri ending in ``/`` truncates back to the same directory, and a
+    # one-character final segment truncates to the parent. There is no prefix that distinguishes
+    # the two implementations for such a subject, so the probe is skipped rather than inverted.
+    _, _, final = subject.uri.rpartition("/")
+    if len(final) < _SEPARABLE_SEGMENT:
+        return
+    truncated = subject.uri[:-1]
+    widened = await store.create_collection(
+        "conformance-prefix-boundary", rule=CollectionRule(uri_prefixes=frozenset({truncated}))
+    )
+    try:
+        swept = {document.id for document in await store.collection_documents(widened.id)}
+        _require(
+            subject.id not in swept,
+            f"a collection ruled on {truncated!r} contained {subject.id!r}, whose uri is "
+            f"{subject.uri!r}. That prefix stops in the middle of a path segment, so it names "
+            f"a neighboring directory rather than a parent: a prefix has to stop on a "
+            f"separator or every collection quietly holds its neighbors' documents",
+        )
+    finally:
+        await store.delete_collection(widened.id)
 
 
 async def assert_tag_store_contract(
