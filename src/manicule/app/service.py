@@ -77,6 +77,7 @@ from manicule.core.rebuild import (
     RebuildLeaseError,
     RebuildOperationError,
     RebuildPublicationValidationError,
+    RebuildRefusalCode,
     RebuildStorageError,
     RebuildTerminalError,
     RebuildTerminalGenerationError,
@@ -397,7 +398,17 @@ def _lifecycle_outcome_report(outcome: LifecycleOutcome) -> r.LifecycleReport:
 
 def _rebuild_plan_report(estimate: RebuildEstimate) -> r.RebuildPlanReport:
     refusal = (
-        r.LifecycleRefusal(code=estimate.refusal.value, count=estimate.missing_count)
+        r.LifecycleRefusal(
+            code=cast("r.LifecycleRefusalCode", estimate.refusal.value),
+            # The count a refusal carries is the size of the problem it names, and for an
+            # incomplete inventory that is the live documents no bound manifest can rebuild,
+            # not the retained bytes that went missing.
+            count=(
+                estimate.uncovered_documents
+                if estimate.refusal is RebuildRefusalCode.INCOMPLETE_SOURCE_INVENTORY
+                else estimate.missing_count
+            ),
+        )
         if estimate.refusal is not None
         else None
     )
@@ -419,6 +430,9 @@ def _rebuild_plan_report(estimate: RebuildEstimate) -> r.RebuildPlanReport:
         max_stored_chunk_tokens=estimate.max_stored_chunk_tokens,
         estimated_embedding_chunks=estimate.estimated_embedding_chunks,
         network_required=estimate.network_required,
+        live_documents=estimate.live_documents,
+        covered_documents=estimate.covered_documents,
+        uncovered_documents=estimate.uncovered_documents,
         lifecycle=r.LifecycleProgress(
             phase="rebuilding",
             outcome="deferred" if estimate.runnable else "refused",

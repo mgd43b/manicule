@@ -372,13 +372,18 @@ async def promoted_snapshot_many(
     engine: AsyncEngine,
     data_dir: Path,
     raws: tuple[RawDocument, ...],
+    *,
+    run_id: str = "promoted-glossary-run",
+    connector: str = "wiki",
+    scope_fingerprint: str = "glossary-v1",
+    watermark: str = "v2",
 ) -> tuple[str, tuple[str, ...]]:
     """Promote several retained inputs so publication must cross evidence pages."""
     run = await store.create_acquisition_run(
-        "promoted-glossary-run",
-        "wiki",
-        source_scope="scope:glossary-v1",
-        scope_fingerprint="glossary-v1",
+        run_id,
+        connector,
+        source_scope=f"scope:{scope_fingerprint}",
+        scope_fingerprint=scope_fingerprint,
     )
     claimed = await store.claim_acquisition_run(
         run.id, "worker", now=NOW, expires_at=NOW + timedelta(minutes=5)
@@ -404,7 +409,7 @@ async def promoted_snapshot_many(
         )
     await store.complete_acquisition_enumeration(
         run.id,
-        Watermark(value="v2", observed_at=NOW),
+        Watermark(value=watermark, observed_at=NOW),
         lease_owner="worker",
         lease_generation=claimed.lease_generation,
         now=NOW,
@@ -444,7 +449,7 @@ async def promoted_snapshot_many(
     )
     await store.promote_snapshot_and_commit_watermark(
         run.id,
-        expected_scope_fingerprint="glossary-v1",
+        expected_scope_fingerprint=scope_fingerprint,
         lease_owner="worker",
         lease_generation=claimed.lease_generation,
         now=NOW,
@@ -1982,7 +1987,10 @@ async def test_live_vector_swap_gets_a_new_plan_and_published_replay_is_idempote
         stale = await rebuilds.plan_rebuild(run_id, target, missing_limit=10)
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", count_record_selects)
-    assert record_selects == 2, "one manifest verification and one bounded planning cursor"
+    assert record_selects == 4, (
+        "one manifest verification, one manifest integrity walk, one contribution cursor, "
+        "one coverage aggregate — a constant per bound run, never one per document"
+    )
     sessions = session_factory(engine)
     async with sessions.begin() as session:
         state = await session.get(models.IndexState, "default")

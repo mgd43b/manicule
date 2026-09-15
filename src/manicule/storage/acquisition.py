@@ -34,6 +34,7 @@ from manicule.core.acquisition import (
     AcquisitionStage,
     SnapshotCompleteness,
     SnapshotItemOutcome,
+    SnapshotMembership,
     SnapshotPromotionPolicy,
     UnsetValue,
 )
@@ -463,6 +464,7 @@ def _run(row: models.AcquisitionRun) -> AcquisitionRun:
         scope_fingerprint=row.scope_fingerprint,
         full_inventory_authority=row.full_inventory_authority,
         scope_inventory_complete=row.scope_inventory_complete,
+        enumeration_membership=row.enumeration_membership,
         promotion_policy=row.promotion_policy,
         state=row.state,
         base_watermark=(
@@ -742,6 +744,25 @@ def _matching_record(
     if cast("Any", row.source_record) != source_json:
         raise AcquisitionConflictError("source identity was rediscovered with different data")
     return _record(row)
+
+
+def _enumeration_membership(
+    connector_row: models.Connector, scope_fingerprint: str
+) -> SnapshotMembership:
+    """What this run's enumeration will cover, decided by the cursor it inherits.
+
+    The same condition :meth:`manicule.ingest.pipeline.Pipeline._start_acquisition` applies
+    before handing a watermark to ``Connector.discover``: a cursor committed for a different
+    scope is not a cursor into this one, and ``None`` means "no previous sync: yield
+    everything". Recording it here rather than leaving it to be rederived from
+    ``base_watermark`` keeps the answer stable once a run has discarded an inherited cursor.
+    """
+    if (
+        connector_row.watermark is None
+        or connector_row.watermark_scope_fingerprint != scope_fingerprint
+    ):
+        return SnapshotMembership.FULL_INVENTORY
+    return SnapshotMembership.INCREMENTAL
 
 
 def _matching_run_identity(
@@ -1039,6 +1060,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         scope_fingerprint: str = "",
         full_inventory_authority: str = "",
         scope_inventory_complete: bool = True,
+        enumerates_full_inventory: bool = False,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         _allow_connector_tombstone: bool = False,
     ) -> AcquisitionRun:
@@ -1096,6 +1118,11 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     scope_fingerprint=scope_fingerprint,
                     full_inventory_authority=full_inventory_authority,
                     scope_inventory_complete=scope_inventory_complete,
+                    enumeration_membership=(
+                        SnapshotMembership.FULL_INVENTORY
+                        if enumerates_full_inventory
+                        else _enumeration_membership(connector_row, scope_fingerprint)
+                    ),
                     promotion_policy=promotion_policy,
                     state=AcquisitionRunState.ENUMERATING,
                     base_watermark=connector_row.watermark,
@@ -1423,6 +1450,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         source_scope: str = "",
         scope_fingerprint: str = "",
         full_inventory_authority: str = "",
+        enumerates_full_inventory: bool = False,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         now: datetime,
         expires_at: datetime,
@@ -1544,6 +1572,14 @@ class AcquisitionJournalMixin(WorkspaceScoped):
                     source_scope=source_scope,
                     scope_fingerprint=scope_fingerprint,
                     full_inventory_authority=full_inventory_authority,
+                    enumeration_membership=(
+                        # A replacement enumeration is handed no watermark, so it walks the
+                        # scope from nothing however current the inherited cursor looks; and a
+                        # connector that discards the cursor does the same on every run.
+                        SnapshotMembership.FULL_INVENTORY
+                        if predecessor is not None or enumerates_full_inventory
+                        else _enumeration_membership(connector_row, scope_fingerprint)
+                    ),
                     promotion_policy=promotion_policy,
                     state=AcquisitionRunState.ENUMERATING,
                     base_watermark=connector_row.watermark,

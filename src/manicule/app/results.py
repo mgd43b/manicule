@@ -88,6 +88,7 @@ type LifecycleRefusalCode = Literal[
     "snapshot_not_promoted",
     "snapshot_changed",
     "workspace_scope_changed",
+    "incomplete_source_inventory",
     "missing_local_input",
     "memory_bound",
     "temp_disk_bound",
@@ -1167,6 +1168,11 @@ class RebuildPlanReport(Payload):
     max_stored_chunk_tokens: int = Field(ge=0)
     estimated_embedding_chunks: int = Field(ge=0)
     network_required: bool = False
+    live_documents: int = Field(default=0, ge=0)
+    """Live documents the bound connectors hold, which this replacement must account for."""
+
+    covered_documents: int = Field(default=0, ge=0)
+    uncovered_documents: int = Field(default=0, ge=0)
     lifecycle: LifecycleProgress
 
 

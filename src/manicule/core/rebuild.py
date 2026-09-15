@@ -31,6 +31,16 @@ class RebuildRefusalCode(StrEnum):
     SNAPSHOT_NOT_PROMOTED = "snapshot_not_promoted"
     SNAPSHOT_CHANGED = "snapshot_changed"
     WORKSPACE_SCOPE_CHANGED = "workspace_scope_changed"
+    INCOMPLETE_SOURCE_INVENTORY = "incomplete_source_inventory"
+    """No retained source view proves the connector's whole current membership.
+
+    Distinct from ``MISSING_LOCAL_INPUT``, which names bodies a proven manifest cannot read
+    back. This one names members the manifest never claimed: the newest promoted run is a
+    delta, and no unbroken chain of promoted runs reaches back to a full inventory that would
+    account for the live documents it does not mention. Replacing a corpus from that subset
+    would retire every document the delta had no reason to enumerate.
+    """
+
     MISSING_LOCAL_INPUT = "missing_local_input"
     MEMORY_BOUND = "memory_bound"
     TEMP_DISK_BOUND = "temp_disk_bound"
@@ -155,6 +165,19 @@ class RebuildEstimate(BaseModel):
     max_stored_chunk_tokens: int = Field(default=0, ge=0)
     estimated_embedding_chunks: int = Field(default=0, ge=0)
     network_required: bool = False
+
+    live_documents: int = Field(default=0, ge=0)
+    """Live documents the bound connectors hold, which a replacement must account for."""
+
+    covered_documents: int = Field(default=0, ge=0)
+    """How many of them the bound manifests name with retained bytes."""
+
+    uncovered_documents: int = Field(default=0, ge=0)
+    """How many they do not. Non-zero without proven deletion authority is a refusal.
+
+    Counts, never identities: this estimate crosses the CLI, HTTP and MCP contracts, and
+    "which documents would be lost" is a list of source ids by another name.
+    """
 
     @property
     def runnable(self) -> bool:

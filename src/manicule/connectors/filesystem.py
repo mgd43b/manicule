@@ -272,6 +272,17 @@ class FilesystemConnector:
     Satisfies :class:`~manicule.core.protocols.Connector`.
     """
 
+    enumerates_full_inventory = True
+    """Discovery walks the whole scope on every run, so every manifest is a full inventory.
+
+    The watermark is accepted and deliberately discarded (see :meth:`discover`), which means
+    this run's own cursor state cannot be read as evidence that its enumeration was
+    incremental — it inherits a committed watermark exactly as a genuinely incremental
+    connector does. Declaring it is what lets an offline rebuild treat the newest manifest as
+    membership and deletion evidence rather than reaching back through history for a proof it
+    already holds (`docs/ingest.md` §10.4).
+    """
+
     def __init__(
         self,
         root: Path,

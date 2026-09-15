@@ -1263,6 +1263,7 @@ class IngestPipeline:
             source_scope=source_scope,
             scope_fingerprint=scope_fingerprint,
             full_inventory_authority=full_inventory_authority,
+            enumerates_full_inventory=snapshot_enumerates_full_inventory(connector),
             promotion_policy=self._snapshot_policy,
             now=now,
             expires_at=now + timedelta(seconds=self._acquisition_lease_s),
@@ -4783,6 +4784,25 @@ def snapshot_full_inventory_authority(connector: Connector) -> FullInventoryAuth
     if callable(declared):
         declared = declared()
     return _closed_full_inventory_authority(declared)
+
+
+def snapshot_enumerates_full_inventory(connector: Connector) -> bool:
+    """Whether discovery walks the whole scope regardless of the cursor it is handed.
+
+    Several connectors accept a watermark and deliberately discard it, because enumerating a
+    local tree is cheap and a modification time is the wrong thing to skip on. Their manifests
+    are full inventories even on the tenth sync, and nothing in the run's own cursor state says
+    so — it inherits a committed watermark exactly as an incremental connector does.
+
+    Duck-typed, like ``full_inventory_authority``, and defaulting to ``False``: a connector that
+    does not make the claim is treated as incremental, which costs it deletion authority and a
+    coverage proof it must earn from an earlier full inventory. That is the safe direction to be
+    wrong in, so a plugin author who never hears about this attribute loses nothing but speed.
+    """
+    declared = getattr(connector, "enumerates_full_inventory", False)
+    if callable(declared):
+        declared = declared()
+    return bool(declared)
 
 
 def _with_status(document: Document, result: ChainResult) -> Document:

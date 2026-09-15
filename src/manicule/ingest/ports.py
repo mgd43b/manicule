@@ -401,6 +401,7 @@ class AcquisitionStore(Protocol):
         scope_fingerprint: str = "",
         full_inventory_authority: str = "",
         scope_inventory_complete: bool = True,
+        enumerates_full_inventory: bool = False,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
     ) -> AcquisitionRun: ...
 
@@ -419,6 +420,7 @@ class AcquisitionStore(Protocol):
         source_scope: str = "",
         scope_fingerprint: str = "",
         full_inventory_authority: str = "",
+        enumerates_full_inventory: bool = False,
         promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         now: datetime,
         expires_at: datetime,

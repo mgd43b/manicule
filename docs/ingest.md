@@ -1671,7 +1671,7 @@ They are not interchangeable, and the price of each is the reason:
 | Lineage | Moves when | Repaired by | Costs |
 |---|---|---|---|
 | `documents.parse_fp` | a parser's rules or one of its libraries changes | `document reindex --stale` | a parse from retained bytes, then an embed of whatever moved |
-| `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | a re-index; the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything |
+| `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | `rebuild plan` then `rebuild execute` (§10.4); the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything, from retained bytes |
 | `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
 | `documents.glossary_fp` | any detection or normalization rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
 | `documents.relation_fp` | a relation extractor is configured, unconfigured, or its rules change | `document reindex --stale-relations` | a pass over stored chunks; **no GPU at all** |
@@ -1694,9 +1694,10 @@ The distinction is the publication boundary. A repair deliberately commits one d
 time, while a generation rebuild keeps its document, chunk, glossary, FTS and vector output
 beside the active corpus until the complete replacement validates.
 
-The only source inputs are the newest promoted acquisition manifests for the workspace's
-connector scopes. The runner accepts a read-only blob source and has no connector dependency,
-fetch method or source-crawl fallback. Planning verifies every manifest once, pages them in a
+The only source inputs are promoted acquisition manifests already held locally: the newest one
+for each of the workspace's connector scopes, and, where that one is an incremental manifest, the
+runs behind it that account for what it did not enumerate. The runner accepts a read-only blob
+source and has no connector dependency, fetch method or source-crawl fallback. Planning verifies every manifest once, pages them in a
 deterministic connector/scope order, stream-verifies each retained blob without
 allocating or fully decompressing it, and returns only
 aggregate counts plus bounded manifest sequence numbers for missing inputs. A missing or corrupt
@@ -1704,8 +1705,10 @@ blob is a typed refusal; it is never permission to contact the source.
 
 `index_state` and its named vector directory are workspace-owned, so the generation binds that
 workspace's manifests into one canonical snapshot set. `derived_generation_snapshots` records
-their ordered run, connector/scope, membership and retained-item commitments. Planning from any
-included snapshot produces the same generation identity. Lease checks and the publication
+their ordered run, connector/scope, membership, retained-item and contributed-item commitments —
+retained being what a run's own manifest holds, which is what acquisition settlement proves, and
+contributed being what it owes this generation once a newer bound run has claimed the documents
+it re-enumerated. Planning from any included snapshot produces the same generation identity. Lease checks and the publication
 transaction repeat the complete set comparison; a connector promotion after planning fences the
 old shadow work with `workspace_scope_changed` and a new plan includes the replacement snapshot.
 Live documents from a source outside the bound connector set also refuse publication rather than
@@ -1915,6 +1918,98 @@ Status therefore distinguishes `retrying`, `takeover_replay`, `validation`, norm
 `operator_required`; a release without a durable diagnostic remains the older honest
 `incomplete` state rather than falsely reporting active work.
 
+**Two completeness questions, and collapsing them cost a corpus.** A promoted run answers
+`completeness` — whether the bodies of the members it enumerated are held locally — and
+`enumeration_membership` — whether it enumerated the connector's whole membership or only what
+had changed since a committed cursor. The second was not recorded, and planning read the first
+as though it were both. A connector's second sync promotes a one-document incremental manifest
+whose single body was retained; that run is `complete`, it is the newest promoted run, and a
+rebuild planned from it priced one document, called itself runnable, and published a replacement
+that soft-deleted every other document the connector held. That is §11.1's rule — never
+mass-delete on a partial enumeration — being broken by the one path §11.1 did not name.
+
+They are now separate conditions, and they gate different things:
+
+- **Coverage** asks whether the bound runs can rebuild every document the connector still
+  holds. A replacement that cannot is refused with `incomplete_source_inventory` before
+  anything is claimed, staged or published, and the plan reports `live_documents`,
+  `covered_documents` and `uncovered_documents` — counts, never identities.
+- **Deletion authority** asks whether the replacement may retire a document it does not
+  contain. Only a newest run that is itself a full enumeration carries it. A delta names what
+  changed, and a source that is removed simply stops being named, so nothing in a delta
+  distinguishes "gone" from "unchanged"; a rebuild led by one publishes its documents and
+  retires nothing. A connector whose discovery ignores the cursor and walks its whole scope
+  every run declares `enumerates_full_inventory`, and keeps the authority its manifests earn.
+
+**Coverage is proved by reaching back, not by refusing.** A refusal alone would leave any corpus
+whose last sync was incremental — which is nearly all of them — permanently unable to migrate
+without re-downloading every body. So when the newest promoted run is a delta, planning walks
+back through the connector's promoted runs, following each run's inherited cursor to the run
+whose `candidate_watermark` it resumed from, until it reaches a full inventory. Those runs are
+bound into the generation together, newest first, and a document named by more than one is built
+once from the newest run that named it, because that run holds its current bytes. Runs behind
+the newest are drawn on only for documents that are still live, so reaching back through history
+cannot reach past a deletion and reinstate what the corpus has already retired.
+
+A chain that does not connect is not a chain. A missing link, a predecessor superseded or left
+behind by history cleanup, a cursor committed for a different scope, an inventory invalidated by
+a source deletion, or more consecutive deltas than planning will walk (256) all read as no
+proof at all rather than as a near miss. The whole contributing set — not just the newest run
+per connector — is what the plan identity names and what publication rechecks, so a run promoted
+between planning and publication invalidates the plan rather than publishing an older proof
+against a newer corpus.
+
+**Migrating a corpus to a release-locked grammar version.** `ChunkFingerprint` records a grammar
+version per language (`parsing.md` §8.1), so changing the installed `tree-sitter-language-pack`
+moves the chunk identity of every language it touches and `check_before_run` refuses the next
+ingest outright. The repair is this path, and it reads no source:
+
+```sh
+manicule connector snapshot CONNECTOR --json   # copy data.snapshot_id
+manicule rebuild plan SNAPSHOT_ID
+manicule rebuild execute SNAPSHOT_ID
+manicule rebuild status GENERATION_ID
+```
+
+`rebuild plan` is a dry run. Read three things in its output before running anything. The
+**source inventory coverage** line must account for every live document — `covered` equal to
+`live`, `not covered` zero. **Missing retained inputs** must be zero; a non-zero count means the
+manifest names bodies the blob store no longer holds, and those documents cannot be rebuilt from
+local state at all. And the **current** and **target chunk identity** lines must differ, or there
+is nothing to migrate.
+
+A plan refused with `incomplete_source_inventory` is saying the connector's retained history no
+longer reaches a full inventory that accounts for the live corpus — because the run that held it
+was superseded, pruned by `cleanup_acquisition_history`, or promoted under a scope that has since
+changed. That is a statement about local history, so no amount of re-planning fixes it: the
+corpus has to be enumerated from the source again. A connector re-enumerates from nothing when
+its configured scope changes, and automatically after a confirmed source deletion
+(`reenumeration_required` → `reenumerating`, §11.1); connectors that discard the cursor and walk
+their whole scope every run — the filesystem, git-site and Confluence-snapshot connectors —
+declare `enumerates_full_inventory` and never reach this refusal at all. Nothing about the
+refusal is destructive: no generation is created, no lease is claimed, and the live corpus is
+exactly as it was.
+
+`rebuild execute` claims a lease, derives every bound input from retained bytes, validates the
+complete replacement beside the live corpus, and publishes it in one transaction. It is
+resumable and idempotent: re-running it after a lost response or a killed process takes over the
+same generation rather than building a second one. Retained originals, document identities,
+metadata, hierarchy, collection membership and tags survive it; what is replaced is derived
+state, and `relation_fp` is cleared rather than carried because a rebuild cannot rederive edges
+(§10.3).
+
+**What this is tested against, and what it is not.** The regression suite in
+`tests/test_rebuild_incremental_coverage_regression.py` covers, against a real SQLite and a real
+Lance store with synthetic fixtures: a full inventory followed by a one-document delta, an empty
+delta, a retired document, two connectors with different histories, a superseded predecessor, a
+predecessor whose inventory was invalidated, a missing retained body, publication preserving
+every covered document, a delta-led publication retiring nothing, a promotion racing the
+publication, and an idempotent republish. What it does not cover is scale: the chain walk, the
+coverage aggregate and the deduplicated evidence reads are each one bounded query per bound run
+rather than per document, but no rehearsal has yet been run against a corpus large enough for
+the constant factors to matter, and a real grammar migration on a production corpus should be
+rehearsed against a copy of that corpus before it is run against the original.
+
 ### 10.5 Source and derived lifecycle boundaries
 
 Lifecycle work is four operations, not one broadly destructive reset:
@@ -2043,7 +2138,7 @@ the one way nobody should have to find it out.
 
 ---
 
-### 10.3 Durable whole-index re-embedding
+### 10.6 Durable whole-index re-embedding
 
 ```
 manicule reembed plan
@@ -2181,6 +2276,11 @@ Three guards, all required:
    recoverable by clearing `deleted_at` — free, within the grace period (`storage.md` §8.2).
 
 Guard 3 is what makes guard 2 tunable rather than terrifying.
+
+The same rule binds the one other path that can retire documents in bulk. An offline rebuild
+publishes a replacement corpus and retires what the replacement does not contain, which is the
+diff in §11.1's shape wearing different clothes — so it is held to the same standard, and §10.4
+says how it proves it.
 
 A dry-run consumes its completed inventory in the same transaction that computes the preview.
 It cannot later be replayed as deletion authority; an applying run must obtain a fresh full
@@ -2459,7 +2559,7 @@ written, so the next sync sees it again.
 §13.2 says recovery is automatic *at the pipeline boundary*: a run that stops leaves a committed
 prefix, and the next run of that connector claims the same run rather than starting a new one.
 What it does not say is who starts that next run, and for acquisition there is no answer inside
-the process. §10.3's restart-recovery job is re-embed's, and it is re-embed's on purpose — an
+the process. §10.6's restart-recovery job is re-embed's, and it is re-embed's on purpose — an
 ownerless re-embed generation has no other actor that would ever resume it, while an acquisition
 run has a connector whose next sync is the resume. So the supervisor *is* the continuation, and
 what it needs is not a mechanism but a signal it can act on without reading private state.
@@ -2504,7 +2604,7 @@ caller may act on any one of them. What it must not do is treat a report with an
 enumerated everything: that is the same `--limit`-shaped mistake §13.2.2 describes.
 
 > **Not built.** A first-class in-process continuation for acquisition runs — a bounded retry
-> budget, an admitted-writer election, a recovery job at startup mirroring §10.3's — is filed
+> budget, an admitted-writer election, a recovery job at startup mirroring §10.6's — is filed
 > rather than deferred. It is the right shape if syncs ever run without a supervisor above them.
 > Today every deployment that runs a sync has one (`deployment.md` §6.3), and a retry budget
 > inside the process would be a second scheduler disagreeing with the first.
