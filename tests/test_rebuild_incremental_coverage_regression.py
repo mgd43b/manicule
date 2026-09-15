@@ -876,3 +876,94 @@ def test_the_shipped_connectors_that_discard_the_cursor_say_so() -> None:
     assert not snapshot_enumerates_full_inventory(object()), (
         "and a connector that makes no claim is treated as incremental, not assumed complete"
     )
+
+
+async def test_a_composed_publication_preserves_collections_and_tags(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Replacing derived state must not disturb what a person put on a document by hand.
+
+    Both of the unchanged documents here are rebuilt from a run older than the one that led
+    the plan, which is the path that did not exist before. Document identity is what
+    collection membership and tags hang off, so this is really a test that composing several
+    runs still produces the same `document_id` — and the cheapest way to be wrong about that
+    is to derive it from the run that supplied the bytes rather than from the connector.
+    """
+    _, raws = await live_full_inventory(store, engine, data_dir)
+    unchanged = raws[1]
+    collection = await store.create_collection("kept")
+    tag = await store.ensure_tag("kept-tag")
+    identity = document_id(store.workspace_id, "wiki", unchanged.source_id)
+    assert await store.add_to_collection(collection.id, [identity]) == 1
+    assert await store.tag_document(identity, [tag.id]) == 1
+
+    delta = await promoted_delta(store, engine, data_dir, source_id=raws[0].source_id)
+    vectors, target = await ready_vectors(data_dir)
+    rebuilds = rebuild_store(store, engine, data_dir, vectors)
+    plan = await rebuilds.plan_rebuild(delta, target, missing_limit=10)
+    await publish_plan(
+        rebuilds,
+        vectors,
+        BlobStore(engine, data_dir),
+        generation_id=plan.generation_id,
+        workspace_id=store.workspace_id,
+        owner="composed-publisher",
+    )
+
+    async with session_factory(engine)() as session:
+        members = (
+            (
+                await session.execute(
+                    select(models.CollectionDocument.document_id).where(
+                        models.CollectionDocument.collection_id == collection.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        document = await session.get(models.Document, identity)
+    assert list(members) == [identity], "membership survives a replacement of derived state"
+    assert [named.id for named in await store.tags_for(identity)] == [tag.id]
+    assert document is not None
+    assert document.original_ref is not None, "and so does the retained original"
+    assert document.chunk_fp == target.chunk_fingerprint, "while the derived identity moved"
+
+
+async def test_a_lease_on_a_composed_generation_is_fenced_by_a_later_promotion(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    """A worker holding a lease is fenced by the same proof planning was bound to.
+
+    The composed case is where this could quietly stop working: the fence compares the whole
+    contributing run set, and a chain is recomputed from the newest promoted run outward — so
+    a promotion that lands mid-build changes not just which run leads, but every run behind
+    it. A fence that still compared only the newest run per connector would let a worker keep
+    building against evidence the workspace had already moved past.
+    """
+    _, raws = await live_full_inventory(store, engine, data_dir)
+    delta = await promoted_delta(store, engine, data_dir, source_id=raws[0].source_id)
+    vectors, target = await ready_vectors(data_dir)
+    rebuilds = rebuild_store(store, engine, data_dir, vectors)
+    plan = await rebuilds.plan_rebuild(delta, target, missing_limit=10)
+    claimed = await rebuilds.claim_generation(
+        plan.generation_id, "builder", now=NOW, expires_at=NOW + timedelta(days=36500)
+    )
+    await rebuilds.assert_generation_lease(
+        plan.generation_id, "builder", claimed.lease_generation, now=NOW
+    )
+
+    await promoted_delta(
+        store,
+        engine,
+        data_dir,
+        source_id=raws[2].source_id,
+        run_id="zzz-promoted-mid-build",
+    )
+
+    with pytest.raises(RebuildPublicationConflictError) as caught:
+        await rebuilds.assert_generation_lease(
+            plan.generation_id, "builder", claimed.lease_generation, now=NOW
+        )
+    assert caught.value.code is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
+    assert await live_source_ids(engine) == {raw.source_id for raw in raws}

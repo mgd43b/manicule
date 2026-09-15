@@ -2003,8 +2003,9 @@ state, and `relation_fp` is cleared rather than carried because a rebuild cannot
 Lance store with synthetic fixtures: a full inventory followed by a one-document delta, an empty
 delta, a retired document, two connectors with different histories, a superseded predecessor, a
 predecessor whose inventory was invalidated, a missing retained body, publication preserving
-every covered document, a delta-led publication retiring nothing, a promotion racing the
-publication, and an idempotent republish. What it does not cover is scale: the chain walk, the
+every covered document, a delta-led publication retiring nothing, collection membership and tags
+surviving a composed publication, a live worker's lease fenced by a promotion that lands
+mid-build, a promotion racing the publication, and an idempotent republish. What it does not cover is scale: the chain walk, the
 coverage aggregate and the deduplicated evidence reads are each one bounded query per bound run
 rather than per document, but no rehearsal has yet been run against a corpus large enough for
 the constant factors to matter, and a real grammar migration on a production corpus should be
