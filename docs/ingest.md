@@ -1694,10 +1694,22 @@ The distinction is the publication boundary. A repair deliberately commits one d
 time, while a generation rebuild keeps its document, chunk, glossary, FTS and vector output
 beside the active corpus until the complete replacement validates.
 
-The only source inputs are promoted acquisition manifests already held locally: the newest one
-for each of the workspace's connector scopes, and, where that one is an incremental manifest, the
-runs behind it that account for what it did not enumerate. The runner accepts a read-only blob
-source and has no connector dependency, fetch method or source-crawl fallback. Planning verifies every manifest once, pages them in a
+That boundary is also the backend requirement, and it is asked about before the run. A rebuild
+stages its chunks into a publication of their own and proves that publication complete before
+anything is made live, so a store holding one row per chunk has nothing for it to count, copy or
+retire; `storage.vector_db = "qdrant"` is that store today. The refusal names the backend and
+happens while the plan is being assembled, rather than arriving as a missing method at the first
+validation — which is after the corpus has been parsed and embedded. It is a capability check
+and not a check on the configured name, because nothing downstream of it reaches into a
+particular backend's storage: a plugin that genuinely implements the publication surface can
+genuinely run this. Re-indexing the sources rebuilds the same derived state without a second
+generation, and is the route for a backend without one.
+
+The only source inputs are promoted acquisition manifests already held locally: the newest
+one for each of the workspace's connector scopes, and, where that one is an incremental
+manifest, the runs behind it that account for what it did not enumerate. The runner accepts a
+read-only blob source and has no connector dependency, fetch method or source-crawl fallback.
+Planning verifies every manifest once, pages them in a
 deterministic connector/scope order, stream-verifies each retained blob without
 allocating or fully decompressing it, and returns only
 aggregate counts plus bounded manifest sequence numbers for missing inputs. A missing or corrupt
@@ -2047,6 +2059,22 @@ fingerprint/stage/publication transactions take an epoch CAS while holding SQLit
 The same-process mutation guard spans the complete external-vector-to-SQLite publication gap.
 Repeating a completed reset is a zero-change success.
 
+None of that turns on which vector backend is configured. The tombstone ledger is relational and
+deletion by physical row id is the one thing every store does, so the exact row cleanup above is
+the same work on any of them; what differs is the last step. The embedded backend's storage is a
+directory this runtime owns and removes itself — except the shared upgrade-era root, which other
+workspaces still index into and which is therefore left standing while one of them remains. Every
+other backend is asked to discard its own, because manicule holds a client rather than a
+filesystem ([`storage.md`](storage.md) §6.7), and a store offering no way to be asked has its
+rows deleted and reports `vector_store_removed` false. The obsolete-generation cleanup folded
+into a reset follows the same three cases: it retires each publication by name where the
+backend can; on a backend whose whole storage is about to be discarded it does not ask, because
+the discard takes those rows with it; and on one that can do neither it leaves the generation
+ledger standing and reports no publications removed. That last case is the rule the other two
+serve — a reset removes what it can and says what it removed, and the record of rows it could
+not remove is the one thing it must not delete, because that record is what a later cleanup on
+a capable backend would work from.
+
 Generation cleanup selects only `failed`, `canceled`, or superseded `published` generations.
 The newest published generation, every publication still named by a live document, and every
 planned/building/validating generation are protected. Physical vector-publication rows are
@@ -2370,6 +2398,15 @@ completed, whether a watermark advanced, whether retry is required, and the type
 reason. This makes an incomplete source walk observable without inferring it from a missing
 watermark or parsing a sentence.
 
+One fact in a run's report is not a counter the run kept. `collected` and `uncollected` are
+measured after it finishes, over this source's live documents, because **nothing in this
+pipeline ever writes a collection membership row** — rule-driven membership is evaluated at read
+time and manual membership is written only by `document_create` ([`storage.md`](storage.md)
+§11.2). There is therefore no moment inside a sync at which a document "joins" anything to be
+counted, and what is true afterwards is what gets reported. A run whose every counter is perfect
+into a workspace with no collections reports `uncollected` equal to the whole of its source,
+which is the one number that says so ([`surfaces.md`](surfaces.md) §5).
+
 Two records serve different purposes. `connectors.metadata.last_run` is the overwritten public
 diagnostic summary. `acquisition_runs` and `acquisition_records` are relational correctness
 state: committed source coverage, completion/candidate markers, leases and pending local work.
@@ -2616,13 +2653,20 @@ enumerated everything: that is the same `--limit`-shaped mistake §13.2.2 descri
 
 Complementing the storage checks (`storage.md` §10) and the parse checks (`parsing.md` §6.6).
 
-There is no `doctor` command yet — it belongs to the CLI work, alongside the storage checks
-(`storage.md` §10) and the parse checks (`parsing.md` §6.6), none of which have one either.
-What the pipeline owes it is the *data*, and each row below names something already recorded
+`doctor` exists; [`surfaces.md`](surfaces.md) §5 is its contract and carries the list of checks
+it actually emits. **This section is the ingest side's standing wish-list, and the rows below
+are not all shipped** — that distinction is the thing to read it with, because the section
+predates the command and for a while claimed the command did not exist at all.
+
+What the pipeline owes `doctor` is the *data*, and each row names something already recorded
 rather than something to be derived later: statuses and `updated_at` on `documents`, kill counts
 by reason on the worker pool, `last_run` counters and `last_clean_reconcile_at` on
 `connectors.metadata`, `proposed_deletion` where guard 2 fired, `original_omitted_reason` on
-every document that has no retained bytes, and the lock file's holder.
+every document that has no retained bytes, and the lock file's holder. Two ingest-adjacent
+checks are shipped today and are named in `surfaces.md` rather than repeated here: `connectors`,
+for documents filed under a connector *type* while an instance of that type is configured, and
+`collection-membership`, for a corpus no collection holds — the second of which the pipeline
+also reports per run, as `collected`/`uncollected` on `IngestReport` (§13.1).
 
 | Check | Detects |
 |---|---|

@@ -575,6 +575,42 @@ class PublicationBoundVectorStore(PublicationAwareVectorStore, Protocol):
 
 
 @runtime_checkable
+class ResettableVectorStore(Protocol):
+    """Optionally discards everything it holds for one workspace, recorded identity included.
+
+    Optional on the same terms as :class:`AnnIndexMaintenance`, and asked of the object for the
+    same reason the rest are. A derived reset deletes the rows the relational store tombstoned,
+    which needs no capability at all; what a tombstone cannot name is the storage *around* those
+    rows — a collection, its payload indexes, and the record saying which model this workspace's
+    vectors came from. Leaving that behind is not a cosmetic residue: the next ingest under a
+    different embedder is refused by a fingerprint the reset was supposed to have removed, which
+    is the state ``reset-index`` exists to get an installation out of.
+
+    The embedded backend does not implement this and is not degraded by it. Its storage is a
+    directory the runtime itself owns, and removing it depends on something the store does not
+    know — whether other workspaces still share the upgrade-era root (``docs/storage.md`` §6.5).
+    A networked backend is the opposite case and the one this exists for: manicule holds a
+    client rather than a filesystem, so the only thing that can drop a collection is the store.
+
+    A backend without this capability still resets. The tombstone sweep is backend-agnostic, and
+    the reset reports that no physical storage was removed rather than implying that it was.
+    """
+
+    async def reset_storage(self) -> bool:
+        """Discard this workspace's vectors and the identity recorded beside them. Idempotent.
+
+        Scoped to one workspace, never to the server: an installation may share a Qdrant
+        instance or a directory with corpora this reset was not asked about, and a reset that
+        took them with it would be the more expensive version of the problem it solves.
+
+        Returns:
+            Whether there was anything to remove, so a reset reports a physical removal it
+            actually performed. A workspace that never held a vector answers ``False``.
+        """
+        ...
+
+
+@runtime_checkable
 class DocStore(Protocol):
     """Relational storage: documents, chunks, lexical search, sync state.
 
@@ -731,6 +767,21 @@ class CollectionStore(Protocol):
 
     async def collections_for(self, document_id: str) -> Sequence[Collection]:
         """Every collection this document is in, by hand or by rule."""
+        ...
+
+    async def count_uncollected(self, *, source: str | None = None) -> int:
+        """How many live documents no collection holds — the complement of every membership.
+
+        The one question about collections whose answer is a property of the *workspace* rather
+        than of a collection, and the reason it is here rather than derived by a caller: with no
+        collections at all the answer is every document, and a caller computing it by summing
+        :meth:`collection_documents` over :meth:`list_collections` would sum an empty list and
+        report nothing wrong. It is counted, not listed, because the one surface that lists
+        these documents also deletes them and the one that reports the number is ``doctor``.
+
+        Args:
+            source: Narrow to one connector's documents. ``None`` counts the workspace.
+        """
         ...
 
 
@@ -1344,6 +1395,7 @@ __all__ = [
     "PublicationAwareVectorStore",
     "PublicationBoundVectorStore",
     "Reranker",
+    "ResettableVectorStore",
     "RetrievalStage",
     "TagStore",
     "TokenStateEmbedder",

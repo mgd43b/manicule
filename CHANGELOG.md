@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/mgd43b/manicule/compare/v0.2.2...v0.2.3) (2026-09-15)
+
+
+### Bug Fixes
+
+* **bind:** stop the bind policy refusing commands that never bind ([#375](https://github.com/mgd43b/manicule/issues/375)) ([3032412](https://github.com/mgd43b/manicule/commit/3032412c0f50ee1ca63c98fa6fbe869f01e5f453))
+
 ## [0.2.2](https://github.com/mgd43b/manicule/compare/v0.2.1...v0.2.2) (2026-09-15)
 
 

@@ -220,6 +220,7 @@ neither is good at both.
 | Model | provider default | **`BAAI/bge-m3`** — 1024d, 8192 tokens, MIT, multilingual | Configuration, not a constant. See [`docs/embeddings.md`](docs/embeddings.md) |
 | Runtime | Ollama / cloud HTTP | **MLX** (`mlx-embeddings`) | **No server process.** What keeps `uv tool install manicule` a single command with nothing to operate alongside it |
 | Second backend | — | **onnxruntime** | Not a fallback — the parity check. Also the path off Apple Silicon |
+| Third backend | — | **`manicule-ollama`** | For a host with neither Apple silicon nor AVX2, where both of the above embed on the slow path. Tier B, and priced accordingly — see below |
 | Pooling | whatever the provider does | **ours, in numpy** | **Gain.** BGE-M3 pools with CLS, and the MLX convenience field mean-pools. See below |
 | Caching | in-memory L2 | keyed by the full `EmbedFingerprint` | A model change is a loud error with a re-embed path, never quietly worse results |
 
@@ -254,12 +255,34 @@ diverge more the longer the chunk, so at the 512-token budget the gap is at its 
 Full detail, with what was measured and what still must be, in
 [`docs/embeddings.md`](docs/embeddings.md) §4.
 
-### Ollama is not an embedding backend
+### Ollama is an embedding backend, on terms the in-process ones are not held to
 
-Settled, not a preference. `/api/embed` returns pooled, already-normalized vectors
-regardless of input, and **no configuration changes that** — setting `LLAMA_ARG_POOLING`
-reaches the engine and then breaks the endpoint for every input. Without token states
-there is no pooling control, and the failure above becomes unavoidable.
+**Reversed on 2026-09-14, and the original reasoning is kept because it was never the part
+that was wrong.** `/api/embed` returns pooled, already-normalized vectors regardless of input,
+and **no configuration changes that** — setting `LLAMA_ARG_POOLING` reaches the engine and then
+breaks the endpoint for every input. The pooling control the section above argues for is
+genuinely unavailable here, and always will be.
+
+What changed is the conclusion drawn from it. `Embedder` has had two tiers throughout: tier A
+returns token states and manicule pools them, tier B returns finished vectors and the reduction
+applied cannot be verified by inspection. Tier B is admitted **by measurement rather than by
+inspection** — a higher bar than an in-process backend clears, not a closed door — and there is
+a deployment the in-process backends do not serve at all. MLX needs Apple silicon and
+onnxruntime's fast kernels are built around AVX2, so a host with neither embeds on the slow path
+whatever it installs; `manicule-ollama` moves the forward pass to a GPU node that is usually
+already running Ollama for generation.
+
+The price is paid rather than waived. The dimension is measured from a returned vector and
+cross-checked against the GGUF; the sequence limit is the `num_ctx` the backend sent rather than
+the one the model declares, because a server holding a model that declares 32768 served 4096 and
+returned a well-formed vector built from the input's first 4095 tokens; `truncate: false` is
+proved with a probe at startup, so that an over-long chunk fails loudly instead of arriving as a
+plausible vector of its opening; and the tokenizer is required configuration checked against the
+server's own `prompt_eval_count`. `weights_identity` carries the backend's name, so no
+fingerprint this runtime produces can equal one from another even by accident. Shipped as its
+own distribution in `packages/manicule-ollama`;
+[`docs/embeddings.md`](docs/embeddings.md) §3.4 is the full accounting, and it makes no parity
+claim.
 
 ### Generation — Ollama, through litellm
 

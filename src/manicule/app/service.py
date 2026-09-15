@@ -1273,19 +1273,43 @@ class ApplicationService:
             UnknownEntityError: The path does not exist.
         """
         started = time.monotonic()
+        report = await self._index_one(
+            path, source=source, limit=limit, force=force, watching=watching
+        )
+        payload = _ingest_payload(report, started)
+        return _with_placement(payload, await self._placement(report.connector))
+
+    async def _index_one(
+        self,
+        path: Path | str,
+        *,
+        source: str,
+        limit: int | None = None,
+        force: bool = False,
+        watching: Watching | None = None,
+    ) -> RunReport:
+        """One path, indexed, with no report built and no membership counted.
+
+        Split out so :meth:`index_changes` can walk a batch without paying for a membership
+        count per file. The count is two statements over the corpus, which is nothing beside
+        one document's parse and embed and is not nothing multiplied by a watch batch — and the
+        batch wants one answer at the end anyway, not fifty intermediate ones.
+
+        Raises:
+            UnknownEntityError: The path does not exist.
+        """
         target = _local(path)
         if not await asyncio.to_thread(target.exists):
             msg = f"no such file or directory: {target}"
             raise UnknownEntityError(msg)
         ingestion = await self._backend.ingestion()
-        report = await ingestion.index_path(
+        return await ingestion.index_path(
             await asyncio.to_thread(target.resolve),
             name=source,
             limit=limit,
             force=force,
             watching=watching,
         )
-        return _ingest_payload(report, started)
 
     async def index_changes(
         self,
@@ -1307,7 +1331,9 @@ class ApplicationService:
         indexed = skipped = failed = discovered = expanded = unrecorded = 0
         incomplete_report: r.IngestReport | None = None
         for path in changed:
-            report = await self.index_path(path, source=source)
+            # Unmeasured, then measured once below: a membership count per file would be the
+            # same two statements fifty times over for one answer at the end of the batch.
+            report = _ingest_payload(await self._index_one(path, source=source), started)
             discovered += report.discovered
             indexed += report.ingested
             skipped += report.skipped
@@ -1320,7 +1346,7 @@ class ApplicationService:
                 incomplete_report = report
                 break
         if incomplete_report is not None:
-            return totals.model_copy(
+            stopped = totals.model_copy(
                 update={
                     "discovered": discovered,
                     "ingested": indexed,
@@ -1338,6 +1364,7 @@ class ApplicationService:
                     "elapsed_ms": _millis(started),
                 }
             )
+            return _with_placement(stopped, await self._placement(source))
         gone = 0
         for path in removed:
             identifier = document_id_of(self.workspace, source, str(_local(path).resolve()))
@@ -1350,7 +1377,7 @@ class ApplicationService:
             gone += 1
         if gone:
             counts["deleted"] = gone
-        return totals.model_copy(
+        applied = totals.model_copy(
             update={
                 "discovered": len(list(changed)),
                 "ingested": indexed,
@@ -1365,6 +1392,57 @@ class ApplicationService:
                 "elapsed_ms": _millis(started),
             }
         )
+        # Counted after the deletions above, not before them: a batch that removed the last
+        # document of a collection-less directory has changed the answer. After the payload
+        # too, so the two statements stay outside the elapsed time they would otherwise pad.
+        return _with_placement(applied, await self._placement(source))
+
+    async def _placement(self, source: str) -> tuple[int, int] | None:
+        """How many of a source's live documents a collection holds, and how many none does.
+
+        **Measured after the run, not counted during it.** The pipeline never writes a
+        membership row — rule-driven membership is evaluated at read time and manual membership
+        is written only by ``document_create`` — so there is no moment inside a sync at which a
+        document "joins" anything to be counted. What is true afterwards is what this reports,
+        in two statements over indexed columns.
+
+        **Scoped to the source, because that is what the run is about.** The whole workspace
+        would report a number a second connector could move without this one running, and
+        narrowing it to the documents this run touched would exclude the ones it skipped as
+        unchanged — which are in exactly the same collections, and are most of a routine sync.
+
+        **``ValidationError`` is in the caught set, and it is the one that is not obvious.**
+        Counting reads every stored rule through ``CollectionRule.model_validate``, which is
+        deliberate — a hand-edited ``auto_rules`` row fails where it is read rather than quietly
+        selecting a different set — and the model forbids unknown fields, so a rule written by a
+        newer manicule raises here on an older one. Raising out of a *read* is right; raising out
+        of a completed sync, and taking its result with it, is not.
+
+        **The two counts are two statements, so the pair is reconciled rather than subtracted
+        blind.** Nothing holds a lock across them — this is a diagnostic, and taking one to
+        make a diagnostic consistent would be the tail wagging the dog — so a document deleted
+        between them leaves ``uncollected`` above ``total``, and a bare subtraction yields a
+        negative ``collected`` that ``IngestReport`` refuses outright. A completed sync failing
+        validation on the way out, over a number describing it, is a far worse outcome than a
+        figure that is one stale in a race nobody will see.
+
+        Returns:
+            ``(collected, uncollected)``, or ``None`` when the store could not answer. ``None``
+            rather than zeroes, and rather than raising: a sync that ran, advanced its watermark
+            and indexed a corpus has succeeded, and failing it over a diagnostic count would
+            report the opposite of what happened. The failure is logged and the two fields say
+            they were not measured.
+        """
+        try:
+            store = await self._backend.organization()
+            documents = await self._backend.documents()
+            uncollected = await store.count_uncollected(source=source)
+            total = await documents.count_documents(source=source)
+        except (ManiculeError, SQLAlchemyError, OSError, ValidationError):
+            _log.warning("collection membership could not be counted for %r", source)
+            return None
+        held = min(uncollected, total)
+        return (total - held, held)
 
     async def connector_sync(
         self,
@@ -1414,7 +1492,8 @@ class ApplicationService:
             acquire_only=acquire_only,
             retain_source_bytes=retain_source_bytes,
         )
-        return _ingest_payload(report, started)
+        payload = _ingest_payload(report, started)
+        return _with_placement(payload, await self._placement(report.connector))
 
     async def connector_login(
         self,
@@ -2952,6 +3031,7 @@ class ApplicationService:
         checks.append(await self._glossary_check())
         checks.append(await self._connectors_check())
         checks.append(await self._authoring_check())
+        checks.append(await self._collection_membership_check())
         checks.append(await self._sessions_check())
         checks.append(await self._document_identity_check())
         checks.append(await self._document_content_check())
@@ -3356,6 +3436,118 @@ class ApplicationService:
             state="ok",
             detail=f"every collection under {connector.root} selects its own directory, so a "
             f"document joins it however it arrives",
+            facts=facts,
+        )
+
+    async def _collection_membership_check(self) -> r.Check:
+        """How much of the corpus no collection holds — and whether any collection exists at all.
+
+        **The check for a corpus whose organization is gone while its documents are fine.**
+        Collections and their rules live in the document store, so restoring or rebuilding that
+        store without them leaves every document indexed, searchable and correctly cited, and
+        every *scoped* search refusing. Nothing else here notices: ``index --stats`` counts the
+        documents, a sync reports them ingested, and an unscoped search answers perfectly. The
+        only symptom is a refusal an operator sees when they happen to name a collection — which
+        in a corpus organized by collection is every question they ask, and in one that is not is
+        never.
+
+        **Two findings, because they send a reader to two different conclusions**, the same
+        split :meth:`_glossary_check` makes between a detector that moved and an index that
+        predates the column. *No collections at all* is a workspace that cannot answer a scoped
+        question — ``search`` refuses the scope, ``collection_counts`` refuses the name, and
+        ``document_create`` into one refuses the write — and it is what a lost collection table
+        looks like. *Some documents outside every collection* is ordinary: collections are
+        optional, a corpus can be partly organized on purpose, and the number is the finding
+        rather than the fault.
+
+        **So the severities are not symmetric, and the asymmetry is the decision.** An empty
+        collection table beside a non-empty corpus is ``degraded``; documents outside existing
+        collections is ``ok`` with the count in the sentence. Reporting the second in amber
+        would put a permanent warning on every corpus anybody has ever indexed without
+        organizing, which is how an operator learns to skim ``doctor`` — the reading
+        :meth:`_grammar_check` applies to an absent capability. Reporting the first as ``ok``
+        would be the bug: the state is indistinguishable from a deliberate one *from here*, and
+        the answer to an ambiguous state that is expensive to be wrong about is to report it,
+        not to guess which one it is. An installation that has chosen it excludes the check by
+        ``name``, which is what ``name`` is for.
+
+        **Never ``failing``, on the reading :meth:`_connectors_check` gives.** Nothing stored is
+        damaged, nothing is lost, and every unscoped query works; what is true is that a whole
+        surface of the product answers refusals. That is a thing to act on rather than a fault
+        to repair.
+        """
+        try:
+            store = await self._backend.organization()
+            documents = await self._backend.documents()
+            collections = await store.list_collections()
+            total = await documents.count_documents()
+            # One count over the complement of the membership clause, not a walk. `doctor` is
+            # run to read a sentence, and `collection_orphans` — the operation that answers this
+            # question in order to *delete* the answer — asks `collections_for` per document,
+            # which is a query per collection per document.
+            uncollected = await store.count_uncollected()
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="collection-membership",
+                state="unknown",
+                detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        # Reconciled rather than reported raw, on :meth:`_placement`'s grounds: these are three
+        # statements with no lock across them, and a document indexed between the two counts
+        # leaves `uncollected` above `total`. The sentences below would then read "3 of 2
+        # document(s)", and an impossible number in the output an operator pastes into an issue
+        # costs more than one figure being a moment stale in a race nobody will see. Taking a
+        # lock to make a diagnostic self-consistent would be the tail wagging the dog.
+        uncollected = min(uncollected, total)
+        facts: dict[str, JsonValue] = {
+            "documents": total,
+            "collections": len(collections),
+            "uncollected": uncollected,
+        }
+        if not total:
+            return r.Check(
+                name="collection-membership",
+                state="ok",
+                detail=f"nothing is indexed, so nothing is outside a collection "
+                f"({len(collections)} collection(s) defined)",
+                facts=facts,
+            )
+        if not collections:
+            return r.Check(
+                name="collection-membership",
+                state="degraded",
+                detail=(
+                    f"this workspace holds {total} document(s) and no collections at all, so "
+                    f"every collection-scoped search refuses rather than running and nothing "
+                    f"else reports it. That is the correct state for a corpus nobody organizes "
+                    f"by collection, and it is also what a document store rebuilt or restored "
+                    f"without its collections looks like — the two are indistinguishable from "
+                    f"here, which is why this is reported rather than judged. List what should "
+                    f"be there; `manicule collection create <name> --uri-prefix <path>` puts a "
+                    f"rule back, and the documents join it without being re-indexed."
+                ),
+                facts=facts,
+                remedy="manicule collection list",
+            )
+        if not uncollected:
+            return r.Check(
+                name="collection-membership",
+                state="ok",
+                detail=f"every one of {total} document(s) is held by at least one of "
+                f"{len(collections)} collection(s)",
+                facts=facts,
+            )
+        return r.Check(
+            name="collection-membership",
+            state="ok",
+            detail=(
+                f"{uncollected} of {total} document(s) belong to none of this workspace's "
+                f"{len(collections)} collection(s), so a scoped search reaches less of the "
+                f"corpus than an unscoped one. Ordinary where collections are partial and "
+                f"deliberate; `manicule collection orphans` names the documents, and reports "
+                f"rather than removes unless asked to."
+            ),
             facts=facts,
         )
 
@@ -5094,14 +5286,27 @@ class ApplicationService:
         return r.ExportReport(path=str(_local(target)), documents=documents, chunks=chunks)
 
     async def import_corpus(self, source: Path | str, *, force: bool = False) -> r.IngestReport:
-        """Ingest an exported archive, re-deriving chunks and vectors here."""
+        """Ingest an exported archive, re-deriving chunks and vectors here.
+
+        **Collection placement is left unmeasured here, and that is the honest answer rather
+        than a gap.** ``connector`` on an import is the literal string ``"import"`` — a label
+        for the run — while every entry is ingested under the source the archive recorded for
+        it, and an archive may carry several. Counting ``source = "import"`` would match no
+        document at all and report ``0`` in no collection, which is the *healthy* answer to a
+        question that was never asked: exactly the confident zero ``None`` exists to keep out
+        of this field. A per-source total would mean threading the manifest's source set out
+        through the ingest port, and the question an operator has after restoring an archive is
+        about the workspace rather than about one of its sources — which is what ``doctor``'s
+        ``collection-membership`` check answers, over all of it.
+        """
         started = time.monotonic()
         path = _local(source)
         if not await asyncio.to_thread(path.exists):
             msg = f"no such archive: {path}"
             raise UnknownEntityError(msg)
         ingestion = await self._backend.ingestion()
-        payload = _ingest_payload(await ingestion.import_archive(path, force=force), started)
+        imported = await ingestion.import_archive(path, force=force)
+        payload = _ingest_payload(imported, started)
         if (
             payload.retry_required
             and payload.incomplete_reason is not None
@@ -6817,6 +7022,20 @@ def _normalize_uri(uri: str) -> str:
         host = f"{host}:{split.port}"
     path = split.path.removesuffix("/") if split.path not in {"", "/"} else split.path
     return urlunsplit((split.scheme.lower(), host.lower(), path, split.query, ""))
+
+
+def _with_placement(payload: r.IngestReport, placement: tuple[int, int] | None) -> r.IngestReport:
+    """Attach ``(collected, uncollected)`` to a finished report, or leave them unmeasured.
+
+    **After the payload rather than inside it, so ``elapsed_ms`` still means the ingest.**
+    The two counts are cheap and are still two statements over the corpus, and folding them
+    into the same call that stamps the clock would put their latency inside the number a
+    person reads as how long their sync took — small on an hours-long Confluence walk, and a
+    third of the total on ``manicule index one-file.md`` against a large corpus.
+    """
+    if placement is None:
+        return payload
+    return payload.model_copy(update={"collected": placement[0], "uncollected": placement[1]})
 
 
 def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:

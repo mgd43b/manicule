@@ -7,7 +7,7 @@ same names, written from the same object by the same rules. Everything that is a
 the integrity verdict — comes from :mod:`manicule.storage.vector_schema`, so the two backends
 cannot drift into answering one question two ways.
 
-Four things here are not simply the Lance store with a different client under it.
+Five things here are not simply the Lance store with a different client under it.
 
 **The index lives on a machine this process does not own.** That is the whole point — it is
 what lets several manicule processes, or a container with no persistent volume, share one
@@ -59,11 +59,19 @@ can replace would be describing a mechanism that is not there. Nor does it imple
 shadow-generation surface re-embedding needs: ``manicule.app.runtime`` refuses a durable
 re-embed on any backend that does not, by name, and that refusal is the honest answer rather
 than a half-built one.
+
+It does implement :class:`~manicule.core.protocols.ResettableVectorStore`, and that one is not
+optional in practice. A derived reset deletes rows by id, which needs nothing from a backend,
+and then has to discard what surrounds them — which on a directory backend the runtime does
+itself and here nothing but this store can do. Until :meth:`QdrantVectorStore.reset_storage`
+existed the reset refused outright, and an operator rebuilding an index dropped collections
+through Qdrant's HTTP API by hand; ``docs/storage.md`` §6.7 records what that cost.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 import uuid
 from collections.abc import AsyncGenerator
@@ -101,12 +109,14 @@ from manicule.storage.vector_schema import (
     CHUNK_COLUMN,
     CHUNK_ID_COLUMN,
     DOCUMENT_ID_COLUMN,
+    FINGERPRINT_HASH_LENGTH,
     ID_COLUMN,
     IDENTITY_COLUMN,
     KIND_COLUMN,
     LANG_COLUMN,
     POSITION_COLUMN,
     PUBLICATION_COLUMN,
+    TABLE_PREFIX,
     VECTOR_COLUMN,
     checksum_of,
     embed_text_of,
@@ -208,6 +218,27 @@ def collection_for(prefix: str, workspace_id: str, fingerprint: EmbedFingerprint
 def meta_collection_for(prefix: str) -> str:
     """Where every workspace's fingerprint is recorded on this server."""
     return f"{prefix}{META_COLLECTION_SUFFIX}"
+
+
+SPACE_SUFFIX: Final = re.compile(f"{re.escape(TABLE_PREFIX)}[0-9a-f]{{{FINGERPRINT_HASH_LENGTH}}}")
+"""What follows a workspace's digest in a name :func:`collection_for` built."""
+
+
+def owns_collection(prefix: str, workspace_id: str, name: str) -> bool:
+    """Whether ``name`` is a collection this installation wrote for this workspace.
+
+    The whole name is matched rather than its opening, and that is the difference between a
+    cleanup and a data-loss bug. ``collection_prefix`` is free text an operator sets, so two
+    installations sharing a server can choose prefixes where one *contains* the other: with
+    ``foo`` here and ``foo_<this workspace's digest>`` there, every collection the second
+    installation owns opens with the first installation's ownership prefix. Requiring the
+    fingerprint-space segment as well means a name is ours only when the digest is immediately
+    followed by what :func:`collection_for` puts there — and another installation's name always
+    has its own workspace digest in between. ``docs/deployment.md`` §6.5 asks for distinct
+    prefixes; this is what holds when the ask is not met.
+    """
+    head = f"{prefix}_{workspace_digest(workspace_id)}_"
+    return name.startswith(head) and bool(SPACE_SUFFIX.fullmatch(name[len(head) :]))
 
 
 def point_id_for(row_id: str) -> str:
@@ -753,6 +784,49 @@ class QdrantVectorStore:
             )
         return HealthReport(state=HealthState.OK, detail=f"Qdrant at {where} answered")
 
+    async def reset_storage(self) -> bool:
+        """Drop every collection this workspace owns, and the fingerprint recorded for it.
+
+        :class:`~manicule.core.protocols.ResettableVectorStore`, and what makes a derived reset
+        finish on this backend. Nothing else can: manicule holds a client, so a reset that only
+        swept the rows the relational store tombstoned would leave the collection, its payload
+        indexes and the meta record standing — and the meta record is the one that matters,
+        because the next ``ensure_ready`` under a new model compares against it and refuses.
+
+        Collections are found by name prefix rather than through the recorded fingerprint. A
+        workspace that has held vectors under two models has two collections and the record
+        names only one of them, so resolving through the record would drop the collection the
+        reset can already see and leave the one nothing would go looking for again.
+
+        The meta collection is shared by every workspace on the server, so the *point* goes and
+        the collection stays. A reset is scoped to one workspace even when it is the only one
+        there, because "the only one there" is a fact about today — and
+        :func:`owns_collection` is why the scope holds even against an installation whose
+        collection prefix contains this one's.
+
+        The prepared state goes with the storage. This handle is cached and the caller reuses
+        it, so leaving a fingerprint behind would leave it ready to write into a collection that
+        no longer exists — the same stale claim the meta record makes, one process closer.
+        """
+        listed = await self._client.get_collections()
+        removed = False
+        for collection in listed.collections:
+            if owns_collection(self._prefix, self._workspace, collection.name):
+                removed = await self._client.delete_collection(collection.name) or removed
+        meta = self._meta_collection()
+        if await self._client.collection_exists(meta) and await self._client.retrieve(
+            collection_name=meta, ids=[self._meta_point()], with_payload=False
+        ):
+            await self._client.delete(
+                collection_name=meta,
+                points_selector=models.PointIdsList(points=[self._meta_point()]),
+                wait=True,
+            )
+            removed = True
+        self._fingerprint = None
+        self._middleware = ()
+        return removed
+
     async def teardown(self) -> None:
         """Close the client, when this store is the one that opened it.
 
@@ -1221,6 +1295,7 @@ __all__ = [
     "META_COLLECTION_SUFFIX",
     "POINT_NAMESPACE",
     "SCROLL_PAGE",
+    "SPACE_SUFFIX",
     "UPSERT_BATCH",
     "ApiException",
     "QdrantVectorStore",
@@ -1229,6 +1304,7 @@ __all__ = [
     "is_cleartext_remote",
     "is_local",
     "meta_collection_for",
+    "owns_collection",
     "point_id_for",
     "workspace_digest",
 ]

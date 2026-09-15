@@ -698,6 +698,11 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
         table.add_row("derivation deferred", "yes (snapshot retained locally)")
     if payload.expanded:
         table.add_row("found inside others", str(payload.expanded))
+    # Both rows or neither, and only when they were measured. "in no collection: 0" beside a
+    # missing "in collections" would read as a healthy corpus on a path that never asked.
+    if payload.collected is not None and payload.uncollected is not None:
+        table.add_row("in collections", str(payload.collected))
+        table.add_row("in no collection", str(payload.uncollected))
     for status, count in sorted(payload.by_status.items()):
         table.add_row(f"  {status}", str(count))
     table.add_row("elapsed", f"{payload.elapsed_ms} ms")
@@ -716,6 +721,19 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
             "[dim]the requested limit stopped discovery; the watermark was not advanced[/dim]"
         )
         return
+    # Said out loud rather than left as a row, because it is the failure this pair of numbers
+    # was added for: a sync reports everything ingested and nothing wrong while every
+    # collection-scoped search over the result reaches nothing. Only when *none* of them
+    # landed anywhere — partial coverage is ordinary and the row already carries it.
+    if payload.uncollected and payload.collected == 0:
+        out.print(
+            f"\n[yellow]none of this source's {payload.uncollected} document(s) belong to any "
+            f"collection, so a collection-scoped search reaches none of them[/yellow]"
+        )
+        out.print(
+            "[dim]manicule collection list shows what exists; "
+            "manicule doctor says whether any collection does[/dim]"
+        )
     # The longest command in the first run ends here, often after minutes, and ended on a
     # table with nothing to do about it — the same gap `init` had. Only when something was
     # actually indexed: after a run that added nothing, "now search it" is advice about
