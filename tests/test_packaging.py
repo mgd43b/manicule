@@ -823,27 +823,57 @@ def test_the_image_builds_against_a_source_date_epoch_that_never_moves() -> None
     )
 
 
-def _model_cache_copy() -> str:
-    """The Dockerfile instruction that puts the fetched weights into the image.
+def _dockerfile_instructions() -> list[str]:
+    """The Dockerfile's instructions: comments dropped, line continuations joined.
 
     Read out of the code rather than matched in the file's text, for the reason
-    `test_the_image_does_not_pin_the_embedding_provider_in_the_environment` gives: the comment
-    above this instruction explains what it must *not* copy and names those paths, so a bare
-    substring search finds the prose and never reads the `cp` at all.
+    `test_the_image_does_not_pin_the_embedding_provider_in_the_environment` gives: this file
+    explains itself at length, and its prose names the very paths and variables these tests
+    read for. A bare substring search finds the explanation and never reaches the instruction.
     """
     code = [
         line for line in DOCKERFILE.read_text().splitlines() if not line.lstrip().startswith("#")
     ]
-    # Continuations joined first: one `RUN` instruction spans several physical lines, with the
-    # `RUN` keyword on the first and the `cp` this reads for on the last.
+    # Continuations joined: one instruction spans several physical lines, with the keyword on
+    # the first and much of what these tests read for on the last.
     instructions: list[str] = []
     for line in code:
         if instructions and instructions[-1].endswith("\\"):
             instructions[-1] = instructions[-1][:-1] + " " + line.strip()
         else:
             instructions.append(line)
+    return instructions
 
-    matches = [line for line in instructions if "prefetch_embedding_models" in line]
+
+def _stage_instructions(stage: str) -> list[str]:
+    """The instructions belonging to one build stage, `FROM <stage>` to the next `FROM`.
+
+    Stage-scoped because several variables this file cares about are legitimately set in one
+    stage and meaningless in another. `PYTHONDONTWRITEBYTECODE` is the example that caught a
+    test out: the runtime stage has always set it, so searching the whole Dockerfile for the
+    name passes whether or not the *build* stage — the only one that compiles anything — sets
+    it at all.
+    """
+    instructions = _dockerfile_instructions()
+    starts = [
+        index
+        for index, line in enumerate(instructions)
+        if line.startswith("FROM ") and line.rstrip().endswith(f" AS {stage}")
+    ]
+    assert len(starts) == 1, f"expected exactly one `FROM ... AS {stage}`; found {len(starts)}"
+
+    begin = starts[0]
+    following = [
+        index
+        for index, line in enumerate(instructions)
+        if index > begin and line.startswith("FROM ")
+    ]
+    return instructions[begin : following[0] if following else len(instructions)]
+
+
+def _model_cache_copy() -> str:
+    """The Dockerfile instruction that puts the fetched weights into the image."""
+    matches = [line for line in _dockerfile_instructions() if "prefetch_embedding_models" in line]
     assert len(matches) == 1, (
         f"expected exactly one Dockerfile instruction calling prefetch_embedding_models.py; "
         f"found {len(matches)}"
@@ -887,4 +917,93 @@ def test_the_image_ships_only_the_hub_cache_out_of_the_download() -> None:
         f"node a full re-pull. `cp -a /tmp/hf/.` is how it was written for five releases; a "
         f"second source beside `hub` is the same regression by another route. Found {sources} "
         f"in:\n{copy}"
+    )
+
+
+def test_the_image_compiles_only_deterministic_bytecode() -> None:
+    """A timestamp `.pyc` is 147.6 MB of churn; no `.pyc` at all is a tax on every command.
+
+    CPython's default invalidation mode is `TIMESTAMP`: the header holds the mtime of the
+    source it was compiled from, and uv stamps installed files with the moment of the install.
+    Measured on the published layers, that made 10,130 of the 10,140 files differing between
+    0.1.22 and 0.1.23 bytecode — re-pulled by every node for the eight `.py` files that
+    actually changed. `rewrite-timestamp` cannot touch it, for the same reason it could not
+    touch `xet/logs/`: the timestamp is inside the file rather than in its tar header.
+
+    Shipping none was measured and rejected — the offline smoke test went from 24.0s to 43.1s,
+    because `PYTHONDONTWRITEBYTECODE` in the runtime stage means nothing is cached on the way
+    past and every invocation recompiles. So the bytecode is made deterministic instead, with
+    PEP 552 hash-based `.pyc` files that record the source's hash in place of its mtime.
+
+    `unchecked` is asserted rather than merely `hash-based`: `checked-hash` is equally
+    reproducible and would pass a looser test, but it re-hashes every source file on every
+    import, which is the run-time half of the cost this arrangement exists to avoid.
+    """
+    instructions = _dockerfile_instructions()
+
+    compiled = [line for line in instructions if "UV_COMPILE_BYTECODE" in line]
+    assert not compiled, (
+        f"the image sets UV_COMPILE_BYTECODE, and uv writes timestamp-invalidated `.pyc` "
+        f"files: a fresh digest on every build, and ~147 MB re-pulled per release. Let "
+        f"`compileall --invalidation-mode unchecked-hash` do it instead. Found: {compiled}"
+    )
+
+    passes = [line for line in instructions if "compileall" in line]
+    assert passes, (
+        "the image must compile its bytecode with `compileall`, once in `deps` for the "
+        "dependency tree and once in `build` for manicule's own code. Without it the venv "
+        "ships no bytecode at all and every container start and CLI invocation recompiles — "
+        "measured at 24.0s to 43.1s on the smoke test."
+    )
+    unchecked = [line for line in passes if "unchecked-hash" in line]
+    assert unchecked == passes, (
+        f"every `compileall` must pass `--invalidation-mode unchecked-hash`. Without the flag "
+        f"CPython writes timestamp `.pyc` files and the churn returns; with `checked-hash` the "
+        f"layers are reproducible but every import re-hashes its source. Found {len(passes)} "
+        f"pass(es), {len(unchecked)} with the flag."
+    )
+
+    # Scoped to `deps`, and deliberately not to the whole file: the runtime stage has always
+    # set this name, so an unscoped search passes even with the build stage letting its own
+    # `python -c` steps cache timestamp bytecode into the venv after `compileall` ran.
+    dont_write = [line for line in _stage_instructions("deps") if "PYTHONDONTWRITEBYTECODE" in line]
+    assert dont_write, (
+        "the `deps` stage must set PYTHONDONTWRITEBYTECODE. `compileall` writes through it, "
+        "but the grammar seed, the vocabulary pre-seed and the weight prefetch all import "
+        "manicule out of this venv, and an ordinary import caches what it touches — scattering "
+        "freshly-stamped timestamp `.pyc` files over the deterministic ones. The runtime stage "
+        "setting it is a different statement and does not cover this."
+    )
+
+
+def test_the_runtime_copies_the_dependency_tree_before_the_release_tree() -> None:
+    """One `COPY` of the venv is ~327 MB re-pulled to deliver a few megabytes of Python.
+
+    The dependency tree is ~900 MB and moves only when `uv.lock` does; manicule's own code
+    moves every release. Copied as one directory they share a layer and a digest, so a version
+    bump re-pulls all of it. Copied from `deps` and then from `build`, BuildKit compares
+    against what the first copy already wrote and the second holds only the files that differ.
+
+    The order is the assertion. Reversed, the stale tree lands on top of the fresh one and the
+    image ships a manicule that is missing whatever the release changed.
+    """
+    venv_copies = [
+        line
+        for line in _dockerfile_instructions()
+        if line.startswith("COPY") and line.rstrip().endswith("/opt/manicule/venv")
+    ]
+
+    assert len(venv_copies) == 2, (
+        f"expected the venv to be copied twice — `--from=deps` for the dependency tree and "
+        f"`--from=build` over the top for manicule's own — so that a release moves a layer the "
+        f"size of what changed. Found {len(venv_copies)}: {venv_copies}"
+    )
+    order = [
+        "deps" if "--from=deps" in line else "build" if "--from=build" in line else "?"
+        for line in venv_copies
+    ]
+    assert order == ["deps", "build"], (
+        f"the venv must be copied from `deps` first and `build` second. In the other order the "
+        f"dependency tree overwrites manicule's own code and the image ships a stale one. "
+        f"Found {order} in:\n{venv_copies[0]}\n{venv_copies[1]}"
     )

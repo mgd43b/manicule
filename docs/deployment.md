@@ -365,9 +365,10 @@ What that buys, and what it costs:
   at a reachable Qdrant instead and the container dials it on every search, every upsert and
   every delete — that is the whole reason the backend exists (`storage.md` §6.7), and it is an
   outbound connection this image did not need before an operator asked for one.
-- **About 3.4 GB**, of which 2.3 GB is the model. Weights are baked in rather than mounted
-  from a cache volume so that the download happens during `docker build`, where a long step is
-  expected, rather than inside a first `index` that appears to hang.
+- **About 3.4 GB on disk and 1.73 GB to pull**, of which 2.3 GB uncompressed — 1.36 GB of the
+  pull — is the model. Weights are baked in rather than mounted from a cache volume so that the
+  download happens during `docker build`, where a long step is expected, rather than inside a
+  first `index` that appears to hang.
 - **Unprivileged.** uid 10001, `/data` created `0700` and owned by it, `cap_drop: ALL` and
   `no-new-privileges` in the compose file. A named volume mounted at `/data` inherits the
   ownership and mode from the image, which is what keeps `doctor` passing.
@@ -397,6 +398,28 @@ What that buys, and what it costs:
   A timestamp in a file's *name and body* is not a tar header and no exporter can rewrite it, so
   the image now copies `hub/` out of the download and leaves the scratch behind. Both halves are
   load-bearing: restore either and the layer moves again.
+
+  The same failure had a second instance, in the venv. Of the 10,140 files that differed
+  between those two releases, **10,130 were `.pyc`** — 147.6 MB of them — against eight `.py`
+  files that had actually changed. CPython's default invalidation mode writes the source's
+  mtime into the bytecode header, and uv stamps installed files with the moment of the install,
+  so every rebuild reissued every one of them. The image now compiles with `compileall
+  --invalidation-mode unchecked-hash`: PEP 552 hash-based bytecode records the source's hash
+  rather than when it was written, which is a property of the file and not of the build. That
+  is also *faster* to import than what shipped before — a timestamp `.pyc` makes the
+  interpreter `stat()` each source file to validate it, and `unchecked` skips that entirely.
+  Measured in the image: `manicule --help` 1.24s → 0.66s, `manicule doctor` 3.31s → 1.82s.
+
+  With the bytecode stable, the venv is worth splitting, and the build stages exist for it. The
+  dependency tree is installed in `deps` and manicule's own code in `build`; the runtime stage
+  copies the first and then the second over the top, and BuildKit writes only what differs.
+  ~306 MB of dependencies stop moving, and a release moves an 11.5 MB layer instead of a 327 MB
+  one. Neither half stands alone: split the venv while the bytecode still carries a clock and
+  the dependency layer takes a new digest anyway.
+
+  Together, and with the model layer, an upgrade between two releases that change only
+  manicule's own code pulls **about 18 MB of a 1.73 GB image** — the 11.5 MB venv overlay and
+  the 6.7 MB the smoke test leaves — rather than the 1.696 GB measured for 0.1.22 → 0.1.23.
 
 **Why the default stays `lancedb`, here specifically.** The `--network=none` smoke test below
 is an assertion about the configuration this image actually ships with, not about every
