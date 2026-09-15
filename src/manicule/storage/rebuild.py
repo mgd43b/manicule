@@ -2063,6 +2063,20 @@ class SqliteRebuildStore(WorkspaceScoped):
     async def _inventory_chain(
         self, session: AsyncSession, latest: models.AcquisitionRun
     ) -> _SourceInventory:
+        """Walk back from one connector's newest promoted run to the full inventory behind it.
+
+        Re-walked on every scope check rather than cached, including the one each durable
+        replay page performs. That is deliberate. The links themselves are immutable — a
+        promoted run's cursors and scope never change again — but *which* runs are promoted and
+        unsuperseded does, and that is precisely what the check exists to notice. A chain
+        remembered for the length of an operation would answer with the membership the
+        workspace had when the operation started, which is the class of stale proof this whole
+        module is built to refuse.
+
+        The cost is bounded and, for the common shape, absent: a connector whose newest run is
+        a full inventory never enters the loop and issues no query at all. It is one query per
+        link beyond the first, and `_INVENTORY_CHAIN_LIMIT` caps that.
+        """
         chain = [latest]
         while (
             chain[-1].enumeration_membership is not SnapshotMembership.FULL_INVENTORY
