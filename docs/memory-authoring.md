@@ -107,6 +107,20 @@ operation as the document. `DocumentCreated.member` reports whether that second 
 a caller that found the document in search but not in its collection has something in the result
 that says so.
 
+**This operation is not the only way in, and for a long time it behaved as though it were.** The
+membership it writes is a manual one, per document. A file that reached the same directory by a
+sync — a corpus pulled from git, a file another tool wrote, or §4.5's kept file that a later sync
+picked up — joined no collection at all, and the only symptom was a collection-scoped search
+returning less. Give the collection a `uri_prefixes` rule naming its directory beneath the root
+(`docs/storage.md` §11.2) and the directory *is* the membership, so a document joins by arriving
+however it arrived. `manicule doctor`'s `authoring` check reports a configured collection that
+has no such rule, because nothing else about that state is visible.
+
+The manual write stays regardless, and is not made conditional on a rule existing. A collection
+here may legitimately have no rule, and a `document_create` that assigned membership one way
+when a rule was present and another way when it was not would be a second notion of what a
+collection contains — which is the thing §11.2 keeps down to one.
+
 ### 4.4 Synchronous through publication
 
 **It returns only once the document is published and searchable.** An assistant that writes a
@@ -277,6 +291,20 @@ Both are empty by default, and empty means authoring is off: the tool is publish
 and refuses every call naming these settings. Both are required together, because either alone
 describes an operation that cannot run — a source with no collection has nowhere to put a document
 that is not an unscoped pile, and collections with no source have no root to be written beneath.
+
+Each name is a collection **and** a single path segment beneath the root, so the collection
+wants a rule saying the same thing. Once per collection:
+
+```bash
+manicule collection create memory --uri-prefix /corpus/memory
+```
+
+Configuration deliberately does not create these or set their rules. Creating a collection is
+already a separate act from granting write access to it — that separation is the whole reason
+`collections` is a list of names rather than "every collection" — and a setting that silently
+created and re-ruled workspace objects on startup would undo it. `manicule doctor` reports the
+gap instead: `failing` for a configured collection the workspace does not have, `degraded` for
+one whose rule does not select its own directory, each naming the command that fixes it.
 
 ---
 

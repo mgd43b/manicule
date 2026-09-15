@@ -2234,9 +2234,12 @@ class Check(Payload):
     """One diagnostic.
 
     ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``plugins``,
-    ``storage``, ``permissions``, ``index``, ``grammars``, ``vocabularies``, ``models``, and
+    ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
+    ``authoring``, ``sessions``, ``document-identity``, ``document-content``,
+    ``wiki-provenance``, ``grammars``, ``vocabularies``, ``models``, and
     ``component:<kind>:<name>`` for anything already constructed. It is what a monitor selects
-    on, so it is chosen once and does not move with the wording.
+    on, so it is chosen once and does not move with the wording — which is why the two spellings
+    in that list stay as they are rather than being tidied into one.
 
     ``detail`` and ``facts`` are the same finding twice, for two readers. ``detail`` is the
     sentence a person reads; ``facts`` is what a script would otherwise have to recover by

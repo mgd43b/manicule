@@ -1470,7 +1470,9 @@ class AuthoringSettings(Section):
         "does not list is refused even when it exists in the workspace: the point of naming "
         "them is that adding a collection to manicule does not silently widen what may be "
         "written. Each name is also the directory beneath the root that its documents land "
-        "in, so it must be a single path segment.",
+        "in, so it must be a single path segment — and the collection wants a "
+        "``CollectionRule`` prefix saying so, or only the documents `document_create` wrote "
+        "are in it. `manicule doctor` reports a collection named here that has neither.",
     )
 
     @property

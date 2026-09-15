@@ -814,9 +814,19 @@ the shape of this payload and moves only when the shape does, which is what a co
 behavior actually wants — `manicule_version` and the envelope's `version` both move with every
 release whether or not anything changed.
 
-Checks: `configuration`, `transport`, `plugins`, `storage`, `permissions`, `index`, `grammars`,
-`vocabularies`, `models`, `connectors`, `sessions`, `glossary`, `vector_integrity`, and
-`component:<kind>:<name>` for anything already constructed.
+Checks, in the order `doctor` emits them: `configuration`, `transport`, `plugins`, `storage`,
+`permissions`, `index`, `vector_integrity`, `glossary`, `connectors`, `authoring`, `sessions`,
+`document-identity`, `document-content`, `wiki-provenance`, `grammars`, `vocabularies`,
+`models`, and `component:<kind>:<name>` for anything already constructed.
+
+`authoring` is `ok` when the feature is off. Configured, it asks whether each name in
+`authoring.collections` is a collection this workspace has — `failing` if not, because
+`document_create` into a collection that does not exist refuses rather than writing — and then
+whether that collection's rule selects its own directory beneath the source's root. A
+collection with no such prefix is `degraded`: authoring still works, but it is the only thing
+that works, because `document_create` writes membership one document at a time. A file that
+reached the same directory by a sync joins nothing, and the only symptom is a collection-scoped
+search quietly returning less. The remedy names the `collection rule set` command that ends it.
 
 `transport` reports the bind: `ok` for loopback, `degraded` for a non-loopback bind with
 authentication on, and `failing` for one without it — including when `--no-authentication` made

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### A collection can be a directory, so a synced file joins it
+
+A collection rule now takes `uri_prefixes`, and a document whose location sits beneath one is a
+member. `manicule collection rule set <id> --uri-prefix /corpus/journals` is the whole of it,
+and `collection create --uri-prefix` sets one at creation. Every surface carries the new
+selector: CLI, HTTP API, control socket and the writable MCP server.
+
+This closes a gap that only showed up as missing search results. `authoring.collections` has
+always held that a collection name is also the directory its documents land in, but only
+`document_create` acted on that, by adding each document it wrote to the collection by hand. A
+file that reached the same directory any other way — a `connector sync` over a tree pulled from
+git, an editor, a write whose ingest failed and that a later sync picked up — joined nothing.
+The corpus reported it by returning fewer results to a collection-scoped search, with nothing
+raised and nothing logged. With a prefix the directory *is* the membership, so a document joins
+by arriving.
+
+Prefixes are matched against the document's location rather than its identity, which is what
+lets a document that moves between directories change collection at read time and without being
+re-indexed. Write one as an ordinary absolute path; it is stored as the `file:` URI the
+connector records, and always with a trailing separator, so `/corpus/journals` cannot also
+select `/corpus/journals-old`. A URL works too, so a mirrored space can be selected by the
+address it mirrors. Membership stays evaluated rather than materialized, and manual members are
+still unioned with whatever the rule selects.
+
+`manicule doctor` gained an `authoring` check for the state this replaces. It reports `degraded`
+for a collection that authoring writes into but whose rule does not select its own directory —
+naming the collection and the exact command to fix it — and `failing` for a configured
+collection this workspace does not have, which `document_create` refuses on but only once
+somebody tries to write.
+
 ### A slow deep offset no longer stops a Data Center inventory
 
 The authoritative Server/Data Center `direct_current_content` walk now converges on a large
@@ -38,8 +68,9 @@ fetch, which is the response whose bytes are retained.
 ### Rule-driven collection management
 
 Collection rules are now available through the application service, CLI, HTTP API, control
-socket, and writable MCP server. A collection can select documents by source, media type, tag,
-or update bounds when it is created, and its rule can later be shown, replaced, or cleared.
+socket, and writable MCP server. A collection can select documents by source, directory, media
+type, tag, or update bounds when it is created, and its rule can later be shown, replaced, or
+cleared.
 
 Existing indexes can adopt these rules immediately. Membership remains evaluated at read time,
 so matching documents already in the workspace and matching documents ingested later appear

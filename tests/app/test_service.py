@@ -2040,6 +2040,7 @@ async def test_collection_rules_are_created_shown_replaced_and_cleared_explicitl
     made = await service.collection_create("Team A", rule=first)
     assert made.rule == {
         "sources": ["wiki-team-a", "wiki-team-a-archive"],
+        "uri_prefixes": [],
         "media_types": [],
         "tag_ids": [],
         "updated_after": None,

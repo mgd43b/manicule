@@ -287,6 +287,7 @@ async def test_a_collection_rule_crosses_the_control_socket_without_field_loss(
     server = await serving(path, handler)
     rule: dict[str, JsonValue] = {
         "sources": ["wiki-team-a", "wiki-team-a-archive"],
+        "uri_prefixes": ["file:///corpus/team-a/"],
         "media_types": ["text/markdown"],
         "tag_ids": ["tag-team-a"],
         "updated_after": "2026-08-01T00:00:00+00:00",

@@ -2234,6 +2234,47 @@ collection, reporting which collections hold a document, and resolving a filter.
 Python-side reading for the "does this one document match" case is how the same rule starts
 giving two answers.
 
+The selectors are `sources`, `uri_prefixes`, `media_types`, `tag_ids` and the two `updated_*`
+bounds. Fields conjoin; values within one set-valued field disjoin.
+
+#### `uri_prefixes`: a directory is a collection
+
+A rule matches `uri_prefixes` against `documents.uri`, so "the collection is the directory" is
+sayable in the one place membership is decided. It exists because `authoring.collections`
+already held that a collection name is also the directory beneath the root its documents land
+in, and only `document_create` acted on it — by writing a membership row per document. A file
+arriving by `connector sync`, or by any route that was not that operation, joined nothing, and
+the corpus reported it by returning fewer results to a collection-scoped search.
+
+**The address, not the identity.** `source_id` is what a source promises is stable; `uri` is
+where the document sits, and a rule about location belongs on the location. Two consequences
+follow, both wanted. A document that moves between directories changes collection, at read time
+and without re-indexing — which is what a directory-shaped collection should do, and what
+materializing membership would get wrong. And a document whose sidecar manifest declares a
+canonical address is selected by *that* address rather than by the copy's path, so a mirror is
+selected by the space it mirrors. §4.2's argument that identity must not be the URI is
+untouched: this decides membership, which is metadata, and moving a file still keeps its id,
+its chunks, its versions and its tags.
+
+**Normalized on the way in**, by `core.organization.directory_prefix`. An absolute path becomes
+the `file:` URI the connector recorded, because a bare path never meets a row and a hand-written
+`file://` string gets the percent-encoding wrong on the first directory with a space in it. And
+every prefix ends in `/`, so `…/journals` cannot also select `…/journals-old` — a boundary that
+is not in the text is not in the comparison, and that failure widens silently. Anything that is
+neither an absolute path nor a URI with a scheme is refused rather than stored as a prefix that
+matches nothing.
+
+**Compared, not matched.** The clause is `uri >= prefix AND uri < ceiling`, never `LIKE`.
+SQLite folds ASCII case in `LIKE` by default, so a pattern would make `Journals/` and
+`journals/` one directory on a filesystem where they are two. The range also uses
+`ix_documents_workspace_id_uri`, which `LIKE` cannot here: that optimization needs the index
+collation to agree with `case_sensitive_like`, which is off. A prefix containing `%` or `_`
+needs no escaping, because a comparison has no wildcards.
+
+A prefix is never opened. It is normalized lexically — `normpath`, never `Path.resolve` —
+stored as text, and bound as a parameter, so there is no traversal surface: a rule selects
+among rows already indexed, and selecting is not reading.
+
 ### 11.3 Resolving `collection_ids` and `tag_ids` — and the inversion it avoids
 
 Neither store honors those two `Filter` fields; both refuse them, because neither the lexical
