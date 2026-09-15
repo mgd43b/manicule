@@ -1,0 +1,123 @@
+name: Re-lock
+
+# **`main` repairs its own lockfile, because the release path cannot be trusted to deliver it.**
+#
+# release.yml already re-locks: `re-lock the release pull request` runs `uv lock` on the release
+# branch so the version bump and the lockfile arrive as one reviewed change. That step is correct
+# and usually wins. It lost once, and the way it lost is the reason this file exists.
+#
+# release-please **force-pushes a regenerated release commit** to its branch on every push to
+# `main`, which discards the re-lock commit an earlier run had already landed there. The step then
+# needs about eleven seconds — checkout, setup-uv, `uv lock`, commit, push — to put it back. In
+# that gap the release pull request is lockfile-stale while showing green and mergeable, because
+# nothing has had time to report otherwise. On 2026-09-15 release-please rewrote the branch at
+# 18:10:45, the release pull request was merged at 18:10:54, and the re-lock push was rejected at
+# 18:10:56 against a branch the merge had deleted. `main` took the version bump without its lock,
+# and ci.yml's `uv lock --check` refused every commit after it.
+#
+# **Why this is not a job in release.yml.** The obvious home is a job there gated on
+# `release_created`, and that is precisely the arrangement that cannot work: every job in that
+# workflow declares `needs: ci-green`, and `ci-green` reads ci.yml's verdict on the commit. A
+# stale lockfile fails `lint`, so `ci-green` fails, so `release-please` is skipped and
+# `release_created` is never written. Run 35005861888 is the recorded proof — `ci-green` failed
+# and all seven jobs behind it, `release-please` included, report `skipped`. A repair that hangs
+# off that output is switched off by the very condition it repairs.
+#
+# So this is its own workflow, on its own trigger, with no `needs:` and no gate. It deliberately
+# acts on a commit whose CI has not passed, which is the one thing release.yml's opening contract
+# promises never to do — another reason it does not belong in that file. It tags nothing, builds
+# nothing and publishes nothing; it only makes the lockfile agree with the manifests again.
+#
+# **It runs on every push rather than only on releases.** `uv lock --check` resolves in about two
+# seconds and the job does nothing when it passes, so gating it on a guess about which pushes can
+# drift buys nothing and adds a second thing to be wrong about. A release merge is the only cause
+# known today; the repair does not need to know that.
+#
+# **The push cannot start a loop.** A push authenticated with `github.token` does not trigger
+# workflows, so the commit written below starts no CI run, no Release run, and no further run of
+# this workflow. That is what makes an unconditional repair safe, and it has a cost worth stating
+# plainly rather than discovering: the repair commit is not itself released. The merged release
+# pull request keeps its `autorelease: pending` label, and the next push to `main` runs
+# release-please against a green tree and cuts the version that was blocked. `main` goes green on
+# its own; the release it was holding up waits for the next merge.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  # Serialized, never canceled. Two repairs resolving the same lockfile against different tips of
+  # `main` is how a fix races another fix; a canceled repair is a `main` left red. Neither is worth
+  # the minute it would save.
+  group: relock-main
+  cancel-in-progress: false
+
+jobs:
+  relock:
+    name: uv.lock matches main
+    runs-on: ubuntu-latest
+    permissions:
+      # To push the repair commit. Nothing else here writes.
+      contents: write
+    steps:
+      # `ref: main` rather than the pushed SHA: the repair belongs on the current tip, and
+      # committing onto an older one would push a commit that reverts whatever landed in between.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # Pinned for the reason release.yml pins it: the interpreter that resolves a lockfile is
+          # a decision, not whatever ubuntu-latest moved to this month. Resolving under a
+          # different one is how a repair introduces the drift it was sent to remove.
+          python-version: "3.14"
+
+      - name: re-lock main if the lockfile has drifted
+        run: |
+          set -euo pipefail
+          # `--check` resolves and refuses rather than rewriting, so this asks the same question
+          # ci.yml's `lint` job asks and gets the same answer. `if` is what keeps `set -e` from
+          # treating that refusal as the end of the job: a non-zero exit here is the signal to do
+          # the work, not a failure.
+          if uv lock --check; then
+            echo "uv.lock already matches the manifests; nothing to repair."
+            exit 0
+          fi
+
+          # Plain `uv lock`, never `--upgrade`, exactly as release.yml re-locks: uv is
+          # conservative by default and rewrites only what the changed constraints require, so
+          # this moves the workspace members' version lines and leaves every third-party pin
+          # alone. A repair must not quietly bump a dependency.
+          uv lock
+
+          # `--check` failing and the file not changing would mean `uv lock` did not resolve to
+          # what `--check` demanded, which is a uv-level disagreement this job must not paper
+          # over by pushing an empty commit and reporting success.
+          if git diff --quiet -- uv.lock; then
+            echo "::error::uv lock --check refused uv.lock, but uv lock rewrote nothing. The lockfile and the manifests disagree in a way this repair cannot fix."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock
+          # Repeated `-m` rather than one multi-line argument: inside a YAML block scalar every
+          # continuation line would carry this block's indentation into the commit body. Single
+          # quotes because the message names shell metacharacters it does not want expanded.
+          git commit \
+            -m 'chore: re-lock uv.lock against main' \
+            -m 'The lockfile did not match the manifests on main, so the uv lock --check in ci.yml refused it. Regenerated with plain uv lock, so no third-party pin is touched.' \
+            -m 'See .github/workflows/relock.yml for why this commit exists.'
+
+          # A rejection here means `main` moved while this job was resolving. The push that moved
+          # it has a run of this workflow of its own, and the concurrency group above makes that
+          # run wait for this one — so the repair still happens, one run later. It fails rather
+          # than exiting quietly anyway: a repair that silently did nothing is indistinguishable
+          # from a repair that was never needed, and this job exists because a lockfile went
+          # missing without anyone being told.
+          if ! git push origin "HEAD:main"; then
+            echo "::error::could not push the re-lock commit; main moved while this job ran. The next run of this workflow repairs it, and nothing has been left half-done."
+            exit 1
+          fi
