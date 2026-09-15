@@ -292,34 +292,42 @@ def test_every_package_depends_on_a_manicule_that_exists() -> None:
     if running == Version("0.0.0.dev0"):  # pragma: no cover - only in an uninstalled tree
         pytest.skip("manicule is not installed; CORE_VERSION has no distribution to read")
 
+    # Every `manicule` requirement, bounded or not, kept per manifest. **Not "the bounded one",**
+    # which is the shape this check has now got wrong twice: a filter that only records what it
+    # approves of cannot report what it skipped. A package may state the requirement more than
+    # once — `dependencies` and an extra — and one bare entry is enough to make an install
+    # unbounded however well-pinned its neighbour is.
     declared: dict[Path, str] = {}
+    bare: dict[Path, list[str]] = {}
     for manifest in sorted(PACKAGES.glob("*/pyproject.toml")):
         with manifest.open("rb") as handle:
             project = tomllib.load(handle).get("project", {})
         optional = cast("dict[str, list[str]]", project.get("optional-dependencies", {}))
         wanted = [*project.get("dependencies", []), *(e for g in optional.values() for e in g)]
+        where = manifest.relative_to(REPO_ROOT)
         for stated in wanted:
             requirement = Requirement(stated)
-            if requirement.name == "manicule" and str(requirement.specifier):
-                declared[manifest.relative_to(REPO_ROOT)] = str(requirement.specifier)
+            if requirement.name != "manicule":
+                continue
+            if str(requirement.specifier):
+                declared[where] = str(requirement.specifier)
+            else:
+                bare.setdefault(where, []).append(stated)
 
-    assert declared, "no sibling package requires manicule; this test is reading the wrong paths"
-
-    # **A missing pin, not just a wrong one.** This check was added after eleven stale
-    # `core_version` ranges shipped a broken `v0.2.0`, and it was written to compare the pins
-    # that exist — so it read four packages and silently skipped `manicule-mlx`, which declared
-    # a bare `"manicule"`. An unbounded dependency is the *worse* of the two states: the plugin
-    # manifest still says `<0.3`, so a resolver is free to install a core the plugin will then
-    # refuse to load, and the failure arrives as an incompatible plugin rather than as the
-    # dependency conflict it actually is.
-    unbounded = sorted(
-        manifest.relative_to(REPO_ROOT)
-        for manifest in PACKAGES.glob("*/pyproject.toml")
-        if manifest.relative_to(REPO_ROOT) not in declared
+    assert declared or bare, (
+        "no sibling package requires manicule; this test is reading the wrong paths"
     )
-    assert not unbounded, (
-        f"these packages require manicule without a version bound: {unbounded}.\n"
-        "Their plugin manifests declare a `core_version` range, so an unbounded dependency lets "
+
+    # **An unbounded requirement, even beside a bounded one.** `manicule-mlx` depended on a bare
+    # `"manicule"` while its plugin manifest said `<0.3`, so a resolver could install a core the
+    # plugin then refuses — and the failure arrives as an incompatible plugin rather than as the
+    # dependency conflict it is. Asserted per *requirement* rather than per manifest, because a
+    # package with a bare entry in `dependencies` and a pinned one in an extra is still unbounded
+    # for anyone who installs it without that extra.
+    assert not bare, (
+        f"these requirements name manicule with no version bound: "
+        f"{ {str(path): entries for path, entries in bare.items()} }.\n"
+        "Their plugin manifests declare a `core_version` range, so an unbounded requirement lets "
         "a resolver install a core the plugin then refuses. State the same range in both."
     )
 
