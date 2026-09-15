@@ -269,7 +269,7 @@ def test_the_console_script_is_guarded(pyproject: dict[str, Any]) -> None:
 
 
 def test_every_package_depends_on_a_manicule_that_exists() -> None:
-    """A sibling package's `manicule` requirement must admit the core it ships beside.
+    """Every sibling package pins `manicule`, and the pin admits the core it ships beside.
 
     **The other half of the same bump, and the half that had no test.**
     :func:`test_every_plugin_admits_the_running_version` reads `core_version=` out of Python
@@ -304,6 +304,24 @@ def test_every_package_depends_on_a_manicule_that_exists() -> None:
                 declared[manifest.relative_to(REPO_ROOT)] = str(requirement.specifier)
 
     assert declared, "no sibling package requires manicule; this test is reading the wrong paths"
+
+    # **A missing pin, not just a wrong one.** This check was added after eleven stale
+    # `core_version` ranges shipped a broken `v0.2.0`, and it was written to compare the pins
+    # that exist — so it read four packages and silently skipped `manicule-mlx`, which declared
+    # a bare `"manicule"`. An unbounded dependency is the *worse* of the two states: the plugin
+    # manifest still says `<0.3`, so a resolver is free to install a core the plugin will then
+    # refuse to load, and the failure arrives as an incompatible plugin rather than as the
+    # dependency conflict it actually is.
+    unbounded = sorted(
+        manifest.relative_to(REPO_ROOT)
+        for manifest in PACKAGES.glob("*/pyproject.toml")
+        if manifest.relative_to(REPO_ROOT) not in declared
+    )
+    assert not unbounded, (
+        f"these packages require manicule without a version bound: {unbounded}.\n"
+        "Their plugin manifests declare a `core_version` range, so an unbounded dependency lets "
+        "a resolver install a core the plugin then refuses. State the same range in both."
+    )
 
     refused = {
         path: specifier

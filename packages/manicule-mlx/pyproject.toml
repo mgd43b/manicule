@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 dependencies = [
-  "manicule",
+  "manicule>=0.1,<0.3",
   # Pooling happens in manicule's own numpy, from the token states this backend hands back.
   "numpy>=2.0",
   # The GPL-3.0 dependency, and Apple-only by construction. Marked rather than left to fail at
