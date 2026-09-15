@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.0](https://github.com/mgd43b/manicule/compare/v0.1.23...v0.2.0) (2026-09-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* **serve:** --no-authentication serves authoring, which is what it is for ([#366](https://github.com/mgd43b/manicule/issues/366))
+
+### Features
+
+* **collections:** a rule can name a directory, so a synced file joins it ([#365](https://github.com/mgd43b/manicule/issues/365)) ([8b10bfe](https://github.com/mgd43b/manicule/commit/8b10bfeddc615a53747cb60910f18a346fc9346e))
+* **serve:** --no-authentication serves authoring, which is what it is for ([#366](https://github.com/mgd43b/manicule/issues/366)) ([ddfcb85](https://github.com/mgd43b/manicule/commit/ddfcb85f958b9c94eb4ecc1c47c973cc1405ba80))
+
+
+### Bug Fixes
+
+* **release:** stop re-pulling 1.7 GB per release — the Xet log, and the venv's timestamped bytecode ([#364](https://github.com/mgd43b/manicule/issues/364)) ([a117b6b](https://github.com/mgd43b/manicule/commit/a117b6b8329e94ee4a66c8c81693ac550180ceba))
+* **tests:** make a leaked connection name itself, and stop a busy writer costing a lease ([#368](https://github.com/mgd43b/manicule/issues/368)) ([a563f0d](https://github.com/mgd43b/manicule/commit/a563f0d3acadc003e63f610c0717abe779d588d5))
+
 ## [0.1.23](https://github.com/mgd43b/manicule/compare/v0.1.22...v0.1.23) (2026-09-14)
 
 
