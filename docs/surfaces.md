@@ -1005,14 +1005,17 @@ refuses to build an unauthenticated one whose address is not loopback. That one 
 something other than `manicule start` is doing the listening — a container entry point, a
 production ASGI server, a hand-written uvicorn call.
 
-And there is a **third**, which fires before either: `Settings.policy_problems` carries the same
-condition and `build_container` raises on it, so a wide `security.transport.bind_host` with
-`security.auth.mode = none` refuses at `Runtime.open` — before an address has been resolved or
-an application built, and for every command rather than only for serving. It is the earliest of
-the three and the one an operator meets first, which is why `--no-authentication` has to reach
-it: a flag that satisfied the bind but not the preflight would refuse to start the deployment it
-was written for, with a message about a configuration file rather than about the argument meant
-to answer it.
+**Two, and deliberately not three.** `Settings.policy_problems` carried the same condition for a
+while, and `build_container` raises on it out of `Runtime.open` — which happens for *every*
+command. So a pod serving with `--no-authentication`, whose configuration necessarily holds a
+wide `bind_host`, could not run `manicule index --stats`, and could not run `manicule doctor`
+either: the tool an operator reaches for when that deployment is the thing misbehaving. Neither
+opens a socket. The refusal even advised passing `--no-authentication`, an option declared only
+on `serve`, so every other command answered with an unknown option.
+
+A rule about what may *listen* belongs where something listens. It is enforced at the two points
+above and nowhere else, and `doctor`'s `transport` check reports the same condition as a finding
+for anybody who wants to know without serving.
 
 ### 6.1 MCP over a socket carries the read-only tools and one named write
 

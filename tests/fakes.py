@@ -738,12 +738,8 @@ class UnenforcedLocalOnly(Settings):
     """
 
     @override
-    def policy_problems(self, *, allow_unauthenticated: bool = False) -> list[str]:
-        return [
-            problem
-            for problem in super().policy_problems(allow_unauthenticated=allow_unauthenticated)
-            if "cloud_allowed" not in problem
-        ]
+    def policy_problems(self) -> list[str]:
+        return [problem for problem in super().policy_problems() if "cloud_allowed" not in problem]
 
 
 class BanningLocalOnly(Settings):
@@ -755,11 +751,11 @@ class BanningLocalOnly(Settings):
     """
 
     @override
-    def policy_problems(self, *, allow_unauthenticated: bool = False) -> list[str]:
+    def policy_problems(self) -> list[str]:
         if self.security.data_policy.cloud_allowed:
-            return super().policy_problems(allow_unauthenticated=allow_unauthenticated)
+            return super().policy_problems()
         return [
-            *super().policy_problems(allow_unauthenticated=allow_unauthenticated),
+            *super().policy_problems(),
             *(
                 f"security.data_policy.cloud_allowed is false, but the {endpoint.describe()} "
                 f"is not on this machine."

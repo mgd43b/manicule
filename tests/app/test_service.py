@@ -1140,13 +1140,19 @@ async def test_the_whole_tree_is_validated_not_just_the_key_being_written(
 ) -> None:
     """Two settings that are each valid and jointly wrong is what ``policy_problems`` catches.
 
-    A routable bind host is a valid string, and ``security.auth.mode = "none"`` is a valid
-    mode. Together they are an unauthenticated document index on the network, and the refusal
-    has to happen when the second one is written rather than at the next start — because by
-    then the file says something the process will not run.
+    ``oauth`` is a valid mode and an empty provider list is a valid list. Together they are an
+    installation that demands a credential no configured provider can issue, and the refusal has
+    to happen when the second one is written rather than at the next start — because by then the
+    file says something the process will not run.
+
+    This used to use a routable ``bind_host`` with ``auth.mode = none``, which is no longer a
+    *configuration* problem: it governs binding, and `policy_problems` is consulted by every
+    command including the ones that never bind. The bind refusal now lives at `resolve_bind` and
+    `build_app`; what is under test here is unchanged, which is that writing one key validates
+    the whole tree.
     """
     with pytest.raises(ConfigError):
-        await service.config_set("security.transport.bind_host", "192.0.2.10")
+        await service.config_set("security.auth.mode", "oauth")
     assert not await asyncio.to_thread(config_home.exists), (
         "the file was written before validation refused it"
     )

@@ -146,32 +146,46 @@ def test_a_wide_unauthenticated_bind_is_possible_when_both_flags_are_passed() ->
     assert bind.every_interface
 
 
-def test_the_preflight_refuses_a_configured_wide_bind_and_the_flag_clears_it() -> None:
-    """**The third reader of this rule, and the one that fires first.**
+def test_a_command_that_binds_nothing_runs_under_a_configured_wide_bind() -> None:
+    """The bind policy governs what may *listen*, and nothing else may be refused by it.
 
-    ``resolve_bind`` is not the only place a wide unauthenticated bind is refused.
-    ``Settings.policy_problems`` carries the same condition, ``build_container`` raises on it,
-    and ``Runtime.open`` reaches that before any address is resolved — so a flag that satisfied
-    the bind and not the preflight would refuse to start the deployment it was written for,
-    with a message about configuration rather than about the argument that was meant to answer
-    it.
+    **This is a production regression.** A pod serving with `--no-authentication` has a wide
+    `security.transport.bind_host` in its configuration, and the rule lived in
+    ``policy_problems`` — which ``build_container`` raises on, out of ``Runtime.open``, for
+    *every* command. So `kubectl exec … manicule index --stats` refused to run, and so did
+    `manicule doctor`, which is the tool an operator reaches for when that deployment is the
+    thing misbehaving. Neither opens a socket.
 
-    **Asserted against a host in *configuration*, not one on the command line**, because that is
-    exactly where the gap was: `--host` leaves `bind_host` at the loopback default, so the
-    preflight stays silent and every check passes while the documented case — a wide
-    `security.transport.bind_host` in a file, which is what `docs/deployment.md` §4 describes —
-    fails. A test that overrode the host would have been green against the bug.
+    The refusal also gave advice it could not take: it said to "pass --no-authentication", an
+    option declared only on `serve`. Every other command answered with an unknown option.
+
+    So the check is gone from the preflight and lives only where a socket comes into being.
+    ``policy_problems`` now holds one kind of entry — a problem for *any* command — which is
+    what makes it safe to raise on for any command.
     """
     settings = Settings(security={"transport": {"bind_host": EVERYWHERE}})  # pyright: ignore[reportArgumentType]
 
-    refused = settings.policy_problems()
-    assert any("security.auth.mode" in problem for problem in refused), refused
-    assert any("--no-authentication" in problem for problem in refused), (
-        "the preflight refuses without naming the argument that answers it, so an operator "
-        "reading it is sent to the configuration file the flag deliberately is not in"
+    assert settings.policy_problems() == [], (
+        "a configured wide bind stops a command that never binds anything, which is the "
+        "failure this test exists for"
     )
 
-    assert settings.policy_problems(allow_unauthenticated=True) == []
+
+def test_the_bind_itself_still_refuses_that_configuration() -> None:
+    """The other half, and the one that matters: moving the check must not remove it.
+
+    Without this the test above is satisfied by deleting the rule outright. The refusal still
+    happens — at :func:`resolve_bind` before a socket exists, and at
+    ``manicule.api.app.build_app`` before an application does — and both still take
+    ``--no-authentication`` to waive, which is what makes the deployment reachable at all.
+    """
+    settings = Settings(security={"transport": {"bind_host": EVERYWHERE}})  # pyright: ignore[reportArgumentType]
+
+    with pytest.raises(PolicyError) as caught:
+        resolve_bind(settings, allow_public=True)
+    assert "security.auth.mode" in str(caught.value)
+
+    assert resolve_bind(settings, allow_public=True, allow_unauthenticated=True).host == EVERYWHERE
 
 
 @pytest.mark.parametrize("host", sorted(LOOPBACK_HOSTS))
