@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import delete, exists, func, literal, or_, select, text, update
+from sqlalchemy import delete, exists, false, func, literal, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
@@ -80,6 +80,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy import CursorResult
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+    from sqlalchemy.orm import InstrumentedAttribute
     from sqlalchemy.sql.elements import ColumnElement
 
     from manicule.core.content import Chunk, Document
@@ -136,9 +137,17 @@ class _SourceInventory:
         what stopped existing. This is the only thing that makes a live document the runs do
         not name explicable rather than alarming.
         """
+        if not self.runs:
+            return False
+        newest = self.runs[0]
+        # The same pair of conditions publication applies before it retires anything, so a plan
+        # cannot proceed on the expectation that publication will retire a document it will in
+        # fact leave in place and stale. A run promoted with omissions is `PARTIAL`, and a
+        # snapshot that could not fetch a body is not evidence the source no longer has it.
         return (
-            bool(self.runs)
-            and self.runs[0].enumeration_membership is SnapshotMembership.FULL_INVENTORY
+            newest.enumeration_membership is SnapshotMembership.FULL_INVENTORY
+            and newest.completeness is not None
+            and SnapshotCompleteness(newest.completeness) is SnapshotCompleteness.COMPLETE
         )
 
 
@@ -578,16 +587,17 @@ class SqliteRebuildStore(WorkspaceScoped):
                     _SnapshotBinding(run=run, retained=retained_items, contributed=contributed)
                 )
             async with self._sessions() as session:
-                live, covered = await self._membership_coverage(session, inventory)
+                live, covered, pending = await self._membership_coverage(session, inventory)
             live_documents += live
             covered_documents += covered
             uncovered_documents += live - covered
-            # A live document no bound run names can only be explained one way: the connector's
-            # newest run enumerated its whole membership and did not find it, so it is gone at
-            # the source and publication will retire it. Without that, the replacement can
-            # neither rebuild the document nor justify removing it, and publishing anyway would
-            # either strand it at the old derived identity or delete it on no evidence.
-            if live != covered and not inventory.authoritative:
+            # A live document that is neither rebuildable nor a sanctioned pending omission has
+            # only one innocent explanation: the connector's newest run enumerated its whole
+            # membership and did not find it, so it is gone at the source and publication will
+            # retire it. Without that, the replacement can neither rebuild the document nor
+            # justify removing it, and publishing anyway would either strand it at the old
+            # derived identity or delete it on no evidence.
+            if live != covered + pending and not inventory.authoritative:
                 return self._refused_estimate(
                     snapshot_run_id,
                     target,
@@ -2108,7 +2118,12 @@ class SqliteRebuildStore(WorkspaceScoped):
         return linked[0] if len(linked) == 1 else None
 
     def _contributes(
-        self, *, connector: str, newer_run_ids: Sequence[str], require_live: bool
+        self,
+        *,
+        connector: str,
+        newer_run_ids: Sequence[str],
+        require_live: bool,
+        source_id: InstrumentedAttribute[str] | None = None,
     ) -> ColumnElement[bool]:
         """Predicate selecting the records one bound run owes a generation.
 
@@ -2118,14 +2133,20 @@ class SqliteRebuildStore(WorkspaceScoped):
         drawn on only for documents that are still live: its manifest is being read to cover
         what a later delta had no reason to mention, not to reinstate what has since been
         removed from the corpus.
+
+        ``source_id`` names the column to own, defaulting to the record table's own. Coverage
+        passes an alias's column so that it asks this exact question rather than a weaker one
+        of its own; the two disagreeing is how a document came to be reported covered by a run
+        that no longer owned it.
         """
+        owned = models.AcquisitionRecord.source_id if source_id is None else source_id
         superseding = aliased(models.AcquisitionRecord)
         live = aliased(models.Document)
         predicate = ~exists(
             select(literal(1)).where(
                 superseding.run_id.in_(tuple(newer_run_ids)),
                 superseding.workspace_id == self._workspace_id,
-                superseding.source_id == models.AcquisitionRecord.source_id,
+                superseding.source_id == owned,
             )
         )
         if not require_live:
@@ -2134,7 +2155,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             select(literal(1)).where(
                 live.workspace_id == self._workspace_id,
                 live.source == connector,
-                live.source_id == models.AcquisitionRecord.source_id,
+                live.source_id == owned,
                 live.deleted_at.is_(None),
             )
         )
@@ -2207,37 +2228,88 @@ class SqliteRebuildStore(WorkspaceScoped):
 
     async def _membership_coverage(
         self, session: AsyncSession, inventory: _SourceInventory
-    ) -> tuple[int, int]:
-        """Live documents this connector holds, and how many the bound runs can rebuild.
+    ) -> tuple[int, int, int]:
+        """Live documents this connector holds, how many are rebuildable, how many are pending.
 
         Aggregates only. "Which documents would be lost" is a list of source ids by another
         name, and this number reaches every automation surface.
         """
-        run_ids = tuple(run.id for run in inventory.runs)
         retained = aliased(models.AcquisitionRecord)
         live = (
             models.Document.workspace_id == self._workspace_id,
             models.Document.source == inventory.connector,
             models.Document.deleted_at.is_(None),
         )
-        covered_by = exists(
-            select(literal(1)).where(
-                retained.run_id.in_(run_ids),
-                retained.workspace_id == self._workspace_id,
-                retained.source_id == models.Document.source_id,
-                retained.blob_ref.is_not(None),
-                retained.acquired_source.is_not(None),
+
+        def owned_by(
+            ordinal: int,
+            run: models.AcquisitionRun,
+            *extra: ColumnElement[bool],
+        ) -> ColumnElement[bool]:
+            # Ownership, not mere presence: the record that *owns* this document is the one a
+            # replacement would be built from. Asking the weaker "does any record in the chain
+            # retain it" let a superseded run answer for a newer owner that had nothing.
+            return exists(
+                select(literal(1)).where(
+                    retained.run_id == run.id,
+                    retained.workspace_id == self._workspace_id,
+                    retained.source_id == models.Document.source_id,
+                    *extra,
+                    self._contributes(
+                        connector=inventory.connector,
+                        newer_run_ids=tuple(newer.id for newer in inventory.runs[:ordinal]),
+                        # Already iterating live documents; the liveness arm would be a second
+                        # lookup for a fact this row is itself the proof of.
+                        require_live=False,
+                        source_id=retained.source_id,
+                    ),
+                )
             )
+
+        # `false()` seeds both: a connector whose runs include no `ALLOW_OMISSIONS` policy
+        # produces no pending clauses at all, and an empty `or_()` is deprecated rather than
+        # false — which this project's `filterwarnings = ["error"]` turns into a failure.
+        covered_by = or_(
+            false(),
+            *(
+                owned_by(
+                    ordinal,
+                    run,
+                    retained.blob_ref.is_not(None),
+                    retained.acquired_source.is_not(None),
+                )
+                for ordinal, run in enumerate(inventory.runs)
+            ),
+        )
+        # An omission the operator's promotion policy allows is not a gap in the evidence, it
+        # is work deferred on purpose: the record stays pending and the next ordinary sync
+        # retries its body. Counting it as coverage would be a lie, and refusing on it would
+        # overrule a contract `ALLOW_OMISSIONS` exists to offer.
+        pending_by = or_(
+            false(),
+            *(
+                owned_by(
+                    ordinal,
+                    run,
+                    retained.snapshot_outcome == SnapshotItemOutcome.OMITTED,
+                    retained.blob_ref.is_(None),
+                    retained.acquired_source.is_(None),
+                )
+                for ordinal, run in enumerate(inventory.runs)
+                if SnapshotPromotionPolicy(run.promotion_policy)
+                is SnapshotPromotionPolicy.ALLOW_OMISSIONS
+            ),
         )
         counts = (
             await session.execute(
                 select(
                     func.count(models.Document.id),
                     func.count(models.Document.id).filter(covered_by),
+                    func.count(models.Document.id).filter(pending_by & ~covered_by),
                 ).where(*live)
             )
         ).one()
-        return int(counts[0]), int(counts[1])
+        return int(counts[0]), int(counts[1]), int(counts[2])
 
     async def _generation_snapshot_rows(
         self, session: AsyncSession, generation_id: str

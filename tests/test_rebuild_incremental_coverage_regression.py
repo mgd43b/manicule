@@ -14,12 +14,20 @@ contacts a source, downloads a model, or starts a browser.
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
-from sqlalchemy import event, select, update
+from sqlalchemy import event, select, text, update
 
-from manicule.core.acquisition import SnapshotMembership
+from manicule.core.acquisition import (
+    AcquisitionDiagnostic,
+    AcquisitionFailureCode,
+    AcquisitionRecordState,
+    AcquisitionSource,
+    AcquisitionStage,
+    SnapshotMembership,
+    SnapshotPromotionPolicy,
+)
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, DocumentStatus, RawDocument
 from manicule.core.ids import chunk_id, document_id
@@ -29,6 +37,7 @@ from manicule.core.rebuild import (
     RebuildRefusalCode,
     RebuildState,
 )
+from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.storage import models
 from manicule.storage.blobs import BlobStore
 from manicule.storage.engine import session_factory
@@ -47,6 +56,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from manicule.core.protocols import Connector
     from manicule.core.rebuild import RebuildCheckpoint, RebuildTarget
     from manicule.storage.docstore import SqliteDocStore
 
@@ -873,7 +883,7 @@ def test_the_shipped_connectors_that_discard_the_cursor_say_so() -> None:
 
     walkers = (FilesystemConnector, ConfluenceSnapshotConnector, GitSiteConnector)
     assert all(connector.enumerates_full_inventory for connector in walkers)
-    assert not snapshot_enumerates_full_inventory(object()), (
+    assert not snapshot_enumerates_full_inventory(cast("Connector", object())), (
         "and a connector that makes no claim is treated as incremental, not assumed complete"
     )
 
@@ -967,3 +977,160 @@ async def test_a_lease_on_a_composed_generation_is_fenced_by_a_later_promotion(
         )
     assert caught.value.code is RebuildRefusalCode.WORKSPACE_SCOPE_CHANGED
     assert await live_source_ids(engine) == {raw.source_id for raw in raws}
+
+
+async def test_a_first_run_is_backfilled_as_a_full_inventory_not_a_delta(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """The migration's predicate has to read the JSON value, not the column's nullness.
+
+    `base_watermark` is a SQLAlchemy `JSON` column, and that type persists a Python `None` as
+    the JSON encoding of null rather than as SQL `NULL`. A first run therefore holds the four
+    characters `null` and answers `IS NOT NULL` in the affirmative, so a backfill asking the
+    column whether it is null would label every full inventory ever promoted as a delta and
+    every upgraded corpus would start refusing its own rebuilds. The ORM hides this — reading
+    the column back deserializes that `null` to `None` — so only a check at the SQL level,
+    like this one, can fail when the predicate is wrong.
+    """
+    run = await store.create_acquisition_run(
+        "first-ever-run", "wiki", source_scope="scope:v1", scope_fingerprint="v1"
+    )
+    assert run.enumeration_membership is SnapshotMembership.FULL_INVENTORY
+
+    async with session_factory(engine)() as session:
+        stored = (
+            await session.execute(
+                text(
+                    "SELECT base_watermark IS NULL, json_valid(base_watermark), "
+                    "json_type(base_watermark), enumeration_membership "
+                    "FROM acquisition_runs WHERE id = :run"
+                ),
+                {"run": run.id},
+            )
+        ).one()
+    is_sql_null, valid_json, json_kind, membership = stored
+    assert not is_sql_null, "the premise: a missing cursor is not a SQL NULL here"
+    assert valid_json, "the column holds JSON"
+    assert json_kind == "null", "and what it holds is the JSON encoding of null"
+    assert membership == SnapshotMembership.FULL_INVENTORY.value, (
+        "so the run that has no cursor at all must still read as a full inventory"
+    )
+
+
+async def test_an_omitted_newest_owner_is_not_counted_as_coverage(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Coverage asks the ownership question, and answers it honestly when the answer is no.
+
+    An older full inventory retains a document; a newer delta promoted under
+    `ALLOW_OMISSIONS` names it and could not fetch its body. The newer run owns the document,
+    because it is the newest run that named it — and it has no bytes, so nothing will be
+    staged for it. Asking only whether *some* record in the chain retained it reported the
+    document covered, which was a plain falsehood in a number an operator is meant to read
+    before publishing.
+
+    It is not, however, a refusal. An omission under a policy the operator chose is work
+    deferred on purpose: the record stays pending and the next ordinary sync retries its body.
+    So the plan runs, and says so — `covered` excludes the document, and the omission counters
+    are where it shows up.
+    """
+    _, raws = await live_full_inventory(store, engine, data_dir)
+    omitted = raws[1]
+    run = await store.create_acquisition_run(
+        "zz-delta-with-omission",
+        "wiki",
+        source_scope="scope:glossary-v1",
+        scope_fingerprint="glossary-v1",
+        promotion_policy=SnapshotPromotionPolicy.ALLOW_OMISSIONS,
+    )
+    claimed = await store.claim_acquisition_run(
+        run.id, "worker", now=NOW, expires_at=NOW + timedelta(minutes=5)
+    )
+    assert claimed is not None
+    await store.append_acquisition_record(
+        run.id,
+        0,
+        AcquisitionSource.from_discovered(
+            DiscoveredDoc(
+                ref=DocRef(source_id=omitted.source_id, uri=omitted.uri),
+                version_token="v3",  # noqa: S106 - source revision, not a credential
+                media_type=omitted.media_type,
+                size_bytes=len(omitted.as_bytes()),
+            )
+        ),
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    await store.complete_acquisition_enumeration(
+        run.id,
+        Watermark(value="v3", observed_at=NOW),
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+    await store.transition_acquisition_record(
+        run.id,
+        omitted.source_id,
+        AcquisitionRecordState.DISCOVERED,
+        AcquisitionRecordState.RETRY,
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+        diagnostic=AcquisitionDiagnostic(
+            stage=AcquisitionStage.ACQUISITION, code=AcquisitionFailureCode.FETCH_FAILED
+        ),
+    )
+    await store.complete_snapshot_acquisition(
+        run.id, lease_owner="worker", lease_generation=claimed.lease_generation, now=NOW
+    )
+    await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint="glossary-v1",
+        lease_owner="worker",
+        lease_generation=claimed.lease_generation,
+        now=NOW,
+    )
+
+    vectors, target = await ready_vectors(data_dir)
+    rebuilds = rebuild_store(store, engine, data_dir, vectors)
+    plan = await rebuilds.plan_rebuild(run.id, target, missing_limit=10, persist=False)
+
+    assert plan.runnable, "a sanctioned omission is deferred work, not missing evidence"
+    assert (plan.live_documents, plan.covered_documents, plan.uncovered_documents) == (3, 2, 1), (
+        "and the counts say plainly that one live document will not be replaced"
+    )
+    fed = await rebuilds.plan_rebuild(run.id, target, missing_limit=10)
+    staged = await rebuilds.snapshot_inputs(fed.generation_id, after_sequence=-1, limit=100)
+    assert omitted.source_id not in {item.source.source_id for item in staged}
+
+
+async def test_a_live_document_whose_owner_holds_no_evidence_at_all_refuses(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    """The same shape without the policy that sanctions it, which is the dangerous one.
+
+    Under `REQUIRE_COMPLETE` there is no such thing as a deferred body: a run either has every
+    member's bytes or it is not promoted. So a live document the bound runs cannot rebuild is
+    not pending anything — it is evidence that has gone missing, and proceeding would advance
+    the workspace's chunk identity while leaving that document on the old one.
+    """
+    _, raws = await live_full_inventory(store, engine, data_dir)
+    await store.upsert_document(
+        make_document(
+            source="wiki",
+            source_id="document-unnamed",
+            uri="https://example.test/wiki/unnamed",
+            media_type="text/plain",
+            body=b"a live document the retained history never mentions",
+        )
+    )
+    delta = await promoted_delta(store, engine, data_dir, source_id=raws[0].source_id)
+    vectors, target = await ready_vectors(data_dir)
+    rebuilds = rebuild_store(store, engine, data_dir, vectors)
+
+    plan = await rebuilds.plan_rebuild(delta, target, missing_limit=10, persist=False)
+
+    assert not plan.runnable
+    assert plan.refusal is RebuildRefusalCode.INCOMPLETE_SOURCE_INVENTORY
+    assert (plan.live_documents, plan.covered_documents, plan.uncovered_documents) == (4, 3, 1)

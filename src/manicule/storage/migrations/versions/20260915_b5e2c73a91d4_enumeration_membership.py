@@ -9,15 +9,27 @@ rebuild planner read that as authority over the connector's whole membership, pr
 document, called itself runnable, and handed publication a replacement that soft-deleted every
 document the delta had no reason to mention.
 
-**The backfill is ``base_watermark IS NOT NULL``**, which is exactly the fact the ingest
+**The backfill asks whether the run inherited a cursor**, which is exactly the fact the ingest
 pipeline consults when it decides what to hand a connector's ``discover``: a run that inherited
-a usable cursor asked for a delta. It is not a perfect reconstruction — a run that inherited a
-cursor and then discarded it, because its scope fingerprint had moved or because a
-re-enumeration was required, walked the whole scope and is recorded here as incremental. That
-error is in the safe direction. An incremental run is refused deletion authority and must prove
-its coverage from an earlier full inventory before a rebuild will plan it, so a full inventory
-mislabelled as a delta costs one refusal an operator can resolve; a delta mislabelled as a full
-inventory costs the corpus.
+a usable cursor asked for a delta.
+
+**It cannot ask that with ``base_watermark IS NOT NULL``.** ``base_watermark`` is a SQLAlchemy
+``JSON`` column, and that type persists a Python ``None`` as the JSON encoding of null rather
+than as SQL ``NULL`` — so a first run, which has no cursor at all, holds the four characters
+``null`` and answers ``IS NOT NULL`` in the affirmative. The predicate has to read the JSON
+value, not the column's nullness, or this revision labels every full inventory ever promoted as
+a delta and every migrated corpus starts refusing its own rebuilds. The ORM is not affected and
+would not have shown this: reading the column back deserializes that ``null`` to ``None``, so
+only raw SQL like this sees the difference.
+
+The ``CASE`` is total, so no row depends on the column default, and its ``ELSE`` is
+``incremental``: a value this predicate cannot recognize is treated as a delta. That is the safe
+direction. An incremental run is refused deletion authority and must prove its coverage from an
+earlier full inventory before a rebuild will plan it, so a full inventory mislabelled as a delta
+costs one refusal an operator can resolve; a delta mislabelled as a full inventory costs the
+corpus. The same reasoning covers the reconstruction's known imperfection — a run that inherited
+a cursor and then discarded it, because its scope fingerprint had moved or because a
+re-enumeration was required, walked the whole scope and is recorded here as incremental.
 
 **A batch alteration, not a plain ``ADD COLUMN``**, because the column carries a CHECK
 constraint, and SQLite can only acquire one by rebuilding the table. ``acquisition_runs`` is
@@ -65,13 +77,19 @@ def upgrade() -> None:
                 "enumeration_membership",
                 sa.String(length=14),
                 nullable=False,
-                server_default="full_inventory",
+                server_default="incremental",
             )
         )
     op.execute(
         sa.text(
-            "UPDATE acquisition_runs SET enumeration_membership = 'incremental' "
-            "WHERE base_watermark IS NOT NULL"
+            "UPDATE acquisition_runs SET enumeration_membership = CASE"
+            # `json_type(x) = 'null'` is the JSON-encoded null a first run holds; the SQL NULL
+            # arm covers a row written before this column's type was what it is now.
+            "  WHEN base_watermark IS NULL THEN 'full_inventory'"
+            "  WHEN json_valid(base_watermark) AND json_type(base_watermark) = 'null'"
+            "    THEN 'full_inventory'"
+            "  ELSE 'incremental'"
+            " END"
         )
     )
     with op.batch_alter_table("acquisition_runs") as batch:

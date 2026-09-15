@@ -1943,9 +1943,15 @@ mass-delete on a partial enumeration — being broken by the one path §11.1 did
 They are now separate conditions, and they gate different things:
 
 - **Coverage** asks whether the bound runs can rebuild every document the connector still
-  holds. A replacement that cannot is refused with `incomplete_source_inventory` before
-  anything is claimed, staged or published, and the plan reports `live_documents`,
-  `covered_documents` and `uncovered_documents` — counts, never identities.
+  holds. The question is about the record that *owns* each document — the newest bound run
+  that named it, which is the one a replacement would be built from — not about whether some
+  superseded run somewhere in the chain happens to retain it. A replacement that cannot is
+  refused with `incomplete_source_inventory` before anything is claimed, staged or published,
+  and the plan reports `live_documents`, `covered_documents` and `uncovered_documents` —
+  counts, never identities. An omission a connector's `ALLOW_OMISSIONS` promotion policy
+  sanctions is deferred work rather than missing evidence: it is excluded from
+  `covered_documents`, because nothing will be staged for it, but it does not refuse, because
+  the record stays pending and the next ordinary sync retries its body.
 - **Deletion authority** asks whether the replacement may retire a document it does not
   contain. Only a newest run that is itself a full enumeration carries it. A delta names what
   changed, and a source that is removed simply stops being named, so nothing in a delta
@@ -1984,11 +1990,13 @@ manicule rebuild status GENERATION_ID
 ```
 
 `rebuild plan` is a dry run. Read three things in its output before running anything. The
-**source inventory coverage** line must account for every live document — `covered` equal to
-`live`, `not covered` zero. **Missing retained inputs** must be zero; a non-zero count means the
-manifest names bodies the blob store no longer holds, and those documents cannot be rebuilt from
-local state at all. And the **current** and **target chunk identity** lines must differ, or there
-is nothing to migrate.
+**source inventory coverage** line says how much of the live corpus the replacement will
+actually rebuild; `not covered` above zero on a runnable plan means those documents are pending
+omissions that will keep their current derived identity until a later sync retries them, which
+may be exactly what you expect or may be a surprise worth resolving first. **Missing retained
+inputs** must be zero; a non-zero count means the manifest names bodies the blob store no longer
+holds, and those documents cannot be rebuilt from local state at all. And the **current** and
+**target chunk identity** lines must differ, or there is nothing to migrate.
 
 A plan refused with `incomplete_source_inventory` is saying the connector's retained history no
 longer reaches a full inventory that accounts for the live corpus — because the run that held it
@@ -1998,9 +2006,20 @@ corpus has to be enumerated from the source again. A connector re-enumerates fro
 its configured scope changes, and automatically after a confirmed source deletion
 (`reenumeration_required` → `reenumerating`, §11.1); connectors that discard the cursor and walk
 their whole scope every run — the filesystem, git-site and Confluence-snapshot connectors —
-declare `enumerates_full_inventory` and never reach this refusal at all. Nothing about the
-refusal is destructive: no generation is created, no lease is claimed, and the live corpus is
-exactly as it was.
+declare `enumerates_full_inventory` and do not reach this refusal for any run recorded under
+that declaration.
+
+**There is one upgrade-shaped exception, and it clears itself.** `enumeration_membership` is
+recorded when a run is created, so runs promoted before the column existed were reconstructed by
+its migration from the cursor they inherited. That reconstruction cannot see a connector's
+declaration, so a cursor-discarding connector's *historical* runs can be labelled incremental
+even though each one walked the whole scope. If the retained chain still reaches an older full
+inventory — the connector's first run always is one — planning composes it and nothing is
+refused. If it does not, one ordinary sync records a fresh `full_inventory` run through the
+declaration and the next plan is clear.
+
+Nothing about the refusal is destructive: no generation is created, no lease is claimed, and the
+live corpus is exactly as it was.
 
 `rebuild execute` claims a lease, derives every bound input from retained bytes, validates the
 complete replacement beside the live corpus, and publishes it in one transaction. It is
@@ -2014,7 +2033,9 @@ state, and `relation_fp` is cleared rather than carried because a rebuild cannot
 `tests/test_rebuild_incremental_coverage_regression.py` covers, against a real SQLite and a real
 Lance store with synthetic fixtures: a full inventory followed by a one-document delta, an empty
 delta, a retired document, two connectors with different histories, a superseded predecessor, a
-predecessor whose inventory was invalidated, a missing retained body, publication preserving
+predecessor whose inventory was invalidated, a missing retained body, a first run's absent
+cursor surviving the migration's backfill as a full inventory, a sanctioned omission counted
+honestly without refusing, a live document no bound run names refusing, publication preserving
 every covered document, a delta-led publication retiring nothing, collection membership and tags
 surviving a composed publication, a live worker's lease fenced by a promotion that lands
 mid-build, a promotion racing the publication, and an idempotent republish. What it does not cover is scale: the chain walk, the
