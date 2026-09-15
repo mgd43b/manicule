@@ -292,55 +292,52 @@ def test_every_package_depends_on_a_manicule_that_exists() -> None:
     if running == Version("0.0.0.dev0"):  # pragma: no cover - only in an uninstalled tree
         pytest.skip("manicule is not installed; CORE_VERSION has no distribution to read")
 
-    # Every `manicule` requirement, bounded or not, kept per manifest. **Not "the bounded one",**
-    # which is the shape this check has now got wrong twice: a filter that only records what it
-    # approves of cannot report what it skipped. A package may state the requirement more than
-    # once — `dependencies` and an extra — and one bare entry is enough to make an install
-    # unbounded however well-pinned its neighbour is.
-    declared: dict[Path, str] = {}
-    bare: dict[Path, list[str]] = {}
+    # **Every occurrence, kept whole.** This check has now been wrong four times in one way: it
+    # collapsed many requirements into one answer and then asserted over the survivor. A filter
+    # that only kept what it approved of could not report what it skipped; a dict keyed by
+    # manifest kept only the last entry, so an incompatible bound was masked by a compatible one
+    # later in the same file. Both are the same mistake. So nothing is collapsed here — every
+    # `manicule` requirement in every section is collected with the file it came from, and both
+    # assertions below run over the whole list.
+    found: list[tuple[Path, Requirement]] = []
     for manifest in sorted(PACKAGES.glob("*/pyproject.toml")):
         with manifest.open("rb") as handle:
             project = tomllib.load(handle).get("project", {})
         optional = cast("dict[str, list[str]]", project.get("optional-dependencies", {}))
         wanted = [*project.get("dependencies", []), *(e for g in optional.values() for e in g)]
         where = manifest.relative_to(REPO_ROOT)
-        for stated in wanted:
-            requirement = Requirement(stated)
-            if requirement.name != "manicule":
-                continue
-            if str(requirement.specifier):
-                declared[where] = str(requirement.specifier)
-            else:
-                bare.setdefault(where, []).append(stated)
+        found.extend(
+            (where, requirement)
+            for stated in wanted
+            if (requirement := Requirement(stated)).name == "manicule"
+        )
 
-    assert declared or bare, (
-        "no sibling package requires manicule; this test is reading the wrong paths"
-    )
+    assert found, "no sibling package requires manicule; this test is reading the wrong paths"
 
     # **An unbounded requirement, even beside a bounded one.** `manicule-mlx` depended on a bare
     # `"manicule"` while its plugin manifest said `<0.3`, so a resolver could install a core the
     # plugin then refuses — and the failure arrives as an incompatible plugin rather than as the
-    # dependency conflict it is. Asserted per *requirement* rather than per manifest, because a
-    # package with a bare entry in `dependencies` and a pinned one in an extra is still unbounded
-    # for anyone who installs it without that extra.
+    # dependency conflict it is. An optional group is not installed by default, so a bare entry
+    # in `dependencies` beside a pinned one in an extra *is* the default install.
+    bare = sorted(
+        f"{path}: {requirement}" for path, requirement in found if not requirement.specifier
+    )
     assert not bare, (
-        f"these requirements name manicule with no version bound: "
-        f"{ {str(path): entries for path, entries in bare.items()} }.\n"
+        f"these requirements name manicule with no version bound: {bare}.\n"
         "Their plugin manifests declare a `core_version` range, so an unbounded requirement lets "
         "a resolver install a core the plugin then refuses. State the same range in both."
     )
 
-    refused = {
-        path: specifier
-        for path, specifier in declared.items()
-        # `prereleases=True` for the reason the sibling test gives: a release candidate is still
-        # the core being released beside these.
-        if not SpecifierSet(specifier, prereleases=True).contains(running)
-    }
+    # `prereleases=True` for the reason the sibling test gives: a release candidate is still the
+    # core being released beside these.
+    refused = sorted(
+        f"{path}: {requirement}"
+        for path, requirement in found
+        if requirement.specifier
+        and not SpecifierSet(str(requirement.specifier), prereleases=True).contains(running)
+    )
     assert not refused, (
-        f"manicule {running} is being released, and these packages require a manicule that "
-        f"excludes it: {refused}.\n"
+        f"manicule {running} is being released, and these requirements exclude it: {refused}.\n"
         "Installing them would resolve to an older core or fail outright. Widen the pins in the "
         "same commit as the bump, alongside the plugin `core_version` ranges."
     )
