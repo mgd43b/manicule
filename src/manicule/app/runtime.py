@@ -92,6 +92,7 @@ if TYPE_CHECKING:
         SqliteReembedCorpus,
         SqliteReembedStore,
     )
+    from manicule.storage.source_lifecycle import ResetPreparation
 
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
@@ -1088,15 +1089,17 @@ class _ContainerChain:
 async def _publication_bound_vectors(runtime: Runtime) -> PublicationBoundVectorStore | None:
     """The vector handle, but only when durable generations are genuinely available.
 
-    Two operations depend on this — a durable re-embed and a derived reset — and both refuse
-    rather than half-perform when the answer is ``None``. They ask through one function because
-    the question has two halves and getting either alone wrong is a real failure.
+    Two operations ask, and they do different things with ``None``. A durable re-embed refuses,
+    because shadow generations are the whole of what it does. A derived reset takes the other
+    branch instead: deleting a workspace's rows and discarding its storage is something every
+    backend can be asked for, and refusing there left an installation running the supported
+    alternative backend with no working way to rebuild its index at all (#377).
 
-    The configured name has to be the built-in embedded backend, because what these operations
-    go on to do is not backend-agnostic: they build ``LanceShadowGenerations`` over a Lance
-    directory and delete it. A third-party store that satisfied the protocol structurally would
-    otherwise pass a capability check and then have its reset manipulate Lance's on-disk
-    generations instead of its own.
+    The configured name has to be the built-in embedded backend, because what this handle
+    licenses is not backend-agnostic: the caller goes on to build ``LanceShadowGenerations``
+    over a Lance directory and delete it. A third-party store that satisfied the protocol
+    structurally would otherwise pass a capability check and then have Lance's on-disk
+    generations manipulated in place of its own.
 
     And the handle still has to satisfy the protocol, because the configured name says only
     which component was asked for, not what a plugin registered under it.
@@ -1358,6 +1361,7 @@ class _Ingestion:
         if not isinstance(blobs, BlobStore):
             raise ManiculeError("offline rebuild requires retained local source bytes")
         vectors = await self._runtime.prepared_vectors()
+        self._require_publication_inventory(vectors)
         store = SqliteRebuildStore(
             self._runtime.require_engine(),
             workspace_id=self._runtime.workspace,
@@ -1412,6 +1416,32 @@ class _Ingestion:
             detect_glossary=settings.rag.glossary.detect_on_ingest,
         )
         return store, rebuilder, target
+
+    def _require_publication_inventory(self, vectors: VectorStore) -> None:
+        """Refuse an offline rebuild whose backend cannot count or copy a publication.
+
+        Asked before the run rather than discovered inside it. A rebuild stages a whole
+        generation into a publication of its own and validates the row count before anything is
+        made live, so on a store that groups no rows into publications the first validation
+        reached for a method that was not there — an ``AttributeError`` from deep inside a
+        rebuild that had already parsed and embedded the corpus, rather than a refusal that
+        names the backend before any of that work is done (#377).
+
+        The capability, not the configured name: unlike a derived reset or a durable re-embed,
+        nothing downstream of here reaches into a particular backend's storage, so a plugin that
+        genuinely implements the publication surface is genuinely able to run this.
+        """
+        from manicule.core.protocols import PublicationAwareVectorStore  # noqa: PLC0415
+
+        if isinstance(vectors, PublicationAwareVectorStore):
+            return
+        raise ManiculeError(
+            f"an offline rebuild stages its chunks into a publication of their own and proves "
+            f"that publication complete before it is made live, and storage.vector_db is "
+            f"{self._runtime.settings.storage.vector_db!r}, whose store holds one row per chunk "
+            f"and has no publication to count, validate or copy. Re-index the sources instead, "
+            f"which rebuilds the same derived state without a second generation."
+        )
 
     async def rebuild_plan(self, snapshot_run_id: str):  # noqa: ANN202
         from manicule.ingest.rebuild import MAX_MISSING_DETAILS  # noqa: PLC0415
@@ -2333,7 +2363,8 @@ class _Maintenance:
         """Delete derived chunks and vectors while retaining source manifests and documents.
 
         Relational visibility is retired first and every unfinished lease/checkpoint is fenced.
-        Physical publications are then removed by their durable generation/table bindings. The
+        Physical rows are then removed through their durable tombstones, and whatever the
+        configured backend keeps around them is discarded by the route that backend offers. The
         owned cleanup is joined through caller cancellation, so return or cancellation both leave
         the reset at a durable terminal or retryable boundary.
         """
@@ -2443,14 +2474,26 @@ class _Maintenance:
         async with self._runtime.derived_mutation_guard():
             return await self._cleanup_derived_generations_guarded()
 
-    async def _cleanup_derived_generations_guarded(self) -> LifecycleOutcome:
+    async def _cleanup_derived_generations_guarded(
+        self, *, retire_publications: bool = True
+    ) -> LifecycleOutcome:
+        """Retire what obsolete generations left behind, physically and then relationally.
+
+        The capability is required at the row that needs it rather than before the walk, and
+        the distinction is not pedantic: an installation that has never run an offline rebuild
+        has no obsolete generation at all, so a check made up front refused the operation — and
+        every derived reset that calls it — over work that did not exist. Same shape as the bind
+        policy that used to refuse commands which never bind (#375).
+
+        ``retire_publications`` is false on the one path where the rows are about to go anyway:
+        a reset on a backend whose whole storage is being discarded. Deleting each publication
+        first would be requests made to a collection that is about to stop existing, and would
+        put a capability requirement in front of a reset that does not need one.
+        """
+        from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
+
         lifecycle = self._source_lifecycle(await self._runtime.documents())
         vectors = await self._runtime.vectors()
-        remover = getattr(vectors, "delete_bound_publication", None)
-        if remover is None:
-            raise ManiculeError(
-                "derived-generation cleanup requires a vector backend with bound publications"
-            )
         removed = 0
         released = 0
         async for page in lifecycle.obsolete_generation_publications():
@@ -2463,11 +2506,14 @@ class _Maintenance:
                     )
                     if publication_id is not None
                 }
-                for publication_id in publication_ids:
-                    await remover(
-                        generation.expected_vector_table,
-                        publication_id,
-                    )
+                if publication_ids and retire_publications:
+                    if not isinstance(vectors, PublicationBoundVectorStore):
+                        raise ManiculeError(self._unbound_publication_refusal())
+                    for publication_id in publication_ids:
+                        await vectors.delete_bound_publication(
+                            generation.expected_vector_table,
+                            publication_id,
+                        )
                 count, bytes_ = await lifecycle.cleanup_obsolete_generation(
                     generation.generation_id
                 )
@@ -2484,6 +2530,112 @@ class _Maintenance:
             released_bytes=released,
         )
 
+    def _unbound_publication_refusal(self) -> str:
+        """Why a named publication cannot be retired here, and what an operator can do instead."""
+        return (
+            f"retiring the vector publications an obsolete generation left behind needs a "
+            f"backend that can delete a publication by name, and storage.vector_db is "
+            f"{self._runtime.settings.storage.vector_db!r}, which groups no rows it can name. "
+            f"Generations are written by an offline rebuild, which this backend refuses, so "
+            f"reaching this means the corpus was moved between backends with a rebuild still "
+            f"pending. Reset the derived index instead — that discards the whole of this "
+            f"workspace's vector storage, these rows included."
+        )
+
+    def _reset_row_deletion(
+        self, vectors: VectorStore, bound: PublicationBoundVectorStore | None
+    ) -> Callable[[str | None, Sequence[str]], Awaitable[int]]:
+        """How this backend deletes a tombstoned row, resolved before anything is retired.
+
+        Up front rather than at the first page, deliberately. Retiring relational visibility and
+        *then* discovering there is no way to remove the rows it named would leave an emptied
+        catalog in front of a full vector store, which is worse than either the reset that was
+        asked for or the refusal that could have been given instead.
+
+        The bound handle names the generation it believes it is deleting from and answers with
+        the rows it actually removed. Every other backend is asked through the narrow surface a
+        vector sweep uses — deletion by physical row id, which reports nothing — so what it
+        contributes is the number of rows it was asked to retire. Worth stating rather than
+        hiding: a row the store had already lost is counted by one and not by the other, which
+        makes ``vector_rows_removed`` an accounting figure and never a census.
+        """
+        from manicule.ingest.sweeps import VectorSweepTarget  # noqa: PLC0415
+
+        if bound is not None:
+            return bound.delete_bound_chunks
+        if not isinstance(vectors, VectorSweepTarget):
+            raise ManiculeError(
+                f"a derived reset has to delete this workspace's vector rows, and the store "
+                f"configured as {self._runtime.settings.storage.vector_db!r} offers no deletion "
+                f"by row id. Every backend manicule ships does; one that does not cannot have "
+                f"its derived index reset at all, and should implement delete_chunks."
+            )
+        sweep = vectors
+
+        async def swept(vector_table: str | None, vector_ids: Sequence[str]) -> int:
+            """The generation is not named, because a store with one row per chunk has none."""
+            del vector_table
+            await sweep.delete_chunks(list(vector_ids))
+            return len(vector_ids)
+
+        return swept
+
+    async def _reset_embedded_storage(
+        self,
+        vectors: PublicationBoundVectorStore,
+        lifecycle: SqliteDocStore,
+        directory: Path,
+        prepared: ResetPreparation,
+    ) -> tuple[bool, int]:
+        """Remove what the built-in backend keeps on disk, once exact row cleanup has settled.
+
+        Reached only once ``storage.vector_db`` has been shown to name the embedded backend,
+        which is what licenses the two things here that no protocol describes: a shadow
+        generation tree laid out by :class:`~manicule.storage.reembed.LanceShadowGenerations`,
+        and a directory this runtime owns rather than storage a store owns. The imports sit
+        inside that branch for the same reason — on a CPU without AVX2, importing LanceDB to
+        find out it is not configured is ``SIGILL`` (``tests/test_import_boundary.py``).
+
+        The shared upgrade-era root is the one directory a reset may not remove: other
+        workspaces still index into it, so their rows would go with this one's. Returns whether
+        physical storage was removed, and the unowned upgrade-era tombstones that removal made
+        it safe to forget.
+        """
+        from manicule.storage.reembed import (  # noqa: PLC0415
+            LanceShadowGenerations,
+            SqliteReembedStore,
+        )
+        from manicule.storage.vectors import reset_vector_directory  # noqa: PLC0415
+
+        authority = SqliteReembedStore(self._runtime.require_engine(), self._runtime.workspace)
+        shadows = LanceShadowGenerations(directory, authority)
+        for run_id in await lifecycle.reset_reembed_run_ids():
+            await shadows.cleanup_terminal(run_id)
+        legacy_root = prepared.vector_namespace == "legacy"
+        if legacy_root and await lifecycle.other_legacy_vector_consumers():
+            return False, 0
+        await vectors.teardown()
+        removed = await reset_vector_directory(directory, legacy_root=legacy_root)
+        unowned = await lifecycle.clear_unowned_legacy_tombstones() if legacy_root else 0
+        return removed, unowned
+
+    async def _discard_vector_storage(self, vectors: VectorStore) -> bool:
+        """Ask a backend that is not the embedded one to drop what this workspace holds.
+
+        The rows themselves are already gone — the tombstone sweep above is backend-agnostic.
+        What this reaches is everything a tombstone cannot name, and on a server backend the
+        recorded fingerprint is the part that matters: left standing, it refuses the next ingest
+        under a different model against an index the reset has emptied.
+
+        A store offering no such capability is not refused. Its rows have been deleted and the
+        reset reports ``vector_store_removed`` false, which is the truth rather than a silence.
+        """
+        from manicule.core.protocols import ResettableVectorStore  # noqa: PLC0415
+
+        if not isinstance(vectors, ResettableVectorStore):
+            return False
+        return await vectors.reset_storage()
+
     async def _reset_derived_joined(self, lifecycle: SqliteDocStore) -> ResetOutcome:
         """Commit visibility first, then join owned physical cleanup through cancellation."""
         import asyncio  # noqa: PLC0415 - only this lifecycle boundary owns a task
@@ -2494,11 +2646,9 @@ class _Maintenance:
 
             directory = await self._runtime.vector_directory()
             async with generation_pin(directory, exclusive=True):
-                vectors = await _publication_bound_vectors(self._runtime)
-                if vectors is None:
-                    raise ManiculeError(
-                        "derived reset requires the built-in publication-aware vector backend"
-                    )
+                bound = await _publication_bound_vectors(self._runtime)
+                vectors = await self._runtime.vectors()
+                retire = self._reset_row_deletion(vectors, bound)
                 prepared = await lifecycle.prepare_reset_derived()
                 vector_rows = 0
                 while tombstones := await lifecycle.reset_vector_tombstones():
@@ -2506,35 +2656,19 @@ class _Maintenance:
                     for tombstone in tombstones:
                         grouped.setdefault(tombstone.vector_table, []).append(tombstone.vector_id)
                     for vector_table, vector_ids in grouped.items():
-                        vector_rows += await vectors.delete_bound_chunks(vector_table, vector_ids)
+                        vector_rows += await retire(vector_table, vector_ids)
                         await lifecycle.clear_tombstones(vector_ids)
-                cleanup = await self.cleanup_derived_generations()
+                cleanup = await self._cleanup_derived_generations_guarded(
+                    retire_publications=bound is not None
+                )
                 await lifecycle.retire_reset_pointer()
-                from manicule.storage.reembed import (  # noqa: PLC0415
-                    LanceShadowGenerations,
-                    SqliteReembedStore,
-                )
-
-                authority = SqliteReembedStore(
-                    self._runtime.require_engine(), self._runtime.workspace
-                )
-                shadows = LanceShadowGenerations(directory, authority)
-                for run_id in await lifecycle.reset_reembed_run_ids():
-                    await shadows.cleanup_terminal(run_id)
-                other_legacy = await lifecycle.other_legacy_vector_consumers()
-                remove_store = prepared.vector_namespace != "legacy" or other_legacy == 0
-                physical_removed = False
-                if remove_store:
-                    from manicule.storage.vectors import (  # noqa: PLC0415
-                        reset_vector_directory,
+                if bound is not None:
+                    physical_removed, unowned = await self._reset_embedded_storage(
+                        bound, lifecycle, directory, prepared
                     )
-
-                    await vectors.teardown()
-                    physical_removed = await reset_vector_directory(
-                        directory, legacy_root=prepared.vector_namespace == "legacy"
-                    )
-                    if prepared.vector_namespace == "legacy":
-                        vector_rows += await lifecycle.clear_unowned_legacy_tombstones()
+                    vector_rows += unowned
+                else:
+                    physical_removed = await self._discard_vector_storage(vectors)
                 fingerprints = await lifecycle.finish_reset_identity()
                 await self._runtime.invalidate_derived_runtime()
                 return ResetOutcome(

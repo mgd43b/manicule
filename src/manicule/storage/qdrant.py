@@ -7,7 +7,7 @@ same names, written from the same object by the same rules. Everything that is a
 the integrity verdict — comes from :mod:`manicule.storage.vector_schema`, so the two backends
 cannot drift into answering one question two ways.
 
-Four things here are not simply the Lance store with a different client under it.
+Five things here are not simply the Lance store with a different client under it.
 
 **The index lives on a machine this process does not own.** That is the whole point — it is
 what lets several manicule processes, or a container with no persistent volume, share one
@@ -59,6 +59,13 @@ can replace would be describing a mechanism that is not there. Nor does it imple
 shadow-generation surface re-embedding needs: ``manicule.app.runtime`` refuses a durable
 re-embed on any backend that does not, by name, and that refusal is the honest answer rather
 than a half-built one.
+
+It does implement :class:`~manicule.core.protocols.ResettableVectorStore`, and that one is not
+optional in practice. A derived reset deletes rows by id, which needs nothing from a backend,
+and then has to discard what surrounds them — which on a directory backend the runtime does
+itself and here nothing but this store can do. Until :meth:`QdrantVectorStore.reset_storage`
+existed the reset refused outright, and an operator rebuilding an index dropped collections
+through Qdrant's HTTP API by hand; ``docs/storage.md`` §6.7 records what that cost.
 """
 
 from __future__ import annotations
@@ -752,6 +759,48 @@ class QdrantVectorStore:
                 ),
             )
         return HealthReport(state=HealthState.OK, detail=f"Qdrant at {where} answered")
+
+    async def reset_storage(self) -> bool:
+        """Drop every collection this workspace owns, and the fingerprint recorded for it.
+
+        :class:`~manicule.core.protocols.ResettableVectorStore`, and what makes a derived reset
+        finish on this backend. Nothing else can: manicule holds a client, so a reset that only
+        swept the rows the relational store tombstoned would leave the collection, its payload
+        indexes and the meta record standing — and the meta record is the one that matters,
+        because the next ``ensure_ready`` under a new model compares against it and refuses.
+
+        Collections are found by name prefix rather than through the recorded fingerprint. A
+        workspace that has held vectors under two models has two collections and the record
+        names only one of them, so resolving through the record would drop the collection the
+        reset can already see and leave the one nothing would go looking for again.
+
+        The meta collection is shared by every workspace on the server, so the *point* goes and
+        the collection stays. A reset is scoped to one workspace even when it is the only one
+        there, because "the only one there" is a fact about today.
+
+        The prepared state goes with the storage. This handle is cached and the caller reuses
+        it, so leaving a fingerprint behind would leave it ready to write into a collection that
+        no longer exists — the same stale claim the meta record makes, one process closer.
+        """
+        owned = f"{self._prefix}_{workspace_digest(self._workspace)}_"
+        listed = await self._client.get_collections()
+        removed = False
+        for collection in listed.collections:
+            if collection.name.startswith(owned):
+                removed = await self._client.delete_collection(collection.name) or removed
+        meta = self._meta_collection()
+        if await self._client.collection_exists(meta) and await self._client.retrieve(
+            collection_name=meta, ids=[self._meta_point()], with_payload=False
+        ):
+            await self._client.delete(
+                collection_name=meta,
+                points_selector=models.PointIdsList(points=[self._meta_point()]),
+                wait=True,
+            )
+            removed = True
+        self._fingerprint = None
+        self._middleware = ()
+        return removed
 
     async def teardown(self) -> None:
         """Close the client, when this store is the one that opened it.

@@ -1715,6 +1715,24 @@ a half-created one is a corpus that silently gets slower rather than a failure a
   chunk, the payload from the chunk, and the vector is a pure function of the chunk's embedding
   input under a fingerprint both writers had to match to get here.
 
+**A derived reset is not on that list, and for one release it was.** `reset-index` refused on
+every backend but the embedded one, which made the operation an installation reaches for when a
+derived index has to be rebuilt the operation this backend could not run: renaming files changes
+`source_id` and orphans their documents, a partial sync leaves the index disagreeing with the
+corpus, and the answer to both was scaling the deployment to zero and dropping collections
+through Qdrant's HTTP API from outside the cluster (#377). Deleting the rows needs no capability
+at all — the reset sweeps the tombstones §6.4 wrote and deletes by physical row id, which every
+store does. What no tombstone names is the storage around them: here the collection, the payload
+indexes created with it, and the meta record naming the model this workspace's vectors came
+from. That record is the part that matters, because it outlives the rows and refuses the *next*
+ingest under a different embedder. `ResettableVectorStore.reset_storage` is the reach for it,
+and this store implements it — every collection whose name carries this workspace's digest, plus
+this workspace's point in the shared meta collection, which is shared and therefore keeps its
+other rows. Matched by name rather than resolved through the record, because a workspace that
+has held two embedding spaces has two collections and the record names one of them. A backend
+implementing neither this capability nor the publication surface still has its rows deleted, and
+the reset reports `vector_store_removed` false rather than implying it did more.
+
 **The corpus leaves this machine, and configuration says so before it does.** The chunk travels
 with the vector (§6.2), so a vector store on another host is an egress path for document *text*
 rather than merely for embeddings — and it is one the model-endpoint classification in

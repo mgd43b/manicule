@@ -92,11 +92,12 @@ VectorStore
     search(vector: Vector, k: int, filter: Filter|None) -> list[Candidate]
 
     # Optional capabilities, each detected separately. A backend implements the ones
-    # it has; nothing requires all four, and a store with none is not degraded.
+    # it has; nothing requires all five, and a store with none is not degraded.
     AnnIndexMaintenance           # ann_index_state, build_ann_index
     VectorIntegrityMaintenance    # checksum_coverage, backfill_checksums
     PublicationAwareVectorStore   # publications: count, validate, copy, retire
     PublicationBoundVectorStore   # the above, following the durable pointer
+    ResettableVectorStore         # reset_storage: discard one workspace's storage
 
 DocStore
     # documents, chunks, lexical search, sync state
@@ -140,7 +141,7 @@ it was given. Joining the *implementation* is what keeps the workspace boundary 
 contracts it satisfies. See [`storage.md`](storage.md) §11.
 
 **A vector store's optional capabilities are asked of the object, never of the module that
-would implement one.** The four above are separate `runtime_checkable` protocols rather than
+would implement one.** The five above are separate `runtime_checkable` protocols rather than
 methods on `VectorStore` for the reason the lifecycle hooks are separate — a networked backend
 that builds no ANN index and holds no shadow generations should report no index state rather
 than an empty one, and should not carry four methods that can only refuse. The rule about
@@ -156,10 +157,20 @@ not interchangeable.** `isinstance` against a `runtime_checkable` protocol match
 *names* — never signatures, never behavior — so a third-party store offering a publication
 surface of its own satisfies `PublicationBoundVectorStore` structurally. That is correct for
 calling a method through the protocol, and wrong for deciding to run backend-specific work:
-a durable re-embed and a derived reset go on to build shadow generations over a Lance directory
-and delete it, so they ask `storage.vector_db` as well, and refuse unless both halves agree.
-The rule is that a capability check licenses a capability call, and only the configured backend
-licenses reaching into that backend's storage.
+a durable re-embed goes on to build shadow generations over a Lance directory and delete it, so
+it asks `storage.vector_db` as well, and refuses unless both halves agree.
+
+**What the second half licenses is the backend-specific branch, not the operation.** A derived
+reset asks the same two-part question the re-embed does and does something else with a
+disagreement: it skips the work that belonged to the embedded backend and takes the route every
+backend has — deleting the rows the relational store tombstoned, then asking the store itself to
+discard what is around them through `ResettableVectorStore`. Refusing the whole operation there
+was a real cost rather than a theoretical one, because a derived reset is what an installation
+reaches for when its index has to be rebuilt, and the backend it refused is the one on the
+hardware that cannot run the other ([`storage.md`](storage.md) §6.7). So the rule has three
+parts: a capability check licenses a capability call, only the configured backend licenses
+reaching into that backend's storage, and neither licenses refusing an operation that needed
+neither.
 
 **`VersionStore.resolve_citation` takes the document as well as the chunk, and the reason is
 the anchor rule.** `chunks.id` is derived from `(document_id, position, text)`, so a chunk that

@@ -47,6 +47,7 @@ from manicule.core.protocols import (
     AnnIndexMaintenance,
     PublicationAwareVectorStore,
     PublicationBoundVectorStore,
+    ResettableVectorStore,
     VectorIntegrityMaintenance,
     VectorStore,
 )
@@ -239,6 +240,21 @@ def test_the_store_does_not_claim_the_publication_capabilities(store: QdrantVect
     """
     assert not isinstance(store, PublicationAwareVectorStore)
     assert not isinstance(store, PublicationBoundVectorStore)
+
+
+@pytest.mark.contract
+def test_the_store_claims_the_capability_a_derived_reset_needs(store: QdrantVectorStore) -> None:
+    """The one capability that has to be claimed, because nothing else can supply it.
+
+    A derived reset deletes the rows the relational store tombstoned, which needs no capability
+    at all, and then has to discard what is around them. On a directory backend the runtime
+    removes the directory itself; here it holds a client, so the only thing that can drop a
+    collection — or the fingerprint record that would otherwise refuse the next model — is the
+    store. Not claiming this is how ``reset-index`` came to have no working form on this backend
+    (#377).
+    """
+    assert isinstance(store, ResettableVectorStore)
+    assert_protocol_signatures(store, ResettableVectorStore)
 
 
 # --- naming and identity -------------------------------------------------------------------
@@ -685,6 +701,105 @@ async def test_deleting_from_a_store_that_holds_nothing_is_not_an_error(
     await store.delete_chunks(["no-such-row"])
 
     assert await store.count() == 0
+
+
+# --- resetting -----------------------------------------------------------------------------
+
+
+async def test_a_reset_drops_this_workspace_s_collection_and_forgets_its_model(
+    store: QdrantVectorStore, client: AsyncQdrantClient
+) -> None:
+    """Both halves, because either one alone leaves a workspace that cannot be re-indexed.
+
+    Dropping the collection and keeping the record leaves the next ``ensure_ready`` comparing
+    against a model whose vectors are gone; keeping the collection and dropping the record
+    leaves rows from a model nothing will admit again.
+    """
+    await prepared(store)
+    await store.upsert([chunk("one")], [spread(4, 0)])
+    collection = collection_for(TEST_COLLECTION_PREFIX, WORKSPACE, fingerprint(4))
+
+    assert await store.reset_storage() is True
+
+    assert not await client.collection_exists(collection)
+    assert await store.fingerprint() is None
+    assert await store.count() == 0
+
+
+async def test_a_reset_lets_the_next_ingest_arrive_from_a_different_model(
+    store: QdrantVectorStore,
+) -> None:
+    """What a reset is *for*, stated as the thing an operator does the day after.
+
+    The recorded fingerprint is the part a row sweep cannot reach, and until #377 nothing else
+    reached it either: every derived reset on this backend refused, so the record survived and
+    re-indexing under a new embedder was refused by an index that no longer held anything. That
+    is the state this asserts an installation can now get out of without a throwaway pod.
+    """
+    await prepared(store)
+    await store.upsert([chunk("one")], [spread(4, 0)])
+    await store.reset_storage()
+
+    await store.ensure_ready(fingerprint(8))
+    await store.upsert([chunk("two")], [spread(8, 1)])
+
+    assert await store.count() == 1
+
+
+async def test_a_reset_leaves_every_other_workspace_on_the_server_alone(
+    make_store: Callable[[], QdrantVectorStore],
+) -> None:
+    """One flat namespace, several corpora, and a reset asked about exactly one of them.
+
+    An installation shares a server the way it never shares a directory, so the blast radius of
+    a reset is a property of the name it matches on rather than of the storage it is deleting.
+    """
+    reset, kept = make_store(), make_store()
+    for held in (reset, kept):
+        await prepared(held)
+        await held.upsert([chunk(f"row-of-{held.workspace_id}")], [spread(4, 0)])
+
+    assert await reset.reset_storage() is True
+
+    assert await kept.count() == 1
+    assert await kept.fingerprint() is not None, "another workspace lost its recorded model"
+
+
+async def test_a_reset_reaches_a_collection_the_record_does_not_name(
+    store: QdrantVectorStore, client: AsyncQdrantClient
+) -> None:
+    """Collections are matched by name, not resolved through the meta record, and this is why.
+
+    A workspace that has held two embedding spaces has two collections and a record naming one
+    of them. Resolving through the record would drop the collection the reset could already see
+    and leave the one nothing would go looking for again — a corpus's worth of vectors from a
+    model this installation no longer runs, invisible to every count it reports.
+    """
+    await prepared(store)
+    orphan = collection_for(TEST_COLLECTION_PREFIX, WORKSPACE, fingerprint(8))
+    await client.create_collection(
+        collection_name=orphan,
+        vectors_config=models.VectorParams(size=8, distance=models.Distance.COSINE),
+    )
+
+    assert await store.reset_storage() is True
+
+    assert not await client.collection_exists(orphan)
+
+
+async def test_resetting_a_workspace_that_never_held_a_vector_removes_nothing(
+    store: QdrantVectorStore,
+) -> None:
+    """A reset runs on an installation whose state nobody is sure of, and says what it found.
+
+    ``False`` is the honest answer rather than a failure: there was nothing to remove. Running
+    it twice has to give the same answer for the same reason.
+    """
+    assert await store.reset_storage() is False
+
+    await prepared(store)
+    assert await store.reset_storage() is True
+    assert await store.reset_storage() is False
 
 
 # --- numerical integrity -------------------------------------------------------------------
