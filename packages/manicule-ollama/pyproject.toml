@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "manicule-ollama"
-version = "0.2.1"
+version = "0.2.2"
 description = "Embedding backend for manicule that runs the model on an Ollama server."
 readme = "README.md"
 # MIT, like manicule itself. Unlike `manicule-mlx` this package carries no copyleft

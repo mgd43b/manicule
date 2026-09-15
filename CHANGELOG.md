@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/mgd43b/manicule/compare/v0.2.1...v0.2.2) (2026-09-15)
+
+
+### Bug Fixes
+
+* **packaging:** pin manicule in every sibling package, and catch a missing pin ([#373](https://github.com/mgd43b/manicule/issues/373)) ([21b112f](https://github.com/mgd43b/manicule/commit/21b112fbb5115df27623f78d970a971d8fefb128))
+
 ## [0.2.1](https://github.com/mgd43b/manicule/compare/v0.2.0...v0.2.1) (2026-09-15)
 
 
