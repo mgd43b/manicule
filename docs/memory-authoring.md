@@ -204,35 +204,37 @@ configuration flag:
 
 The property that mattered is that the absence of every *other* write tool stays **mechanical
 rather than reasoned**, and it does. `_Registrar.tool` registers a tool only when its
-`readOnlyHint` is true or its name is in the set `manicule.mcp.server.network_authoring` returns
-— `NETWORK_AUTHORING`, a frozenset holding one name, or nothing at all — so there is no handler
-behind any other write tool on a socket. An absence, not a refusal.
-`tests/api/test_routes.py` asserts both rows as set operations: the published set *is* the
-read-only set plus that constant, or the read-only set exactly, so a second write tool cannot
-drift in behind the first and the first cannot survive the credential going away.
+`readOnlyHint` is true or its name is in `manicule.mcp.server.NETWORK_AUTHORING` — a frozenset
+holding one name — so there is no handler behind any other write tool on a socket. An absence,
+not a refusal. `tests/api/test_routes.py` asserts that row as a set operation: the published set
+*is* the read-only set plus that constant, so a second write tool cannot drift in behind the
+first.
 
-**The third row is the one that had to be added**, and it is the answer to a question this
-section originally settled the other way. It used to say the surface needed no flag guarding it
-because `resolve_bind` refuses a non-loopback bind unless an operator named a host, passed an
-explicit opt-in and switched authentication on — the gate was one layer up, and a
-`network_authoring: false` knob would only be a setting nobody changes. The gate is still one
-layer up and there is still no knob, but `--no-authentication` ([`surfaces.md`
-§6](surfaces.md#6-where-a-server-listens)) means the third of those three can now be satisfied
-by an argument, so "authentication is on" stopped being something this table could assume.
+**That set does not depend on authentication, and the attempt to make it depend on
+authentication is worth recording.** When `--no-authentication` was added
+([`surfaces.md` §6](surfaces.md#6-where-a-server-listens)) the set was briefly emptied for
+`security.auth.mode = none`, on the reasoning that without a credential
+`manicule.api.security.Principal` resolves an anonymous caller to `admin`, `require_network_member`'s
+member floor is cleared by everybody, and anything routing to the port could then write into a
+corpus read back as standing instructions.
 
-The fix is not a knob and not a guard. **Authoring's presence on a socket is a function of
-whether that socket is authenticated**, which is what `network_authoring` computes and the only
-place the question is asked. Without a credential there is nothing to tell one caller from
-another: `manicule.api.security.Principal` resolves an anonymous caller to `admin`, so
-`require_network_member`'s member floor is cleared by everybody and anything that can route to
-the port could write into this corpus. Given what the corpus *is* — read back as standing
-instructions, which the last paragraph of this section is about — that is an injection channel
-rather than a privacy question, and the answer to an injection channel is that the tool is not
-there, never that a check refuses it.
+The reasoning about the exposure was right. The conclusion was wrong, because it made *this
+deployment* impossible: manicule serving this corpus to Claude and Codex on machines running no
+manicule of their own, where authoring is the entire point of the socket. They could search the
+corpus and not write to it. A read-only network surface makes the deployment pointless — the
+sentence §4.10 already used, applied to its own mitigation.
+
+So `security.auth.mode` decides **who may call** `document_create` and never whether the socket
+carries it. On an unauthenticated bind the answer to "who" is everyone who can route to the
+port, over the MCP mount and over `POST /api/v1/documents` alike, and that is accepted rather
+than mitigated: it takes an argument no configuration file can supply, the startup banner names
+this corpus at the moment it becomes writable, and `manicule doctor` reports it as failing for
+as long as it holds.
 
 Two constraints ride along and both are enforced:
 
-- **Auth is non-negotiable on a socket.** `manicule.app.bind.require_authoring_authentication`
+- **Auth is non-negotiable on a socket unless an operator says otherwise at a terminal.**
+  `manicule.app.bind.require_authoring_authentication`
   refuses when authoring is configured and `security.auth.mode` is `none` — loopback included,
   where `resolve_bind` asks for nothing. Two callers, because there are two ways a socket carries
   the tool: `manicule.mcp.serve.address_for` for `--mcp-only`, and `manicule.api.app.build_app`

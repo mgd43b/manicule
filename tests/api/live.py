@@ -39,7 +39,11 @@ if TYPE_CHECKING:
 
 @contextlib.asynccontextmanager
 async def mounted(
-    backend: FakeBackend, *, web: bool = True, credential: dict[str, str] | None = None
+    backend: FakeBackend,
+    *,
+    web: bool = True,
+    credential: dict[str, str] | None = None,
+    allow_unauthenticated: bool = False,
 ) -> AsyncGenerator[Client[Any]]:
     """An MCP client speaking to the mount, through the application and not through a socket.
 
@@ -57,10 +61,17 @@ async def mounted(
     driven *as a caller* rather than only inspected. Without it the only reachable case was the
     anonymous one, which is how an unauthenticated mount went unnoticed: every assertion here
     passed against a surface that admitted everybody.
+
+    ``allow_unauthenticated`` is ``manicule serve --no-authentication``, needed here for one case:
+    an installation with authoring configured refuses to build an application at all without it,
+    so a suite that wants to drive an *unauthenticated write* cannot otherwise reach one. It
+    defaults to false, so every other caller gets the refusal the product ships with.
     """
     import httpx  # noqa: PLC0415 - what fastmcp's client is written against
 
-    app = build_app(ApplicationService(backend), web=web)
+    app = build_app(
+        ApplicationService(backend), web=web, allow_unauthenticated=allow_unauthenticated
+    )
 
     def through_the_app(**arguments: Any) -> httpx.AsyncClient:
         """The client fastmcp would have built, pointed at the application instead of a socket.

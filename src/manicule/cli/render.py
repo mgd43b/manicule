@@ -1288,7 +1288,11 @@ def _unauthenticated_warning(out: Console, *, loopback: bool, authoring: str) ->
         # The label is plain and only the target is marked up: `_signpost` pads with `ljust`,
         # which counts markup characters that Rich then strips — so a colored label is a
         # column that does not line up with the ones above it.
-        _signpost(out, "writes", f"[red]{reach} can author into {authoring!r}[/red]")
+        # `escape` because the corpus name comes from configuration and nothing constrains it
+        # to exclude brackets: a source called `[bold]` would be read as markup and could
+        # restyle or swallow part of the one line on this banner that names an exposure.
+        corpus = escape(repr(authoring))
+        _signpost(out, "writes", f"[red]{reach} can author into {corpus}[/red]")
 
 
 def render_upgrade(out: Console, payload: r.UpgradeReport) -> None:

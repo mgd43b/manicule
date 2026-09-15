@@ -11,17 +11,17 @@ non-loopback bind needs a host somebody wrote down, an explicit opt-in the calle
 authentication switched on — or a second opt-in saying the operator accepts serving without it.
 Any one missing is a refusal.
 
-**And it carries the read-only tools, plus exactly one write — while it is authenticated.**
-Binding a socket removes the property stdio had, so something has to replace it:
-:func:`~manicule.mcp.server.build_server` is asked for the read-only surface, which registers a
-tool only when its ``readOnlyHint`` is true or its name is in
-:func:`~manicule.mcp.server.network_authoring`. That set holds ``document_create`` and nothing
-else, and it is empty whenever ``security.auth.mode`` is ``none`` — so ``--no-authentication``
-buys a socket that reads and cannot be written to at all. Every other write tool stays on stdio,
-on the command line, and on the control socket of #139 — every one of them a place where a
-person is present or a process is the writer. See :data:`NETWORK_SURFACE_IS_READ_ONLY`, and
-:func:`~manicule.app.bind.require_authoring_authentication` for the one thing a socket
-carrying authoring must have.
+**And it carries the read-only tools, plus exactly one write.** Binding a socket removes the
+property stdio had, so something has to replace it: :func:`~manicule.mcp.server.build_server` is
+asked for the read-only surface, which registers a tool only when its ``readOnlyHint`` is true or
+its name is in :data:`~manicule.mcp.server.NETWORK_AUTHORING`. That set holds ``document_create``
+and nothing else, whatever the authentication mode — the credential decides *who may call* it
+(:func:`~manicule.mcp.server.require_network_member`), never whether the socket carries it. Every
+other write tool stays on stdio, on the command line, and on the control socket of #139 — every
+one of them a place where a person is present or a process is the writer. See
+:data:`NETWORK_SURFACE_IS_READ_ONLY`, and
+:func:`~manicule.app.bind.require_authoring_authentication` for the one thing a socket carrying
+authoring must have, and for the argument that waives it.
 
 **A socket also gets a front door**, which stdio has no use for and no place to put. ``/`` on
 this transport is where ``--mcp-only`` lands somebody who opened the address the process printed,

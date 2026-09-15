@@ -15,14 +15,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
 from typer.testing import CliRunner
 
 import manicule.cli.main as cli
+from manicule.api.app import build_app
 from manicule.app import commands
 from manicule.app.commands import Command
 from manicule.app.dispatch import run_op
@@ -43,6 +46,7 @@ from manicule.core.ids import document_id
 from manicule.ingest.pipeline import RunReport
 from manicule.mcp.server import build_server
 from manicule.plugins.registry import ComponentRegistry
+from tests.api.live import mounted
 from tests.app.fakes import FakeBackend, FakeIngestion, FakeStore, make_chunk, make_document
 
 if TYPE_CHECKING:
@@ -208,6 +212,77 @@ async def test_a_created_document_is_on_disk_indexed_and_in_its_collection(root:
     backend = service.backend
     assert isinstance(backend, FakeBackend)
     assert backend.organization_.members["col-0"] == [created.document_id]
+
+
+async def test_an_unauthenticated_socket_authors_through_both_doors(root: Path) -> None:
+    """``--no-authentication`` is not a claim about construction; it is a write that lands.
+
+    **This is the test the surrounding suite could not make.** Every other case here calls
+    ``document_create`` on the service directly, and the two network tests in ``tests/api`` assert
+    that an application *can be built*. Between them, publication, anonymous principal resolution
+    and the write itself could disagree and everything would stay green — which is exactly what
+    happened once already, when the tool was published and the surface it was published on had
+    been emptied.
+
+    So both doors are driven end to end, anonymously, against a **real filesystem connector**,
+    and the assertion is the file on disk:
+
+    * the MCP mount, where ``require_network_member`` asks for a member floor and an anonymous
+      caller clears it only because ``auth.mode = none`` makes them an administrator;
+    * ``POST /api/v1/documents``, whose ``MemberPrincipal`` dependency is the same question asked
+      by FastAPI instead.
+
+    ``settings_for`` configures ``api_key`` because the refusal demands it; this is the one case
+    that needs the other mode, so it is overridden here and the flag is passed. That pairing is
+    the deployment: a corpus assistants can write to over a network the operator owns.
+    """
+    settings = settings_for(root).model_copy(
+        update={"security": SecuritySettings(auth=AuthSettings(mode=AuthMode.NONE))}
+    )
+    backend = await backend_for(settings)
+
+    async with mounted(backend, allow_unauthenticated=True) as client:
+        over_mcp = await client.call_tool(
+            "document_create",
+            {"collection": COLLECTION, "slug": "over_mcp", "body": BODY},
+        )
+    assert dict(over_mcp.structured_content or {})["ok"] is True, over_mcp.structured_content
+
+    app = build_app(ApplicationService(backend), allow_unauthenticated=True)
+    with TestClient(app) as http:
+        over_http = http.post(
+            "/api/v1/documents",
+            json={"collection": COLLECTION, "slug": "over_http", "body": BODY},
+        )
+    assert over_http.status_code == HTTPStatus.OK, over_http.text
+    assert over_http.json()["ok"] is True, over_http.text
+
+    # The corpus changed, which is the only evidence that is not a statement about a response.
+    assert written_under(root) == [
+        COLLECTION,
+        f"{COLLECTION}/over_http.md",
+        f"{COLLECTION}/over_mcp.md",
+    ]
+    assert (root / COLLECTION / "over_mcp.md").read_text(encoding="utf-8") == BODY
+    assert (root / COLLECTION / "over_http.md").read_text(encoding="utf-8") == BODY
+
+
+async def test_neither_door_authors_without_the_flag(root: Path) -> None:
+    """The control. Without the argument the application refuses to exist, so neither door opens.
+
+    Without this the test above would pass against a build that had simply stopped refusing, and
+    the default — an installation that never asked for any of this — is the case that matters
+    most.
+    """
+    settings = settings_for(root).model_copy(
+        update={"security": SecuritySettings(auth=AuthSettings(mode=AuthMode.NONE))}
+    )
+    backend = await backend_for(settings)
+
+    with pytest.raises(PolicyError, match="authoring"):
+        build_app(ApplicationService(backend))
+
+    assert written_under(root) == []
 
 
 async def test_the_identity_is_the_slug_so_a_new_title_does_not_move_it(root: Path) -> None:

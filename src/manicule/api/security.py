@@ -21,13 +21,18 @@ non-loopback bind with no auth is refused twice: by
 
 ``manicule serve --no-authentication`` satisfies both refusals, and it is the one case where
 the assumption above does not hold: the anonymous administrator below is then anything that can
-route to the port. **What keeps that bounded is that the surface shrinks rather than the check
-loosening.** No route gains a guard for this, because a guard is a thing to get wrong on one
-route. The authority an anonymous administrator holds on that bind is the whole surface —
-reads, and ``document_create`` over both MCP and ``POST /api/v1/documents`` — because authoring
-over a network is the capability the flag exists to serve. It is a decision about exposure, made
-by a person with the flag's name in their shell history, announced at startup naming the corpus
-and reported by ``manicule doctor`` for as long as it holds.
+route to the port. **Nothing here bounds that, and the honest thing is to say so rather than to
+imply a mitigation.** No route gains a guard for it — a guard is a thing to get wrong on one
+route — and the surface does not shrink either: the authority an anonymous administrator holds on
+that bind is the whole of it, reads and ``document_create`` over both MCP and
+``POST /api/v1/documents``, because authoring over a network is the capability the flag exists to
+serve.
+
+What stands in its place is not a check but a person. The flag is argv, so no configuration file
+can reach it; it is announced at startup naming the corpus that becomes writable; and
+``manicule doctor`` reports it as a failing finding for as long as it holds. The operator is
+asserting that the network in front of this process is one they own, and manicule cannot verify
+that any more than it can verify ``--allow-public-bind``.
 """
 
 from __future__ import annotations
