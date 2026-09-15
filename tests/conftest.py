@@ -10,9 +10,11 @@ which is a manicule-internal concern rather than something a plugin author needs
 
 from __future__ import annotations
 
+import gc
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -169,3 +171,64 @@ def color_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in CLEARED_TERMINAL_VARIABLES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TERM", BASELINE_TERM)
+
+
+_LEAKED_CONNECTIONS: dict[int, tuple[str, str]] = {}
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Record where every ``aiosqlite`` connection was opened, so a leaked one names itself.
+
+    ``aiosqlite.Connection.__del__`` warns when a connection is collected unclosed, and
+    ``filterwarnings = ["error"]`` turns that into a failure. But it is raised *inside*
+    ``__del__``, where it cannot propagate, so pytest reports it as a
+    ``PytestUnraisableExceptionWarning`` against whichever test happened to be running when the
+    collector fired. That test is a bystander. On 2026-09-14 the blame landed on
+    ``tests/web/test_escaping.py``, which opens no database at all, and the real leak stayed
+    hidden through three separate hunts.
+
+    So two things happen here. ``pytest_runtest_teardown`` forces a collection after every test,
+    which moves the warning onto the test that actually leaked; and this hook remembers the
+    stack each connection was opened from, so the report names the *line* rather than the test.
+    """
+    import traceback  # noqa: PLC0415
+
+    import aiosqlite  # noqa: PLC0415
+
+    del config
+    opened = aiosqlite.Connection.__init__
+    closed = aiosqlite.Connection.close
+
+    def remember(self: Any, *args: Any, **kwargs: Any) -> None:
+        opened(self, *args, **kwargs)
+        _LEAKED_CONNECTIONS[id(self)] = (
+            os.environ.get("PYTEST_CURRENT_TEST", "<no test>"),
+            "".join(traceback.format_stack()[-12:-1]),
+        )
+
+    async def forget(self: Any, *args: Any, **kwargs: Any) -> Any:
+        _LEAKED_CONNECTIONS.pop(id(self), None)
+        return await closed(self, *args, **kwargs)
+
+    aiosqlite.Connection.__init__ = remember
+    aiosqlite.Connection.close = forget
+
+
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> None:
+    """Collect now, so an unclosed handle is attributed to the test that opened it.
+
+    Without this the warning surfaces whenever the collector next runs, which is somebody
+    else's test — see :func:`pytest_configure`.
+    """
+    del item, nextitem
+    gc.collect()
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Name every connection still open, with the line that opened it."""
+    del session, exitstatus
+    if not _LEAKED_CONNECTIONS:
+        return
+    print(f"\n=== {len(_LEAKED_CONNECTIONS)} unclosed aiosqlite connection(s) ===")  # noqa: T201
+    for test, stack in list(_LEAKED_CONNECTIONS.values())[:5]:
+        print(f"\n--- opened during {test}\n{stack}")  # noqa: T201

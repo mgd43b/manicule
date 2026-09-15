@@ -472,9 +472,18 @@ async def _migrate_connector(  # noqa: PLR0912, PLR0915 - resumable lifecycle di
         raise RuntimeError(msg)
     lease_lost = asyncio.Event()
 
+    interval = LEASE_DURATION.total_seconds() / 3
+    # A busy writer costs a fraction of an opportunity rather than a whole one. Retrying after
+    # a full `interval` was the bug: three renewals fit in a lease, so one busy round left two —
+    # and on a loaded runner two late wake-ups then expired a lease nobody had taken. Waiting
+    # out a lock that is typically held for milliseconds is also simply the wrong response to it.
+    busy_retry = interval / 10
+
     async def heartbeat() -> None:
+        delay = interval
         while True:
-            await asyncio.sleep(LEASE_DURATION.total_seconds() / 3)
+            await asyncio.sleep(delay)
+            delay = interval
             heartbeat_at = utcnow()
             try:
                 renewed = await store.renew_acquisition_lease(
@@ -485,9 +494,11 @@ async def _migrate_connector(  # noqa: PLR0912, PLR0915 - resumable lifecycle di
                     expires_at=heartbeat_at + LEASE_DURATION,
                 )
             except StorageBusyError:
-                # A different connection can briefly own SQLite's writer lock. With three
-                # renewal opportunities per lease, one busy round is not evidence of takeover;
-                # the next fenced journal operation remains authoritative.
+                # A different connection can briefly own SQLite's writer lock. That is not
+                # evidence of takeover, so the renewal is retried promptly rather than deferred
+                # to the next opportunity; the next fenced journal operation remains
+                # authoritative either way.
+                delay = busy_retry
                 continue
             except Exception:
                 lease_lost.set()
