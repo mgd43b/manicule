@@ -1397,6 +1397,13 @@ class ApplicationService:
         narrowing it to the documents this run touched would exclude the ones it skipped as
         unchanged — which are in exactly the same collections, and are most of a routine sync.
 
+        **``ValidationError`` is in the caught set, and it is the one that is not obvious.**
+        Counting reads every stored rule through ``CollectionRule.model_validate``, which is
+        deliberate — a hand-edited ``auto_rules`` row fails where it is read rather than quietly
+        selecting a different set — and the model forbids unknown fields, so a rule written by a
+        newer manicule raises here on an older one. Raising out of a *read* is right; raising out
+        of a completed sync, and taking its result with it, is not.
+
         **The two counts are two statements, so the pair is reconciled rather than subtracted
         blind.** Nothing holds a lock across them — this is a diagnostic, and taking one to
         make a diagnostic consistent would be the tail wagging the dog — so a document deleted
@@ -1417,7 +1424,7 @@ class ApplicationService:
             documents = await self._backend.documents()
             uncollected = await store.count_uncollected(source=source)
             total = await documents.count_documents(source=source)
-        except (ManiculeError, SQLAlchemyError, OSError):
+        except (ManiculeError, SQLAlchemyError, OSError, ValidationError):
             _log.warning("collection membership could not be counted for %r", source)
             return None
         held = min(uncollected, total)
@@ -5258,7 +5265,19 @@ class ApplicationService:
         return r.ExportReport(path=str(_local(target)), documents=documents, chunks=chunks)
 
     async def import_corpus(self, source: Path | str, *, force: bool = False) -> r.IngestReport:
-        """Ingest an exported archive, re-deriving chunks and vectors here."""
+        """Ingest an exported archive, re-deriving chunks and vectors here.
+
+        **Collection placement is left unmeasured here, and that is the honest answer rather
+        than a gap.** ``connector`` on an import is the literal string ``"import"`` — a label
+        for the run — while every entry is ingested under the source the archive recorded for
+        it, and an archive may carry several. Counting ``source = "import"`` would match no
+        document at all and report ``0`` in no collection, which is the *healthy* answer to a
+        question that was never asked: exactly the confident zero ``None`` exists to keep out
+        of this field. A per-source total would mean threading the manifest's source set out
+        through the ingest port, and the question an operator has after restoring an archive is
+        about the workspace rather than about one of its sources — which is what ``doctor``'s
+        ``collection-membership`` check answers, over all of it.
+        """
         started = time.monotonic()
         path = _local(source)
         if not await asyncio.to_thread(path.exists):
@@ -5266,9 +5285,7 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         ingestion = await self._backend.ingestion()
         imported = await ingestion.import_archive(path, force=force)
-        payload = _with_placement(
-            _ingest_payload(imported, started), await self._placement(imported.connector)
-        )
+        payload = _ingest_payload(imported, started)
         if (
             payload.retry_required
             and payload.incomplete_reason is not None

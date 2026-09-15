@@ -1890,7 +1890,10 @@ class IngestReport(Payload):
 
     ``None`` for both means *not measured*, kept distinct from ``0`` for the usual reason: zero
     documents in no collection is the healthy answer, and a path that never asked must not be
-    able to report it.
+    able to report it. ``import`` is always ``None`` here, and is the case that makes the
+    distinction earn its keep: ``connector`` on an import is the literal string ``"import"``, a
+    label for the run, while every entry is filed under the source the archive recorded for it.
+    Counting that label would match no document and report a confident zero.
     """
 
     connector: str

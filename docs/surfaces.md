@@ -774,7 +774,12 @@ and not a durable fact: a rule changed five minutes later moves them, exactly as
 
 `null` for both means *not measured* — kept distinct from `0`, because zero documents in no
 collection is the healthy answer and a path that never asked must not be able to report it.
-`doctor`'s `collection-membership` check (§5) asks the same question of the whole workspace.
+`import` always reports `null`, and is the case that makes the distinction earn its keep:
+`connector` on an import is the literal string `import`, a label for the run, while every entry
+is filed under the source the archive recorded for it and one archive may carry several — so
+counting that label would match no document and report a confident zero. `doctor`'s
+`collection-membership` check (§5) asks the same question of the whole workspace, which is the
+granularity a restored archive actually raises.
 
 `outcome` is the automation contract:
 

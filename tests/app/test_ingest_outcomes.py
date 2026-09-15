@@ -8,6 +8,7 @@ import threading
 from typing import TYPE_CHECKING, Any, Never, cast, override
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from manicule.api.envelopes import SERVICE_UNAVAILABLE, status_for
@@ -883,3 +884,59 @@ async def test_a_delete_racing_the_two_counts_does_not_fail_the_run_it_describes
     assert payload.outcome == "complete"
     assert payload.collected == 0
     assert payload.uncollected == 2, "the pair was not reconciled against the total it came with"
+
+
+async def test_an_import_leaves_collection_placement_unmeasured(tmp_path: Path) -> None:
+    """`connector` on an import is a run label, not a source, and zero would be a lie.
+
+    Every entry is ingested under the source the archive recorded for it, and an archive may
+    carry several; nothing is ever filed under `"import"`. Counting that name matches no
+    document and reports `0` in no collection — the *healthy* answer to a question never asked,
+    which is the confident zero `None` exists to keep out of this field.
+    """
+    service, backend = _service(
+        RunReport(connector="import", discovered=2, by_status={"indexed": 2})
+    )
+    for index in range(2):
+        document = backend.store.add(
+            make_document(backend.workspace, source="confluence", source_id=f"page-{index}.md")
+        )
+        backend.organization_.documents[document.id] = document
+    archive = tmp_path / "corpus.tar.gz"
+    archive.write_bytes(b"not read by the fake")
+
+    payload = await service.import_corpus(archive)
+
+    assert payload.ingested == 2
+    assert payload.collected is None, (
+        "an import reported a placement count for a source nothing uses"
+    )
+    assert payload.uncollected is None
+
+
+async def test_a_rule_this_build_cannot_read_does_not_fail_the_sync_it_describes() -> None:
+    """`CollectionRule` forbids unknown fields, so a newer manicule's rule raises on an older one.
+
+    Counting reads every stored rule through `model_validate`, deliberately — a hand-edited
+    `auto_rules` row should fail where it is read rather than quietly select a different set.
+    Raising out of a read is right; raising out of a completed sync, and taking the result of
+    an ingest that already happened with it, is not.
+    """
+    service, backend = _service(_clean())
+    document = backend.store.add(
+        make_document(backend.workspace, source="synthetic-wiki", source_id="page.md")
+    )
+    backend.organization_.documents[document.id] = document
+
+    async def refuse(*, source: str | None = None) -> Never:
+        del source
+        raise ValidationError.from_exception_data("CollectionRule", [])
+
+    backend.organization_.count_uncollected = refuse
+
+    payload = await service.connector_sync("synthetic-wiki")
+
+    assert payload.outcome == "complete", "a rule this build cannot read failed the run"
+    assert payload.ingested == 3
+    assert payload.collected is None
+    assert payload.uncollected is None
