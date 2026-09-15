@@ -1533,6 +1533,11 @@ def render_rebuild_plan(out: Console, payload: r.RebuildPlanReport) -> None:
         f"network required: {'yes' if payload.network_required else 'no'}"
     )
     out.print(
+        f"source inventory coverage: {payload.covered_documents} of "
+        f"{payload.live_documents} live document(s); "
+        f"not covered: {payload.uncovered_documents}"
+    )
+    out.print(
         f"current chunk identity: {escape(payload.current_chunk_fingerprint or 'unrecorded')}"
     )
     out.print(f"target chunk identity: {escape(payload.target_chunk_fingerprint)}")

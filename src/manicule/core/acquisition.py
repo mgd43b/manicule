@@ -66,6 +66,22 @@ class SnapshotCompleteness(StrEnum):
     PARTIAL = "partial"
 
 
+class SnapshotMembership(StrEnum):
+    """Whether a promoted manifest names a scope's whole membership or only what changed.
+
+    A separate question from :class:`SnapshotCompleteness`, which is about bytes. A
+    one-document incremental manifest whose single body was retained is ``COMPLETE`` and
+    still proves nothing about the documents the connector holds and did not re-enumerate.
+    Collapsing the two is what lets a delta be mistaken for deletion authority.
+    """
+
+    FULL_INVENTORY = "full_inventory"
+    """The enumeration walked the scope from nothing, so its members are the whole scope."""
+
+    INCREMENTAL = "incremental"
+    """The enumeration resumed from a committed cursor, so its members are a delta."""
+
+
 class SnapshotItemOutcome(StrEnum):
     """Immutable byte-coverage result for one deterministic manifest member."""
 
@@ -261,6 +277,7 @@ class AcquisitionRun(BaseModel):
     scope_fingerprint: str = ""
     full_inventory_authority: str = ""
     scope_inventory_complete: bool = True
+    enumeration_membership: SnapshotMembership = SnapshotMembership.FULL_INVENTORY
     promotion_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE
     state: AcquisitionRunState
     base_watermark: Watermark | None = None
@@ -344,6 +361,7 @@ __all__ = [
     "AcquisitionStage",
     "SnapshotCompleteness",
     "SnapshotItemOutcome",
+    "SnapshotMembership",
     "SnapshotPromotionPolicy",
     "UnsetValue",
 ]

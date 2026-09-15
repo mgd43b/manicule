@@ -10,9 +10,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import delete, func, literal, select, text, update
+from sqlalchemy import delete, exists, false, func, literal, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import aliased
 
 from manicule.core.acquisition import (
     AcquiredSource,
@@ -20,6 +21,7 @@ from manicule.core.acquisition import (
     AcquisitionSource,
     SnapshotCompleteness,
     SnapshotItemOutcome,
+    SnapshotMembership,
     SnapshotPromotionPolicy,
 )
 from manicule.core.errors import ManiculeError, VectorStoreStateError
@@ -78,6 +80,8 @@ if TYPE_CHECKING:
 
     from sqlalchemy import CursorResult
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+    from sqlalchemy.orm import InstrumentedAttribute
+    from sqlalchemy.sql.elements import ColumnElement
 
     from manicule.core.content import Chunk, Document
 
@@ -98,6 +102,66 @@ This mirrors the vector store's fixed ``IDENTITY_QUERY_PAGE`` bound without coup
 storage protocol to its concrete implementation.  A relational evidence page can span many
 documents, but its vector proof must remain a bounded ``IN`` query.
 """
+
+
+_INVENTORY_CHAIN_LIMIT = 256
+"""Promoted runs one connector may contribute to a single replacement generation.
+
+A chain exists only to reach back from an incremental manifest to the full inventory that
+accounts for the documents it did not re-enumerate, and every link is a promoted run whose
+records and retained bytes are still held. A corpus that has accumulated more deltas than this
+without a single full enumeration has a re-enumeration problem, not a rebuild problem, and
+walking further would turn planning into an unbounded read of acquisition history.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceInventory:
+    """One connector's ordered contributing runs, newest first.
+
+    The walk behind the newest run stops at the first full inventory, and stops early at a link
+    that does not connect. Either way the result is just a set of runs: how much of the
+    connector it accounts for is then measured against the live corpus rather than asserted,
+    so a chain that came up short is caught by the same check as one that was never walked.
+    """
+
+    connector: str
+    runs: tuple[models.AcquisitionRun, ...]
+
+    @property
+    def authoritative(self) -> bool:
+        """Whether the newest run is itself a full enumeration, and so deletion authority.
+
+        A delta cannot express a removal — a source that disappears simply stops being
+        enumerated — so a chain led by one proves what still exists and nothing whatever about
+        what stopped existing. This is the only thing that makes a live document the runs do
+        not name explicable rather than alarming.
+        """
+        if not self.runs:
+            return False
+        newest = self.runs[0]
+        # The same pair of conditions publication applies before it retires anything, so a plan
+        # cannot proceed on the expectation that publication will retire a document it will in
+        # fact leave in place and stale. A run promoted with omissions is `PARTIAL`, and a
+        # snapshot that could not fetch a body is not evidence the source no longer has it.
+        return (
+            newest.enumeration_membership is SnapshotMembership.FULL_INVENTORY
+            and newest.completeness is not None
+            and SnapshotCompleteness(newest.completeness) is SnapshotCompleteness.COMPLETE
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotBinding:
+    """One promoted run bound into a generation, and what it owes that generation."""
+
+    run: AcquisitionRun
+
+    retained: int
+    """Retained members of this run's own manifest, which is what settlement proves."""
+
+    contributed: int
+    """Retained members this run is the newest bound run to name, which is what it builds."""
 
 
 class BlobInventory(Protocol):
@@ -278,6 +342,24 @@ def _staging_publication(row: models.DerivedGeneration) -> str | None:
     return row.replay_target_publication_id if replay_bound else lease_publication
 
 
+def _binding_predecessors(
+    snapshots: Sequence[models.DerivedGenerationSnapshot],
+) -> dict[str, tuple[str, ...]]:
+    """Run ids bound ahead of each binding for the same connector, newest first.
+
+    Bindings are stored in ordinal order and a connector's newest run is bound first, so a
+    single pass is enough. This is the persisted form of the ordering planning used, which is
+    what keeps "which run owns this document" the same answer at build and publication time.
+    """
+    bound: dict[str, list[str]] = {}
+    newer: dict[str, tuple[str, ...]] = {}
+    for snapshot in snapshots:
+        seen = bound.setdefault(snapshot.connector_name, [])
+        newer[snapshot.run_id] = tuple(seen)
+        seen.append(snapshot.run_id)
+    return newer
+
+
 def _checkpoint(
     row: models.DerivedGeneration, *, predecessor_vector_publication_id: str | None = None
 ) -> RebuildCheckpoint:
@@ -420,72 +502,120 @@ class SqliteRebuildStore(WorkspaceScoped):
             )
         async with self._sessions() as session:
             latest_rows = await self._latest_promoted_runs(session)
+            inventories = await self._source_inventories(session)
         if snapshot_run_id not in {row.id for row in latest_rows}:
             return self._refused_estimate(
                 snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
             )
-        runs: list[AcquisitionRun] = []
-        for row in latest_rows:
-            candidate = await self._acquisition.get_acquisition_run(row.id)
-            if (
-                candidate is None
-                or candidate.promoted_at is None
-                or not candidate.membership_hash
-                or not await self._acquisition.verify_snapshot_manifest(row.id)
-            ):
-                return self._refused_estimate(
-                    snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
-                )
-            runs.append(candidate)
+        runs: dict[str, AcquisitionRun] = {}
+        for inventory in inventories:
+            for row in inventory.runs:
+                candidate = await self._acquisition.get_acquisition_run(row.id)
+                if (
+                    candidate is None
+                    or candidate.promoted_at is None
+                    or not candidate.membership_hash
+                    or not await self._acquisition.verify_snapshot_manifest(row.id)
+                ):
+                    return self._refused_estimate(
+                        snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
+                    )
+                runs[row.id] = candidate
         missing: list[MissingSnapshotInput] = []
         missing_count = 0
         documents = 0
         known_bytes = 0
         largest_input = 0
-        snapshot_bindings: list[tuple[AcquisitionRun, int]] = []
+        snapshot_bindings: list[_SnapshotBinding] = []
         global_sequence = 0
-        for run in runs:
-            manifest_items = 0
-            retained_items = 0
-            async for record in self._acquisition.iter_acquisition_records(run.id):
-                if record.sequence != manifest_items:
+        live_documents = 0
+        covered_documents = 0
+        uncovered_documents = 0
+        for inventory in inventories:
+            for ordinal, row in enumerate(inventory.runs):
+                run = runs[row.id]
+                run_base = global_sequence
+                manifest_items = 0
+                retained_items = 0
+                # One pass to prove the manifest is intact and dense, a second to price only
+                # what this run owes the generation. Separate because they answer about
+                # different sets: integrity is about the run's own immutable manifest, and a
+                # run behind the newest one owes only the documents no later run re-enumerated.
+                async for record in self._acquisition.iter_acquisition_records(run.id):
+                    if record.sequence != manifest_items:
+                        return self._refused_estimate(
+                            snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
+                        )
+                    manifest_items += 1
+                    if record.blob_ref is not None and record.acquired_source is not None:
+                        retained_items += 1
+                global_sequence = run_base + manifest_items
+                if manifest_items != run.discovered_count:
                     return self._refused_estimate(
                         snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
                     )
-                manifest_items += 1
-                if (
-                    record.blob_ref is None
-                    or record.acquired_source is None
-                    or not await self._blobs.contains(record.blob_ref)
-                ):
-                    if (
-                        run.promotion_policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS
-                        and record.snapshot_outcome is SnapshotItemOutcome.OMITTED
-                        and record.blob_ref is None
-                        and record.acquired_source is None
-                    ):
-                        continue
-                    missing_count += 1
-                    if len(missing) < missing_limit:
-                        missing.append(MissingSnapshotInput(sequence=global_sequence))
-                else:
-                    retained_items += 1
-                    documents += 1
-                    known_bytes += record.acquired_source.byte_length
-                    largest_input = max(largest_input, record.acquired_source.byte_length)
-                global_sequence += 1
-            if manifest_items != run.discovered_count:
-                return self._refused_estimate(
-                    snapshot_run_id, target, RebuildRefusalCode.SNAPSHOT_CHANGED
+                contributed = 0
+                async with self._sessions() as session:
+                    owed = self._contributed_records(
+                        session,
+                        connector=inventory.connector,
+                        run_id=run.id,
+                        newer_run_ids=tuple(newer.id for newer in inventory.runs[:ordinal]),
+                    )
+                    async for sequence, blob_ref, acquired, outcome in owed:
+                        if (
+                            blob_ref is None
+                            or acquired is None
+                            or not await self._blobs.contains(blob_ref)
+                        ):
+                            if (
+                                run.promotion_policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS
+                                and outcome is SnapshotItemOutcome.OMITTED
+                                and blob_ref is None
+                                and acquired is None
+                            ):
+                                continue
+                            missing_count += 1
+                            if len(missing) < missing_limit:
+                                missing.append(MissingSnapshotInput(sequence=run_base + sequence))
+                            continue
+                        contributed += 1
+                        documents += 1
+                        known_bytes += acquired.byte_length
+                        largest_input = max(largest_input, acquired.byte_length)
+                snapshot_bindings.append(
+                    _SnapshotBinding(run=run, retained=retained_items, contributed=contributed)
                 )
-            snapshot_bindings.append((run, retained_items))
+            async with self._sessions() as session:
+                live, covered, pending = await self._membership_coverage(session, inventory)
+            live_documents += live
+            covered_documents += covered
+            uncovered_documents += live - covered
+            # A live document that is neither rebuildable nor a sanctioned pending omission has
+            # only one innocent explanation: the connector's newest run enumerated its whole
+            # membership and did not find it, so it is gone at the source and publication will
+            # retire it. Without that, the replacement can neither rebuild the document nor
+            # justify removing it, and publishing anyway would either strand it at the old
+            # derived identity or delete it on no evidence.
+            if live != covered + pending and not inventory.authoritative:
+                return self._refused_estimate(
+                    snapshot_run_id,
+                    target,
+                    RebuildRefusalCode.INCOMPLETE_SOURCE_INVENTORY,
+                    live_documents=live_documents,
+                    covered_documents=covered_documents,
+                    uncovered_documents=uncovered_documents,
+                )
 
         combined_membership = hashlib.sha256(
             _canonical(
-                [[run.id, run.membership_hash, retained] for run, retained in snapshot_bindings]
+                [
+                    [binding.run.id, binding.run.membership_hash, binding.retained]
+                    for binding in snapshot_bindings
+                ]
             )
         ).hexdigest()
-        run_ids = tuple(run.id for run, _ in snapshot_bindings)
+        run_ids = tuple(binding.run.id for binding in snapshot_bindings)
         canonical_run_id = run_ids[0]
 
         target_json = target.model_dump(mode="json")
@@ -529,6 +659,9 @@ class SqliteRebuildStore(WorkspaceScoped):
                 max_stored_chunk_tokens=max_stored_chunk_tokens,
                 estimated_embedding_chunks=estimated_chunks,
                 network_required=False,
+                live_documents=live_documents,
+                covered_documents=covered_documents,
+                uncovered_documents=uncovered_documents,
             )
 
         if not persist:
@@ -667,7 +800,8 @@ class SqliteRebuildStore(WorkspaceScoped):
                         ]
                     )
                 )
-                for ordinal, (bound_run, retained) in enumerate(snapshot_bindings):
+                for ordinal, binding in enumerate(snapshot_bindings):
+                    bound_run = binding.run
                     await session.execute(
                         sqlite_insert(models.DerivedGenerationSnapshot)
                         .values(
@@ -677,7 +811,8 @@ class SqliteRebuildStore(WorkspaceScoped):
                             connector_name=bound_run.connector,
                             scope_fingerprint=bound_run.scope_fingerprint,
                             membership_hash=bound_run.membership_hash,
-                            expected_item_count=retained,
+                            expected_item_count=binding.retained,
+                            contributed_item_count=binding.contributed,
                         )
                         .on_conflict_do_nothing(
                             index_elements=[
@@ -691,13 +826,14 @@ class SqliteRebuildStore(WorkspaceScoped):
             expected_bindings = [
                 (
                     ordinal,
-                    bound_run.id,
-                    bound_run.connector,
-                    bound_run.scope_fingerprint,
-                    bound_run.membership_hash,
-                    retained,
+                    binding.run.id,
+                    binding.run.connector,
+                    binding.run.scope_fingerprint,
+                    binding.run.membership_hash,
+                    binding.retained,
+                    binding.contributed,
                 )
-                for ordinal, (bound_run, retained) in enumerate(snapshot_bindings)
+                for ordinal, binding in enumerate(snapshot_bindings)
             ]
             if (
                 generation.snapshot_membership_hash != combined_membership
@@ -710,6 +846,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                         binding.scope_fingerprint,
                         binding.membership_hash,
                         binding.expected_item_count,
+                        binding.contributed_item_count,
                     )
                     for binding in persisted_bindings
                 ]
@@ -784,6 +921,10 @@ class SqliteRebuildStore(WorkspaceScoped):
         snapshot_run_id: str,
         target: RebuildTarget,
         code: RebuildRefusalCode,
+        *,
+        live_documents: int = 0,
+        covered_documents: int = 0,
+        uncovered_documents: int = 0,
     ) -> RebuildEstimate:
         target_digest = hashlib.sha256(_canonical(target.model_dump(mode="json"))).hexdigest()
         return RebuildEstimate(
@@ -800,6 +941,9 @@ class SqliteRebuildStore(WorkspaceScoped):
             refusal=code,
             target_chunk_fingerprint=target.chunk_fingerprint,
             network_required=False,
+            live_documents=live_documents,
+            covered_documents=covered_documents,
+            uncovered_documents=uncovered_documents,
         )
 
     async def checkpoint(self, generation_id: str) -> RebuildCheckpoint:
@@ -1201,11 +1345,13 @@ class SqliteRebuildStore(WorkspaceScoped):
             ):
                 raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
             skip = after_sequence + 1
+            predecessors = _binding_predecessors(snapshots)
             result: list[SnapshotRebuildInput] = []
             for snapshot in snapshots:
-                if skip >= snapshot.expected_item_count:
-                    skip -= snapshot.expected_item_count
+                if skip >= snapshot.contributed_item_count:
+                    skip -= snapshot.contributed_item_count
                     continue
+                newer_run_ids = predecessors[snapshot.run_id]
                 ranked = (
                     select(
                         models.AcquisitionRecord.id.label("record_id"),
@@ -1218,6 +1364,11 @@ class SqliteRebuildStore(WorkspaceScoped):
                         models.AcquisitionRecord.workspace_id == self._workspace_id,
                         models.AcquisitionRecord.blob_ref.is_not(None),
                         models.AcquisitionRecord.acquired_source.is_not(None),
+                        self._contributes(
+                            connector=snapshot.connector_name,
+                            newer_run_ids=newer_run_ids,
+                            require_live=bool(newer_run_ids),
+                        ),
                     )
                     .subquery()
                 )
@@ -1690,7 +1841,15 @@ class SqliteRebuildStore(WorkspaceScoped):
                 raise RebuildPublicationValidationError
 
             connectors = {snapshot.connector_name for snapshot in snapshots}
-            complete_connectors = {
+            # Two independent conditions, and both are required before a publication may
+            # retire a document it did not replace. Byte completeness says the bodies of the
+            # members the run enumerated are all held locally. Full inventory says the run
+            # enumerated the connector's whole membership in the first place — a delta names
+            # what changed, and a source that is removed simply stops being named, so nothing
+            # about a delta distinguishes "gone" from "unchanged". Treating the first as if it
+            # implied the second is what let a one-document incremental replacement
+            # soft-delete every other document its connector held.
+            authoritative_connectors = {
                 connector
                 for connector in connectors
                 if all(
@@ -1699,11 +1858,13 @@ class SqliteRebuildStore(WorkspaceScoped):
                         snapshot_runs[snapshot.run_id].completeness is not None
                         and SnapshotCompleteness(snapshot_runs[snapshot.run_id].completeness)
                         is SnapshotCompleteness.COMPLETE
+                        and snapshot_runs[snapshot.run_id].enumeration_membership
+                        is SnapshotMembership.FULL_INVENTORY
                     )
                     for snapshot in snapshots
                 )
             }
-            for connector in complete_connectors:
+            for connector in authoritative_connectors:
                 await session.execute(
                     update(models.Document)
                     .where(
@@ -1887,6 +2048,283 @@ class SqliteRebuildStore(WorkspaceScoped):
             ).scalars()
         )
 
+    async def _source_inventories(self, session: AsyncSession) -> list[_SourceInventory]:
+        """Every connector's contributing runs, newest first, ordered by connector name.
+
+        The newest promoted run per connector is where a replacement starts, but it is only
+        where it *ends* when that run enumerated the whole scope. An incremental manifest
+        names what changed, so the runs before it are what account for everything else.
+        """
+        return [
+            await self._inventory_chain(session, latest)
+            for latest in await self._latest_promoted_runs(session)
+        ]
+
+    async def _inventory_chain(
+        self, session: AsyncSession, latest: models.AcquisitionRun
+    ) -> _SourceInventory:
+        """Walk back from one connector's newest promoted run to the full inventory behind it.
+
+        Re-walked on every scope check rather than cached, including the one each durable
+        replay page performs. That is deliberate. The links themselves are immutable — a
+        promoted run's cursors and scope never change again — but *which* runs are promoted and
+        unsuperseded does, and that is precisely what the check exists to notice. A chain
+        remembered for the length of an operation would answer with the membership the
+        workspace had when the operation started, which is the class of stale proof this whole
+        module is built to refuse.
+
+        The cost is bounded and, for the common shape, absent: a connector whose newest run is
+        a full inventory never enters the loop and issues no query at all. It is one query per
+        link beyond the first, and `_INVENTORY_CHAIN_LIMIT` caps that.
+        """
+        chain = [latest]
+        while (
+            chain[-1].enumeration_membership is not SnapshotMembership.FULL_INVENTORY
+            and len(chain) < _INVENTORY_CHAIN_LIMIT
+        ):
+            older = await self._preceding_promoted_run(session, chain[-1])
+            if older is None:
+                break
+            chain.append(older)
+        return _SourceInventory(latest.connector_name, tuple(chain))
+
+    async def _preceding_promoted_run(
+        self, session: AsyncSession, run: models.AcquisitionRun
+    ) -> models.AcquisitionRun | None:
+        """The promoted run this one resumed from, or ``None`` if the cursor does not link.
+
+        Continuity is the run's own inherited cursor, not adjacency in time: the predecessor
+        is the promoted run whose ``candidate_watermark`` is exactly the watermark this run
+        started from, in the same scope. Anything else — a cursor committed for a different
+        scope, a predecessor whose inventory was invalidated by a source deletion, a gap left
+        by history cleanup — is a chain that does not connect, and an unproven chain refuses.
+        """
+        if run.base_watermark is None or run.base_watermark_scope_fingerprint != (
+            run.scope_fingerprint
+        ):
+            return None
+        candidates = (
+            await session.execute(
+                select(models.AcquisitionRun)
+                .where(
+                    models.AcquisitionRun.workspace_id == self._workspace_id,
+                    models.AcquisitionRun.connector_id == run.connector_id,
+                    models.AcquisitionRun.scope_fingerprint == run.scope_fingerprint,
+                    models.AcquisitionRun.id != run.id,
+                    models.AcquisitionRun.promoted_at.is_not(None),
+                    models.AcquisitionRun.superseded_at.is_(None),
+                    models.AcquisitionRun.membership_hash.is_not(None),
+                    models.AcquisitionRun.candidate_watermark == run.base_watermark,
+                    models.AcquisitionRun.inventory_state
+                    != models.AcquisitionInventoryState.REENUMERATION_REQUIRED,
+                )
+                .order_by(
+                    models.AcquisitionRun.promoted_at.desc(),
+                    models.AcquisitionRun.created_at.desc(),
+                    models.AcquisitionRun.id.desc(),
+                )
+                .limit(2)
+            )
+        ).scalars()
+        linked = list(candidates)
+        # Two runs claiming the same committed cursor is an ambiguous history, and picking the
+        # newer of them would be a guess about which one the corpus was actually built from.
+        return linked[0] if len(linked) == 1 else None
+
+    def _contributes(
+        self,
+        *,
+        connector: str,
+        newer_run_ids: Sequence[str],
+        require_live: bool,
+        source_id: InstrumentedAttribute[str] | None = None,
+    ) -> ColumnElement[bool]:
+        """Predicate selecting the records one bound run owes a generation.
+
+        Two conditions, and the second is what keeps a rebuild from resurrecting anything. A
+        document named by more than one bound run is built once, from the newest run that
+        named it, because that run holds its current bytes. And a run older than the newest is
+        drawn on only for documents that are still live: its manifest is being read to cover
+        what a later delta had no reason to mention, not to reinstate what has since been
+        removed from the corpus.
+
+        ``source_id`` names the column to own, defaulting to the record table's own. Coverage
+        passes an alias's column so that it asks this exact question rather than a weaker one
+        of its own; the two disagreeing is how a document came to be reported covered by a run
+        that no longer owned it.
+        """
+        owned = models.AcquisitionRecord.source_id if source_id is None else source_id
+        superseding = aliased(models.AcquisitionRecord)
+        live = aliased(models.Document)
+        predicate = ~exists(
+            select(literal(1)).where(
+                superseding.run_id.in_(tuple(newer_run_ids)),
+                superseding.workspace_id == self._workspace_id,
+                superseding.source_id == owned,
+            )
+        )
+        if not require_live:
+            return predicate
+        return predicate & exists(
+            select(literal(1)).where(
+                live.workspace_id == self._workspace_id,
+                live.source == connector,
+                live.source_id == owned,
+                live.deleted_at.is_(None),
+            )
+        )
+
+    async def _contributed_records(
+        self,
+        session: AsyncSession,
+        *,
+        connector: str,
+        run_id: str,
+        newer_run_ids: Sequence[str],
+    ) -> AsyncIterator[tuple[int, str | None, AcquiredSource | None, SnapshotItemOutcome | None]]:
+        """Stream the members one bound run owes this generation, in manifest order.
+
+        Streamed rather than collected: a manifest is as large as the corpus. Members with no
+        retained evidence are yielded too — whether an evidence-less member is a legitimate
+        omission or a missing local input is a promotion-policy question the caller settles,
+        and skipping them here would quietly turn the second answer into the first.
+        """
+        rows = await session.stream(
+            select(
+                models.AcquisitionRecord.sequence,
+                models.AcquisitionRecord.blob_ref,
+                models.AcquisitionRecord.acquired_source,
+                models.AcquisitionRecord.snapshot_outcome,
+            )
+            .where(
+                models.AcquisitionRecord.run_id == run_id,
+                models.AcquisitionRecord.workspace_id == self._workspace_id,
+                self._contributes(
+                    connector=connector,
+                    newer_run_ids=newer_run_ids,
+                    require_live=bool(newer_run_ids),
+                ),
+            )
+            .order_by(models.AcquisitionRecord.sequence)
+            .execution_options(yield_per=_INVENTORY_PAGE)
+        )
+        async for sequence, blob_ref, acquired, outcome in rows:
+            yield (
+                int(sequence),
+                None if blob_ref is None else str(blob_ref),
+                None if acquired is None else AcquiredSource.model_validate(acquired),
+                None if outcome is None else SnapshotItemOutcome(outcome),
+            )
+
+    async def _contribution_filter(
+        self, session: AsyncSession, generation_id: str
+    ) -> ColumnElement[bool]:
+        """Planning's ownership rule, as a predicate over a binding-joined record query.
+
+        Every read that walks a generation's evidence has to agree about which bound run owns
+        each document, or the counts stop matching each other: the header verifies one number,
+        the evidence fence hashes a different set, and the disagreement surfaces as a snapshot
+        conflict nobody can act on. One predicate, applied everywhere, is what keeps them the
+        same answer.
+        """
+        bindings = await self._generation_snapshot_rows(session, generation_id)
+        predecessors = _binding_predecessors(bindings)
+        clauses = [
+            (models.AcquisitionRecord.run_id == binding.run_id)
+            & self._contributes(
+                connector=binding.connector_name,
+                newer_run_ids=predecessors[binding.run_id],
+                require_live=bool(predecessors[binding.run_id]),
+            )
+            for binding in bindings
+        ]
+        return or_(*clauses) if clauses else cast("ColumnElement[bool]", literal(False))
+
+    async def _membership_coverage(
+        self, session: AsyncSession, inventory: _SourceInventory
+    ) -> tuple[int, int, int]:
+        """Live documents this connector holds, how many are rebuildable, how many are pending.
+
+        Aggregates only. "Which documents would be lost" is a list of source ids by another
+        name, and this number reaches every automation surface.
+        """
+        retained = aliased(models.AcquisitionRecord)
+        live = (
+            models.Document.workspace_id == self._workspace_id,
+            models.Document.source == inventory.connector,
+            models.Document.deleted_at.is_(None),
+        )
+
+        def owned_by(
+            ordinal: int,
+            run: models.AcquisitionRun,
+            *extra: ColumnElement[bool],
+        ) -> ColumnElement[bool]:
+            # Ownership, not mere presence: the record that *owns* this document is the one a
+            # replacement would be built from. Asking the weaker "does any record in the chain
+            # retain it" let a superseded run answer for a newer owner that had nothing.
+            return exists(
+                select(literal(1)).where(
+                    retained.run_id == run.id,
+                    retained.workspace_id == self._workspace_id,
+                    retained.source_id == models.Document.source_id,
+                    *extra,
+                    self._contributes(
+                        connector=inventory.connector,
+                        newer_run_ids=tuple(newer.id for newer in inventory.runs[:ordinal]),
+                        # Already iterating live documents; the liveness arm would be a second
+                        # lookup for a fact this row is itself the proof of.
+                        require_live=False,
+                        source_id=retained.source_id,
+                    ),
+                )
+            )
+
+        # `false()` seeds both: a connector whose runs include no `ALLOW_OMISSIONS` policy
+        # produces no pending clauses at all, and an empty `or_()` is deprecated rather than
+        # false — which this project's `filterwarnings = ["error"]` turns into a failure.
+        covered_by = or_(
+            false(),
+            *(
+                owned_by(
+                    ordinal,
+                    run,
+                    retained.blob_ref.is_not(None),
+                    retained.acquired_source.is_not(None),
+                )
+                for ordinal, run in enumerate(inventory.runs)
+            ),
+        )
+        # An omission the operator's promotion policy allows is not a gap in the evidence, it
+        # is work deferred on purpose: the record stays pending and the next ordinary sync
+        # retries its body. Counting it as coverage would be a lie, and refusing on it would
+        # overrule a contract `ALLOW_OMISSIONS` exists to offer.
+        pending_by = or_(
+            false(),
+            *(
+                owned_by(
+                    ordinal,
+                    run,
+                    retained.snapshot_outcome == SnapshotItemOutcome.OMITTED,
+                    retained.blob_ref.is_(None),
+                    retained.acquired_source.is_(None),
+                )
+                for ordinal, run in enumerate(inventory.runs)
+                if SnapshotPromotionPolicy(run.promotion_policy)
+                is SnapshotPromotionPolicy.ALLOW_OMISSIONS
+            ),
+        )
+        counts = (
+            await session.execute(
+                select(
+                    func.count(models.Document.id),
+                    func.count(models.Document.id).filter(covered_by),
+                    func.count(models.Document.id).filter(pending_by & ~covered_by),
+                ).where(*live)
+            )
+        ).one()
+        return int(counts[0]), int(counts[1]), int(counts[2])
+
     async def _generation_snapshot_rows(
         self, session: AsyncSession, generation_id: str
     ) -> list[models.DerivedGenerationSnapshot]:
@@ -1901,10 +2339,17 @@ class SqliteRebuildStore(WorkspaceScoped):
         )
 
     async def _snapshot_set_is_current(self, session: AsyncSession, run_ids: Sequence[str]) -> bool:
-        latest = await self._latest_promoted_runs(session)
-        if tuple(row.id for row in latest) != tuple(run_ids):
+        """Whether the bound runs are still exactly the workspace's current source evidence.
+
+        Compares the whole contributing set, not just the newest run per connector, so that
+        planning and publication are held to the same membership proof. A new promotion
+        between the two changes the newest run, which changes every chain behind it.
+        """
+        inventories = await self._source_inventories(session)
+        contributing = tuple(run.id for inventory in inventories for run in inventory.runs)
+        if contributing != tuple(run_ids):
             return False
-        connectors = {row.connector_name for row in latest}
+        connectors = {inventory.connector for inventory in inventories}
         foreign_live = await session.scalar(
             select(func.count(models.Document.id)).where(
                 models.Document.workspace_id == self._workspace_id,
@@ -2109,6 +2554,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 models.AcquisitionRecord.workspace_id == self._workspace_id,
                 models.AcquisitionRecord.blob_ref.is_not(None),
                 models.AcquisitionRecord.acquired_source.is_not(None),
+                await self._contribution_filter(session, generation.id),
             )
             .order_by(
                 models.DerivedGenerationSnapshot.ordinal,
@@ -2173,6 +2619,7 @@ class SqliteRebuildStore(WorkspaceScoped):
                 models.AcquisitionRecord.workspace_id == self._workspace_id,
                 models.AcquisitionRecord.blob_ref.is_not(None),
                 models.AcquisitionRecord.acquired_source.is_not(None),
+                await self._contribution_filter(session, generation.id),
             )
             .distinct()
             .order_by(models.AcquisitionRecord.blob_ref)
@@ -2414,6 +2861,7 @@ class SqliteRebuildStore(WorkspaceScoped):
             raise RebuildPublicationConflictError(RebuildRefusalCode.SNAPSHOT_CHANGED)
         snapshot_count = 0
         evidence_count = 0
+        predecessors = _binding_predecessors(snapshots)
         for snapshot in snapshots:
             run = await session.get(models.AcquisitionRun, snapshot.run_id)
             if (
@@ -2447,6 +2895,23 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
             ).one()
             total, retained, omitted = (int(value) for value in counts)
+            newer_run_ids = predecessors[snapshot.run_id]
+            contributed = int(
+                await session.scalar(
+                    select(func.count(models.AcquisitionRecord.sequence)).where(
+                        models.AcquisitionRecord.run_id == snapshot.run_id,
+                        models.AcquisitionRecord.workspace_id == self._workspace_id,
+                        models.AcquisitionRecord.blob_ref.is_not(None),
+                        models.AcquisitionRecord.acquired_source.is_not(None),
+                        self._contributes(
+                            connector=snapshot.connector_name,
+                            newer_run_ids=newer_run_ids,
+                            require_live=bool(newer_run_ids),
+                        ),
+                    )
+                )
+                or 0
+            )
             completeness = (
                 None if run.completeness is None else SnapshotCompleteness(run.completeness)
             )
@@ -2466,11 +2931,13 @@ class SqliteRebuildStore(WorkspaceScoped):
             if (
                 total != run.discovered_count
                 or retained != snapshot.expected_item_count
+                or contributed != snapshot.contributed_item_count
+                or contributed > retained
                 or not (partial_is_honest or complete_is_honest)
             ):
                 raise RebuildPublicationValidationError
             snapshot_count += total
-            evidence_count += retained
+            evidence_count += contributed
         if (
             generation.next_sequence != generation.expected_item_count
             or generation.documents_built != generation.expected_item_count
@@ -2542,6 +3009,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         # same constant regardless of how large the generation is.
         by_key: dict[tuple[str, str], models.AcquisitionRecord] = {}
         if documents:
+            contributing = await self._contribution_filter(session, generation.id)
             rows = await session.execute(
                 select(models.AcquisitionRecord, models.DerivedGenerationSnapshot.connector_name)
                 .join(
@@ -2550,15 +3018,16 @@ class SqliteRebuildStore(WorkspaceScoped):
                 )
                 .where(
                     models.DerivedGenerationSnapshot.generation_id == generation.id,
-                    models.DerivedGenerationSnapshot.connector_name.in_(
-                        {document.source for document in documents}
-                    ),
                     models.AcquisitionRecord.workspace_id == self._workspace_id,
                     models.AcquisitionRecord.source_id.in_(
                         {document.source_id for document in documents}
                     ),
                     models.AcquisitionRecord.blob_ref.is_not(None),
                     models.AcquisitionRecord.acquired_source.is_not(None),
+                    # Resolving a staged document back to its evidence has to apply the same
+                    # ownership rule the plan did, or a document named by two bound runs would
+                    # read here as two candidate records and be refused as corruption.
+                    contributing,
                 )
             )
             for record, connector_name in rows:

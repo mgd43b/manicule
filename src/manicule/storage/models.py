@@ -43,6 +43,7 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     SnapshotCompleteness,
     SnapshotItemOutcome,
+    SnapshotMembership,
     SnapshotPromotionPolicy,
 )
 from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
@@ -118,6 +119,10 @@ def _acquisition_run_state_enum() -> Enum:
 
 def _acquisition_inventory_state_enum() -> Enum:
     return _value_enum(AcquisitionInventoryState, "acquisition_inventory_state")
+
+
+def _snapshot_membership_enum() -> Enum:
+    return _value_enum(SnapshotMembership, "snapshot_membership")
 
 
 def _acquisition_record_state_enum() -> Enum:
@@ -291,6 +296,18 @@ class AcquisitionRun(Base):
     scope_fingerprint: Mapped[str] = mapped_column(Text, nullable=False, default="")
     full_inventory_authority: Mapped[str] = mapped_column(Text, nullable=False, default="")
     scope_inventory_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    enumeration_membership: Mapped[SnapshotMembership] = mapped_column(
+        _snapshot_membership_enum(),
+        nullable=False,
+        default=SnapshotMembership.FULL_INVENTORY,
+    )
+    """Whether this enumeration walked the whole scope or resumed from a committed cursor.
+
+    Written once, when the run is created, from the cursor it inherits — the same fact the
+    pipeline uses to decide what to hand the connector's ``discover``. Recorded rather than
+    rederived from ``base_watermark`` because a run that discarded an inherited cursor and
+    walked from nothing is indistinguishable afterwards from one that used it.
+    """
     promotion_policy: Mapped[SnapshotPromotionPolicy] = mapped_column(
         Text,
         nullable=False,
@@ -1571,12 +1588,29 @@ class DerivedGenerationSnapshot(Base):
     scope_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
     membership_hash: Mapped[str] = mapped_column(Text, nullable=False)
     expected_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Retained members of this run's own manifest, which is what settlement proves."""
+
+    contributed_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    """Retained members this run contributes to *this* generation, after deduplication.
+
+    Equal to ``expected_item_count`` whenever a connector binds one run, which is every
+    generation planned from a full inventory. It is smaller when an incremental run is bound
+    together with the earlier runs that cover the documents it did not re-enumerate: a
+    document named by two bound runs is built once, from the newer one. Kept separate rather
+    than folded into ``expected_item_count`` because acquisition settlement checks a run's own
+    retained inventory, and that number does not change because another run also named it.
+    """
 
     __table_args__ = (
         UniqueConstraint("generation_id", "run_id", name="uq_generation_snapshot_run"),
         CheckConstraint(
-            "ordinal >= 0 AND expected_item_count >= 0",
-            name="derived_generation_snapshot_counts_are_not_negative",
+            "ordinal >= 0 AND expected_item_count >= 0 "
+            "AND contributed_item_count >= 0 "
+            "AND contributed_item_count <= expected_item_count",
+            # Renamed from `..._are_not_negative` when the second count arrived: what it now
+            # enforces is an ordering between the two, and a constraint whose name describes
+            # half of it is a constraint somebody will read instead of a violation report.
+            name="derived_generation_snapshot_counts_are_coherent",
         ),
     )
 

@@ -268,7 +268,9 @@ manicule rebuild status GENERATION_ID
 There is no separate settlement command: successful publication atomically settles the exact
 acquisition manifests it consumed, and rebuild has no connector or source fallback. Planning
 binds the newest promoted snapshot for every connector scope in the workspace into one ordered
-shadow generation. An interrupted worker resumes its durable sequence checkpoint, and the old
+shadow generation, together with the earlier snapshots needed to account for every live document
+when that newest one is an incremental manifest. A replacement that cannot account for all of
+them is refused rather than published (`docs/ingest.md` §10.4). An interrupted worker resumes its durable sequence checkpoint, and the old
 corpus remains queryable until the complete multi-source replacement validates and publishes in
 one transaction.
 
