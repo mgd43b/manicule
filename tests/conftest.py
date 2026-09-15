@@ -195,6 +195,7 @@ def pytest_configure(config: pytest.Config) -> None:
     is roughly seven minutes per CI shard). This costs nothing measurable: the same sample runs
     in 2.07s against a 2.22s baseline.
     """
+    import itertools  # noqa: PLC0415
     import traceback  # noqa: PLC0415
 
     import aiosqlite  # noqa: PLC0415
@@ -202,16 +203,25 @@ def pytest_configure(config: pytest.Config) -> None:
     del config
     opened = aiosqlite.Connection.__init__
     closed = aiosqlite.Connection.close
+    # **A counter, not `id()`.** CPython reuses an address once an object is freed, so keying by
+    # `id` lets a *later* connection overwrite a leaked one's entry and then remove it on close —
+    # dropping the very leak this exists to report, silently. The token is unique for the life of
+    # the session and is carried on the instance, so each connection owns exactly its own record.
+    tokens = itertools.count()
 
     def remember(self: Any, *args: Any, **kwargs: Any) -> None:
         opened(self, *args, **kwargs)
-        _OPEN_CONNECTIONS[id(self)] = (
+        token = next(tokens)
+        self._leak_token = token
+        _OPEN_CONNECTIONS[token] = (
             os.environ.get("PYTEST_CURRENT_TEST", "<no test>"),
             "".join(traceback.format_stack()[-12:-1]),
         )
 
     async def forget(self: Any, *args: Any, **kwargs: Any) -> Any:
-        _OPEN_CONNECTIONS.pop(id(self), None)
+        token: int | None = getattr(self, "_leak_token", None)
+        if token is not None:
+            _OPEN_CONNECTIONS.pop(token, None)
         return await closed(self, *args, **kwargs)
 
     aiosqlite.Connection.__init__ = remember
@@ -235,6 +245,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         f"Unclosed, they warn from `__del__` during a later test, which is how this "
         f"arrives as an unrelated test failing on one shard."
     ]
-    lines.extend(f"\n--- opened during {test}\n{stack}" for test, stack in leaked[:5])
+    # Every one of them. Truncating hid any leak past the fifth, and the sixth is exactly the
+    # one nobody would find another way — the warning that eventually surfaces names a bystander.
+    lines.extend(f"\n--- opened during {test}\n{stack}" for test, stack in leaked)
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
     raise pytest.UsageError("\n".join(lines))
