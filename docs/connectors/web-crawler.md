@@ -27,7 +27,7 @@ surfaces.
 
 ## 1. The first connector: `git-site`
 
-`filesystem` can already index the repository today. `git-site` adds the facts a filesystem does
+[`filesystem`](filesystem.md) can already index the repository today. `git-site` adds the facts a filesystem does
 not know:
 
 - which files are pages;
@@ -73,7 +73,7 @@ route_manifest = ".manicule-site.json"
 | `revision` | `HEAD` | Commit-ish resolved once at setup. It must resolve to a commit. |
 | `content_root` | `.` | Repository-relative boundary containing page inputs. It may not escape the repository. |
 | `base_url` | required | Absolute HTTP(S) site root, with no credentials, query or fragment. |
-| `include` | page suffixes | Git-style path globs admitted as pages. |
+| `include` | page suffixes | Git-style path globs admitted as pages. `*` stops at `/`, `**` crosses it, and a leading `**/` matches zero directories as well as more. |
 | `exclude` | tool/draft paths | Globs applied after `include`; an exclusion always wins. |
 | `route_manifest` | absent | Optional repository-relative v1 route manifest. |
 | `max_bytes` | absent | Optional per-page ceiling. The Git reader retains its 256 MiB safety ceiling when absent. |

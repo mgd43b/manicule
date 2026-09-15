@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import fnmatch
 import hashlib
 import json
 from collections.abc import AsyncIterator
@@ -12,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
+from manicule.connectors import globs
 from manicule.connectors.config import GitSiteConfig
 from manicule.connectors.git_reader import (
     GitBlobTooLargeError,
@@ -82,19 +82,6 @@ def _relative(path: str, root: str) -> str:
     if not path.startswith(prefix):
         raise GitSourceError("Git returned a path outside the configured content root")
     return path[len(prefix) :]
-
-
-def _matches(path: str, pattern: str) -> bool:
-    """Match POSIX globs, including the useful zero-directory meaning of ``**/``."""
-    return fnmatch.fnmatchcase(path, pattern) or (
-        pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:])
-    )
-
-
-def _admitted(path: str, *, include: tuple[str, ...], exclude: tuple[str, ...]) -> bool:
-    return any(_matches(path, pattern) for pattern in include) and not any(
-        _matches(path, pattern) for pattern in exclude
-    )
 
 
 def _token(entry: GitTreeEntry, record: SiteRouteRecord) -> str:
@@ -203,7 +190,7 @@ class GitSiteConnector:
             entry
             for entry in ordinary
             if entry.path != self._config.route_manifest
-            and _admitted(
+            and globs.admitted(
                 _relative(entry.path, self._config.content_root),
                 include=self._config.include,
                 exclude=self._config.exclude,

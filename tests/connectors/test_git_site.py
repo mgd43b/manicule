@@ -251,6 +251,13 @@ async def test_git_site_satisfies_the_connector_contract(repository: Path) -> No
 
 
 def test_git_site_configuration_is_closed_and_canonical(repository: Path) -> None:
+    """A setting that appears to be in force and silently is not is worse than one that fails.
+
+    The two glob fields are validated by the same rule, so both are checked here: a pattern
+    that can never match reads exactly like one that is simply not being hit yet, and on
+    ``exclude`` that is the difference between a draft being kept out of a public site and a
+    draft being published.
+    """
     config = _config(repository, base_url="HTTPS://DOCS.EXAMPLE.TEST:443/manual/")
     assert config.base_url == "https://docs.example.test/manual/"
     with pytest.raises(ValidationError):
@@ -259,3 +266,5 @@ def test_git_site_configuration_is_closed_and_canonical(repository: Path) -> Non
         _config(repository, content_root="../private")
     with pytest.raises(ValidationError):
         _config(repository, include=("/absolute/*.md",))
+    with pytest.raises(ValidationError):
+        _config(repository, exclude=("../outside/**",))
