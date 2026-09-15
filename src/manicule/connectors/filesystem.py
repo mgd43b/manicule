@@ -396,7 +396,7 @@ class FilesystemConnector:
         except ValueError:
             return False
         return any(
-            globs.excluded(candidate, self._exclude)
+            globs.matches_any(candidate, self._exclude)
             for part in (relative, *relative.parents)
             if part != _SELF
             for candidate in (str(part), f"{part}/")

@@ -27,8 +27,8 @@ if TYPE_CHECKING:
 __all__ = [
     "MAX_PATTERN_LENGTH",
     "admitted",
-    "excluded",
     "matches",
+    "matches_any",
     "path_glob",
 ]
 
@@ -71,8 +71,13 @@ def matches(path: str, pattern: str) -> bool:
     )
 
 
-def excluded(path: str, patterns: Sequence[str]) -> bool:
-    """Whether any pattern names ``path``. Empty patterns exclude nothing."""
+def matches_any(path: str, patterns: Sequence[str]) -> bool:
+    """Whether any of ``patterns`` names ``path``. No patterns match nothing.
+
+    One primitive named for what it does rather than for what either caller wants it to mean:
+    the same test decides admission and refusal, and a helper called ``excluded`` would read as
+    a lie in :func:`admitted`, where it is asked about the *include* list.
+    """
     return any(matches(path, pattern) for pattern in patterns)
 
 
@@ -82,4 +87,4 @@ def admitted(path: str, *, include: Sequence[str], exclude: Sequence[str]) -> bo
     An exclusion always wins, which is the only ordering that lets a broad ``include`` be
     written once and corrected in place rather than being restated as a list of exceptions.
     """
-    return excluded(path, include) and not excluded(path, exclude)
+    return matches_any(path, include) and not matches_any(path, exclude)

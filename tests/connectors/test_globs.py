@@ -54,9 +54,9 @@ def test_a_pattern_does_not_match_a_path_it_merely_resembles(path: str, pattern:
     assert not globs.matches(path, pattern)
 
 
-def test_nothing_is_excluded_by_no_patterns() -> None:
+def test_no_patterns_match_nothing() -> None:
     """The default for a connector that ships none, so it is the case that runs most often."""
-    assert not globs.excluded("anything/at/all.md", ())
+    assert not globs.matches_any("anything/at/all.md", ())
 
 
 def test_an_exclusion_beats_an_inclusion() -> None:
