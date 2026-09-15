@@ -24,6 +24,7 @@ from collections.abc import (
 )
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit, urlunsplit
 
 from manicule.core.anchors import Unlocated
 from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
@@ -1024,6 +1025,19 @@ _SEPARABLE_SEGMENT = 2
 """Characters a final path segment needs before a prefix can be cut to stop inside it."""
 
 
+def _containing_directory(uri: str) -> str:
+    """The directory ``uri`` sits in, as a prefix.
+
+    Split on the *path component* rather than on the raw string, because the last ``/`` of a
+    raw ``file:///doc.md`` is structural: cutting there leaves ``file://``, which names an
+    empty host rather than the filesystem root and is refused as a prefix. A document at the
+    root of its authority has ``/`` for a parent, and that is a real directory.
+    """
+    scheme, netloc, path, _, _ = urlsplit(uri)
+    parent = path.rsplit("/", 1)[0]
+    return urlunsplit((scheme, netloc, f"{parent}/", "", ""))
+
+
 async def _assert_prefix_membership(store: CollectionStore, subject: Document) -> None:
     """Check that a prefix rule selects by location, and stops at the directory it names.
 
@@ -1032,7 +1046,7 @@ async def _assert_prefix_membership(store: CollectionStore, subject: Document) -
     string prefix, or a case-folding one, still reports the subject as a member and differs
     only in what *else* it quietly sweeps up. A store that widens here widens silently.
     """
-    directory = subject.uri.rsplit("/", 1)[0]
+    directory = _containing_directory(subject.uri)
     ruled = await store.create_collection(
         "conformance-prefix", rule=CollectionRule(uri_prefixes=frozenset({directory}))
     )

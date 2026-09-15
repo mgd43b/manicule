@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
 
@@ -755,7 +756,7 @@ async def test_doctor_names_the_collection_that_holds_its_documents_by_hand(root
     assert f"{COLLECTION!r}" in check.detail
     assert check.facts["uncovered"] == [COLLECTION]
     assert check.remedy.startswith("manicule collection rule set ")
-    assert f"--uri-prefix {root / COLLECTION}" in check.remedy
+    assert f"--uri-prefix {shlex.quote(str(root / COLLECTION))}" in check.remedy
 
 
 async def test_a_collection_selecting_its_own_directory_is_quiet(root: Path) -> None:
@@ -801,7 +802,8 @@ async def test_doctor_reports_a_configured_collection_the_workspace_does_not_hav
     assert f"{COLLECTION!r}" in check.detail
     assert check.facts["missing"] == [COLLECTION]
     assert check.remedy == (
-        f"manicule collection create {COLLECTION} --uri-prefix {root / COLLECTION}"
+        f"manicule collection create {COLLECTION} "
+        f"--uri-prefix {shlex.quote(str(root / COLLECTION))}"
     )
 
 
@@ -843,3 +845,26 @@ async def test_an_unusable_authoring_source_is_reported_rather_than_raised(root:
 
     assert check.state == "failing"
     assert "'absent'" in check.detail
+
+
+async def test_a_remedy_naming_a_collection_with_a_space_is_still_one_command(
+    tmp_path: Path,
+) -> None:
+    """A remedy is a command to run, and an unquoted one silently becomes a different command.
+
+    `normalize_name` collapses runs of whitespace and keeps single spaces, so `Team A` is an
+    ordinary collection name rather than a contrived one — and a corpus root under `My
+    Documents` is just as ordinary. Unquoted, `manicule collection create Team A --uri-prefix
+    /corpus/Team A` is four arguments and creates a collection called `Team`. The check that
+    exists to hand somebody a working command must hand them a working command.
+    """
+    root = tmp_path / "My Corpus"
+    root.mkdir()
+    settings = settings_for(root, collections=("Team A",))
+    service = await service_for(settings, existing=())
+
+    check = _authoring_check(await service.doctor())
+
+    assert check.state == "failing"
+    assert check.remedy == (f"manicule collection create 'Team A' --uri-prefix '{root / 'Team A'}'")
+    assert shlex.split(check.remedy)[-1] == str(root / "Team A")

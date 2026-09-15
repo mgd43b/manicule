@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from manicule.core.errors import ManiculeError, NameInUseError
-from manicule.core.organization import CollectionRule
+from manicule.core.organization import CollectionRule, directory_prefix
 from manicule.core.retrieval import Filter
 from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
 from manicule.storage.organization import resolve_filter, rule_clause
@@ -670,7 +670,10 @@ async def test_a_prefix_is_stored_in_the_form_the_column_holds(written: str, sto
     assert CollectionRule(uri_prefixes=frozenset({written})).uri_prefixes == frozenset({stored})
 
 
-@pytest.mark.parametrize("written", ["", "   ", "corpus/journals", "./journals", "C:/corpus"])
+@pytest.mark.parametrize(
+    "written",
+    ["", "   ", "corpus/journals", "./journals", "C:/corpus", "file://corpus/journals", "file:x"],
+)
 async def test_a_prefix_that_names_no_location_is_refused(written: str) -> None:
     """Relative to nothing is not a location, and a rule is re-run where nobody chose the cwd.
 
@@ -679,8 +682,28 @@ async def test_a_prefix_that_names_no_location_is_refused(written: str) -> None:
     be stored as a URI prefix no connector can ever write — refused loudly here instead of
     selecting nothing quietly forever.
     """
-    with pytest.raises(ValueError, match=r"absolute path|not an empty string"):
+    with pytest.raises(
+        ValueError, match=r"absolute path|not an empty string|names the host|absolute location"
+    ):
         CollectionRule(uri_prefixes=frozenset({written}))
+
+
+async def test_a_written_file_uri_is_re_derived_rather_than_trusted() -> None:
+    """Having a scheme is not having the right escaping, and the gap matches nothing silently.
+
+    `documents.uri` holds `Path.as_uri()`, which percent-encodes. A hand-written
+    `file:///corpus/my journals` parses fine, stores fine, and then never equals the
+    `file:///corpus/my%20journals` the walk recorded — the exact failure this field exists to
+    remove, arriving through the one input that looks most authoritative. Both spellings, and
+    the plain path, have to land on one prefix, and re-normalizing an already-stored rule must
+    not move it.
+    """
+    encoded = "file:///corpus/my%20journals/"
+    for written in ("/corpus/my journals", "file:///corpus/my journals", encoded):
+        assert CollectionRule(uri_prefixes=frozenset({written})).uri_prefixes == frozenset(
+            {encoded}
+        )
+    assert directory_prefix(encoded) == encoded
 
 
 async def test_an_empty_rule_is_refused_rather_than_matching_everything() -> None:

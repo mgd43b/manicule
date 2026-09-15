@@ -29,6 +29,7 @@ import logging
 import os
 import platform
 import secrets
+import shlex
 import time
 import tomllib
 from base64 import b64encode
@@ -3276,8 +3277,8 @@ class ApplicationService:
                 f"have. Authoring into a collection that does not exist refuses rather than "
                 f"writing, so those names author nothing.",
                 facts=facts,
-                remedy=f"manicule collection create {missing[0]} "
-                f"--uri-prefix {connector.root / missing[0]}",
+                remedy=f"manicule collection create {shlex.quote(missing[0])} "
+                f"--uri-prefix {shlex.quote(str(connector.root / missing[0]))}",
             )
         if uncovered:
             named = ", ".join(repr(name) for name in uncovered)
@@ -3289,8 +3290,8 @@ class ApplicationService:
                 f"`document_create` joins nothing and a collection-scoped search quietly "
                 f"returns less.",
                 facts=facts,
-                remedy=f"manicule collection rule set {identifiers[uncovered[0]]} "
-                f"--uri-prefix {connector.root / uncovered[0]}",
+                remedy=f"manicule collection rule set {shlex.quote(identifiers[uncovered[0]])} "
+                f"--uri-prefix {shlex.quote(str(connector.root / uncovered[0]))}",
             )
         return r.Check(
             name="authoring",
