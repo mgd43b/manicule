@@ -214,12 +214,9 @@ class Runtime:
         *,
         discovery: Discovery | None = None,
         writer: bool = True,
-        allow_unauthenticated: bool = False,
     ) -> None:
         self._settings = settings
-        self._container = build_container(
-            settings, discovery=discovery, allow_unauthenticated=allow_unauthenticated
-        )
+        self._container = build_container(settings, discovery=discovery)
         self._slots: dict[str, _Lazy] = {}
         self._engine: AsyncEngine | None = None
         self._migrated = False
@@ -236,7 +233,6 @@ class Runtime:
         cls,
         *,
         writer: bool = True,
-        allow_unauthenticated: bool = False,
         **overrides: Any,  # noqa: ANN401 - mirrors Settings
     ) -> Runtime:
         """Load configuration, verify it against what is installed, and return the runtime.
@@ -247,13 +243,6 @@ class Runtime:
                 exclusion rather than silently going without, and the cost of being wrong that
                 way round is a refusal an operator can read. ``docs/ingest.md`` 8.6 has the
                 classification and :func:`~manicule.app.dispatch.writes` applies it.
-            allow_unauthenticated: ``manicule serve --no-authentication``. Named beside
-                ``writer`` rather than left to ``**overrides``, and the distinction is the
-                point: everything in ``overrides`` is a settings field, and this one must never
-                be — so it is spelled out here, where a field of the same name would collide
-                loudly rather than quietly becoming configuration. ``tests/app/test_bind.py``
-                asserts no such field exists. Only ``manicule serve`` passes it; every other
-                command opens a runtime that judges the configuration on its own terms.
             **overrides: Settings fields.
 
         Raises:
@@ -261,9 +250,7 @@ class Runtime:
             PolicyError: It is individually valid and jointly unrunnable, or it names a
                 component nothing installed provides. Everything wrong is listed at once.
         """
-        return cls(
-            load_settings(**overrides), writer=writer, allow_unauthenticated=allow_unauthenticated
-        )
+        return cls(load_settings(**overrides), writer=writer)
 
     async def __aenter__(self) -> Self:
         """Take the data directory, if this runtime is one that writes.

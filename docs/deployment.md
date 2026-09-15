@@ -278,9 +278,13 @@ manicule refuses the software half of this on its own. `manicule.app.bind.resolv
 three separate things before it will bind anywhere but loopback: a non-loopback host somebody
 wrote into configuration, `--allow-public-bind` on the command line where no config file can
 supply it, and `security.auth.mode` set to something other than `none`. Any one missing is a
-refusal — and the first one an operator meets is earlier still: `Settings.policy_problems`
-refuses a wide `bind_host` with `auth.mode = none` at `Runtime.open`, before any address is
-resolved and for every command rather than only for serving.
+refusal.
+
+**Commands that open no socket are not subject to it**, which matters in a container: a pod
+serving with `--no-authentication` has a wide `bind_host` in its configuration, and
+`kubectl exec … manicule index --stats` or `manicule doctor` runs there normally. The bind
+policy governs binding; it is enforced when an address or an application is made, not when the
+data directory is opened.
 
 `manicule doctor`'s `transport` check reports what that produced: `ok` for a loopback bind,
 `degraded` for a non-loopback bind with authentication on — reachable from the network, which

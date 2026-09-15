@@ -571,12 +571,20 @@ def test_a_hosted_model_with_no_credential_says_which_variable_to_set() -> None:
     assert any("ANTHROPIC_API_KEY" in problem for problem in problems)
 
 
-def test_binding_beyond_loopback_without_authentication_is_refused() -> None:
-    """An unauthenticated index on a routable address is readable by anyone who reaches it."""
+def test_binding_beyond_loopback_without_authentication_is_not_a_configuration_problem() -> None:
+    """It is a *bind* problem, and `policy_problems` is consulted by commands that never bind.
+
+    An unauthenticated index on a routable address is still refused — by
+    `manicule.app.bind.resolve_bind` before a socket exists and by
+    `manicule.api.app.build_app` before an application does, and `tests/app/test_bind.py` holds
+    both. What it must not do is refuse `manicule index --stats` inside a pod whose server is
+    deliberately serving that way, which is what listing it here did: `build_container` raises on
+    anything `policy_problems` reports, for every command.
+    """
     settings = Settings(
         security={"transport": {"bind_host": "0.0.0.0"}},  # noqa: S104  # pyright: ignore[reportArgumentType]
     )
-    assert any("bind_host" in problem for problem in settings.policy_problems())
+    assert not any("bind_host" in problem for problem in settings.policy_problems())
 
 
 def test_oauth_without_a_provider_is_refused() -> None:
@@ -622,7 +630,11 @@ def test_every_problem_is_reported_at_once() -> None:
     settings = Settings(
         llm={"provider": "openai"},  # pyright: ignore[reportArgumentType]
         security={  # pyright: ignore[reportArgumentType]
-            "transport": {"bind_host": "0.0.0.0"},  # noqa: S104
+            # A wide `bind_host` used to be the third problem here, and is no longer a problem
+            # this method reports at all: it governs binding, and `policy_problems` is consulted
+            # by every command including those that never bind. `auth.mode = oauth` with no
+            # provider is a genuine one in its place — the point of this test is the plural.
+            "auth": {"mode": "oauth"},
             "data_policy": {"cloud_allowed": False},
         },
     )
