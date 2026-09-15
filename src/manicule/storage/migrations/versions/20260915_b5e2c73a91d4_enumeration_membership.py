@@ -25,8 +25,8 @@ only raw SQL like this sees the difference.
 The ``CASE`` is total, so no row depends on the column default, and its ``ELSE`` is
 ``incremental``: a value this predicate cannot recognize is treated as a delta. That is the safe
 direction. An incremental run is refused deletion authority and must prove its coverage from an
-earlier full inventory before a rebuild will plan it, so a full inventory mislabelled as a delta
-costs one refusal an operator can resolve; a delta mislabelled as a full inventory costs the
+earlier full inventory before a rebuild will plan it, so a full inventory mislabeled as a delta
+costs one refusal an operator can resolve; a delta mislabeled as a full inventory costs the
 corpus. The same reasoning covers the reconstruction's known imperfection — a run that inherited
 a cursor and then discarded it, because its scope fingerprint had moved or because a
 re-enumeration was required, walked the whole scope and is recorded here as incremental.

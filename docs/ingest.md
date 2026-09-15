@@ -2012,7 +2012,7 @@ that declaration.
 **There is one upgrade-shaped exception, and it clears itself.** `enumeration_membership` is
 recorded when a run is created, so runs promoted before the column existed were reconstructed by
 its migration from the cursor they inherited. That reconstruction cannot see a connector's
-declaration, so a cursor-discarding connector's *historical* runs can be labelled incremental
+declaration, so a cursor-discarding connector's *historical* runs can be labeled incremental
 even though each one walked the whole scope. If the retained chain still reaches an older full
 inventory — the connector's first run always is one — planning composes it and nothing is
 refused. If it does not, one ordinary sync records a fresh `full_inventory` run through the
