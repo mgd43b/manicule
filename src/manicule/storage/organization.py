@@ -375,6 +375,62 @@ class CollectionsMixin(WorkspaceScoped):
                     holding.append(_to_collection(row))
             return holding
 
+    async def count_uncollected(self, *, source: str | None = None) -> int:
+        """How many live documents no collection holds — manually or by rule.
+
+        **One statement, built from the clause every other reader uses.** ``doctor`` asks this,
+        and ``doctor`` is run to read a sentence. The answer that already existed —
+        :meth:`~manicule.app.service.ApplicationService.collection_orphans` — calls
+        :meth:`collections_for` once per document, which is a query per collection per document:
+        affordable for a cleanup somebody typed, not for a health check. Building the predicate
+        out of :meth:`_membership_clause` is what keeps the number from disagreeing with the
+        lists it is the complement of, on the rule this module opens by stating.
+
+        **``or_(false(), ...)`` rather than a bare splat, because the empty case is the finding.**
+        A workspace holding documents and *no collections at all* is exactly what a doc store
+        restored without its collections looks like, and there the disjunction has no terms. The
+        explicit ``false()`` makes "nothing holds anything, so every document is uncollected" the
+        SQL that is rendered, rather than an answer resting on how an empty ``or_`` happens to.
+
+        **Negating a predicate is only safe while the predicate cannot be NULL**, and here it
+        cannot: every column :func:`rule_clause` reads — ``source``, ``uri``, ``media_type``,
+        ``updated_at`` — is ``NOT NULL``, and both ``IN`` selectors compare a non-nullable id
+        against a non-nullable column. Three-valued logic is what makes this worth stating
+        rather than leaving to be noticed: ``NOT NULL`` is ``NULL``, a ``WHERE`` keeps only
+        rows that are true, so a nullable selector added to ``CollectionRule`` later would
+        make documents *drop out of this count* — reported as held by the collection that
+        does not hold them, which is the quiet direction.
+
+        Args:
+            source: Narrow to one connector's documents, for a report about the corpus one run
+                contributes to rather than the whole workspace. ``None`` counts the workspace.
+        """
+        async with self._sessions() as session:
+            collections = (
+                (
+                    await session.execute(
+                        select(models.Collection).where(
+                            models.Collection.workspace_id == self._workspace_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            held = or_(false(), *(self._membership_clause(row) for row in collections))
+            statement = (
+                select(func.count())
+                .select_from(models.Document)
+                .where(
+                    models.Document.workspace_id == self._workspace_id,
+                    models.Document.deleted_at.is_(None),
+                    ~held,
+                )
+            )
+            if source is not None:
+                statement = statement.where(models.Document.source == source)
+            return (await session.execute(statement)).scalar_one()
+
     # --- internals --------------------------------------------------------------------------
 
     def _membership_clause(self, row: models.Collection) -> ColumnElement[bool]:

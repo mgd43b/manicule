@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### A corpus that belongs to no collection now says so
+
+`manicule doctor` gained a `collection-membership` check, and `connector sync`, `index` and
+`import` gained two numbers: `in collections` and `in no collection`, for the source the run
+was over.
+
+Both exist because of a failure that is quiet in the worst way. Collections and their rules live
+in the document store, so rebuilding or restoring that store without recreating them leaves a
+corpus whose documents are all perfectly indexed and whose organization is gone. Every signal
+there is says the installation is healthy: the sync reports `503 indexed, 0 failed, outcome
+complete`, `index --stats` counts 503 documents, and an unscoped search answers. Only a
+collection-scoped search fails, and it fails by refusing a name — so an operator who does not
+happen to scope one may not notice for a long time, while everything they do search is narrower
+than they think.
+
+The check reports three numbers — how many documents, how many collections, and how many
+documents no collection holds, by hand or by rule. A workspace with documents and **no
+collections at all** is `degraded`: there, a scoped `search` refuses the scope,
+`collection_counts` refuses the name and `document_create` refuses the write, so a whole surface
+of the product answers refusals while nothing says why. That is also what a corpus nobody
+organizes by collection looks like, and the two cannot be told apart from inside the check —
+which is the reason it reports the state rather than guessing which one it is. Documents outside
+collections that *do* exist stay `ok` with the count in the sentence, because collections are
+optional and amber on every partly-filed corpus is how a reader learns to skim `doctor`.
+
+The sync numbers answer the same question about one source, in its own output rather than in a
+later refusal. They are measured when the run finishes rather than counted during it, because
+nothing in the ingest path ever writes a membership row: rule-driven membership is evaluated at
+read time, and a document a run skipped as unchanged is in exactly the collections one it
+indexed is. A run that placed nothing anywhere now says so on the line under its table.
+
+Neither is a new way to find these documents — `manicule collection orphans` already lists them,
+and still reports rather than removes unless asked to. What is new is that nobody has to know to
+run it.
+
 ### A collection can be a directory, so a synced file joins it
 
 A collection rule now takes `uri_prefixes`, and a document whose location sits beneath one is a

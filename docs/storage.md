@@ -2229,10 +2229,34 @@ rule JSON. They do not enumerate the corpus, materialize membership rows, contac
 reach parsing, chunking, embedding, and vector publication. Clearing the rule removes only its
 evaluated half; manually added membership survives.
 
-There is **one** expression of a rule, `rule_clause`, used by all three readers: listing a
-collection, reporting which collections hold a document, and resolving a filter. A second,
-Python-side reading for the "does this one document match" case is how the same rule starts
-giving two answers.
+There is **one** expression of a rule, `rule_clause`, used by all four readers: listing a
+collection, reporting which collections hold a document, resolving a filter, and counting the
+documents no collection holds. A second, Python-side reading for the "does this one document
+match" case is how the same rule starts giving two answers.
+
+#### The complement: documents no collection holds
+
+`count_uncollected` is that fourth reader, and it exists because the question has an answer the
+other three cannot produce. Summing what the collections hold and subtracting reports nothing
+wrong when there are **no collections at all** — the sum of an empty list is zero and so is the
+shortfall it implies — and that is precisely the state a doc store rebuilt or restored without
+its collections is in. So the complement is asked directly: live documents matching neither a
+membership row nor any collection's rule, negated once over a disjunction built from the same
+`_membership_clause` the listings use.
+
+The disjunction is built as `or_(false(), …)` rather than a bare splat, because the empty case
+*is* the finding. SQL renders an empty `AND` as true and an empty `OR` as false, and only the
+second is correct here: with no collections, nothing holds anything, so every document is
+uncollected. Getting it backwards would report a corpus belonging to nothing as fully
+organized.
+
+It is a count rather than a listing, and the split is deliberate. The operation that *lists*
+these documents is `collection orphans`, which asks `collections_for` once per document —
+affordable for a cleanup somebody typed, and not for `doctor`, which is run to read a sentence.
+`doctor`'s `collection-membership` check and `connector_sync`'s `uncollected` field both read
+this count ([`surfaces.md`](surfaces.md) §5); an optional `source` narrows it to one connector's
+corpus, which is what makes the second of those a fact about the run's own source rather than
+about whatever else shares the workspace.
 
 The selectors are `sources`, `uri_prefixes`, `media_types`, `tag_ids` and the two `updated_*`
 bounds. Fields conjoin; values within one set-valued field disjoin.

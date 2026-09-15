@@ -388,6 +388,12 @@ If an external SQLite writer remains present beyond the bounded retry policy, th
 `StorageBusyError`; retrying resumes the committed acquisition prefix without advancing the
 watermark or exposing SQL and local paths in the envelope.
 
+A sync also reports `in collections` and `in no collection` for the source it ran over, and says
+so out loud when the second is all of them. Every other number a run keeps can be perfect while
+the corpus it wrote into holds no collections at all, in which case each of those documents is
+indexed, searchable and outside the reach of every collection-scoped search. `manicule doctor`
+reports the same state for the whole workspace, as `collection-membership`.
+
 </details>
 
 ### The HTTP API

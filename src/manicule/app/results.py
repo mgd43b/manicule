@@ -1878,6 +1878,19 @@ class IngestReport(Payload):
     ``by_status`` is the run's own counter table rather than a summary of it, because a
     document that ended ``no_extractable_text`` is neither an ingest nor a failure and
     collapsing the two would hide exactly the outcome that needs looking at.
+
+    ``collected`` and ``uncollected`` are the one pair here that is **not** a counter the run
+    kept. They are measured once when it finishes, over this source's live documents, and they
+    answer a question the other numbers cannot: a run that indexed five hundred documents into a
+    workspace whose collections are gone reports five hundred ingested and nothing wrong, and
+    the corpus is silently narrower than every scoped search will assume. They are about the
+    source rather than about the run because membership is evaluated rather than stored — a
+    document this run skipped as unchanged is in exactly the collections one it indexed is, and
+    a figure counting only the touched half would be a smaller number with no clear meaning.
+
+    ``None`` for both means *not measured*, kept distinct from ``0`` for the usual reason: zero
+    documents in no collection is the healthy answer, and a path that never asked must not be
+    able to report it.
     """
 
     connector: str
@@ -1886,6 +1899,8 @@ class IngestReport(Payload):
     skipped: int = Field(default=0, ge=0)
     failed: int = Field(default=0, ge=0)
     expanded: int = Field(default=0, ge=0)
+    collected: int | None = Field(default=None, ge=0)
+    uncollected: int | None = Field(default=None, ge=0)
     by_status: dict[str, int] = Field(default_factory=dict)
     error: str = ""
     outcome: IngestOutcome = "complete"
@@ -2235,11 +2250,18 @@ class Check(Payload):
 
     ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``plugins``,
     ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
-    ``authoring``, ``sessions``, ``document-identity``, ``document-content``,
-    ``wiki-provenance``, ``grammars``, ``vocabularies``, ``models``, and
+    ``authoring``, ``collection-membership``, ``sessions``, ``document-identity``,
+    ``document-content``, ``wiki-provenance``, ``grammars``, ``vocabularies``, ``models``, and
     ``component:<kind>:<name>`` for anything already constructed. It is what a monitor selects
     on, so it is chosen once and does not move with the wording — which is why the two spellings
     in that list stay as they are rather than being tidied into one.
+
+    ``collection-membership`` is spelled the long way for a reason worth writing down, since the
+    obvious shorter names are both taken. ``collections`` is what a vector backend calls its own
+    storage units, which a ``component:`` check already reports on
+    (``docs/deployment.md`` §6.5), and ``orphans`` already means dangling foreign-key rows in the
+    storage checks (``docs/storage.md`` §10). A monitor selecting on a name that means two things
+    is a monitor watching the wrong one.
 
     ``detail`` and ``facts`` are the same finding twice, for two readers. ``detail`` is the
     sentence a person reads; ``facts`` is what a script would otherwise have to recover by

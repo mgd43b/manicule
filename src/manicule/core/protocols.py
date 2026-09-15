@@ -733,6 +733,21 @@ class CollectionStore(Protocol):
         """Every collection this document is in, by hand or by rule."""
         ...
 
+    async def count_uncollected(self, *, source: str | None = None) -> int:
+        """How many live documents no collection holds — the complement of every membership.
+
+        The one question about collections whose answer is a property of the *workspace* rather
+        than of a collection, and the reason it is here rather than derived by a caller: with no
+        collections at all the answer is every document, and a caller computing it by summing
+        :meth:`collection_documents` over :meth:`list_collections` would sum an empty list and
+        report nothing wrong. It is counted, not listed, because the one surface that lists
+        these documents also deletes them and the one that reports the number is ``doctor``.
+
+        Args:
+            source: Narrow to one connector's documents. ``None`` counts the workspace.
+        """
+        ...
+
 
 @runtime_checkable
 class TagStore(Protocol):

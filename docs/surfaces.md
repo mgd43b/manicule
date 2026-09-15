@@ -752,13 +752,29 @@ replayed conversation claim it had cited a version that did not exist yet.
 
 ### `index_path` / `connector_sync` / `import` → `IngestReport`
 
-`connector`, `discovered`, `ingested`, `skipped`, `failed`, `expanded`, `by_status`, `error`,
-`outcome`, `enumeration_completed`, `watermark_advanced`, `retry_required`,
-`intentionally_bounded`, `unrecorded`, `incomplete_reason`, `elapsed_ms`.
+`connector`, `discovered`, `ingested`, `skipped`, `failed`, `expanded`, `collected`,
+`uncollected`, `by_status`, `error`, `outcome`, `enumeration_completed`, `watermark_advanced`,
+`retry_required`, `intentionally_bounded`, `unrecorded`, `incomplete_reason`, `elapsed_ms`.
 
 `by_status` is the run's own counter table rather than a summary of it. A document that ended
 `no_extractable_text` is neither an ingest nor a failure, and collapsing the two would hide
 exactly the outcome that needs looking at.
+
+`collected` and `uncollected` are the one pair here that is **not** a counter the run kept. They
+are measured once when it finishes, over this source's live documents, and they answer a
+question none of the others can: a run that indexed five hundred documents into a workspace
+whose collections are gone reports five hundred ingested, zero failed and `outcome: complete`,
+and every collection-scoped search over the result then refuses. The numbers are about the
+**source** rather than about the run, because membership is evaluated rather than stored
+([`storage.md`](storage.md) §11.2) — a document this run skipped as unchanged is in exactly the
+collections one it indexed is, and a figure counting only the touched half would be a smaller
+number meaning nothing in particular. For the same reason they are a point-in-time evaluation
+and not a durable fact: a rule changed five minutes later moves them, exactly as it moves
+`collection_counts` (§4.2).
+
+`null` for both means *not measured* — kept distinct from `0`, because zero documents in no
+collection is the healthy answer and a path that never asked must not be able to report it.
+`doctor`'s `collection-membership` check (§5) asks the same question of the whole workspace.
 
 `outcome` is the automation contract:
 
@@ -802,6 +818,30 @@ now retains the counters while failing explicitly:
 }
 ```
 
+The other shape worth writing down is the one that is not a failure anywhere and is still worth
+looking at — a run that did everything right into a workspace with nothing to file it under:
+
+```json
+{
+  "op": "connector_sync",
+  "ok": true,
+  "data": {
+    "outcome": "complete",
+    "discovered": 503,
+    "ingested": 503,
+    "failed": 0,
+    "collected": 0,
+    "uncollected": 503
+  }
+}
+```
+
+Nothing here is an error and `ok` is correctly `true`: every document was fetched, parsed,
+chunked, embedded and stored, and all of it is searchable. What the last two numbers say is that
+a collection-scoped search over this corpus reaches none of it. The command line prints the pair
+as `in collections` and `in no collection`, and says the sentence out loud when the first is
+zero.
+
 ### `doctor` → `Diagnosis`
 
 `state`, `schema_version`, `manicule_version`, `checked_at` and `checks[]`, each
@@ -815,9 +855,10 @@ behavior actually wants — `manicule_version` and the envelope's `version` both
 release whether or not anything changed.
 
 Checks, in the order `doctor` emits them: `configuration`, `transport`, `plugins`, `storage`,
-`permissions`, `index`, `vector_integrity`, `glossary`, `connectors`, `authoring`, `sessions`,
-`document-identity`, `document-content`, `wiki-provenance`, `grammars`, `vocabularies`,
-`models`, and `component:<kind>:<name>` for anything already constructed.
+`permissions`, `index`, `vector_integrity`, `glossary`, `connectors`, `authoring`,
+`collection-membership`, `sessions`, `document-identity`, `document-content`,
+`wiki-provenance`, `grammars`, `vocabularies`, `models`, and `component:<kind>:<name>` for
+anything already constructed.
 
 `authoring` is `ok` when the feature is off. Configured, it asks whether each name in
 `authoring.collections` is a collection this workspace has — `failing` if not, because
@@ -827,6 +868,41 @@ collection with no such prefix is `degraded`: authoring still works, but it is t
 that works, because `document_create` writes membership one document at a time. A file that
 reached the same directory by a sync joins nothing, and the only symptom is a collection-scoped
 search quietly returning less. The remedy names the `collection rule set` command that ends it.
+
+`connectors` is `ok` with no sources configured, and `ok` when every configured source is named
+after its own type. Otherwise it counts the documents filed under a connector *type* name while
+an instance of that type is configured under a different one — the identity change in
+[#94](https://github.com/mgd43b/manicule/issues/94), which moved `documents.source` from the
+component name to the instance name. Those documents keep working; the next sync indexes the
+same pages again under new ids and leaves the existing rows behind, so the corpus appears to
+have doubled with nothing reporting an error. `degraded` rather than `failing`, because the
+damage is prospective: it names the affected type names in `facts.affected`, the count in
+`facts.documents`, and a `document list --source` command to inspect them with. There is no bulk
+reconciliation for this and the wording deliberately does not imply one.
+
+`collection-membership` asks the same question of every collection rather than only the ones
+authoring names, and it asks it of the corpus rather than of the configuration. `facts` carry
+three numbers — `documents`, `collections` and `uncollected` — and the last is the complement of
+membership: live documents that no collection holds, by hand or by rule.
+
+**A workspace holding documents and no collections at all is `degraded`.** There, a
+collection-scoped `search` refuses the scope, `collection_counts` refuses the name and
+`document_create` refuses the write, so a whole surface of the product answers refusals while
+every other signal reports health — an unscoped search answers, `index --stats` counts the
+corpus, and the sync that wrote it said `outcome: complete`. It is also what a corpus nobody
+organizes by collection looks like. The two are indistinguishable from here, and the answer to
+an ambiguous state that is expensive to be wrong about is to report it rather than guess; a
+deployment that has chosen it excludes the check by `name`. The remedy is `collection list`,
+because what to recreate is a thing only the operator knows.
+
+**Documents outside collections that do exist is `ok`, with the count in the sentence.**
+Collections are optional and a corpus can be partly organized on purpose, so amber here would
+put a permanent warning on every corpus anybody has indexed without filing all of it — which is
+how a reader learns to skim `doctor`. `collection orphans` — command line only, and in §4's operation
+table — names the documents; it reports rather than removes unless asked to.
+
+It is never `failing`. Nothing stored is damaged and nothing is lost, which is the same reading
+`connectors` applies to prospective rather than present harm.
 
 `transport` reports the bind: `ok` for loopback, `degraded` for a non-loopback bind with
 authentication on, and `failing` for one without it — including when `--no-authentication` made

@@ -188,7 +188,9 @@ any of that. `sweep-vectors` purges soft-deleted documents whose grace period ha
 which restoring one costs a re-parse rather than being free — and it needs no assistant, because
 a served installation already runs it on a schedule.
 `collection orphans` moves every document outside every collection into the trash, which in a
-corpus where collections are optional is most of it.
+corpus where collections are optional is most of it. Asking how many there *are* needs none of
+that: `doctor`'s `collection-membership` check counts them on every surface, and a sync reports
+the figure for its own source.
 
 ## HTTP endpoints — 62
 

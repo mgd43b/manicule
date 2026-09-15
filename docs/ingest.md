@@ -2269,6 +2269,15 @@ completed, whether a watermark advanced, whether retry is required, and the type
 reason. This makes an incomplete source walk observable without inferring it from a missing
 watermark or parsing a sentence.
 
+One fact in a run's report is not a counter the run kept. `collected` and `uncollected` are
+measured after it finishes, over this source's live documents, because **nothing in this
+pipeline ever writes a collection membership row** — rule-driven membership is evaluated at read
+time and manual membership is written only by `document_create` ([`storage.md`](storage.md)
+§11.2). There is therefore no moment inside a sync at which a document "joins" anything to be
+counted, and what is true afterwards is what gets reported. A run whose every counter is perfect
+into a workspace with no collections reports `uncollected` equal to the whole of its source,
+which is the one number that says so ([`surfaces.md`](surfaces.md) §5).
+
 Two records serve different purposes. `connectors.metadata.last_run` is the overwritten public
 diagnostic summary. `acquisition_runs` and `acquisition_records` are relational correctness
 state: committed source coverage, completion/candidate markers, leases and pending local work.
@@ -2515,13 +2524,20 @@ enumerated everything: that is the same `--limit`-shaped mistake §13.2.2 descri
 
 Complementing the storage checks (`storage.md` §10) and the parse checks (`parsing.md` §6.6).
 
-There is no `doctor` command yet — it belongs to the CLI work, alongside the storage checks
-(`storage.md` §10) and the parse checks (`parsing.md` §6.6), none of which have one either.
-What the pipeline owes it is the *data*, and each row below names something already recorded
+`doctor` exists; [`surfaces.md`](surfaces.md) §5 is its contract and carries the list of checks
+it actually emits. **This section is the ingest side's standing wish-list, and the rows below
+are not all shipped** — that distinction is the thing to read it with, because the section
+predates the command and for a while claimed the command did not exist at all.
+
+What the pipeline owes `doctor` is the *data*, and each row names something already recorded
 rather than something to be derived later: statuses and `updated_at` on `documents`, kill counts
 by reason on the worker pool, `last_run` counters and `last_clean_reconcile_at` on
 `connectors.metadata`, `proposed_deletion` where guard 2 fired, `original_omitted_reason` on
-every document that has no retained bytes, and the lock file's holder.
+every document that has no retained bytes, and the lock file's holder. Two ingest-adjacent
+checks are shipped today and are named in `surfaces.md` rather than repeated here: `connectors`,
+for documents filed under a connector *type* while an instance of that type is configured, and
+`collection-membership`, for a corpus no collection holds — the second of which the pipeline
+also reports per run, as `collected`/`uncollected` on `IngestReport` (§13.1).
 
 | Check | Detects |
 |---|---|
