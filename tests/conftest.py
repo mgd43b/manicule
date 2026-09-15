@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -169,3 +170,71 @@ def color_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in CLEARED_TERMINAL_VARIABLES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TERM", BASELINE_TERM)
+
+
+_OPEN_CONNECTIONS: dict[int, tuple[str, str]] = {}
+"""Every ``aiosqlite`` connection opened and not yet closed, with where it was opened."""
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Record where every ``aiosqlite`` connection was opened, so a leaked one names its line.
+
+    **Why this exists rather than trusting the warning.**
+    ``aiosqlite.Connection.__del__`` warns when a connection is collected unclosed, and
+    ``filterwarnings = ["error"]`` turns that into a failure — but it is raised *inside*
+    ``__del__``, where it cannot propagate, so pytest reports it as a
+    ``PytestUnraisableExceptionWarning`` against whichever test happened to be running when the
+    collector fired. On 2026-09-14 that was ``tests/web/test_escaping.py``, which opens no
+    database at all, and the real leak survived three hunts behind the misdirection.
+
+    **This does not depend on the collector at all**, which is what makes it better than
+    forcing one. ``close`` removes the entry, so anything left in the dict at the end of the
+    session was opened and never closed — a fact about the code, not about when the garbage
+    collector happened to run. Forcing a collection at every teardown also works, and was
+    measured at **3.7x the suite's runtime** (7.64s against 2.07s on a 216-test sample, which
+    is roughly seven minutes per CI shard). This costs nothing measurable: the same sample runs
+    in 2.07s against a 2.22s baseline.
+    """
+    import traceback  # noqa: PLC0415
+
+    import aiosqlite  # noqa: PLC0415
+
+    del config
+    opened = aiosqlite.Connection.__init__
+    closed = aiosqlite.Connection.close
+
+    def remember(self: Any, *args: Any, **kwargs: Any) -> None:
+        opened(self, *args, **kwargs)
+        _OPEN_CONNECTIONS[id(self)] = (
+            os.environ.get("PYTEST_CURRENT_TEST", "<no test>"),
+            "".join(traceback.format_stack()[-12:-1]),
+        )
+
+    async def forget(self: Any, *args: Any, **kwargs: Any) -> Any:
+        _OPEN_CONNECTIONS.pop(id(self), None)
+        return await closed(self, *args, **kwargs)
+
+    aiosqlite.Connection.__init__ = remember
+    aiosqlite.Connection.close = forget
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Fail the session for a connection nobody closed, naming the test and the line.
+
+    A failure rather than a warning, because the alternative is the state this replaced: the
+    leak is real, it reddens CI eventually, and it does so against an innocent test on whichever
+    shard the collector happened to visit. Reported here rather than per test so a connection
+    deliberately held across tests is not mistaken for one that escaped.
+    """
+    del exitstatus
+    if not _OPEN_CONNECTIONS:
+        return
+    leaked = list(_OPEN_CONNECTIONS.values())
+    lines = [
+        f"{len(leaked)} aiosqlite connection(s) were opened and never closed. "
+        f"Unclosed, they warn from `__del__` during a later test, which is how this "
+        f"arrives as an unrelated test failing on one shard."
+    ]
+    lines.extend(f"\n--- opened during {test}\n{stack}" for test, stack in leaked[:5])
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    raise pytest.UsageError("\n".join(lines))
