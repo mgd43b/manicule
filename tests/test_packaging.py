@@ -268,6 +268,58 @@ def test_the_console_script_is_guarded(pyproject: dict[str, Any]) -> None:
     )
 
 
+def test_every_package_depends_on_a_manicule_that_exists() -> None:
+    """A sibling package's `manicule` requirement must admit the core it ships beside.
+
+    **The other half of the same bump, and the half that had no test.**
+    :func:`test_every_plugin_admits_the_running_version` reads `core_version=` out of Python
+    files; a distribution also states a range in its `pyproject.toml`, and those went past 0.2
+    unguarded. `manicule-ollama` required `manicule[embeddings]>=0.1,<0.2` and
+    `manicule-plugin-wikilinks` required `manicule>=0.1,<0.2`, so at 0.2.0 both were
+    *uninstallable* alongside the core they are released with.
+
+    That failure looks nothing like the other one, which is why it needs its own check. A stale
+    `core_version` produces a running manicule that refuses its plugins — loud, and every suite
+    sees it. A stale dependency pin produces a resolver error for somebody who typed
+    `pip install manicule-ollama`, on a machine nobody here is sitting at, and no test in this
+    repository runs a resolver.
+
+    Extras are kept on the requirement rather than stripped: `manicule[embeddings]` and
+    `manicule` are the same distribution and the same range applies, and parsing it back through
+    ``Requirement`` is what makes that true rather than assumed.
+    """
+    running = Version(CORE_VERSION)
+    if running == Version("0.0.0.dev0"):  # pragma: no cover - only in an uninstalled tree
+        pytest.skip("manicule is not installed; CORE_VERSION has no distribution to read")
+
+    declared: dict[Path, str] = {}
+    for manifest in sorted(PACKAGES.glob("*/pyproject.toml")):
+        with manifest.open("rb") as handle:
+            project = tomllib.load(handle).get("project", {})
+        optional = cast("dict[str, list[str]]", project.get("optional-dependencies", {}))
+        wanted = [*project.get("dependencies", []), *(e for g in optional.values() for e in g)]
+        for stated in wanted:
+            requirement = Requirement(stated)
+            if requirement.name == "manicule" and str(requirement.specifier):
+                declared[manifest.relative_to(REPO_ROOT)] = str(requirement.specifier)
+
+    assert declared, "no sibling package requires manicule; this test is reading the wrong paths"
+
+    refused = {
+        path: specifier
+        for path, specifier in declared.items()
+        # `prereleases=True` for the reason the sibling test gives: a release candidate is still
+        # the core being released beside these.
+        if not SpecifierSet(specifier, prereleases=True).contains(running)
+    }
+    assert not refused, (
+        f"manicule {running} is being released, and these packages require a manicule that "
+        f"excludes it: {refused}.\n"
+        "Installing them would resolve to an older core or fail outright. Widen the pins in the "
+        "same commit as the bump, alongside the plugin `core_version` ranges."
+    )
+
+
 def test_every_plugin_admits_the_running_version() -> None:
     """Every plugin here declares a `core_version` range that contains the running version.
 
