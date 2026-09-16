@@ -1290,9 +1290,10 @@ STOCK_COLLECTION: Final[dict[str, dict[str, Any]]] = {
 }
 """What ``qdrant/qdrant`` reports for a collection created with only a size and a distance.
 
-Recorded from v1.19.1, the server CI runs, and identical from v1.17.0. It is the collection every
-installation made before its shape was configurable, which is why it is a recording rather than
-something built here: the property under test is that a store leaves *that* collection alone.
+Recorded from v1.19.1 and identical from v1.17.0, the two servers CI runs this suite against. It
+is the collection every installation made before its shape was configurable, which is why it is a
+recording rather than something built here: the property under test is that a store leaves *that*
+collection alone.
 """
 
 

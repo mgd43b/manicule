@@ -1758,8 +1758,8 @@ once more after the update, and any dial still not in force raises `VectorStoreS
 each setting beside the value the collection has; a Qdrant too old to know a field is the likely
 cause, because it takes the request and ignores the field. A setting that reads as in force and is
 not is the failure the reconcile exists to close, and a log line nobody reads is that failure by a
-longer route. The reconcile's behavior was checked against `qdrant/qdrant` v1.19.1, the image CI
-runs, and against v1.17.0.
+longer route. CI runs the server suite against `qdrant/qdrant` v1.19.1 and v1.17.0, one on each side
+of the `memory` change.
 
 **The collection is checked before it is shaped, and in-process mode stops there.** A collection
 bearing this store's name was made by this store unless somebody made it by hand — on a dashboard,
