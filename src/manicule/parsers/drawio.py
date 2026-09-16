@@ -47,8 +47,9 @@ from urllib.parse import unquote
 from xml.etree import ElementTree
 
 from manicule.core.anchors import Anchor, HeadingAnchor, Unlocated
+from manicule.core.compression import RAW_DEFLATE_WBITS, inflate
 from manicule.core.content import BlockKind, ParsedBlock, RawDocument
-from manicule.core.errors import ParseError
+from manicule.core.errors import DecompressionError, DecompressionLimitError, ParseError
 from manicule.parsers.base import ParserProfile, decode
 from manicule.parsers.config import DRAWIO_MEDIA_TYPES, DrawioConfig
 
@@ -234,7 +235,7 @@ def _png_text(kind: bytes, body: bytes, *, max_bytes: int) -> str | None:
         if not rest or rest[0] != 0:
             msg = "zTXt chunk declares a compression method draw.io does not write"
             raise ParseError(msg)
-        payload = _inflate(rest[1:], max_bytes=max_bytes, wbits=zlib.MAX_WBITS, what="zTXt chunk")
+        payload = _expand(rest[1:], max_bytes=max_bytes, wbits=zlib.MAX_WBITS, what="zTXt chunk")
     return unquote(payload.decode("utf-8", errors="replace"))
 
 
@@ -256,51 +257,25 @@ def _diagram_model(element: ElementTree.Element, *, max_bytes: int) -> str | Non
             f"refusing to guess at a third encoding ({exc})"
         )
         raise ParseError(msg) from exc
-    inflated = _inflate(compressed, max_bytes=max_bytes, wbits=-zlib.MAX_WBITS, what="<diagram>")
+    inflated = _expand(compressed, max_bytes=max_bytes, wbits=RAW_DEFLATE_WBITS, what="<diagram>")
     return unquote(inflated.decode("utf-8", errors="replace"))
 
 
-def _inflate(data: bytes, *, max_bytes: int, wbits: int, what: str) -> bytes:
-    """Expand ``data``, refusing the moment it passes ``max_bytes``.
+def _expand(data: bytes, *, max_bytes: int, wbits: int, what: str) -> bytes:
+    """:func:`manicule.core.compression.inflate`, with its refusals spoken as this parser's.
 
-    Bounded while expanding rather than checked afterwards, which is §9.3's ruling for zip
-    members and is the same threat in a different container: a declared size is a field the
-    attacker wrote, and by the time ``len()`` can be taken the memory is already spent.
+    The bounding is shared with the sitemap reader because it is the same problem — a compressed
+    payload from outside the process, needing a ceiling on what it expands *to*. The vocabulary
+    is not shared: a parser declines with :class:`~manicule.core.errors.ParseError` so the next
+    one in the chain gets a turn, and the ceiling names the setting that moves it.
     """
-    engine = zlib.decompressobj(wbits)
-    out = bytearray()
-    pending = data
-    while True:
-        try:
-            part = engine.decompress(pending, _CHUNK)
-        except zlib.error as exc:
-            msg = f"{what} does not hold a readable deflate stream ({exc})"
-            raise ParseError(msg) from exc
-        out += part
-        if len(out) > max_bytes:
-            msg = (
-                f"{what} expands past the {max_bytes}-byte ceiling. Raise "
-                f"parsers.drawio.max_decompressed_bytes to read it, or leave it refused."
-            )
-            raise ParseError(msg)
-        if engine.eof:
-            return bytes(out)
-        if not part and engine.unconsumed_tail == pending:
-            # No output and no input consumed. Neither the byte ceiling nor the truncation check
-            # below can fire from here — `out` never grows and the tail never shrinks — so
-            # without this the loop is the only unbounded thing in a reader whose whole job is
-            # bounding untrusted input.
-            msg = f"{what} stopped producing output before its stream ended"
-            raise ParseError(msg)
-        pending = engine.unconsumed_tail
-        if not pending and not part:
-            # An empty tail alone does not mean the input ran out: capping the *output* leaves
-            # the rest of it buffered inside the decompressor with every byte of input already
-            # consumed, which is the ordinary state for any stream that expands past one chunk.
-            # Truncation is an empty tail that also yields nothing more, and reading the first
-            # half of that pair as the whole of it refused every diagram over ~128 KiB.
-            msg = f"{what} holds a truncated deflate stream"
-            raise ParseError(msg)
+    try:
+        return inflate(data, max_bytes=max_bytes, wbits=wbits, what=what)
+    except DecompressionLimitError as exc:
+        msg = f"{exc}. Raise parsers.drawio.max_decompressed_bytes to read it, or leave it refused."
+        raise ParseError(msg) from exc
+    except DecompressionError as exc:
+        raise ParseError(str(exc)) from exc
 
 
 def _parse_xml(source: str) -> ElementTree.Element:
