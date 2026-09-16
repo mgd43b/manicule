@@ -8,7 +8,7 @@ call, and ``docs/parsing.md`` §10 sizes it as its own unit of work for that rea
 **A shim, not a second parser.** The transport headers and the body are read out and
 reconstituted into an RFC 5322 message, which is then handed to
 :class:`~manicule.parsers.mail.MailParser`. Anchors, the canonical-body rule, chunking and
-round-trip behaviour are therefore identical between the two formats *by construction* rather
+round-trip behavior are therefore identical between the two formats *by construction* rather
 than by two implementations agreeing — which is worth more than it costs, and is the whole
 design. Attachments come along as ordinary MIME parts, so they become container members through
 the same code that serves ``.eml``, under the same ``mail:`` scheme.
@@ -25,7 +25,7 @@ share of what people export. There the headers are synthesized from the subject,
 properties and the recipient table, and the synthesized path is a required fixture (§3.5).
 
 **Two spellings, read rather than deduced.** A string property is stored as UTF-16 under a
-``001F`` stream or as 8-bit under ``001E``, signalled once by ``STORE_UNICODE_OK`` in
+``001F`` stream or as 8-bit under ``001E``, signaled once by ``STORE_UNICODE_OK`` in
 ``PidTagStoreSupportMask``. Both stream names are looked for and whichever exists is read. That
 is not guessing between them — only one is present — and it means a file that disagrees with its
 own flag still reads, which a reader that trusted the flag would not.
@@ -242,9 +242,15 @@ def _recipients(ole: object, *, limit: int) -> Iterator[tuple[str, str]]:
 
 
 def _attachments(ole: object, *, config: MsgConfig) -> Iterator[tuple[str, bytes]]:
-    for ordinal, storage in enumerate(_storages(ole, _ATTACHMENT_STORAGE)):
-        if ordinal >= config.max_attachments:
-            return
+    storages = _storages(ole, _ATTACHMENT_STORAGE)
+    if len(storages) > config.max_attachments:
+        msg = (
+            f"the message declares {len(storages)} attachments, above the "
+            f"{config.max_attachments} ceiling. Raise parsers.msg.max_attachments to read it, "
+            f"or leave it refused."
+        )
+        raise ParseError(msg)
+    for ordinal, storage in enumerate(storages):
         payload = _binary(ole, _ATTACH_DATA, prefix=storage, limit=config.max_attachment_bytes)
         if payload is None:
             continue

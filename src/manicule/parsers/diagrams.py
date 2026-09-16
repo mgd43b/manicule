@@ -487,7 +487,7 @@ _MXFILE_WRAPPERS: Final = frozenset({"object", "UserObject"})
 """Elements draw.io wraps a cell in when the shape carries custom fields.
 
 The wrapper then owns the id and the label and the ``mxCell`` inside it owns the geometry, so a
-reader that only looked at ``mxCell`` would see those shapes as unlabelled."""
+reader that only looked at ``mxCell`` would see those shapes as unlabeled."""
 
 
 def _read_mxfile(source: str) -> _Graph:

@@ -391,7 +391,7 @@ holds the reader table to this set, so the two cannot drift.
 ``mxfile`` has no grammar and needs none: it is XML, and
 :class:`~manicule.parsers.drawio.DrawioParser` has already decoded it by the time a chunk
 carrying it reaches the middleware. It is in this set because the *reading* is the same reading
-— labelled nodes and the edges between them — and a second rewrite path would mean two answers
+— labeled nodes and the edges between them — and a second rewrite path would mean two answers
 to one question. A mermaid diagram inserted through draw.io is served here and never by the
 mermaid grammar, because draw.io converts it to native shapes at insert time.
 """
@@ -670,7 +670,7 @@ class MsgConfig(BaseModel):
     """How the reconstituted message is read.
 
     The same configuration the ``.eml`` parser takes, held here rather than duplicated, because
-    ``.msg`` is a shim onto that parser and two settings for one behaviour would let a corpus
+    ``.msg`` is a shim onto that parser and two settings for one behavior would let a corpus
     chunk the same message two ways depending on which file it arrived in."""
 
     max_property_bytes: int = Field(
@@ -690,11 +690,19 @@ class MsgConfig(BaseModel):
     max_attachments: int = Field(
         default=64,
         ge=0,
-        description="Most attachments one message contributes before the rest are ignored.",
+        description="Most attachments one message may declare before it is refused.",
     )
     """Separate from :attr:`MailConfig.max_members` and narrower on purpose: this bounds the
     *reconstruction*, so a message declaring thousands of attachment storages costs a bounded
-    build rather than a bounded expansion of an unbounded message."""
+    build rather than a bounded expansion of an unbounded message.
+
+    **Past it the message is refused rather than rebuilt without the rest**, and that is the one
+    place this parser is coarser than the archive parser, which fails the member and keeps the
+    archive. The reason is the shim: reconstruction happens before there are members to fail, so
+    the only granularities available are the whole message or a silent omission — and a message
+    quietly rebuilt without four of its attachments is the failure `docs/parsing.md` §9.3 refuses
+    for containers. Both ceilings here are generous for that reason, and both name themselves in
+    the refusal so an operator can raise one."""
 
     max_attachment_bytes: int = Field(
         default=64 * 1024 * 1024,

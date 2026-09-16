@@ -72,7 +72,7 @@ RICH_MODEL = """<mxGraphModel>
 </mxGraphModel>"""
 """Labels that are rich text, and cells wrapped in ``<object>`` so the wrapper owns the label.
 
-A reader that only looked at ``mxCell`` would see these shapes as unlabelled, and one that did
+A reader that only looked at ``mxCell`` would see these shapes as unlabeled, and one that did
 not strip the markup would embed ``<b>`` as a word."""
 
 

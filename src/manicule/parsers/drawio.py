@@ -16,7 +16,7 @@ a document full of plausible mojibake instead of a visible failure.
 **A block's text is the decoded ``mxGraphModel``, and the relationships go in ``embed_text``.**
 That is §8.4.2's rule applied unchanged: the lexical leg indexes ``chunks.text``, so a node id
 or a style string stays searchable verbatim, and a citation into a diagram keeps quoting what
-the file holds. The reading — labelled nodes and the edges between them — is produced by
+the file holds. The reading — labeled nodes and the edges between them — is produced by
 :mod:`manicule.parsers.diagrams` under the ``mxfile`` language and installed by the same
 ``diagrams`` middleware that serves Graphviz and mermaid. One reader table, one rewrite, one
 fingerprint.

@@ -148,7 +148,7 @@ def test_a_disabled_cache_still_hands_back_a_vector_nobody_can_edit() -> None:
     """``capacity = 0`` decides what is remembered, never what a caller is allowed to do.
 
     Two code paths that differ in more than how much they keep is how a setting meant to be
-    a no-op becomes a behaviour change nobody tested.
+    a no-op becomes a behavior change nobody tested.
     """
     cache = EmbeddingCache(capacity=0)
     print_ = fingerprint()

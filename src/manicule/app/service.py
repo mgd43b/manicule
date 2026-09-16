@@ -711,7 +711,7 @@ def _declared(document: Document) -> str:
 SCANNED_CORPUS_RATIO = 0.05
 """The share of ``no_extractable_text`` documents above which a source is probably scanned.
 
-Five per cent, and the number is a judgement rather than a measurement — which is why it is a
+Five per cent, and the number is a judgment rather than a measurement — which is why it is a
 named constant an operator can read rather than a literal inside a sentence. Below it the
 explanation is ordinary: a spacer image, a blank page, a PDF that is genuinely one picture.
 Above it the explanation is usually the corpus, and the answer to a scanned corpus is OCR
@@ -4125,7 +4125,9 @@ class ApplicationService:
             for source, counts in measured.items()
             if counts[0] / counts[1] > SCANNED_CORPUS_RATIO
         }
-        share = {source: round(empty / total, 4) for source, (empty, total) in measured.items()}
+        share: dict[str, JsonValue] = {
+            source: round(empty / total, 4) for source, (empty, total) in measured.items()
+        }
         if not over:
             return r.Check(
                 name="extractable-text",
@@ -4135,7 +4137,7 @@ class ApplicationService:
                     if not measured
                     else "every source yields text from all but a small share of its documents"
                 ),
-                facts={"sources": len(measured), "threshold": SCANNED_CORPUS_RATIO, **share},
+                facts={"sources": len(measured), "threshold": SCANNED_CORPUS_RATIO, "share": share},
             )
         named = ", ".join(
             f"{source} ({empty}/{total})" for source, (empty, total) in sorted(over.items())
@@ -4150,7 +4152,7 @@ class ApplicationService:
                 f"stored and not searchable. The documents are kept with their status, so "
                 f"nothing is lost and they are selectable for re-parse if that changes."
             ),
-            facts={"sources": len(measured), "threshold": SCANNED_CORPUS_RATIO, **share},
+            facts={"sources": len(measured), "threshold": SCANNED_CORPUS_RATIO, "share": share},
             remedy=(
                 f"manicule document list --source {sorted(over)[0]} "
                 f"# then read a few: if they are scans, #23 is the ticket"

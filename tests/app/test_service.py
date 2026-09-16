@@ -3009,7 +3009,7 @@ async def test_a_few_unreadable_documents_are_ordinary_and_are_not_reported(
     check = _check(await ApplicationService(backend).doctor(), "extractable-text")
 
     assert check.state == "ok"
-    assert check.facts["notes"] == round(1 / 41, 4)
+    assert check.facts["share"] == {"notes": round(1 / 41, 4)}
 
 
 async def test_the_extractable_text_check_measures_each_source_separately(

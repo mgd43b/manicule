@@ -854,7 +854,7 @@ async def test_a_nested_container_emptied_of_members_retires_them() -> None:
     An archive inside an archive is an ordinary shape, and members removed from the inner one
     are exactly as invisible to connector reconciliation as members removed from the outer. A
     nested container that still yields *something* is reconciled either way; one emptied to
-    nothing is reconciled only if a container is recognised by what it was as well as by what
+    nothing is reconciled only if a container is recognized by what it was as well as by what
     it just produced.
     """
     pipeline, store, _ = build(

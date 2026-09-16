@@ -560,7 +560,7 @@ async def test_hard_deleting_a_container_takes_its_members_with_it(
 
     ``container_id``'s foreign key has to be added inline in ``ADD COLUMN``, which costs SQLite
     the constraint's *name* on reflection and therefore costs autogenerate the ability to
-    compare it — so the schema comparison is filtered and this behaviour is what holds the
+    compare it — so the schema comparison is filtered and this behavior is what holds the
     cascade honest instead.
     """
     container = make_document(source="confluence", source_id="bundle.zip")
