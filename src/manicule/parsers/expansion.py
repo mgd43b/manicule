@@ -236,6 +236,23 @@ class MemberFailure(BaseModel):
     depth: int = Field(ge=1)
     metadata: Metadata = Field(default_factory=dict)
 
+    truncates: bool = Field(
+        default=False,
+        description="Whether the enumeration stopped here, leaving members unseen.",
+    )
+    """The difference between "this member could not be read" and "the rest were never looked at".
+
+    Both are refusals and both are reported, but only the first says anything about what the
+    container holds. A ceiling — member count, or a whole-tree budget — ends the walk, so every
+    member after it is absent from the result while being perfectly present in the archive.
+
+    A consumer that mistook the second for the first would read a truncated list as an
+    authoritative one. The pipeline does exactly that when it reconciles a container against what
+    it just expanded to, which is why this is a field rather than a convention: defaulting to
+    ``False`` makes a parser that does not set it merely incomplete, and defaulting the
+    *pipeline* to refusing to reconcile makes an unset flag cost a deletion rather than cause
+    one."""
+
 
 type MemberOutcome = ExpandedMember | MemberFailure
 """What one member of a container turned into.

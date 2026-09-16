@@ -105,6 +105,13 @@ class _Graph:
     order: list[str] = field(default_factory=list[str])
     """Every identifier seen, in source order, so an unconnected node is still reported."""
 
+    truncated: bool = False
+    """Whether the reader stopped before the end of the source.
+
+    A reading that stops early and says nothing is a partial description of a diagram presented
+    as a complete one, which is worse than no reading: an embedder cannot tell that the half it
+    was given is a half."""
+
     def note(self, identifier: str) -> str:
         if identifier and identifier not in self.order:
             self.order.append(identifier)
@@ -245,6 +252,11 @@ def _lines(graph: _Graph) -> Iterator[str]:
         if group.label and members:
             mentioned.update(group.members)
             yield f'group "{group.label}": {", ".join(members)}'
+    if graph.truncated:
+        # Said in the reading rather than left to the caller, because the reading is the only
+        # thing the embedder sees. A partial diagram that looks complete is the failure this
+        # costs one line to avoid.
+        yield "… the diagram continues past this reader's limit"
     unconnected = [graph.name(item) for item in graph.order if item not in mentioned]
     named = [item for item in unconnected if item]
     # A diagram of boxes with no edges still states something, and its labels are the whole of
@@ -516,8 +528,14 @@ def _read_mxfile(source: str) -> _Graph:
         if element.tag in _MXFILE_WRAPPERS
         for child in element.findall("mxCell")
     }
-    for seen, element in enumerate(root.iter()):
-        if seen >= MAX_CELLS:
+    cells = 0
+    for element in root.iter():
+        # Counted per *cell*, not per XML element. Every vertex carries an `mxGeometry` and a
+        # wrapped one carries its `mxCell` too, so counting descendants spends the budget two
+        # or three times faster than the thing it is meant to bound — a ten-thousand-cell
+        # diagram would have been cut off around a third of the way in.
+        if cells >= MAX_CELLS:
+            graph.truncated = True
             break
         if element.tag in _MXFILE_WRAPPERS:
             cell = element.find("mxCell")
@@ -528,6 +546,7 @@ def _read_mxfile(source: str) -> _Graph:
             cell, identifier, label = element, element.get("id") or "", element.get("value") or ""
         else:
             continue
+        cells += 1
         drawn = plain_text(label)
         if cell.get("edge") == "1":
             head, tail = cell.get("source") or "", cell.get("target") or ""

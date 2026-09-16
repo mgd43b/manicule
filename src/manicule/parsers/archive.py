@@ -209,6 +209,7 @@ class ArchiveParser:
                         f"the archive, or raise maxMembers.",
                         DocumentStatus.FAILED,
                         address=_unique(inner_path(info.filename) or "member", ordinal, seen),
+                        truncates=True,
                     )
                     return
                 path = inner_path(info.filename)
@@ -241,6 +242,11 @@ class ArchiveParser:
                 )
                 if isinstance(outcome, ExpandedMember):
                     used_bytes += len(outcome.raw.as_bytes())
+                elif stop:
+                    # `stop` says the walk ends here, which makes this refusal the boundary of
+                    # what was looked at rather than a verdict on one member. A consumer
+                    # reconciling against the result has to be able to tell the two apart.
+                    outcome = outcome.model_copy(update={"truncates": True})
                 yield outcome
                 if stop:
                     return
@@ -479,6 +485,7 @@ def _refusal(
     status: DocumentStatus,
     *,
     address: str | None = None,
+    truncates: bool = False,
 ) -> MemberFailure:
     """A member that will not become a document, addressed so a person can find it.
 
@@ -496,5 +503,6 @@ def _refusal(
         status=status,
         reason=reason,
         depth=depth,
+        truncates=truncates,
         metadata={"member_name": path},
     )

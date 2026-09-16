@@ -16,6 +16,7 @@ import pytest
 from manicule.core.anchors import LineAnchor
 from manicule.core.errors import ParseError
 from manicule.parsers.config import MSG_MEDIA_TYPE, MailConfig, MsgConfig
+from manicule.parsers.expansion import ExpandedMember
 from manicule.parsers.mail import MailParser
 from manicule.parsers.msg import MsgParser
 from tests.parsers.support import check_corpus, check_fixture, raw_from, raw_of
@@ -156,6 +157,39 @@ async def test_an_attachment_becomes_a_member_through_the_email_parser(
 
     assert [member.source_id for member in members] == ["mail:typical.msg!/notes.txt"]
     assert [member.depth for member in members] == [1]
+
+
+async def test_an_attachment_keeps_the_media_type_the_message_declared(
+    parser: MsgParser, messages: Path
+) -> None:
+    """``PidTagAttachMimeTag`` is what the sender said the bytes were, and it is worth reading.
+
+    The mail parser infers a member's type from its filename only when the part declares none,
+    so an attachment with no extension reaches the parser chain as generic bytes and is routed
+    nowhere — while the message itself said, in a property this reader had declared and never
+    looked at, exactly what it was.
+    """
+    raw = raw_from(messages / "mime-tagged.msg", MSG_MEDIA_TYPE)
+
+    members = [member async for member in parser.expand(raw)]
+
+    expanded = [member for member in members if isinstance(member, ExpandedMember)]
+    assert [member.raw.media_type for member in expanded] == ["text/csv"]
+
+
+async def test_a_property_past_its_ceiling_is_refused_without_being_read_whole(
+    messages: Path,
+) -> None:
+    """The ceiling bounds the allocation, not just the verdict.
+
+    Reading a stream whole and measuring afterwards spends exactly the memory the limit exists
+    to protect — which would make these settings a report on the allocation rather than a bound
+    on it. One byte past the limit is enough to refuse and is all that is taken.
+    """
+    tight = MsgParser(MsgConfig(max_body_bytes=8))
+
+    with pytest.raises(ParseError, match="above the 8-byte ceiling"):
+        [block async for block in tight.parse(raw_from(messages / "typical.msg", MSG_MEDIA_TYPE))]
 
 
 async def test_the_blocks_are_the_ones_the_email_parser_would_have_produced(

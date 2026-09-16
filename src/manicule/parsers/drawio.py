@@ -273,7 +273,12 @@ def _inflate(data: bytes, *, max_bytes: int, wbits: int, what: str) -> bytes:
         if engine.eof:
             return bytes(out)
         pending = engine.unconsumed_tail
-        if not pending:
+        if not pending and not part:
+            # An empty tail alone does not mean the input ran out: capping the *output* leaves
+            # the rest of it buffered inside the decompressor with every byte of input already
+            # consumed, which is the ordinary state for any stream that expands past one chunk.
+            # Truncation is an empty tail that also yields nothing more, and reading the first
+            # half of that pair as the whole of it refused every diagram over ~128 KiB.
             msg = f"{what} holds a truncated deflate stream"
             raise ParseError(msg)
 
@@ -290,25 +295,37 @@ def _parse_xml(source: str) -> ElementTree.Element:
         raise ParseError(msg) from exc
 
 
-_ELEMENT_START = re.compile(r"<[A-Za-z_]")
-
-
 def _has_doctype(source: str) -> bool:
     """Whether a document type declaration appears before the root element.
 
-    A literal scan rather than an expat handler: the declaration can only be spelled one way and
-    can only appear in the prolog, so this is exact, while reaching into
-    :class:`xml.etree.ElementTree.XMLParser` for a handler means depending on an attribute the
-    standard library does not document.
+    A scan rather than an expat handler, because reaching into
+    :class:`xml.etree.ElementTree.XMLParser` for one means depending on an attribute the standard
+    library does not document. But it walks the prolog rather than searching it: a prolog is
+    whitespace, processing instructions and comments, and then either a ``DOCTYPE`` or the root
+    element, so stepping over the first three lands exactly on the answer.
 
-    The prolog ends at the first ``<`` that begins an element name, which is what makes the scan
-    exact rather than merely conservative: ``<?xml`` and ``<!--`` do not open one, and anything
-    after the root element has opened is content — where the literal string may legitimately
-    appear inside a label.
+    **Searching for the first element-looking token instead was a hole.** A comment may contain
+    anything, including ``<!-- <a> -->``, so a boundary taken at the first ``<`` followed by a
+    letter lands *inside* the comment and leaves a ``DOCTYPE`` after it unexamined — which is the
+    whole of the refusal, bypassed by a comment.
     """
-    opened = _ELEMENT_START.search(source)
-    prolog = source if opened is None else source[: opened.start()]
-    return "<!DOCTYPE" in prolog
+    at = 0
+    while at < len(source):
+        if source[at].isspace():
+            at += 1
+        elif source.startswith("<?", at):
+            end = source.find("?>", at)
+            if end < 0:
+                return False
+            at = end + 2
+        elif source.startswith("<!--", at):
+            end = source.find("-->", at)
+            if end < 0:
+                return False
+            at = end + 3
+        else:
+            return source.startswith("<!DOCTYPE", at)
+    return False
 
 
 def _serialize(element: ElementTree.Element) -> str:

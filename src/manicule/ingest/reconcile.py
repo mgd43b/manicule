@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, overload
 from uuid import uuid4
 
 from manicule.core.protocols import BatchedReconciliationConnector
+from manicule.ingest.containers import retire_derived
 from manicule.ingest.ports import ReconciliationStore
 
 if TYPE_CHECKING:
@@ -191,6 +192,12 @@ async def reconcile(
         document = await store.find_document(connector.name, source_id)
         if document is not None:
             await store.soft_delete_document(document.id)
+            # And whatever was expanded out of it. A member's source id was never in this
+            # connector's inventory, so the diff above cannot name it and a later pass never
+            # will — the query that finds candidates excludes derived documents on purpose.
+            # Leaving them behind is leaving documents that are searchable, citable, and
+            # unreachable by the only thing that would have removed them.
+            await retire_derived(store, document)
     await _record_clean(store, connector.name, now)
     return Reconciliation(
         connector=connector.name,

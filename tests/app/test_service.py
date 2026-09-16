@@ -3039,12 +3039,34 @@ async def test_the_extractable_text_check_measures_each_source_separately(
     assert "wiki" not in check.detail
 
 
+async def test_a_configured_source_with_no_documents_is_not_an_unconfigured_one(
+    backend: FakeBackend,
+) -> None:
+    """Two different states, and reporting the second as the first is a false statement.
+
+    A connector that is configured and has indexed nothing is an install mid-setup or a sync
+    that has not run; "no sources are configured" tells its operator to go and configure the
+    thing they already configured.
+    """
+    backend.settings = Settings(
+        connectors={"scans": ConnectorSettings(type="filesystem", options={"root": "/srv/scans"})}
+    )
+
+    check = _check(await ApplicationService(backend).doctor(), "extractable-text")
+
+    assert check.state == "ok"
+    assert check.facts["sources"] == 1
+    assert check.facts["measured"] == 0
+    assert "every configured source is empty" in check.detail
+
+
 async def test_an_empty_corpus_is_not_a_scanned_one(backend: FakeBackend) -> None:
     """Zero over zero is not a ratio, and a fresh install must not open amber."""
     check = _check(await ApplicationService(backend).doctor(), "extractable-text")
 
     assert check.state == "ok"
     assert check.facts["sources"] == 0
+    assert "no sources are configured" in check.detail
 
 
 # --- glossary lineage ------------------------------------------------------------------------

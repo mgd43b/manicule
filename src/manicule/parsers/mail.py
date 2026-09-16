@@ -212,6 +212,7 @@ class MailParser:
                     f"the limit is {self._config.max_members}. Raise maxMembers to index the "
                     f"rest.",
                     DocumentStatus.FAILED,
+                    truncates=True,
                 )
                 return
             if not self._config.expand_attachments:
@@ -331,6 +332,8 @@ class MailParser:
         depth: int,
         reason: str,
         status: DocumentStatus,
+        *,
+        truncates: bool = False,
     ) -> MemberFailure:
         return MemberFailure(
             source_id=member_source_id(raw.source_id, name, scheme=MAIL_SCHEME),
@@ -338,6 +341,7 @@ class MailParser:
             status=status,
             reason=reason,
             depth=depth,
+            truncates=truncates,
             metadata={"member_filename": name},
         )
 

@@ -146,6 +146,29 @@ def build(dest: Path) -> None:
             [],
         )
     )
+    # An attachment with no extension and a MAPI MIME tag that names what it is. Without
+    # reading `370E` the reconstituted part is `application/octet-stream`, the mail parser's
+    # filename fallback has nothing to work with, and a perfectly ordinary CSV is routed
+    # nowhere.
+    (dest / "mime-tagged.msg").write_bytes(
+        compound_file(
+            {
+                **_stream("007D", "001F", TRANSPORT_HEADERS),
+                **_stream("0037", "001F", "Quarterly numbers"),
+                **_stream("1000", "001F", BODY),
+            },
+            [
+                Storage(
+                    "__attach_version1.0_#00000000",
+                    {
+                        **_stream("3707", "001F", "quarterly-numbers"),
+                        **_stream("370E", "001F", "text/csv"),
+                        **_stream("3701", "0102", b"quarter,throughput\n2026Q1,1.2\n"),
+                    },
+                )
+            ],
+        )
+    )
     # Degenerate: named `.msg`, and not a compound file at all. It must be declined rather than
     # read as an empty message, because a message that indexes as empty looks like a success.
     (dest / "not-a-compound-file.msg").write_bytes(b"Subject: this is an .eml in disguise\n\nhi\n")

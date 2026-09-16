@@ -99,6 +99,20 @@ class AttemptResult:
     """:class:`~manicule.parsers.expansion.MemberOutcome` values. Typed loosely here so that
     this module does not import the expansion vocabulary it only ever passes through."""
 
+    enumerated: bool = False
+    """Whether an expander walked this document to the end, so ``members`` is all of them.
+
+    **Not the same as "members is non-empty", and the difference is a deletion.** A parser that
+    reaches a member ceiling reports the refusal and stops, so what comes back is a prefix of a
+    container that is perfectly intact. A consumer reconciling a container against what it just
+    expanded to would read that prefix as the whole membership and retire everything past the
+    ceiling.
+
+    ``False`` by default, and every path that did not expand leaves it there — a declined
+    parser, a failed one, a document nothing expanded. That is the safe direction: an unset flag
+    costs a reconciliation, where a wrongly set one costs documents.
+    """
+
 
 def _attempt_output_bytes(result: AttemptResult) -> int:
     """Exact bytes the complete parse reply would put on the process pipe."""
@@ -165,6 +179,16 @@ class ParseRunner(Protocol):
     async def run_attempt(self, name: str, raw: RawDocument) -> AttemptResult: ...
 
 
+def _enumerated(members: Sequence[object]) -> bool:
+    """Whether a completed expansion saw the whole container.
+
+    The walk ran to its end unless one of its own refusals says otherwise, which is what
+    :attr:`~manicule.parsers.expansion.MemberFailure.truncates` records. Asked with ``getattr``
+    because this module deliberately does not import the expansion vocabulary it passes through.
+    """
+    return not any(getattr(member, "truncates", False) for member in members)
+
+
 async def attempt_one(parser: object, name: str, raw: RawDocument) -> AttemptResult:
     """Give one already-constructed parser its turn, reading it and expanding it.
 
@@ -204,7 +228,10 @@ async def attempt_one(parser: object, name: str, raw: RawDocument) -> AttemptRes
             # object that only expands is a legitimate thing to be handed, and asking it for
             # blocks it never offered would fail the document on an `AttributeError`.
             return AttemptResult(
-                [], Attempt(parser=name, outcome=Outcome.PARSED), members=tuple(members)
+                [],
+                Attempt(parser=name, outcome=Outcome.PARSED),
+                members=tuple(members),
+                enumerated=_enumerated(members),
             )
         expanded = ParserChain(parsers={name: parser}, chains={})
         blocks, read = await expanded.attempt(name, raw)
@@ -217,7 +244,10 @@ async def attempt_one(parser: object, name: str, raw: RawDocument) -> AttemptRes
         # and a message can be an attachment with no body. The attempt still succeeded, because
         # expansion is what this parser was asked for.
         return AttemptResult(
-            list(blocks), Attempt(parser=name, outcome=Outcome.PARSED), members=tuple(members)
+            list(blocks),
+            Attempt(parser=name, outcome=Outcome.PARSED),
+            members=tuple(members),
+            enumerated=_enumerated(members),
         )
 
     chain = ParserChain(parsers={name: parser}, chains={})  # pyright: ignore[reportArgumentType]

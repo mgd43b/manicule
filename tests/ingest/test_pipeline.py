@@ -933,6 +933,113 @@ async def test_a_superseded_container_does_not_retire_the_members_it_never_saw()
     assert await store.find_document("memory", "bundle!/two") is not None
 
 
+async def test_a_truncated_expansion_retires_nothing() -> None:
+    """A member ceiling ends the walk, so what came back is a prefix of an intact archive.
+
+    This is the difference between "this member could not be read" and "the rest were never
+    looked at", and reading the second as the first retires every member past the ceiling — of
+    a container that still holds every one of them. Both parsers stop at their ceiling, so this
+    is the ordinary shape of a large archive rather than a corner.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+
+    class Truncating(fakes.FakeArchive):
+        """Yields the first member, then says the walk stopped rather than ended."""
+
+        @override
+        async def expand(self, raw: RawDocument) -> AsyncIterator[fakes.MemberOutcome]:
+            async for member in super().expand(raw):
+                yield member
+                yield fakes.MemberFailure(
+                    source_id=f"{raw.source_id}!/ceiling",
+                    uri=f"fake:{raw.uri}!/ceiling",
+                    status=DocumentStatus.FAILED,
+                    reason="member count exceeded",
+                    depth=1,
+                    truncates=True,
+                )
+                return
+
+    truncated, _, _ = build(
+        store=store,
+        parsers={"archive": Truncating(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector.documents["bundle"] = "one=alpha\ntwo=gamma"
+    await truncated.run(connector)
+
+    assert await store.find_document("memory", "bundle!/two") is not None, (
+        "`two` was never looked at, and a member nobody looked at is not a member that has gone"
+    )
+
+
+async def test_a_container_that_failed_to_parse_retires_nothing() -> None:
+    """Failing to read an archive is not reading it and finding it empty.
+
+    The bytes are unchanged and every member is still in there; what changed is that this build
+    could not open it. Retiring the members on that basis turns one parser fault into a corpus
+    losing documents it can still see.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+
+    class Breaking(fakes.FakeArchive):
+        @override
+        async def expand(self, raw: RawDocument) -> AsyncIterator[fakes.MemberOutcome]:
+            del raw
+            msg = "the archive index could not be read"
+            raise RuntimeError(msg)
+            yield  # pragma: no cover - present to make this an async generator
+
+    broken, _, _ = build(
+        store=store,
+        parsers={"archive": Breaking(), "lines": fakes.LineParser()},
+        chain=("archive",),
+    )
+    connector.documents["bundle"] = "one=alpha\ntwo=beta\nthree=delta"
+    await broken.run(connector)
+
+    assert await store.find_document("memory", "bundle!/one") is not None
+    assert await store.find_document("memory", "bundle!/two") is not None
+
+
+async def test_retiring_a_nested_container_retires_what_was_inside_it() -> None:
+    """A soft delete does not cascade, and the descendants it leaves are unreachable.
+
+    ``container_id`` carries ``ON DELETE CASCADE`` and that runs on a *hard* delete. Retiring a
+    member that is itself a container therefore leaves its own members live — and connector
+    reconciliation excludes derived documents by design, so nothing else will ever remove them.
+    Searchable, citable, and orphaned.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"outer": "inner.zip=one=alpha\\ntwo=beta\nkeep=gamma"})
+    connector.media_types["outer"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+    assert await store.find_document("memory", "outer!/inner.zip!/one") is not None
+
+    connector.documents["outer"] = "keep=gamma"  # the nested archive is gone from the outer one
+    await pipeline.run(connector)
+
+    assert await store.find_document("memory", "outer!/inner.zip") is None
+    assert await store.find_document("memory", "outer!/inner.zip!/one") is None
+    assert await store.find_document("memory", "outer!/inner.zip!/two") is None
+    assert await store.find_document("memory", "outer!/keep") is not None
+
+
 async def test_reconciliation_never_sees_a_document_no_connector_could_report() -> None:
     """The defect this ownership column exists for, stated as the arithmetic that produced it.
 

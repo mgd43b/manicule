@@ -94,6 +94,14 @@ Only the storages' streams are read here, so the shorter header is the one that 
 _PROPERTY_ENTRY: Final = 16
 """Four bytes of tag, four of flags, eight of value."""
 
+_MAX_PROPERTIES_BYTES: Final = 1 << 20
+"""Ceiling on one storage's properties stream, which holds fixed-width values and nothing else.
+
+A megabyte is roughly sixty-five thousand entries against the handful a recipient or attachment
+actually declares, so it bounds the read without being reachable by a real file. A constant
+rather than configuration for the same reason ``MsgConfig`` has no field for it: nobody tunes the
+size of a table of eight-byte integers."""
+
 _CARRIED_HEADERS: Final = ("From", "To", "Cc", "Date", "Subject")
 """The headers copied from the transport block onto the reconstituted message.
 
@@ -195,8 +203,8 @@ def _message(ole: object, *, config: MsgConfig) -> bytes:
         # `.eml` parser already emits the header block alone for it.
         built.set_content("")
 
-    for name, payload in _attachments(ole, config=config):
-        built.add_attachment(payload, maintype="application", subtype="octet-stream", filename=name)
+    for name, payload, (maintype, subtype) in _attachments(ole, config=config):
+        built.add_attachment(payload, maintype=maintype, subtype=subtype, filename=name)
     return built.as_bytes(policy=SMTP)
 
 
@@ -241,7 +249,27 @@ def _recipients(ole: object, *, limit: int) -> Iterator[tuple[str, str]]:
             yield entry, kind
 
 
-def _attachments(ole: object, *, config: MsgConfig) -> Iterator[tuple[str, bytes]]:
+def _media_type(declared: str) -> tuple[str, str]:
+    """``PidTagAttachMimeTag`` split for :meth:`EmailMessage.add_attachment`, or a safe default.
+
+    Worth reading rather than labeling everything ``application/octet-stream``: the mail parser
+    infers a member's type from its filename only when the part declares none, so an
+    extensionless attachment — or one whose extension disagrees with what the sender said it was
+    — otherwise reaches the parser chain as generic bytes and is routed nowhere.
+
+    Anything that is not one plain ``type/subtype`` falls back to the default rather than being
+    passed through, because the value is attacker-controlled and ``add_attachment`` puts it into
+    a header verbatim.
+    """
+    maintype, _, subtype = declared.strip().lower().partition("/")
+    if not (maintype.isascii() and maintype.isalnum() and subtype.isascii() and subtype):
+        return "application", "octet-stream"
+    if not subtype.replace("-", "").replace("+", "").replace(".", "").isalnum():
+        return "application", "octet-stream"
+    return maintype, subtype
+
+
+def _attachments(ole: object, *, config: MsgConfig) -> Iterator[tuple[str, bytes, tuple[str, str]]]:
     storages = _storages(ole, _ATTACHMENT_STORAGE)
     if len(storages) > config.max_attachments:
         msg = (
@@ -259,7 +287,8 @@ def _attachments(ole: object, *, config: MsgConfig) -> Iterator[tuple[str, bytes
             or _text(ole, _ATTACH_NAME, prefix=storage, limit=config.max_property_bytes)
             or f"attachment-{ordinal + 1}"
         )
-        yield name, payload
+        declared = _text(ole, _ATTACH_MIME_TAG, prefix=storage, limit=config.max_property_bytes)
+        yield name, payload, _media_type(declared)
 
 
 def _storages(ole: object, pattern: re.Pattern[str]) -> list[str]:
@@ -282,22 +311,31 @@ def _listdir(ole: object) -> Sequence[Sequence[str]]:
     return listdir(streams=True, storages=False)
 
 
-def _stream(ole: object, tag: str, kind: str, *, prefix: str | None = None) -> bytes | None:
+def _stream(ole: object, tag: str, kind: str, *, prefix: str | None, limit: int) -> bytes | None:
+    """One property stream, read to at most ``limit + 1`` bytes.
+
+    The extra byte is the whole point: enough to know the property is over its ceiling, and not
+    enough to pay for it. Reading the stream whole and measuring afterwards spends exactly the
+    memory the ceiling exists to protect, which would make the limits in
+    :class:`~manicule.parsers.config.MsgConfig` a report on the allocation rather than a bound on
+    it — and a ``.msg`` is a file from the corpus, so the size it declares is a number somebody
+    else wrote.
+    """
     name = f"__substg1.0_{tag}{kind}"
     path = name if prefix is None else f"{prefix}/{name}"
     exists = ole.exists  # pyright: ignore[reportAttributeAccessIssue] - olefile has no stubs
     if not exists(path):
         return None
     with ole.openstream(path) as handle:  # pyright: ignore[reportAttributeAccessIssue]
-        return handle.read()
+        return handle.read(limit + 1)
 
 
 def _text(ole: object, tag: str, *, prefix: str | None = None, limit: int) -> str:
     """A string property in whichever of its two spellings the file used."""
-    unicode_bytes = _stream(ole, tag, _UNICODE, prefix=prefix)
+    unicode_bytes = _stream(ole, tag, _UNICODE, prefix=prefix, limit=limit)
     if unicode_bytes is not None:
         return _bounded(unicode_bytes, limit, tag).decode("utf-16-le", errors="replace")
-    ansi_bytes = _stream(ole, tag, _ANSI, prefix=prefix)
+    ansi_bytes = _stream(ole, tag, _ANSI, prefix=prefix, limit=limit)
     if ansi_bytes is not None:
         return _bounded(ansi_bytes, limit, tag).decode("cp1252", errors="replace")
     return ""
@@ -310,7 +348,7 @@ def _binary(ole: object, tag: str, *, prefix: str | None = None, limit: int) -> 
     ``…1013001F`` by analogy with the plain body finds nothing and concludes the message has no
     HTML part (``docs/parsing.md`` §10).
     """
-    found = _stream(ole, tag, _BINARY, prefix=prefix)
+    found = _stream(ole, tag, _BINARY, prefix=prefix, limit=limit)
     return None if found is None else _bounded(found, limit, tag)
 
 
@@ -321,7 +359,7 @@ def _long(ole: object, tag: int, *, prefix: str) -> int:
     if not exists(path):
         return 0
     with ole.openstream(path) as handle:  # pyright: ignore[reportAttributeAccessIssue]
-        data: bytes = handle.read()
+        data: bytes = handle.read(_MAX_PROPERTIES_BYTES)
     for at in range(_PROPERTIES_HEADER, len(data) - _PROPERTY_ENTRY + 1, _PROPERTY_ENTRY):
         if int.from_bytes(data[at : at + 4], "little") == tag:
             return int.from_bytes(data[at + 8 : at + 12], "little")

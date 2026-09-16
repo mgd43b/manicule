@@ -767,6 +767,32 @@ class SqliteDocStore(
             )
         return row, None
 
+    async def _require_own_container(self, session: AsyncSession, document: Document) -> None:
+        """Refuse a container that belongs to another workspace, or to nothing.
+
+        ``document_id`` carries the workspace, so an id built the ordinary way cannot cross the
+        boundary — but ``container_id`` arrives as a field on a caller's value and is copied onto
+        the row verbatim. The consequence is not a stale pointer: the column is a foreign key
+        with ``ON DELETE CASCADE``, so hard-deleting a container in workspace A would take a
+        child in workspace B with it, which is a tenant deleting another tenant's documents by
+        removing one of their own.
+
+        The migration adopts existing parents within each workspace and the column is a
+        single-column foreign key, so nothing in the schema prevents the next write from getting
+        it wrong. This does, at the one point every write goes through.
+        """
+        if document.container_id is None:
+            return
+        owner = await session.get(models.Document, document.container_id)
+        if owner is None or owner.workspace_id != self._workspace_id:
+            held = "no workspace" if owner is None else repr(owner.workspace_id)
+            msg = (
+                f"document {document.id!r} names container {document.container_id!r}, which "
+                f"belongs to {held} rather than {self._workspace_id!r}. A container and its "
+                f"members are one cascade, so they have to be one tenant's."
+            )
+            raise CrossWorkspaceCollisionError(msg)
+
     async def _write_document(self, session: AsyncSession, document: Document) -> Document:
         """The write both :meth:`upsert_document` and :meth:`commit_document` perform.
 
@@ -778,6 +804,7 @@ class SqliteDocStore(
             raise CrossWorkspaceCollisionError(
                 _cross_workspace(document.id, row.workspace_id, self._workspace_id)
             )
+        await self._require_own_container(session, document)
         if row is None:
             row = models.Document(id=document.id, workspace_id=self._workspace_id)
             session.add(row)

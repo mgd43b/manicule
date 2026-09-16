@@ -108,6 +108,7 @@ from manicule.core.protocols import BatchedDiscoveryConnector, EnumerationProgre
 from manicule.core.provenance import Provenance
 from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, SourceId
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError
+from manicule.ingest.containers import retire_subtree
 from manicule.ingest.embedding import DEFAULT_TARGET_BATCH_TOKENS, EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
@@ -436,6 +437,13 @@ class DocumentOutcome:
 
     members: tuple[str, ...] = ()
     """Source ids of documents found inside this one, queued rather than recursed into."""
+
+    enumerated: bool = False
+    """Whether an expander walked this document to the end, so :attr:`members` is all of them.
+
+    What container reconciliation is allowed to act on. ``False`` on every outcome that did not
+    expand — skipped, superseded, failed, declined, or simply not a container — because the
+    consequence of believing it wrongly is retiring documents that are still there."""
 
     embedding: EmbeddingWork = field(default_factory=EmbeddingWork)
     """What the embed stage cost: what was reused, what was embedded, and how many batches.
@@ -3399,7 +3407,11 @@ class IngestPipeline:
             derived[outcome.document_id] = set()
         while queue:
             owner, member = queue.pop(0)
-            derived.setdefault(owner, set()).add(member.source_id)
+            # Only for an owner the gate above admitted. `setdefault` here would re-create the
+            # entry the gate had just refused, and fill it with a partial member list — which
+            # is the whole hazard, reintroduced one line after being guarded against.
+            if owner in derived:
+                derived[owner].add(member.source_id)
             if isinstance(member, MemberFailure):
                 outcomes.append(
                     await self._record_member_failure(
@@ -3590,7 +3602,7 @@ class IngestPipeline:
 
         await self._advance(existing, DocumentStatus.PARSING)
 
-        result, members = await self._parse(raw)
+        result, members, enumerated = await self._parse(raw)
         if members and not result.blocks:
             # A container is a document with nothing of its own, and that is what the status
             # says: zero chunks, its content being the documents its members became. A message
@@ -3642,6 +3654,7 @@ class IngestPipeline:
                     failed_stage=result.failed_stage,
                     glossary_detail=glossary_detail,
                     members=tuple(member.source_id for member in members),
+                    enumerated=enumerated,
                 ),
                 members,
             )
@@ -3659,8 +3672,15 @@ class IngestPipeline:
         # invisible while every member-producing document was a container and therefore never
         # reached this branch.
         if not members:
-            return finished, ()
-        return replace(finished, members=tuple(member.source_id for member in members)), members
+            return replace(finished, enumerated=enumerated), ()
+        return (
+            replace(
+                finished,
+                members=tuple(member.source_id for member in members),
+                enumerated=enumerated,
+            ),
+            members,
+        )
 
     async def _retire_absent_members(
         self, container_id: str, present: set[str]
@@ -3683,15 +3703,19 @@ class IngestPipeline:
         for member in await self._store.container_members(container_id):
             if member.source_id in present:
                 continue
-            await self._store.soft_delete_document(member.id)
-            outcomes.append(
-                DocumentOutcome(
-                    source_id=member.source_id,
-                    status=DocumentStatus.DELETED,
-                    document_id=member.id,
-                    detail="no longer present in the container that produced it",
+            # The whole subtree, because a soft delete does not cascade: `container_id` carries
+            # `ON DELETE CASCADE` and that runs on a hard delete. A removed member that is
+            # itself a container would otherwise leave its own members live *and* unreachable,
+            # since connector reconciliation excludes derived documents by design.
+            for retired in await retire_subtree(self._store, member):
+                outcomes.append(
+                    DocumentOutcome(
+                        source_id=retired.source_id,
+                        status=DocumentStatus.DELETED,
+                        document_id=retired.id,
+                        detail="no longer present in the container that produced it",
+                    )
                 )
-            )
         return outcomes
 
     async def _record_member_failure(
@@ -3748,7 +3772,7 @@ class IngestPipeline:
             raise ValueError(msg)
         return raw
 
-    async def _parse(self, raw: RawDocument) -> tuple[ChainResult, tuple[MemberOutcome, ...]]:
+    async def _parse(self, raw: RawDocument) -> tuple[ChainResult, tuple[MemberOutcome, ...], bool]:
         """Run the resolved chain, remembering whether the winner was a container.
 
         The chain is resolved **once, before the first attempt**, and recorded as it proceeds.
@@ -3778,10 +3802,11 @@ class IngestPipeline:
             attempted = tuple(a.attempt for a in captured)
             reason = f"{type(exc).__name__}: {exc}"
             broken = (*attempted, Attempt(parser="", outcome=Outcome.FAILED, reason=reason))
-            return classify(raw, broken), ()
+            return classify(raw, broken), (), False
         won = captured[-1] if captured else None
-        members = won.members if won is not None and won.attempt.outcome is Outcome.PARSED else ()
-        return result, tuple(members)  # pyright: ignore[reportReturnType]
+        if won is None or won.attempt.outcome is not Outcome.PARSED:
+            return result, (), False
+        return result, tuple(won.members), won.enumerated  # pyright: ignore[reportReturnType]
 
     async def _finish(
         self,
@@ -4893,17 +4918,21 @@ def _raise_lost_acquisition_lease(run_id: str) -> None:
 
 
 def _expanded(outcome: DocumentOutcome) -> bool:
-    """Whether this run actually re-derived the document's members.
+    """Whether this run walked the document's container to the end.
 
-    Two states look like "expanded to nothing" and are not. **Skipped**: change detection
-    stopped before the parser ran, so the archive was never opened — treating that as an empty
-    expansion retires every member of every container on the first sync that finds it
-    unchanged, which is every sync after the first. **Superseded**: the compare-and-swap found
-    newer bytes and nothing was written, so this run holds a stale view of a container somebody
-    else is mid-way through re-deriving, and its member list is the one thing here that is
-    certainly out of date.
+    One positive fact rather than a list of the ways it can be false, because the list kept
+    being short by one. **Skipped**: change detection stopped before the parser ran, so the
+    archive was never opened — treating that as an empty expansion retires every member of
+    every container on the first sync that finds it unchanged, which is every sync after the
+    first. **Superseded**: nothing was written and somebody else holds newer bytes.
+    **Failed, declined, or routed nowhere**: the container was not read, which is not the same
+    as reading it and finding nothing. **Truncated**: a member ceiling ended the walk, so what
+    came back is a prefix of an intact archive.
+
+    Every one of those leaves :attr:`DocumentOutcome.enumerated` at its default, so the gate is
+    the flag and the flag is set in exactly one place — by the expander that reached the end.
     """
-    return not outcome.skipped and not outcome.superseded
+    return outcome.enumerated
 
 
 def snapshot_scope(connector: Connector) -> tuple[str, str]:

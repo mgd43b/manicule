@@ -4134,10 +4134,17 @@ class ApplicationService:
                 state="ok",
                 detail=(
                     "no sources are configured, so there is no corpus to measure"
+                    if not sources
+                    else "every configured source is empty, so there is no corpus to measure"
                     if not measured
                     else "every source yields text from all but a small share of its documents"
                 ),
-                facts={"sources": len(measured), "threshold": SCANNED_CORPUS_RATIO, "share": share},
+                facts={
+                    "sources": len(sources),
+                    "measured": len(measured),
+                    "threshold": SCANNED_CORPUS_RATIO,
+                    "share": share,
+                },
             )
         named = ", ".join(
             f"{source} ({empty}/{total})" for source, (empty, total) in sorted(over.items())
@@ -4152,7 +4159,12 @@ class ApplicationService:
                 f"stored and not searchable. The documents are kept with their status, so "
                 f"nothing is lost and they are selectable for re-parse if that changes."
             ),
-            facts={"sources": len(measured), "threshold": SCANNED_CORPUS_RATIO, "share": share},
+            facts={
+                "sources": len(sources),
+                "measured": len(measured),
+                "threshold": SCANNED_CORPUS_RATIO,
+                "share": share,
+            },
             remedy=(
                 f"manicule document list --source {sorted(over)[0]} "
                 f"# then read a few: if they are scans, #23 is the ticket"
