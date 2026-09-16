@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/mgd43b/manicule/compare/v0.2.4...v0.2.5) (2026-09-16)
+
+
+### Features
+
+* **storage:** carry an existing vector index to another backend without re-embedding ([#387](https://github.com/mgd43b/manicule/issues/387)) ([3dbef8c](https://github.com/mgd43b/manicule/commit/3dbef8cb3caccc2aa73838503afd821fc5510595))
+
 ## [0.2.4](https://github.com/mgd43b/manicule/compare/v0.2.3...v0.2.4) (2026-09-15)
 
 
