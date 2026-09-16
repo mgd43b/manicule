@@ -193,6 +193,23 @@ class TelemetrySettings(Section):
     endpoint: str | None = None
 
 
+class LoggingSettings(Section):
+    requests: bool = Field(
+        default=True,
+        description="Write content-free HTTP and MCP request summaries to a local file and stderr.",
+    )
+    file: Path = Field(
+        default=Path("logs/requests.jsonl"),
+        description="Request log file. Relative paths are resolved beneath data_dir.",
+    )
+    max_bytes: int = Field(
+        default=10 * 1024 * 1024, ge=1, description="Rotate the request log at this many bytes."
+    )
+    backup_count: int = Field(
+        default=5, ge=1, description="Number of rotated request logs to keep."
+    )
+
+
 class AuditDestination(StrEnum):
     LOCAL = "local"
     SYSLOG = "syslog"
@@ -1528,6 +1545,7 @@ class Settings(BaseSettings):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     events: EventSettings = Field(default_factory=EventSettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
+    logging: LoggingSettings = Field(default_factory=LoggingSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
     authoring: AuthoringSettings = Field(default_factory=AuthoringSettings)
 
@@ -2047,6 +2065,7 @@ __all__ = [
     "GlossarySettings",
     "IngestSettings",
     "LlmSettings",
+    "LoggingSettings",
     "Mode",
     "OAuthProvider",
     "PluginSettings",

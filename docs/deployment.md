@@ -25,14 +25,32 @@ with no `XDG_DATA_HOME` set — and is overridden by `data_dir` in the config fi
 | `manicule.db` | SQLite: documents, chunks, versions, workspaces, API key digests, conversations |
 | `vectors/` | The LanceDB table the dense leg searches — under the default, `storage.vector_db = "lancedb"` |
 | `blobs/sha256/…` | **The retained original bytes of every ingested document** |
+| `logs/requests.jsonl` | Content-free HTTP and MCP completion records, with `.1` through `.5` rotated backups |
 
-That third row is the one to read twice.
+That blob row is the one to read twice.
 
 The second row is conditional on that default. Set `storage.vector_db = "qdrant"` and the dense
 index moves off this filesystem entirely, onto the server named by `storage.vector_db_url` —
 no vector index data lives under `<data_dir>` any more — `prepare_data_dir` still creates an
 empty `vectors/`, for the reason §2 gives — and a copy of this directory is a copy of the
 authority and the retained bytes only. §6.5 says what running that way changes.
+
+The request log is persistent local diagnostics, not corpus content. Its default path is
+`<data_dir>/logs/requests.jsonl`; configuration, rotation and the fields it excludes are in
+[`surfaces.md` §9.7](surfaces.md#97-request-and-tool-completion-logs). The file is appended
+across restarts and retains five rotated files. In the Compose deployment, the existing named
+`manicule-data:/data` volume preserves the log and its rotations along with the rest of the
+data directory. To follow it without starting manicule, run:
+
+```bash
+docker compose run --rm --entrypoint tail manicule -F /data/logs/requests.jsonl
+```
+
+The command mounts the same volume and only reads it, so it can run beside a server or another
+Compose command. The container also keeps the stderr copy, which is available through
+`docker logs` when a long-running container is used. A host bind mount in place of the named
+volume must be writable by uid/gid `10001` (the image's `manicule` account); its directory and
+the files created below it retain the private permissions described in §2.
 
 ### 1.1 It is a complete, verbatim copy of everything indexed
 

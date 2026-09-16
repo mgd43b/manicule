@@ -14,15 +14,16 @@ services:
     build:
       context: .
     image: manicule:local
-    # `run` rather than `up`: every command is a short-lived process, and manicule serves MCP
-    # over stdio, so there is no daemon here to keep alive. `init: true` gives that process a
-    # reaper for pid 1 so ^C during a long ingest is not swallowed.
+    # `run` rather than `up`: the default command prints help, and the examples above are
+    # short-lived commands. `init: true` gives the process a reaper for pid 1 so ^C during
+    # a long ingest is not swallowed.
     init: true
     volumes:
       # The data directory: the database, the LanceDB vector index (the default — absent under
       # storage.vector_db = "qdrant", see the profiled service below), and — because ingest
       # retains source bytes — a byte-identical copy of everything indexed. Treat it as the
-      # corpus itself. docs/deployment.md §1.
+      # corpus itself. Request logs and rotated backups live here too, under /data/logs.
+      # docs/deployment.md §1.
       - manicule-data:/data
       # Read-only, so an indexing run cannot write to what it is reading.
       - ${MANICULE_CORPUS:-.}:/corpus:ro
@@ -42,9 +43,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Deliberately no `ports:`. The default command serves MCP over stdio, which opens no
-    # socket at all. `manicule start --transport http` serves the HTTP API, and publishing
-    # that is an operator's decision: docs/deployment.md §4 says what it costs, and manicule
+    # Deliberately no `ports:`. The default command prints help; serving MCP with
+    # `--transport stdio` opens no socket. HTTP mode serves the API; publishing that is an
+    # operator's decision: docs/deployment.md §4 says what it costs, and manicule
     # refuses a non-loopback bind unless authentication is on or `--no-authentication` is in
     # the command that started it — never because of anything written in a file.
 

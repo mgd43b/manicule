@@ -462,7 +462,7 @@ Four of the answers are worth stating because a name would have got them wrong:
 **`search` carries `readOnlyHint: true` and does perform one write**, and it is stated here
 rather than hidden: retrieval appends a row to the local query log. That is the exception this
 project already makes for it — `manicule.app.dispatch.READ_ONLY_OPS` has carried it since before
-the annotations existed, and §9.7 says why a failed write there does not fail the query. It
+the annotations existed, and §9.8 says why a failed write there does not fail the query. It
 records that a read happened; it changes nothing any search, answer or listing reports, and it is
 readable only through the admin query-log surface. Nothing else on the read-only side writes at
 all, which is asserted rather than claimed: `tests/mcp/test_annotations.py` calls every tool that
@@ -1464,7 +1464,79 @@ websocket scope — and it is the more serious case: a browser applies no cross-
 `WebSocket` at all, so the page reads every frame rather than only causing an effect it cannot
 see. It is refused before `accept` and before the credential is read.
 
-### 9.7 Telemetry, and what a failed write costs
+### 9.7 Request and tool completion logs
+
+The transport logs one completion record per HTTP request and one per MCP tool call. These are
+local operator diagnostics, emitted as JSON Lines to stderr and to a persistent file through the
+`manicule.requests` logger. They are enabled by default for a local process; set
+`[logging] requests = false` or `MANICULE_LOGGING__REQUESTS=false` and restart the process to
+disable them. Configuration is read at transport startup, so changing it does not alter an
+already running server.
+
+The default file is `<data_dir>/logs/requests.jsonl` (for the default data directory, see
+[`deployment.md` §1](deployment.md#1-what-the-data-directory-contains)). It is opened in append mode and
+survives restarts. Rotation uses a 10 MiB `max_bytes` limit and keeps five backups as
+`requests.jsonl.1` through `.5`; the limit is approximate because one record may itself exceed
+the remaining space. The directory is created `0700` when new, and the log files are `0600`,
+including when an existing file is reopened. A pre-existing custom directory is not chmodded.
+An unwritable file or parent at startup is a configuration error with a corrective hint.
+
+The file and rotation settings can be changed alongside the switch:
+
+```toml
+[logging]
+requests = true
+file = "logs/requests.jsonl"       # relative to data_dir; absolute paths are accepted
+max_bytes = 10485760                # 10 MiB
+backup_count = 5
+```
+
+The corresponding environment names are `MANICULE_LOGGING__REQUESTS`,
+`MANICULE_LOGGING__FILE`, `MANICULE_LOGGING__MAX_BYTES`, and
+`MANICULE_LOGGING__BACKUP_COUNT`. A `~` in `logging.file` is expanded. To follow the default
+file across rotations, use `tail -F ~/.local/share/manicule/logs/requests.jsonl` in a standard
+local installation. Independent server processes should use different log files: rotation is
+owned by the one process serving a data directory.
+
+Every record has these fields:
+
+| Field | Meaning |
+|---|---|
+| `event` | Always `request` |
+| `timestamp` | UTC ISO 8601 timestamp emitted for the record |
+| `surface` | `http` or `mcp` |
+| `operation` | Registered route or tool name; `unmatched` for an HTTP request that did not match a route or was refused before routing, `unknown` for an unknown MCP tool |
+| `outcome` | `ok`, `error`, `canceled`, or `incomplete` |
+| `duration_ms` | Elapsed completion time |
+
+HTTP records also carry the normalized method and response status. Standard methods retain their
+usual uppercase spelling (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `CONNECT`, `OPTIONS`, `TRACE`);
+any other method is `OTHER`. The ASGI logger observes the complete response stream, so its
+duration includes the stream lifetime rather than stopping when response headers are sent.
+An HTTP status of 400 or above, or an exception, produces `error`; cancellation produces
+`canceled`. A response that returns without finishing its body is `incomplete`. A cancellation
+before headers has a null status; an exception before headers is recorded as 500.
+
+MCP records describe tool calls, including calls made through stdio, the combined HTTP/MCP
+surface at `/mcp/`, and `--mcp-only`. The MCP transport can return HTTP 200 while the envelope
+contains `ok: false`; that is an `error` outcome in the MCP record. An HTTP access record and an
+MCP tool record can therefore both be correct for one `/mcp/` exchange: they answer transport
+and application questions respectively. Protocol discovery does not produce a tool record,
+though its HTTP exchange still produces an access record. Websocket handshakes and messages
+are outside both logs. Stdio records go to stderr, keeping stdout reserved for MCP messages.
+
+These records intentionally contain no raw path, query string, header, request body, result,
+exception text, identity, or peer address. The built-in Uvicorn access logger remains disabled,
+including in MCP-only mode, because its path logging could expose bearer share tokens. Existing
+`query_logs` and `audit_logs` telemetry is unchanged, and these local records are not exported to
+an external sink.
+
+An application embedding manicule can configure its own handler on `manicule.requests` before
+transport startup; in that case manicule leaves the existing handlers alone and does not add its
+default file or stderr sinks. Constructing the ASGI app or MCP server alone does not install a
+handler.
+
+### 9.8 Telemetry, and what a failed write costs
 
 `search` and `ask` record a row in `query_logs`, and that recording is the **service's** rather
 than a surface's: telemetry written only by whichever surface remembered to write it describes
@@ -1479,7 +1551,7 @@ The two writes this surface makes are treated **differently on purpose**:
 - **A failed audit write fails the operation it was auditing.** A trail with holes in it is
   worse than none, because the holes are invisible and the operation reported success.
 
-### 9.8 Search quality
+### 9.9 Search quality
 
 `GET /api/v1/admin/search-quality` **reports**; it does not measure. `manicule.evaluation` is
 the only thing in this project that decides whether one retrieval configuration beats another,

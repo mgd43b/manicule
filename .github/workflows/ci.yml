@@ -694,6 +694,20 @@ jobs:
           echo "/data: ${mode}"
           test "${mode}" = "700 manicule"
 
+      - name: request logs persist and rotate on the data volume
+        run: |
+          set -euo pipefail
+          request_log_volume="manicule-request-logs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker volume create "${request_log_volume}"
+          trap 'docker volume rm "${request_log_volume}"' EXIT
+          for phase in first restart; do
+            docker run --rm -i --network none --cap-drop ALL \
+              --security-opt no-new-privileges:true \
+              --mount "type=volume,source=${request_log_volume},target=/data" \
+              --entrypoint /opt/manicule/venv/bin/python \
+              manicule:ci - --phase "${phase}" < tools/check_container_request_logging.py
+          done
+
   # Runs on every pull request, including ones that touch no Python at all. The repository
   # is mostly cross-referenced design documents, and a heading renumbered in one file
   # silently invalidates every inbound reference to it. Nothing else catches that.

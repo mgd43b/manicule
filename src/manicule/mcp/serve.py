@@ -32,10 +32,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+from starlette.middleware import Middleware
 from starlette.responses import PlainTextResponse
 
 from manicule.app import frontdoor
 from manicule.app.bind import require_authoring_authentication, resolve_bind, stdio
+from manicule.app.request_logging import configure_request_logging
+from manicule.app.request_logging_http import RequestLoggingMiddleware
 from manicule.app.results import ServerAddress
 from manicule.core.errors import PolicyError
 from manicule.mcp.server import TOOL_NAMES, Surface, build_surface
@@ -186,6 +189,8 @@ async def serve(
         allow_public=allow_public,
         allow_unauthenticated=allow_unauthenticated,
     )
+    if service.settings.logging.requests:
+        configure_request_logging(service.settings)
     server = surface(service, transport=transport).server
     if address.transport == "stdio":
         await server.run_stdio_async(show_banner=False)
@@ -214,6 +219,12 @@ async def serve(
         # modes disagreeing about which of two addresses is the real one is exactly the kind of
         # thing nobody finds by reading, because both work from a browser.
         path=frontdoor.MCP_ENDPOINT,
+        middleware=[Middleware(RequestLoggingMiddleware)]
+        if service.settings.logging.requests
+        else [],
+        # Keep raw URLs out of the standalone transport's logs, just as the combined server
+        # does. Even a rejected URL can carry credentials in its path or query string.
+        uvicorn_config={"access_log": False},
     )
 
 
