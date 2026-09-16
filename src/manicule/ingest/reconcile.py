@@ -273,6 +273,11 @@ async def confirm_proposed_deletion(
         document = await store.find_document(connector, source_id)
         if document is not None:
             await store.soft_delete_document(document.id)
+            # The same cleanup the unproposed path does, for the same reason: a member's source
+            # id was never in this connector's inventory, so nothing here will ever name it
+            # again. An operator confirming a proposal removes a container and would otherwise
+            # leave its members live and permanently unreachable.
+            await retire_derived(store, document)
         applied.append(source_id)
     await store.record_connector_metadata(connector, {PROPOSED_DELETION_KEY: None})
     await _record_clean(store, connector, now)

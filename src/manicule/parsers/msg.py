@@ -315,22 +315,43 @@ def _listdir(ole: object) -> Sequence[Sequence[str]]:
 
 
 def _stream(ole: object, tag: str, kind: str, *, prefix: str | None, limit: int) -> bytes | None:
-    """One property stream, read to at most ``limit + 1`` bytes.
+    """One property stream, refused before it is opened if it declares more than ``limit``.
 
-    The extra byte is the whole point: enough to know the property is over its ceiling, and not
-    enough to pay for it. Reading the stream whole and measuring afterwards spends exactly the
-    memory the ceiling exists to protect, which would make the limits in
-    :class:`~manicule.parsers.config.MsgConfig` a report on the allocation rather than a bound on
-    it — and a ``.msg`` is a file from the corpus, so the size it declares is a number somebody
-    else wrote.
+    **The check has to come before the open, and a bounded read afterwards is not a bound.**
+    ``olefile``'s stream object subclasses :class:`io.BytesIO` and its constructor walks the FAT
+    chain into one buffer, so ``openstream`` has already materialized the whole property by the
+    time anything can call ``read``. Bounding the read would have left the limits in
+    :class:`~manicule.parsers.config.MsgConfig` describing the allocation rather than capping it,
+    which is the prose-ahead-of-the-code failure this project keeps finding, and it was found
+    here by review rather than by the tests.
+
+    ``get_size`` reads the directory entry and no data. The size it reports is a field somebody
+    else wrote, and that cuts the safe way: understating it makes ``olefile`` read *less*,
+    because it truncates the stream to the size it was told.
+
+    The bounded read stays as the second half of the pair — it costs nothing and it is what
+    holds if a future ``olefile`` starts streaming lazily.
     """
     name = f"__substg1.0_{tag}{kind}"
     path = name if prefix is None else f"{prefix}/{name}"
     exists = ole.exists  # pyright: ignore[reportAttributeAccessIssue] - olefile has no stubs
     if not exists(path):
         return None
+    _bounded_size(ole, path, limit, tag)
     with ole.openstream(path) as handle:  # pyright: ignore[reportAttributeAccessIssue]
         return handle.read(limit + 1)
+
+
+def _bounded_size(ole: object, path: str, limit: int, tag: str) -> None:
+    """Refuse a stream whose directory entry declares more than ``limit`` bytes."""
+    get_size = ole.get_size  # pyright: ignore[reportAttributeAccessIssue] - olefile has no stubs
+    declared: int = get_size(path)
+    if declared > limit:
+        msg = (
+            f"MAPI property {tag} declares {declared} bytes, above the {limit}-byte ceiling. "
+            f"Raise the matching parsers.msg limit to read it, or leave it refused."
+        )
+        raise ParseError(msg)
 
 
 def _text(ole: object, tag: str, *, prefix: str | None = None, limit: int) -> str:
@@ -361,6 +382,7 @@ def _long(ole: object, tag: int, *, prefix: str) -> int:
     exists = ole.exists  # pyright: ignore[reportAttributeAccessIssue] - olefile has no stubs
     if not exists(path):
         return 0
+    _bounded_size(ole, path, _MAX_PROPERTIES_BYTES, _PROPERTIES)
     with ole.openstream(path) as handle:  # pyright: ignore[reportAttributeAccessIssue]
         data: bytes = handle.read(_MAX_PROPERTIES_BYTES)
     for at in range(_PROPERTIES_HEADER, len(data) - _PROPERTY_ENTRY + 1, _PROPERTY_ENTRY):

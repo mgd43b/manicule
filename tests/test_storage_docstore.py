@@ -580,16 +580,26 @@ async def test_hard_deleting_a_container_takes_its_members_with_it(
     )
 
 
-async def test_a_container_from_another_workspace_is_refused(store: SqliteDocStore) -> None:
+async def test_a_container_from_another_workspace_is_refused(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
     """A container and its members are one cascade, so they have to be one tenant's.
 
     ``container_id`` arrives as a field on a caller's value and is copied onto the row; the
     column is a foreign key with ``ON DELETE CASCADE``, so a cross-workspace pointer would let
     one tenant delete another's documents by hard-deleting one of their own.
-    """
-    outsider = make_document(source="confluence", source_id="theirs.zip", workspace_id="other")
 
-    with pytest.raises(CrossWorkspaceCollisionError, match="one cascade"):
+    The other workspace's container is really stored, and the assertion names the workspace it
+    belongs to. Constructing one and never persisting it sends this down the *missing* container
+    path instead, where the refusal is the same class and a looser assertion cannot tell the two
+    apart — which is what happened the first time this was written.
+    """
+    theirs = SqliteDocStore(engine, workspace_id="other")
+    await theirs.ensure_workspace()
+    outsider = make_document(source="confluence", source_id="theirs.zip", workspace_id="other")
+    await theirs.upsert_document(outsider)
+
+    with pytest.raises(CrossWorkspaceCollisionError, match="belongs to 'other'"):
         await store.upsert_document(
             make_document(
                 source="confluence",
@@ -601,7 +611,7 @@ async def test_a_container_from_another_workspace_is_refused(store: SqliteDocSto
 
 async def test_a_container_that_does_not_exist_is_refused(store: SqliteDocStore) -> None:
     """A foreign key to nothing is a cascade with nothing at the other end of it."""
-    with pytest.raises(CrossWorkspaceCollisionError, match="no workspace"):
+    with pytest.raises(CrossWorkspaceCollisionError, match="belongs to no workspace"):
         await store.upsert_document(
             make_document(
                 source="confluence",

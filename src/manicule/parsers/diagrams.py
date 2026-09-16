@@ -518,6 +518,8 @@ def _wrapped_cells(root: Element, limit: int) -> tuple[set[Element], bool]:
     """
     owned: set[Element] = set()
     for walked, element in enumerate(root.iter()):
+        # In elements, not cells — this walk visits every node in the tree, and holding it to a
+        # bound counted in cells would stop it part-way through a diagram that fits.
         if walked >= limit:
             return owned, False
         if element.tag in _MXFILE_WRAPPERS:
@@ -534,6 +536,7 @@ def _read_mxfile(source: str) -> _Graph:
     """
     from manicule.parsers.drawio import (  # noqa: PLC0415 - a parsing extra, not core
         MAX_CELLS,
+        MAX_ELEMENTS,
         graph_source,
         plain_text,
     )
@@ -542,17 +545,10 @@ def _read_mxfile(source: str) -> _Graph:
     root = graph_source(source)
     if root is None:
         return graph
-    owned, complete = _wrapped_cells(root, MAX_CELLS)
+    owned, complete = _wrapped_cells(root, MAX_ELEMENTS)
     graph.truncated = not complete
     cells = 0
     for element in root.iter():
-        # Counted per *cell*, not per XML element. Every vertex carries an `mxGeometry` and a
-        # wrapped one carries its `mxCell` too, so counting descendants spends the budget two
-        # or three times faster than the thing it is meant to bound — a ten-thousand-cell
-        # diagram would have been cut off around a third of the way in.
-        if cells >= MAX_CELLS:
-            graph.truncated = True
-            break
         if element.tag in _MXFILE_WRAPPERS:
             cell = element.find("mxCell")
             if cell is None:
@@ -562,6 +558,15 @@ def _read_mxfile(source: str) -> _Graph:
             cell, identifier, label = element, element.get("id") or "", element.get("value") or ""
         else:
             continue
+        # Counted per *cell*, and checked here rather than at the top of the loop, which are
+        # two separate corrections of the same mistake. Every vertex carries an `mxGeometry`
+        # and a wrapped one carries its `mxCell` too, so counting descendants spends the budget
+        # two or three times faster than the thing it bounds — and testing it before an element
+        # is known to be a cell marks the graph truncated when the only thing left was the
+        # geometry of the last cell read, putting a "there is more" line on a complete diagram.
+        if cells >= MAX_CELLS:
+            graph.truncated = True
+            break
         cells += 1
         drawn = plain_text(label)
         if cell.get("edge") == "1":

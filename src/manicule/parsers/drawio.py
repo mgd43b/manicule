@@ -69,6 +69,15 @@ The reading is already bounded twice by statements and by characters, but both o
 the answer; this bounds the traversal, so a page with a million cells costs a bounded walk
 rather than a bounded answer arrived at slowly."""
 
+MAX_ELEMENTS: Final = MAX_CELLS * 4
+"""Most XML elements the wrapper pre-walk visits, which is a different count from the cells.
+
+The pre-walk visits elements and the read counts cells, so they cannot share a bound: a diagram
+sitting exactly on the cell budget carries geometry and wrappers besides, and one constant for
+both would mark every such diagram truncated on the strength of its own geometry. Four per cell
+is generous — a wrapped vertex is an ``<object>``, an ``mxCell`` and an ``mxGeometry``, and the
+model and root elements are two more in total."""
+
 _CHUNK: Final = 64 * 1024
 _MAX_PNG_CHUNKS: Final = 4096
 """A PNG is a chunk list, so a hostile one is an unbounded chunk list. Scanning stops here."""

@@ -1708,6 +1708,7 @@ class Settings(BaseSettings):
         problems.extend(self._redaction_problems())
         problems.extend(self._source_restriction_problems())
         problems.extend(self._vector_store_problems())
+        problems.extend(self._dispatch_problems())
 
         if self.security.auth.mode is AuthMode.OAUTH and not self.security.auth.providers:
             problems.append("security.auth.mode is 'oauth' but no OAuth providers are configured")
@@ -1715,6 +1716,37 @@ class Settings(BaseSettings):
         if self.security.audit.destination is AuditDestination.WEBHOOK and not self.events.webhooks:
             problems.append("security.audit.destination is 'webhook' but events.webhooks is empty")
 
+        return problems
+
+    def _dispatch_problems(self) -> list[str]:
+        """Settings that name a delivery this build does not perform.
+
+        ``events.transport``, ``events.webhooks`` and ``security.audit.destination`` all parse,
+        all validate against each other, and all reach nothing: there is no event bus and no
+        webhook dispatcher — they are the unchecked half of
+        `#14 <https://github.com/mgd43b/manicule/issues/14>`_. An operator who configures an
+        endpoint for audit events and sees the process start has been told the events are going
+        somewhere.
+
+        This is the rule ``CONTRIBUTING.md`` states rather than a new one: *a setting that
+        appears to be in force and silently is not is worse than one that fails at startup*. So
+        it fails at startup, and says what is missing rather than that the value is wrong —
+        because the value is not wrong, it is early.
+        """
+        problems: list[str] = []
+        if self.events.transport != "in_process" or self.events.webhooks:
+            problems.append(
+                "events.transport or events.webhooks names a webhook, and nothing in this "
+                "build dispatches one — there is no event bus yet (#14). Leave "
+                "events.transport at 'in_process' and remove events.webhooks until there is."
+            )
+        if self.security.audit.destination is not AuditDestination.LOCAL:
+            problems.append(
+                f"security.audit.destination is "
+                f"{self.security.audit.destination.value!r}, and this build writes the audit "
+                f"trail locally and nowhere else (#14). Set it to 'local', or the records you "
+                f"are expecting elsewhere are not being sent."
+            )
         return problems
 
     def _vector_store_problems(self) -> list[str]:

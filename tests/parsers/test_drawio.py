@@ -16,7 +16,7 @@ import pytest
 from manicule.core.anchors import HeadingAnchor, Unlocated
 from manicule.core.content import BlockKind
 from manicule.core.errors import ParseError
-from manicule.parsers import grammars
+from manicule.parsers import drawio, grammars
 from manicule.parsers.config import DRAWIO_MEDIA_TYPE, DrawioConfig
 from manicule.parsers.diagrams import reading
 from manicule.parsers.drawio import DrawioParser
@@ -248,6 +248,54 @@ async def test_a_wrapped_cell_keeps_its_label_and_is_not_read_twice(
     assert said is not None
     assert said.count("routes to") == 1
     assert "Gateway edge → Core & friends: routes to" in said
+
+
+_TYPICAL_CELLS = 6
+"""``mxCell`` elements in ``typical.drawio``: the two roots, three shapes and one edge.
+
+Named because the test below sets the budget to exactly it, which is the only place the
+off-by-one being guarded against can appear."""
+
+
+async def test_a_diagram_that_exactly_fills_the_cell_budget_is_not_marked_truncated(
+    parser: DrawioParser, diagrams: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker says "there is more", so it must not appear when there is not.
+
+    The budget is spent by cells, but ``root.iter()`` yields each cell's ``mxGeometry`` after
+    it — so a check made before an element is known to be a cell fires on the geometry of the
+    last cell read and puts a "there is more" line on a diagram that was read in full. Only a
+    diagram sitting exactly on the budget can show it, which is why the budget moves here rather
+    than the fixture.
+
+    A reader who learns the marker is sometimes wrong stops believing it when it is right.
+    """
+    monkeypatch.setattr(drawio, "MAX_CELLS", _TYPICAL_CELLS)
+    found = await blocks(parser, diagrams / "typical.drawio")
+
+    said = reading("mxfile", found[0].text, budget=4000, max_statements=64)
+
+    assert said is not None
+    assert "Auth Service → Token Store" in said, "the whole diagram was read"
+    assert "larger than the reader's limit" not in said
+
+
+async def test_a_diagram_past_the_cell_budget_says_it_was_read_in_part(
+    parser: DrawioParser, diagrams: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other direction, because a marker that never fires is not a marker.
+
+    It is placed second in the reading rather than last: ``_render`` trims from the end to fit
+    its budget, so a marker at the bottom is the first thing dropped from exactly the reading
+    that needs it.
+    """
+    monkeypatch.setattr(drawio, "MAX_CELLS", _TYPICAL_CELLS - 2)
+    found = await blocks(parser, diagrams / "typical.drawio")
+
+    said = reading("mxfile", found[0].text, budget=4000, max_statements=64)
+
+    assert said is not None
+    assert "larger than the reader's limit" in said
 
 
 async def test_a_reading_needs_no_grammar_and_so_no_grammar_bundle(
