@@ -3393,7 +3393,7 @@ class IngestPipeline:
         # case whose children all have to be retired — and it is the case a "did it yield
         # members" test would skip.
         derived: dict[str, set[str]] = {}
-        if not outcome.skipped and (
+        if _expanded(outcome) and (
             members or (existing is not None and existing.status is DocumentStatus.CONTAINER)
         ):
             derived[outcome.document_id] = set()
@@ -3428,7 +3428,7 @@ class IngestPipeline:
             # emptied of its members is still a container that has to retire them, and a nested
             # container that was hash-skipped derived nothing and must not.
             if deeper or (
-                not inner.skipped
+                _expanded(inner)
                 and member_existing is not None
                 and member_existing.status is DocumentStatus.CONTAINER
             ):
@@ -4890,6 +4890,20 @@ def _source_dependencies(document: Document) -> tuple[SourceId, ...] | None:
 def _raise_lost_acquisition_lease(run_id: str) -> None:
     msg = f"acquisition lease for run {run_id!r} was lost"
     raise AcquisitionLeaseLostError(msg)
+
+
+def _expanded(outcome: DocumentOutcome) -> bool:
+    """Whether this run actually re-derived the document's members.
+
+    Two states look like "expanded to nothing" and are not. **Skipped**: change detection
+    stopped before the parser ran, so the archive was never opened — treating that as an empty
+    expansion retires every member of every container on the first sync that finds it
+    unchanged, which is every sync after the first. **Superseded**: the compare-and-swap found
+    newer bytes and nothing was written, so this run holds a stale view of a container somebody
+    else is mid-way through re-deriving, and its member list is the one thing here that is
+    certainly out of date.
+    """
+    return not outcome.skipped and not outcome.superseded
 
 
 def snapshot_scope(connector: Connector) -> tuple[str, str]:

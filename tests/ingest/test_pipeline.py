@@ -876,6 +876,63 @@ async def test_a_nested_container_emptied_of_members_retires_them() -> None:
     assert await store.find_document("memory", "outer!/inner.zip") is not None
 
 
+async def test_a_superseded_container_does_not_retire_the_members_it_never_saw() -> None:
+    """Nothing was written, so this run's view of the member list is the stale one.
+
+    A compare-and-swap that loses means somebody else has newer bytes for this container and is
+    part-way through re-deriving it. Reading "expanded to nothing" off a run that never got to
+    publish would let the loser retire members the winner is about to confirm — and soft delete
+    is cheap to cause and slow to notice, because the documents stay in the trash looking fine.
+
+    Driven through the shape ``reindex.re_parse`` uses — a known ``existing`` and the revision
+    it was read at — because that is the caller that supplies both halves the branch needs.
+    """
+    pipeline, store, vectors = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+    container = await store.find_document("memory", "bundle")
+    assert container is not None
+
+    class OvertakingEmptyArchive(fakes.FakeArchive):
+        """Expands to nothing, having let somebody else publish first."""
+
+        @override
+        async def expand(self, raw: RawDocument) -> AsyncIterator[fakes.MemberOutcome]:
+            del raw
+            store.documents[container.id] = store.documents[container.id].model_copy(
+                update={"content_hash": content_hash("winner"), "version_token": "winner"}
+            )
+            return
+            yield  # pragma: no cover - present to make this an async generator
+
+    contender, _, _ = build(
+        store=store,
+        vectors=vectors,
+        parsers={"archive": OvertakingEmptyArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    outcomes = await contender.ingest_raw(
+        RawDocument(
+            source_id="bundle",
+            uri="memory://bundle",
+            media_type=fakes.CONTAINER_MEDIA_TYPE,
+            content="one=alpha",
+        ),
+        source="memory",
+        existing=container,
+        force=True,
+        expected=container.revision,
+    )
+
+    assert outcomes[0].superseded
+    assert await store.find_document("memory", "bundle!/one") is not None
+    assert await store.find_document("memory", "bundle!/two") is not None
+
+
 async def test_reconciliation_never_sees_a_document_no_connector_could_report() -> None:
     """The defect this ownership column exists for, stated as the arithmetic that produced it.
 
