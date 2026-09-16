@@ -92,7 +92,7 @@ def record_request(
     *,
     surface: Literal["http", "mcp"],
     operation: str,
-    outcome: Literal["ok", "error", "cancelled", "incomplete"],
+    outcome: Literal["ok", "error", "canceled", "incomplete"],
     started: float,
     method: str | None = None,
     status: int | None = None,

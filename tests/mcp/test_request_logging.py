@@ -161,7 +161,7 @@ async def test_cancellation_is_recorded_and_still_propagates(
 
     event = _event(caplog)
     assert event["operation"] == "collection_list"
-    assert event["outcome"] == "cancelled"
+    assert event["outcome"] == "canceled"
 
 
 async def test_request_logging_can_be_disabled(caplog: pytest.LogCaptureFixture) -> None:

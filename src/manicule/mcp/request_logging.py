@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from mcp.types import CallToolRequestParams
 
 
-type Outcome = Literal["ok", "error", "cancelled", "incomplete"]
+type Outcome = Literal["ok", "error", "canceled", "incomplete"]
 
 
 class RequestLoggingMiddleware(Middleware):
@@ -48,7 +48,7 @@ class RequestLoggingMiddleware(Middleware):
         try:
             result = await call_next(context)
         except asyncio.CancelledError:
-            record_request(surface="mcp", operation=operation, outcome="cancelled", started=started)
+            record_request(surface="mcp", operation=operation, outcome="canceled", started=started)
             raise
         except Exception:
             record_request(surface="mcp", operation=operation, outcome="error", started=started)

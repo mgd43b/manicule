@@ -33,7 +33,7 @@ class RequestLoggingMiddleware:
         started = perf_counter()
         status: int | None = None
         complete = False
-        outcome: Literal["ok", "error", "cancelled", "incomplete"] = "error"
+        outcome: Literal["ok", "error", "canceled", "incomplete"] = "error"
 
         async def observe(message: Message) -> None:
             nonlocal status, complete
@@ -49,7 +49,7 @@ class RequestLoggingMiddleware:
             if status is not None and status >= ERROR_STATUS:
                 outcome = "error"
         except CancelledError:
-            outcome = "cancelled"
+            outcome = "canceled"
             raise
         finally:
             # Routing adds only server-defined objects. An unmatched URL never becomes a

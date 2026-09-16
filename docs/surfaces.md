@@ -1506,7 +1506,7 @@ Every record has these fields:
 | `timestamp` | UTC ISO 8601 timestamp emitted for the record |
 | `surface` | `http` or `mcp` |
 | `operation` | Registered route or tool name; `unmatched` for an HTTP request that did not match a route or was refused before routing, `unknown` for an unknown MCP tool |
-| `outcome` | `ok`, `error`, `cancelled`, or `incomplete` |
+| `outcome` | `ok`, `error`, `canceled`, or `incomplete` |
 | `duration_ms` | Elapsed completion time |
 
 HTTP records also carry the normalized method and response status. Standard methods retain their
@@ -1514,7 +1514,7 @@ usual uppercase spelling (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `CONN
 any other method is `OTHER`. The ASGI logger observes the complete response stream, so its
 duration includes the stream lifetime rather than stopping when response headers are sent.
 An HTTP status of 400 or above, or an exception, produces `error`; cancellation produces
-`cancelled`. A response that returns without finishing its body is `incomplete`. A cancellation
+`canceled`. A response that returns without finishing its body is `incomplete`. A cancellation
 before headers has a null status; an exception before headers is recorded as 500.
 
 MCP records describe tool calls, including calls made through stdio, the combined HTTP/MCP

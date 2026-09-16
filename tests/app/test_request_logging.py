@@ -110,7 +110,7 @@ async def test_cancellation_propagates_with_no_invented_http_status(
     with pytest.raises(asyncio.CancelledError):
         await RequestLoggingMiddleware(app)(scope(), receive, discard)
     (event,) = events(caplog)
-    assert event["outcome"] == "cancelled"
+    assert event["outcome"] == "canceled"
     assert event["status"] is None
 
 
