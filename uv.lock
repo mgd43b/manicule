@@ -1595,7 +1595,7 @@ requires-dist = [
     { name = "python-docx", marker = "extra == 'parsers'", specifier = ">=1.1" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "python-pptx", marker = "extra == 'parsers'", specifier = ">=1.0" },
-    { name = "qdrant-client", marker = "extra == 'qdrant'", specifier = ">=1.15" },
+    { name = "qdrant-client", marker = "extra == 'qdrant'", specifier = ">=1.19" },
     { name = "rich", marker = "extra == 'serve'", specifier = ">=13.9" },
     { name = "ruamel-yaml", marker = "extra == 'parsers'", specifier = ">=0.18" },
     { name = "selectolax", marker = "extra == 'parsers'", specifier = ">=0.3.21" },

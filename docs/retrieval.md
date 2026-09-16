@@ -315,6 +315,13 @@ set it.**
 | `workspace_ids` | **Neither.** The hydrating join (§4.2) | No field on either store, deliberately: promoting it creates a value that can disagree with SQLite |
 | `sources`, `media_types`, `collection_ids`, `tag_ids`, `updated_*` | SQLite, into `document_ids`, then pushed down | Each needs a join neither vector store has fields for |
 
+**Level on eligibility, not on recall.** What the table holds equal across the two backends is
+which rows a filter admits. How closely an approximate search then finds the nearest of those rows
+is each backend's own business — `storage.ann_index_threshold` on LanceDB; the HNSW, indexing
+threshold, quantization and placement settings under `storage.qdrant` on Qdrant
+([`storage.md`](storage.md) §6.7) — and neither set has a counterpart on the other store, because
+no dial in either changes a row's eligibility. Parity is unaffected by any of them.
+
 The lexical leg needs none of this: it is one SQL statement against the authoritative store and
 applies the whole filter inline, before `LIMIT` ([`storage.md`](storage.md) §6.1).
 
@@ -516,7 +523,7 @@ anyway.
 
 | Knob | Default | Why that value |
 |---|---|---|
-| `overfetch_min` | 3 | A healthy single-workspace index still loses rows to the soft-delete grace window, in-flight documents and unswept tombstones. 3× removes the retry from the common path. On LanceDB, over an exhaustive search below `storage.ann_index_threshold` (`docs/storage.md` §6.2) it is not measurable, and that threshold now has a lifecycle behind it rather than only a number, so the claim is checkable: `manicule index` with no path says whether this index is still exhaustive; past the threshold the over-fetch stops being free — it costs probes against an IVF_PQ index rather than a longer linear scan, which is the same interaction §3.3 flags for filters. `ann_index_threshold` is LanceDB-only — Qdrant builds and maintains its own HNSW index on every write, with no exhaustive/indexed distinction this setting could describe |
+| `overfetch_min` | 3 | A healthy single-workspace index still loses rows to the soft-delete grace window, in-flight documents and unswept tombstones. 3× removes the retry from the common path. On LanceDB, over an exhaustive search below `storage.ann_index_threshold` (`docs/storage.md` §6.2) it is not measurable, and that threshold now has a lifecycle behind it rather than only a number, so the claim is checkable: `manicule index` with no path says whether this index is still exhaustive; past the threshold the over-fetch stops being free — it costs probes against an IVF_PQ index rather than a longer linear scan, which is the same interaction §3.3 flags for filters. `ann_index_threshold` is LanceDB-only. Qdrant builds its own HNSW graph for each segment that passes `storage.qdrant.indexing_threshold_kb` — kilobytes of vectors in one segment, not vectors in the corpus — so there is no corpus-wide exhaustive/indexed state for this setting to describe; that threshold and the graph and quantization dials beside it move recall and throughput, never eligibility, so they leave §3.3's parity alone |
 | `overfetch_max` | 20 | Past this the plan should have inverted to the pre-filter regime (§3.3); the cap is what makes that visible in the trace rather than absorbed as latency |
 | `absolute_row_cap` | 2000 | Every over-fetched row is a `chunk_json` decode. The cap bounds the work independently of the multiplier |
 

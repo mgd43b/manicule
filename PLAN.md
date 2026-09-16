@@ -97,14 +97,22 @@ is configured, regardless of `cloud_allowed`.
 
 Reached at `storage.vector_db_url` (required for `qdrant`, refused for `lancedb`, where it would
 read as a setting in force and is not) and configured under `storage.qdrant` (API key, transport,
-timeout, collection prefix). Implemented in `src/manicule/storage/qdrant.py`, sharing field
-names, the filter rules and the integrity verdict with the LanceDB store through
-`src/manicule/storage/vector_schema.py` so the two cannot drift into answering one question two
-ways. Filter push-down (`document_ids`, `kinds`, `langs`) is deliberately identical on both —
-not widened for Qdrant even though its engine could filter on more, so the same query returns
-the same rows regardless of which store an installation configured. Qdrant builds and maintains
-its own HNSW index, so `storage.ann_index_threshold` and the IVF-PQ build it schedules stay
-LanceDB-only; durable re-embedding (shadow generations) was already LanceDB-only and remains so.
+timeout, collection prefix, and the collections' shape). Implemented in
+`src/manicule/storage/qdrant.py`, sharing field names, the filter rules and the integrity verdict
+with the LanceDB store through `src/manicule/storage/vector_schema.py` so the two cannot drift into
+answering one question two ways. Filter push-down (`document_ids`, `kinds`, `langs`) is
+deliberately identical on both — not widened for Qdrant even though its engine could filter on
+more, so the same query returns the same rows regardless of which store an installation configured.
+Qdrant builds and maintains its own HNSW index, so `storage.ann_index_threshold` and the IVF-PQ
+build it schedules stay LanceDB-only. What an installation does choose is the collection's shape —
+HNSW `m` and `ef_construct`, the segment size at which a graph is built, scalar quantization, and
+whether vectors and payload live on disk — set under `storage.qdrant` and applied to an existing
+collection each time the store is prepared as well as to a new one
+([#393](https://github.com/mgd43b/manicule/issues/393); `docs/storage.md` §6.7). Those are recall,
+memory and throughput dials rather than eligibility, so the filter parity above is untouched, and
+the vector datatype is deliberately not among them: the integrity checksum is taken over stored
+`float32` values. Durable re-embedding (shadow generations) was already LanceDB-only and remains
+so.
 
 ## 3. Plugin system
 

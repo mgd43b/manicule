@@ -29,9 +29,11 @@ installation survives: a data directory moves, a container is rebuilt, a workspa
 ``default`` on both machines. So two installations that share a server and both leave
 ``storage.qdrant.collection_prefix`` at its default share collections — which is safe for
 retrieval, since the hydrating join admits only document ids the local authority knows, and is
-wrong for everything else: ``count`` reports the union, and a second installation whose
-embedder differs is refused by the fingerprint record rather than served. Give each
-installation its own prefix on a shared server; ``docs/deployment.md`` §6.5 says so where an
+wrong for everything else: ``count`` reports the union, a second installation whose embedder
+differs is refused by the fingerprint record rather than served, and two whose
+:class:`CollectionShape` settings differ each reshape the shared collection back to their own on
+every prepare, since nothing identifies whose shape it was. Give each installation its own prefix
+on a shared server; ``docs/deployment.md`` §6.5 says so where an
 operator will read it.
 
 **A readback is narrowed to float32 before it is believed.** The numerical-integrity checksum
@@ -53,9 +55,11 @@ rule is kept by asking which of the batch's ids already exist and writing only t
 
 This store deliberately does **not** implement
 :class:`~manicule.core.protocols.AnnIndexMaintenance`. Qdrant builds and maintains its own HNSW
-index on its own schedule, so there is no build for an operator to trigger and no partition
-count this project chose; reporting an IVF-PQ lifecycle for an index manicule neither built nor
-can replace would be describing a mechanism that is not there. Nor does it implement the
+index on its own schedule, so there is no build for an operator to trigger; reporting an IVF-PQ
+lifecycle for an index manicule neither built nor can replace would be describing a mechanism
+that is not there. What an installation *does* choose is the graph's shape, the size at which
+Qdrant starts building one, and whether a quantized copy is searched — :class:`CollectionShape`,
+applied to every collection each time the store is prepared. Nor does it implement the
 shadow-generation surface re-embedding needs: ``manicule.app.runtime`` refuses a durable
 re-embed on any backend that does not, by name, and that refusal is the honest answer rather
 than a half-built one.
@@ -80,11 +84,13 @@ through Qdrant's HTTP API by hand; ``docs/storage.md`` §6.7 records what that c
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import struct
 import uuid
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Any, Final, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Final, Literal, cast, override
 from urllib.parse import urlsplit
 
 from qdrant_client import AsyncQdrantClient, models
@@ -142,6 +148,8 @@ if TYPE_CHECKING:
     from manicule.core.embedding import Vector
     from manicule.core.retrieval import Filter
 
+_LOG = logging.getLogger(__name__)
+
 POINT_NAMESPACE: Final = uuid.UUID("bf695e23-5f0a-50ac-8b49-8ab96140066a")
 """The UUIDv5 namespace every point id is derived in.
 
@@ -176,6 +184,14 @@ SCROLL_PAGE: Final = 512
 The bound that keeps both operations constant-memory over a corpus of any size. A page holds
 ``SCROLL_PAGE`` vectors — at 1024 float32 components that is about two megabytes — and nothing
 accumulates across pages except integers.
+"""
+
+RESCORED: Final = models.SearchParams(quantization=models.QuantizationSearchParams(rescore=True))
+"""Search parameters asking that a quantized collection score candidates against the originals.
+
+Sent on every ranked search rather than only when the configured shape quantizes, because a
+collection can carry quantization this handle's configuration did not ask for until the next
+prepare removes it, and on a collection with none it asks for nothing.
 """
 
 RETRIEVE_PAGE: Final = 512
@@ -296,6 +312,278 @@ def is_local(client: AsyncQdrantClient) -> bool:
     return bool(options.get("path")) or options.get("location") == ":memory:"
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CollectionShape:
+    """What an installation chooses about the collections this store keeps: ``storage.qdrant``.
+
+    Every dial here is memory, recall or throughput and none is eligibility — no value changes
+    which rows a filter admits, though the graph and quantization can change which admitted rows
+    an approximate search ranks highest — so a shape is not part of a collection's name, and two
+    shapes of one corpus hold the same rows. The field names are the settings' names, and the
+    defaults are the values Qdrant gives a collection nobody tuned. A store built without a
+    shape, which is every store built before these were settings, therefore makes and keeps
+    exactly the collection it always did.
+
+    HNSW, quantization and vector placement are written on the vector rather than on the
+    collection. A vector's own value takes precedence on the server, so a collection-level
+    value somebody set by hand cannot leave a change accepted and not in force; and it is the
+    half of a configuration Qdrant's in-process engine keeps, so a test can see it.
+    """
+
+    quantization: Literal["none", "scalar"] = "none"
+    quantization_always_ram: bool = True
+    on_disk_vectors: bool = False
+    on_disk_payload: bool = True
+    hnsw_m: int = 16
+    hnsw_ef_construct: int = 100
+    indexing_threshold_kb: int = 10_000
+
+    def vector_params(self, dimension: int) -> models.VectorParams:
+        """The vector configuration a collection is created with."""
+        return models.VectorParams(
+            size=dimension,
+            distance=models.Distance.COSINE,
+            hnsw_config=models.HnswConfigDiff(m=self.hnsw_m, ef_construct=self.hnsw_ef_construct),
+            quantization_config=self.quantization_config(),
+            on_disk=self.on_disk_vectors,
+        )
+
+    def quantization_config(self) -> models.ScalarQuantization | None:
+        """The quantization this shape asks for, or ``None`` for none."""
+        if self.quantization == "none":
+            return None
+        return models.ScalarQuantization(
+            scalar=models.ScalarQuantizationConfig(
+                type=models.ScalarType.INT8, always_ram=self.quantization_always_ram
+            )
+        )
+
+    def drift(
+        self, config: models.CollectionConfig, vector: models.VectorParams
+    ) -> tuple[ShapeDrift, ...]:
+        """Every dial on which a collection, as the server reports it, is not this shape.
+
+        Compared as *in force* rather than as written: a vector's value where it has one and
+        the collection's where it does not, and Qdrant's newer ``memory`` placement where a
+        server reports that in place of the flag it replaced. A comparison of what was written
+        would call an untuned collection different from its own defaults and rewrite it.
+        """
+        in_force = dials_in_force(config, vector)
+        wanted: dict[str, object] = {
+            "quantization": self.quantization,
+            "quantization_always_ram": self.quantization_always_ram,
+            "on_disk_vectors": self.on_disk_vectors,
+            "on_disk_payload": self.on_disk_payload,
+            "hnsw_m": self.hnsw_m,
+            "hnsw_ef_construct": self.hnsw_ef_construct,
+            "indexing_threshold_kb": self.indexing_threshold_kb,
+        }
+        if self.quantization != "scalar" or in_force["quantization"] != "scalar":
+            del wanted["quantization_always_ram"]
+        return tuple(
+            ShapeDrift(setting=name, configured=value, in_force=in_force[name])
+            for name, value in wanted.items()
+            if in_force[name] != value
+        )
+
+    def update_for(
+        self,
+        drift: Sequence[ShapeDrift],
+        config: models.CollectionConfig,
+        vector: models.VectorParams,
+    ) -> ShapeUpdate:
+        """The one update that brings a collection from ``drift`` to this shape.
+
+        Only the dials that differ are sent, in the terms the server itself reported them in.
+
+        Quantization is the dial with two places to live. Turning it on writes the vector's
+        value, which takes precedence; turning it off has to clear the collection's value too,
+        because a vector with none of its own falls back to the collection's.
+
+        Placement has two vocabularies. Qdrant is replacing the ``on_disk`` and
+        ``on_disk_payload`` flags with a ``memory`` field that overrides them when both are set,
+        so a flag written to a component that already reports ``memory`` is accepted and does
+        nothing — and a server that does not know ``memory`` accepts that and drops it. Each
+        placement is therefore written in whichever of the two the component reported, which is
+        the one both kinds of server honor.
+        """
+        changed = {item.setting for item in drift}
+        vector_quantization, collection_quantization = self._quantization_update(
+            changed, config, vector
+        )
+        hnsw = None
+        if changed & {"hnsw_m", "hnsw_ef_construct"}:
+            hnsw = models.HnswConfigDiff(m=self.hnsw_m, ef_construct=self.hnsw_ef_construct)
+        on_disk: bool | None = None
+        memory: models.Memory | None = None
+        if "on_disk_vectors" in changed:
+            if vector.memory is None:
+                on_disk = self.on_disk_vectors
+            else:
+                memory = models.Memory.COLD if self.on_disk_vectors else models.Memory.CACHED
+        vectors: models.VectorsConfigDiff | None = None
+        if any(value is not None for value in (hnsw, vector_quantization, on_disk, memory)):
+            vectors = {
+                "": models.VectorParamsDiff(
+                    hnsw_config=hnsw,
+                    quantization_config=vector_quantization,
+                    on_disk=on_disk,
+                    memory=memory,
+                )
+            }
+        optimizers = None
+        if "indexing_threshold_kb" in changed:
+            optimizers = models.OptimizersConfigDiff(indexing_threshold=self.indexing_threshold_kb)
+        return ShapeUpdate(
+            vectors=vectors,
+            quantization=collection_quantization,
+            optimizers=optimizers,
+            params=self._payload_update(changed, config),
+        )
+
+    def _quantization_update(
+        self, changed: set[str], config: models.CollectionConfig, vector: models.VectorParams
+    ) -> tuple[models.QuantizationConfigDiff | None, models.QuantizationConfigDiff | None]:
+        """The vector's quantization change and the collection's, in that order."""
+        if not changed & {"quantization", "quantization_always_ram"}:
+            return None, None
+        wanted = self.quantization_config()
+        if wanted is not None:
+            return wanted, None
+        return (
+            None if vector.quantization_config is None else models.Disabled.DISABLED,
+            None if config.quantization_config is None else models.Disabled.DISABLED,
+        )
+
+    def _payload_update(
+        self, changed: set[str], config: models.CollectionConfig
+    ) -> models.CollectionParamsDiff | None:
+        """The payload's placement change, in the vocabulary the collection reported it in."""
+        if "on_disk_payload" not in changed:
+            return None
+        payload = config.params.payload
+        if payload is None or payload.memory is None:
+            return models.CollectionParamsDiff(on_disk_payload=self.on_disk_payload)
+        placement = models.Memory.COLD if self.on_disk_payload else models.Memory.CACHED
+        return models.CollectionParamsDiff(payload=models.PayloadStorageParams(memory=placement))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ShapeUpdate:
+    """The arguments of one ``update_collection``, each ``None`` where nothing changes."""
+
+    vectors: models.VectorsConfigDiff | None
+    quantization: models.QuantizationConfigDiff | None
+    optimizers: models.OptimizersConfigDiff | None
+    params: models.CollectionParamsDiff | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ShapeDrift:
+    """One dial on which a collection is not the configured :class:`CollectionShape`."""
+
+    setting: str
+    configured: object
+    in_force: object
+
+    @override
+    def __str__(self) -> str:
+        return (
+            f"storage.qdrant.{self.setting} is {self.configured!r}, "
+            f"the collection has {self.in_force!r}"
+        )
+
+
+def dials_in_force(
+    config: models.CollectionConfig, vector: models.VectorParams
+) -> dict[str, object]:
+    """What each :class:`CollectionShape` dial is on a collection, in the shape's own terms.
+
+    A quantization this store never writes reads as its kind — ``"product"``, ``"binary"`` — so
+    it is reported as different from both of the shape's values rather than mistaken for one.
+    """
+    quantization = vector.quantization_config or config.quantization_config
+    always_ram: bool | None = None
+    if isinstance(quantization, models.ScalarQuantization):
+        kind = "scalar"
+        scalar = quantization.scalar
+        always_ram = (
+            scalar.memory is models.Memory.PINNED
+            if scalar.memory is not None
+            else bool(scalar.always_ram)
+        )
+    elif quantization is None:
+        kind = "none"
+    else:
+        kind = type(quantization).__name__.removesuffix("Quantization").lower()
+    hnsw = vector.hnsw_config
+    payload = config.params.payload
+    return {
+        "quantization": kind,
+        "quantization_always_ram": always_ram,
+        "on_disk_vectors": (
+            vector.memory is models.Memory.COLD
+            if vector.memory is not None
+            else bool(vector.on_disk)
+        ),
+        "on_disk_payload": (
+            payload.memory is models.Memory.COLD
+            if payload is not None and payload.memory is not None
+            else config.params.on_disk_payload is not False
+        ),
+        "hnsw_m": hnsw.m if hnsw is not None and hnsw.m is not None else config.hnsw_config.m,
+        "hnsw_ef_construct": (
+            hnsw.ef_construct
+            if hnsw is not None and hnsw.ef_construct is not None
+            else config.hnsw_config.ef_construct
+        ),
+        "indexing_threshold_kb": config.optimizer_config.indexing_threshold,
+    }
+
+
+def writable_vector(
+    collection: str, config: models.CollectionConfig, dimension: int
+) -> models.VectorParams:
+    """The collection's vector configuration, refused unless this store can write it and verify it.
+
+    A collection bearing this store's name was made by this store, unless somebody made it by
+    hand — on a dashboard, from a script, by restoring another installation's snapshot. Each
+    property checked here is one whose mismatch nothing else refuses. The wrong size fails every
+    write with a server error that names no cause, and so does a multivector field, which wants a
+    matrix where this store writes a list. Another distance ranks every query with
+    scores nothing here was calibrated against. And a datatype other than ``float32`` hands back
+    numbers other than the ones written, so every checksum disagrees and the whole corpus reads
+    as corrupt and drops out of search while every request succeeds — which is why the datatype
+    is not a :class:`CollectionShape` dial, and why it is checked rather than trusted.
+
+    Raises:
+        VectorStoreStateError: The collection holds vectors this store cannot use.
+    """
+    vector = config.params.vectors
+    if not isinstance(vector, models.VectorParams):
+        problem = "named vectors, where this store writes one unnamed vector"
+    elif vector.size != dimension:
+        problem = f"{vector.size}-dimension vectors, where the embedder produces {dimension}"
+    elif vector.distance != models.Distance.COSINE:
+        problem = f"vectors ranked by {vector.distance.value}, where this store ranks by cosine"
+    elif vector.multivector_config is not None:
+        problem = "multivectors, where this store writes one flat vector per point"
+    elif vector.datatype not in (None, models.Datatype.FLOAT32):
+        problem = (
+            f"{vector.datatype.value} vectors, where every checksum is taken over the float32 "
+            f"values a point stores"
+        )
+    else:
+        return vector
+    msg = (
+        f"{collection} holds {problem}. manicule never creates a collection that way, so "
+        f"something else did, and writing into it would fail or read back as corruption. "
+        f"`manicule reset-index` discards this workspace's collections and the next ingest "
+        f"creates them again; or give this installation its own storage.qdrant.collection_prefix."
+    )
+    raise VectorStoreStateError(msg)
+
+
 class QdrantVectorStore:
     """:class:`~manicule.core.protocols.VectorStore` on a Qdrant server.
 
@@ -315,11 +603,13 @@ class QdrantVectorStore:
         *,
         workspace_id: str,
         collection_prefix: str,
+        shape: CollectionShape | None = None,
         owns_client: bool = False,
     ) -> None:
         self._client = client
         self._workspace = workspace_id
         self._prefix = collection_prefix
+        self._shape = shape or CollectionShape()
         self._owns_client = owns_client
         self._fingerprint: EmbedFingerprint | None = None
         self._middleware: tuple[str, ...] = ()
@@ -333,6 +623,16 @@ class QdrantVectorStore:
         workspace it stands for is to hash the candidate and compare.
         """
         return self._workspace
+
+    @property
+    def shape(self) -> CollectionShape:
+        """The shape this handle creates collections in and brings existing ones to.
+
+        Public so that a caller holding a built store can tell which configuration reached it,
+        which is the one fact a factory mapping settings onto the shape could get wrong without
+        anything else noticing until a collection had been reshaped.
+        """
+        return self._shape
 
     def storage_name(self, fingerprint: EmbedFingerprint) -> str:
         """Which collection this workspace's vectors for ``fingerprint`` live in.
@@ -349,9 +649,10 @@ class QdrantVectorStore:
     ) -> None:
         """Prepare the store for vectors from ``fingerprint``.
 
-        The first call creates the collection at the dimension the embedder reports, indexes
-        every payload field a query filters on, and records the fingerprint. Later calls
-        compare what is recorded.
+        The first call creates the collection at the dimension the embedder reports, in the
+        configured shape, indexes every payload field a query filters on, and records the
+        fingerprint. Later calls compare what is recorded, and bring an existing collection to
+        the configured shape.
 
         The collection is created before the fingerprint is recorded, and both steps check for
         what they are about to make. An interruption between them therefore leaves a collection
@@ -371,6 +672,8 @@ class QdrantVectorStore:
         Raises:
             FingerprintMismatchError: When this workspace already holds vectors from a
                 different model, including a different model of the same size.
+            VectorStoreStateError: When the collection holds vectors this store cannot write
+                or verify, or the server did not apply a change to its shape.
         """
         recorded = await self._recorded_fingerprint()
         if recorded is not None:
@@ -582,6 +885,16 @@ class QdrantVectorStore:
         on the strength of bytes nothing vouches for. A search can therefore return fewer than
         ``k`` candidates over a damaged collection, which is the honest outcome.
 
+        **Under quantization the copy chooses and the originals score.** Qdrant does not rescore
+        a scalar-quantized search unless asked — measured on v1.17.0 and v1.19.1, where a query
+        identical to a stored vector scores 0.9994 against the int8 copy — so without
+        :data:`RESCORED` both the order and every score would be taken against bytes no checksum
+        covers, which is the argument above by another route. With it, the copy picks ``k``
+        candidates and the checksummed ``float32`` originals score and order them; which ``k`` the
+        copy picks is the recall ``storage.qdrant.quantization`` trades. On a collection with no
+        quantization the parameter asks for nothing. Local mode is sent none: it searches exactly,
+        so its scores are already the originals', and it warns about any search parameter.
+
         **A query with no direction.** The zero vector is not near anything and cosine
         similarity against it is undefined for every row, so ranking it would be inventing an
         order. Instead the store returns the first ``k`` points the filter admits, each scored
@@ -610,6 +923,7 @@ class QdrantVectorStore:
             collection_name=self._collection(fingerprint),
             query=query,
             query_filter=condition,
+            search_params=None if is_local(self._client) else RESCORED,
             limit=k,
             with_payload=True,
             with_vectors=True,
@@ -948,29 +1262,90 @@ class QdrantVectorStore:
         return await self._client.collection_exists(self._collection(fingerprint))
 
     async def _ensure_collection(self, fingerprint: EmbedFingerprint) -> None:
-        """Create the collection and its payload indexes, or finish creating them.
+        """Create the collection or check the one there, bring it to its shape, index its payload.
 
-        The indexes are (re)declared on **every** call rather than only when the collection is
-        made, because creating one that exists is a no-op on the server and skipping them is
-        not recoverable: a crash between the create and the index loop would otherwise leave a
-        collection whose filters are permanently scans, with nothing to notice it. An index is
-        invisible to correctness — Qdrant answers a filter with or without one — so the failure
-        mode this closes is a corpus that silently gets slower as it grows.
+        The shape and the indexes are both (re)declared on **every** call rather than only when
+        the collection is made.
+
+        The indexes, because creating one that exists is a no-op on the server and skipping
+        them is not recoverable: a crash between the create and the index loop would otherwise
+        leave a collection whose filters are permanently scans, with nothing to notice it. An
+        index is invisible to correctness — Qdrant answers a filter with or without one — so the
+        failure mode this closes is a corpus that silently gets slower as it grows.
+
+        The shape, because a setting read only at creation does nothing to the collection every
+        installation already has. Turning quantization on would show in ``config show`` and in
+        no memory graph, indefinitely. So the collection is read back and compared, and updated
+        only where it differs — an untuned collection is never written to, and a server is never
+        asked to re-optimize for a change that is not one.
+
+        Local mode checks that the collection is one this store can write and stops there. The
+        in-process engine keeps a vector's half of a shape at creation, ignores every update
+        without saying so and warns about payload indexes, so what it can be asked is only what
+        it can hold.
         """
         collection = self._collection(fingerprint)
         if not await self._client.collection_exists(collection):
             await self._client.create_collection(
                 collection_name=collection,
-                vectors_config=models.VectorParams(
-                    size=fingerprint.dimension, distance=models.Distance.COSINE
+                vectors_config=self._shape.vector_params(fingerprint.dimension),
+                on_disk_payload=self._shape.on_disk_payload,
+                optimizers_config=models.OptimizersConfigDiff(
+                    indexing_threshold=self._shape.indexing_threshold_kb
                 ),
             )
+        config = (await self._client.get_collection(collection)).config
+        vector = writable_vector(collection, config, fingerprint.dimension)
         if is_local(self._client):
             return
+        await self._reshape(collection, config, vector)
         for field, schema in INDEXED_PAYLOAD_FIELDS:
             await self._client.create_payload_index(
                 collection_name=collection, field_name=field, field_schema=schema
             )
+
+    async def _reshape(
+        self, collection: str, config: models.CollectionConfig, vector: models.VectorParams
+    ) -> None:
+        """Change whatever differs between ``collection`` and the configured shape.
+
+        One request, carrying only the dials that differ. What the server reports afterwards is
+        compared again, and a dial it accepted and did not apply is refused rather than logged:
+        a setting that reads as in force and is not is the failure the update exists to close,
+        and a log line nobody reads is that failure by a longer route.
+
+        Raises:
+            VectorStoreStateError: The server accepted the change and still reports a dial that
+                is not the configured one.
+        """
+        shape = self._shape
+        drift = shape.drift(config, vector)
+        if not drift:
+            return
+        update = shape.update_for(drift, config, vector)
+        await self._client.update_collection(
+            collection_name=collection,
+            vectors_config=update.vectors,
+            quantization_config=update.quantization,
+            optimizers_config=update.optimizers,
+            collection_params=update.params,
+        )
+        after = (await self._client.get_collection(collection)).config
+        remaining = shape.drift(after, writable_vector(collection, after, vector.size))
+        if remaining:
+            listed = "; ".join(str(item) for item in remaining)
+            msg = (
+                f"{collection} was asked to change and still differs: {listed}. The server "
+                f"took the request and did not apply it, so those settings are not in force. "
+                f"A Qdrant too old to know a dial ignores it; upgrade the server, or set the "
+                f"dial to what the collection has."
+            )
+            raise VectorStoreStateError(msg)
+        _LOG.info(
+            "reshaped Qdrant collection %s: %s",
+            collection,
+            "; ".join(f"{item.setting} {item.in_force!r} -> {item.configured!r}" for item in drift),
+        )
 
     async def _recorded_fingerprint(self) -> EmbedFingerprint | None:
         """What the server says this workspace holds, or ``None`` if it has never held anything.

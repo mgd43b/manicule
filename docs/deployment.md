@@ -903,10 +903,10 @@ rebuild of the affected generation and a look at what is underneath it — the d
 ### 6.5 Running against Qdrant
 
 Setting `storage.vector_db = "qdrant"` and `storage.vector_db_url` to a reachable Qdrant HTTP
-endpoint (`https://qdrant.internal:6333`, say) moves the dense index off this machine and onto
-that server. `storage.qdrant` carries what the dial needs beyond the endpoint:
-`collection_prefix`, `prefer_grpc` and `grpc_port` for the data path, and `timeout_s` for how
-long one request is allowed to take.
+endpoint (`https://qdrant.internal:6333`, say) moves the dense index off this machine and onto that
+server. `storage.qdrant` carries what the dial needs beyond the endpoint: `collection_prefix`,
+`prefer_grpc` and `grpc_port` for the data path, and `timeout_s` for how long one request is
+allowed to take. The rest of it shapes the collections, and is described below.
 
 **Set `collection_prefix` per installation if the server is shared.** A collection is named
 `<prefix>_<workspace digest>_chunks__<fp8>`, so one installation's workspaces and embedding
@@ -915,7 +915,10 @@ moved data directory or a rebuilt container, so the prefix is it — and two ins
 both leave it at `manicule` while pointing at one server share collections. Retrieval survives
 that, because the hydrating join admits only document ids the local authority knows; nothing
 else does. `manicule index` reports the union, and the second installation to prepare a
-workspace is refused outright when its embedder differs from the first's.
+workspace is refused outright when its embedder differs from the first's. The collection's shape
+becomes a contest as well: it is configuration rather than part of the name, so two installations
+whose shape settings (below) differ each bring the shared collection back to their own whenever
+they prepare it, and the `reshaped Qdrant collection` line appears in both logs.
 
 What sharing a prefix does *not* do is let one installation's `reset-index` delete another's
 collections, and that holds even for the awkward case where one prefix contains the other —
@@ -928,6 +931,78 @@ installation's name always has its own workspace digest in between (`storage.md`
 variable when the setting itself is left unset — so a credential need not be written into the
 config file at all.
 
+**Shaping the collections.** Seven more settings under `storage.qdrant` decide what a collection
+costs the server in memory and how its search trades recall for speed. None of them changes which
+chunks a filter admits, so none is part of a collection's name: changing one creates no new
+collection and re-embeds nothing. What the graph and quantization settings can change is how
+closely an approximate search finds the nearest of the admitted chunks — and so, at the margin,
+which of them reach the top of a ranking.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `quantization` | `"none"` | `"scalar"` keeps an int8 copy of every vector, a quarter of the originals' size, and searches that. The `float32` originals stay as written, and so does every checksum over them, so the RAM it saves comes from pairing it with `on_disk_vectors`. Setting `"none"` again drops the copy |
+| `quantization_always_ram` | `true` | Holds that copy in RAM even when `on_disk_vectors` puts the originals on disk. Read only when `quantization` is `"scalar"` |
+| `on_disk_vectors` | `false` | Serves the `float32` vectors from disk through the page cache instead of holding them in RAM |
+| `on_disk_payload` | `true` | Keeps each point's payload on disk. The payload carries the whole chunk, a second copy of the corpus text; the fields a query filters on are indexed and stay in RAM either way |
+| `hnsw_m` | `16` | Edges per node in the HNSW graph: better recall and a larger graph as it rises. At least `4` |
+| `hnsw_ef_construct` | `100` | Neighbors considered for each node while the graph is built: a better graph and a slower build, at no cost per query. At least `4` |
+| `indexing_threshold_kb` | `10000` | Kilobytes of vectors a segment holds before Qdrant builds a graph for it; below that the segment is searched exactly. A 1024-dimension vector is 4 kB, so the default is about 2,500 chunks. `0` never builds a graph. Unrelated to `storage.ann_index_threshold`, which counts vectors and is read only by `lancedb` |
+
+A value below those bounds, or a negative `indexing_threshold_kb`, is refused when the
+configuration loads. `hnsw_m = 0` in particular is not passed through: Qdrant reads it as no graph
+at all, and keeping search exhaustive already has one spelling, `indexing_threshold_kb = 0`.
+
+**Every default is Qdrant's own** for a collection nobody tuned, which is what every existing
+collection already is, so upgrading changes nothing on a server running its stock configuration.
+A server whose own `config.yaml` chose other defaults is the exception: its existing collections
+are brought to the values above, so say what you want here rather than relying on the server's
+configuration to say it.
+
+**An edit reaches the collection you already have**, not only one created after it. The first time
+a process searches or ingests, and again before an ingest or a migration writes, manicule reads the
+collection back and sends one update carrying only the settings that differ, logging each change:
+
+```text
+reshaped Qdrant collection manicule_<digest>_chunks__<fp8>: quantization 'none' -> 'scalar'
+```
+
+A collection that already matches is not written to. Changing the graph, the quantization or
+where the vectors live has Qdrant rebuild segments in the background, so on a large collection
+expect a period of server CPU and disk activity afterwards. If the server takes the update and
+still reports an old value — which is what a Qdrant too old to know the field does — the store
+refuses to open, naming each setting beside the value the collection has: upgrade the server, or
+set the setting to what the collection has.
+
+**The collection's vectors are checked as well.** A collection under this installation's name
+whose vectors manicule cannot write or verify — named vectors, the wrong size, a distance other
+than cosine, multivectors, a datatype other than `float32`, as one made by hand or restored from another
+installation's snapshot can be — is refused rather than written into. `manicule reset-index`
+discards this workspace's collections for the next ingest to recreate; a `collection_prefix` of
+this installation's own leaves that collection alone instead.
+
+**There is no datatype setting, and `quantization` is why none is needed.** A `float16` or
+`uint8` collection hands back numbers other than the `float32` values every checksum (§6.4) was
+taken over, so the whole corpus would read as corrupt and drop out of search, including the rows
+`migrate-vectors` carried across, which keep the checksum they arrived with. `vector-checksum
+--yes` would not repair it either, because it fills in only checksums that are missing.
+Scalar quantization paired with `on_disk_vectors` saves more RAM than `float16` would, and leaves
+the originals exactly as written (`storage.md` §6.7).
+
+**For a large corpus**, the two settings worth changing are these. A 320,000-chunk corpus at
+1024 dimensions holds about 1.3 GB of `float32` vectors, all of it in RAM at the defaults:
+
+```toml
+[storage.qdrant]
+quantization = "scalar"    # an int8 copy, about 330 MB for that corpus, held in RAM
+on_disk_vectors = true     # the float32 originals, served from disk through the page cache
+```
+
+`quantization_always_ram` stays at its default, `true`. The copy in RAM with the originals on disk
+is the pairing that makes quantization a memory saving rather than a latency cost: a search picks
+its candidates from the copy and reads the originals only for those, to score them exactly —
+manicule asks for that rescoring, since Qdrant does not rescore scalar quantization by default. The graph settings answer a measured
+recall problem, not a memory one, and are best left at their defaults until there is one.
+
 **`manicule doctor` reports reachability, once the store has been built.** Component health in
 this system reports on what a process has already constructed, so a fresh process that has not
 yet opened the vector store — before the first search or the first ingest — shows nothing for
@@ -938,13 +1013,23 @@ the credential this installation actually configured, and a failure names both
 `storage.vector_db_url` and `storage.qdrant.api_key` in its remedy rather than leaving you to
 guess which of the two is wrong.
 
-**Two refusals, checked at startup before anything is built.** `Settings.policy_problems()` —
-surfaced by `manicule config show` and by `doctor`'s `configuration` check — refuses
-`storage.vector_db = "qdrant"` at a non-loopback URL when `security.data_policy.cloud_allowed`
-is false, and refuses it there too when any `local_only` source is configured. Both rest on the
-same fact: the chunk's text travels with its vector, so a vector store on another host is an
-egress path for document *text*, not merely for embeddings, and `local_only`'s premise — that
-search never leaves this machine — does not survive indexing into one.
+**Four refusals, checked at startup before anything is built.** `Settings.policy_problems()` —
+surfaced by `manicule config show` and by `doctor`'s `configuration` check — makes two about the
+endpoint and two about where the corpus goes.
+
+- `storage.vector_db = "qdrant"` with `storage.vector_db_url` empty. A networked store has
+  nowhere to be by default.
+- `storage.vector_db = "lancedb"` with `storage.vector_db_url` set. The embedded store lives in
+  a directory under the data directory and dials nothing, so the URL would read as a setting in
+  force and not be one.
+- `qdrant` at a non-loopback URL when `security.data_policy.cloud_allowed` is false.
+- `qdrant` at a non-loopback URL when any `local_only` source is configured, whatever
+  `cloud_allowed` says.
+
+The last two rest on the same fact: the chunk's text travels with its vector, so a vector store
+on another host is an egress path for document *text*, not merely for embeddings, and
+`local_only`'s premise — that search never leaves this machine — does not survive indexing into
+one.
 
 **Moving an index you already have does not cost a re-embed.** An installation that has been
 running on the embedded backend has its vectors in `vectors/` right now, and `manicule
@@ -953,7 +1038,8 @@ Qdrant payload holds is the row a Lance table holds, so the move is a read of th
 rather than a pass of the embedder (`storage.md` §6.8). The order is: set `storage.vector_db`
 and `storage.vector_db_url`, leave the vectors directory alone, run `manicule migrate-vectors`
 to see what would move, then `--yes`. Setting the configuration first is what puts the two
-policy refusals below in front of the copy rather than behind it.
+egress refusals above in front of the copy rather than behind it, and what has the destination
+collection created in the shape `storage.qdrant` describes.
 
 It plans by default and the plan creates nothing, so it is safe to run while deciding. It
 refuses a destination that already holds rows, a rebuild or re-embed still in flight, and any

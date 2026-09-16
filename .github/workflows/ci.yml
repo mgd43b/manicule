@@ -235,24 +235,34 @@ jobs:
 
   # The vector-store suite that a server is the only way to check. `qdrant-client` ships an
   # in-process mode the ordinary suite uses, and it is a Python reimplementation: it searches
-  # exhaustively, ignores payload indexes, and hands back the list it was given. Three
-  # properties therefore exist only here — that the payload indexes are created at all, that a
-  # `float32` survives the REST transport's JSON rounding, and that the reuse contract holds
-  # over a socket — and the store would pass every other test in the repository while getting
-  # any of them wrong.
-      #
+  # exhaustively, ignores payload indexes and every collection update, and hands back the list
+  # it was given. So several properties exist only here — that the payload indexes are created
+  # at all, that a `float32` survives the REST transport's JSON rounding, that the reuse
+  # contract holds over a socket, that an existing collection is brought to the configured
+  # shape, and that a quantized search is scored against the originals — and the store would
+  # pass every other test in the repository while getting any of them wrong.
+  #
   # `REQUIRE_QDRANT` turns the suite's skips into failures, the way the grammar and vocabulary
   # jobs do: a skipped conformance suite reports green while proving nothing, and this one
   # skips by default so that a developer with no Qdrant running gets a green first checkout.
   qdrant:
-    name: vector store (qdrant)
+    name: vector store (qdrant ${{ matrix.server }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Two servers, because the store speaks two dialects. Qdrant 1.19 replaced the `on_disk`
+      # placement flags with a `memory` field that overrides them, and 1.17 accepts `memory`
+      # and drops it, so the collection shape writes whichever vocabulary a collection reports
+      # — a branch one server alone cannot exercise both sides of. 1.17.0 is also what the
+      # deployed installation runs, and the client is 1.19, more than a minor version apart.
+      matrix:
+        server: [v1.19.1, v1.17.0]
     services:
       qdrant:
         # Pinned rather than `latest`, because the thing under test is an interaction with a
         # server's wire behavior and "it passed on whatever was published that morning" is not
         # a result anybody can reproduce.
-        image: qdrant/qdrant:v1.19.1
+        image: qdrant/qdrant:${{ matrix.server }}
         ports:
           - 6333:6333
           - 6334:6334

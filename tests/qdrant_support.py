@@ -7,14 +7,17 @@ Two engines answer to ``qdrant-client``, and the difference matters to what a te
   that "every vector store passes these" needs no service and no marker — the guarantees those
   suites check are the store's, not the engine's.
 - **A real server** is the configuration this backend exists for, and it is the only place
-  three things can be observed at all: payload indexes (local mode ignores them and says so),
-  HNSW rather than a brute-force scan, and the REST transport's JSON rounding of a stored
-  ``float32`` — which is the one difference that could make a healthy corpus read as corrupt.
+  four things can be observed at all: payload indexes (local mode ignores them and says so),
+  HNSW rather than a brute-force scan, a collection's shape changing after it was created
+  (local mode ignores every update and says nothing), and the REST transport's JSON rounding of
+  a stored ``float32`` — which is the one difference that could make a healthy corpus read as
+  corrupt.
 
 :data:`REQUIRE_QDRANT_ENV` is what tells a developer's machine from CI, and it is
 **deliberately outside manicule's ``MANICULE_`` namespace**: ``manicule_environment`` deletes
 every variable with that prefix before each test, so a switch named that way is scrubbed before
 it is ever read and the job goes green having skipped everything.
+
 **Local mode also re-normalizes a vector on write, and the real server does not.** Measured on
 500 random unit vectors at 64 dimensions: 47 came back from ``:memory:`` with one component
 moved by a single ulp, against 0 from ``qdrant/qdrant:v1.19.1``. It is float64 arithmetic in a
@@ -56,6 +59,19 @@ def local_client() -> AsyncQdrantClient:
     return AsyncQdrantClient(":memory:")
 
 
+def remote_client(url: str) -> AsyncQdrantClient:
+    """A client on the real server at ``url``, built the way the product builds one.
+
+    That is, without the client's version check, which the plugin factory also turns off. The
+    check is a blocking request on a background thread that *warns* when client and server are
+    more than a minor version apart, and this project turns warnings into errors — so a suite
+    pointed at the Qdrant an installation actually runs failed on that warning, before reaching
+    any property it was written to check. The image CI pins is not the only server worth
+    pointing it at.
+    """
+    return AsyncQdrantClient(url=url, timeout=30, check_compatibility=False)
+
+
 def server_url() -> str | None:
     """The real server this machine has, if it has one."""
     return os.environ.get(QDRANT_URL_ENV, "").strip() or None
@@ -89,6 +105,7 @@ __all__ = [
     "REQUIRE_QDRANT_ENV",
     "TEST_COLLECTION_PREFIX",
     "local_client",
+    "remote_client",
     "require_server",
     "server_url",
 ]
