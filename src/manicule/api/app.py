@@ -5,7 +5,7 @@ takes one. That is what lets the suites drive the **real** routing, the real dep
 resolution and the real middleware against a fake backend — and a surface that could only be
 tested by starting a whole manicule is a surface nobody tests.
 
-Three decisions are made here and nowhere else, because each of them has to hold for every
+The application-wide decisions are made here, because each of them has to hold for every
 route or it does not hold at all:
 
 **An unauthenticated application that configuration says is not loopback does not get built.**
@@ -30,18 +30,19 @@ the route somebody added last. The question only arose with the browser surface:
 posture is loopback with no credential at all, which is precisely the ambient authority a page
 on another origin can spend on the user's behalf.
 
-**MCP is mounted here too, at** :data:`MCP_PATH`, **and it carries the read-only tools only.**
+**MCP is mounted here too, at** :data:`MCP_PATH`, **with the reads and one named authoring tool.**
 One process, one port, one bind decision and one address for an operator to remember — a second
 port would double what has to be got right and would need its own answer to every question this
 module already answers once. Mounting it on *this* application is what makes those answers apply
 to it: the middleware above wraps the whole ASGI stack, so the cross-site refusal, the security
 headers and the principal resolution reach ``/mcp`` without being restated there.
 
-What does **not** carry over is the tool surface, and that is the point of it being read-only.
+What does **not** carry over is the full stdio tool surface.
 ``tests/api/test_routes.py`` asserts by name that the destructive operations have no route here;
 a mount that offered ``document_delete`` over the same socket would have made that assertion
-true and meaningless on the same day. :mod:`manicule.mcp.serve` decides which tools a transport
-carries, and this asks it rather than deciding again.
+true and meaningless on the same day. The one admitted write is ``document_create``;
+:mod:`manicule.mcp.serve` decides which tools a transport carries, and this asks it rather
+than deciding again.
 """
 
 from __future__ import annotations
@@ -76,6 +77,7 @@ from manicule.api.security import require, resolve
 from manicule.api.widget import router as widget_router
 from manicule.app import frontdoor
 from manicule.app.bind import is_loopback, require_authoring_authentication
+from manicule.app.request_logging_http import RequestLoggingMiddleware
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import PolicyError
 from manicule.core.version import CORE_VERSION
@@ -364,6 +366,8 @@ def build_app(
     # name nothing reads, which a strict type checker correctly reports as dead — and the
     # honest fix is to reference the function rather than to silence the checker.
     app.middleware("http")(identify)
+    if settings.logging.requests:
+        app.add_middleware(RequestLoggingMiddleware)
     for failure in AUTH_ERRORS:
         app.add_exception_handler(failure, refuse)
     app.add_exception_handler(RequestValidationError, unreadable)

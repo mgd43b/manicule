@@ -193,6 +193,13 @@ class TelemetrySettings(Section):
     endpoint: str | None = None
 
 
+class LoggingSettings(Section):
+    requests: bool = Field(
+        default=True,
+        description="Write content-free HTTP and MCP request summaries to local stderr.",
+    )
+
+
 class AuditDestination(StrEnum):
     LOCAL = "local"
     SYSLOG = "syslog"
@@ -1528,6 +1535,7 @@ class Settings(BaseSettings):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     events: EventSettings = Field(default_factory=EventSettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
+    logging: LoggingSettings = Field(default_factory=LoggingSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
     authoring: AuthoringSettings = Field(default_factory=AuthoringSettings)
 

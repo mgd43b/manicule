@@ -52,6 +52,7 @@ from mcp.types import ToolAnnotations
 from manicule.app.dispatch import run_op
 from manicule.core.organization import CollectionRule
 from manicule.core.version import CORE_VERSION
+from manicule.mcp.request_logging import RequestLoggingMiddleware
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -1397,6 +1398,8 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         )
     }
     _check_wiring(register, declared, read_only=read_only)
+    if service.settings.logging.requests:
+        mcp.add_middleware(RequestLoggingMiddleware(frozenset(register.carried)))
     return Surface(server=mcp, tools=tuple(sorted(register.carried)))
 
 
