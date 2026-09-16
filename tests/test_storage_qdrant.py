@@ -44,6 +44,7 @@ from manicule.core.errors import (
 from manicule.core.ids import vector_id
 from manicule.core.lifecycle import HealthState
 from manicule.core.protocols import (
+    AdoptingVectorStore,
     AnnIndexMaintenance,
     PublicationAwareVectorStore,
     PublicationBoundVectorStore,
@@ -82,6 +83,7 @@ from manicule.storage.vector_schema import (
 )
 from manicule.testing.contracts import (
     assert_protocol_signatures,
+    assert_vector_store_adopts_rows_verbatim,
     assert_vector_store_is_dimension_agnostic,
     assert_vector_store_records_vector_checksums,
     assert_vector_store_rejects_foreign_vectors,
@@ -202,6 +204,60 @@ async def test_the_store_records_a_checksum_over_what_it_persists(
     """Hashing the caller's argument passes the one-hot case and fails a real embedder's."""
     chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
     await assert_vector_store_records_vector_checksums(make_store, chunks)
+
+
+@pytest.mark.contract
+async def test_the_store_carries_an_adopted_row_rather_than_rebuilding_it(
+    make_store: Callable[[], QdrantVectorStore],
+) -> None:
+    """Rebuilding the row from its chunk certifies a damaged vector as verified."""
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
+    await assert_vector_store_adopts_rows_verbatim(make_store, chunks)
+
+
+async def test_adoption_refuses_a_row_whose_chunk_did_not_come_with_it(
+    store: QdrantVectorStore,
+) -> None:
+    """A point without its chunk is a point every search that ranks it fails on.
+
+    The chunk travels with the vector because ``search`` returns one with no database behind
+    it, so storing the point anyway does not lose a little context — it plants a row that
+    raises a validation error in whichever process ranks it next, long after the migration that
+    wrote it reported success. Refused where the id and the vector beside it are refused.
+    """
+    await store.ensure_ready(fingerprint(4))
+    row = {
+        "id": "row-1",
+        "chunk_id": "chunk-1",
+        "publication_id": "legacy",
+        "document_id": "doc-1",
+        "kind": "paragraph",
+        "lang": "en",
+        "position": 0,
+        "chunk_json": "",
+        "embed_identity": "identity",
+        "vector_checksum": "unrecorded",
+        "vector_checksum_version": "unrecorded",
+        "vector": [1.0, 0.0, 0.0, 0.0],
+    }
+
+    with pytest.raises(ValueError, match="no chunk beside its vector"):
+        await store.adopt_rows([row])
+
+    assert await store.count() == 0, "a refused row must not be half-written"
+
+
+@pytest.mark.contract
+async def test_the_store_satisfies_the_adopting_protocol(store: QdrantVectorStore) -> None:
+    """The capability a migration asks of the object rather than of the module.
+
+    Signatures as well as attributes, for the reason the ``VectorStore`` check above gives: a
+    migration resolves this with ``isinstance`` and then calls it, so a store whose
+    ``adopt_rows`` took something other than a sequence of rows would pass the resolution and
+    fail partway through a corpus.
+    """
+    assert isinstance(store, AdoptingVectorStore)
+    assert_protocol_signatures(store, AdoptingVectorStore)
 
 
 @pytest.mark.contract

@@ -191,7 +191,7 @@ def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
     }.isdisjoint(TOOL_NAMES)
 
 
-def test_the_command_line_offers_exactly_thirty_two_commands() -> None:
+def test_the_command_line_offers_exactly_thirty_three_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
@@ -229,6 +229,7 @@ def test_the_command_line_offers_exactly_thirty_two_commands() -> None:
         "import",
         "index",
         "init",
+        "migrate-vectors",
         "plugin",
         "rebuild",
         "reembed",
@@ -246,7 +247,7 @@ def test_the_command_line_offers_exactly_thirty_two_commands() -> None:
         "vector-checksum",
         "workspace",
     ]
-    assert len(names) == 32
+    assert len(names) == 33
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(

@@ -874,6 +874,40 @@ def render_vector_checksum(out: Console, payload: r.VectorChecksumReport) -> Non
     out.print(f"[dim]{escape(payload.detail)}[/dim]")
 
 
+def render_vector_migration(out: Console, payload: r.VectorMigrationReport) -> None:
+    """Where the vectors went, how many, and the one sentence saying what to do next.
+
+    ``expected`` is printed whenever it disagrees with what the source held, and only then.
+    The two agreeing is the ordinary case and says nothing an operator has to act on; the two
+    disagreeing means the index was already short of the corpus before anything moved, which
+    is the finding that changes what they do next and is easy to miss in a row of counts.
+    """
+    table = _folding_table()
+    # Escaped, because these are configuration and database values rather than words this
+    # process chose: `storage_name` carries `storage.qdrant.collection_prefix` verbatim, and a
+    # prefix containing a square bracket would either restyle the rest of the table or raise a
+    # markup error while reporting on a corpus somebody has just moved.
+    table.add_row("from", escape(payload.source))
+    table.add_row("to", escape(payload.destination))
+    if payload.storage_name:
+        table.add_row("stored in", escape(payload.storage_name))
+    if payload.generation:
+        table.add_row("generation", escape(payload.generation))
+    if payload.dimension:
+        table.add_row("dimensions", str(payload.dimension))
+    table.add_row("vectors", str(payload.source_rows))
+    if payload.expected_rows != payload.source_rows:
+        table.add_row("authority expects", str(payload.expected_rows))
+    if not payload.dry_run:
+        table.add_row("copied", str(payload.copied))
+    if payload.unverified:
+        table.add_row("without a checksum", str(payload.unverified))
+    out.print(table)
+    if payload.dry_run:
+        out.print("[dim]nothing was written; add [/dim]--yes[dim] to perform the copy[/dim]")
+    out.print(f"[dim]{escape(payload.detail)}[/dim]")
+
+
 def render_vector_index(out: Console, payload: r.VectorIndexReport) -> None:
     table = _folding_table()
     before, after = payload.before, payload.after
@@ -1643,6 +1677,9 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.CollectionOrphans: lambda out, p: render_collection_orphans(out, _as(r.CollectionOrphans, p)),
     r.VectorChecksumReport: lambda out, p: render_vector_checksum(
         out, _as(r.VectorChecksumReport, p)
+    ),
+    r.VectorMigrationReport: lambda out, p: render_vector_migration(
+        out, _as(r.VectorMigrationReport, p)
     ),
 }
 """Payload type to renderer.

@@ -27,17 +27,29 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
 from manicule.core.anchors import Unlocated
-from manicule.core.content import Chunk, Document, DocumentStatus, ParsedBlock, RawDocument
+from manicule.core.content import (
+    LEGACY_PUBLICATION,
+    Chunk,
+    Document,
+    DocumentStatus,
+    ParsedBlock,
+    RawDocument,
+)
 from manicule.core.embedding import (
+    VECTOR_CHECKSUM_VERSION,
     EmbedFingerprint,
     Pooling,
     Vector,
     VectorIntegrity,
     VectorState,
+    embedding_input_identity,
+    vector_checksum,
 )
 from manicule.core.errors import ContextOverflowError, FingerprintMismatchError, ManiculeError
+from manicule.core.ids import vector_id
 from manicule.core.organization import ChunkRelationType, CitationState, CollectionRule
 from manicule.core.protocols import (
+    AdoptingVectorStore,
     Chunker,
     ChunkRelationStore,
     CollectionStore,
@@ -459,6 +471,127 @@ async def assert_vector_store_records_vector_checksums(
         f"has to be taken *after* whatever normalization and float32 conversion storage "
         f"performs — hashing the caller's argument produces a digest that no readback can "
         f"ever match, and every row then looks corrupt",
+    )
+
+
+async def assert_vector_store_adopts_rows_verbatim(
+    make_store: Callable[[], AdoptingVectorStore], chunks: Sequence[Chunk]
+) -> None:
+    """Check that a store taking another backend's rows carries them rather than rebuilding them.
+
+    :class:`~manicule.core.protocols.AdoptingVectorStore` is how a corpus moves between backends
+    without a corpus-sized forward pass, and the whole value of it rests on one property: what
+    comes out is what went in. Run against every store that claims the capability, because the
+    guarantee belongs to the backend — a store that rebuilt the row from its ``chunk_json`` on
+    the way past would satisfy every *shape* a migration checks and still quietly change the
+    corpus.
+
+    Three cases, and the third is the one that matters most:
+
+    1. **The row arrives.** A search finds the adopted chunk, so the vector is queryable rather
+       than merely stored.
+    2. **The identity is carried, not recomputed.** ``embed_identity`` is derived from the
+       configured ``embed_text`` middleware, so a store that recomputed it would produce a
+       different value on an installation whose middleware had moved since the rows were
+       written — and every reuse lookup would then miss, re-embedding a corpus that had just
+       been migrated precisely to avoid that.
+    3. **A checksum that does not describe its vector is refused, not refreshed.** This is the
+       one a plausible implementation gets wrong. Hashing the incoming vector is the obvious
+       thing to do and it is what turns a damaged row into a verified one: the digest then
+       describes the damage, and the integrity check that exists to notice reports the corpus
+       as healthy forever.
+    """
+    fingerprint = _fingerprint(8)
+    store = make_store()
+    await store.ensure_ready(fingerprint)
+    if not chunks:  # pragma: no cover - the caller supplies a fixture with enough
+        _fail("this check needs at least one chunk")
+    chunk = chunks[0]
+    # One-hot, and that is load-bearing rather than lazy: its norm is exactly 1, so a backend
+    # that re-normalizes on write (a cosine collection does) writes back exactly what it was
+    # given. A vector a hair off unit length would move by an ulp on some implementations and
+    # not others, which would make this suite fail by platform rather than by defect.
+    vector = [1.0 if column == 0 else 0.0 for column in range(8)]
+    recorded = embedding_input_identity(
+        chunk.embed_text, document_id=chunk.document_id, embed=fingerprint, middleware=()
+    )
+
+    def row(*, identity: str, values: Sequence[float], checksum: str) -> dict[str, object]:
+        return {
+            "id": vector_id(LEGACY_PUBLICATION, chunk.id),
+            "chunk_id": chunk.id,
+            "publication_id": LEGACY_PUBLICATION,
+            "document_id": chunk.document_id,
+            "kind": chunk.kind.value,
+            "lang": chunk.lang,
+            "position": chunk.position,
+            "chunk_json": chunk.model_dump_json(),
+            "embed_identity": identity,
+            "vector_checksum": checksum,
+            "vector_checksum_version": VECTOR_CHECKSUM_VERSION,
+            "vector": list(values),
+        }
+
+    written = await store.adopt_rows(
+        [row(identity=recorded, values=vector, checksum=vector_checksum(vector))]
+    )
+    _require(
+        written == 1,
+        f"the store reported adopting {written} row(s) when it was given one. The count is what "
+        f"a migration reports against the source, so a store that miscounts makes a short copy "
+        f"indistinguishable from a complete one",
+    )
+
+    found = await store.search(vector, 1)
+    _require(
+        bool(found) and found[0].chunk.id == chunk.id,
+        "a search did not find the chunk whose row was adopted. An adopted row has to be "
+        "queryable, not merely present: a store that accepted the write and indexed nothing "
+        "would report a faithful migration and serve an empty corpus",
+    )
+    verdict = (await store.stored_vectors([chunk]))[chunk.id]
+    _require(
+        verdict.state is VectorState.READABLE and verdict.integrity is VectorIntegrity.VERIFIED,
+        f"the store read an adopted row back as {verdict.state.value}/"
+        f"{verdict.integrity.value}. Its vector, identity and checksum were consistent when "
+        f"they were handed over, so anything else means the store altered one of them",
+    )
+
+    await store.adopt_rows(
+        [
+            row(
+                identity="not-an-identity-this-store-derives",
+                values=vector,
+                checksum=vector_checksum(vector),
+            )
+        ]
+    )
+    foreign = (await store.stored_vectors([chunk]))[chunk.id]
+    _require(
+        foreign.state is VectorState.STALE,
+        f"a row carrying an embedding identity this store would never derive read back as "
+        f"{foreign.state.value!r} rather than stale, so the store recomputed the identity "
+        f"instead of carrying the one it was given. That is invisible until an installation "
+        f"whose embed_text middleware has changed migrates, and then every reuse lookup misses "
+        f"and the corpus it just moved to avoid re-embedding is re-embedded",
+    )
+
+    # Rotated rather than rescaled, and that distinction is the test working. A backend whose
+    # distance is cosine may normalize on write — Qdrant does — so a vector damaged by scaling
+    # one component is a vector the store legitimately restores, and the checksum then matches
+    # for an honest reason. A different *direction* of the same length is damage no
+    # normalization can undo, which is what makes a store that rehashes fail here.
+    rotated = [0.0, 1.0, *([0.0] * 6)]
+    await store.adopt_rows(
+        [row(identity=recorded, values=rotated, checksum=vector_checksum(vector))]
+    )
+    damaged = (await store.stored_vectors([chunk]))[chunk.id]
+    _require(
+        damaged.integrity is not VectorIntegrity.VERIFIED,
+        "the store read back a row whose recorded checksum does not describe its vector as "
+        "verified. It recomputed the digest over what it was given instead of carrying the one "
+        "the source recorded — which certifies the damage rather than preserving the evidence "
+        "of it, and is the single failure this capability exists to avoid",
     )
 
 
@@ -1550,6 +1683,7 @@ __all__ = [
     "assert_retrieval_stage_contract",
     "assert_tag_store_contract",
     "assert_trash_store_contract",
+    "assert_vector_store_adopts_rows_verbatim",
     "assert_vector_store_is_dimension_agnostic",
     "assert_vector_store_records_vector_checksums",
     "assert_vector_store_rejects_foreign_vectors",

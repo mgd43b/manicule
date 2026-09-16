@@ -290,6 +290,7 @@ server and the built command tree.
 | `rebuild_status` | ✓ | `rebuild status` | private-safe aggregate rebuild checkpoint |
 | `vector_index_build` | ✓ dry-run only | `build-vector-index [--yes] [--force]` | ANN index state before and after; whether a build ran |
 | `vector_checksum` | ✓ verify only | `vector-checksum [--verify] [--yes]` | aggregate numerical-integrity coverage and typed failure counts; no checksum value or chunk id |
+| `vector_migrate` | — | `migrate-vectors [--yes]` | counts, the destination's own name for where they landed, and the source generation; no chunk or document id |
 | `vector_sweep` | — | `sweep-vectors` | vectors removed and documents purged in one bounded pass |
 | `lifecycle_reset_derived` | ✓ dry-run only | `reset-derived --dry-run/--yes` | aggregate derived rows removed; source roots retained |
 | `lifecycle_cleanup_generations` | ✓ dry-run only | `cleanup-derived-generations [--yes]` | eligible/protected generations and temporary bytes |

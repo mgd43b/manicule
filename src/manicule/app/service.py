@@ -89,6 +89,10 @@ from manicule.core.version import CORE_VERSION
 from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
 from manicule.research.config import ResearchLimits
 
+# Two names, no engine: `storage.config` imports nothing heavier than pydantic, so the service
+# can say which backend it read from without acquiring a database to ask.
+from manicule.storage.config import VECTOR_STORE_NAME
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 
@@ -115,6 +119,7 @@ if TYPE_CHECKING:
     from manicule.parsers.config import SourceCodeConfig
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
+    from manicule.storage.vector_migration import VectorMigration
 
 _log = logging.getLogger("manicule.app")
 """For the one thing here that is reported rather than raised: a telemetry write that failed.
@@ -2966,6 +2971,52 @@ class ApplicationService:
             detail=_checksum_detail(coverage, pass_),
         )
 
+    async def migrate_vectors(
+        self, *, report: Callable[[str], None] | None = None, dry_run: bool = True
+    ) -> r.VectorMigrationReport:
+        """Carry the embedded vector index into the configured backend, without re-embedding.
+
+        The operation an installation reaches for exactly once, when it moves its index off
+        this machine. ``docs/storage.md`` §9.4 names two postures for a corpus whose vectors
+        are not where the configured store looks — treat them as disposable and embed the whole
+        corpus again, or restore them from a snapshot the destination took on its own schedule.
+        This is the third: the vectors already exist, the row a destination wants is the row the
+        source holds, and moving them costs a read rather than a model.
+
+        **What it establishes, and the one thing it does not.** Every row read was written with
+        its numbers unchanged and its recorded checksum still describing them — a row that
+        fails that check stops the migration rather than being carried or skipped. What it does
+        not establish is that the *source* held everything the corpus expects, which is why
+        ``expected_rows`` is reported beside ``source_rows`` rather than folded into a single
+        verdict: a faithful copy of a source that is itself short of the corpus is a different
+        situation, and a different repair, from a copy that lost rows on the way.
+
+        Args:
+            report: Progress, one sentence at a time, while a long copy runs.
+            dry_run: Count what would move and write nothing. The default, like every other
+                boundary here.
+
+        Returns:
+            What moved, or what would.
+        """
+        maintenance = await self._backend.maintenance()
+        documents = await self._backend.documents()
+        expected = await documents.live_chunk_count()
+        outcome = await maintenance.migrate_vectors(report=report, dry_run=dry_run)
+        return r.VectorMigrationReport(
+            source=VECTOR_STORE_NAME,
+            destination=self.settings.storage.vector_db,
+            storage_name=outcome.storage_name,
+            generation=outcome.generation,
+            dimension=outcome.dimension,
+            source_rows=outcome.source_rows,
+            expected_rows=expected,
+            copied=outcome.copied,
+            unverified=outcome.unverified,
+            dry_run=outcome.dry_run,
+            detail=_migration_detail(outcome, expected, self.settings.storage.vector_db),
+        )
+
     async def ready(self) -> bool:
         """Whether this installation can actually serve a question.
 
@@ -3032,6 +3083,9 @@ class ApplicationService:
         # made with. Numerical integrity is the next question down: not whether the right
         # model produced them, but whether what it produced is still on disk unchanged.
         checks.append(await self._vector_integrity_check())
+        # After it, and for a different axis again: not whether the numbers are intact but
+        # whether the pointer naming them means anything to the backend now configured.
+        checks.append(await self._vector_backend_check())
         checks.append(await self._glossary_check())
         checks.append(await self._connectors_check())
         checks.append(await self._authoring_check())
@@ -4305,6 +4359,63 @@ class ApplicationService:
             detail=(
                 f"all {coverage.rows} stored vector(s) carry a checksum. "
                 f"`manicule vector-checksum --verify` recomputes them; this counts them."
+            ),
+            facts=facts,
+        )
+
+    async def _vector_backend_check(self) -> r.Check:
+        """Whether the live generation pointer means anything to the configured backend.
+
+        ``index_state.vector_table`` holds either a space name or a ``reembed-…`` generation
+        pointer, and a generation pointer names a *directory* under the embedded store's root.
+        Only the embedded backend has generations, so the pointer surviving a move to another
+        backend leaves a corpus whose recorded index identity names something the configured
+        store has never heard of.
+
+        ``manicule migrate-vectors`` retargets it, so reaching this means the backend was
+        changed without the vectors being moved — which is a legitimate thing to do, and the
+        reason this is ``degraded`` rather than ``failing``: search works, the next ingest
+        corrects the pointer, and in between every surface that reports which space is live
+        reports a directory instead. ``runtime`` refuses a derived reset outright in this
+        state, which is the failure an operator otherwise meets first and with less context.
+        """
+        configured = self.settings.storage.vector_db
+        try:
+            store = await self._backend.documents()
+            pointer = (await store.index_fingerprints()).vector_table
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="vector_backend",
+                state="unknown",
+                detail=f"index state could not be read: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        facts: dict[str, JsonValue] = {"vector_db": configured, "vector_table": pointer}
+        stranded = (
+            pointer is not None
+            and pointer.startswith("reembed-")
+            and configured != VECTOR_STORE_NAME
+        )
+        if stranded:
+            return r.Check(
+                name="vector_backend",
+                state="degraded",
+                detail=(
+                    f"this workspace's live index is recorded as {pointer!r}, which names a "
+                    f"generation directory belonging to the embedded store, but "
+                    f"storage.vector_db is {configured!r}. The backend was changed without the "
+                    f"vectors being carried across, so the recorded identity describes storage "
+                    f"the configured backend does not have."
+                ),
+                facts=facts,
+                remedy="manicule migrate-vectors",
+            )
+        return r.Check(
+            name="vector_backend",
+            state="ok",
+            detail=(
+                f"the live index pointer is consistent with the configured vector store "
+                f"({configured})."
             ),
             facts=facts,
         )
@@ -7945,6 +8056,42 @@ def _vector_index_state(state: AnnIndexState) -> r.VectorIndexState:
         unindexed_rows=index.unindexed_rows if index else 0,
         coverage=index.coverage if index else 1.0,
         detail=state.detail,
+    )
+
+
+def _migration_detail(outcome: VectorMigration, expected: int, destination: str) -> str:
+    """One sentence naming what an operator should do next, or that the move is done.
+
+    Ordered by what changes a decision. A source that disagrees with the authority outranks
+    everything, because it is the one finding that makes the *destination* untrustworthy for a
+    reason the destination cannot be asked about — and it is as true before the copy as after,
+    so a plan reports it while the vectors are still in a directory somebody can repair.
+    """
+    short = expected - outcome.source_rows
+    if short > 0:
+        return (
+            f"the embedded index holds {outcome.source_rows} vector(s) but the authority "
+            f"accounts for {expected} chunk(s), so {short} are already missing before anything "
+            f"moves. Copying now carries the shortfall across faithfully. Run `manicule index` "
+            f"first to embed what is absent, or accept that the destination starts incomplete."
+        )
+    if outcome.dry_run:
+        return (
+            f"would copy {outcome.source_rows} vector(s) from {outcome.generation} into "
+            f"{outcome.storage_name or 'the destination'} without calling the embedder. "
+            f"Nothing has been written; pass --yes to perform it."
+        )
+    carried = f"copied {outcome.copied} vector(s) into {outcome.storage_name}, no embedder called"
+    if outcome.unverified:
+        return (
+            f"{carried}. {outcome.unverified} of them predate the numerical-integrity contract "
+            f"and still record no checksum; `manicule vector-checksum --yes` clears that "
+            f"against the destination now that it holds them."
+        )
+    return (
+        f"{carried}. Verify with `manicule vector-checksum --verify`, and once the destination "
+        f"answers searches, the vectors directory is no longer read and can be removed — "
+        f"`manicule backup` does not capture {destination}, so plan that side separately."
     )
 
 

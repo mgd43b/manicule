@@ -36,7 +36,13 @@ from manicule.config.loader import load_settings
 from manicule.container import keys
 from manicule.container.container import Container, build_container
 from manicule.core.content import RawDocument
-from manicule.core.errors import ManiculeError, PolicyError, UnknownEntityError
+from manicule.core.errors import (
+    ConfigError,
+    ManiculeError,
+    PolicyError,
+    UnknownEntityError,
+    VectorMigrationError,
+)
 from manicule.core.lifecycle import HealthReport, HealthState
 from manicule.ingest.capacity import CapacityRefusedError
 from manicule.ingest.recovery import InstanceLock
@@ -66,9 +72,11 @@ if TYPE_CHECKING:
     from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.protocols import (
+        AdoptingVectorStore,
         Connector,
         Embedder,
         Generator,
+        InspectableVectorStore,
         Parser,
         PublicationBoundVectorStore,
         ResettableVectorStore,
@@ -94,6 +102,8 @@ if TYPE_CHECKING:
         SqliteReembedStore,
     )
     from manicule.storage.source_lifecycle import ResetPreparation
+    from manicule.storage.vector_migration import VectorMigration
+    from manicule.storage.vectors import LanceVectorStore
 
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
@@ -2444,6 +2454,341 @@ class _Maintenance:
         if not isinstance(vectors, VectorIntegrityMaintenance):
             return None
         return await vectors.backfill_checksums(limit=limit, dry_run=dry_run)
+
+    async def migrate_vectors(
+        self, *, report: Callable[[str], None] | None = None, dry_run: bool = True
+    ) -> VectorMigration:
+        """Carry the live generation's vectors from the embedded directory into the destination.
+
+        The one operation in this class that deliberately holds two backends at once, and the
+        only place ``lancedb`` is imported on a process configured for something else. That
+        import is inside the method rather than at module scope for the reason
+        ``tests/test_import_boundary.py`` exists: LanceDB's extension is compiled around AVX2,
+        so on a host without it an import taken to *ask a question* is a ``SIGILL`` rather than
+        a slow start. Here it is not a question — the directory is about to be read — and an
+        installation reaching this line has a Lance directory it wants moved.
+
+        Which backends can *receive* a corpus is asked of the store through
+        :class:`~manicule.core.protocols.AdoptingVectorStore` rather than by naming them, so a
+        backend added later becomes migratable by implementing the capability rather than by
+        being added to a list here. Only the source is named, because only the source has a
+        location this runtime knows how to find.
+
+        Refused before a row is read, each naming what the operator has to do:
+
+        *The configured store is the one being read from, or cannot adopt rows.* Migrating
+        requires the installation already be pointed at the backend it is moving to, which is
+        also what puts ``Settings.policy_problems()`` between a local-only corpus and a network
+        store before any text leaves the machine (``docs/storage.md`` §6.7).
+
+        *A rebuild or a durable re-embed is in flight.* An unpublished generation is still being
+        written, so what a copy captures is a moment rather than a generation — and its rows
+        carry replay lineage in four ``source_*`` columns a destination is under no obligation
+        to have a home for (``docs/storage.md`` §6.4), so moving them can drop the provenance a
+        resumed replay reads. Finish or abandon it first and both go away.
+
+        *No embedded index to move.* A directory that was never built, or was reset.
+
+        *The destination already holds rows.* Refused in the engine, which is where the count
+        comes from.
+        """
+        from manicule.core.protocols import AdoptingVectorStore  # noqa: PLC0415
+        from manicule.storage.config import VECTOR_STORE_NAME  # noqa: PLC0415
+
+        settings = self._runtime.settings
+        configured = settings.storage.vector_db
+        if configured == VECTOR_STORE_NAME:
+            msg = (
+                f"storage.vector_db is {configured!r}, which is the store this reads *from*, so "
+                f"a migration would copy the embedded index onto itself. Point this "
+                f"installation at the backend you are moving to first and leave the vectors "
+                f"directory where it is; this reads it in place."
+            )
+            raise ConfigError(msg)
+        target = await self._runtime.vectors()
+        if not isinstance(target, AdoptingVectorStore):
+            msg = (
+                f"the vector store configured as {configured!r} cannot adopt rows another "
+                f"backend already holds, so vectors can only reach it by being embedded again. "
+                f"Re-index into it instead — `manicule index` writes to whichever store is "
+                f"configured — or move to a backend that implements adoption."
+            )
+            raise ConfigError(msg)
+        if dry_run:
+            # Unguarded, because a plan writes nothing and is meant to be runnable while a sync
+            # is in flight. What it reports can go stale behind it, which is what a plan is: a
+            # reading taken at a moment, not a promise about the next one.
+            return await self._migration(target, report, dry_run=True)
+        # **The guard is taken before the preflight reads anything, not around the copy.** Both
+        # of the reads that decide whether this may proceed — whether a generation is in flight,
+        # and which one `index_state.vector_table` names — are only worth what they are worth
+        # while nothing else can move them, and the guard is what stops another task in this
+        # process moving them. Taking it later leaves two windows: a re-embed started after the
+        # in-flight check runs beside a migration that was told there was none, and a generation
+        # published after the pointer is read leaves this holding the superseded source — where
+        # `_retarget_index_state` would then overwrite the newly published pointer with the old
+        # space. The data directory's writer lock does not close either, because it excludes
+        # other *processes* and this is two tasks inside one served one.
+        async with self._runtime.derived_mutation_guard():
+            return await self._migration(target, report, dry_run=False)
+
+    async def _migration(
+        self,
+        target: AdoptingVectorStore,
+        report: Callable[[str], None] | None,
+        *,
+        dry_run: bool,
+    ) -> VectorMigration:
+        """Preflight, open the source, and copy — all of it under whatever the caller holds."""
+        await self._refuse_migration_in_flight()
+        source, generation, directory = await self._embedded_source()
+        try:
+            await self._require_recorded_fingerprint(source)
+            return await self._migrate_from(
+                source, target, generation, directory, report, dry_run=dry_run
+            )
+        finally:
+            await source.teardown()
+
+    async def _require_recorded_fingerprint(self, source: InspectableVectorStore) -> None:
+        """Refuse unless the directory's own fingerprint is the one SQLite recorded for it.
+
+        The physical metadata says what the vectors *are*; ``index_state.embed_fingerprint``
+        says what every later ingest will expect them to be. They agree on any installation
+        nothing has been done to by hand, and the case where they do not is the one this
+        refuses: a vectors directory swapped in from elsewhere, or restored from a backup taken
+        against a different model. Copying then moves model A's vectors into the destination
+        while the relational authority goes on naming model B, and the disagreement is
+        discovered by the next ingest being refused against a corpus that has already moved.
+
+        A workspace with no index-state row at all has never recorded a fingerprint, so there
+        is nothing to disagree with and nothing to refuse.
+        """
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.core.embedding import EmbedFingerprint  # noqa: PLC0415
+        from manicule.storage import models  # noqa: PLC0415
+
+        physical = await source.fingerprint()
+        if physical is None:  # pragma: no cover - `open_existing` established it
+            return
+        async with self._runtime.require_engine().connect() as connection:
+            row = (
+                await connection.execute(
+                    select(
+                        models.IndexState.workspace_id, models.IndexState.embed_fingerprint
+                    ).where(models.IndexState.workspace_id == self._runtime.workspace)
+                )
+            ).one_or_none()
+        if row is None:
+            # No row at all, which is not the same as a row recording no fingerprint — and the
+            # two were indistinguishable here until this told them apart. A migration that
+            # proceeded would copy the whole corpus and then have nothing to retarget: the
+            # `UPDATE` would match zero rows, the destination would be left with no
+            # `vector_table` pointer, and `doctor` would report a migrated corpus as being in
+            # no vector table at all. Refused here, before the expensive half.
+            msg = (
+                f"this workspace holds vectors at {self._runtime.workspace!r} and has no "
+                f"index-state row to record where they live. A migration has to move that "
+                f"pointer when it finishes and there is nothing to move, so it would copy the "
+                f"corpus and leave the destination unnamed. Run `manicule index` to restore "
+                f"the workspace's index state first, or `manicule doctor` to see what else is "
+                f"missing."
+            )
+            raise VectorMigrationError(msg)
+        recorded = row.embed_fingerprint
+        if not recorded:
+            return
+        EmbedFingerprint.model_validate_json(recorded).require_match(physical)
+
+    async def _migrate_from(
+        self,
+        source: InspectableVectorStore,
+        target: AdoptingVectorStore,
+        generation: str,
+        directory: Path,
+        report: Callable[[str], None] | None,
+        *,
+        dry_run: bool,
+    ) -> VectorMigration:
+        """Run the copy under the source generation's pin, so cleanup cannot delete it."""
+        from manicule.storage.vector_migration import migrate_vectors  # noqa: PLC0415
+        from manicule.storage.vector_paths import generation_pin  # noqa: PLC0415
+
+        async with generation_pin(directory):
+            outcome = await migrate_vectors(
+                source, target, generation=generation, report=report, dry_run=dry_run
+            )
+        if not outcome.dry_run:
+            try:
+                await self._retarget_index_state(source)
+            except (ManiculeError, OSError) as exc:
+                # The vectors are already in the destination and the pointer is not. Saying so
+                # is the whole of what this adds: the copy is the expensive half and an operator
+                # told only "migration failed" would reasonably re-run it, meet the
+                # populated-destination refusal, and have no way to tell which of the two halves
+                # had happened.
+                msg = (
+                    f"{outcome.copied} vector(s) reached {outcome.storage_name}, and then the "
+                    f"index-state pointer could not be moved off {outcome.generation!r}: "
+                    f"{type(exc).__name__}: {exc}. The copy is done; do not repeat it. Resolve "
+                    f"whatever refused the write and re-run, which will refuse the populated "
+                    f"destination — clear it with `manicule reset-index` first if you do."
+                )
+                raise VectorMigrationError(msg) from exc
+        return outcome
+
+    async def _retarget_index_state(self, source: InspectableVectorStore) -> None:
+        """Point ``index_state.vector_table`` at a space the destination can resolve.
+
+        A ``reembed-…`` pointer names a *directory* under the embedded store's root, and the
+        destination has no such thing — it holds one space per fingerprint and no generations
+        at all. Left alone the pointer survives the move and goes on naming a directory the
+        configured backend has never heard of, which is the state
+        :meth:`_reset_embedded_storage` already refuses with "the corpus was moved between
+        backends with a rebuild still pending".
+
+        It is not merely cosmetic. ``manicule doctor`` reads this column to say which space a
+        corpus is served from, the backup manifest records it, and the next ingest would
+        silently correct it — so between the migration and that ingest every one of those
+        reports the wrong thing with no indication that it is wrong.
+
+        The published root needs no update: ``legacy`` already resolves to ``chunks__<fp8>``,
+        which is what the destination calls its space too.
+        """
+        from sqlalchemy import update  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.vector_schema import space_name  # noqa: PLC0415
+
+        fingerprint = await source.fingerprint()
+        if fingerprint is None:  # pragma: no cover - the copy established it
+            return
+        space = space_name(fingerprint)
+        async with self._runtime.require_engine().begin() as connection:
+            result = await connection.execute(
+                update(models.IndexState)
+                .where(models.IndexState.workspace_id == self._runtime.workspace)
+                .values(vector_table=space)
+            )
+        if result.rowcount != 1:
+            # Checked rather than assumed, because an `UPDATE` matching nothing is not an error
+            # to SQL and this is the last step of an operation that has already moved a corpus.
+            # The preflight refuses the reachable cause; reaching it here means the row went
+            # away underneath a guarded migration, which is worth saying out loud rather than
+            # reporting as a completed move.
+            msg = (
+                f"the vectors were copied and the index-state pointer was not moved: the "
+                f"update matched {result.rowcount} row(s) for workspace "
+                f"{self._runtime.workspace!r} rather than one. The destination holds the "
+                f"corpus; the relational authority still names the source."
+            )
+            raise VectorMigrationError(msg)
+
+    async def _embedded_source(self) -> tuple[LanceVectorStore, str, Path]:
+        """Open the live embedded generation read-only, and say which one it is."""
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.vector_paths import (  # noqa: PLC0415
+            generation_directory,
+            published_generation_key,
+        )
+        from manicule.storage.vectors import LanceVectorStore  # noqa: PLC0415
+
+        root = await self._runtime.vector_directory()
+        async with self._runtime.require_engine().connect() as connection:
+            pointer = (
+                await connection.execute(
+                    select(models.IndexState.vector_table).where(
+                        models.IndexState.workspace_id == self._runtime.workspace
+                    )
+                )
+            ).scalar_one_or_none()
+        generation = published_generation_key(pointer)
+        directory = generation_directory(root, generation)
+        if not await asyncio.to_thread(directory.exists):
+            msg = (
+                f"there is no embedded vector index at {directory} to migrate. Either this "
+                f"workspace has never been indexed, or its derived index was reset — in both "
+                f"cases there are no vectors to carry and `manicule index` builds them "
+                f"directly into the configured store."
+            )
+            raise ConfigError(msg)
+        # Opened rather than merely constructed, and `open_existing` rather than `ensure_ready`:
+        # preparing would create an empty table beside a directory that was supposed to already
+        # hold the corpus, so a migration run against the wrong path would report having
+        # faithfully moved nothing instead of saying the path was wrong.
+        store = LanceVectorStore(directory)
+        try:
+            await store.open_existing()
+        except BaseException:
+            # `open_existing` holds the connection before it validates what is behind it, so a
+            # directory with no fingerprint metadata, a missing table or a contradictory record
+            # raises with the handle already open. This runs before the caller's `finally`, so
+            # without this the refusal leaks a LanceDB connection — and an unclosed one becomes
+            # a `ResourceWarning` attributed to whatever is running when the collector next
+            # fires, which under `filterwarnings = ["error"]` fails an unrelated test.
+            await store.teardown()
+            raise
+        return store, generation, directory
+
+    async def _refuse_migration_in_flight(self) -> None:
+        """Refuse while an unpublished generation still expects its lineage columns."""
+        from sqlalchemy import func, select  # noqa: PLC0415
+
+        from manicule.core.rebuild import RebuildState  # noqa: PLC0415
+        from manicule.ingest.reembed import ReembedState  # noqa: PLC0415
+        from manicule.storage import models  # noqa: PLC0415
+
+        workspace = self._runtime.workspace
+        settled_rebuilds = (RebuildState.PUBLISHED, RebuildState.FAILED, RebuildState.CANCELED)
+        settled_reembeds = (
+            ReembedState.PUBLISHED,
+            ReembedState.SUPERSEDED,
+            ReembedState.FAILED,
+        )
+        async with self._runtime.require_engine().connect() as connection:
+            rebuilds = (
+                await connection.execute(
+                    select(func.count())
+                    .select_from(models.DerivedGeneration)
+                    .where(
+                        models.DerivedGeneration.workspace_id == workspace,
+                        models.DerivedGeneration.state.not_in(settled_rebuilds),
+                    )
+                )
+            ).scalar_one()
+            reembeds = (
+                await connection.execute(
+                    select(func.count())
+                    .select_from(models.ReembedRunRecord)
+                    .where(
+                        models.ReembedRunRecord.workspace_id == workspace,
+                        models.ReembedRunRecord.state.not_in(
+                            [state.value for state in settled_reembeds]
+                        ),
+                    )
+                )
+            ).scalar_one()
+        if not rebuilds and not reembeds:
+            return
+        pending = ", ".join(
+            part
+            for part in (
+                f"{rebuilds} rebuild(s)" if rebuilds else "",
+                f"{reembeds} re-embed(s)" if reembeds else "",
+            )
+            if part
+        )
+        msg = (
+            f"this workspace has {pending} still in flight, so nothing was copied. An "
+            f"unpublished generation's vectors carry replay lineage in columns a Qdrant "
+            f"payload has no field for, and moving them now would drop the provenance a "
+            f"resumed replay reads without anything noticing. Finish it, or abandon it, and "
+            f"run this again."
+        )
+        raise VectorMigrationError(msg)
 
     async def plan_reset_derived(self) -> LifecyclePlan:
         return await self._source_lifecycle(await self._runtime.documents()).plan_reset_derived()

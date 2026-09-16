@@ -96,8 +96,17 @@ class Arguments:
             self._refuse(name, "a string or nothing", value)
         return value
 
-    def flag(self, name: str) -> bool:
-        value = self.values.get(name, False)
+    def flag(self, name: str, *, default: bool = False) -> bool:
+        """Read a boolean argument, or ``default`` when the caller sent none.
+
+        ``False`` is the right default for a flag that *enables* something, which is nearly all
+        of them: an absent ``--force`` means no force. It is the wrong default for the one
+        shape where absence must mean the safe thing rather than the permissive one — a
+        ``dry_run`` that an operation performs when it is missing. The command line always
+        sends the field, so the gap is only reachable over the control socket, which is exactly
+        where a client one version older than its server sends a command without it.
+        """
+        value = self.values.get(name, default)
         if not isinstance(value, bool):
             self._refuse(name, "true or false", value)
         return value
@@ -218,6 +227,13 @@ class Command:
             return Arguments(self.op, self.arguments).flag("delete")
         if self.op.startswith("lifecycle_") and Arguments(self.op, self.arguments).flag("dry_run"):
             return False
+        if self.op == "vector_migrate":
+            # The same invocation boundary. A plan reads the embedded directory, the relational
+            # pointer and the destination's own counts, and deliberately creates nothing — so it
+            # is a diagnostic somebody can run against a live installation while deciding
+            # whether to move at all. Performing it writes the destination *and* retargets
+            # `index_state.vector_table`, which is the write that needs the lock.
+            return not Arguments(self.op, self.arguments).flag("dry_run", default=True)
         if self.op == "vector_checksum":
             # The same invocation boundary once more. Reporting coverage — even the setting that
             # recomputes every digest — reads rows and writes nothing, and is a diagnostic
@@ -380,6 +396,13 @@ BINDERS: Mapping[str, Binder] = {
     ),
     "vector_checksum": lambda service, args, report: service.vector_checksum(
         verify=args.flag("verify"), dry_run=args.flag("dry_run")
+    ),
+    "vector_migrate": lambda service, args, report: service.migrate_vectors(
+        # `default=True`, because a command that arrived without the field must plan rather
+        # than copy a corpus — and because the classification above has to agree with it, or a
+        # bare command would be run as a read and then write.
+        report=report,
+        dry_run=args.flag("dry_run", default=True),
     ),
     "vector_sweep": lambda service, args, report: service.sweep_vectors(),
     "vector_index_build": lambda service, args, report: service.vector_index_build(

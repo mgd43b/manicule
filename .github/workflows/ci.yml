@@ -277,7 +277,10 @@ jobs:
         env:
           QDRANT_TEST_URL: http://localhost:6333
           REQUIRE_QDRANT: "1"
-        run: uv run pytest tests/test_storage_qdrant.py -q -rs
+        # The migration suite belongs here for the same reason the store's own does: its whole
+        # claim is that a vector survives the move unchanged, and local mode hands back the list
+        # it was given, so the one property worth proving is the one only a socket can test.
+        run: uv run pytest tests/test_storage_qdrant.py tests/test_storage_vector_migration.py -q -rs
 
   # The embedding backend whose model is a *service*, and the only suite here that cannot be
   # checked without one. `manicule-ollama` makes six claims about a server it does not control
