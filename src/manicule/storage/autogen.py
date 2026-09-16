@@ -37,6 +37,40 @@ begins by dropping the lexical index.
 """
 
 
+UNREFLECTABLE_FOREIGN_KEYS = frozenset({("documents", ("container_id",))})
+"""Foreign keys SQLite reports without their name, by table and constrained columns.
+
+SQLite cannot ALTER a constraint onto an existing table, so a foreign key added after the
+initial schema has to arrive inline in ``ADD COLUMN`` — the only form the engine accepts, and
+the reason ``c7d1a4e83f26`` writes that one statement as raw DDL. The constraint is real:
+``PRAGMA foreign_key_list`` reports it with ``ON DELETE CASCADE`` and the engine enforces it.
+What is lost is the *name*, because SQLAlchemy recovers foreign-key names by parsing the
+table-constraint form ``CONSTRAINT x FOREIGN KEY (...) REFERENCES ...`` out of the stored DDL,
+and a column-level ``REFERENCES`` has no such clause to parse.
+
+So autogenerate compares a reflected constraint with no name against a declared one the naming
+convention named, concludes they are different constraints, and proposes dropping and adding —
+on every fresh database, for ever. This is the same shape as :func:`enum_check_constraints`
+above: present in the database, present in the models, and unmatchable between them.
+
+Rebuilding ``documents`` would let the constraint be declared the reflectable way and is
+exactly what none of these migrations may do — a batch rebuild fires every ``ON DELETE
+CASCADE`` pointing at ``documents`` and empties the corpus's derived state while reporting
+success.
+"""
+
+
+def _foreign_key_identity(obj: SchemaItem) -> tuple[str | None, tuple[str, ...]]:
+    """A foreign key as ``(table, constrained columns)``, which is what both sides share.
+
+    Matching on identity rather than on name is the point: the reflected side has no name, and
+    a filter keyed on one would exclude the declared constraint and keep proposing to add it.
+    """
+    table = getattr(getattr(obj, "table", None), "name", None)
+    columns = getattr(obj, "column_keys", None) or ()
+    return table, tuple(str(column) for column in columns)
+
+
 def include_name(name: str | None, type_: NameType, _parent_names: ParentNames) -> bool:
     """Whether autogenerate should consider an object it found in the database."""
     if type_ == "table" and name is not None:
@@ -80,11 +114,14 @@ def include_object(
         return name not in EXCLUDED_TABLES
     if type_ == "check_constraint" and name is not None:
         return name not in enum_check_constraints()
+    if type_ == "foreign_key_constraint":
+        return _foreign_key_identity(_obj) not in UNREFLECTABLE_FOREIGN_KEYS
     return True
 
 
 __all__ = [
     "EXCLUDED_TABLES",
+    "UNREFLECTABLE_FOREIGN_KEYS",
     "NameType",
     "ParentNames",
     "enum_check_constraints",

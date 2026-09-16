@@ -25,6 +25,7 @@ from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import BlobSink, IngestPipeline
+from manicule.ingest.reindex import re_parse
 from manicule.ingest.workers import InProcessRunner
 from manicule.parsers.versions import parse_fingerprint
 from tests.fakes import MEDIA_TYPE, HashEmbedder
@@ -751,6 +752,470 @@ async def test_a_member_that_could_not_be_read_is_stored_with_its_reason() -> No
     assert failed.status_detail == "member is encrypted"
 
 
+async def test_a_member_records_the_container_it_came_out_of() -> None:
+    """Ownership is a column, because two things join on it and neither can read a source id.
+
+    Connector reconciliation has to exclude derived documents, and re-expansion has to find the
+    ones a container no longer produces. Both are joins, and the ``zip:<container>!/<path>``
+    spelling is a string nothing joins on.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=!encrypted"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+
+    await pipeline.run(connector)
+
+    container = await store.find_document("memory", "bundle")
+    member = await store.find_document("memory", "bundle!/one")
+    refused = await store.find_document("memory", "bundle!/two")
+    assert container is not None
+    assert member is not None
+    assert refused is not None
+    assert container.container_id is None
+    assert container.container_depth == 0
+    assert member.container_id == container.id
+    assert member.container_depth == 1
+    assert refused.container_id == container.id, (
+        "a member that could not be read is still owned, or the container it came out of "
+        "would retire it on the next expansion as though it had gone"
+    )
+
+
+async def test_a_member_removed_from_its_container_is_retired_rather_than_left_indexed() -> None:
+    """Re-expansion is a reconcile: members that are gone go, members that stay keep their ids.
+
+    Without it a file deleted from an archive stays in the corpus for ever, because connector
+    reconciliation cannot see it — its source id was never in any inventory.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+    kept_before = await store.find_document("memory", "bundle!/one")
+    assert kept_before is not None
+
+    connector.documents["bundle"] = "one=alpha"
+    await pipeline.run(connector)
+
+    assert await store.find_document("memory", "bundle!/two") is None
+    kept = await store.find_document("memory", "bundle!/one")
+    assert kept is not None
+    assert kept.id == kept_before.id, (
+        "a reconcile, never a delete-then-insert: re-minting ids would discard the version "
+        "history of every unchanged member because one member was removed"
+    )
+
+
+async def test_an_unchanged_container_does_not_retire_the_members_it_never_expanded() -> None:
+    """A container whose bytes have not moved is never expanded, so it derived nothing.
+
+    Reading "derived nothing" as "expands to nothing" would retire every member of every
+    archive on the first sync that found it unchanged — which is every sync after the first.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+
+    await pipeline.run(connector)
+
+    assert await store.find_document("memory", "bundle!/one") is not None
+    assert await store.find_document("memory", "bundle!/two") is not None
+
+
+async def test_an_emptied_container_retires_every_member_it_used_to_have() -> None:
+    """An archive whose last member was removed is the case a "did it yield members" test skips."""
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+
+    connector.documents["bundle"] = ""
+    await pipeline.run(connector)
+
+    assert await store.find_document("memory", "bundle!/one") is None
+
+
+async def test_a_nested_container_emptied_of_members_retires_them() -> None:
+    """The rule one level down, in the case that "did it yield members" cannot see.
+
+    An archive inside an archive is an ordinary shape, and members removed from the inner one
+    are exactly as invisible to connector reconciliation as members removed from the outer. A
+    nested container that still yields *something* is reconciled either way; one emptied to
+    nothing is reconciled only if a container is recognized by what it was as well as by what
+    it just produced.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"outer": "inner.zip=one=alpha\\ntwo=beta"})
+    connector.media_types["outer"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+    member = await store.find_document("memory", "outer!/inner.zip!/two")
+    assert member is not None
+    assert member.container_depth == 2, "depth counts from the top-level document, not the parent"
+
+    connector.documents["outer"] = "inner.zip="  # the inner archive is now empty
+    await pipeline.run(connector)
+
+    assert await store.find_document("memory", "outer!/inner.zip!/one") is None
+    assert await store.find_document("memory", "outer!/inner.zip!/two") is None
+    assert await store.find_document("memory", "outer!/inner.zip") is not None
+
+
+async def test_a_superseded_container_does_not_retire_the_members_it_never_saw() -> None:
+    """Nothing was written, so this run's view of the member list is the stale one.
+
+    A compare-and-swap that loses means somebody else has newer bytes for this container and is
+    part-way through re-deriving it. Reading "expanded to nothing" off a run that never got to
+    publish would let the loser retire members the winner is about to confirm — and soft delete
+    is cheap to cause and slow to notice, because the documents stay in the trash looking fine.
+
+    Driven through the shape ``reindex.re_parse`` uses — a known ``existing`` and the revision
+    it was read at — because that is the caller that supplies both halves the branch needs.
+    """
+    pipeline, store, vectors = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+    container = await store.find_document("memory", "bundle")
+    assert container is not None
+
+    class OvertakingEmptyArchive(fakes.FakeArchive):
+        """Expands to nothing, having let somebody else publish first."""
+
+        @override
+        async def expand(self, raw: RawDocument) -> AsyncIterator[fakes.MemberOutcome]:
+            del raw
+            store.documents[container.id] = store.documents[container.id].model_copy(
+                update={"content_hash": content_hash("winner"), "version_token": "winner"}
+            )
+            return
+            yield  # pragma: no cover - present to make this an async generator
+
+    contender, _, _ = build(
+        store=store,
+        vectors=vectors,
+        parsers={"archive": OvertakingEmptyArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    outcomes = await contender.ingest_raw(
+        RawDocument(
+            source_id="bundle",
+            uri="memory://bundle",
+            media_type=fakes.CONTAINER_MEDIA_TYPE,
+            content="one=alpha",
+        ),
+        source="memory",
+        existing=container,
+        force=True,
+        expected=container.revision,
+    )
+
+    assert outcomes[0].superseded
+    assert await store.find_document("memory", "bundle!/one") is not None
+    assert await store.find_document("memory", "bundle!/two") is not None
+
+
+async def test_a_truncated_expansion_retires_nothing() -> None:
+    """A member ceiling ends the walk, so what came back is a prefix of an intact archive.
+
+    This is the difference between "this member could not be read" and "the rest were never
+    looked at", and reading the second as the first retires every member past the ceiling — of
+    a container that still holds every one of them. Both parsers stop at their ceiling, so this
+    is the ordinary shape of a large archive rather than a corner.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+
+    class Truncating(fakes.FakeArchive):
+        """Yields the first member, then says the walk stopped rather than ended."""
+
+        @override
+        async def expand(self, raw: RawDocument) -> AsyncIterator[fakes.MemberOutcome]:
+            async for member in super().expand(raw):
+                yield member
+                yield fakes.MemberFailure(
+                    source_id=f"{raw.source_id}!/ceiling",
+                    uri=f"fake:{raw.uri}!/ceiling",
+                    status=DocumentStatus.FAILED,
+                    reason="member count exceeded",
+                    depth=1,
+                    truncates=True,
+                )
+                return
+
+    truncated, _, _ = build(
+        store=store,
+        parsers={"archive": Truncating(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector.documents["bundle"] = "one=alpha\ntwo=gamma"
+    await truncated.run(connector)
+
+    assert await store.find_document("memory", "bundle!/two") is not None, (
+        "`two` was never looked at, and a member nobody looked at is not a member that has gone"
+    )
+
+
+async def test_a_container_that_failed_to_parse_retires_nothing() -> None:
+    """Failing to read an archive is not reading it and finding it empty.
+
+    The bytes are unchanged and every member is still in there; what changed is that this build
+    could not open it. Retiring the members on that basis turns one parser fault into a corpus
+    losing documents it can still see.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+
+    class Breaking(fakes.FakeArchive):
+        @override
+        async def expand(self, raw: RawDocument) -> AsyncIterator[fakes.MemberOutcome]:
+            del raw
+            msg = "the archive index could not be read"
+            raise RuntimeError(msg)
+            yield  # pragma: no cover - present to make this an async generator
+
+    broken, _, _ = build(
+        store=store,
+        parsers={"archive": Breaking(), "lines": fakes.LineParser()},
+        chain=("archive",),
+    )
+    connector.documents["bundle"] = "one=alpha\ntwo=beta\nthree=delta"
+    await broken.run(connector)
+
+    assert await store.find_document("memory", "bundle!/one") is not None
+    assert await store.find_document("memory", "bundle!/two") is not None
+
+
+async def test_retiring_a_nested_container_retires_what_was_inside_it() -> None:
+    """A soft delete does not cascade, and the descendants it leaves are unreachable.
+
+    ``container_id`` carries ``ON DELETE CASCADE`` and that runs on a *hard* delete. Retiring a
+    member that is itself a container therefore leaves its own members live — and connector
+    reconciliation excludes derived documents by design, so nothing else will ever remove them.
+    Searchable, citable, and orphaned.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"outer": "inner.zip=one=alpha\\ntwo=beta\nkeep=gamma"})
+    connector.media_types["outer"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+    assert await store.find_document("memory", "outer!/inner.zip!/one") is not None
+
+    connector.documents["outer"] = "keep=gamma"  # the nested archive is gone from the outer one
+    await pipeline.run(connector)
+
+    assert await store.find_document("memory", "outer!/inner.zip") is None
+    assert await store.find_document("memory", "outer!/inner.zip!/one") is None
+    assert await store.find_document("memory", "outer!/inner.zip!/two") is None
+    assert await store.find_document("memory", "outer!/keep") is not None
+
+
+async def test_a_truncated_nested_expansion_retires_nothing() -> None:
+    """The gate one level down, which is where the first version of it was still open.
+
+    ``deeper`` being non-empty proves a nested archive was read, not that it was read to the
+    end — so an inner archive that stops at its member ceiling would have been reconciled
+    against a prefix and had the rest of its members retired.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"outer": "inner.zip=one=alpha\\ntwo=beta"})
+    connector.media_types["outer"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+    assert await store.find_document("memory", "outer!/inner.zip!/two") is not None
+
+    class TruncatingInner(fakes.FakeArchive):
+        """Reads the outer archive whole, and stops part-way through the inner one."""
+
+        @override
+        async def expand(self, raw: RawDocument) -> AsyncIterator[fakes.MemberOutcome]:
+            nested = raw.source_id.endswith("inner.zip")
+            async for member in super().expand(raw):
+                yield member
+                if nested:
+                    yield fakes.MemberFailure(
+                        source_id=f"{raw.source_id}!/ceiling",
+                        uri=f"fake:{raw.uri}!/ceiling",
+                        status=DocumentStatus.FAILED,
+                        reason="member count exceeded",
+                        depth=2,
+                        truncates=True,
+                    )
+                    return
+
+    truncated, _, _ = build(
+        store=store,
+        parsers={"archive": TruncatingInner(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector.documents["outer"] = "inner.zip=one=gamma\\ntwo=beta"
+    await truncated.run(connector)
+
+    assert await store.find_document("memory", "outer!/inner.zip!/two") is not None
+
+
+async def test_a_message_that_loses_its_last_attachment_retires_it() -> None:
+    """The shape this branch introduced, and the one the old gate could not see.
+
+    A message with a body *and* an attachment is neither a plain document nor a container: it
+    is ``indexed``, with chunks of its own and a member. So the day it loses its last
+    attachment it has no members and a status that is not ``container`` — and a gate that asked
+    "does it have members, or was it a container" answered no to a document that had just been
+    walked end to end. The attachment stayed live and searchable.
+    """
+    pipeline, store, _ = _mail_pipeline()
+    connector = fakes.DictConnector({"m3": _message(attachment=True)})
+    connector.media_types["m3"] = "message/rfc822"
+    await pipeline.run(connector)
+    assert await store.find_document("memory", "mail:m3!/notes.txt") is not None
+
+    connector.documents["m3"] = _message(attachment=False)
+    await pipeline.run(connector)
+
+    document = await store.find_document("memory", "m3")
+    assert document is not None
+    assert document.status is DocumentStatus.INDEXED, "the message itself is still a document"
+    assert await store.find_document("memory", "mail:m3!/notes.txt") is None
+
+
+async def test_reconciliation_never_sees_a_document_no_connector_could_report() -> None:
+    """The defect this ownership column exists for, stated as the arithmetic that produced it.
+
+    A member's source id was never in any inventory and never could be, so counting it makes
+    every member of every container permanently missing — and the deletion ceiling the only
+    thing between a current document and the trash.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"bundle": "one=alpha\ntwo=beta", "plain": "gamma"})
+    connector.media_types["bundle"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+
+    known = [source_id async for source_id in store.known_source_ids("memory")]
+
+    assert sorted(known) == ["bundle", "plain"]
+
+
+# --- a parser that both reads and expands -----------------------------------------------------
+
+
+def _message(*, attachment: bool) -> bytes:
+    """A real message from the standard library's own writer.
+
+    Written rather than hand-rolled for the reason ``tests/corpus/mail.py`` gives: the
+    boundaries, the transfer encodings and the folded headers are then the ones a mail transfer
+    agent produces instead of the ones a fixture author remembered.
+    """
+    from email.message import EmailMessage  # noqa: PLC0415 - stdlib, and only these tests need it
+    from email.policy import SMTP  # noqa: PLC0415
+
+    built = EmailMessage()
+    built["From"] = "ana@example.test"
+    built["To"] = "platform@example.test"
+    built["Subject"] = "Where the retry budget went"
+    built["Date"] = "Tue, 03 Feb 2026 09:14:00 +0000"
+    built.set_content(
+        "The budget is netted down once for the fetch and once more for the parse, so a "
+        "document sized to it is refused twice.\n"
+    )
+    if attachment:
+        built.add_attachment(
+            b"Measured over the whole quarter rather than at the peak.\n",
+            maintype="text",
+            subtype="plain",
+            filename="notes.txt",
+        )
+    return built.as_bytes(policy=SMTP)
+
+
+def _mail_pipeline() -> tuple[IngestPipeline, fakes.MemoryIngestStore, fakes.MemoryVectors]:
+    from manicule.parsers.config import MailConfig  # noqa: PLC0415 - a parsing extra
+    from manicule.parsers.mail import MailParser  # noqa: PLC0415 - a parsing extra
+
+    return build(
+        parsers={"email": MailParser(MailConfig()), "lines": fakes.LineParser()},
+        chain=("email", "lines"),
+    )
+
+
+async def test_an_email_with_no_attachments_is_indexed_with_its_own_text() -> None:
+    """A parser that can expand is still a parser, and a message's body is its content.
+
+    Expansion used to end the attempt, on the reasoning that such a parser's ``parse`` produces
+    nothing — true of the archive parser and false of this one. Every plain email in a corpus
+    therefore arrived with no chunks in it, and the parser's own suite went on passing because
+    it calls ``parse`` directly rather than through the runner the pipeline uses.
+    """
+    pipeline, store, _ = _mail_pipeline()
+    connector = fakes.DictConnector({"m1": _message(attachment=False)})
+    connector.media_types["m1"] = "message/rfc822"
+
+    await pipeline.run(connector)
+
+    document = await store.find_document("memory", "m1")
+    assert document is not None
+    assert document.status is DocumentStatus.INDEXED
+    assert store.chunks[document.id], "the headers and the body are blocks, and blocks are chunks"
+    assert any("retry budget" in chunk.text for chunk in store.chunks[document.id])
+
+
+async def test_a_message_with_an_attachment_keeps_its_body_and_owns_the_attachment() -> None:
+    """Both halves, because the fix for one of them is what would break the other.
+
+    A container is a document with nothing of its own. A message with a body is not that, so
+    calling it one would throw the body away in order to describe the attachment — while the
+    attachment must still become a document the message owns.
+    """
+    pipeline, store, _ = _mail_pipeline()
+    connector = fakes.DictConnector({"m2": _message(attachment=True)})
+    connector.media_types["m2"] = "message/rfc822"
+
+    await pipeline.run(connector)
+
+    document = await store.find_document("memory", "m2")
+    assert document is not None
+    assert document.status is DocumentStatus.INDEXED
+    assert any("retry budget" in chunk.text for chunk in store.chunks[document.id])
+    attachment = await store.find_document("memory", "mail:m2!/notes.txt")
+    assert attachment is not None
+    assert attachment.container_id == document.id
+    assert attachment.container_depth == 1
+
+
 # --- retained bytes ---------------------------------------------------------------------------
 
 
@@ -872,6 +1337,51 @@ async def test_the_bytes_that_are_retained_are_the_ones_the_connector_returned()
         "storage.md §4.2: original_ref is the same value as content_hash when retention worked"
     )
     assert blobs.data[document.content_hash] == b"alpha"
+
+
+async def test_a_hook_that_raises_before_parsing_keeps_the_bytes_it_was_given() -> None:
+    """Retention completes before ``before_parse``, so a raising hook leaves a blob on disk.
+
+    Recording ``original_ref=None`` beside it says the bytes are gone while they are sitting
+    there: the document cannot be repaired offline, and the collector reclaims a blob that a
+    re-parse would have used. This is the one failure position where that can happen, because
+    every other one is downstream of a settlement that already threads retention through.
+    """
+    blobs = fakes.MemoryBlobs()
+    pipeline, store, _ = build(blobs=blobs, middleware=(fakes.EarlyExploder(),))
+
+    await pipeline.run(fakes.DictConnector({"a": "alpha"}))
+
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.status is DocumentStatus.FAILED
+    assert document.failed_stage is PipelineStage.MIDDLEWARE
+    assert document.original_ref == content_hash(b"alpha")
+    assert store.originals[document.id] == (content_hash(b"alpha"), None)
+    assert blobs.data[content_hash(b"alpha")] == b"alpha"
+
+
+async def test_a_document_failed_by_a_hook_can_be_reparsed_from_its_retained_bytes() -> None:
+    """The point of retaining bytes: fix the hook, repair the document, do not re-fetch it.
+
+    ``re_parse`` refuses a document whose ``original_ref`` is unset, so a failure that
+    discards the reference is not merely untidy — it converts a one-command repair into a
+    forced re-sync of a source that may be rate-limited or gone.
+    """
+    blobs = fakes.MemoryBlobs()
+    pipeline, store, _ = build(blobs=blobs, middleware=(fakes.EarlyExploder(),))
+    await pipeline.run(fakes.DictConnector({"a": "alpha"}))
+    failed = await store.find_document("memory", "a")
+    assert failed is not None
+
+    repaired, _, _ = build(blobs=blobs, store=store)
+    report = await re_parse([failed], pipeline=repaired, blobs=blobs)
+
+    assert report.unrepairable == []
+    assert report.documents == 1
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.status is DocumentStatus.INDEXED
 
 
 async def test_members_of_a_container_do_not_consume_a_discovery_limit() -> None:

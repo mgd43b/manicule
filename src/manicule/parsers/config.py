@@ -59,6 +59,8 @@ __all__ = [
     "DIAGRAM_MIDDLEWARE_NAME",
     "MAIL_MEDIA_TYPES",
     "MARKDOWN_MEDIA_TYPES",
+    "MSG_MEDIA_TYPE",
+    "MSG_MEDIA_TYPES",
     "NOTEBOOK_MEDIA_TYPE",
     "NOTEBOOK_MEDIA_TYPES",
     "PDF_MEDIA_TYPES",
@@ -79,6 +81,7 @@ __all__ = [
     "DiagramConfig",
     "MailConfig",
     "MarkdownConfig",
+    "MsgConfig",
     "NotebookConfig",
     "PdfConfig",
     "PlaintextConfig",
@@ -127,6 +130,18 @@ MARKDOWN_MEDIA_TYPES = frozenset({"text/markdown", "text/x-markdown", "text/mdx"
 Markdown with components rather than a format of its own."""
 
 WEB_MEDIA_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+
+MSG_MEDIA_TYPE = "application/vnd.ms-outlook"
+"""Outlook's own type for a ``.msg``, and what a mail export names the file with."""
+
+MSG_MEDIA_TYPES = frozenset({MSG_MEDIA_TYPE})
+
+DRAWIO_MEDIA_TYPE = "application/vnd.jgraph.mxfile"
+"""draw.io's own type for an ``mxfile``, and the one Confluence reports for the attachment its
+``drawio`` macro stores. A ``.drawio.png`` is a real PNG carrying the same XML in a text chunk,
+so it routes here too rather than to an image path that would find no text in it."""
+
+DRAWIO_MEDIA_TYPES = frozenset({DRAWIO_MEDIA_TYPE})
 
 ADF_MEDIA_TYPE = "application/json;profile=atlas-doc-format"
 """ADF is not a file type. It is the body format the Confluence Cloud API returns, and it
@@ -352,7 +367,16 @@ Spelled once, here, because three places reach for it — the registration, the 
 message, and the fingerprint declaration — and a second spelling would let one of them name a
 component that is not the one being built."""
 
-DIAGRAM_LANGUAGES: frozenset[str] = frozenset({"dot", "mermaid"})
+GRAMMARLESS_DIAGRAM_LANGUAGES: frozenset[str] = frozenset({"mxfile"})
+"""Notations read without a grammar, and the reason the distinction is declared rather than
+inferred.
+
+A tree-sitter notation needs its grammar seeded or it reads nothing on an air-gapped install and
+everything on a warm cache — one corpus, two chunkings, which is the hazard ``docs/parsing.md``
+§8.1 exists for. A notation in this set has no grammar to seed, so holding it to that requirement
+would fail the check that guards the hazard while changing nothing about the hazard."""
+
+DIAGRAM_LANGUAGES: frozenset[str] = frozenset({"dot", "mermaid"}) | GRAMMARLESS_DIAGRAM_LANGUAGES
 """Notations :mod:`manicule.parsers.diagrams` reads relationships out of.
 
 Named here rather than beside the readers for the reason every media-type set is named here: the
@@ -363,6 +387,13 @@ holds the reader table to this set, so the two cannot drift.
 ``plantuml`` has a grammar in the same pack and is deliberately absent — see
 :data:`~manicule.parsers.diagrams.DIAGRAM_LANGUAGES` for the measurement, and ``docs/parsing.md``
 §8.4.1 for the record.
+
+``mxfile`` has no grammar and needs none: it is XML, and
+:class:`~manicule.parsers.drawio.DrawioParser` has already decoded it by the time a chunk
+carrying it reaches the middleware. It is in this set because the *reading* is the same reading
+— labeled nodes and the edges between them — and a second rewrite path would mean two answers
+to one question. A mermaid diagram inserted through draw.io is served here and never by the
+mermaid grammar, because draw.io converts it to native shapes at insert time.
 """
 
 
@@ -392,6 +423,30 @@ class DiagramConfig(BaseModel):
     relationships *and* the diagram's title, its groupings and its unconnected nodes; a bound that
     counted only edges would let the other three grow past it. Called ``max_relations`` it read as
     a promise the code does not keep — adding a title would have silently cost an edge."""
+
+
+class DrawioConfig(BaseModel):
+    """Configuration for :class:`~manicule.parsers.drawio.DrawioParser`."""
+
+    max_decompressed_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        ge=1,
+        description="Most bytes one compressed payload may expand to before it is refused.",
+    )
+    """An attachment is a file from the corpus, so a deflate stream inside one is untrusted input
+    on both counts. ``docs/parsing.md`` §9.3 settles the shape of the answer for zip members and
+    it holds here: the bound is on what the payload expands *to*, enforced while it expands.
+    Configuration rather than a constant for §9.3's reason too — a test can then exercise the
+    streaming refusal at a size that keeps a suite fast."""
+
+    max_diagrams: int = Field(
+        default=64,
+        ge=1,
+        description="Most pages one mxfile may contribute before the rest are ignored.",
+    )
+    """A draw.io file is tabbed, and a corpus's files have a handful of tabs. A file declaring
+    thousands is either generated or hostile, and in both cases the first sixty-four are what a
+    reader would have opened."""
 
 
 class ADFConfig(BaseModel):
@@ -606,6 +661,54 @@ class MailConfig(BaseModel):
     thousand parts a hundred thousand documents. Lower than the archive's ten thousand because
     a message with a thousand attachments is already not a message anybody sent.
     """
+
+
+class MsgConfig(BaseModel):
+    """Configuration for :class:`~manicule.parsers.msg.MsgParser`."""
+
+    mail: MailConfig = Field(default_factory=MailConfig)
+    """How the reconstituted message is read.
+
+    The same configuration the ``.eml`` parser takes, held here rather than duplicated, because
+    ``.msg`` is a shim onto that parser and two settings for one behavior would let a corpus
+    chunk the same message two ways depending on which file it arrived in."""
+
+    max_property_bytes: int = Field(
+        default=1024 * 1024,
+        ge=1,
+        description="Most bytes one MAPI string property may hold before it is refused.",
+    )
+    """Headers, a subject and a filename are all small. A property this large is a file that is
+    not what it claims to be, and reading it costs the memory before anything can check it."""
+
+    max_body_bytes: int = Field(
+        default=16 * 1024 * 1024,
+        ge=1,
+        description="Most bytes the plain or HTML body may hold before it is refused.",
+    )
+
+    max_attachments: int = Field(
+        default=64,
+        ge=0,
+        description="Most attachments one message may declare before it is refused.",
+    )
+    """Separate from :attr:`MailConfig.max_members` and narrower on purpose: this bounds the
+    *reconstruction*, so a message declaring thousands of attachment storages costs a bounded
+    build rather than a bounded expansion of an unbounded message.
+
+    **Past it the message is refused rather than rebuilt without the rest**, and that is the one
+    place this parser is coarser than the archive parser, which fails the member and keeps the
+    archive. The reason is the shim: reconstruction happens before there are members to fail, so
+    the only granularities available are the whole message or a silent omission — and a message
+    quietly rebuilt without four of its attachments is the failure `docs/parsing.md` §9.3 refuses
+    for containers. Both ceilings here are generous for that reason, and both name themselves in
+    the refusal so an operator can raise one."""
+
+    max_attachment_bytes: int = Field(
+        default=64 * 1024 * 1024,
+        ge=1,
+        description="Most bytes one attachment may hold before it is refused.",
+    )
 
 
 class PlaintextConfig(BaseModel):

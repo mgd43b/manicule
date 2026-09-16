@@ -47,6 +47,8 @@ from manicule.core.protocols import Middleware
 from manicule.parsers.config import DIAGRAM_LANGUAGES, DIAGRAM_MIDDLEWARE_NAME, DiagramConfig
 
 if TYPE_CHECKING:
+    from xml.etree.ElementTree import Element
+
     from tree_sitter import Node
 
     from manicule.core.content import Chunk, Document
@@ -105,6 +107,13 @@ class _Graph:
     order: list[str] = field(default_factory=list[str])
     """Every identifier seen, in source order, so an unconnected node is still reported."""
 
+    truncated: bool = False
+    """Whether the reader stopped before the end of the source.
+
+    A reading that stops early and says nothing is a partial description of a diagram presented
+    as a complete one, which is worse than no reading: an embedder cannot tell that the half it
+    was given is a half."""
+
     def note(self, identifier: str) -> str:
         if identifier and identifier not in self.order:
             self.order.append(identifier)
@@ -125,7 +134,19 @@ def notations() -> frozenset[str]:
     in step. The same reasoning shapes
     :data:`~manicule.parsers.confluence.INTERPRETED_MACROS`.
     """
-    return frozenset(_READERS)
+    return frozenset(_READERS) | grammarless_notations()
+
+
+def grammarless_notations() -> frozenset[str]:
+    """The notations this module reads without loading a grammar, asked of the dispatch table.
+
+    The declaration is :data:`~manicule.parsers.config.GRAMMARLESS_DIAGRAM_LANGUAGES`, for the
+    same reason :func:`notations` has a declaration beside it: registration must not import
+    tree-sitter to find out. This is the question a test can put to the module itself, so the
+    pair cannot drift into a notation that is declared grammar-free and dispatched through a
+    grammar, or the reverse.
+    """
+    return frozenset(_SOURCE_READERS)
 
 
 def reading(language: str, source: str, *, budget: int, max_statements: int) -> str | None:
@@ -145,6 +166,13 @@ def reading(language: str, source: str, *, budget: int, max_statements: int) -> 
     """
     if language not in DIAGRAM_LANGUAGES or not source.strip():
         return None
+    direct = _SOURCE_READERS.get(language)
+    if direct is not None:
+        # A notation the parser already decoded into a structure this module can walk. It needs
+        # no grammar, so it must not pay for one: a missing grammar bundle is a real state on
+        # this machine, and letting it silence a reading that never wanted tree-sitter would
+        # make an unrelated install step decide whether draw.io diagrams embed as relationships.
+        return _render(direct(source), budget=budget, max_statements=max_statements)
     from manicule.parsers.grammars import (  # noqa: PLC0415 - a parsing extra, not core
         GrammarUnavailableError,
         GrammarUnusableError,
@@ -213,6 +241,11 @@ def _lines(graph: _Graph) -> Iterator[str]:
     """Title, then relationships, then groupings, then whatever was never connected."""
     if graph.title:
         yield graph.title
+    if graph.truncated:
+        # Second, because `_render` trims from the end to fit its budget: a marker at the bottom
+        # is the first thing dropped from exactly the reading that needs it, which would leave a
+        # partial diagram presenting as a complete one.
+        yield "… this diagram is larger than the reader's limit and is read in part"
     mentioned: set[str] = set()
     for edge in graph.edges:
         source, target = graph.name(edge.source), graph.name(edge.target)
@@ -459,6 +492,90 @@ def _mermaid_signal(statement: Node, data: bytes, graph: _Graph) -> None:
 
 
 # --- the notations this module reads -----------------------------------------------------------
+
+
+# --- draw.io -----------------------------------------------------------------------------------
+
+
+_MXFILE_WRAPPERS: Final = frozenset({"object", "UserObject"})
+"""Elements draw.io wraps a cell in when the shape carries custom fields.
+
+The wrapper then owns the id and the label and the ``mxCell`` inside it owns the geometry, so a
+reader that only looked at ``mxCell`` would see those shapes as unlabeled."""
+
+
+def _read_mxfile(source: str) -> _Graph:
+    """draw.io, whose model is already a list of cells that are either nodes or edges.
+
+    No grammar, because the notation is XML and the parser has already decoded it. The two
+    shapes worth knowing: a cell is a node when it says ``vertex="1"`` and an edge when it says
+    ``edge="1"``, and either may be wrapped in an ``<object>`` that holds the label instead.
+    """
+    from manicule.parsers.drawio import (  # noqa: PLC0415 - a parsing extra, not core
+        MAX_CELLS,
+        MAX_ELEMENTS,
+        graph_source,
+        plain_text,
+    )
+
+    graph = _Graph()
+    root = graph_source(source)
+    if root is None:
+        return graph
+    # One pass, because ownership is knowable as it goes: `iter()` is document order and a
+    # wrapper is the parent of the cell it owns, so the wrapper is always seen first. Two passes
+    # needed a second bound to stop the first one, and any bound counted in elements will stop
+    # part-way through a diagram that fits — at which point the wrapped cells the first pass
+    # never reached are unowned, get read a second time on their own, and every edge among them
+    # is drawn twice. The two counts are still two counts, because they count different things.
+    owned: set[Element] = set()
+    cells = 0
+    for walked, element in enumerate(root.iter()):
+        if walked >= MAX_ELEMENTS:
+            graph.truncated = True
+            break
+        if element.tag in _MXFILE_WRAPPERS:
+            cell = element.find("mxCell")
+            if cell is None:
+                continue
+            owned.add(cell)
+            identifier, label = element.get("id") or "", element.get("label") or ""
+        elif element.tag == "mxCell" and element not in owned:
+            cell, identifier, label = element, element.get("id") or "", element.get("value") or ""
+        else:
+            continue
+        # Counted per *cell*, and checked here rather than at the top of the loop, which are
+        # two separate corrections of one mistake. Every vertex carries an `mxGeometry` and a
+        # wrapped one carries its `mxCell` too, so counting elements spends this budget two or
+        # three times faster than the thing it bounds — and testing it before an element is
+        # known to be a cell marks the graph truncated when all that was left was the geometry
+        # of the last cell read, putting a "there is more" line on a complete diagram.
+        if cells >= MAX_CELLS:
+            graph.truncated = True
+            break
+        cells += 1
+        drawn = plain_text(label)
+        if cell.get("edge") == "1":
+            head, tail = cell.get("source") or "", cell.get("target") or ""
+            if head and tail:
+                graph.edges.append(_Edge(source=head, target=tail, label=drawn))
+            continue
+        if cell.get("vertex") != "1" or not identifier:
+            continue
+        graph.note(identifier)
+        if drawn:
+            graph.labels[identifier] = drawn
+    return graph
+
+
+_SOURCE_READERS: Final[Mapping[str, Callable[[str], _Graph]]] = {"mxfile": _read_mxfile}
+"""Notations read straight from a chunk's text, with no grammar between.
+
+Separate from :data:`_READERS` because the signature genuinely differs — a tree-sitter reader is
+handed a parsed root and the bytes behind it, and this one is handed the source — and because
+collapsing them would mean the grammar load in :func:`reading` had to be made conditional on a
+property of the value rather than on which table answered.
+"""
 
 
 _READERS: Final[Mapping[str, Callable[[Node, bytes], _Graph]]] = {

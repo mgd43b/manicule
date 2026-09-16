@@ -187,6 +187,27 @@ class SqliteDocStore(
             ).scalar_one_or_none()
             return None if row is None else to_document(row)
 
+    async def container_members(self, container_id: str) -> Sequence[Document]:
+        """Every live document currently owned by one container, in ``source_id`` order.
+
+        Ordered so that a container re-expanded twice retires its absent members in the same
+        order both times, which is what makes the run report comparable rather than merely
+        correct. ``ix_documents_container_id`` covers the predicate.
+        """
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.Document)
+                    .where(
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.container_id == container_id,
+                        models.Document.deleted_at.is_(None),
+                    )
+                    .order_by(models.Document.source_id)
+                )
+            ).scalars()
+            return [to_document(row) for row in rows]
+
     async def find_documents_by_uri(self, uri: str) -> Sequence[Document]:
         """Live documents of this workspace whose URI is exactly ``uri``.
 
@@ -746,6 +767,32 @@ class SqliteDocStore(
             )
         return row, None
 
+    async def _require_own_container(self, session: AsyncSession, document: Document) -> None:
+        """Refuse a container that belongs to another workspace, or to nothing.
+
+        ``document_id`` carries the workspace, so an id built the ordinary way cannot cross the
+        boundary — but ``container_id`` arrives as a field on a caller's value and is copied onto
+        the row verbatim. The consequence is not a stale pointer: the column is a foreign key
+        with ``ON DELETE CASCADE``, so hard-deleting a container in workspace A would take a
+        child in workspace B with it, which is a tenant deleting another tenant's documents by
+        removing one of their own.
+
+        The migration adopts existing parents within each workspace and the column is a
+        single-column foreign key, so nothing in the schema prevents the next write from getting
+        it wrong. This does, at the one point every write goes through.
+        """
+        if document.container_id is None:
+            return
+        owner = await session.get(models.Document, document.container_id)
+        if owner is None or owner.workspace_id != self._workspace_id:
+            held = "no workspace" if owner is None else repr(owner.workspace_id)
+            msg = (
+                f"document {document.id!r} names container {document.container_id!r}, which "
+                f"belongs to {held} rather than {self._workspace_id!r}. A container and its "
+                f"members are one cascade, so they have to be one tenant's."
+            )
+            raise CrossWorkspaceCollisionError(msg)
+
     async def _write_document(self, session: AsyncSession, document: Document) -> Document:
         """The write both :meth:`upsert_document` and :meth:`commit_document` perform.
 
@@ -757,6 +804,7 @@ class SqliteDocStore(
             raise CrossWorkspaceCollisionError(
                 _cross_workspace(document.id, row.workspace_id, self._workspace_id)
             )
+        await self._require_own_container(session, document)
         if row is None:
             row = models.Document(id=document.id, workspace_id=self._workspace_id)
             session.add(row)
@@ -1572,7 +1620,14 @@ class SqliteDocStore(
             row.run_metadata = cast("Any", merged)
 
     async def known_source_ids(self, connector: str) -> AsyncIterator[SourceId]:
-        """Every source id currently indexed for a connector.
+        """Every source id a connector itself supplied, currently indexed.
+
+        **Derived documents are excluded, and that is the whole point of the predicate.** A
+        member of an archive has a ``zip:<container>!/<path>`` source id that no connector
+        reported and none ever could, so including it puts every member of every container
+        permanently in reconciliation's missing set — where the only thing standing between a
+        current document and deletion is the ceiling. A container's own members are reconciled
+        against the container that owns them, by the expansion that derives them.
 
         Streamed rather than collected: reconciliation runs over whole corpora, and the diff
         does not need the list in memory at once.
@@ -1590,6 +1645,7 @@ class SqliteDocStore(
                     models.Document.workspace_id == self._workspace_id,
                     models.Document.source == connector,
                     models.Document.deleted_at.is_(None),
+                    models.Document.container_id.is_(None),
                 )
             )
             async for (source_id,) in result:

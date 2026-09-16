@@ -807,6 +807,77 @@ async def test_parse_lineage_arrives_empty_and_leaves_the_rest_alone(data_dir: P
         await engine.dispose()
 
 
+async def test_container_ownership_adopts_the_members_already_indexed(data_dir: Path) -> None:
+    """The half of this migration an empty database cannot exercise.
+
+    Every other lineage column this project has added arrives ``NULL`` on existing rows, and
+    that is right when ``NULL`` is *true* — nothing had derived those edges. A null container id
+    on a document that plainly is a member is false, and false in the direction that keeps the
+    deletion hazard alive: connector reconciliation would go on counting every archive member as
+    missing until each container happened to re-sync.
+
+    So ownership is recovered from the identity that has been encoding it all along, and depth
+    is filled by walking what was just recorded. The nested member is the one that matters —
+    ``zip:zip:bundle.zip!/inner.zip!/deep.txt`` has two plausible parents and only one that
+    exists, which is why each candidate is resolved against the table rather than trusted.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision=_first_revision())
+        await _seed(engine)
+        await _seed_container_tree(engine)
+
+        await upgrade(engine)
+
+        async with engine.begin() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT source_id, container_id, container_depth FROM documents "
+                        "ORDER BY source_id"
+                    )
+                )
+            ).all()
+        owned = {row.source_id: (row.container_id, row.container_depth) for row in rows}
+
+        assert owned["bundle.zip"] == (None, 0), "a document a connector fetched owns itself"
+        assert owned["zip:bundle.zip!/inner.zip"] == ("c1", 1)
+        assert owned["zip:zip:bundle.zip!/inner.zip!/deep.txt"] == ("c2", 2)
+        assert owned["s1"] == (None, 0), "an ordinary document is untouched"
+        assert owned["zip:absent.zip!/orphan.txt"] == (None, 0), (
+            "a member whose container is not in this index names no parent, because a foreign "
+            "key to a row that does not exist is a cascade with nothing at the other end"
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _seed_container_tree(engine: AsyncEngine) -> None:
+    """A container, a nested container inside it, a leaf inside that, and one orphan."""
+    rows = (
+        ("c1", "bundle.zip", "application/zip"),
+        ("c2", "zip:bundle.zip!/inner.zip", "application/zip"),
+        ("c3", "zip:zip:bundle.zip!/inner.zip!/deep.txt", "text/plain"),
+        ("c4", "zip:absent.zip!/orphan.txt", "text/plain"),
+    )
+    async with engine.begin() as connection:
+        for identifier, source_id, media_type in rows:
+            await connection.execute(
+                text(
+                    "INSERT INTO documents (id, workspace_id, source, source_id, uri, title, "
+                    "media_type, content_hash, status, metadata, created_at, updated_at) "
+                    "VALUES (:id, 'w', 'fs', :source_id, :uri, '', :media_type, :id, "
+                    "'indexed', '{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+                ),
+                {
+                    "id": identifier,
+                    "source_id": source_id,
+                    "uri": f"file:///{source_id}",
+                    "media_type": media_type,
+                },
+            )
+
+
 async def test_glossary_lineage_arrives_empty_so_the_first_release_repairs_rather_than_trusts(
     data_dir: Path,
 ) -> None:

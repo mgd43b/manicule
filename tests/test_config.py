@@ -460,6 +460,50 @@ def test_a_saved_configuration_loads_back(
 # --- policy gates -------------------------------------------------------------------------
 
 
+def test_a_webhook_nothing_dispatches_is_refused_rather_than_ignored() -> None:
+    """Configuration that parses, validates, and reaches nothing is the worse failure.
+
+    ``events.transport``, ``events.webhooks`` and ``security.audit.destination`` all describe a
+    delivery this build does not perform — there is no event bus and no dispatcher yet (#14) —
+    and an operator who set one and watched the process start has been told their events are
+    going somewhere. ``CONTRIBUTING.md``: *a setting that appears to be in force and silently is
+    not is worse than one that fails at startup.*
+    """
+    settings = Settings(
+        events={  # pyright: ignore[reportArgumentType]
+            "transport": "webhook",
+            "webhooks": [{"url": "https://hooks.example.test/manicule", "events": ["sync"]}],
+        }
+    )
+
+    problems = settings.policy_problems()
+
+    assert any("nothing in this build dispatches one" in problem for problem in problems)
+    with pytest.raises(PolicyError):
+        settings.require_valid()
+
+
+def test_an_audit_destination_nothing_writes_to_is_refused() -> None:
+    """The same rule for the other half of it: the trail is written locally and nowhere else."""
+    settings = Settings(
+        security={  # pyright: ignore[reportArgumentType]
+            "audit": {"enabled": True, "destination": "syslog"},
+        }
+    )
+
+    problems = settings.policy_problems()
+
+    assert any("writes the audit trail locally" in problem for problem in problems)
+
+
+def test_the_default_configuration_names_no_delivery_it_cannot_perform() -> None:
+    """The refusal must not fire on an install nobody has configured."""
+    assert not any(
+        "dispatches" in problem or "audit trail locally" in problem
+        for problem in Settings().policy_problems()
+    )
+
+
 def test_a_hosted_model_under_a_local_only_policy_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

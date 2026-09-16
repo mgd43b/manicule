@@ -371,6 +371,18 @@ class Document(_Content):
     uri: str = Field(min_length=1)
     title: str = ""
 
+    container_id: str | None = Field(
+        default=None,
+        description="The document this one was expanded out of, for an archive or mail "
+        "member. ``None`` means the connector fetched it directly.",
+    )
+    container_depth: int = Field(
+        default=0,
+        ge=0,
+        description="How far inside a top-level document this one is. ``0`` for a document "
+        "the connector fetched.",
+    )
+
     content_hash: str = Field(min_length=1, description="Hash of the retained source bytes.")
 
     version_token: str | None = Field(

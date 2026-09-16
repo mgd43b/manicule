@@ -7,6 +7,7 @@ consumer revalidates the resulting handle inside its write transaction.
 
 from __future__ import annotations
 
+from itertools import batched
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import delete, exists, func, insert, literal, select, update
@@ -30,6 +31,19 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 INVENTORY_PAGE_LIMIT = 1_000
+
+_RETIRE_BATCH = 500
+"""How many container ids one ``IN`` carries while retiring descendants.
+
+SQLite bounds the parameters in a statement and the bound has moved between releases, so this
+clears the oldest of them rather than being tuned to the newest."""
+
+_MAX_CONTAINER_DEPTH = 3
+"""``manicule.parsers.expansion.MAX_DEPTH``, as a bound on the descent below.
+
+Spelled out rather than imported: this module is storage and that one is parsing, and the number
+is a ceiling on a loop here rather than a shared decision. The loop stops when a level retires
+nothing, so the bound is what keeps a cycle the schema should not allow from being a hang."""
 
 
 class ReconciliationInventoryError(AcquisitionConflictError):
@@ -515,10 +529,25 @@ class ReconciliationJournalMixin(WorkspaceScoped):
         return row
 
     def _live_documents(self, run: models.ReconciliationRun) -> tuple[Any, ...]:
+        """What this connector's inventory is diffed against, and what it is not.
+
+        ``container_id IS NULL`` is the load-bearing clause. An archive member's source id is
+        ``zip:<container>!/<path>``: the connector never reported it and never could, so a
+        derived document is absent from every inventory by construction. Counting it makes
+        every member of every container a deletion candidate on every pass, and the ceiling is
+        then the only thing standing between a current document and the trash. Members are
+        reconciled against the container that owns them, when that container is re-expanded.
+
+        It narrows the denominator as well as the numerator, which is the half that is easy to
+        miss: a corpus that is mostly archive members would otherwise compute its missing
+        fraction against a live count padded with documents that can never be in an inventory,
+        making the ceiling read as comfortable while the proposal is entirely wrong.
+        """
         return (
             models.Document.workspace_id == self._workspace_id,
             models.Document.source == run.connector_name,
             models.Document.deleted_at.is_(None),
+            models.Document.container_id.is_(None),
         )
 
     async def _apply_candidates(
@@ -540,15 +569,60 @@ class ReconciliationJournalMixin(WorkspaceScoped):
                 ),
             )
         )
-        result = cast(
-            "CursorResult[Any]",
+        removed = (
             await session.execute(
                 update(models.Document)
                 .where(*self._live_documents(run), candidate_matches)
                 .values(deleted_at=now, updated_at=utcnow())
-            ),
-        )
-        return result.rowcount
+                .returning(models.Document.id)
+            )
+        ).scalars()
+        roots = list(removed)
+        return len(roots) + await self._retire_derived(session, now, roots)
+
+    async def _retire_derived(
+        self, session: AsyncSession, now: datetime, roots: Sequence[str]
+    ) -> int:
+        """Soft-delete everything derived from the documents this pass just removed.
+
+        **A soft delete does not cascade.** ``documents.container_id`` carries ``ON DELETE
+        CASCADE`` and that fires on a *hard* delete; setting ``deleted_at`` on a container says
+        nothing about its members. They are then worse than stale — :meth:`_live_documents`
+        excludes derived documents on purpose, so nothing this class does will ever name them
+        again, and they stay searchable and citable for good.
+
+        **Scoped to the rows this statement deleted, not to the timestamp it used.** ``now`` is
+        supplied by the caller and is a fixed value in every test and in any caller that stamps
+        one moment across a batch, so "every container deleted at ``now``" is not this
+        reconciliation's set — it is every reconciliation sharing that instant, across
+        connectors, whose descendants would have been retired here and counted in this run's
+        total. The candidate update returns its ids and the descent starts from those.
+
+        One statement per level, bounded by the nesting ceiling and by a level retiring nothing.
+        """
+        retired = 0
+        frontier = list(roots)
+        for _ in range(_MAX_CONTAINER_DEPTH):
+            if not frontier:
+                return retired
+            found: list[str] = []
+            for batch in batched(frontier, _RETIRE_BATCH):
+                step = (
+                    await session.execute(
+                        update(models.Document)
+                        .where(
+                            models.Document.workspace_id == self._workspace_id,
+                            models.Document.deleted_at.is_(None),
+                            models.Document.container_id.in_(batch),
+                        )
+                        .values(deleted_at=now, updated_at=utcnow())
+                        .returning(models.Document.id)
+                    )
+                ).scalars()
+                found.extend(step)
+            retired += len(found)
+            frontier = found
+        return retired
 
     async def _record_proposal(
         self, session: AsyncSession, run: models.ReconciliationRun, now: datetime

@@ -110,6 +110,40 @@ async def test_a_refused_proposal_can_be_confirmed_without_re_enumerating() -> N
     assert PROPOSED_DELETION_KEY not in store.connector_meta["memory"]
 
 
+async def test_confirming_a_proposal_retires_what_was_derived_from_it() -> None:
+    """The confirmation path removes the same things the unproposed one does.
+
+    Two paths reach a deletion — straight through when the ceiling is not crossed, and through
+    a reviewed proposal when it is — and only one of them had been taught that a soft delete
+    does not cascade. A member left behind here is unreachable for good: its source id was never
+    in any inventory, so no later pass can name it.
+    """
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", [f"doc-{n}" for n in range(10)])
+    container = store.documents[document_id("default", "memory", "doc-0")]
+    member = make_document().model_copy(
+        update={
+            "id": document_id("default", "memory", "zip:doc-0!/inside.txt"),
+            "source": "memory",
+            "source_id": "zip:doc-0!/inside.txt",
+            "status": DocumentStatus.INDEXED,
+            "container_id": container.id,
+            "container_depth": 1,
+        }
+    )
+    store.documents[member.id] = member
+    connector = fakes.DictConnector({f"doc-{n}": "text" for n in range(10)})
+    connector.hidden = {f"doc-{n}" for n in range(5)}
+    await reconcile(connector, store, max_delete_fraction=0.1)
+
+    await confirm_proposed_deletion("memory", store)
+
+    assert member.id in store.deleted_at, (
+        "the member of a confirmed-deleted container has to go with it, or it is live and "
+        "unreachable — connector reconciliation excludes derived documents by design"
+    )
+
+
 async def test_reconciliation_never_hard_deletes() -> None:
     """Guard 3 is what makes guard 2 tunable rather than terrifying."""
     store = fakes.MemoryIngestStore()

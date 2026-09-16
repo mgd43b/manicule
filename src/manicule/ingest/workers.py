@@ -99,6 +99,20 @@ class AttemptResult:
     """:class:`~manicule.parsers.expansion.MemberOutcome` values. Typed loosely here so that
     this module does not import the expansion vocabulary it only ever passes through."""
 
+    enumerated: bool = False
+    """Whether an expander walked this document to the end, so ``members`` is all of them.
+
+    **Not the same as "members is non-empty", and the difference is a deletion.** A parser that
+    reaches a member ceiling reports the refusal and stops, so what comes back is a prefix of a
+    container that is perfectly intact. A consumer reconciling a container against what it just
+    expanded to would read that prefix as the whole membership and retire everything past the
+    ceiling.
+
+    ``False`` by default, and every path that did not expand leaves it there — a declined
+    parser, a failed one, a document nothing expanded. That is the safe direction: an unset flag
+    costs a reconciliation, where a wrongly set one costs documents.
+    """
+
 
 def _attempt_output_bytes(result: AttemptResult) -> int:
     """Exact bytes the complete parse reply would put on the process pipe."""
@@ -165,13 +179,30 @@ class ParseRunner(Protocol):
     async def run_attempt(self, name: str, raw: RawDocument) -> AttemptResult: ...
 
 
+def _enumerated(members: Sequence[object]) -> bool:
+    """Whether a completed expansion saw the whole container.
+
+    The walk ran to its end unless one of its own refusals says otherwise, which is what
+    :attr:`~manicule.parsers.expansion.MemberFailure.truncates` records. Asked with ``getattr``
+    because this module deliberately does not import the expansion vocabulary it passes through.
+    """
+    return not any(getattr(member, "truncates", False) for member in members)
+
+
 async def attempt_one(parser: object, name: str, raw: RawDocument) -> AttemptResult:
-    """Give one already-constructed parser its turn, expanding it if it is a container.
+    """Give one already-constructed parser its turn, reading it and expanding it.
 
     Shared by the in-process runner and by the worker, so that the two cannot diverge on the
-    question they most easily would: whether this document is a container. Expansion is tried
-    **first** for a parser that supports it, because such a parser's ``parse`` succeeds while
-    producing nothing, and running it first would spend the attempt discovering that.
+    question they most easily would: whether this document is a container.
+
+    **Expansion is tried first, and then the document is read anyway.** Trying expansion first
+    is right — a parser that declines to expand these bytes has declined, and reading them
+    would be work spent on an answer already given. Stopping there was not. It held for the
+    archive parser, whose ``parse`` yields nothing by design, and was wrong for every parser
+    that both reads and expands: a ``.eml`` has headers and a body that are content, and only
+    its attachments are members. Returning no blocks made every plain email in a corpus arrive
+    with nothing in it, reported as ``parsed``, and the shape of the failure is why it went
+    unnoticed — the parser's own suite exercises ``parse`` directly and passes.
     """
     from manicule.parsers.chain import ParserChain  # noqa: PLC0415 - avoids an import cycle
     from manicule.parsers.expansion import SupportsExpansion, read_members  # noqa: PLC0415
@@ -188,8 +219,35 @@ async def attempt_one(parser: object, name: str, raw: RawDocument) -> AttemptRes
         except Exception as exc:  # noqa: BLE001 - a container's own bug fails one document
             reason = f"{type(exc).__name__}: {exc}"
             return AttemptResult([], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason))
+        from manicule.core.protocols import Parser  # noqa: PLC0415 - avoids an import cycle
+
+        if not isinstance(parser, Parser):
+            # Expanding and reading are separate capabilities and only one of them is claimed
+            # here. Every registered parser is both — the registry will not take one without
+            # media types — but `SupportsExpansion` asks for `expand` and nothing else, so an
+            # object that only expands is a legitimate thing to be handed, and asking it for
+            # blocks it never offered would fail the document on an `AttributeError`.
+            return AttemptResult(
+                [],
+                Attempt(parser=name, outcome=Outcome.PARSED),
+                members=tuple(members),
+                enumerated=_enumerated(members),
+            )
+        expanded = ParserChain(parsers={name: parser}, chains={})
+        blocks, read = await expanded.attempt(name, raw)
+        if read.outcome is Outcome.FAILED:
+            # Expansion worked and reading broke, which is a broken document rather than a
+            # container: publishing the members of a message whose own body could not be read
+            # would index the attachments and silently lose what they were attached to.
+            return AttemptResult([], read)
+        # ``DECLINED`` and ``EMPTY`` are both ordinary here — an archive has no text of its own,
+        # and a message can be an attachment with no body. The attempt still succeeded, because
+        # expansion is what this parser was asked for.
         return AttemptResult(
-            [], Attempt(parser=name, outcome=Outcome.PARSED), members=tuple(members)
+            list(blocks),
+            Attempt(parser=name, outcome=Outcome.PARSED),
+            members=tuple(members),
+            enumerated=_enumerated(members),
         )
 
     chain = ParserChain(parsers={name: parser}, chains={})  # pyright: ignore[reportArgumentType]

@@ -41,7 +41,7 @@ OpenDocuments got it right. Where it does not, the reason is stated.
 | CLI | Typer · Rich |
 | Web UI | HTMX · Jinja2 · Tailwind standalone |
 | HTTP client | httpx (async everywhere) |
-| Scheduling | apscheduler |
+| Scheduling | ~~apscheduler~~ — one `asyncio` task per source, no dependency (see §below) |
 | Auth | authlib · itsdangerous |
 
 ---
@@ -400,8 +400,8 @@ event bus with webhook dispatch · degraded-mode warnings · update checks.
 
 | | Choice |
 |---|---|
-| Scheduling | **apscheduler** — connector polling, no broker |
-| Webhooks | httpx with retry and backoff |
+| Scheduling | ~~**apscheduler**~~ — **built without it.** `manicule.app.served.Scheduler` is one `asyncio` task per source: no broker, and no dependency either. The task's name is its job id, a source never overlaps itself, the first run is one interval after startup rather than at it, and a failed sync never stops the loop. `tests/test_import_boundary.py` now *bans* the import, so this row was naming a library the build refuses |
+| Webhooks | ~~httpx with retry and backoff~~ — **not built.** `[events]` parses and reaches nothing; configuring one is refused at startup rather than silently ignored ([#14](https://github.com/mgd43b/manicule/issues/14)) |
 | Diagnostics | Rich-formatted `doctor` |
 
 ## 16. Cross-cutting subsystems

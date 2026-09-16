@@ -26,10 +26,11 @@ from manicule.app.ports import Organizing, ResetOutcome
 from manicule.app.results import CheckState
 from manicule.app.service import (
     _IDENTITY_SAMPLE,  # pyright: ignore[reportPrivateUsage]
+    SCANNED_CORPUS_RATIO,
     ApplicationService,
     hardware,
 )
-from manicule.config.settings import Settings, config_file
+from manicule.config.settings import ConnectorSettings, Settings, config_file
 from manicule.connectors.enriched import AdapterOutcome
 from manicule.connectors.filesystem import ENRICHED_KEY
 from manicule.core.ann import AnnIndex, AnnIndexState, AnnLifecycle
@@ -2947,6 +2948,125 @@ async def test_a_document_that_was_never_re_keyed_is_not_reported_as_owing_a_re_
     backend.store.add(make_document(backend.workspace, source="handbook", source_id="notes.md"))
 
     assert _check(await ApplicationService(backend).doctor(), "document-content").state == "ok"
+
+
+# --- extractable text ------------------------------------------------------------------------
+
+
+def _unreadable(backend: FakeBackend, source: str, ordinal: int) -> Document:
+    return make_document(
+        backend.workspace,
+        source=source,
+        source_id=f"scan-{ordinal}.pdf",
+        status=DocumentStatus.NO_EXTRACTABLE_TEXT,
+        status_detail="every parser in the chain returned no text",
+    )
+
+
+async def test_doctor_warns_when_a_source_is_mostly_documents_nothing_could_read(
+    backend: FakeBackend,
+) -> None:
+    """The trigger that makes an out-of-scope decision revisitable rather than forgotten.
+
+    A handful of unreadable documents is ordinary. A share of them usually means the corpus is
+    scanned, and the answer to a scanned corpus is OCR — which manicule does not do. Without
+    this nobody finds that out, because the documents are stored correctly and look like a
+    working index.
+    """
+    backend.settings = Settings(
+        connectors={"scans": ConnectorSettings(type="filesystem", options={"root": "/srv/scans"})}
+    )
+    backend.store.add(make_document(backend.workspace, source="scans", source_id="readable.md"))
+    for ordinal in range(3):
+        backend.store.add(_unreadable(backend, "scans", ordinal))
+
+    check = _check(await ApplicationService(backend).doctor(), "extractable-text")
+
+    assert check.state == "degraded"
+    assert check.facts["threshold"] == SCANNED_CORPUS_RATIO
+    assert "scans (3/4)" in check.detail
+    assert "does not do OCR" in check.detail
+    assert check.remedy.startswith("manicule document list --source scans")
+
+
+async def test_a_few_unreadable_documents_are_ordinary_and_are_not_reported(
+    backend: FakeBackend,
+) -> None:
+    """Amber for a deliberate, ordinary state teaches an operator to skim ``doctor``.
+
+    A spacer image and a blank page are not a finding, and reporting them as one costs the
+    attention the real finding needs.
+    """
+    backend.settings = Settings(
+        connectors={"notes": ConnectorSettings(type="filesystem", options={"root": "/srv/notes"})}
+    )
+    for ordinal in range(40):
+        backend.store.add(
+            make_document(backend.workspace, source="notes", source_id=f"note-{ordinal}.md")
+        )
+    backend.store.add(_unreadable(backend, "notes", 0))
+
+    check = _check(await ApplicationService(backend).doctor(), "extractable-text")
+
+    assert check.state == "ok"
+    assert check.facts["share"] == {"notes": round(1 / 41, 4)}
+
+
+async def test_the_extractable_text_check_measures_each_source_separately(
+    backend: FakeBackend,
+) -> None:
+    """A scanned archive beside a healthy wiki must not be averaged into looking fine.
+
+    One number over a whole corpus is the shape of finding that hides the thing it is meant to
+    report, because the source that is fine is usually the larger one.
+    """
+    backend.settings = Settings(
+        connectors={
+            "wiki": ConnectorSettings(type="filesystem", options={"root": "/srv/wiki"}),
+            "scans": ConnectorSettings(type="filesystem", options={"root": "/srv/scans"}),
+        }
+    )
+    for ordinal in range(50):
+        backend.store.add(
+            make_document(backend.workspace, source="wiki", source_id=f"page-{ordinal}.md")
+        )
+    backend.store.add(_unreadable(backend, "scans", 0))
+
+    check = _check(await ApplicationService(backend).doctor(), "extractable-text")
+
+    assert check.state == "degraded"
+    assert "scans (1/1)" in check.detail
+    assert "wiki" not in check.detail
+
+
+async def test_a_configured_source_with_no_documents_is_not_an_unconfigured_one(
+    backend: FakeBackend,
+) -> None:
+    """Two different states, and reporting the second as the first is a false statement.
+
+    A connector that is configured and has indexed nothing is an install mid-setup or a sync
+    that has not run; "no sources are configured" tells its operator to go and configure the
+    thing they already configured.
+    """
+    backend.settings = Settings(
+        connectors={"scans": ConnectorSettings(type="filesystem", options={"root": "/srv/scans"})}
+    )
+
+    check = _check(await ApplicationService(backend).doctor(), "extractable-text")
+
+    assert check.state == "ok"
+    assert check.facts["sources"] == 1
+    assert check.facts["measured"] == 0
+    assert "every configured source is empty" in check.detail
+
+
+async def test_an_empty_corpus_is_not_a_scanned_one(backend: FakeBackend) -> None:
+    """Zero over zero is not a ratio, and a fresh install must not open amber."""
+    check = _check(await ApplicationService(backend).doctor(), "extractable-text")
+
+    assert check.state == "ok"
+    assert check.facts["sources"] == 0
+    assert "no sources are configured" in check.detail
 
 
 # --- glossary lineage ------------------------------------------------------------------------

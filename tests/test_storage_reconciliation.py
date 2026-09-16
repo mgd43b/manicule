@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from manicule.core.acquisition import AcquisitionRecordState, AcquisitionSource
 from manicule.core.reconciliation import CompletedInventory, ReconciliationAssessment
@@ -354,6 +354,85 @@ async def test_ceiling_records_a_bounded_proposal_and_confirmation_applies_revie
     assert confirmed.applied_count == 4
     assert await store.find_document(_CONNECTOR, "page-7") is not None
     assert PROPOSED_DELETION_KEY not in await store.connector_metadata(_CONNECTOR)
+
+
+async def test_removing_a_container_removes_what_was_derived_from_it(
+    store: SqliteDocStore,
+) -> None:
+    """A soft delete does not cascade, and what it leaves behind is unreachable for good.
+
+    ``documents.container_id`` carries ``ON DELETE CASCADE`` and that fires on a *hard* delete;
+    setting ``deleted_at`` on a container says nothing about its members. And the query that
+    finds deletion candidates excludes derived documents on purpose — their source ids were
+    never in any connector inventory — so a member orphaned this way is searchable, citable,
+    and can never be named by this pass again.
+    """
+    await store.upsert_document(make_document(_CONNECTOR, "bundle.zip"))
+    container = await store.find_document(_CONNECTOR, "bundle.zip")
+    assert container is not None
+    await store.upsert_document(
+        make_document(
+            _CONNECTOR, "zip:bundle.zip!/inner.zip", container_id=container.id, container_depth=1
+        )
+    )
+    nested = await store.find_document(_CONNECTOR, "zip:bundle.zip!/inner.zip")
+    assert nested is not None
+    await store.upsert_document(
+        make_document(
+            _CONNECTOR,
+            "zip:zip:bundle.zip!/inner.zip!/deep.txt",
+            container_id=nested.id,
+            container_depth=2,
+        )
+    )
+    await store.upsert_document(make_document(_CONNECTOR, "page-0"))
+
+    completed = await _complete(store, "gone", ["page-0"])
+    result = await store.assess_reconciliation_inventory(
+        completed, max_delete_fraction=1.0, now=_NOW
+    )
+
+    assert result.applied_count == 3, "the container and both generations under it"
+    assert await store.find_document(_CONNECTOR, "bundle.zip") is None
+    assert await store.find_document(_CONNECTOR, "zip:bundle.zip!/inner.zip") is None
+    assert await store.find_document(_CONNECTOR, "zip:zip:bundle.zip!/inner.zip!/deep.txt") is None
+    assert await store.find_document(_CONNECTOR, "page-0") is not None
+
+
+async def test_another_connectors_container_is_not_swept_up_by_a_shared_timestamp(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """Descendant retirement follows the rows this pass deleted, not the instant it stamped.
+
+    ``now`` is the caller's, and a caller that stamps one moment across a batch — or a test that
+    pins one — makes "every container deleted at ``now``" mean every reconciliation sharing that
+    instant, across connectors. Their members would be retired here and counted in this run's
+    total, which is a second connector's documents disappearing because the first one ran.
+    """
+    sessions = session_factory(engine)
+    await store.upsert_document(make_document("other", "theirs.zip"))
+    theirs = await store.find_document("other", "theirs.zip")
+    assert theirs is not None
+    await store.upsert_document(
+        make_document(
+            "other", "zip:theirs.zip!/inside.txt", container_id=theirs.id, container_depth=1
+        )
+    )
+    async with sessions.begin() as session:
+        await session.execute(
+            update(models.Document).where(models.Document.id == theirs.id).values(deleted_at=_NOW)
+        )
+    await _documents(store, 2)
+
+    completed = await _complete(store, "shared-instant", ["page-0"])
+    result = await store.assess_reconciliation_inventory(
+        completed, max_delete_fraction=1.0, now=_NOW
+    )
+
+    assert result.applied_count == 1, "only this connector's own missing document"
+    assert await store.find_document("other", "zip:theirs.zip!/inside.txt") is not None, (
+        "another connector's member is not this reconciliation's to retire"
+    )
 
 
 async def test_dry_run_never_proposes_or_deletes(store: SqliteDocStore) -> None:

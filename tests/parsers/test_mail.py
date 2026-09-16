@@ -392,6 +392,10 @@ async def test_a_message_with_more_attachments_than_the_limit_stops_and_says_so(
     assert refused, "the attachments past the limit must be reported, never dropped"
     assert "attachment count exceeded" in refused[0].reason
     assert "the limit is 1" in refused[0].reason
+    assert refused[0].truncates, (
+        "the walk stopped here rather than ending, and the difference is what stops a consumer "
+        "reading a prefix of the attachments as all of them"
+    )
 
 
 async def test_the_body_part_is_never_also_expanded_as_an_attachment(

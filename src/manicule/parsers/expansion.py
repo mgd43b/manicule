@@ -104,15 +104,26 @@ TREE_MEMBERS = "container_tree_members"
 """Metadata key: members already produced from this document's container tree."""
 
 
+_COMPOUND_MEDIA_TYPE_BY_SUFFIX: dict[str, str] = {
+    ".drawio.png": "application/vnd.jgraph.mxfile",
+}
+"""Two-part suffixes, checked before the single-suffix table.
+
+``.drawio.png`` is the only one so far and it is the reason the table exists: the file really is
+a PNG, so resolving it on its last suffix alone is not wrong exactly — it is just the answer that
+throws away the diagram XML the export carries in a text chunk for precisely this purpose."""
+
 _MEDIA_TYPE_BY_SUFFIX: dict[str, str] = {
     ".css": "text/css",
     ".csv": "text/csv",
+    ".drawio": "application/vnd.jgraph.mxfile",
     ".eml": "message/rfc822",
     ".htm": "text/html",
     ".html": "text/html",
     ".ipynb": "application/x-ipynb+json",
     ".json": "application/json",
     ".md": "text/markdown",
+    ".msg": "application/vnd.ms-outlook",
     ".pdf": "application/pdf",
     ".toml": "application/toml",
     ".txt": "text/plain",
@@ -142,6 +153,9 @@ def media_type_for(name: str) -> str:
     slash = lowered.rfind("/")
     if dot <= slash + 1:
         return OCTET_STREAM
+    for suffix, media_type in _COMPOUND_MEDIA_TYPE_BY_SUFFIX.items():
+        if lowered.endswith(suffix) and len(lowered) - len(suffix) > slash:
+            return media_type
     return _MEDIA_TYPE_BY_SUFFIX.get(lowered[dot:], OCTET_STREAM)
 
 
@@ -221,6 +235,23 @@ class MemberFailure(BaseModel):
     reason: str = Field(min_length=1, description="Actionable, and shown in diagnostics.")
     depth: int = Field(ge=1)
     metadata: Metadata = Field(default_factory=dict)
+
+    truncates: bool = Field(
+        default=False,
+        description="Whether the enumeration stopped here, leaving members unseen.",
+    )
+    """The difference between "this member could not be read" and "the rest were never looked at".
+
+    Both are refusals and both are reported, but only the first says anything about what the
+    container holds. A ceiling — member count, or a whole-tree budget — ends the walk, so every
+    member after it is absent from the result while being perfectly present in the archive.
+
+    A consumer that mistook the second for the first would read a truncated list as an
+    authoritative one. The pipeline does exactly that when it reconciles a container against what
+    it just expanded to, which is why this is a field rather than a convention: defaulting to
+    ``False`` makes a parser that does not set it merely incomplete, and defaulting the
+    *pipeline* to refusing to reconcile makes an unset flag cost a deletion rather than cause
+    one."""
 
 
 type MemberOutcome = ExpandedMember | MemberFailure

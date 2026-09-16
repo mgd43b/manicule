@@ -81,6 +81,18 @@ class ComponentSetupError(ContainerError):
 # --- pipeline --------------------------------------------------------------------------
 
 
+class DecompressionError(ManiculeError):
+    """A compressed payload could not be expanded: unreadable, truncated, or stalled."""
+
+
+class DecompressionLimitError(DecompressionError):
+    """A compressed payload expanded past the ceiling it was given.
+
+    Separate from its parent because the remedy differs and nothing else about it does: the
+    stream is fine and the limit is the thing an operator can move.
+    """
+
+
 class ParseError(ManiculeError):
     """A parser could not handle a document it nominally supports.
 

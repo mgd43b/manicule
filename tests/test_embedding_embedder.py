@@ -31,6 +31,7 @@ from tests.embedding_fakes import (
     StubEmbedder,
     UnmaskedMeanEmbedder,
     WrongWidthEmbedder,
+    edit_in_place,
 )
 from tests.embedding_support import write_model
 
@@ -281,6 +282,39 @@ async def test_a_cached_text_is_not_embedded_again(card: ModelCard) -> None:
 
     assert embedder.forward_calls == calls
     assert second == [first[1], first[0]]
+
+
+async def test_duplicate_texts_in_one_batch_do_not_share_an_editable_vector(
+    card: ModelCard,
+) -> None:
+    """One forward pass fills several output slots, so one object sits at several positions.
+
+    That sharing is the deduplication the cache exists for, and it is only safe while nothing
+    can write through it — otherwise editing the first copy of a repeated boilerplate line
+    edits the other thirty-nine and the cached entry behind them.
+    """
+    embedder = StubEmbedder(card, batch_size=64)
+
+    vectors = await embedder.embed(["alpha", "alpha"])
+
+    assert vectors[0] == vectors[1]
+    assert edit_in_place(vectors[0]) is False
+    assert (await embedder.embed(["alpha"]))[0] == vectors[0]
+
+
+async def test_a_caller_cannot_poison_the_next_embedding_of_the_same_text(
+    card: ModelCard,
+) -> None:
+    """The cache is shared by everything in the process, so one caller's edit is everyone's.
+
+    A plugin holding ``Sequence[float]`` has no way of knowing it was handed the cache's own
+    value, which is why the guarantee has to come from the value rather than from the caller.
+    """
+    embedder = StubEmbedder(card)
+    first = (await embedder.embed(["alpha"]))[0]
+
+    assert edit_in_place(first) is False
+    assert (await embedder.embed(["alpha"]))[0] == first
 
 
 async def test_batching_does_not_change_the_vectors(card: ModelCard) -> None:

@@ -31,6 +31,8 @@ def to_document(row: models.Document) -> Document:
         source_id=row.source_id,
         uri=row.uri,
         title=row.title,
+        container_id=row.container_id,
+        container_depth=row.container_depth,
         content_hash=row.content_hash,
         version_token=row.version_token,
         original_ref=row.original_ref,
@@ -68,6 +70,8 @@ def apply_document(row: models.Document, document: Document) -> None:
     row.source_id = document.source_id
     row.uri = document.uri
     row.title = document.title
+    row.container_id = document.container_id
+    row.container_depth = document.container_depth
     row.media_type = document.media_type
     row.content_hash = document.content_hash
     row.version_token = document.version_token

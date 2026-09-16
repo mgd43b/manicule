@@ -258,6 +258,10 @@ async def test_a_wide_archive_stops_at_the_member_count_limit(corpus: Path) -> N
     assert len(_members(outcomes)) == 10
     assert len(_failures(outcomes)) == 1
     assert "member count exceeded" in _failures(outcomes)[0].reason
+    assert _failures(outcomes)[0].truncates, (
+        "the walk stopped here, so the members after it were never looked at — and a consumer "
+        "reconciling an archive against this list would otherwise retire every one of them"
+    )
 
 
 async def test_a_tree_budget_already_spent_upstream_is_honored(

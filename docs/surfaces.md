@@ -861,10 +861,17 @@ behavior actually wants — `manicule_version` and the envelope's `version` both
 release whether or not anything changed.
 
 Checks, in the order `doctor` emits them: `configuration`, `transport`, `plugins`, `storage`,
-`permissions`, `index`, `vector_integrity`, `glossary`, `connectors`, `authoring`,
-`collection-membership`, `sessions`, `document-identity`, `document-content`,
-`wiki-provenance`, `grammars`, `vocabularies`, `models`, and `component:<kind>:<name>` for
-anything already constructed.
+`permissions`, `index`, `vector_integrity`, `vector_backend`, `glossary`, `connectors`,
+`authoring`, `collection-membership`, `sessions`, `document-identity`, `document-content`,
+`extractable-text`, `wiki-provenance`, `grammars`, `vocabularies`, `models`, and
+`component:<kind>:<name>` for anything already constructed.
+
+`extractable-text` is `degraded` when more than 5% of a source's documents ended
+`no_extractable_text`. It is the trigger [#23](https://github.com/mgd43b/manicule/issues/23)
+names: a handful of unreadable documents is ordinary, a share of them usually means the source
+is scanned, and OCR is the capability manicule does not have. Nothing is damaged — the documents
+are stored with the right status and are selectable for re-parse — which is why it is amber
+rather than red.
 
 `authoring` is `ok` when the feature is off. Configured, it asks whether each name in
 `authoring.collections` is a collection this workspace has — `failing` if not, because

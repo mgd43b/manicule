@@ -105,6 +105,7 @@ def make_document(
     status: DocumentStatus = DocumentStatus.INDEXED,
     provenance: Provenance | None = None,
     indexed_at: datetime | None = None,
+    status_detail: str | None = None,
 ) -> Document:
     """A document whose id is derived the way the real one is.
 
@@ -124,6 +125,7 @@ def make_document(
         content_hash=content_hash(f"{workspace}/{source_id}"),
         media_type="text/markdown",
         status=status,
+        status_detail=status_detail,
         metadata={PROVENANCE_KEY: provenance.as_metadata_value()} if provenance else {},
         indexed_at=indexed_at,
     )

@@ -141,6 +141,16 @@ class IngestStore(Protocol):
 
     async def soft_delete_document(self, document_id: str) -> None: ...
 
+    async def container_members(self, container_id: str) -> Sequence[Document]:
+        """Every live document currently owned by one container, in a stable order.
+
+        What a container's re-expansion is diffed against. It has to be the stored children
+        rather than the ones this run derived, because the question being asked is which
+        members have *gone* — and a member that is gone is by definition not in what was just
+        derived.
+        """
+        ...
+
     async def list_documents(
         self,
         filter: Filter | None = None,  # noqa: A002 - mirrors the protocol it widens

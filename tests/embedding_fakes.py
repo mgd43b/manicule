@@ -12,8 +12,8 @@ that does not go through the code under test proves nothing about it.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
-from typing import override
+from collections.abc import MutableSequence, Sequence
+from typing import cast, override
 
 import numpy as np
 
@@ -147,11 +147,30 @@ def token_states(input_ids: np.ndarray, dimension: int, pad_id: int = PAD_ID) ->
     return states
 
 
+def edit_in_place(vector: Vector) -> bool:
+    """Try to write through ``vector``, and report whether the write landed.
+
+    Asserting ``isinstance(vector, tuple)`` would pin the implementation; what a caller
+    actually needs is that a vector handed to them cannot be written through, and that is a
+    different claim that outlives any particular choice of container. The cast is the point of
+    the helper: static typing already forbids this, and the defect being guarded against is a
+    caller who does it anyway — a plugin, or code reached through ``Sequence[float]`` with no
+    idea what it is holding.
+    """
+    editable = cast("MutableSequence[float]", vector)
+    try:
+        editable[0] = 99.0
+    except (AttributeError, TypeError):
+        return False
+    return True
+
+
 __all__ = [
     "NameKeyedCache",
     "PrePooledEmbedder",
     "StubEmbedder",
     "UnmaskedMeanEmbedder",
     "WrongWidthEmbedder",
+    "edit_in_place",
     "token_states",
 ]

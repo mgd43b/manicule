@@ -112,6 +112,8 @@ def make_document(
     title: str = "A",
     media_type: str = "text/markdown",
     body: bytes = b"hello",
+    container_id: str | None = None,
+    container_depth: int = 0,
 ) -> Document:
     """A document with the invariants the model insists on already satisfied."""
     detail = "synthetic detail" if status in NEEDS_ATTENTION else None
@@ -121,6 +123,8 @@ def make_document(
         source_id=source_id,
         uri=uri,
         title=title,
+        container_id=container_id,
+        container_depth=container_depth,
         content_hash=content_hash(body),
         media_type=media_type,
         status=status,

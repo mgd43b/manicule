@@ -696,6 +696,30 @@ class Document(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False, default="")
     media_type: Mapped[str] = mapped_column(Text, nullable=False)
 
+    container_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    """The document this one was expanded out of, for an archive or mail member.
+
+    A self-referential cascade, and a column rather than a key inside :attr:`doc_metadata` for
+    two reasons that both come from what it is used for. Deleting a container has to delete its
+    members, and that is a foreign key. And connector-level reconciliation diffs the ids a
+    connector reports against the ids this table holds — a member's id was never reported by any
+    connector and never could be, so without a column saying it is derived, every member of every
+    container is permanently missing and eligible for deletion.
+
+    ``NULL`` means the document came from the connector directly.
+    """
+
+    container_depth: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    """How far inside a top-level document this one is. ``0`` for a document a connector fetched.
+
+    Persisted rather than derived by walking :attr:`container_id`, because the walk costs a query
+    per level exactly where the answer is wanted in bulk, and because it is the number a bound is
+    stated against. ``docs/parsing.md`` §9.2's ceiling is still enforced during expansion — this
+    records what the expansion decided rather than replacing the decision.
+    """
+
     content_hash: Mapped[str] = mapped_column(Text, nullable=False)
     version_token: Mapped[str | None] = mapped_column(Text)
     original_ref: Mapped[str | None] = mapped_column(ForeignKey("blobs.hash", ondelete="RESTRICT"))
@@ -777,6 +801,7 @@ class Document(Base):
         Index("ix_documents_embed_fp", "embed_fp"),
         Index("ix_documents_glossary_fp", "glossary_fp"),
         Index("ix_documents_relation_fp", "relation_fp"),
+        Index("ix_documents_container_id", "container_id"),
         Index(
             "ix_documents_workspace_live_id",
             "workspace_id",

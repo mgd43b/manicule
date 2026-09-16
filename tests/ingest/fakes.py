@@ -53,7 +53,13 @@ from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
 from manicule.ingest.ports import GlossaryWriter
 from manicule.ingest.workers import AttemptResult, InProcessRunner
 from manicule.parsers.chain import Attempt, Outcome
-from manicule.parsers.expansion import ExpandedMember, MemberFailure, MemberOutcome
+from manicule.parsers.expansion import (
+    CONTAINER_DEPTH,
+    ExpandedMember,
+    MemberFailure,
+    MemberOutcome,
+    container_depth_of,
+)
 from tests.fakes import MEDIA_TYPE, HashEmbedder
 
 CONTAINER_MEDIA_TYPE = "application/x-fake-archive"
@@ -213,6 +219,13 @@ class MemoryIngestStore:
             ):
                 return self._with_lineage(document)
         return None
+
+    async def container_members(self, container_id: str) -> Sequence[Document]:
+        return tuple(
+            self._with_lineage(document)
+            for document in sorted(self.documents.values(), key=lambda item: item.source_id)
+            if document.container_id == container_id and document.id not in self.deleted_at
+        )
 
     async def dependent_documents(
         self, source: str, source_ids: Collection[SourceId]
@@ -544,8 +557,17 @@ class MemoryIngestStore:
         self.watermarks[connector] = watermark
 
     async def known_source_ids(self, connector: str) -> AsyncIterator[SourceId]:
+        """Only what the connector itself supplied, matching the real store's predicate.
+
+        A fake that returned derived members too would let the exclusion regress while every
+        in-memory reconciliation test went on passing.
+        """
         for document in list(self.documents.values()):
-            if document.source == connector and document.id not in self.deleted_at:
+            if (
+                document.source == connector
+                and document.id not in self.deleted_at
+                and document.container_id is None
+            ):
                 yield document.source_id
 
     async def connector_metadata(self, connector: str) -> Metadata:
@@ -858,16 +880,26 @@ class FakeArchive:
                     depth=1,
                 )
                 continue
+            # A member named `*.zip` is itself a container, and its depth is one past this
+            # one's. Both halves are how the real parsers behave, and a fake that flattened
+            # nesting would leave every nested-container case untested — including the one
+            # where a nested archive has to retire members it no longer produces.
+            depth = container_depth_of(raw) + 1
+            nested = name.endswith(".zip")
             yield ExpandedMember(
                 source_id=f"{raw.source_id}!/{name}",
                 uri=f"fake:{raw.uri}!/{name}",
                 raw=RawDocument(
                     source_id=f"{raw.source_id}!/{name}",
                     uri=f"fake:{raw.uri}!/{name}",
-                    media_type=MEDIA_TYPE,
-                    content=body,
+                    media_type=CONTAINER_MEDIA_TYPE if nested else MEDIA_TYPE,
+                    # A member's body is one line of this archive's own body, so a nested
+                    # archive — whose body is itself a list of members — needs a way to carry
+                    # more than one. `\n` is unescaped here and nowhere else.
+                    content=body.replace("\\n", "\n"),
+                    metadata={CONTAINER_DEPTH: depth},
                 ),
-                depth=1,
+                depth=depth,
             )
 
 
@@ -1028,11 +1060,16 @@ class BrokenRunner:
 
 
 class DictConnector:
-    """A connector over a dictionary, with a settable version token per document."""
+    """A connector over a dictionary, with a settable version token per document.
 
-    def __init__(self, documents: Mapping[str, str], *, name: str = "memory") -> None:
+    Bodies are ``str`` or ``bytes``, because a real connector returns bytes and a fake that
+    only accepted text would quietly confine every test to documents whose exact bytes do not
+    matter — which excludes a mail message, whose boundaries and CRLFs are the whole of it.
+    """
+
+    def __init__(self, documents: Mapping[str, str | bytes], *, name: str = "memory") -> None:
         self.name = name
-        self.documents = dict(documents)
+        self.documents: dict[str, str | bytes] = dict(documents)
         self.media_types: dict[str, str] = {}
         self.fetches: list[str] = []
         self.fail_fetch: set[str] = set()
@@ -1425,6 +1462,23 @@ class Exploder(PassThrough):
     @override
     async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:
         del document, chunks
+        msg = "the hook could not reach its service"
+        raise RuntimeError(msg)
+
+
+class EarlyExploder(PassThrough):
+    """Raises before parsing, which is the side of retention that matters.
+
+    Distinct from :class:`Exploder` because of *when* it raises: source bytes are retained
+    before ``before_parse`` runs, so this is the only hook position where a failure can leave
+    a blob on disk and a document claiming there is none.
+    """
+
+    name = "early-exploder"
+
+    @override
+    async def before_parse(self, raw: RawDocument) -> RawDocument | None:
+        del raw
         msg = "the hook could not reach its service"
         raise RuntimeError(msg)
 

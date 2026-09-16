@@ -95,6 +95,17 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # measurement and for why `email` does not move with these four.
     "adf": ParserVersions(rules="2"),
     "archive": ParserVersions(rules="1"),
+    # No distributions, and that is the whole point of the entry rather than a gap in it. An
+    # `mxfile` is XML with a deflate stream inside it, so `base64`, `zlib` and `xml.etree` are
+    # the reader — all standard library, all versioned with the interpreter, none of them a
+    # thing this table can name. What moves this number is a change to the decode or to which
+    # part of a page becomes a block, and both are changes to `rules`.
+    "drawio": ParserVersions(rules="1"),
+    # `olefile` decides which bytes come out of the compound file, so it decides the stored text
+    # and belongs here. What it does *not* decide is how those bytes become a message — that is
+    # `rules`, and the two move independently: a fix to the synthesized-header path moves
+    # `rules` while the reader stays put.
+    "msg": ParserVersions(rules="1", distributions=("olefile",)),
     # Started at 1 rather than inheriting `html`'s 2. A version is a statement about one
     # parser's own output, and these are different parsers: the documents this reads were
     # previously read by `html`, and what re-parses them is `Change.ROUTING` noticing that the
