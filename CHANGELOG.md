@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/mgd43b/manicule/compare/v0.2.6...v0.2.7) (2026-09-16)
+
+
+### Features
+
+* **storage:** configure the Qdrant collection's shape, and apply it to collections that exist ([#396](https://github.com/mgd43b/manicule/issues/396)) ([b0ca437](https://github.com/mgd43b/manicule/commit/b0ca4375e37a3142fc9e50fb2a046a639e5636cc))
+
 ## [0.2.6](https://github.com/mgd43b/manicule/compare/v0.2.5...v0.2.6) (2026-09-16)
 
 
