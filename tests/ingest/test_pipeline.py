@@ -848,6 +848,34 @@ async def test_an_emptied_container_retires_every_member_it_used_to_have() -> No
     assert await store.find_document("memory", "bundle!/one") is None
 
 
+async def test_a_nested_container_emptied_of_members_retires_them() -> None:
+    """The rule one level down, in the case that "did it yield members" cannot see.
+
+    An archive inside an archive is an ordinary shape, and members removed from the inner one
+    are exactly as invisible to connector reconciliation as members removed from the outer. A
+    nested container that still yields *something* is reconciled either way; one emptied to
+    nothing is reconciled only if a container is recognised by what it was as well as by what
+    it just produced.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"outer": "inner.zip=one=alpha\\ntwo=beta"})
+    connector.media_types["outer"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+    member = await store.find_document("memory", "outer!/inner.zip!/two")
+    assert member is not None
+    assert member.container_depth == 2, "depth counts from the top-level document, not the parent"
+
+    connector.documents["outer"] = "inner.zip="  # the inner archive is now empty
+    await pipeline.run(connector)
+
+    assert await store.find_document("memory", "outer!/inner.zip!/one") is None
+    assert await store.find_document("memory", "outer!/inner.zip!/two") is None
+    assert await store.find_document("memory", "outer!/inner.zip") is not None
+
+
 async def test_reconciliation_never_sees_a_document_no_connector_could_report() -> None:
     """The defect this ownership column exists for, stated as the arithmetic that produced it.
 

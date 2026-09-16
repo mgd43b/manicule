@@ -53,7 +53,13 @@ from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
 from manicule.ingest.ports import GlossaryWriter
 from manicule.ingest.workers import AttemptResult, InProcessRunner
 from manicule.parsers.chain import Attempt, Outcome
-from manicule.parsers.expansion import ExpandedMember, MemberFailure, MemberOutcome
+from manicule.parsers.expansion import (
+    CONTAINER_DEPTH,
+    ExpandedMember,
+    MemberFailure,
+    MemberOutcome,
+    container_depth_of,
+)
 from tests.fakes import MEDIA_TYPE, HashEmbedder
 
 CONTAINER_MEDIA_TYPE = "application/x-fake-archive"
@@ -874,16 +880,26 @@ class FakeArchive:
                     depth=1,
                 )
                 continue
+            # A member named `*.zip` is itself a container, and its depth is one past this
+            # one's. Both halves are how the real parsers behave, and a fake that flattened
+            # nesting would leave every nested-container case untested — including the one
+            # where a nested archive has to retire members it no longer produces.
+            depth = container_depth_of(raw) + 1
+            nested = name.endswith(".zip")
             yield ExpandedMember(
                 source_id=f"{raw.source_id}!/{name}",
                 uri=f"fake:{raw.uri}!/{name}",
                 raw=RawDocument(
                     source_id=f"{raw.source_id}!/{name}",
                     uri=f"fake:{raw.uri}!/{name}",
-                    media_type=MEDIA_TYPE,
-                    content=body,
+                    media_type=CONTAINER_MEDIA_TYPE if nested else MEDIA_TYPE,
+                    # A member's body is one line of this archive's own body, so a nested
+                    # archive — whose body is itself a list of members — needs a way to carry
+                    # more than one. `\n` is unescaped here and nowhere else.
+                    content=body.replace("\\n", "\n"),
+                    metadata={CONTAINER_DEPTH: depth},
                 ),
-                depth=1,
+                depth=depth,
             )
 
 

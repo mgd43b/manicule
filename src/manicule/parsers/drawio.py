@@ -290,16 +290,24 @@ def _parse_xml(source: str) -> ElementTree.Element:
         raise ParseError(msg) from exc
 
 
+_ELEMENT_START = re.compile(r"<[A-Za-z_]")
+
+
 def _has_doctype(source: str) -> bool:
     """Whether a document type declaration appears before the root element.
 
-    A literal scan rather than an expat handler: the declaration can only be spelled one way
-    and can only appear in the prolog, so finding it is exact, while reaching into
+    A literal scan rather than an expat handler: the declaration can only be spelled one way and
+    can only appear in the prolog, so this is exact, while reaching into
     :class:`xml.etree.ElementTree.XMLParser` for a handler means depending on an attribute the
     standard library does not document.
+
+    The prolog ends at the first ``<`` that begins an element name, which is what makes the scan
+    exact rather than merely conservative: ``<?xml`` and ``<!--`` do not open one, and anything
+    after the root element has opened is content — where the literal string may legitimately
+    appear inside a label.
     """
-    root = source.find("<mxfile")
-    prolog = source if root < 0 else source[:root]
+    opened = _ELEMENT_START.search(source)
+    prolog = source if opened is None else source[: opened.start()]
     return "<!DOCTYPE" in prolog
 
 

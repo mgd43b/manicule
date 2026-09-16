@@ -3424,7 +3424,14 @@ class IngestPipeline:
             )
             outcomes.append(inner)
             queue.extend((inner.document_id, item) for item in deeper)
-            if deeper:
+            # The same rule the top-level document gets, one level down: a nested container
+            # emptied of its members is still a container that has to retire them, and a nested
+            # container that was hash-skipped derived nothing and must not.
+            if deeper or (
+                not inner.skipped
+                and member_existing is not None
+                and member_existing.status is DocumentStatus.CONTAINER
+            ):
                 derived.setdefault(inner.document_id, set())
         for container, present in derived.items():
             outcomes.extend(await self._retire_absent_members(container, present))
