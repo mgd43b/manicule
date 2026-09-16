@@ -86,6 +86,7 @@ class Corpus:
     """
 
 
+_MXFILE = parser_config.DRAWIO_MEDIA_TYPE
 _XLSX = parser_config.XLSX_MEDIA_TYPE
 _DOCX = parser_config.WORD_MEDIA_TYPE
 _PPTX = parser_config.SLIDES_MEDIA_TYPE
@@ -161,6 +162,15 @@ CORPORA: dict[str, Corpus] = {
         media_types={".ipynb": parser_config.NOTEBOOK_MEDIA_TYPE},
         required=("notebook_typical.ipynb", "notebook_structurally_hard.ipynb"),
         min_blocks=20,
+    ),
+    "drawio": Corpus(
+        directory="drawio",
+        # `.png` is mapped deliberately: a `.drawio.png` is a real PNG carrying the diagram's
+        # own XML in a text chunk, and this directory holds no other kind of image. Routing it
+        # anywhere else is how the diagram inside an export gets thrown away.
+        media_types={".drawio": _MXFILE, ".png": _MXFILE},
+        required=("typical.drawio", "multi-page.drawio", "uncompressed.drawio"),
+        min_blocks=6,
     ),
     "email": Corpus(
         directory="mail",

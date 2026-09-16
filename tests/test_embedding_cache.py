@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from manicule.core.embedding import EmbedFingerprint, Pooling
 from manicule.embedding.cache import EmbeddingCache
-from tests.embedding_fakes import NameKeyedCache
+from tests.embedding_fakes import NameKeyedCache, edit_in_place
 
 
 def fingerprint(
@@ -70,7 +70,7 @@ def test_a_name_keyed_cache_serves_vectors_from_the_wrong_space() -> None:
 
     served = cache.get(fingerprint(pooling=Pooling.MEAN), "text")
 
-    assert served == cls_vector, "the fake is meant to be wrong; if it stopped being, fix it"
+    assert served == tuple(cls_vector), "the fake is meant to be wrong; if it stopped being, fix it"
     assert EmbeddingCache(capacity=10).get(fingerprint(pooling=Pooling.MEAN), "text") is None
 
 
@@ -107,9 +107,56 @@ def test_lookup_asks_for_each_distinct_text_once() -> None:
 
     slots, pending = cache.lookup(print_, ["cached", "new", "new", "other"])
 
-    assert slots[0] == [1.0]
+    assert slots[0] == (1.0,)
     assert slots[1] is None
     assert pending == ["new", "other"]
+
+
+def test_the_cache_keeps_its_own_copy_of_what_it_was_given() -> None:
+    """A caller reusing one buffer across texts must not rewrite what was already memoized.
+
+    Reusing a buffer is an ordinary thing for a backend to do, and nothing about the cache's
+    signature warns against it.
+    """
+    cache = EmbeddingCache(capacity=10)
+    print_ = fingerprint()
+    caller_owned = [1.0, 2.0]
+
+    cache.put(print_, "text", caller_owned)
+    caller_owned[0] = 99.0
+
+    assert cache.get(print_, "text") == (1.0, 2.0)
+
+
+def test_a_vector_the_cache_handed_back_cannot_be_written_through() -> None:
+    """Editing a returned vector would change what every later caller is told, and say nothing.
+
+    The fingerprint still matches and the counters still add up, so a poisoned entry is
+    admissible in the live index by every check the pipeline makes.
+    """
+    cache = EmbeddingCache(capacity=10)
+    print_ = fingerprint()
+    cache.put(print_, "text", [1.0, 2.0])
+    returned = cache.get(print_, "text")
+
+    assert returned is not None
+    assert edit_in_place(returned) is False
+    assert cache.get(print_, "text") == (1.0, 2.0)
+
+
+def test_a_disabled_cache_still_hands_back_a_vector_nobody_can_edit() -> None:
+    """``capacity = 0`` decides what is remembered, never what a caller is allowed to do.
+
+    Two code paths that differ in more than how much they keep is how a setting meant to be
+    a no-op becomes a behaviour change nobody tested.
+    """
+    cache = EmbeddingCache(capacity=0)
+    print_ = fingerprint()
+
+    stored = cache.put(print_, "text", [1.0, 2.0])
+
+    assert stored == (1.0, 2.0)
+    assert edit_in_place(stored) is False
 
 
 def test_hits_and_misses_are_counted_for_diagnostics() -> None:

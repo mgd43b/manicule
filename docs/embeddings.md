@@ -911,6 +911,20 @@ the text, and computing it themselves returns the identical vector. One honest c
 shared cache is a weak timing oracle for "has anyone here embedded this exact text", which is
 a documented property of a self-hosted tool rather than a defect.
 
+**Values are stored frozen, and what a caller receives is the frozen value.** A memo that hands
+back the list it is holding is not a memo: one caller editing a returned vector in place changes
+what every later caller is told, and nothing reports it — the fingerprint still matches, the
+hit and miss counts still add up, and the poisoned entry is admissible in the live index by
+every check the pipeline makes. So `put` converts to a tuple on the way in and returns that
+tuple, and `get` and `lookup` hand out the stored one. `Vector` is `Sequence[float]`, so nothing
+downstream changes shape.
+
+That also settles the subtler half, which is the deduplication above read the other way round.
+A batch containing one text forty times costs one forward pass and therefore fills forty output
+slots from one object — by design, and the thing that makes the cache worth having. Sharing an
+immutable object across those slots is free; sharing a mutable one means editing the first copy
+edits the other thirty-nine and the cached entry behind them.
+
 ---
 
 ## 9. Filed, not deferred

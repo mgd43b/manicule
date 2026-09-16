@@ -99,6 +99,14 @@ PARSERS: tuple[_Registration, ...] = (
         summary="Heading anchors, deep-linking only where the author supplied an id.",
     ),
     _Registration(
+        name="drawio",
+        module="manicule.parsers.drawio",
+        factory="DrawioParser",
+        config_model=parser_config.DrawioConfig,
+        media_types=parser_config.DRAWIO_MEDIA_TYPES,
+        summary="draw.io attachments, one block per page, anchored on the page's own name.",
+    ),
+    _Registration(
         name="adf",
         module="manicule.parsers.adf",
         factory="ADFParser",

@@ -15,7 +15,7 @@ an absence.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, MutableSequence
 from pathlib import Path
 from typing import cast
 
@@ -26,7 +26,7 @@ from manicule_ollama.config import OllamaEmbedderConfig
 from manicule_ollama.served import resolve
 from ollama_fake import DIGEST, MODEL, SPECIAL_TOKENS, FakeOllama, config_payload
 
-from manicule.core.embedding import PrefixScheme
+from manicule.core.embedding import PrefixScheme, Vector
 from manicule.core.errors import ConfigError, ContextOverflowError
 from manicule.core.protocols import Embedder, TokenStateEmbedder
 from manicule.embedding.runtimes.tokenization import FastTokenizer
@@ -307,6 +307,40 @@ async def test_embedding_is_deterministic_batch_invariant_and_cached(
         "the third call should have been served from the cache, which is keyed on the "
         "canonical fingerprint rather than on the model's name"
     )
+    await embedder.teardown()
+
+
+def _edit_in_place(vector: Vector) -> bool:
+    """Try to write through ``vector``, and report whether the write landed.
+
+    Static typing already forbids this; the defect it guards is a caller who does it anyway,
+    reached through ``Sequence[float]`` with no idea it is holding the cache's own value.
+    """
+    editable = cast("MutableSequence[float]", vector)
+    try:
+        editable[0] = 99.0
+    except (AttributeError, TypeError):
+        return False
+    return True
+
+
+async def test_a_cached_vector_cannot_be_edited_by_whoever_received_it(
+    vocabulary: Path, counter: Callable[[str], int]
+) -> None:
+    """The cache is shared by everything in the process, so one caller's edit is everyone's.
+
+    Held here as well as in the core suite because this backend does not inherit
+    :meth:`~manicule.embedding.base.PooledEmbedder.embed` — it carries its own copy of that
+    method, and a fix applied only to the shared one would leave this path poisonable.
+    """
+    server = FakeOllama(count=counter)
+    embedder = await ready(server, vocabulary)
+
+    duplicated = await embedder.embed(["alpha beta", "alpha beta"])
+
+    assert list(duplicated[0]) == list(duplicated[1])
+    assert _edit_in_place(duplicated[0]) is False
+    assert list((await embedder.embed(["alpha beta"]))[0]) == list(duplicated[0])
     await embedder.teardown()
 
 

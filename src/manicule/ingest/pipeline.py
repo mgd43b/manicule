@@ -3524,6 +3524,7 @@ class IngestPipeline:
                 digest=digest,
                 version_token=version_token,
                 title=title,
+                retention=retention,
             )
             return failed, ()
         if transformed is None:
@@ -3640,6 +3641,9 @@ class IngestPipeline:
             title="",
             identifier=document_id(self._workspace, source, member.source_id),
             existing=await self._store.find_document(source, member.source_id),
+            retention=Retention(
+                omitted_reason="not retained: a member that could not be read has no bytes"
+            ),
         )
 
     # --- stages --------------------------------------------------------------------------
@@ -4494,7 +4498,9 @@ class IngestPipeline:
         expected: DocumentRevision | None = None,
         retention: Retention | None = None,
     ) -> DocumentOutcome:
-        retention = retention or Retention(omitted_reason="not retained: the document was skipped")
+        retention = retention or Retention(
+            omitted_reason="not retained: no retention was attempted for this document"
+        )
         document = await self._store_record(
             result,
             raw=raw,
@@ -4594,8 +4600,17 @@ class IngestPipeline:
         digest: str = "",
         version_token: str | None = None,
         title: str = "",
+        retention: Retention | None = None,
     ) -> DocumentOutcome:
-        """Record a failure that happened before there was anything to store."""
+        """Record a failure that happened before there was anything to store.
+
+        ``retention`` is what a caller that already retained the source bytes hands over, and
+        it is the difference between a repairable failure and an unrepairable one. Retention
+        completes before ``before_parse`` runs, so a hook that raises leaves a blob on disk;
+        recording ``original_ref=None`` beside it would say the bytes are gone while they are
+        sitting there, refuse the offline re-parse that is the whole point of keeping them,
+        and leave the blob referenced by nothing for the collector to reclaim.
+        """
         if existing is not None:
             return await self._demote(existing, existing, stage, detail)
         if raw is None:
@@ -4621,6 +4636,7 @@ class IngestPipeline:
             title=title,
             identifier=document_id(self._workspace, source, source_id),
             existing=None,
+            retention=retention,
         )
 
     async def _demote(

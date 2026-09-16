@@ -472,11 +472,13 @@ whether provenance is real.
 | **Email** | `.eml` `.msg` | `LineAnchor(start, end, None)` | line span within the canonical text — headers, blank line, body (§10) | **Exact**, given the part-selection rule |
 | **Plain text** | `.txt` | `LineAnchor(start, end, None)` | source line numbers | **Exact** |
 | **Structured** | `.json` `.yaml` `.yml` `.toml` | `LineAnchor(start, end, symbol)` | source line span; `symbol` is the dotted key path, with `[n]` for an array index | **Exact** where positions exist (§11) |
+| **draw.io** | `.drawio` `.drawio.png` | `HeadingAnchor(path, fragment\|None)` | the page's own `name`, else its `id`; fragment only where two pages share one name (§8.4.6) | **Exact.** The name is the file's, never the tab's position |
 | **Archive** | `.zip` | *(none — emits no chunks)* | members become their own documents with their own anchors (§9) | N/A |
 
-Twelve parsers over eighteen extensions, matching `PLAN.md` §5 and the `CAPABILITIES.md`
-file-type list: XLSX and CSV share one parser because the anchor and the block model are
-identical once a CSV is given a sheet name. The code parser is the exception to the
+Twelve parsers over the eighteen extensions of `PLAN.md` §5 and the `CAPABILITIES.md` file-type
+list, plus draw.io, which is past that floor rather than on it — the floor has no diagram row at
+all, and §8.4.6 is why one exists here. XLSX and CSV share one parser because the anchor and the
+block model are identical once a CSV is given a sheet name. The code parser is the exception to the
 eighteen — its extension set is the grammar pack's language list, which is deliberately
 wider than the capability floor, since real ASTs across many languages is one of the two
 upgrades this ticket exists for.
@@ -2205,19 +2207,43 @@ as well — render each diagram to an image and embed it with a vision model —
 Graphviz binary in the image, a layout pass over untrusted input, and a second embedding space
 the vector table cannot hold (§8.3). Everything of value here is reachable from the source text.
 
-#### 8.4.6 draw.io is the exception, and is filed separately
+#### 8.4.6 draw.io is the exception, and is built rather than declared
 
-[#250](https://github.com/mgd43b/manicule/issues/250). It shares this section's goal and none of
-its mechanism: the diagram arrives as a page **attachment** rather than as a block, so it needs a
-media type claimed and a parser registered rather than a language declared, and an `mxfile` is
-XML — commonly deflate-compressed and base64-encoded inside `<diagram>`, sometimes plain — which
-needs no grammar and no new dependency, but does need the decompression bound §9.3 establishes.
+**Built** ([#250](https://github.com/mgd43b/manicule/issues/250)), and it shares this section's
+goal and none of its mechanism. The diagram arrives as a page **attachment** rather than as a
+block, so it is reached by claiming a media type — `application/vnd.jgraph.mxfile`, for the
+`.drawio` and `.drawio.png` spellings — and registering `manicule.parsers.drawio.DrawioParser`,
+rather than by declaring a language. It takes no new dependency: an `mxfile` is XML, and the two
+spellings of a `<diagram>` body are plain, or `encodeURIComponent` then raw-deflate then base64,
+all of which `base64`, `zlib` and `xml.etree` already read.
 
-One thing worth knowing before scoping it: **a mermaid diagram inserted through draw.io does not
-retain its mermaid source.** draw.io converts it to native shapes at insert time, so the
-attachment holds `mxCell` nodes and edges. The extraction target is identical, so this costs
-nothing — but it means draw.io mermaid is served by the mxfile decoder and never by the mermaid
-grammar, and should not be budgeted twice.
+**Where the two halves join is the reading.** A block's `text` is the decoded `mxGraphModel`, so
+§8.4.2's rule is unchanged — the lexical leg indexes `chunks.text` and a citation keeps quoting
+what the file holds — and the relationships reach the embedder through the same `diagrams`
+middleware, under the `mxfile` language. One reader table, one rewrite, one fingerprint. It is
+therefore the one notation in `DIAGRAM_LANGUAGES` with no grammar behind it, and that split is
+declared in `GRAMMARLESS_DIAGRAM_LANGUAGES` rather than inferred, so the grammar-seeding check
+that guards §8.1's one-corpus-two-chunkings hazard is not failed by a notation that has no
+grammar to seed.
+
+**Three refusals, because an attachment is untrusted input in ways a code block is not.** A
+deflate stream is bounded on what it expands *to*, enforced while it expands, which is §9.3's
+ruling in a different container (`parsers.drawio.max_decompressed_bytes`, 8 MiB). A `DOCTYPE` is
+refused outright, because `xml.etree` expands internal entities and there is no ceiling available
+to stop it. And a `<diagram>` body in neither of the two spellings is refused rather than guessed
+at, because a wrong guess yields a document full of plausible mojibake instead of a visible
+`unsupported_media_type`.
+
+**A page's anchor is the page's own name, or its own id, and never its position.** draw.io writes
+both on every diagram it saves. Two tabs sharing a name is ordinary, and the tie breaks in the
+fragment so the first keeps the plain name a reader would cite; a hand-written file with neither
+is `Unlocated` with a reason, because a tab's position is not a name the file gave it.
+
+One thing worth knowing, and it is why this is not budgeted twice: **a mermaid diagram inserted
+through draw.io does not retain its mermaid source.** draw.io converts it to native shapes at
+insert time, so the attachment holds `mxCell` nodes and edges. The extraction target is
+identical, so this costs nothing — but it means draw.io mermaid is served by the mxfile decoder
+and never by the mermaid grammar.
 
 #### 8.4.7 This is a hypothesis, and it is measurable
 

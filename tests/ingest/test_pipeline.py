@@ -25,6 +25,7 @@ from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import BlobSink, IngestPipeline
+from manicule.ingest.reindex import re_parse
 from manicule.ingest.workers import InProcessRunner
 from manicule.parsers.versions import parse_fingerprint
 from tests.fakes import MEDIA_TYPE, HashEmbedder
@@ -872,6 +873,51 @@ async def test_the_bytes_that_are_retained_are_the_ones_the_connector_returned()
         "storage.md §4.2: original_ref is the same value as content_hash when retention worked"
     )
     assert blobs.data[document.content_hash] == b"alpha"
+
+
+async def test_a_hook_that_raises_before_parsing_keeps_the_bytes_it_was_given() -> None:
+    """Retention completes before ``before_parse``, so a raising hook leaves a blob on disk.
+
+    Recording ``original_ref=None`` beside it says the bytes are gone while they are sitting
+    there: the document cannot be repaired offline, and the collector reclaims a blob that a
+    re-parse would have used. This is the one failure position where that can happen, because
+    every other one is downstream of a settlement that already threads retention through.
+    """
+    blobs = fakes.MemoryBlobs()
+    pipeline, store, _ = build(blobs=blobs, middleware=(fakes.EarlyExploder(),))
+
+    await pipeline.run(fakes.DictConnector({"a": "alpha"}))
+
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.status is DocumentStatus.FAILED
+    assert document.failed_stage is PipelineStage.MIDDLEWARE
+    assert document.original_ref == content_hash(b"alpha")
+    assert store.originals[document.id] == (content_hash(b"alpha"), None)
+    assert blobs.data[content_hash(b"alpha")] == b"alpha"
+
+
+async def test_a_document_failed_by_a_hook_can_be_reparsed_from_its_retained_bytes() -> None:
+    """The point of retaining bytes: fix the hook, repair the document, do not re-fetch it.
+
+    ``re_parse`` refuses a document whose ``original_ref`` is unset, so a failure that
+    discards the reference is not merely untidy — it converts a one-command repair into a
+    forced re-sync of a source that may be rate-limited or gone.
+    """
+    blobs = fakes.MemoryBlobs()
+    pipeline, store, _ = build(blobs=blobs, middleware=(fakes.EarlyExploder(),))
+    await pipeline.run(fakes.DictConnector({"a": "alpha"}))
+    failed = await store.find_document("memory", "a")
+    assert failed is not None
+
+    repaired, _, _ = build(blobs=blobs, store=store)
+    report = await re_parse([failed], pipeline=repaired, blobs=blobs)
+
+    assert report.unrepairable == []
+    assert report.documents == 1
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.status is DocumentStatus.INDEXED
 
 
 async def test_members_of_a_container_do_not_consume_a_discovery_limit() -> None:

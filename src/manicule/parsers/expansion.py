@@ -104,9 +104,19 @@ TREE_MEMBERS = "container_tree_members"
 """Metadata key: members already produced from this document's container tree."""
 
 
+_COMPOUND_MEDIA_TYPE_BY_SUFFIX: dict[str, str] = {
+    ".drawio.png": "application/vnd.jgraph.mxfile",
+}
+"""Two-part suffixes, checked before the single-suffix table.
+
+``.drawio.png`` is the only one so far and it is the reason the table exists: the file really is
+a PNG, so resolving it on its last suffix alone is not wrong exactly — it is just the answer that
+throws away the diagram XML the export carries in a text chunk for precisely this purpose."""
+
 _MEDIA_TYPE_BY_SUFFIX: dict[str, str] = {
     ".css": "text/css",
     ".csv": "text/csv",
+    ".drawio": "application/vnd.jgraph.mxfile",
     ".eml": "message/rfc822",
     ".htm": "text/html",
     ".html": "text/html",
@@ -142,6 +152,9 @@ def media_type_for(name: str) -> str:
     slash = lowered.rfind("/")
     if dot <= slash + 1:
         return OCTET_STREAM
+    for suffix, media_type in _COMPOUND_MEDIA_TYPE_BY_SUFFIX.items():
+        if lowered.endswith(suffix) and len(lowered) - len(suffix) > slash:
+            return media_type
     return _MEDIA_TYPE_BY_SUFFIX.get(lowered[dot:], OCTET_STREAM)
 
 

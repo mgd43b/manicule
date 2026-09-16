@@ -25,6 +25,14 @@ hit reveals nothing the caller does not already hold, since it holds the text an
 compute the same vector itself. One honest caveat: a shared cache is a weak timing oracle for
 "has anyone here embedded this exact string", which is a property of a self-hosted tool rather
 than a defect.
+
+**The cache owns its values, so it stores them frozen.** A memo that hands back the list it is
+holding is not a memo: one caller editing a returned vector in place changes what every later
+caller is told, and nothing anywhere would report it — the fingerprint still matches, the
+counts still add up, and the index fills with vectors the model never produced. So a vector is
+converted to a tuple on the way in and that tuple is what every reader gets, which also settles
+the subtler half: two copies of one text in a single batch share an object by design, and
+sharing an immutable one is free where sharing a mutable one is a defect.
 """
 
 from __future__ import annotations
@@ -36,6 +44,10 @@ from manicule.core.embedding import EmbedFingerprint, Vector
 
 type CacheKey = tuple[str, str]
 """``(fingerprint.canonical(), embed_text)``."""
+
+type FrozenVector = tuple[float, ...]
+"""What the cache stores and returns: a :data:`~manicule.core.embedding.Vector` a caller cannot
+edit. ``Sequence[float]`` already admits it, so nothing downstream changes shape."""
 
 
 class EmbeddingCache:
@@ -55,7 +67,7 @@ class EmbeddingCache:
             msg = f"cache capacity cannot be negative, got {capacity}"
             raise ValueError(msg)
         self._capacity = capacity
-        self._entries: OrderedDict[CacheKey, Vector] = OrderedDict()
+        self._entries: OrderedDict[CacheKey, FrozenVector] = OrderedDict()
         self._hits = 0
         self._misses = 0
 
@@ -69,8 +81,12 @@ class EmbeddingCache:
         """
         return (fingerprint.canonical(), text)
 
-    def get(self, fingerprint: EmbedFingerprint, text: str) -> Vector | None:
-        """The stored vector for ``text`` under ``fingerprint``, or ``None``."""
+    def get(self, fingerprint: EmbedFingerprint, text: str) -> FrozenVector | None:
+        """The stored vector for ``text`` under ``fingerprint``, or ``None``.
+
+        The returned tuple *is* the stored one. Handing out the cache's own object is safe
+        precisely because it cannot be edited.
+        """
         key = self.key(fingerprint, text)
         entry = self._entries.get(key)
         if entry is None:
@@ -80,19 +96,27 @@ class EmbeddingCache:
         self._hits += 1
         return entry
 
-    def put(self, fingerprint: EmbedFingerprint, text: str, vector: Vector) -> None:
-        """Store ``vector``, evicting the least recently used entry if full."""
+    def put(self, fingerprint: EmbedFingerprint, text: str, vector: Vector) -> FrozenVector:
+        """Store ``vector`` frozen, evicting the least recently used entry if full.
+
+        Returns the frozen value, which is the point of returning anything: the caller is
+        about to hand this vector to whoever asked for it, and giving back the cache's own
+        copy is what stops the two diverging. A disabled cache still freezes and returns, so
+        ``capacity = 0`` changes how much is remembered and nothing about what callers hold.
+        """
+        frozen = tuple(float(value) for value in vector)
         if self._capacity == 0:
-            return
+            return frozen
         key = self.key(fingerprint, text)
-        self._entries[key] = vector
+        self._entries[key] = frozen
         self._entries.move_to_end(key)
         while len(self._entries) > self._capacity:
             self._entries.popitem(last=False)
+        return frozen
 
     def lookup(
         self, fingerprint: EmbedFingerprint, texts: Sequence[str]
-    ) -> tuple[list[Vector | None], list[str]]:
+    ) -> tuple[list[FrozenVector | None], list[str]]:
         """Resolve a whole batch at once.
 
         Returns:
@@ -101,7 +125,7 @@ class EmbeddingCache:
             of the same boilerplate costs one forward pass rather than forty — which is where
             a corpus's hit rate actually comes from.
         """
-        slots: list[Vector | None] = []
+        slots: list[FrozenVector | None] = []
         pending: list[str] = []
         seen: set[str] = set()
         for text in texts:
@@ -128,4 +152,4 @@ class EmbeddingCache:
         return len(self._entries)
 
 
-__all__ = ["CacheKey", "EmbeddingCache"]
+__all__ = ["CacheKey", "EmbeddingCache", "FrozenVector"]

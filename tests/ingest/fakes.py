@@ -1429,6 +1429,23 @@ class Exploder(PassThrough):
         raise RuntimeError(msg)
 
 
+class EarlyExploder(PassThrough):
+    """Raises before parsing, which is the side of retention that matters.
+
+    Distinct from :class:`Exploder` because of *when* it raises: source bytes are retained
+    before ``before_parse`` runs, so this is the only hook position where a failure can leave
+    a blob on disk and a document claiming there is none.
+    """
+
+    name = "early-exploder"
+
+    @override
+    async def before_parse(self, raw: RawDocument) -> RawDocument | None:
+        del raw
+        msg = "the hook could not reach its service"
+        raise RuntimeError(msg)
+
+
 # --- blobs --------------------------------------------------------------------------------------
 
 

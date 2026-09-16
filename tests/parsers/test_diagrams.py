@@ -19,9 +19,15 @@ from manicule.parsers import grammars
 from manicule.parsers.config import (
     DIAGRAM_LANGUAGES,
     DIAGRAM_MIDDLEWARE_NAME,
+    GRAMMARLESS_DIAGRAM_LANGUAGES,
     DiagramConfig,
 )
-from manicule.parsers.diagrams import DiagramMiddleware, notations, reading
+from manicule.parsers.diagrams import (
+    DiagramMiddleware,
+    grammarless_notations,
+    notations,
+    reading,
+)
 from manicule.parsers.plugin import PLUGIN
 from manicule.plugins import ComponentRegistry
 from manicule.testing import assert_middleware_contract
@@ -48,7 +54,7 @@ def require_grammars() -> None:
     are the tests that catch a reader wired up wrongly, and a blanket skip would take them out
     exactly when something is missing.
     """
-    absent = grammars.missing_grammars(sorted(DIAGRAM_LANGUAGES))
+    absent = grammars.missing_grammars(sorted(DIAGRAM_LANGUAGES - GRAMMARLESS_DIAGRAM_LANGUAGES))
     if absent:
         pytest.skip(
             f"no grammar cached for {', '.join(absent)} in {grammars.cache_directory()}, so the "
@@ -352,8 +358,23 @@ def test_the_reader_table_and_the_declared_set_agree() -> None:
 def test_every_declared_notation_has_a_media_type_so_its_grammar_is_seeded() -> None:
     """Declaring the language is what makes ``prefetch`` fetch the grammar and the bundle carry
     it, so a notation missing from ``MEDIA_TYPES`` reads nothing on an air-gapped install and
-    everything on a developer's warm cache — one corpus, two chunkings."""
-    assert set(grammars.MEDIA_TYPES) >= DIAGRAM_LANGUAGES
+    everything on a developer's warm cache — one corpus, two chunkings.
+
+    Scoped to the notations that have a grammar, because that is what the requirement is about.
+    A grammar-free notation is held to the other half of the pair below.
+    """
+    assert set(grammars.MEDIA_TYPES) >= DIAGRAM_LANGUAGES - GRAMMARLESS_DIAGRAM_LANGUAGES
+
+
+def test_a_grammar_free_notation_is_dispatched_without_one() -> None:
+    """The two halves of the split have to agree, in both directions.
+
+    Declared grammar-free but dispatched through a grammar is a reading that silently stops on
+    an air-gapped install; dispatched grammar-free but declared as needing one is a grammar
+    fetched forever for a notation nothing will ever ask it about.
+    """
+    assert grammarless_notations() == GRAMMARLESS_DIAGRAM_LANGUAGES
+    assert not set(grammars.MEDIA_TYPES) & GRAMMARLESS_DIAGRAM_LANGUAGES
 
 
 # --- the middleware ----------------------------------------------------------------------------

@@ -163,9 +163,13 @@ class OllamaEmbedder(Lifecycle):
         resolved: dict[str, Vector] = {}
         if pending:
             computed = await self._embed_uncached(pending)
-            resolved = dict(zip(pending, computed, strict=True))
-            for text, vector in resolved.items():
-                self._cache.put(self.fingerprint, text, vector)
+            # What the cache froze, not what the model returned: duplicate texts in one batch
+            # resolve to one object at several output positions, and that object must be one
+            # nobody can edit. `pending` is already distinct, so this is still one put each.
+            resolved = {
+                text: self._cache.put(self.fingerprint, text, vector)
+                for text, vector in zip(pending, computed, strict=True)
+            }
 
         return [
             slot if slot is not None else resolved[text]
