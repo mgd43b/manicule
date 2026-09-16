@@ -159,8 +159,12 @@ def test_the_image_does_not_pin_the_embedding_provider_in_the_environment() -> N
     )
 
 
-def _qdrant_service_image(path: Path, job: str | None) -> str:
-    """The image `services.qdrant.image` names in a parsed document, not in its prose.
+MATRIX_REFERENCE = re.compile(r"\$\{\{\s*matrix\.(\w+)\s*\}\}")
+"""A ``${{ matrix.<key> }}`` expression inside a workflow value."""
+
+
+def _qdrant_service_images(path: Path, job: str | None) -> tuple[str, ...]:
+    """Every image `services.qdrant.image` names in a parsed document, not in its prose.
 
     Read from the service definition rather than matched in the file's text, because the text
     also contains sentences *about* the image — this repository's workflows and manifests
@@ -168,6 +172,10 @@ def _qdrant_service_image(path: Path, job: str | None) -> str:
     `qdrant/qdrant` in prose. A regular expression over the raw bytes reads those sentences as
     pins, so a service that was removed or renamed would go on matching its own explanation.
     `test_ci_and_release_sync_the_same_way` parses for the same reason.
+
+    A workflow image that interpolates the job's matrix is expanded over it, one image per
+    entry, so a matrix entry is held to the same rules as a literal pin rather than read as the
+    unexpanded expression.
 
     ``job`` names the workflow job the service hangs off, or ``None`` for a compose file, which
     declares its services at the top level.
@@ -186,52 +194,65 @@ def _qdrant_service_image(path: Path, job: str | None) -> str:
         + "; this test is reading for one. If the service moved or was removed, this test is "
         "what needs updating."
     )
-    return cast(str, cast(dict[str, Any], services["qdrant"])["image"])
+    image = cast(str, cast(dict[str, Any], services["qdrant"])["image"])
+    reference = MATRIX_REFERENCE.search(image)
+    if reference is None:
+        return (image,)
+    strategy = cast(dict[str, Any], document.get("strategy") or {})
+    matrix = cast(dict[str, Any], strategy.get("matrix") or {})
+    key = reference.group(1)
+    assert key in matrix, f"{path.name} job `{job}` names matrix.{key}, which its matrix lacks"
+    return tuple(
+        MATRIX_REFERENCE.sub(str(value), image) for value in cast(list[object], matrix[key])
+    )
 
 
 def test_the_qdrant_the_suite_tests_against_is_the_one_compose_runs() -> None:
-    """The two Qdrant services name one exact release, and Dependabot only sees one of them.
+    """Every Qdrant the suite runs against is an exact release, and one is the compose pin.
 
     Not a tidiness check, and the asymmetry is the whole reason for it. Dependabot's `docker`
     ecosystem reads `image:` in a YAML manifest as well as a Dockerfile, so the pin in
-    `compose.yaml` is tracked and gets a pull request when a release lands. The one in
-    `ci.yml` is not: that ecosystem does not scan `.github/workflows/`, and `github-actions`
+    `compose.yaml` is tracked and gets a pull request when a release lands. The ones in
+    `ci.yml` are not: that ecosystem does not scan `.github/workflows/`, and `github-actions`
     updates `uses:` references rather than a job's `services.*.image`.
 
-    So the tracked pin moves and the untracked one stays, silently — and the untracked one is
-    the server the vector-store conformance suite actually runs against, which makes it the
-    half that matters. Holding them equal turns the bump Dependabot *does* raise into a failing
-    build until both move together, which is the same trick
+    So the tracked pin moves and the untracked ones stay, silently — and the untracked ones are
+    the servers the vector-store conformance suite actually runs against, which makes them the
+    half that matters. Requiring the compose pin to be among them turns the bump Dependabot
+    *does* raise into a failing build until the workflow moves with it, which is the same trick
     `test_the_image_installs_what_the_documented_install_installs` plays on the Dockerfile's
     extras, for the same reason: two copies of one decision, and only one of them maintained.
 
-    **Equality alone is not enough**, which is the second assertion. Two references that both
-    said `latest` would be equal and would agree about nothing: the suite would certify the
-    backend against whatever was published that morning, and a wire-behavior regression would
-    arrive as a test failure on an unrelated pull request. The tag has to be an exact release
-    before it is worth comparing.
-    """
-    pins = {
-        COMPOSE.name: _qdrant_service_image(COMPOSE, None),
-        CI_WORKFLOW.name: _qdrant_service_image(CI_WORKFLOW, "qdrant"),
-    }
+    CI runs a matrix of servers rather than one because the store speaks two placement
+    dialects, and a server on each side of Qdrant's `memory` change is the only way to run both.
+    The older entry is a deliberate floor rather than a pin that fell behind, which is why the
+    requirement is membership rather than equality.
 
-    floating = {name: image for name, image in pins.items() if not QDRANT_PIN.match(image)}
+    **Membership alone is not enough**, which is the first assertion. References that said
+    `latest` would match anything and agree about nothing: the suite would certify the backend
+    against whatever was published that morning, and a wire-behavior regression would arrive as
+    a test failure on an unrelated pull request. Every tag has to be an exact release before it
+    is worth comparing.
+    """
+    composed = _qdrant_service_images(COMPOSE, None)
+    tested = _qdrant_service_images(CI_WORKFLOW, "qdrant")
+
+    floating = [image for image in (*composed, *tested) if not QDRANT_PIN.match(image)]
     assert not floating, (
         "a Qdrant service is not pinned to an exact release.\n"
-        + "".join(f"  {name}: {image}\n" for name, image in sorted(floating.items()))
+        + "".join(f"  {image}\n" for image in sorted(floating))
         + "`latest` floats by definition and a `vMAJOR.MINOR` tag floats to the newest patch, "
         "so either would leave the conformance suite testing against whatever was published "
         "most recently. Pin `vMAJOR.MINOR.PATCH`."
     )
 
-    versions = {cast(re.Match[str], QDRANT_PIN.match(image)).group(1) for image in pins.values()}
-    assert len(versions) == 1, (
-        "the Qdrant the test suite runs against and the one `docker compose` starts have "
-        "drifted.\n"
-        + "".join(f"  {name}: {image}\n" for name, image in sorted(pins.items()))
-        + "Dependabot tracks the compose pin and not the workflow one, so this is what a "
-        "merged bump looks like. Move the other to match."
+    assert len(composed) == 1
+    assert composed[0] in tested, (
+        "the Qdrant `docker compose` starts is not one the test suite runs against.\n"
+        f"  {COMPOSE.name}: {composed[0]}\n"
+        f"  {CI_WORKFLOW.name}: {', '.join(tested)}\n"
+        "Dependabot tracks the compose pin and not the workflow ones, so this is what a merged "
+        "bump looks like. Move the newest workflow entry to match."
     )
 
 
