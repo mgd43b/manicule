@@ -195,7 +195,18 @@ async def attempt_one(parser: object, name: str, raw: RawDocument) -> AttemptRes
         except Exception as exc:  # noqa: BLE001 - a container's own bug fails one document
             reason = f"{type(exc).__name__}: {exc}"
             return AttemptResult([], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason))
-        expanded = ParserChain(parsers={name: parser}, chains={})  # pyright: ignore[reportArgumentType]
+        from manicule.core.protocols import Parser  # noqa: PLC0415 - avoids an import cycle
+
+        if not isinstance(parser, Parser):
+            # Expanding and reading are separate capabilities and only one of them is claimed
+            # here. Every registered parser is both — the registry will not take one without
+            # media types — but `SupportsExpansion` asks for `expand` and nothing else, so an
+            # object that only expands is a legitimate thing to be handed, and asking it for
+            # blocks it never offered would fail the document on an `AttributeError`.
+            return AttemptResult(
+                [], Attempt(parser=name, outcome=Outcome.PARSED), members=tuple(members)
+            )
+        expanded = ParserChain(parsers={name: parser}, chains={})
         blocks, read = await expanded.attempt(name, raw)
         if read.outcome is Outcome.FAILED:
             # Expansion worked and reading broke, which is a broken document rather than a
