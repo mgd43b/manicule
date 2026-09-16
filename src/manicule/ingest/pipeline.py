@@ -3402,7 +3402,7 @@ class IngestPipeline:
         # members" test would skip.
         derived: dict[str, set[str]] = {}
         if _expanded(outcome) and (
-            members or (existing is not None and existing.status is DocumentStatus.CONTAINER)
+            members or (existing is not None and existing.status is CONTAINER_STATUS)
         ):
             derived[outcome.document_id] = set()
         while queue:
@@ -3436,13 +3436,14 @@ class IngestPipeline:
             )
             outcomes.append(inner)
             queue.extend((inner.document_id, item) for item in deeper)
-            # The same rule the top-level document gets, one level down: a nested container
-            # emptied of its members is still a container that has to retire them, and a nested
-            # container that was hash-skipped derived nothing and must not.
-            if deeper or (
-                _expanded(inner)
-                and member_existing is not None
-                and member_existing.status is DocumentStatus.CONTAINER
+            # The same rule the top-level document gets, one level down — and the same shape,
+            # because writing it the other way round is how the hazard survives: `deeper` being
+            # non-empty proves a nested archive was read, not that it was read to the end. One
+            # that stops at its member ceiling yields a prefix, and reconciling against a prefix
+            # retires everything past it.
+            if _expanded(inner) and (
+                deeper
+                or (member_existing is not None and member_existing.status is CONTAINER_STATUS)
             ):
                 derived.setdefault(inner.document_id, set())
         for container, present in derived.items():
@@ -4915,6 +4916,10 @@ def _source_dependencies(document: Document) -> tuple[SourceId, ...] | None:
 def _raise_lost_acquisition_lease(run_id: str) -> None:
     msg = f"acquisition lease for run {run_id!r} was lost"
     raise AcquisitionLeaseLostError(msg)
+
+
+CONTAINER_STATUS: Final = DocumentStatus.CONTAINER
+"""Spelled once, because the two reconciliation gates must keep asking the same question."""
 
 
 def _expanded(outcome: DocumentOutcome) -> bool:

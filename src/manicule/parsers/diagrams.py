@@ -47,6 +47,8 @@ from manicule.core.protocols import Middleware
 from manicule.parsers.config import DIAGRAM_LANGUAGES, DIAGRAM_MIDDLEWARE_NAME, DiagramConfig
 
 if TYPE_CHECKING:
+    from xml.etree.ElementTree import Element
+
     from tree_sitter import Node
 
     from manicule.core.content import Chunk, Document
@@ -239,6 +241,11 @@ def _lines(graph: _Graph) -> Iterator[str]:
     """Title, then relationships, then groupings, then whatever was never connected."""
     if graph.title:
         yield graph.title
+    if graph.truncated:
+        # Second, because `_render` trims from the end to fit its budget: a marker at the bottom
+        # is the first thing dropped from exactly the reading that needs it, which would leave a
+        # partial diagram presenting as a complete one.
+        yield "… this diagram is larger than the reader's limit and is read in part"
     mentioned: set[str] = set()
     for edge in graph.edges:
         source, target = graph.name(edge.source), graph.name(edge.target)
@@ -252,11 +259,6 @@ def _lines(graph: _Graph) -> Iterator[str]:
         if group.label and members:
             mentioned.update(group.members)
             yield f'group "{group.label}": {", ".join(members)}'
-    if graph.truncated:
-        # Said in the reading rather than left to the caller, because the reading is the only
-        # thing the embedder sees. A partial diagram that looks complete is the failure this
-        # costs one line to avoid.
-        yield "… the diagram continues past this reader's limit"
     unconnected = [graph.name(item) for item in graph.order if item not in mentioned]
     named = [item for item in unconnected if item]
     # A diagram of boxes with no edges still states something, and its labels are the whole of
@@ -502,6 +504,27 @@ The wrapper then owns the id and the label and the ``mxCell`` inside it owns the
 reader that only looked at ``mxCell`` would see those shapes as unlabeled."""
 
 
+def _wrapped_cells(root: Element, limit: int) -> tuple[set[Element], bool]:
+    """The cells a wrapper owns, and whether the walk that found them reached the end.
+
+    Its own pass, and its own bound. A wrapper owns its cell's identity, so that cell must not
+    also be read on its own — the inner element carries the edge's endpoints, and reading it
+    twice draws the edge twice. Finding them means walking the tree, and a walk over untrusted
+    XML that is bounded only *after* it finishes is not bounded at all: the budget below would
+    have been consulted for the first time once this had already visited every element of an
+    8 MiB document.
+
+    Held as elements rather than as ``id()`` values, which CPython reuses.
+    """
+    owned: set[Element] = set()
+    for walked, element in enumerate(root.iter()):
+        if walked >= limit:
+            return owned, False
+        if element.tag in _MXFILE_WRAPPERS:
+            owned.update(element.findall("mxCell"))
+    return owned, True
+
+
 def _read_mxfile(source: str) -> _Graph:
     """draw.io, whose model is already a list of cells that are either nodes or edges.
 
@@ -519,15 +542,8 @@ def _read_mxfile(source: str) -> _Graph:
     root = graph_source(source)
     if root is None:
         return graph
-    # A wrapper owns its cell's identity, so the cell must not also be read on its own: the
-    # inner element carries the edge's endpoints, and reading it twice draws the edge twice.
-    # Held as elements rather than as `id()` values, which CPython reuses.
-    owned = {
-        child
-        for element in root.iter()
-        if element.tag in _MXFILE_WRAPPERS
-        for child in element.findall("mxCell")
-    }
+    owned, complete = _wrapped_cells(root, MAX_CELLS)
+    graph.truncated = not complete
     cells = 0
     for element in root.iter():
         # Counted per *cell*, not per XML element. Every vertex carries an `mxGeometry` and a

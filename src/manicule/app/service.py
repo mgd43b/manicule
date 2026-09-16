@@ -4103,15 +4103,24 @@ class ApplicationService:
         try:
             store = await self._backend.documents()
             sources = sorted(self.settings.connectors)
-            measured = {
-                source: (
-                    await store.count_documents(
-                        source=source, statuses=(DocumentStatus.NO_EXTRACTABLE_TEXT,)
-                    ),
-                    total,
+            # Gathered rather than awaited one at a time: the counts are independent, and a
+            # comprehension full of `await` turns an installation's connector count into that
+            # many serialized round trips for a check whose whole output is one sentence.
+            counted = await asyncio.gather(
+                *(
+                    asyncio.gather(
+                        store.count_documents(source=source),
+                        store.count_documents(
+                            source=source, statuses=(DocumentStatus.NO_EXTRACTABLE_TEXT,)
+                        ),
+                    )
+                    for source in sources
                 )
-                for source in sources
-                if (total := await store.count_documents(source=source))
+            )
+            measured = {
+                source: (empty, total)
+                for source, (total, empty) in zip(sources, counted, strict=True)
+                if total
             }
         except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
             return r.Check(

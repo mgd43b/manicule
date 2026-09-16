@@ -188,7 +188,7 @@ def _message(ole: object, *, config: MsgConfig) -> bytes:
         # Drafts and Sent Items never traversed a transport, so there is no header block to
         # carry and the addresses have to be assembled from the properties that do exist. This
         # is the larger half of a real export rather than an edge case.
-        _synthesize(ole, built, subject=subject, limit=config.max_property_bytes)
+        _synthesize(ole, built, limit=config.max_property_bytes)
     if subject and "Subject" not in built:
         built["Subject"] = subject
 
@@ -217,9 +217,12 @@ def _carry(built: EmailMessage, headers: str) -> None:
             built[name] = value
 
 
-def _synthesize(ole: object, built: EmailMessage, *, subject: str, limit: int) -> None:
-    """Assemble From and To from the sender properties and the recipient table."""
-    del subject
+def _synthesize(ole: object, built: EmailMessage, *, limit: int) -> None:
+    """Assemble From and To from the sender properties and the recipient table.
+
+    The subject is the caller's to set, because it is set the same way whether or not there was
+    a transport block to read it from.
+    """
     sender = _address(
         _text(ole, _SENDER_SMTP, limit=limit) or _text(ole, _SENDER_EMAIL, limit=limit),
         _text(ole, _SENDER_NAME, limit=limit),

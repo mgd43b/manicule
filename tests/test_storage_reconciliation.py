@@ -356,6 +356,49 @@ async def test_ceiling_records_a_bounded_proposal_and_confirmation_applies_revie
     assert PROPOSED_DELETION_KEY not in await store.connector_metadata(_CONNECTOR)
 
 
+async def test_removing_a_container_removes_what_was_derived_from_it(
+    store: SqliteDocStore,
+) -> None:
+    """A soft delete does not cascade, and what it leaves behind is unreachable for good.
+
+    ``documents.container_id`` carries ``ON DELETE CASCADE`` and that fires on a *hard* delete;
+    setting ``deleted_at`` on a container says nothing about its members. And the query that
+    finds deletion candidates excludes derived documents on purpose — their source ids were
+    never in any connector inventory — so a member orphaned this way is searchable, citable,
+    and can never be named by this pass again.
+    """
+    await store.upsert_document(make_document(_CONNECTOR, "bundle.zip"))
+    container = await store.find_document(_CONNECTOR, "bundle.zip")
+    assert container is not None
+    await store.upsert_document(
+        make_document(
+            _CONNECTOR, "zip:bundle.zip!/inner.zip", container_id=container.id, container_depth=1
+        )
+    )
+    nested = await store.find_document(_CONNECTOR, "zip:bundle.zip!/inner.zip")
+    assert nested is not None
+    await store.upsert_document(
+        make_document(
+            _CONNECTOR,
+            "zip:zip:bundle.zip!/inner.zip!/deep.txt",
+            container_id=nested.id,
+            container_depth=2,
+        )
+    )
+    await store.upsert_document(make_document(_CONNECTOR, "page-0"))
+
+    completed = await _complete(store, "gone", ["page-0"])
+    result = await store.assess_reconciliation_inventory(
+        completed, max_delete_fraction=1.0, now=_NOW
+    )
+
+    assert result.applied_count == 3, "the container and both generations under it"
+    assert await store.find_document(_CONNECTOR, "bundle.zip") is None
+    assert await store.find_document(_CONNECTOR, "zip:bundle.zip!/inner.zip") is None
+    assert await store.find_document(_CONNECTOR, "zip:zip:bundle.zip!/inner.zip!/deep.txt") is None
+    assert await store.find_document(_CONNECTOR, "page-0") is not None
+
+
 async def test_dry_run_never_proposes_or_deletes(store: SqliteDocStore) -> None:
     await _documents(store, 4)
     completed = await _complete(store, "dry", ["page-0"])

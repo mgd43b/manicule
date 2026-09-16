@@ -165,7 +165,19 @@ def build(dest: Path) -> None:
                         **_stream("370E", "001F", "text/csv"),
                         **_stream("3701", "0102", b"quarter,throughput\n2026Q1,1.2\n"),
                     },
-                )
+                ),
+                # A tag that is not one plain `type/subtype`. It is attacker-controlled and ends
+                # up in a header, so the reader has to refuse it back to the default rather than
+                # pass it through — and a fixture that only ever carries a well-formed one
+                # exercises none of that.
+                Storage(
+                    "__attach_version1.0_#00000001",
+                    {
+                        **_stream("3707", "001F", "notes"),
+                        **_stream("370E", "001F", "text/plain\r\nX-Injected: yes"),
+                        **_stream("3701", "0102", b"measured at the boundary\n"),
+                    },
+                ),
             ],
         )
     )

@@ -44,7 +44,9 @@ Created: 2026-09-15 12:00:00.000000
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections import defaultdict
+from collections.abc import Iterator, Sequence
+from itertools import batched
 
 import sqlalchemy as sa
 from alembic import op
@@ -67,6 +69,12 @@ _SCHEMES = ("zip", "mail")
 
 _MAX_DEPTH = 3
 """``manicule.parsers.expansion.MAX_DEPTH``, and here a bound on the settling passes below."""
+
+_LOOKUP_BATCH = 500
+"""How many identities one ``IN`` carries.
+
+SQLite bounds the parameters in a statement, and the bound has moved between releases — so the
+batch is small enough to clear the oldest of them rather than tuned to the newest."""
 
 
 def upgrade() -> None:
@@ -113,22 +121,41 @@ def _adopt_existing_members() -> None:
         sa.column("container_id", sa.Text),
         sa.column("container_depth", sa.Integer),
     )
-    rows = bind.execute(
-        sa.select(
-            documents.c.id, documents.c.workspace_id, documents.c.source, documents.c.source_id
-        )
+    identity = (
+        documents.c.id,
+        documents.c.workspace_id,
+        documents.c.source,
+        documents.c.source_id,
+    )
+    # Only rows whose identity could encode a parent. A corpus is overwhelmingly *not* container
+    # members, so selecting all of it to find the few that are made the upgrade's peak memory the
+    # size of the index rather than the size of the thing being adopted.
+    children = bind.execute(
+        sa.select(*identity).where(documents.c.source_id.like(f"%{_SEPARATOR}%"))
     ).all()
-    by_identity = {(row.workspace_id, row.source, row.source_id): row.id for row in rows}
+    if not children:
+        return
 
-    owners: dict[str, str] = {}
-    for row in rows:
-        parent = _parent_of(row.source_id, row.workspace_id, row.source, by_identity)
+    # And only the documents those identities actually name, rather than every document there is.
+    wanted = sorted({guess for row in children for guess in _candidate_parents(row.source_id)})
+    by_identity: dict[tuple[str, str, str], str] = {}
+    for batch in batched(wanted, _LOOKUP_BATCH):
+        found = bind.execute(sa.select(*identity).where(documents.c.source_id.in_(batch)))
+        for row in found:
+            by_identity[row.workspace_id, row.source, row.source_id] = row.id
+
+    owners: dict[str, list[str]] = defaultdict(list)
+    for row in children:
+        parent = _parent_of(row.source_id, row.workspace_id, row.source, by_identity, row.id)
         if parent is not None:
-            owners[row.id] = parent
-    for child, parent in owners.items():
-        bind.execute(
-            sa.update(documents).where(documents.c.id == child).values(container_id=parent)
-        )
+            owners[parent].append(row.id)
+    # Grouped by parent, so an archive of two hundred members costs one statement rather than
+    # two hundred.
+    for parent, adopted in owners.items():
+        for batch in batched(adopted, _LOOKUP_BATCH):
+            bind.execute(
+                sa.update(documents).where(documents.c.id.in_(batch)).values(container_id=parent)
+            )
 
     # Depth settles upward: a child of a top-level document reaches 1 on the first pass, a child
     # of that child on the second. Bounded by the nesting ceiling rather than run to a fixed
@@ -147,8 +174,30 @@ def _adopt_existing_members() -> None:
         )
 
 
+def _candidate_parents(source_id: str) -> Iterator[str]:
+    """Every ``source_id`` this member's identity could be naming as its container.
+
+    Longest first, because a path inside a container may itself contain the separator and the
+    longest match is the one that leaves the shortest inner path. Each is only a candidate until
+    it resolves to a document that exists.
+    """
+    for scheme in _SCHEMES:
+        prefix = f"{scheme}:"
+        if not source_id.startswith(prefix):
+            continue
+        rest = source_id[len(prefix) :]
+        cut = rest.rfind(_SEPARATOR)
+        while cut > 0:
+            yield rest[:cut]
+            cut = rest.rfind(_SEPARATOR, 0, cut)
+
+
 def _parent_of(
-    source_id: str, workspace_id: str, source: str, by_identity: dict[tuple[str, str, str], str]
+    source_id: str,
+    workspace_id: str,
+    source: str,
+    by_identity: dict[tuple[str, str, str], str],
+    own_id: str,
 ) -> str | None:
     """The document id this member was expanded out of, or ``None`` if it is not one.
 
@@ -158,17 +207,8 @@ def _parent_of(
     spelling is what stops a connector whose own ids happen to contain ``!/`` from adopting
     documents that are not its members.
     """
-    for scheme in _SCHEMES:
-        prefix = f"{scheme}:"
-        if not source_id.startswith(prefix):
-            continue
-        rest = source_id[len(prefix) :]
-        cut = rest.rfind(_SEPARATOR)
-        while cut > 0:
-            candidate = by_identity.get((workspace_id, source, rest[:cut]))
-            if candidate is not None and candidate != by_identity.get(
-                (workspace_id, source, source_id)
-            ):
-                return candidate
-            cut = rest.rfind(_SEPARATOR, 0, cut)
+    for guess in _candidate_parents(source_id):
+        candidate = by_identity.get((workspace_id, source, guess))
+        if candidate is not None and candidate != own_id:
+            return candidate
     return None

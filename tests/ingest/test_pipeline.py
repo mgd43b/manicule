@@ -1040,6 +1040,52 @@ async def test_retiring_a_nested_container_retires_what_was_inside_it() -> None:
     assert await store.find_document("memory", "outer!/keep") is not None
 
 
+async def test_a_truncated_nested_expansion_retires_nothing() -> None:
+    """The gate one level down, which is where the first version of it was still open.
+
+    ``deeper`` being non-empty proves a nested archive was read, not that it was read to the
+    end — so an inner archive that stops at its member ceiling would have been reconciled
+    against a prefix and had the rest of its members retired.
+    """
+    pipeline, store, _ = build(
+        parsers={"archive": fakes.FakeArchive(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector = fakes.DictConnector({"outer": "inner.zip=one=alpha\\ntwo=beta"})
+    connector.media_types["outer"] = fakes.CONTAINER_MEDIA_TYPE
+    await pipeline.run(connector)
+    assert await store.find_document("memory", "outer!/inner.zip!/two") is not None
+
+    class TruncatingInner(fakes.FakeArchive):
+        """Reads the outer archive whole, and stops part-way through the inner one."""
+
+        @override
+        async def expand(self, raw: RawDocument) -> AsyncIterator[fakes.MemberOutcome]:
+            nested = raw.source_id.endswith("inner.zip")
+            async for member in super().expand(raw):
+                yield member
+                if nested:
+                    yield fakes.MemberFailure(
+                        source_id=f"{raw.source_id}!/ceiling",
+                        uri=f"fake:{raw.uri}!/ceiling",
+                        status=DocumentStatus.FAILED,
+                        reason="member count exceeded",
+                        depth=2,
+                        truncates=True,
+                    )
+                    return
+
+    truncated, _, _ = build(
+        store=store,
+        parsers={"archive": TruncatingInner(), "lines": fakes.LineParser()},
+        chain=("archive", "lines"),
+    )
+    connector.documents["outer"] = "inner.zip=one=gamma\\ntwo=beta"
+    await truncated.run(connector)
+
+    assert await store.find_document("memory", "outer!/inner.zip!/two") is not None
+
+
 async def test_reconciliation_never_sees_a_document_no_connector_could_report() -> None:
     """The defect this ownership column exists for, stated as the arithmetic that produced it.
 

@@ -174,7 +174,13 @@ async def test_an_attachment_keeps_the_media_type_the_message_declared(
     members = [member async for member in parser.expand(raw)]
 
     expanded = [member for member in members if isinstance(member, ExpandedMember)]
-    assert [member.raw.media_type for member in expanded] == ["text/csv"]
+    assert [member.raw.media_type for member in expanded] == [
+        "text/csv",
+        "application/octet-stream",
+    ], (
+        "the well-formed tag is honored and the one carrying a header injection is refused "
+        "back to the default rather than passed into a header verbatim"
+    )
 
 
 async def test_a_property_past_its_ceiling_is_refused_without_being_read_whole(

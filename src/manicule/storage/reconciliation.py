@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import delete, exists, func, insert, literal, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import aliased
 
 from manicule.core.reconciliation import (
     CompletedInventory,
@@ -30,6 +31,13 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 INVENTORY_PAGE_LIMIT = 1_000
+
+_MAX_CONTAINER_DEPTH = 3
+"""``manicule.parsers.expansion.MAX_DEPTH``, as a bound on the descent below.
+
+Spelled out rather than imported: this module is storage and that one is parsing, and the number
+is a ceiling on a loop here rather than a shared decision. The loop stops when a level retires
+nothing, so the bound is what keeps a cycle the schema should not allow from being a hang."""
 
 
 class ReconciliationInventoryError(AcquisitionConflictError):
@@ -563,7 +571,47 @@ class ReconciliationJournalMixin(WorkspaceScoped):
                 .values(deleted_at=now, updated_at=utcnow())
             ),
         )
-        return result.rowcount
+        return result.rowcount + await self._retire_derived(session, now)
+
+    async def _retire_derived(self, session: AsyncSession, now: datetime) -> int:
+        """Soft-delete everything derived from the documents this pass just removed.
+
+        **A soft delete does not cascade.** ``documents.container_id`` carries ``ON DELETE
+        CASCADE`` and that fires on a *hard* delete; setting ``deleted_at`` on a container says
+        nothing about its members. They are then worse than stale — :meth:`_live_documents`
+        excludes derived documents on purpose, so nothing this class does will ever name them
+        again, and they stay searchable and citable for good.
+
+        Set-based rather than a list of ids: a descendant is a live document whose container was
+        deleted at exactly this pass's timestamp, which walks one level per statement without
+        materializing anything. Bounded by the nesting ceiling in
+        ``manicule.parsers.expansion``, and by rows stopping rather than by that bound.
+        """
+        retired = 0
+        parent = aliased(models.Document, name="container")
+        for _ in range(_MAX_CONTAINER_DEPTH):
+            descends = exists(
+                select(parent.id).where(
+                    parent.id == models.Document.container_id,
+                    parent.deleted_at == now,
+                )
+            )
+            step = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.Document)
+                    .where(
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.deleted_at.is_(None),
+                        descends,
+                    )
+                    .values(deleted_at=now, updated_at=utcnow())
+                ),
+            )
+            if not step.rowcount:
+                return retired
+            retired += step.rowcount
+        return retired
 
     async def _record_proposal(
         self, session: AsyncSession, run: models.ReconciliationRun, now: datetime

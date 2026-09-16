@@ -272,6 +272,13 @@ def _inflate(data: bytes, *, max_bytes: int, wbits: int, what: str) -> bytes:
             raise ParseError(msg)
         if engine.eof:
             return bytes(out)
+        if not part and engine.unconsumed_tail == pending:
+            # No output and no input consumed. Neither the byte ceiling nor the truncation check
+            # below can fire from here — `out` never grows and the tail never shrinks — so
+            # without this the loop is the only unbounded thing in a reader whose whole job is
+            # bounding untrusted input.
+            msg = f"{what} stopped producing output before its stream ended"
+            raise ParseError(msg)
         pending = engine.unconsumed_tail
         if not pending and not part:
             # An empty tail alone does not mean the input ran out: capping the *output* leaves
