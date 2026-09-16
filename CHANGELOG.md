@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6](https://github.com/mgd43b/manicule/compare/v0.2.5...v0.2.6) (2026-09-16)
+
+
+### Features
+
+* persist HTTP and MCP request logs ([#389](https://github.com/mgd43b/manicule/issues/389)) ([66e8371](https://github.com/mgd43b/manicule/commit/66e8371b8c4f7de33740ee06f1d91f1df2abdad0))
+
 ## [0.2.5](https://github.com/mgd43b/manicule/compare/v0.2.4...v0.2.5) (2026-09-16)
 
 
