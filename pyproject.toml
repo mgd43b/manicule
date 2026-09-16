@@ -55,9 +55,12 @@ qdrant = [
   #
   # Apache-2.0, so it belongs in this distribution rather than in a package of its own —
   # the split that `mlx-embeddings` forced is a licensing consequence, not a house pattern.
-  # The floor is 1.15: `query_points` replaced `search` there, and this store is written
-  # against the replacement rather than against an API already deprecated when it arrived.
-  "qdrant-client>=1.15",
+  # The floor is 1.19: the collection shape reads and writes Qdrant's `memory` placement
+  # (`models.Memory`, `VectorParams.memory`, `PayloadStorageParams`), which no client before it
+  # carries — 1.15 through 1.18 would fail with an AttributeError on the first prepare rather
+  # than at install. The client's floor is not the server's: the store turns the version check
+  # off and speaks REST, and the server suite passes against a v1.17.0 server.
+  "qdrant-client>=1.19",
 ]
 embeddings = [     # #3
   # Pooling happens in our own numpy, from token states the backend hands back, because a

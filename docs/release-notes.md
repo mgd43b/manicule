@@ -12,12 +12,13 @@ no setting anywhere could say otherwise. On a small corpus that costs nothing. O
 corpus at 1024 dimensions it is about 1.3 GB of `float32` vectors held in RAM, beside a payload
 that carries a second copy of the corpus text.
 
-`quantization = "scalar"` with `on_disk_vectors = true` is the combination for a corpus that
+`quantization = "scalar"` with `on_disk_vectors = true` is the combination for a corpus of that
 size: search runs against an int8 copy of about 330 MB kept in RAM, while the originals stay on
 disk for the server to rescore against. The stored vectors, and every checksum over them, are
-untouched. None of the seven changes which chunks a query may return, so none is part of a
-collection's name and changing one re-embeds nothing. `deployment.md` §6.5 has the table and the
-example.
+untouched. None of the seven changes which chunks a filter admits, so none is part of a
+collection's name and changing one re-embeds nothing; the graph and quantization settings move
+recall, which can move which admitted chunks reach the top of a ranking. `deployment.md` §6.5 has
+the table and the example.
 
 **Upgrading changes nothing on a stock Qdrant.** Every default is the value Qdrant gives a
 collection nobody tuned, which is what every existing collection already is, and a collection

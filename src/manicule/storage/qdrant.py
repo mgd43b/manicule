@@ -29,9 +29,11 @@ installation survives: a data directory moves, a container is rebuilt, a workspa
 ``default`` on both machines. So two installations that share a server and both leave
 ``storage.qdrant.collection_prefix`` at its default share collections — which is safe for
 retrieval, since the hydrating join admits only document ids the local authority knows, and is
-wrong for everything else: ``count`` reports the union, and a second installation whose
-embedder differs is refused by the fingerprint record rather than served. Give each
-installation its own prefix on a shared server; ``docs/deployment.md`` §6.5 says so where an
+wrong for everything else: ``count`` reports the union, a second installation whose embedder
+differs is refused by the fingerprint record rather than served, and two whose
+:class:`CollectionShape` settings differ each reshape the shared collection back to their own on
+every prepare, since nothing identifies whose shape it was. Give each installation its own prefix
+on a shared server; ``docs/deployment.md`` §6.5 says so where an
 operator will read it.
 
 **A readback is narrowed to float32 before it is believed.** The numerical-integrity checksum
@@ -307,11 +309,12 @@ class CollectionShape:
     """What an installation chooses about the collections this store keeps: ``storage.qdrant``.
 
     Every dial here is memory, recall or throughput and none is eligibility — no value changes
-    which rows a filter admits — so a shape is not part of a collection's name, and two shapes
-    of one corpus are the same index. The field names are the settings' names, and the defaults
-    are the values Qdrant gives a collection nobody tuned. A store built without a shape, which
-    is every store built before these were settings, therefore makes and keeps exactly the
-    collection it always did.
+    which rows a filter admits, though the graph and quantization can change which admitted rows
+    an approximate search ranks highest — so a shape is not part of a collection's name, and two
+    shapes of one corpus hold the same rows. The field names are the settings' names, and the
+    defaults are the values Qdrant gives a collection nobody tuned. A store built without a
+    shape, which is every store built before these were settings, therefore makes and keeps
+    exactly the collection it always did.
 
     HNSW, quantization and vector placement are written on the vector rather than on the
     collection. A vector's own value takes precedence on the server, so a collection-level

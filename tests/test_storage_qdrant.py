@@ -1922,6 +1922,48 @@ async def test_a_real_server_moves_a_placement_somebody_set_in_the_newer_vocabul
         await _drop(server_store, server_client, 8)
 
 
+@pytest.mark.parametrize(
+    ("placed", "always_ram"),
+    [(models.Memory.CACHED, True), (models.Memory.PINNED, False)],
+    ids=["cached-to-always-ram", "pinned-to-follow-originals"],
+)
+async def test_a_real_server_moves_a_quantized_copy_placed_in_the_newer_vocabulary(
+    server_store: QdrantVectorStore,
+    server_client: AsyncQdrantClient,
+    placed: models.Memory,
+    always_ram: bool,
+) -> None:
+    """A scalar config reporting ``memory`` is moved by writing the flag, unlike placement.
+
+    ``memory`` overrides ``always_ram`` when both are set, so this would look like the placement
+    case — except that a quantization update replaces the whole scalar configuration rather than
+    merging into it, taking ``memory`` with it. Measured, and held here in both directions,
+    because the day a server starts merging it is the day this dial stops converging.
+    """
+    name = server_store.storage_name(fingerprint(8))
+    wanted = CollectionShape(quantization="scalar", quantization_always_ram=always_ram)
+    try:
+        await server_store.ensure_ready(fingerprint(8))
+        await server_client.update_collection(
+            collection_name=name,
+            vectors_config={
+                "": models.VectorParamsDiff(
+                    quantization_config=models.ScalarQuantization(
+                        scalar=models.ScalarQuantizationConfig(
+                            type=models.ScalarType.INT8, memory=placed
+                        )
+                    )
+                )
+            },
+        )
+
+        await _handle(server_client, server_store.workspace_id, wanted).ensure_ready(fingerprint(8))
+
+        assert await _in_force(server_client, server_store) == _expected(wanted)
+    finally:
+        await _drop(server_store, server_client, 8)
+
+
 async def test_a_real_server_that_does_not_apply_a_change_is_refused(
     server_store: QdrantVectorStore,
     server_client: AsyncQdrantClient,

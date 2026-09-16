@@ -539,10 +539,11 @@ class QdrantSettings(Section):
     searched. Three things are true of every one of them.
 
     **They are memory, recall and throughput dials, and never eligibility.** None of them
-    changes which rows a filter admits or which chunks a query may return, so none widens what
-    ``docs/retrieval.md`` §3.3 holds level across the two backends — which is why they have no
-    embedded-store counterpart, for the same reason ``storage.ann_index_threshold`` has no
-    Qdrant one.
+    changes which rows a filter admits. The graph and quantization settings move recall, so they
+    can change which admitted chunks an approximate search ranks highest, but none changes which
+    chunks are candidates at all — so none widens what ``docs/retrieval.md`` §3.3 holds level
+    across the two backends, which is why they have no embedded-store counterpart, for the same
+    reason ``storage.ann_index_threshold`` has no Qdrant one.
 
     **Each default is the value Qdrant gives a collection nobody tuned**, which is the
     collection every installation already has. An upgrade therefore changes nothing on a server

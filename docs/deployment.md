@@ -915,7 +915,10 @@ moved data directory or a rebuilt container, so the prefix is it — and two ins
 both leave it at `manicule` while pointing at one server share collections. Retrieval survives
 that, because the hydrating join admits only document ids the local authority knows; nothing
 else does. `manicule index` reports the union, and the second installation to prepare a
-workspace is refused outright when its embedder differs from the first's.
+workspace is refused outright when its embedder differs from the first's. The collection's shape
+becomes a contest as well: it is configuration rather than part of the name, so two installations
+whose shape settings (below) differ each bring the shared collection back to their own whenever
+they prepare it, and the `reshaped Qdrant collection` line appears in both logs.
 
 What sharing a prefix does *not* do is let one installation's `reset-index` delete another's
 collections, and that holds even for the awkward case where one prefix contains the other —
@@ -929,9 +932,11 @@ variable when the setting itself is left unset — so a credential need not be w
 config file at all.
 
 **Shaping the collections.** Seven more settings under `storage.qdrant` decide what a collection
-costs the server in memory and how its search trades recall for speed. None of them changes
-which chunks a query may return, so none is part of a collection's name: changing one creates no
-new collection and re-embeds nothing.
+costs the server in memory and how its search trades recall for speed. None of them changes which
+chunks a filter admits, so none is part of a collection's name: changing one creates no new
+collection and re-embeds nothing. What the graph and quantization settings can change is how
+closely an approximate search finds the nearest of the admitted chunks — and so, at the margin,
+which of them reach the top of a ranking.
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -977,9 +982,9 @@ this installation's own leaves that collection alone instead.
 
 **There is no datatype setting, and `quantization` is why none is needed.** A `float16` or
 `uint8` collection hands back numbers other than the `float32` values every checksum (§6.4) was
-taken over, so the whole corpus would read as corrupt and drop out of search — rows
-`migrate-vectors` carried across included, since they keep the checksum they arrived with — and
-`vector-checksum --yes` would not repair it, because it fills in only checksums that are missing.
+taken over, so the whole corpus would read as corrupt and drop out of search, including the rows
+`migrate-vectors` carried across, which keep the checksum they arrived with. `vector-checksum
+--yes` would not repair it either, because it fills in only checksums that are missing.
 Scalar quantization paired with `on_disk_vectors` saves more RAM than `float16` would, and leaves
 the originals exactly as written (`storage.md` §6.7).
 

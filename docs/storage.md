@@ -1718,12 +1718,14 @@ hand then cannot leave a change accepted and not in force; payload placement and
 threshold exist only at collection level. The `<prefix>_meta` collection, one point per workspace,
 is not shaped.
 
-**None of them is eligibility.** No value changes which rows a filter admits or which chunks a
-query may return; each moves recall, memory or throughput. That is why they widen nothing
-`retrieval.md` §3.3 holds level across the two backends, why they have no embedded-store
+**None of them is eligibility.** No value changes which rows a filter admits; each moves recall,
+memory or throughput. Recall is not nothing — a sparser graph or a quantized copy can let an
+approximate search miss a near neighbor, so a dial can change which admitted chunks reach the top
+of a ranking — but no dial changes which chunks are candidates at all. That is why they widen
+nothing `retrieval.md` §3.3 holds level across the two backends, why they have no embedded-store
 counterpart — for the reason `storage.ann_index_threshold` has no Qdrant one — and why neither a
-collection's name nor a pipeline's identity carries them. Two shapes of one corpus are the same
-index, so changing a dial neither orphans a collection nor re-embeds a row.
+collection's name nor a pipeline's identity carries them. Two shapes of one corpus hold the same
+rows under the same name, so changing a dial neither orphans a collection nor re-embeds a row.
 
 **The shape is reconciled on every prepare, not only at creation**, as the payload indexes are. A
 setting read only when a collection is created does nothing to the collection every installation
@@ -1777,8 +1779,8 @@ as it is asked for no payload indexes.
 values a point stores, and a `float16` or `uint8` collection hands back other numbers — measured on
 a v1.19.1 server. Every row would recompute as `mismatched`, read `CORRUPT` and drop out of search
 while every request succeeded, and nothing repairs that from inside: `vector-checksum --yes`
-selects only rows that record no checksum, and a row `migrate-vectors` adopts carries its source's
-checksum verbatim (§6.8), so it would arrive corrupt. Qdrant fixes a datatype at creation besides —
+selects only rows that record no checksum, and `migrate-vectors` copies each row's checksum
+verbatim from its source (§6.8), so a migrated row would arrive already corrupt. Qdrant fixes a datatype at creation besides —
 `VectorParamsDiff` has no field for it, and a raw `PATCH` carrying one is accepted and ignored — so
 the setting could only ever have been the creation-only kind the paragraphs above refuse to be.
 Scalar quantization is the memory saving that keeps the checksummed originals: the int8 copy is
