@@ -4,7 +4,13 @@
 
 A change is done when every one of these is true. Not most of them.
 
-1. **`ruff check .` and `ruff format --check src tests packages` pass.**
+1. **`ruff check .` and `ruff format --check .` pass.** Both over `.`, deliberately. It does
+   not widen what the formatter touches — `[tool.ruff.format] exclude` still exempts `tools/`
+   and the Python inside markdown documents, on purpose, and `ruff check .` lints both anyway.
+   What it removes is a *second* scope: while this line said `src tests packages`, the obvious
+   developer command `ruff format .` rewrote files CI could never fail on, and the two sets
+   drifted. With the scope in configuration, the command you run and the command CI runs are
+   the same command over the same files. `tests/test_ci_format_scope.py` holds CI to `.`.
 2. **`pyright` passes in strict mode.** No new `# pyright: ignore` without a comment on the
    same line saying why the checker is wrong.
 3. **`pytest` passes**, with tests at the levels described below.
@@ -43,7 +49,7 @@ Run the whole gate locally before pushing:
 
 ```bash
 uv sync --all-groups
-uv run ruff check . && uv run ruff format --check src tests packages
+uv run ruff check . && uv run ruff format --check .
 uv run pyright
 uv run pytest
 ```

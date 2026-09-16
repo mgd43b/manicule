@@ -2534,6 +2534,7 @@ MINIMAL: dict[str, list[str]] = {
     "snapshot_status": ["connector", "snapshot", "handbook"],
     "upgrade": ["upgrade"],
     "vector_checksum": ["vector-checksum", "--yes"],
+    "vector_migrate": ["migrate-vectors", "--yes"],
     "vector_index_build": ["build-vector-index", "--yes"],
     "vector_sweep": ["sweep-vectors"],
     "workspace_switch": ["workspace", "switch", "other"],
@@ -2682,3 +2683,23 @@ def test_the_long_running_hand_offs_carry_every_flag_their_command_accepts() -> 
         accepted = set(inspect.signature(runner).parameters)
         unknown = sorted(passed[name] - accepted)
         assert not unknown, f"main.py passes {unknown} to {name}, which does not accept them"
+
+
+def test_a_migrate_command_with_no_arguments_plans_rather_than_copies() -> None:
+    """The one flag whose absence must mean the safe thing rather than the permissive one.
+
+    ``Arguments.flag`` answers ``False`` for a field nobody sent, which is right for a flag that
+    enables something and wrong for a ``dry_run``. The command line always sends it, so the gap
+    is only reachable over the control socket — which is exactly where a client one version
+    older than its server sends a command without it, and would copy a corpus and retarget the
+    live index pointer having asked for a plan.
+
+    The classification is asserted beside it because the two have to agree: a bare command that
+    plans is a read, and one that took the writer lock while planning would serialize a
+    diagnostic against the sync it is meant to be runnable during.
+    """
+    from manicule.app.commands import Arguments, Command  # noqa: PLC0415
+
+    assert Arguments("vector_migrate", {}).flag("dry_run", default=True) is True
+    assert Command("vector_migrate").writes() is False
+    assert Command("vector_migrate", {"dry_run": False}).writes() is True

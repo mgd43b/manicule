@@ -283,6 +283,10 @@ WRITERS: frozenset[str] = frozenset(
         "document_reindex_stale",
         "import",
         "index_path",
+        # Performing it writes the destination *and* retargets `index_state.vector_table`, so
+        # it takes the data directory. Its plan does neither and is routed through the read
+        # path by `Command.writes`, the same invocation boundary `vector_checksum` has.
+        "vector_migrate",
         "lifecycle_cleanup_generations",
         "lifecycle_delete_snapshot",
         "lifecycle_release_history",
@@ -605,6 +609,9 @@ def test_every_command_is_accounted_for_by_the_classification_or_named_as_an_exc
         # for what an operator types. Same shape as `reset-derived` above.
         "build-vector-index",
         "sweep-vectors",
+        # `migrate-vectors` emits `vector_migrate`, for the same reason: grouped by the noun on
+        # the wire, named for what an operator types.
+        "migrate-vectors",
         "snapshot-delete",
         "connector-snapshot",
         "connector-verify",

@@ -928,6 +928,22 @@ same fact: the chunk's text travels with its vector, so a vector store on anothe
 egress path for document *text*, not merely for embeddings, and `local_only`'s premise — that
 search never leaves this machine — does not survive indexing into one.
 
+**Moving an index you already have does not cost a re-embed.** An installation that has been
+running on the embedded backend has its vectors in `vectors/` right now, and `manicule
+migrate-vectors` carries them into the configured store without loading a model — the row a
+Qdrant payload holds is the row a Lance table holds, so the move is a read of the directory
+rather than a pass of the embedder (`storage.md` §6.8). The order is: set `storage.vector_db`
+and `storage.vector_db_url`, leave the vectors directory alone, run `manicule migrate-vectors`
+to see what would move, then `--yes`. Setting the configuration first is what puts the two
+policy refusals below in front of the copy rather than behind it.
+
+It plans by default and the plan creates nothing, so it is safe to run while deciding. It
+refuses a destination that already holds rows, a rebuild or re-embed still in flight, and any
+row whose stored numbers no longer match its checksum — that last one stops the copy rather
+than carrying damage to a place the original is no longer there to be compared against. Verify
+afterwards with `manicule vector-checksum --verify`, which now reads the destination. Once
+search is being served from it, the `vectors/` directory is no longer read and can go.
+
 **Backup and restore are Qdrant's problem for the vector leg**, and §3 above has the honest
 version of what that means: `manicule backup` still captures the authority and the retained
 bytes; the index itself is either re-embedded or restored from a snapshot Qdrant took on its own

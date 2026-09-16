@@ -1704,7 +1704,8 @@ a half-created one is a corpus that silently gets slower rather than a failure a
   generations over a Lance directory outright. The configured name alone would trust a name
   over what a plugin actually registered under it. Refusing is the whole of the design here: a
   half-built generation mechanism on a second engine is how two stores come to disagree about
-  which generation is live.
+  which generation is live. §6.9 is what it would take to lift this, and why it is a design
+  decision rather than an implementation task.
 - **No atomic insert-if-absent.** §6.4 keys a physical row by publication plus chunk so that
   staging a replacement cannot overwrite the generation retrieval is serving, and the embedded
   store gets that from one `merge_insert` commit. Qdrant offers neither a conditional insert nor
@@ -1749,6 +1750,186 @@ when `security.data_policy.cloud_allowed` is false, and refuses it outright when
 `local_only` source is configured — because `local_only` rests on search staying local, and
 indexing into a remote store sends those documents' text off this machine before any question is
 asked.
+
+### 6.8 Moving a corpus between backends
+
+An installation that has been running on the embedded index and now wants it on a server has a
+problem §9.4 states and does not solve: SQLite keeps `chunks.embed_text`, exactly what the
+embedder saw, and keeps no vectors at all. So pointing `storage.vector_db` at an empty store
+makes every chunk read `ABSENT` on the reuse path (§6.2) and the next ingest is a full forward
+pass of the embedder over the corpus. The two postures §9.4 offers — treat the index as
+disposable, or restore a snapshot the destination took for itself — are both answers to "the
+vectors are not here". Neither is an answer to "the vectors are right here, in a directory, and
+I want them over there".
+
+`manicule migrate-vectors` is that third answer, and it is cheap for the reason this whole
+section is short: **the row is already the same row.** A Lance column and a Qdrant payload
+field carry the same names under the same rules, written down once in
+`manicule.storage.vector_schema` (§6.7). A migration is therefore a read in one shape and a
+write in the same shape, and the only arithmetic between them is the point id, which is derived
+from the physical row id rather than stored.
+
+**The copy names no backend, and what ships is narrower than that.** The engine asks the source
+for `InspectableVectorStore` and the destination for `AdoptingVectorStore`, both in
+`manicule.core.protocols`, so neither is named in it — the same rule §6.7 states about asking a
+capability of the object rather than of the module that would implement it. **A backend added
+later is a *destination* by implementing `AdoptingVectorStore` and nothing else.** Becoming a
+*source* takes more than the capability, because finding the generation to read is not a
+capability: `manicule.app.runtime` resolves a workspace's vector directory, a published
+generation pointer and a filesystem pin, all of which are the embedded store's. So what the
+command does today is LanceDB to whichever adopting destination is configured, and the
+generality is real on exactly one side of it. The two halves are separate protocols because the backends are not symmetric: the
+embedded store is the one installations start on and therefore read *from*, a networked store
+is the one they move *to*, and one combined protocol would make every backend claim both in
+order to offer either.
+
+**Adoption carries the row; it does not rebuild it.** `upsert` takes a chunk and a vector fresh
+from an embedder and derives the checksum and the embedding identity on the way past, which is
+right there and wrong here. A checksum recomputed over a vector that arrived from another store
+describes whatever arrived — so a row whose numbers had already drifted would be written with a
+fresh digest certifying the drift, and §6.2.5's whole mechanism would report the corpus as
+healthy forever. The identity is carried for a second-order version of the same reason: it is
+derived from the configured `embed_text` middleware, so recomputing it on an installation whose
+middleware had moved since the rows were written would make every reuse lookup miss, and the
+corpus would be re-embedded by the operation performed to avoid re-embedding it.
+`assert_vector_store_adopts_rows_verbatim` is the conformance suite, and `tests/fakes.py`
+carries the two plausible wrong implementations it catches.
+
+**No embedder is built.** The fingerprint comes from what the source recorded beside its
+vectors, cross-checked against `index_state.embed_fingerprint`. Asking the configured embedder
+would make moving an index impossible on a machine whose model runtime is broken or whose
+weights are absent — which is a machine that still deserves a working index and is
+disproportionately the machine somebody is migrating off. Same argument as §6.2.5's coverage
+read.
+
+**Every refusal here exists because the alternative is a plausible-looking success.**
+
+A real migration takes the derived-mutation guard **before** the preflight reads anything,
+rather than around the copy. Both reads that decide whether it may proceed — whether a
+generation is in flight, and which one `index_state.vector_table` names — are worth what they
+are worth only while nothing else can move them. Guarding the copy alone leaves a re-embed free
+to start after the in-flight check, and a generation free to publish after the pointer is read:
+the migration then holds the superseded source and its retarget overwrites the newly published
+pointer with the old space. §8's writer lock closes neither, because it excludes other
+*processes* and both of these are tasks inside one served one. A plan takes no guard, because it
+writes nothing and is meant to be runnable while a sync is in flight.
+
+- *The configured store is the one being read from, or cannot adopt rows.* Migrating requires
+  the installation already point at its destination, which is also what puts
+  `Settings.policy_problems()` in front of the copy: a corpus configured `local_only` is refused
+  before a chunk of text leaves the machine (§6.7).
+- *The source records no fingerprint, or one that disagrees with `index_state.embed_fingerprint`.*
+  The physical metadata says what the vectors are; the recorded one says what every later
+  ingest will expect them to be. A directory swapped in from elsewhere makes them differ,
+  and copying then moves one model's vectors under another model's name.
+- *The copy ends short.* The destination is counted at the end rather than the writes
+  being trusted, because those answer different questions.
+- *A rebuild or durable re-embed is in flight.* An unpublished generation is still being
+  written, so a copy captures a moment rather than a generation — and its rows carry replay
+  lineage in four `source_*` columns a destination is under no obligation to have a home for
+  (§6.4), so moving them can drop the provenance a resumed replay reads.
+- *No embedded index to move.* Reporting "copied 0" for a workspace that never indexed implies
+  it moved something.
+- *The destination already holds rows.* Merging would mix this corpus with rows whose
+  provenance nothing here can establish — another installation sharing a prefix, or what an
+  interrupted migration left behind. `reset-index` clears it deliberately.
+- *A source row's recorded checksum no longer describes its vector.* This one stops the copy
+  outright. Carried across, the damage arrives somewhere the original is no longer there to be
+  compared against; skipped, the destination is quietly short of the corpus and nothing
+  downstream asks a vector store whether it is complete.
+
+The verification happens as rows are read rather than in a pass of its own, and the cost of that
+is worth naming: a corrupt row is found after earlier rows have been written, so the refusal
+leaves a partially populated destination. The alternative is a second full read of every vector
+before the first one moves, which doubles the work on every healthy corpus to improve the
+diagnostics on a damaged one — and the partial destination is cleared by the reset the next
+attempt requires anyway.
+
+**A plan creates nothing.** `storage_name` is arithmetic and the counts read what the
+destination already recorded, so `migrate-vectors` without `--yes` leaves an installation that
+decided not to migrate exactly as it found it, rather than leaving an empty collection on a
+shared server carrying this installation's workspace digest.
+
+**What it establishes, and the two things it does not.** It establishes that every row the
+source held reached the destination with its numbers unchanged and its recorded checksum still
+describing them. That is a claim about a *backend*, not about arithmetic in the abstract, and it
+is checked against a real server for the reason §6.7 gives about the readback: a store whose
+distance is cosine may re-normalize on write, and whether that moves a stored `float32` depends
+on the implementation. `qdrant/qdrant` does not move it — measured at 0 of 500 random unit
+vectors — while `qdrant-client`'s in-process mode, which is a Python reimplementation and not
+the thing an installation runs, moves roughly one in eleven by a single ulp. So the fidelity
+assertion belongs to the server suite, and a backend added later owes the same evidence rather
+than the same assumption. It does not establish that the *source* held everything the corpus expects —
+which is why the report prints `expected_rows` from `chunks.vector_id` beside `source_rows`
+rather than folding them into one verdict, since a faithful copy of an already-short index is a
+different situation and a different repair. And it does not establish that the destination will
+keep them: backup is still §9.4's problem, and the vectors' durability becomes the
+destination's own.
+
+**One relational repair, performed by the migration because it is the migration that creates the
+need.** `index_state.vector_table` holds either `chunks__<fp8>` or a `reembed-…` generation
+pointer, and a pointer names a *directory* under the embedded root. The destination has no
+generations, so left alone the pointer survives the move and goes on naming something the
+configured backend has never heard of — the state `reset-index` already refuses with "the
+corpus was moved between backends with a rebuild still pending". A completed migration
+therefore retargets it to the space name. The next ingest would correct it anyway; between the
+two, `doctor` and the backup manifest would report the wrong thing with nothing indicating that
+they were wrong.
+
+### 6.9 What durable re-embedding on a networked backend would take
+
+§6.7 refuses it, and that refusal is honest rather than permanent. This is what lifting it
+costs, written down because the expensive part is a decision rather than an implementation.
+
+**The orchestration is already backend-neutral.** `manicule.ingest.reembed` — the state machine
+— is written entirely against four protocols and names no engine. The Lance-specific half is
+`LanceShadowGenerations` in `manicule.storage.reembed`, and it reaches past the vector-store
+protocol in eleven places: six are filesystem operations with no vector-store analog, and four
+are `LanceVectorStore` methods that are on no protocol at all — `open_existing`,
+`upsert_snapshot`, `inspection_pages` and `storage_revision`. `PublicationBoundVectorStore` is
+therefore a necessary and nowhere near sufficient condition: implementing its eight methods on a
+second backend satisfies the capability check and leaves the thing that actually executes a
+re-embed untouched.
+
+**The blocker is a correctness property, not a missing method.** `storage_revision` returns
+Lance's monotonic table commit version, and the seal protocol is built on it: it fences before
+inspection, again after it, and again between inspection and seal, it is a field of the sealed
+inspection, and it is a seal precondition. What it buys is that the bytes sealed are the bytes
+inspected with nothing written in between, established without re-reading the corpus. Qdrant
+exposes no such counter — `collection_info` reports a point count, and a count is not a version,
+because a delete and an insert of equal cardinality are invisible to it. The SQLite lease
+catches a *cooperative* writer and is genuinely strong; `storage_revision` exists precisely
+because the lease is a SQLite fact and the rows are not, so it catches a writer that never took
+the lease. On a shared server — the configuration this backend exists for — that is the
+realistic case rather than the hypothetical one.
+
+**The proposed route is an alias swap, and it reshapes the contract rather than porting it.**
+Build the new generation into a differently-named collection, never mutate it after seal, and
+flip `update_collection_aliases` — which is atomic server-side, and which the in-process mode
+the suite runs on implements for real and resolves reads through, so the path is testable
+without a server. The seal then rests on immutability-after-write plus an atomic pointer flip
+instead of on an observed version.
+
+**The open decision, stated plainly: this weakens what `ShadowInspection.storage_revision`
+means.** It stops being one measurement and becomes a backend-specific claim, which is exactly
+the drift `manicule.storage.vector_schema` exists to prevent. That is a trade worth making or
+refusing deliberately, and it is the reason this section proposes rather than schedules.
+
+Three smaller problems, all real and none of them the blocker:
+
+- The fingerprint record is one point per workspace at a fixed id, and its payload names a
+  single collection. A shadow build has two, so the record needs a second pointer or the design
+  has to keep the pointer only in `index_state`.
+- `ensure_ready` refuses a fingerprint that does not match the recorded one, which is exactly
+  the situation a re-embed to a new model creates. It would refuse the shadow before the first
+  point.
+- `owns_collection` matches `chunks__<fp8>` with `fullmatch`, so a decorated shadow name would
+  be *leaked* by `reset_storage` rather than deleted. Widening it is what that function's own
+  docstring warns costs a stranger's corpus, so it has to move in lockstep with the naming rule.
+
+What transfers for free is more than it looks: `index_state.vector_table` is already a `Text`
+column that the publish compare-and-swap treats as an opaque token, so the fencing half of
+`manicule.storage.reembed` — which is pure SQLAlchemy — needs no change at all.
 
 ---
 
@@ -2147,7 +2328,14 @@ reasoning still holds and is now the whole story: the index is derived, and the 
 of skew is the derived side being a superset of the authority.
 
 **Restore therefore costs a re-embed, unless Qdrant was backed up too.** Two honest postures,
-and an installation should pick one deliberately rather than discover which it has:
+and an installation should pick one deliberately rather than discover which it has. Note what
+neither of them is: *moving* an index that already exists is a third thing and is §6.8's, and
+the distinction matters because the two situations look alike and cost differently. A migration
+copies vectors that are in a directory right now; a restore from a `manicule backup` has no
+vectors to copy, because that archive never captured them. Restoring a Qdrant snapshot taken
+on Qdrant's own schedule *does* bring vectors back — that is the second posture above — and it
+is still not this: it returns an index to where it already was rather than moving one between
+backends.
 
 - **Treat the collection as disposable.** Restore the data directory, re-ingest, and let the
   reuse path (§6.2) rebuild vectors from `chunks.embed_text`. This is correct, needs nothing

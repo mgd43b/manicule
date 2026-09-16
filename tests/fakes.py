@@ -10,10 +10,10 @@ Deliberately kept honest. Where an implementation would be wrong, there is a mat
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import override
+from typing import Any, override
 
 from manicule.config.settings import Settings
 from manicule.core.anchors import Anchor, LineAnchor, Unlocated
@@ -49,6 +49,13 @@ from manicule.core.lifecycle import HealthReport, Metric
 from manicule.core.protocols import DocStore
 from manicule.core.retrieval import Candidate, Filter, Query
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
+from manicule.storage.vector_schema import (
+    CHUNK_COLUMN,
+    IDENTITY_COLUMN,
+    VECTOR_COLUMN,
+    checksum_of,
+    space_name,
+)
 
 MEDIA_TYPE = "text/x-fake"
 
@@ -286,6 +293,28 @@ class MemoryVectorStore:
                 chunk, stored, self._identity_of(chunk), vector_checksum(stored)
             )
 
+    def storage_name(self, fingerprint: EmbedFingerprint) -> str:
+        return space_name(fingerprint)
+
+    async def rows_in_space(self, fingerprint: EmbedFingerprint) -> int:
+        del fingerprint
+        return len(self._rows)
+
+    async def adopt_rows(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Take another backend's rows, carrying the identity and checksum they arrive with.
+
+        The whole of the capability in six lines, which is the point of having it here: the
+        broken subclass below differs from this by one of them, and that one line is the
+        difference between a migration that preserves the evidence of a damaged vector and one
+        that certifies it.
+        """
+        for row in rows:
+            chunk = Chunk.model_validate_json(str(row[CHUNK_COLUMN]))
+            stored = tuple(float(value) for value in row[VECTOR_COLUMN])
+            checksum, _version = checksum_of(dict(row))
+            self._rows[chunk.id] = _Row(chunk, stored, str(row[IDENTITY_COLUMN]), checksum)
+        return len(rows)
+
     async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
         verdicts: dict[str, StoredVector] = {}
         for chunk in chunks:
@@ -458,6 +487,49 @@ class PrehashingVectorStore(MemoryVectorStore):
             self._rows[chunk.id] = _Row(
                 row.chunk, row.vector, row.identity, vector_checksum(vector)
             )
+
+
+class RehashingVectorStore(MemoryVectorStore):
+    """A store that recomputes an adopted row's checksum instead of carrying it.
+
+    The obvious implementation, and the one that quietly destroys the reason a checksum exists.
+    Every row it adopts reads back verified — including the row whose numbers had already
+    drifted in the source, because the digest it writes describes the drift. A corpus migrated
+    through this store reports perfect numerical integrity forever and cannot be told apart
+    from one that is actually intact.
+    """
+
+    @override
+    async def adopt_rows(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        written = await super().adopt_rows(rows)
+        for row in rows:
+            chunk = Chunk.model_validate_json(str(row[CHUNK_COLUMN]))
+            held = self._rows[chunk.id]
+            self._rows[chunk.id] = _Row(
+                held.chunk, held.vector, held.identity, vector_checksum(list(held.vector))
+            )
+        return written
+
+
+class DerivingVectorStore(MemoryVectorStore):
+    """A store that derives an adopted row's embedding identity rather than carrying it.
+
+    Indistinguishable from the right thing on the installation that wrote the rows, and wrong
+    on any installation whose ``embed_text`` middleware has moved since — where every migrated
+    row then fails the reuse lookup and is embedded again, which is the cost the migration was
+    performed to avoid.
+    """
+
+    @override
+    async def adopt_rows(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        written = await super().adopt_rows(rows)
+        for row in rows:
+            chunk = Chunk.model_validate_json(str(row[CHUNK_COLUMN]))
+            held = self._rows[chunk.id]
+            self._rows[chunk.id] = _Row(
+                held.chunk, held.vector, self._identity_of(chunk), held.checksum
+            )
+        return written
 
 
 class ForgetfulVectorStore(MemoryVectorStore):

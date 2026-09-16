@@ -122,6 +122,28 @@ class VectorStoreStateError(ManiculeError):
     """
 
 
+class VectorMigrationError(ManiculeError):
+    """Vectors could not be carried from one backend to another.
+
+    Every use is a refusal the operator can act on and retry: a generation still being built, a
+    destination that already holds rows nothing here put there, a source row whose recorded
+    checksum no longer describes its vector, or a destination that did not end up holding what
+    the source held. The checksum one is the reason this is fatal rather than a count in a
+    report — a migration that skipped the rows it could not verify would produce a destination
+    that is quietly short of the corpus, and nothing downstream asks a vector store whether it
+    is complete.
+
+    **Some of these are raised before anything is written and some are not**, and a caller must
+    not assume the first. Verification happens as rows stream past, so a refusal partway through
+    a corpus leaves the rows before it already in the destination. That is why every message
+    here names clearing the destination as part of retrying rather than treating a retry as free.
+
+    Here rather than beside a backend for the reason :class:`VectorStoreStateError` is: the
+    operation spans both stores and belongs to neither, and an installation configured for one
+    must not import the other to catch it.
+    """
+
+
 class StorageBusyError(ManiculeError):
     """SQLite writer ownership stayed unavailable beyond the bounded retry policy.
 
@@ -376,6 +398,7 @@ __all__ = [
     "TokenStateError",
     "UnknownComponentError",
     "UnknownEntityError",
+    "VectorMigrationError",
     "VectorStoreStateError",
     "WorkerKilledError",
 ]

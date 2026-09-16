@@ -8,6 +8,11 @@ local-only policy while every prompt crossed the network.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import threading
+import time
+
 import pytest
 
 from manicule.config.providers import Egress
@@ -16,7 +21,11 @@ from manicule.core.content import Document
 from manicule.core.errors import ConfigError, RedactionError
 from manicule.core.retrieval import Context
 from manicule.generation.policy import EgressPolicy, filter_context
-from manicule.generation.redaction import BUILTIN_DETECTORS, Redactor
+from manicule.generation.redaction import (
+    BUILTIN_DETECTORS,
+    Redactor,
+    _in_daemon_thread,  # pyright: ignore[reportPrivateUsage] - the unit under test
+)
 from manicule.testing import assert_local_only_policy_is_enforced
 from tests.generation.fakes import candidate, context, context_estimator, document, settings
 
@@ -288,3 +297,49 @@ def test_every_named_detector_is_one_the_configuration_can_actually_select() -> 
     """A detector registry and a configuration that disagree is a policy nobody is running."""
     for name in BUILTIN_DETECTORS:
         assert Redactor(redaction(patterns=(name,))).detectors
+
+
+def test_a_redaction_thread_outliving_its_loop_raises_nothing_into_the_interpreter() -> None:
+    """The worker settles on a loop that has already closed, and stays silent about it.
+
+    The thread is a daemon precisely so a regex that may not terminate cannot hold up exit, and
+    the consequence is that a caller which was canceled, timed out, or simply finished takes
+    its loop away while the thread is still working. ``call_soon_threadsafe`` raises
+    ``RuntimeError`` in exactly that case.
+
+    Left to propagate it becomes an *unhandled thread exception*, which Python attributes to
+    whatever is running when it notices rather than to redaction — so under
+    ``filterwarnings = ["error"]`` it fails a test that never touched this module, in a
+    different subsystem, intermittently and only under load. That is how it was found.
+
+    Driven through ``_in_daemon_thread`` itself rather than through a fake, because what is
+    being checked is which side of ``call_soon_threadsafe`` the guard sits on.
+    """
+    raised: list[BaseException | None] = []
+    original = threading.excepthook
+    threading.excepthook = lambda args: raised.append(args.exc_value)
+
+    def slow() -> None:
+        time.sleep(0.2)
+
+    async def abandon_it() -> None:
+        # The await ends and the thread does not: `wait_for` cancels this side only, which is
+        # the whole situation under test. Nothing is left pending on the loop afterwards.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(_in_daemon_thread(slow), timeout=0.01)
+
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(abandon_it())
+        finally:
+            loop.close()
+        time.sleep(0.5)  # long enough for the worker to wake and find the loop gone
+    finally:
+        threading.excepthook = original
+
+    assert raised == [], (
+        f"the redaction worker raised {raised!r} into the interpreter after its loop closed. "
+        f"Nothing is awaiting it and there is nothing to report to, so the only thing this can "
+        f"do is fail an unrelated test somewhere else"
+    )

@@ -15,6 +15,15 @@ Two engines answer to ``qdrant-client``, and the difference matters to what a te
 **deliberately outside manicule's ``MANICULE_`` namespace**: ``manicule_environment`` deletes
 every variable with that prefix before each test, so a switch named that way is scrubbed before
 it is ever read and the job goes green having skipped everything.
+**Local mode also re-normalizes a vector on write, and the real server does not.** Measured on
+500 random unit vectors at 64 dimensions: 47 came back from ``:memory:`` with one component
+moved by a single ulp, against 0 from ``qdrant/qdrant:v1.19.1``. It is float64 arithmetic in a
+Python reimplementation rather than the server's, so which vectors move depends on the platform.
+
+The consequence for anything checking a *stored* vector: assert numeric fidelity against a
+server, and assert against local mode only what is not the vector — counts, point ids, payload
+fields. A test that compares stored components against what was written will pass on one machine
+and fail on another, for no reason in the code under test.
 """
 
 from __future__ import annotations

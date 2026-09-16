@@ -30,7 +30,7 @@ from collections.abc import (
 from collections.abc import Set as AbstractSet
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from manicule.core.anchors import Anchor
 from manicule.core.ann import AnnIndexBuild, AnnIndexState
@@ -606,6 +606,86 @@ class ResettableVectorStore(Protocol):
         Returns:
             Whether there was anything to remove, so a reset reports a physical removal it
             actually performed. A workspace that never held a vector answers ``False``.
+        """
+        ...
+
+
+@runtime_checkable
+class InspectableVectorStore(VectorStore, Protocol):
+    """Optionally streams every row it holds, in the shape ``vector_schema`` names.
+
+    The read half of moving a corpus between backends (``docs/storage.md`` §6.8). What makes
+    that a copy rather than a conversion is that there is one row shape and
+    :mod:`manicule.storage.vector_schema` is where it is written down — so a store that can
+    hand its rows back in that shape can be read by a migration that has never heard of it.
+
+    Optional on the same terms as :class:`AnnIndexMaintenance`: a backend that can only be
+    queried by vector, and never enumerated, is not a degraded store. It is one whose contents
+    can be rebuilt but not carried, which is a real difference to tell an operator about before
+    they plan a move rather than after.
+    """
+
+    def inspection_pages(self, *, page_size: int = 256) -> AsyncIterator[list[dict[str, Any]]]:
+        """Every row this store holds, in bounded batches, in a stable order.
+
+        Stable because a migration reports a count against what it read: an order that varied
+        between the count and the read would make a short copy indistinguishable from a
+        concurrent write. Bounded because the corpora worth moving do not fit in memory.
+        """
+        ...
+
+
+@runtime_checkable
+class AdoptingVectorStore(VectorStore, Protocol):
+    """Optionally takes rows another backend already holds, without re-embedding them.
+
+    The write half of :class:`InspectableVectorStore`, and the pair is deliberately two
+    protocols rather than one: the backends are not symmetric. The embedded store is the one
+    installations start on and therefore the one they migrate *from*; a networked store is the
+    one they migrate *to*. A single ``MigratableVectorStore`` would make every backend claim
+    both halves in order to offer either.
+
+    **Why a store must implement this rather than a migration calling ``upsert``.** ``upsert``
+    takes a :class:`~manicule.core.content.Chunk` and a vector fresh from an embedder, and
+    derives the row's checksum and embedding identity on the way past. Both derivations are
+    right there and wrong here: a checksum recomputed over a vector that arrived from another
+    store would describe whatever arrived, so a source row whose numbers had drifted would be
+    written with a fresh digest certifying the drift. Adoption carries the recorded pair
+    instead, which is what leaves the integrity check still able to notice.
+    """
+
+    def storage_name(self, fingerprint: EmbedFingerprint) -> str:
+        """What this backend calls the place ``fingerprint``'s vectors live.
+
+        A Lance table, a Qdrant collection, a relational table — the physical name in this
+        backend's own namespace, which is not :func:`~manicule.storage.vector_schema.space_name`
+        because a backend may qualify that with a prefix or a schema. An operation that moved a
+        corpus and then could not say where it went would leave the operator reconstructing the
+        name from a configuration file.
+        """
+        ...
+
+    async def rows_in_space(self, fingerprint: EmbedFingerprint) -> int:
+        """How many rows this backend holds for ``fingerprint``'s space, right now.
+
+        **Asked about the space rather than about the store, and that distinction is the whole
+        reason this exists.** :meth:`VectorStore.count` answers for whatever space the backend
+        has *recorded* itself as holding, so a destination whose recorded identity is missing —
+        a half-finished reset, a metadata record removed by hand — answers zero while its
+        storage is still full. A migration's refusal to merge into a populated destination
+        would then be satisfied by exactly the case it exists to catch, and rows of unknown
+        provenance would be mixed into the corpus being moved.
+
+        Zero for a space this backend has never created, which is the ordinary answer on a
+        first migration and is not an error.
+        """
+        ...
+
+    async def adopt_rows(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Store rows keyed by the ``vector_schema`` names, carrying every field across.
+
+        Returns:
+            How many rows were written.
         """
         ...
 
@@ -1381,6 +1461,7 @@ class ChunkRelationExtractor(Protocol):
 
 __all__ = [
     "CLOSE_DEADLINE_S",
+    "AdoptingVectorStore",
     "AnnIndexMaintenance",
     "ChunkRelationExtractor",
     "ChunkRelationStore",
@@ -1390,6 +1471,7 @@ __all__ = [
     "DocStore",
     "Embedder",
     "Generator",
+    "InspectableVectorStore",
     "Middleware",
     "Parser",
     "PublicationAwareVectorStore",

@@ -85,9 +85,10 @@ from manicule.ingest.reindex import GlossarySweep, ReindexReport, RelationSweep,
 from manicule.ingest.sweeps import SweepResult
 from manicule.retrieval.retriever import RetrievalResult
 from manicule.storage.organization import normalize_name
+from manicule.storage.vector_migration import VectorMigration
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Collection, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.retrieval import Filter
@@ -237,9 +238,30 @@ class FakeStore:
         ]
         return len(chosen)
 
+    live_chunks: int | None = None
+    """What ``live_chunk_count`` reports, or ``None`` to derive it from the documents held.
+
+    Settable alongside :attr:`total_chunks` because the whole point of that method is that it
+    is *narrower* than ``count_chunks`` — a fake whose two counts could never disagree could
+    not catch a caller that reached for the wrong one, which is a test that passes against the
+    defect it was written for.
+    """
+    total_chunks: int | None = None
+    """What ``count_chunks`` reports, or ``None`` to derive it from the chunks held.
+
+    The wider count: live chunks plus those of soft-deleted documents.
+    """
+
+    async def live_chunk_count(self) -> int:
+        if self.live_chunks is not None:
+            return self.live_chunks
+        return await self.count_chunks()
+
     async def count_chunks(self, document_id: str | None = None) -> int:
         if document_id is not None:
             return len(self.chunks.get(document_id, []))
+        if self.total_chunks is not None:
+            return self.total_chunks
         return sum(len(chunks) for chunks in self.chunks.values())
 
     async def delete_document(self, document_id: str) -> None:
@@ -259,8 +281,11 @@ class FakeStore:
             by_status[document.status.value] = by_status.get(document.status.value, 0) + 1
         return {"by_source": by_source, "by_media_type": by_media, "by_status": by_status}
 
+    index_fingerprints_: IndexFingerprints = field(default_factory=IndexFingerprints)
+    """What this store reports about the live index, for the checks that read it."""
+
     async def index_fingerprints(self) -> IndexFingerprints:
-        return IndexFingerprints()
+        return self.index_fingerprints_
 
     async def connector_metadata(self, connector: str) -> Mapping[str, object]:
         del connector
@@ -1220,6 +1245,15 @@ class FakeMaintenance:
     """Every export asked for, on the same terms and for the same reason as :attr:`backups`."""
     backup_error: Exception | None = None
     """Raised instead of writing, for tests about how a refusal reaches the caller."""
+    migrations: list[bool] = field(default_factory=list[bool])
+    """Every vector migration asked for, and whether it was a plan.
+
+    Recorded rather than counted, because the thing worth asserting is that a plan stayed a
+    plan: a command that reported "would copy" having actually copied looks identical in an
+    exit status.
+    """
+    migration_error: Exception | None = None
+    """Raised instead of copying, for tests about how each refusal reaches the caller."""
     vector_index: AnnIndexState | None = field(
         default_factory=lambda: AnnIndexState(
             lifecycle=AnnLifecycle.EXHAUSTIVE, threshold=100_000, rows=1
@@ -1305,6 +1339,24 @@ class FakeMaintenance:
         if coverage is None:
             return None
         return VectorChecksumBackfill(remaining=coverage.unverified, dry_run=dry_run)
+
+    async def migrate_vectors(
+        self, *, report: Callable[[str], None] | None = None, dry_run: bool = True
+    ) -> VectorMigration:
+        if self.migration_error is not None:
+            raise self.migration_error
+        if report is not None:
+            report("copying 2 vector(s)")
+        self.migrations.append(dry_run)
+        return VectorMigration(
+            storage_name="manicule_0123456789abcdef_chunks__deadbeef",
+            generation="legacy",
+            dimension=8,
+            source_rows=2,
+            copied=0 if dry_run else 2,
+            unverified=0,
+            dry_run=dry_run,
+        )
 
     async def plan_reset_derived(self) -> LifecyclePlan:
         return LifecyclePlan(operation=LifecycleOperation.RESET_DERIVED)

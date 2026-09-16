@@ -680,6 +680,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "lifecycle_release_history": r.LifecycleReport,
     "lifecycle_delete_snapshot": r.LifecycleReport,
     "vector_checksum": r.VectorChecksumReport,
+    "vector_migrate": r.VectorMigrationReport,
     "vector_index_build": r.VectorIndexReport,
     "vector_sweep": r.VectorSweepReport,
     "doctor": r.Diagnosis,
@@ -2150,6 +2151,60 @@ def vector_checksum(
         emit("vector_checksum", lambda service: service.vector_checksum(verify=verify))
         return
     submit(Command("vector_checksum", {"verify": verify, "dry_run": False}))
+
+
+@app.command("migrate-vectors")
+def migrate_vectors(
+    *,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Perform the copy. Without it this only reports what would move.",
+        ),
+    ] = False,
+) -> None:
+    """Move an existing vector index into the configured store, without re-embedding anything.
+
+    For the installation that has been running on the embedded index and wants it somewhere
+    several processes can share. Until this existed the two honest answers were to embed the
+    whole corpus again or to restore a snapshot the destination had taken for itself, because
+    SQLite keeps the text an embedder saw and never the vectors it produced.
+
+    Neither is needed, because every backend stores the same row under the same field names. A
+    vector, its chunk, its embedding identity and its checksum are carried across exactly as
+    they were written — no model is loaded and no forward pass is run, so the cost is one read
+    of the directory rather than one pass of the embedder, and a machine whose embedder is
+    broken can still move its index.
+
+    Point the installation at the destination first — set `storage.vector_db` and its URL — and
+    leave the vectors directory in place; this reads it where it is. That order is what puts the
+    data-policy refusals in front of the copy rather than behind it: a corpus configured
+    `local_only` is refused before a single chunk of text leaves this machine.
+
+    Four things are refused rather than worked around, each of which would otherwise be found
+    later and cost more: a destination that already holds rows, because merging would mix this
+    corpus with rows of unknown provenance; a rebuild or durable re-embed still in flight,
+    because an unpublished generation is a moment rather than a thing to copy; a source that
+    records no fingerprint; and any row whose stored numbers no longer match the checksum
+    written beside it — that one stops the copy outright rather than carrying damage somewhere
+    the original is no longer there to compare against.
+
+    Plans by default. The plan creates nothing at the destination, so running it to decide
+    whether to move at all leaves an untouched installation untouched.
+
+    Afterwards, verify with `manicule vector-checksum --verify` against the destination. Note
+    what moves and what does not: `manicule backup` captures the relational authority and the
+    retained bytes, never a remote index, so durability for the vectors becomes the
+    destination's own and is worth planning before it is needed rather than after.
+    """
+    if not yes:
+        # The read path. A plan reads three things and creates none of them, so it is available
+        # while a sync is running and is safe to run on an installation nobody has decided to
+        # migrate yet.
+        emit("vector_migrate", lambda service: service.migrate_vectors(dry_run=True))
+        return
+    submit(Command("vector_migrate", {"dry_run": False}))
 
 
 @app.command("build-vector-index")
