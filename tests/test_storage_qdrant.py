@@ -17,6 +17,7 @@ test are the store's. The suite at the bottom is the one that needs a real one, 
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import struct
@@ -1847,9 +1848,10 @@ async def test_a_real_server_brings_an_existing_collection_to_an_edited_shape(
 ) -> None:
     """A setting read only at creation does nothing to the collection that already exists.
 
-    Every dial is changed on a collection with vectors in it, and then changed back, which is
-    the direction that has to reach two places: quantization turned off must also leave no
-    quantized copy behind.
+    Every dial is changed on a collection with a vector in it and then changed back, so each is
+    shown to move in both directions — as configuration in force. Whether a quantized copy is
+    then actually built and read around is the next test's question, and it needs a corpus
+    large enough for Qdrant to build one.
     """
     try:
         await server_store.ensure_ready(fingerprint(8))
@@ -1948,6 +1950,29 @@ async def test_a_real_server_that_does_not_apply_a_change_is_refused(
         await _drop(server_store, server_client, 8)
 
 
+QUANTIZED_POINTS: Final = 300
+"""Enough eight-dimension vectors to fill several segments past a one-kilobyte threshold."""
+
+
+async def _wait_until_indexed(client: AsyncQdrantClient, collection: str, points: int) -> None:
+    """Return once every point is in an indexed segment, which is where a quantized copy lives.
+
+    Qdrant builds the graph and the quantized vectors when its optimizer turns an appendable
+    segment into an indexed one, in the background and after the write returns. Reading before
+    that reads a plain segment with no copy in it, and passes whatever quantization does.
+    """
+    info = await client.get_collection(collection)
+    for _ in range(300):
+        info = await client.get_collection(collection)
+        if info.status is models.CollectionStatus.GREEN and info.indexed_vectors_count == points:
+            return
+        await asyncio.sleep(0.1)
+    pytest.fail(
+        f"{collection} indexed {info.indexed_vectors_count} of {points} points in 30 seconds, so "
+        f"no quantized segment exists and this test would prove nothing about one."
+    )
+
+
 @pytest.mark.contract
 async def test_a_real_server_keeps_a_quantized_corpus_verifiable(
     server_store: QdrantVectorStore, server_client: AsyncQdrantClient
@@ -1956,28 +1981,37 @@ async def test_a_real_server_keeps_a_quantized_corpus_verifiable(
 
     A quantized copy that replaced what ``stored_vectors`` reads would fail every checksum, and
     the corpus would drop out of search while every request succeeded — the reason ``datatype``
-    is not offered at all.
+    is not offered at all. So the corpus is made large enough, and the threshold low enough,
+    that every point is in an indexed segment carrying the int8 copy before anything is read:
+    three points under the default threshold never leave a plain segment, and a test over those
+    passes with quantization off.
     """
-    tuned = _handle(server_client, server_store.workspace_id, TUNED)
-    chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
+    shape = dataclasses.replace(TUNED, indexing_threshold_kb=1)
+    tuned = _handle(server_client, server_store.workspace_id, shape)
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(QUANTIZED_POINTS)]
     offered = [
-        [0.3, -0.4, 0.5, 0.1, -0.2, 0.05, 0.7, -0.15],
-        [-0.1, 0.6, 0.2, -0.3, 0.4, 0.1, -0.5, 0.25],
-        [0.2, 0.1, -0.6, 0.45, 0.05, -0.3, 0.15, 0.5],
+        [byte / 255 - 0.5 for byte in hashlib.sha256(f"point-{index}".encode()).digest()[:8]]
+        for index in range(QUANTIZED_POINTS)
     ]
     try:
         await tuned.ensure_ready(fingerprint(8))
         await tuned.upsert(chunks, offered)
+        await _wait_until_indexed(
+            server_client, tuned.storage_name(fingerprint(8)), QUANTIZED_POINTS
+        )
 
         verdicts = await tuned.stored_vectors(chunks)
         coverage = await tuned.checksum_coverage(recompute=True)
-        ranked = await tuned.search(offered[1], k=1)
+        probes = (0, 137, QUANTIZED_POINTS - 1)
+        ranked = [await tuned.search(offered[index], k=1) for index in probes]
 
         assert {verdict.integrity for verdict in verdicts.values()} == {VectorIntegrity.VERIFIED}
         assert [tuple(verdicts[item.id].vector) for item in chunks] == [
             canonical_stored_vector(vector) for vector in offered
         ]
-        assert (coverage.verified, coverage.failed) == (3, 0)
-        assert [result.chunk.id for result in ranked] == ["chunk-1"]
+        assert (coverage.verified, coverage.failed) == (QUANTIZED_POINTS, 0)
+        assert [[result.chunk.id for result in found] for found in ranked] == [
+            [f"chunk-{index}"] for index in probes
+        ]
     finally:
         await _drop(server_store, server_client, 8)
