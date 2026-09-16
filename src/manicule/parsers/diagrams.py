@@ -504,29 +504,6 @@ The wrapper then owns the id and the label and the ``mxCell`` inside it owns the
 reader that only looked at ``mxCell`` would see those shapes as unlabeled."""
 
 
-def _wrapped_cells(root: Element, limit: int) -> tuple[set[Element], bool]:
-    """The cells a wrapper owns, and whether the walk that found them reached the end.
-
-    Its own pass, and its own bound. A wrapper owns its cell's identity, so that cell must not
-    also be read on its own — the inner element carries the edge's endpoints, and reading it
-    twice draws the edge twice. Finding them means walking the tree, and a walk over untrusted
-    XML that is bounded only *after* it finishes is not bounded at all: the budget below would
-    have been consulted for the first time once this had already visited every element of an
-    8 MiB document.
-
-    Held as elements rather than as ``id()`` values, which CPython reuses.
-    """
-    owned: set[Element] = set()
-    for walked, element in enumerate(root.iter()):
-        # In elements, not cells — this walk visits every node in the tree, and holding it to a
-        # bound counted in cells would stop it part-way through a diagram that fits.
-        if walked >= limit:
-            return owned, False
-        if element.tag in _MXFILE_WRAPPERS:
-            owned.update(element.findall("mxCell"))
-    return owned, True
-
-
 def _read_mxfile(source: str) -> _Graph:
     """draw.io, whose model is already a list of cells that are either nodes or edges.
 
@@ -545,25 +522,34 @@ def _read_mxfile(source: str) -> _Graph:
     root = graph_source(source)
     if root is None:
         return graph
-    owned, complete = _wrapped_cells(root, MAX_ELEMENTS)
-    graph.truncated = not complete
+    # One pass, because ownership is knowable as it goes: `iter()` is document order and a
+    # wrapper is the parent of the cell it owns, so the wrapper is always seen first. Two passes
+    # needed a second bound to stop the first one, and any bound counted in elements will stop
+    # part-way through a diagram that fits — at which point the wrapped cells the first pass
+    # never reached are unowned, get read a second time on their own, and every edge among them
+    # is drawn twice. The two counts are still two counts, because they count different things.
+    owned: set[Element] = set()
     cells = 0
-    for element in root.iter():
+    for walked, element in enumerate(root.iter()):
+        if walked >= MAX_ELEMENTS:
+            graph.truncated = True
+            break
         if element.tag in _MXFILE_WRAPPERS:
             cell = element.find("mxCell")
             if cell is None:
                 continue
+            owned.add(cell)
             identifier, label = element.get("id") or "", element.get("label") or ""
         elif element.tag == "mxCell" and element not in owned:
             cell, identifier, label = element, element.get("id") or "", element.get("value") or ""
         else:
             continue
         # Counted per *cell*, and checked here rather than at the top of the loop, which are
-        # two separate corrections of the same mistake. Every vertex carries an `mxGeometry`
-        # and a wrapped one carries its `mxCell` too, so counting descendants spends the budget
-        # two or three times faster than the thing it bounds — and testing it before an element
-        # is known to be a cell marks the graph truncated when the only thing left was the
-        # geometry of the last cell read, putting a "there is more" line on a complete diagram.
+        # two separate corrections of one mistake. Every vertex carries an `mxGeometry` and a
+        # wrapped one carries its `mxCell` too, so counting elements spends this budget two or
+        # three times faster than the thing it bounds — and testing it before an element is
+        # known to be a cell marks the graph truncated when all that was left was the geometry
+        # of the last cell read, putting a "there is more" line on a complete diagram.
         if cells >= MAX_CELLS:
             graph.truncated = True
             break

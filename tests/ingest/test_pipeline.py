@@ -1086,6 +1086,30 @@ async def test_a_truncated_nested_expansion_retires_nothing() -> None:
     assert await store.find_document("memory", "outer!/inner.zip!/two") is not None
 
 
+async def test_a_message_that_loses_its_last_attachment_retires_it() -> None:
+    """The shape this branch introduced, and the one the old gate could not see.
+
+    A message with a body *and* an attachment is neither a plain document nor a container: it
+    is ``indexed``, with chunks of its own and a member. So the day it loses its last
+    attachment it has no members and a status that is not ``container`` — and a gate that asked
+    "does it have members, or was it a container" answered no to a document that had just been
+    walked end to end. The attachment stayed live and searchable.
+    """
+    pipeline, store, _ = _mail_pipeline()
+    connector = fakes.DictConnector({"m3": _message(attachment=True)})
+    connector.media_types["m3"] = "message/rfc822"
+    await pipeline.run(connector)
+    assert await store.find_document("memory", "mail:m3!/notes.txt") is not None
+
+    connector.documents["m3"] = _message(attachment=False)
+    await pipeline.run(connector)
+
+    document = await store.find_document("memory", "m3")
+    assert document is not None
+    assert document.status is DocumentStatus.INDEXED, "the message itself is still a document"
+    assert await store.find_document("memory", "mail:m3!/notes.txt") is None
+
+
 async def test_reconciliation_never_sees_a_document_no_connector_could_report() -> None:
     """The defect this ownership column exists for, stated as the arithmetic that produced it.
 

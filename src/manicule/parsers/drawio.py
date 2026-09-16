@@ -69,14 +69,18 @@ The reading is already bounded twice by statements and by characters, but both o
 the answer; this bounds the traversal, so a page with a million cells costs a bounded walk
 rather than a bounded answer arrived at slowly."""
 
-MAX_ELEMENTS: Final = MAX_CELLS * 4
-"""Most XML elements the wrapper pre-walk visits, which is a different count from the cells.
+MAX_ELEMENTS: Final = 250_000
+"""Most XML elements the reader walks, which is a different count from the cells.
 
-The pre-walk visits elements and the read counts cells, so they cannot share a bound: a diagram
-sitting exactly on the cell budget carries geometry and wrappers besides, and one constant for
-both would mark every such diagram truncated on the strength of its own geometry. Four per cell
-is generous — a wrapped vertex is an ``<object>``, an ``mxCell`` and an ``mxGeometry``, and the
-model and root elements are two more in total."""
+The walk visits every node and the reading counts only cells, so the two cannot share a number:
+a cell carries an ``mxGeometry``, a wrapped one carries an ``<object>`` as well, and an edge's
+geometry carries an ``mxPoint`` per waypoint. Tying this to :data:`MAX_CELLS` by a fixed ratio
+guesses at that shape, and a diagram whose edges are heavily routed would be stopped below its
+own cell budget.
+
+So it is its own number, set where no diagram a person has drawn will reach it and an 8 MiB
+decompressed payload will. Reaching it truncates the reading and says so, the same way the cell
+budget does."""
 
 _CHUNK: Final = 64 * 1024
 _MAX_PNG_CHUNKS: Final = 4096

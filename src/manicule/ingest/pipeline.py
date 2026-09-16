@@ -3401,9 +3401,7 @@ class IngestPipeline:
         # case whose children all have to be retired — and it is the case a "did it yield
         # members" test would skip.
         derived: dict[str, set[str]] = {}
-        if _expanded(outcome) and (
-            members or (existing is not None and existing.status is CONTAINER_STATUS)
-        ):
+        if _expanded(outcome):
             derived[outcome.document_id] = set()
         while queue:
             owner, member = queue.pop(0)
@@ -3436,15 +3434,8 @@ class IngestPipeline:
             )
             outcomes.append(inner)
             queue.extend((inner.document_id, item) for item in deeper)
-            # The same rule the top-level document gets, one level down — and the same shape,
-            # because writing it the other way round is how the hazard survives: `deeper` being
-            # non-empty proves a nested archive was read, not that it was read to the end. One
-            # that stops at its member ceiling yields a prefix, and reconciling against a prefix
-            # retires everything past it.
-            if _expanded(inner) and (
-                deeper
-                or (member_existing is not None and member_existing.status is CONTAINER_STATUS)
-            ):
+            # The same rule the top-level document gets, one level down, and the same one line.
+            if _expanded(inner):
                 derived.setdefault(inner.document_id, set())
         for container, present in derived.items():
             outcomes.extend(await self._retire_absent_members(container, present))
@@ -4918,24 +4909,26 @@ def _raise_lost_acquisition_lease(run_id: str) -> None:
     raise AcquisitionLeaseLostError(msg)
 
 
-CONTAINER_STATUS: Final = DocumentStatus.CONTAINER
-"""Spelled once, because the two reconciliation gates must keep asking the same question."""
-
-
 def _expanded(outcome: DocumentOutcome) -> bool:
     """Whether this run walked the document's container to the end.
 
-    One positive fact rather than a list of the ways it can be false, because the list kept
-    being short by one. **Skipped**: change detection stopped before the parser ran, so the
-    archive was never opened — treating that as an empty expansion retires every member of
+    One positive fact and nothing beside it, because every attempt to say the same thing a
+    second way has been wrong. **Skipped**: change detection stopped before the parser ran, so
+    the archive was never opened — treating that as an empty expansion retires every member of
     every container on the first sync that finds it unchanged, which is every sync after the
-    first. **Superseded**: nothing was written and somebody else holds newer bytes.
-    **Failed, declined, or routed nowhere**: the container was not read, which is not the same
-    as reading it and finding nothing. **Truncated**: a member ceiling ended the walk, so what
-    came back is a prefix of an intact archive.
+    first. **Superseded**: nothing was written and somebody else holds newer bytes. **Failed,
+    declined, or routed nowhere**: the container was not read, which is not the same as reading
+    it and finding nothing. **Truncated**: a member ceiling ended the walk, so what came back is
+    a prefix of an intact archive. **Not a container at all**: no expander ran.
 
     Every one of those leaves :attr:`DocumentOutcome.enumerated` at its default, so the gate is
     the flag and the flag is set in exactly one place — by the expander that reached the end.
+
+    **The clause that used to sit beside it was wrong for the shape this branch introduced.**
+    ``members or existing.status is CONTAINER`` approximated "is this a container" from before
+    the flag existed, and a message with a body *and* an attachment is neither: it is
+    ``indexed``, so the day it loses its last attachment it has no members and a status that is
+    not ``container``, and the attachment it dropped would have stayed live and searchable.
     """
     return outcome.enumerated
 

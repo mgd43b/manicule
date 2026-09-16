@@ -7,11 +7,11 @@ consumer revalidates the resulting handle inside its write transaction.
 
 from __future__ import annotations
 
+from itertools import batched
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import delete, exists, func, insert, literal, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.orm import aliased
 
 from manicule.core.reconciliation import (
     CompletedInventory,
@@ -31,6 +31,12 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 INVENTORY_PAGE_LIMIT = 1_000
+
+_RETIRE_BATCH = 500
+"""How many container ids one ``IN`` carries while retiring descendants.
+
+SQLite bounds the parameters in a statement and the bound has moved between releases, so this
+clears the oldest of them rather than being tuned to the newest."""
 
 _MAX_CONTAINER_DEPTH = 3
 """``manicule.parsers.expansion.MAX_DEPTH``, as a bound on the descent below.
@@ -563,17 +569,20 @@ class ReconciliationJournalMixin(WorkspaceScoped):
                 ),
             )
         )
-        result = cast(
-            "CursorResult[Any]",
+        removed = (
             await session.execute(
                 update(models.Document)
                 .where(*self._live_documents(run), candidate_matches)
                 .values(deleted_at=now, updated_at=utcnow())
-            ),
-        )
-        return result.rowcount + await self._retire_derived(session, now)
+                .returning(models.Document.id)
+            )
+        ).scalars()
+        roots = list(removed)
+        return len(roots) + await self._retire_derived(session, now, roots)
 
-    async def _retire_derived(self, session: AsyncSession, now: datetime) -> int:
+    async def _retire_derived(
+        self, session: AsyncSession, now: datetime, roots: Sequence[str]
+    ) -> int:
         """Soft-delete everything derived from the documents this pass just removed.
 
         **A soft delete does not cascade.** ``documents.container_id`` carries ``ON DELETE
@@ -582,35 +591,37 @@ class ReconciliationJournalMixin(WorkspaceScoped):
         excludes derived documents on purpose, so nothing this class does will ever name them
         again, and they stay searchable and citable for good.
 
-        Set-based rather than a list of ids: a descendant is a live document whose container was
-        deleted at exactly this pass's timestamp, which walks one level per statement without
-        materializing anything. Bounded by the nesting ceiling in
-        ``manicule.parsers.expansion``, and by rows stopping rather than by that bound.
+        **Scoped to the rows this statement deleted, not to the timestamp it used.** ``now`` is
+        supplied by the caller and is a fixed value in every test and in any caller that stamps
+        one moment across a batch, so "every container deleted at ``now``" is not this
+        reconciliation's set — it is every reconciliation sharing that instant, across
+        connectors, whose descendants would have been retired here and counted in this run's
+        total. The candidate update returns its ids and the descent starts from those.
+
+        One statement per level, bounded by the nesting ceiling and by a level retiring nothing.
         """
         retired = 0
-        parent = aliased(models.Document, name="container")
+        frontier = list(roots)
         for _ in range(_MAX_CONTAINER_DEPTH):
-            descends = exists(
-                select(parent.id).where(
-                    parent.id == models.Document.container_id,
-                    parent.deleted_at == now,
-                )
-            )
-            step = cast(
-                "CursorResult[Any]",
-                await session.execute(
-                    update(models.Document)
-                    .where(
-                        models.Document.workspace_id == self._workspace_id,
-                        models.Document.deleted_at.is_(None),
-                        descends,
-                    )
-                    .values(deleted_at=now, updated_at=utcnow())
-                ),
-            )
-            if not step.rowcount:
+            if not frontier:
                 return retired
-            retired += step.rowcount
+            found: list[str] = []
+            for batch in batched(frontier, _RETIRE_BATCH):
+                step = (
+                    await session.execute(
+                        update(models.Document)
+                        .where(
+                            models.Document.workspace_id == self._workspace_id,
+                            models.Document.deleted_at.is_(None),
+                            models.Document.container_id.in_(batch),
+                        )
+                        .values(deleted_at=now, updated_at=utcnow())
+                        .returning(models.Document.id)
+                    )
+                ).scalars()
+                found.extend(step)
+            retired += len(found)
+            frontier = found
         return retired
 
     async def _record_proposal(
