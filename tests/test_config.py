@@ -26,6 +26,7 @@ from manicule.config.providers import (
     runs_in_process,
 )
 from manicule.config.settings import REDACTED, AuthMode, Mode, Settings, Theme
+from manicule.core.ann import MINIMUM_ANN_INDEX_THRESHOLD
 from manicule.core.errors import ConfigError, PolicyError
 from manicule.core.retrieval import RetrievalProfile
 
@@ -812,3 +813,68 @@ def test_the_qdrant_key_does_not_survive_being_printed() -> None:
     printed = settings.redacted()
 
     assert "shhh" not in str(printed)
+
+
+@pytest.mark.parametrize(
+    ("dial", "value", "refusal"),
+    [
+        ("hnsw_m", 0, "greater than or equal to 4"),
+        ("hnsw_ef_construct", 3, "greater than or equal to 4"),
+        ("indexing_threshold_kb", -1, "greater than or equal to 0"),
+        ("quantization", "product", "'none' or 'scalar'"),
+    ],
+)
+def test_a_collection_dial_qdrant_would_misread_is_refused_at_startup(
+    dial: str, value: object, refusal: str
+) -> None:
+    """Each of these is accepted by the server and means something nobody asked for.
+
+    ``m = 0`` builds no graph at all, and keeping search exhaustive already has one spelling;
+    ``ef_construct`` below four is refused by Qdrant, but only on the first start that tries to
+    apply it; a negative threshold and an unknown quantization are typos. A refusal here names
+    the setting before anything is dialed.
+    """
+    with pytest.raises(ValidationError, match=refusal) as refused:
+        _qdrant("https://qdrant.internal:6333", qdrant={dial: value})
+
+    assert dial in str(refused.value)
+
+
+def test_the_collection_dials_default_to_the_collection_qdrant_already_made() -> None:
+    """Qdrant's stock values, so an upgrade asks the server to change nothing.
+
+    Stated as numbers rather than as "whatever the server does", which is what they were until
+    they were settings: the indexing threshold in particular is ten thousand kilobytes on the
+    server and twenty thousand in the client's own documentation.
+    """
+    qdrant = _qdrant("https://qdrant.internal:6333").storage.qdrant
+
+    assert (qdrant.quantization, qdrant.on_disk_vectors, qdrant.on_disk_payload) == (
+        "none",
+        False,
+        True,
+    )
+    assert (qdrant.hnsw_m, qdrant.hnsw_ef_construct, qdrant.indexing_threshold_kb) == (
+        16,
+        100,
+        10_000,
+    )
+
+
+@pytest.mark.parametrize("threshold", [1, MINIMUM_ANN_INDEX_THRESHOLD - 1])
+def test_an_ann_threshold_no_build_could_reach_is_refused(threshold: int) -> None:
+    """Below the codebook's size, every surface would report a build due and none could run.
+
+    The floor was enforced and nothing held it: a validator whose only test is the one that
+    never exercises it is a validator that can be deleted without anything going red.
+    """
+    with pytest.raises(ValidationError, match="no index can be built"):
+        Settings.model_validate({"storage": {"ann_index_threshold": threshold}})
+
+
+@pytest.mark.parametrize("threshold", [0, MINIMUM_ANN_INDEX_THRESHOLD])
+def test_an_ann_threshold_of_zero_or_the_floor_is_accepted(threshold: int) -> None:
+    """Zero keeps search exhaustive permanently, and the floor itself is a build that can run."""
+    settings = Settings.model_validate({"storage": {"ann_index_threshold": threshold}})
+
+    assert settings.storage.ann_index_threshold == threshold

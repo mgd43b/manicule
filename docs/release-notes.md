@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### A Qdrant collection's memory and search settings are now configuration
+
+Seven settings under `storage.qdrant` shape the collections manicule keeps on a Qdrant server:
+`quantization` and `quantization_always_ram`, `on_disk_vectors` and `on_disk_payload`, `hnsw_m`
+and `hnsw_ef_construct`, and `indexing_threshold_kb`. Until now a collection was created with a
+size and a distance and nothing else, so it got whatever the running server's defaults were and
+no setting anywhere could say otherwise. On a small corpus that costs nothing. On a 320,000-chunk
+corpus at 1024 dimensions it is about 1.3 GB of `float32` vectors held in RAM, beside a payload
+that carries a second copy of the corpus text.
+
+`quantization = "scalar"` with `on_disk_vectors = true` is the combination for a corpus that
+size: search runs against an int8 copy of about 330 MB kept in RAM, while the originals stay on
+disk for the server to rescore against. The stored vectors, and every checksum over them, are
+untouched. None of the seven changes which chunks a query may return, so none is part of a
+collection's name and changing one re-embeds nothing. `deployment.md` §6.5 has the table and the
+example.
+
+**Upgrading changes nothing on a stock Qdrant.** Every default is the value Qdrant gives a
+collection nobody tuned, which is what every existing collection already is, and a collection
+that already matches is never written to. A server whose own `config.yaml` sets other defaults
+for these dials is the exception: the first time manicule opens its existing collections after
+the upgrade, they are brought to manicule's values, because the collection is now described by
+manicule's configuration rather than by the server's.
+
+**A setting reaches the collection you already have**, not only one created after it. Each time the
+store is prepared, manicule reads the collection back, sends one update carrying only what differs,
+and logs a `reshaped Qdrant collection` line naming each change. If the server accepts the update
+and still reports the old value — which is what a Qdrant too old to know the field does — the store
+refuses to open and names every such setting, rather than leaving it reading as configured.
+
+**A collection manicule cannot use is now refused when it is opened.** Named vectors, the wrong
+size, a distance other than cosine, or a datatype other than `float32` — a collection made by
+hand, say, or restored from another installation's snapshot — used to fail every write with a
+server error that named no cause, rank with scores nothing was calibrated against, or, for a
+`float16` or `uint8` datatype, read as entirely corrupt and drop out of search while every
+request succeeded. The refusal names `manicule reset-index`, or a `collection_prefix` of the
+installation's own.
+
+That last case is also why there is no `datatype` setting. The checksum is taken over the
+`float32` values a point stores, and a collection of any other datatype hands back different
+numbers. Scalar quantization is the memory saving that keeps the originals. `storage.md` §6.7 is
+the design.
+
 ### An existing vector index can move to another backend without being re-embedded
 
 `manicule migrate-vectors` carries a workspace's vectors from the embedded LanceDB directory

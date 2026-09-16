@@ -527,12 +527,39 @@ class EventSettings(Section):
 
 
 class QdrantSettings(Section):
-    """How to reach the Qdrant server, when ``storage.vector_db`` selects it.
+    """How to reach the Qdrant server ``storage.vector_db`` selects, and what to keep on it.
 
     Where the server *is* lives in ``storage.vector_db_url``, beside ``storage.db_url``,
     because an endpoint is a property of the installation rather than of the client dialing
-    it — and two places a location can be set is how the two come to disagree. What is here
-    is everything else the dial needs.
+    it — and two places a location can be set is how the two come to disagree. The first five
+    settings here are everything else the dial needs.
+
+    The rest shape the collections: where the vectors and the payload are held, how the HNSW
+    graph is built and when one is built at all, and whether a quantized copy of the vectors is
+    searched. Three things are true of every one of them.
+
+    **They are memory, recall and throughput dials, and never eligibility.** None of them
+    changes which rows a filter admits or which chunks a query may return, so none widens what
+    ``docs/retrieval.md`` §3.3 holds level across the two backends — which is why they have no
+    embedded-store counterpart, for the same reason ``storage.ann_index_threshold`` has no
+    Qdrant one.
+
+    **Each default is the value Qdrant gives a collection nobody tuned**, which is the
+    collection every installation already has. An upgrade therefore changes nothing on a server
+    running its stock configuration. A server whose own configuration chose other defaults has
+    its existing collections brought to these values, because the collection is described here
+    now rather than there.
+
+    **They are applied to a collection that exists, not only to a new one.** Each time the
+    store is prepared it reads the collection back and changes whatever differs, so an edit
+    takes effect at the next start rather than waiting for a collection that is never created
+    again (``docs/storage.md`` §6.7).
+
+    The vector *datatype* is deliberately not among them. The integrity checksum is taken over
+    the ``binary32`` values a point stores, and a ``float16`` or ``uint8`` collection hands back
+    other numbers, so every row would read as corrupt and drop out of search; nor can a
+    datatype be changed once a collection exists. Scalar quantization is the memory saving that
+    keeps the checksummed originals.
     """
 
     api_key: SecretStr | None = Field(
@@ -572,6 +599,58 @@ class QdrantSettings(Section):
         "already cannot meet — but nothing identifies an installation on its own, and a "
         "workspace is called 'default' on both machines. Leave this at its default on a shared "
         "server and the two share collections. Give each its own.",
+    )
+    quantization: Literal["none", "scalar"] = Field(
+        default="none",
+        description="Keep an int8 copy of every vector, a quarter of its size, and search the "
+        "copy. The float32 originals are kept beside it — Qdrant can rescore candidates "
+        "against them, and every checksum over them is untouched — so on its own this adds "
+        "memory; paired with on_disk_vectors, it is what lets the originals leave RAM. "
+        "Setting it back to 'none' drops the copy.",
+    )
+    quantization_always_ram: bool = Field(
+        default=True,
+        description="Hold the quantized copy in RAM even when on_disk_vectors puts the "
+        "originals on disk. That pairing is what makes quantization a memory saving rather "
+        "than a latency cost, because the originals are read only to rescore. Read only when "
+        "quantization is 'scalar'.",
+    )
+    on_disk_vectors: bool = Field(
+        default=False,
+        description="Serve the float32 vectors from disk through the page cache rather than "
+        "holding them in RAM. At 1024 dimensions each is four kilobytes, so on a large corpus "
+        "this is most of the resident memory; pair it with scalar quantization to keep search "
+        "off the disk.",
+    )
+    on_disk_payload: bool = Field(
+        default=True,
+        description="Keep each point's payload on disk rather than in RAM. The payload carries "
+        "the whole chunk, so it is a second copy of the corpus text; the fields a query "
+        "filters on are indexed and stay in RAM either way. Qdrant's own default, stated here "
+        "so that it is not whatever a server's configuration happens to say.",
+    )
+    hnsw_m: int = Field(
+        default=16,
+        ge=4,
+        description="Edges per node in the HNSW graph: more is better recall and a larger "
+        "graph. Refused below four. Qdrant reads zero as no graph at all, and keeping search "
+        "exhaustive already has one spelling, indexing_threshold_kb = 0.",
+    )
+    hnsw_ef_construct: int = Field(
+        default=100,
+        ge=4,
+        description="Neighbors considered for each node while the graph is built: more is a "
+        "better graph and a slower build, and costs nothing at query time. Qdrant refuses a "
+        "value below four.",
+    )
+    indexing_threshold_kb: int = Field(
+        default=10_000,
+        ge=0,
+        description="Kilobytes of vectors a segment holds before Qdrant builds an HNSW graph "
+        "for it; below that the segment is searched exactly. Kilobytes rather than points: a "
+        "1024-dimension vector is four, so the default indexes a segment past about 2,500 "
+        "chunks. 0 never builds a graph. Unrelated to storage.ann_index_threshold, which "
+        "counts vectors and is read only by the embedded store.",
     )
 
 

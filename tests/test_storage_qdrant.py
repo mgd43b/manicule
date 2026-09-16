@@ -17,11 +17,12 @@ test are the store's. The suite at the bottom is the one that needs a real one, 
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import struct
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 from qdrant_client import AsyncQdrantClient, models
@@ -58,9 +59,11 @@ from manicule.storage.config import QdrantVectorStoreConfig
 from manicule.storage.plugin import PLUGIN, build_qdrant_vector_store
 from manicule.storage.qdrant import (
     INDEXED_PAYLOAD_FIELDS,
+    CollectionShape,
     QdrantVectorStore,
     as_float32,
     collection_for,
+    dials_in_force,
     is_cleartext_remote,
     is_local,
     meta_collection_for,
@@ -89,7 +92,12 @@ from manicule.testing.contracts import (
     assert_vector_store_rejects_foreign_vectors,
     assert_vector_store_reuses_by_embedding_input,
 )
-from tests.qdrant_support import TEST_COLLECTION_PREFIX, local_client, require_server
+from tests.qdrant_support import (
+    TEST_COLLECTION_PREFIX,
+    local_client,
+    remote_client,
+    require_server,
+)
 from tests.storage_helpers import fingerprint, make_chunk, make_document
 
 if TYPE_CHECKING:
@@ -1178,6 +1186,65 @@ async def test_the_factory_builds_a_store_without_dialing_anything() -> None:
     await built.teardown()
 
 
+def _built(settings: Settings) -> QdrantVectorStore:
+    built = build_qdrant_vector_store(
+        BuildContext(
+            settings=settings,
+            config=QdrantVectorStoreConfig(),
+            data_dir=settings.data_dir,
+            cache_dir=settings.cache_dir,
+            components=_NoComponents(),
+        )
+    )
+    assert isinstance(built, QdrantVectorStore)
+    return built
+
+
+async def test_the_factory_hands_every_configured_dial_to_the_store() -> None:
+    """A dial the factory forgets to copy is a setting that reads as in force and is not.
+
+    Every dial is set away from its default, so a missing copy leaves a default where the
+    configured value should be; and the names are matched rather than listed, so a dial added
+    to the shape without a setting of the same name fails here instead of in a review.
+    """
+    tuned = {
+        "quantization": "scalar",
+        "quantization_always_ram": False,
+        "on_disk_vectors": True,
+        "on_disk_payload": False,
+        "hnsw_m": 32,
+        "hnsw_ef_construct": 256,
+        "indexing_threshold_kb": 0,
+    }
+    assert set(tuned) == {dial.name for dial in dataclasses.fields(CollectionShape)}
+    settings = Settings.model_validate(
+        {"storage": {"vector_db": "qdrant", "vector_db_url": "http://127.0.0.1:1", "qdrant": tuned}}
+    )
+
+    built = _built(settings)
+
+    assert dataclasses.asdict(built.shape) == tuned
+    await built.teardown()
+
+
+async def test_the_configured_defaults_are_the_shape_a_store_has_without_one() -> None:
+    """Two statements of Qdrant's defaults, held to one another.
+
+    The settings are what an installation reads and the shape is what a store built outside the
+    factory uses, and both claim to be the collection every installation already has. If they
+    disagreed, the first start after an upgrade would rewrite every collection to whichever was
+    wrong.
+    """
+    settings = Settings.model_validate(
+        {"storage": {"vector_db": "qdrant", "vector_db_url": "http://127.0.0.1:1"}}
+    )
+
+    built = _built(settings)
+
+    assert built.shape == CollectionShape()
+    await built.teardown()
+
+
 def test_the_factory_refuses_to_build_without_an_endpoint() -> None:
     """Normally refused earlier by policy; refused here too, for a caller outside that path."""
     settings = Settings.model_validate({"storage": {"vector_db": "qdrant"}})
@@ -1194,13 +1261,335 @@ def test_the_factory_refuses_to_build_without_an_endpoint() -> None:
         )
 
 
+# --- the collection's shape ------------------------------------------------------------------
+
+STOCK_COLLECTION: Final[dict[str, dict[str, Any]]] = {
+    "params": {
+        "vectors": {"size": 4, "distance": "Cosine"},
+        "shard_number": 1,
+        "replication_factor": 1,
+        "write_consistency_factor": 1,
+        "on_disk_payload": True,
+    },
+    "hnsw_config": {
+        "m": 16,
+        "ef_construct": 100,
+        "full_scan_threshold": 10000,
+        "max_indexing_threads": 0,
+        "on_disk": False,
+    },
+    "optimizer_config": {
+        "deleted_threshold": 0.2,
+        "vacuum_min_vector_number": 1000,
+        "default_segment_number": 0,
+        "indexing_threshold": 10000,
+        "flush_interval_sec": 5,
+    },
+    "wal_config": {"wal_capacity_mb": 32, "wal_segments_ahead": 0, "wal_retain_closed": 1},
+}
+"""What ``qdrant/qdrant`` reports for a collection created with only a size and a distance.
+
+Recorded from v1.19.1, the server CI runs, and identical from v1.17.0. It is the collection every
+installation made before its shape was configurable, which is why it is a recording rather than
+something built here: the property under test is that a store leaves *that* collection alone.
+"""
+
+
+def _config(**changes: dict[str, Any]) -> models.CollectionConfig:
+    """The stock collection with each section of ``changes`` merged into its own."""
+    merged: dict[str, dict[str, Any]] = {
+        name: dict(section) for name, section in STOCK_COLLECTION.items()
+    }
+    for name, section in changes.items():
+        merged[name] = {**merged.get(name, {}), **section}
+    return models.CollectionConfig.model_validate(merged)
+
+
+def _drift(shape: CollectionShape, config: models.CollectionConfig) -> dict[str, object]:
+    vector = config.params.vectors
+    assert isinstance(vector, models.VectorParams)
+    return {item.setting: item.in_force for item in shape.drift(config, vector)}
+
+
+def test_the_default_shape_is_the_collection_a_stock_server_already_has() -> None:
+    """An upgrade must not write to a collection nobody tuned.
+
+    Every default is compared against what the server reports rather than against a value
+    somebody believed was Qdrant's, so a default that is wrong — the client's own docstring
+    gives the indexing threshold as 20,000 — reshapes nothing here and fails this instead.
+    """
+    assert _drift(CollectionShape(), _config()) == {}
+
+
+def test_a_vector_s_own_value_is_the_one_in_force() -> None:
+    """A vector's HNSW and quantization take precedence over the collection's.
+
+    Comparing the collection's value alone would report a collection this store had tuned as
+    untuned, and the reshape would then repeat on every start without ever converging.
+    """
+    config = _config(
+        params={
+            "vectors": {
+                "size": 4,
+                "distance": "Cosine",
+                "hnsw_config": {"m": 32},
+                "quantization_config": {"scalar": {"type": "int8", "always_ram": True}},
+            }
+        },
+        quantization_config={"product": {"compression": "x16"}},
+    )
+
+    in_force = _drift(CollectionShape(hnsw_m=32, quantization="scalar"), config)
+
+    assert in_force == {}
+
+
+def test_a_collection_s_value_is_in_force_where_the_vector_has_none() -> None:
+    """Quantization set on the collection by hand is quantization, whatever the vector says.
+
+    Read as "none", it would leave a product-quantized collection standing under a
+    configuration that asks for no quantization at all.
+    """
+    config = _config(quantization_config={"product": {"compression": "x16"}})
+
+    assert _drift(CollectionShape(), config) == {"quantization": "product"}
+    assert _drift(CollectionShape(quantization="scalar"), config) == {"quantization": "product"}
+
+
+def test_the_newer_memory_placement_is_read_as_the_flag_it_replaced() -> None:
+    """Qdrant is deprecating the placement flags for a ``memory`` enum, and may report either.
+
+    A server that answered in the new terms would otherwise read as having every placement at
+    its default, and a store would ask it for the same change on every start.
+    """
+    config = _config(
+        params={
+            "vectors": {
+                "size": 4,
+                "distance": "Cosine",
+                "memory": "cold",
+                "quantization_config": {"scalar": {"type": "int8", "memory": "pinned"}},
+            },
+            "payload": {"memory": "cached"},
+        }
+    )
+
+    shape = CollectionShape(quantization="scalar", on_disk_vectors=True, on_disk_payload=False)
+
+    assert _drift(shape, config) == {}
+
+
+def test_placement_of_a_quantized_copy_is_not_compared_when_there_is_none() -> None:
+    """``quantization_always_ram`` means nothing without quantization, on either side."""
+    assert _drift(CollectionShape(quantization_always_ram=False), _config()) == {}
+
+
+def test_every_dial_that_differs_is_named_with_what_the_collection_has() -> None:
+    """The reshape sends exactly the dials that differ, and the refusal names them."""
+    config = _config(
+        params={"on_disk_payload": False},
+        hnsw_config={"ef_construct": 64},
+        optimizer_config={"indexing_threshold": 20000},
+    )
+
+    assert _drift(CollectionShape(), config) == {
+        "on_disk_payload": False,
+        "hnsw_ef_construct": 64,
+        "indexing_threshold_kb": 20000,
+    }
+
+
+def test_the_dials_read_from_a_collection_are_exactly_the_shape_s() -> None:
+    """A dial read and never compared, or compared and never read, is a silent half-feature."""
+    vector = _config().params.vectors
+    assert isinstance(vector, models.VectorParams)
+
+    assert set(dials_in_force(_config(), vector)) == {
+        dial.name for dial in dataclasses.fields(CollectionShape)
+    }
+
+
+def test_an_update_carries_only_the_dials_that_differ() -> None:
+    """A request that restated every dial would re-send placement and quantization with it.
+
+    HNSW goes as a pair even when one half differs, so a server that merges the diff and one
+    that replaces it both end at the configured graph.
+    """
+    config = _config(hnsw_config={"ef_construct": 64})
+    vector = config.params.vectors
+    assert isinstance(vector, models.VectorParams)
+    shape = CollectionShape()
+
+    update = shape.update_for(shape.drift(config, vector), config, vector)
+
+    assert update.vectors == {
+        "": models.VectorParamsDiff(hnsw_config=models.HnswConfigDiff(m=16, ef_construct=100))
+    }
+    assert (update.quantization, update.optimizers, update.params) == (None, None, None)
+
+
+def test_turning_quantization_off_clears_both_places_it_lives() -> None:
+    """Clearing only the vector's would leave the collection's in force behind it."""
+    config = _config(
+        params={
+            "vectors": {
+                "size": 4,
+                "distance": "Cosine",
+                "quantization_config": {"scalar": {"type": "int8"}},
+            }
+        },
+        quantization_config={"product": {"compression": "x16"}},
+    )
+    vector = config.params.vectors
+    assert isinstance(vector, models.VectorParams)
+    shape = CollectionShape()
+
+    update = shape.update_for(shape.drift(config, vector), config, vector)
+
+    assert update.vectors == {
+        "": models.VectorParamsDiff(quantization_config=models.Disabled.DISABLED)
+    }
+    assert update.quantization == models.Disabled.DISABLED
+
+
+@pytest.mark.parametrize("newer", [False, True], ids=["flags", "memory"])
+def test_placement_is_written_in_the_vocabulary_the_collection_reports(newer: bool) -> None:
+    """``memory`` overrides the flag it replaces, and a server that predates it drops it.
+
+    So a flag written to a component reporting ``memory`` is accepted and changes nothing, and
+    ``memory`` written to one that does not is accepted and changes nothing. Either would be
+    refused on every start as a server that did not apply a change.
+    """
+    params: dict[str, Any] = {"vectors": {"size": 4, "distance": "Cosine"}}
+    if newer:
+        params = {
+            "vectors": {"size": 4, "distance": "Cosine", "memory": "cached"},
+            "payload": {"memory": "cold"},
+        }
+    config = _config(params=params)
+    vector = config.params.vectors
+    assert isinstance(vector, models.VectorParams)
+    shape = CollectionShape(on_disk_vectors=True, on_disk_payload=False)
+
+    update = shape.update_for(shape.drift(config, vector), config, vector)
+
+    if newer:
+        assert update.vectors == {"": models.VectorParamsDiff(memory=models.Memory.COLD)}
+        assert update.params == models.CollectionParamsDiff(
+            payload=models.PayloadStorageParams(memory=models.Memory.CACHED)
+        )
+    else:
+        assert update.vectors == {"": models.VectorParamsDiff(on_disk=True)}
+        assert update.params == models.CollectionParamsDiff(on_disk_payload=False)
+
+
+async def test_a_new_collection_is_created_in_the_configured_shape(
+    client: AsyncQdrantClient,
+) -> None:
+    """The half of a shape the in-process engine keeps, which is the half written on the vector."""
+    shape = CollectionShape(
+        quantization="scalar",
+        quantization_always_ram=False,
+        on_disk_vectors=True,
+        hnsw_m=32,
+        hnsw_ef_construct=256,
+    )
+    store = QdrantVectorStore(
+        client, workspace_id=WORKSPACE, collection_prefix=TEST_COLLECTION_PREFIX, shape=shape
+    )
+
+    await prepared(store)
+
+    info = await client.get_collection(
+        collection_for(TEST_COLLECTION_PREFIX, WORKSPACE, fingerprint(4))
+    )
+    vector = info.config.params.vectors
+    assert isinstance(vector, models.VectorParams)
+    assert vector.on_disk is True
+    assert vector.hnsw_config == models.HnswConfigDiff(m=32, ef_construct=256)
+    assert vector.quantization_config == models.ScalarQuantization(
+        scalar=models.ScalarQuantizationConfig(type=models.ScalarType.INT8, always_ram=False)
+    )
+
+
+async def test_local_mode_is_never_asked_to_reshape(
+    client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The in-process engine ignores every update and says nothing, so it is not asked.
+
+    Asked anyway, the comparison afterwards would find nothing applied and refuse — every test
+    in this file that prepares a store twice under two shapes would fail for a property of the
+    test double rather than of the store.
+    """
+
+    async def refuse(*_: object, **__: object) -> bool:
+        raise AssertionError("local mode was asked to update a collection")
+
+    monkeypatch.setattr(client, "update_collection", refuse)
+    await prepared(
+        QdrantVectorStore(client, workspace_id=WORKSPACE, collection_prefix=TEST_COLLECTION_PREFIX)
+    )
+    tuned = QdrantVectorStore(
+        client,
+        workspace_id=WORKSPACE,
+        collection_prefix=TEST_COLLECTION_PREFIX,
+        shape=CollectionShape(quantization="scalar", hnsw_m=64),
+    )
+
+    await prepared(tuned)
+
+
+@pytest.mark.parametrize(
+    ("vectors", "refusal"),
+    [
+        (
+            models.VectorParams(
+                size=4, distance=models.Distance.COSINE, datatype=models.Datatype.FLOAT16
+            ),
+            "float16 vectors",
+        ),
+        (
+            models.VectorParams(
+                size=4, distance=models.Distance.COSINE, datatype=models.Datatype.UINT8
+            ),
+            "uint8 vectors",
+        ),
+        (models.VectorParams(size=8, distance=models.Distance.COSINE), "8-dimension vectors"),
+        (models.VectorParams(size=4, distance=models.Distance.DOT), "ranked by Dot"),
+        (
+            {"dense": models.VectorParams(size=4, distance=models.Distance.COSINE)},
+            "named vectors",
+        ),
+    ],
+    ids=["float16", "uint8", "wrong-size", "dot", "named"],
+)
+async def test_a_collection_this_store_cannot_use_is_refused_before_it_is_written(
+    store: QdrantVectorStore,
+    client: AsyncQdrantClient,
+    vectors: models.VectorParams | dict[str, models.VectorParams],
+    refusal: str,
+) -> None:
+    """A collection bearing this store's name and shaped by something else.
+
+    The float16 case is the one that motivates the check. Every write succeeds, every readback
+    returns numbers other than the float32 the checksum was taken over, and the whole corpus
+    reads as corrupt and drops silently out of search. Refused when the store is prepared, it
+    is one error naming the collection instead.
+    """
+    name = collection_for(TEST_COLLECTION_PREFIX, WORKSPACE, fingerprint(4))
+    await client.create_collection(collection_name=name, vectors_config=vectors)
+
+    with pytest.raises(VectorStoreStateError, match=refusal):
+        await prepared(store)
+
+
 # --- against a real server -------------------------------------------------------------------
 
 
 @pytest.fixture
 def server_client() -> AsyncQdrantClient:
     """A client on a real Qdrant, or a skipped test saying how to get one."""
-    return AsyncQdrantClient(url=require_server(), timeout=30, check_compatibility=False)
+    return remote_client(require_server())
 
 
 @pytest.fixture
@@ -1350,3 +1739,245 @@ async def test_a_real_server_answers_the_whole_reuse_contract(
     finally:
         for store in made:
             await _drop(store, server_client, 8)
+
+
+def _handle(
+    client: AsyncQdrantClient, workspace_id: str, shape: CollectionShape
+) -> QdrantVectorStore:
+    """Another handle on a workspace, as a restart with edited settings would build one."""
+    return QdrantVectorStore(
+        client, workspace_id=workspace_id, collection_prefix=TEST_COLLECTION_PREFIX, shape=shape
+    )
+
+
+def _record_updates(
+    client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> list[dict[str, object]]:
+    """Every ``update_collection`` the client is asked for, passed through to the server."""
+    calls: list[dict[str, object]] = []
+    original = client.update_collection
+
+    async def recording(**kwargs: Any) -> bool:
+        calls.append(kwargs)
+        return await original(**kwargs)
+
+    monkeypatch.setattr(client, "update_collection", recording)
+    return calls
+
+
+async def _in_force(client: AsyncQdrantClient, store: QdrantVectorStore) -> dict[str, object]:
+    config = (await client.get_collection(store.storage_name(fingerprint(8)))).config
+    vector = config.params.vectors
+    assert isinstance(vector, models.VectorParams)
+    return dials_in_force(config, vector)
+
+
+def _expected(shape: CollectionShape) -> dict[str, object]:
+    """What a collection in ``shape`` reads as: no placement for a quantized copy it lacks."""
+    expected: dict[str, object] = dataclasses.asdict(shape)
+    if shape.quantization == "none":
+        expected["quantization_always_ram"] = None
+    return expected
+
+
+TUNED: Final = CollectionShape(
+    quantization="scalar",
+    quantization_always_ram=True,
+    on_disk_vectors=True,
+    on_disk_payload=False,
+    hnsw_m=32,
+    hnsw_ef_construct=200,
+    indexing_threshold_kb=5000,
+)
+"""Every dial away from its default, so a dial that is not applied cannot pass as one that is."""
+
+
+async def test_a_real_server_leaves_a_collection_nobody_tuned_alone(
+    server_store: QdrantVectorStore,
+    server_client: AsyncQdrantClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The upgrade: a collection the previous release made, prepared by this one.
+
+    It is made here exactly as that release made it — a size and a distance, nothing else — and
+    it must not be written to. An update that changed nothing would still be an update: a
+    request every installation sends on its first start, and a re-optimization on any server
+    that does not diff what it is sent.
+    """
+    name = server_store.storage_name(fingerprint(8))
+    try:
+        await server_client.create_collection(
+            collection_name=name,
+            vectors_config=models.VectorParams(size=8, distance=models.Distance.COSINE),
+        )
+        before = (await server_client.get_collection(name)).config
+        updates = _record_updates(server_client, monkeypatch)
+
+        await server_store.ensure_ready(fingerprint(8))
+
+        assert updates == []
+        assert (await server_client.get_collection(name)).config == before
+    finally:
+        await _drop(server_store, server_client, 8)
+
+
+async def test_a_real_server_creates_a_collection_in_the_whole_configured_shape(
+    server_store: QdrantVectorStore,
+    server_client: AsyncQdrantClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Including the dials local mode drops at creation: payload placement and the threshold.
+
+    And with no update behind it, because a collection created in the wrong shape and then
+    corrected would pass every assertion about the result.
+    """
+    tuned = _handle(server_client, server_store.workspace_id, TUNED)
+    updates = _record_updates(server_client, monkeypatch)
+    try:
+        await tuned.ensure_ready(fingerprint(8))
+
+        assert updates == []
+        assert await _in_force(server_client, tuned) == _expected(TUNED)
+    finally:
+        await _drop(server_store, server_client, 8)
+
+
+async def test_a_real_server_brings_an_existing_collection_to_an_edited_shape(
+    server_store: QdrantVectorStore, server_client: AsyncQdrantClient
+) -> None:
+    """A setting read only at creation does nothing to the collection that already exists.
+
+    Every dial is changed on a collection with vectors in it, and then changed back, which is
+    the direction that has to reach two places: quantization turned off must also leave no
+    quantized copy behind.
+    """
+    try:
+        await server_store.ensure_ready(fingerprint(8))
+        await server_store.upsert([chunk("chunk-one")], [spread(8, 0)])
+
+        await _handle(server_client, server_store.workspace_id, TUNED).ensure_ready(fingerprint(8))
+        assert await _in_force(server_client, server_store) == _expected(TUNED)
+
+        await _handle(server_client, server_store.workspace_id, CollectionShape()).ensure_ready(
+            fingerprint(8)
+        )
+        assert await _in_force(server_client, server_store) == _expected(CollectionShape())
+        assert await server_store.count() == 1
+    finally:
+        await _drop(server_store, server_client, 8)
+
+
+async def test_a_real_server_drops_quantization_the_collection_itself_carries(
+    server_store: QdrantVectorStore, server_client: AsyncQdrantClient
+) -> None:
+    """Quantization set on the collection by hand, which the vector's own value falls back to.
+
+    Clearing only the vector's value would report success, change nothing, and — because the
+    comparison afterwards reads the collection's value — be refused on every start.
+    """
+    name = server_store.storage_name(fingerprint(8))
+    try:
+        await server_store.ensure_ready(fingerprint(8))
+        await server_client.update_collection(
+            collection_name=name,
+            quantization_config=models.ScalarQuantization(
+                scalar=models.ScalarQuantizationConfig(type=models.ScalarType.INT8)
+            ),
+        )
+
+        await server_store.ensure_ready(fingerprint(8))
+
+        assert (await server_client.get_collection(name)).config.quantization_config is None
+    finally:
+        await _drop(server_store, server_client, 8)
+
+
+async def test_a_real_server_moves_a_placement_somebody_set_in_the_newer_vocabulary(
+    server_store: QdrantVectorStore, server_client: AsyncQdrantClient
+) -> None:
+    """A component that reports ``memory`` is moved by ``memory``, not by the flag it overrides.
+
+    Set by hand here, as an operator reading current Qdrant documentation would set it. A
+    server that predates the field drops it, reports the flags, and is moved by those, so this
+    passes against both — which is the point of writing in the reported vocabulary.
+    """
+    name = server_store.storage_name(fingerprint(8))
+    moved = CollectionShape(on_disk_vectors=True, on_disk_payload=False)
+    try:
+        await server_store.ensure_ready(fingerprint(8))
+        await server_client.update_collection(
+            collection_name=name,
+            vectors_config={"": models.VectorParamsDiff(memory=models.Memory.CACHED)},
+            collection_params=models.CollectionParamsDiff(
+                payload=models.PayloadStorageParams(memory=models.Memory.COLD)
+            ),
+        )
+
+        await _handle(server_client, server_store.workspace_id, moved).ensure_ready(fingerprint(8))
+
+        assert await _in_force(server_client, server_store) == _expected(moved)
+    finally:
+        await _drop(server_store, server_client, 8)
+
+
+async def test_a_real_server_that_does_not_apply_a_change_is_refused(
+    server_store: QdrantVectorStore,
+    server_client: AsyncQdrantClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that accepts a dial and ignores it — an older Qdrant — leaves a setting inert.
+
+    That is the failure the whole reshape exists to close, so it is refused with the dial and
+    both values named rather than logged and served past.
+    """
+
+    async def accept_and_ignore(**_: object) -> bool:
+        return True
+
+    try:
+        await server_store.ensure_ready(fingerprint(8))
+        monkeypatch.setattr(server_client, "update_collection", accept_and_ignore)
+        tuned = _handle(server_client, server_store.workspace_id, CollectionShape(hnsw_m=32))
+
+        with pytest.raises(
+            VectorStoreStateError, match=r"storage\.qdrant\.hnsw_m is 32, the collection has 16"
+        ):
+            await tuned.ensure_ready(fingerprint(8))
+    finally:
+        monkeypatch.undo()
+        await _drop(server_store, server_client, 8)
+
+
+@pytest.mark.contract
+async def test_a_real_server_keeps_a_quantized_corpus_verifiable(
+    server_store: QdrantVectorStore, server_client: AsyncQdrantClient
+) -> None:
+    """Quantization is offered because it keeps the originals, and this is that claim, checked.
+
+    A quantized copy that replaced what ``stored_vectors`` reads would fail every checksum, and
+    the corpus would drop out of search while every request succeeded — the reason ``datatype``
+    is not offered at all.
+    """
+    tuned = _handle(server_client, server_store.workspace_id, TUNED)
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
+    offered = [
+        [0.3, -0.4, 0.5, 0.1, -0.2, 0.05, 0.7, -0.15],
+        [-0.1, 0.6, 0.2, -0.3, 0.4, 0.1, -0.5, 0.25],
+        [0.2, 0.1, -0.6, 0.45, 0.05, -0.3, 0.15, 0.5],
+    ]
+    try:
+        await tuned.ensure_ready(fingerprint(8))
+        await tuned.upsert(chunks, offered)
+
+        verdicts = await tuned.stored_vectors(chunks)
+        coverage = await tuned.checksum_coverage(recompute=True)
+        ranked = await tuned.search(offered[1], k=1)
+
+        assert {verdict.integrity for verdict in verdicts.values()} == {VectorIntegrity.VERIFIED}
+        assert [tuple(verdicts[item.id].vector) for item in chunks] == [
+            canonical_stored_vector(vector) for vector in offered
+        ]
+        assert (coverage.verified, coverage.failed) == (3, 0)
+        assert [result.chunk.id for result in ranked] == ["chunk-1"]
+    finally:
+        await _drop(server_store, server_client, 8)

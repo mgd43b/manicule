@@ -1699,14 +1699,105 @@ return different rows depending on which store an installation configured, which
 collection is, and re-declared on every `ensure_ready`: an index is invisible to correctness, so
 a half-created one is a corpus that silently gets slower rather than a failure anybody sees.
 
+**A collection's shape is configuration, and it is applied to the collection that exists.** Seven
+settings under `storage.qdrant` choose what a chunk collection costs to hold and to search.
+`quantization` is `none` or `scalar` — an int8 copy of every vector, searched in place of the
+originals — and `quantization_always_ram` says whether that copy stays in RAM when the originals do
+not. `on_disk_vectors` and `on_disk_payload` put the `float32` vectors, and the payload that
+carries `chunk_json` and so a second copy of the corpus text, on disk rather than in RAM. `hnsw_m`
+and `hnsw_ef_construct` are the graph's shape, and `indexing_threshold_kb` is how many kilobytes of
+vectors a segment holds before Qdrant builds a graph for it at all: below that the segment is
+searched exactly, and `0` never builds one. Every default is the value Qdrant gives a collection
+nobody tuned, which is the collection every installation made before these were settings, so on a
+server running its stock configuration an upgrade changes nothing; a server whose own configuration
+chose other defaults has its existing collections brought to these values, because the collection
+is now described by manicule's configuration rather than the server's. HNSW, quantization and
+vector placement are written into the vector's own parameters rather than onto the collection,
+because a vector's value takes precedence on the server and a collection-level one somebody set by
+hand then cannot leave a change accepted and not in force; payload placement and the indexing
+threshold exist only at collection level. The `<prefix>_meta` collection, one point per workspace,
+is not shaped.
+
+**None of them is eligibility.** No value changes which rows a filter admits or which chunks a
+query may return; each moves recall, memory or throughput. That is why they widen nothing
+`retrieval.md` §3.3 holds level across the two backends, why they have no embedded-store
+counterpart — for the reason `storage.ann_index_threshold` has no Qdrant one — and why neither a
+collection's name nor a pipeline's identity carries them. Two shapes of one corpus are the same
+index, so changing a dial neither orphans a collection nor re-embeds a row.
+
+**The shape is reconciled on every prepare, not only at creation**, as the payload indexes are. A
+setting read only when a collection is created does nothing to the collection every installation
+already has: turning quantization on would show in `manicule config show` and in no memory graph,
+indefinitely. So `ensure_ready` — run when a process first needs its vector store and again by what
+writes to it, ingest, a rebuild and `migrate-vectors` among them, but never per query — reads the
+collection back after creating or finding it, and compares each dial *in force* with the configured
+shape: the vector's value where it has one, the collection's where it does not, and Qdrant's newer
+`memory` placement where a server reports that in place of the flags it replaced. Compared as
+written instead, an untuned collection would differ from its own defaults and be rewritten at every
+prepare. What differs goes to the server as one `update_collection` carrying only those dials, so
+an untuned collection on a stock server is never written to and a server is never asked to
+re-optimize for a change that is not one. A change that lands logs one line, `reshaped Qdrant
+collection`, naming each dial's old and new value. The same path prepares a migration's destination
+(§6.8) and the collection the next ingest recreates after `reset-index`, so each is born in the
+configured shape.
+
+**What differs is written where the server will act on it.** Turning quantization off clears it
+from the collection as well as from the vector, because a vector with none of its own falls back to
+the collection's. A placement change is written in whichever vocabulary the component reported.
+Where a vector or the payload reports Qdrant's newer `memory` field it is moved with `memory` —
+`cold` for on disk, `cached` for not — and otherwise with the `on_disk` or `on_disk_payload` flag,
+because neither vocabulary is safe to write blind: on v1.19.1 `memory` overrides the flag it
+replaces, so a flag written to a component that reports `memory` is accepted and does nothing, and
+v1.17.0 accepts `memory` and drops it. Quantization needs no such care, since a change to it
+replaces the whole scalar configuration, `always_ram` included.
+
+**A change the server accepted and did not apply is refused, not logged.** The collection is read
+once more after the update, and any dial still not in force raises `VectorStoreStateError` naming
+each setting beside the value the collection has; a Qdrant too old to know a field is the likely
+cause, because it takes the request and ignores the field. A setting that reads as in force and is
+not is the failure the reconcile exists to close, and a log line nobody reads is that failure by a
+longer route. The reconcile's behavior was checked against `qdrant/qdrant` v1.19.1, the image CI
+runs, and against v1.17.0.
+
+**The collection is checked before it is shaped, and in-process mode stops there.** A collection
+bearing this store's name was made by this store unless somebody made it by hand — on a dashboard,
+from a script, by restoring another installation's snapshot. So one this store cannot write or
+verify is refused with `VectorStoreStateError` on every prepare: named vectors, a size other than
+the embedder's dimension, a distance other than cosine, or a datatype other than `float32`. Each is
+a mismatch nothing else refuses. The wrong size fails every write with a server error that names no
+cause, another distance ranks with scores nothing here was calibrated against, and another datatype
+is the next paragraph. The refusal names `manicule reset-index`, which discards this workspace's
+collections for the next ingest to recreate, or a `storage.qdrant.collection_prefix` of this
+installation's own. `qdrant-client`'s in-process mode, a test convenience no installation serves
+from, runs that check and nothing after it: it drops the collection-level half of a shape at
+creation and ignores `update_collection` without saying so, so it is asked for no reconcile, just
+as it is asked for no payload indexes.
+
+**The datatype is deliberately not a setting.** §6.2.5's checksum is taken over the `binary32`
+values a point stores, and a `float16` or `uint8` collection hands back other numbers — measured on
+a v1.19.1 server. Every row would recompute as `mismatched`, read `CORRUPT` and drop out of search
+while every request succeeded, and nothing repairs that from inside: `vector-checksum --yes`
+selects only rows that record no checksum, and a row `migrate-vectors` adopts carries its source's
+checksum verbatim (§6.8), so it would arrive corrupt. Qdrant fixes a datatype at creation besides —
+`VectorParamsDiff` has no field for it, and a raw `PATCH` carrying one is accepted and ignored — so
+the setting could only ever have been the creation-only kind the paragraphs above refuse to be.
+Scalar quantization is the memory saving that keeps the checksummed originals: the int8 copy is
+what the graph searches, and the `float32` vectors are what a readback returns and what the server
+can rescore against. Search sends no quantization parameters, so whether it oversamples and
+rescores is left to the server's defaults.
+
 **What this backend does not have, said plainly.**
 
 - **No ANN lifecycle.** Qdrant builds and maintains its own HNSW index on its own schedule, so
-  there is no build for an operator to trigger and no partition count this project chose. The
-  store does not implement `AnnIndexMaintenance` at all rather than reporting an IVF-PQ
-  lifecycle for an index manicule neither built nor can replace; `storage.ann_index_threshold`
-  is read only by the embedded store, and every surface reports no index state rather than an
-  empty one (§6.2.2 is the reason that distinction is kept).
+  there is no build for an operator to trigger and no partition count to choose. What an
+  installation does choose — the graph's shape, the segment size at which one is built, and
+  whether a quantized copy is searched — is the collection shape above: a property of the
+  collection that the server acts on, not a lifecycle manicule runs. The store does not
+  implement `AnnIndexMaintenance` at all rather than reporting an IVF-PQ lifecycle for an index
+  manicule neither built nor can replace; `storage.ann_index_threshold` is read only by the
+  embedded store, and is not `storage.qdrant.indexing_threshold_kb` under another name — one
+  counts vectors in a corpus, the other kilobytes of vectors in a segment. Every surface reports
+  no index state rather than an empty one (§6.2.2 is the reason that distinction is kept).
 - **No shadow generations, and therefore no durable re-embedding.** §6.5's replacement is a
   directory swap behind a SQLite pointer, and `manicule.app.runtime` refuses a durable re-embed
   by name on any backend that does not implement it — by asking whether `storage.vector_db` is
@@ -2356,7 +2447,10 @@ backends.
 - **Back the collection up with Qdrant's own tooling**, on Qdrant's own schedule. A snapshot
   taken independently of the SQLite backup is skewed against it in an unknown direction, so
   the restored pair must be reconciled the way §8.3 reconciles any crash: the authority wins,
-  and vectors it does not account for are tombstoned rather than trusted.
+  and vectors it does not account for are tombstoned rather than trusted. A restored collection
+  comes back in the shape it had when the snapshot was taken, and the next `ensure_ready` brings
+  it to this installation's `storage.qdrant` — or refuses it, when its vectors are not ones this
+  store can write (§6.7).
 
 **The acceptance test in §9.3 does not exercise this backend**, and that is a statement about
 what it proves rather than a gap to paper over: step 3 destroys the data directory, which

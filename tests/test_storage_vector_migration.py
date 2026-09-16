@@ -37,7 +37,12 @@ from manicule.storage.vector_schema import (
     VECTOR_COLUMN,
 )
 from manicule.storage.vectors import LanceVectorStore
-from tests.qdrant_support import TEST_COLLECTION_PREFIX, local_client, require_server
+from tests.qdrant_support import (
+    TEST_COLLECTION_PREFIX,
+    local_client,
+    remote_client,
+    require_server,
+)
 from tests.storage_helpers import fingerprint, make_chunk, make_document
 from tests.vector_helpers import nudged, read_column, rewrite_row
 
@@ -422,7 +427,7 @@ async def test_the_physical_row_id_survives_the_move(
 @pytest.fixture
 async def server_target() -> AsyncGenerator[QdrantVectorStore]:
     """A store on a real Qdrant, in a workspace of its own, cleaned up afterwards."""
-    client = AsyncQdrantClient(url=require_server(), timeout=30)
+    client = remote_client(require_server())
     store = QdrantVectorStore(
         client,
         workspace_id=f"{WORKSPACE}-{uuid.uuid4()}",
@@ -493,7 +498,7 @@ async def test_a_migrated_vector_survives_the_transport_intact(
     # transport serializes it as decimal text; comparing the parsed float64 would fail on a
     # store that had done nothing wrong.
     assert len(before) == 6
-    verifier = AsyncQdrantClient(url=require_server(), timeout=30)
+    verifier = remote_client(require_server())
     try:
         for row_id, row in before.items():
             stored = (

@@ -127,9 +127,10 @@ def build_qdrant_vector_store(context: BuildContext) -> VectorStore:
     diagnostic command fail on the thing it was invoked to diagnose.
 
     The store is given the workspace, because Qdrant has one flat namespace and the isolation a
-    directory gives the embedded store has to be in the collection's name instead. It is also
-    told it owns the client, so the container's shutdown closes the sockets rather than leaving
-    them to the garbage collector.
+    directory gives the embedded store has to be in the collection's name instead. It is given
+    the collection's shape, which it applies to a collection that already exists as well as to
+    a new one. And it is told it owns the client, so the container's shutdown closes the sockets
+    rather than leaving them to the garbage collector.
 
     Raises:
         ConfigError: The context carries configuration of some other type, or no endpoint. The
@@ -140,7 +141,7 @@ def build_qdrant_vector_store(context: BuildContext) -> VectorStore:
     """
     from qdrant_client import AsyncQdrantClient  # noqa: PLC0415 - see module docstring
 
-    from manicule.storage.qdrant import QdrantVectorStore  # noqa: PLC0415
+    from manicule.storage.qdrant import CollectionShape, QdrantVectorStore  # noqa: PLC0415
 
     config = context.config
     if not isinstance(config, QdrantVectorStoreConfig):
@@ -179,6 +180,15 @@ def build_qdrant_vector_store(context: BuildContext) -> VectorStore:
         client,
         workspace_id=settings.workspace,
         collection_prefix=qdrant.collection_prefix,
+        shape=CollectionShape(
+            quantization=qdrant.quantization,
+            quantization_always_ram=qdrant.quantization_always_ram,
+            on_disk_vectors=qdrant.on_disk_vectors,
+            on_disk_payload=qdrant.on_disk_payload,
+            hnsw_m=qdrant.hnsw_m,
+            hnsw_ef_construct=qdrant.hnsw_ef_construct,
+            indexing_threshold_kb=qdrant.indexing_threshold_kb,
+        ),
         owns_client=True,
     )
 
