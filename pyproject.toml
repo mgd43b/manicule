@@ -99,6 +99,10 @@ parsers = [
   "markdown-it-py>=3.0",
   "ruamel.yaml>=0.18",
   "tiktoken>=0.8",
+  # `.msg` is a compound file holding MAPI properties as named streams, and this reads compound
+  # files. BSD-2-Clause, and the layer the GPL-3.0 `extract-msg` itself sits on — docs/parsing.md
+  # §12 records why that one is refused under every license this project has carried.
+  "olefile>=0.47",
 ]
 retrieval = [      # #6
   # Context fitting only. It is a stand-in for the generator's tokenizer, not a claim to be

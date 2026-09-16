@@ -166,12 +166,19 @@ class ParseRunner(Protocol):
 
 
 async def attempt_one(parser: object, name: str, raw: RawDocument) -> AttemptResult:
-    """Give one already-constructed parser its turn, expanding it if it is a container.
+    """Give one already-constructed parser its turn, reading it and expanding it.
 
     Shared by the in-process runner and by the worker, so that the two cannot diverge on the
-    question they most easily would: whether this document is a container. Expansion is tried
-    **first** for a parser that supports it, because such a parser's ``parse`` succeeds while
-    producing nothing, and running it first would spend the attempt discovering that.
+    question they most easily would: whether this document is a container.
+
+    **Expansion is tried first, and then the document is read anyway.** Trying expansion first
+    is right — a parser that declines to expand these bytes has declined, and reading them
+    would be work spent on an answer already given. Stopping there was not. It held for the
+    archive parser, whose ``parse`` yields nothing by design, and was wrong for every parser
+    that both reads and expands: a ``.eml`` has headers and a body that are content, and only
+    its attachments are members. Returning no blocks made every plain email in a corpus arrive
+    with nothing in it, reported as ``parsed``, and the shape of the failure is why it went
+    unnoticed — the parser's own suite exercises ``parse`` directly and passes.
     """
     from manicule.parsers.chain import ParserChain  # noqa: PLC0415 - avoids an import cycle
     from manicule.parsers.expansion import SupportsExpansion, read_members  # noqa: PLC0415
@@ -188,8 +195,18 @@ async def attempt_one(parser: object, name: str, raw: RawDocument) -> AttemptRes
         except Exception as exc:  # noqa: BLE001 - a container's own bug fails one document
             reason = f"{type(exc).__name__}: {exc}"
             return AttemptResult([], Attempt(parser=name, outcome=Outcome.FAILED, reason=reason))
+        expanded = ParserChain(parsers={name: parser}, chains={})  # pyright: ignore[reportArgumentType]
+        blocks, read = await expanded.attempt(name, raw)
+        if read.outcome is Outcome.FAILED:
+            # Expansion worked and reading broke, which is a broken document rather than a
+            # container: publishing the members of a message whose own body could not be read
+            # would index the attachments and silently lose what they were attached to.
+            return AttemptResult([], read)
+        # ``DECLINED`` and ``EMPTY`` are both ordinary here — an archive has no text of its own,
+        # and a message can be an attachment with no body. The attempt still succeeded, because
+        # expansion is what this parser was asked for.
         return AttemptResult(
-            [], Attempt(parser=name, outcome=Outcome.PARSED), members=tuple(members)
+            list(blocks), Attempt(parser=name, outcome=Outcome.PARSED), members=tuple(members)
         )
 
     chain = ParserChain(parsers={name: parser}, chains={})  # pyright: ignore[reportArgumentType]

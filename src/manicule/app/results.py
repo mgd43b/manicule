@@ -2316,10 +2316,14 @@ class Check(Payload):
     ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``plugins``,
     ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
     ``authoring``, ``collection-membership``, ``sessions``, ``document-identity``,
-    ``document-content``, ``wiki-provenance``, ``grammars``, ``vocabularies``, ``models``, and
-    ``component:<kind>:<name>`` for anything already constructed. It is what a monitor selects
-    on, so it is chosen once and does not move with the wording — which is why the two spellings
-    in that list stay as they are rather than being tidied into one.
+    ``document-content``, ``extractable-text``, ``wiki-provenance``, ``grammars``,
+    ``vocabularies``, ``models``, and ``component:<kind>:<name>`` for anything already
+    constructed. ``vector_backend`` is emitted too and had been missing from this list since it
+    was added, which is the drift this enumeration exists to prevent and is now corrected.
+
+    It is what a monitor selects on, so a name is chosen once and does not move with the
+    wording — which is why the two spellings in that list stay as they are rather than being
+    tidied into one.
 
     ``collection-membership`` is spelled the long way for a reason worth writing down, since the
     obvious shorter names are both taken. ``collections`` is what a vector backend calls its own

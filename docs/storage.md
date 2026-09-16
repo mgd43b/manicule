@@ -422,8 +422,21 @@ hard deletion is `RESTRICT` and requires its documents be dealt with first.
 its own `Document` with a `zip:<container>!/<inner/path>` URI, and deleting the container
 must delete its members. That is a foreign key, so it is a column — it cannot be a key
 inside `metadata`, and `chunk_relations` is the wrong table because this relates documents,
-not chunks. `container_depth` carries a `CHECK` against a configured maximum so a nested
-archive cannot recurse without bound.
+not chunks. `container_depth` records what the expansion decided; the bound on it is enforced
+during expansion (`parsing.md` §9.2) and **deliberately not as a `CHECK`**. A `CHECK` cannot be
+added to `documents` on SQLite without a batch rebuild, and a batch rebuild of this table fires
+every `ON DELETE CASCADE` pointing at it and empties chunks, versions, tags, collection
+membership and glossary entries while reporting success. A constraint bought at that price is
+not worth what it guards, and the guard it duplicates already runs.
+
+The foreign key itself has the same origin and one visible consequence. SQLite cannot ALTER a
+constraint onto an existing table, so it is declared inline in `ADD COLUMN`, which the engine
+does accept — `PRAGMA foreign_key_list` reports it with `ON DELETE CASCADE` and enforces it. What
+that costs is the constraint's *name* on reflection, because SQLAlchemy recovers foreign-key
+names by parsing the table-constraint spelling out of the stored DDL and a column-level
+`REFERENCES` has none. So this one constraint is excluded from the schema comparison
+(`manicule.storage.autogen.UNREFLECTABLE_FOREIGN_KEYS`) and the cascade is held honest by a test
+that deletes a container and looks for its members instead.
 
 **Re-deriving a container's members is a reconcile, not a delete-then-insert.**
 `docs/parsing.md` re-derives every member when a container's bytes change, on the grounds

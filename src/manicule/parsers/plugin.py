@@ -99,6 +99,14 @@ PARSERS: tuple[_Registration, ...] = (
         summary="Heading anchors, deep-linking only where the author supplied an id.",
     ),
     _Registration(
+        name="msg",
+        module="manicule.parsers.msg",
+        factory="MsgParser",
+        config_model=parser_config.MsgConfig,
+        media_types=parser_config.MSG_MEDIA_TYPES,
+        summary="Outlook .msg, reconstituted as a message and read by the email parser.",
+    ),
+    _Registration(
         name="drawio",
         module="manicule.parsers.drawio",
         factory="DrawioParser",

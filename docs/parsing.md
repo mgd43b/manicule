@@ -453,9 +453,10 @@ emitted — the parser emits `Unlocated(reason="ambiguous heading path")` instea
 
 ### 2.4 Per-format anchor strategy
 
-Twelve parsers over eighteen extensions, plus the two Confluence body formats, which are not
-file types. Every row names the `Anchor` variant, where the location physically comes from, and
-whether provenance is real.
+Fourteen parsers over the eighteen extensions of the capability floor plus `.msg`, `.drawio` and
+`.drawio.png`, and plus the two Confluence body formats, which are not file types. Every row
+names the `Anchor` variant, where the location physically comes from, and whether provenance is
+real.
 
 | Parser | Extensions | Anchor | Location source | Provenance |
 |---|---|---|---|---|
@@ -469,19 +470,22 @@ whether provenance is real.
 | **XLSX / CSV** | `.xlsx` `.csv` | `CellAnchor(sheet, ref)` | sheet name + the row/column range the block covers, as `Sheet1!B4:D12`. A CSV has no sheet, so `sheet` is the file stem | **Exact** |
 | **PPTX** | `.pptx` | `PageAnchor(page, rects)` | slide index (1-based, presentation order); shape geometry → `Rect` | **Exact** |
 | **Jupyter** | `.ipynb` | `HeadingAnchor(path, "cell-<id>")` | markdown-cell heading tree; fragment is the nbformat cell `id` | **Exact** for nbformat ≥ 4.5; see §2.5 below |
-| **Email** | `.eml` `.msg` | `LineAnchor(start, end, None)` | line span within the canonical text — headers, blank line, body (§10) | **Exact**, given the part-selection rule |
+| **Email** | `.eml` | `LineAnchor(start, end, None)` | line span within the canonical text — headers, blank line, body (§10) | **Exact**, given the part-selection rule |
+| **Outlook** | `.msg` | `LineAnchor(start, end, None)` | the same span, in the message the MAPI properties reconstitute (§10) | **Exact**, and identical to `.eml` by construction |
 | **Plain text** | `.txt` | `LineAnchor(start, end, None)` | source line numbers | **Exact** |
 | **Structured** | `.json` `.yaml` `.yml` `.toml` | `LineAnchor(start, end, symbol)` | source line span; `symbol` is the dotted key path, with `[n]` for an array index | **Exact** where positions exist (§11) |
 | **draw.io** | `.drawio` `.drawio.png` | `HeadingAnchor(path, fragment\|None)` | the page's own `name`, else its `id`; fragment only where two pages share one name (§8.4.6) | **Exact.** The name is the file's, never the tab's position |
 | **Archive** | `.zip` | *(none — emits no chunks)* | members become their own documents with their own anchors (§9) | N/A |
 
-Twelve parsers over the eighteen extensions of `PLAN.md` §5 and the `CAPABILITIES.md` file-type
-list, plus draw.io, which is past that floor rather than on it — the floor has no diagram row at
-all, and §8.4.6 is why one exists here. XLSX and CSV share one parser because the anchor and the
-block model are identical once a CSV is given a sheet name. The code parser is the exception to the
-eighteen — its extension set is the grammar pack's language list, which is deliberately
-wider than the capability floor, since real ASTs across many languages is one of the two
-upgrades this ticket exists for.
+Twelve of those parsers cover the eighteen extensions of `PLAN.md` §5 and the `CAPABILITIES.md`
+file-type list. The other two are past that floor rather than on it: draw.io, because the floor
+has no diagram row at all and §8.4.6 is why one exists here; and `.msg`, which is on the floor as
+an extension but is its own parser rather than a second `.eml` spelling, because reading it is a
+MAPI property reader (§10). XLSX and CSV share one parser because the anchor and the block model
+are identical once a CSV is given a sheet name. The code parser is the exception to the eighteen
+— its extension set is the grammar pack's language list, which is deliberately wider than the
+capability floor, since real ASTs across many languages is one of the two upgrades this ticket
+exists for.
 
 **The last two rows are body formats rather than file types**, which is why the count above
 separates them. Both are Confluence, both register under a profiled media type, and neither has
@@ -2292,15 +2296,25 @@ positional: a member that moves within the archive keeps its identity, and one i
 of another does not steal it.
 
 `container_id` and `container_depth` are **real columns rather than metadata**, because the
-cascade in §9.1 is a foreign key and a foreign key cannot point into a JSON field. Depth is
-additionally bounded by a `CHECK` in the schema, so the limit in §9.2 holds even against a
-code path that forgets to check it.
+cascade in §9.1 is a foreign key and a foreign key cannot point into a JSON field — and because
+reconciliation joins on ownership twice, neither of which can read a `source_id`: connector-level
+reconciliation excludes derived documents, and a re-expansion retires the members its container
+no longer produces.
+
+Depth is **not** additionally bounded by a `CHECK`. Acquiring one would mean rebuilding
+`documents`, which fires every cascade pointing at it and empties the corpus's derived state
+while reporting success ([`storage.md`](storage.md) §4.2). The bound in §9.2 is enforced where it
+always was, during expansion, and the column records what that decided.
 
 **The container itself emits no chunks** and gets status `container` (§6.4). It is not
 `no_extractable_text` — nothing failed, and conflating the two would put every archive into
 the bucket that triggers the OCR warning in §6.5. The container is not indexed as a manifest
 either; a chunk listing filenames is retrieval noise that competes with the real content
-inside it. The member list is metadata, visible through `document list --container <id>`.
+inside it. Which documents came out of a container is a column on them rather than a list on it,
+so it is a query against `container_id` — and a query the store answers directly, which is what
+`Document.container_members` is for. There is no `document list --container` flag: `Filter` is
+the one type carrying a security boundary, and widening it is a decision about that boundary
+rather than a convenience to add in passing.
 
 **Deletion cascades.** Removing a container removes its members — `ON DELETE CASCADE` on
 `container_id` ([`storage.md`](storage.md) §4.2).
@@ -2436,7 +2450,7 @@ Quoted reply chains are kept. Trimming them is a retrieval optimization with a r
 not a parsing decision.
 
 **Attachments recurse into the parser chain**, as archive members do (§9.1): each becomes a
-document with `container_document_id` pointing at the message. This matches what the
+document with `container_id` pointing at the message. This matches what the
 Confluence connector does with page attachments
 ([`confluence.md`](connectors/confluence.md) §6), so a PDF is a PDF wherever it arrived
 from.
@@ -2487,9 +2501,32 @@ transport — drafts and items in Sent Items, which is a large share of what peo
 There the shim synthesizes headers from `PR_SUBJECT`, the sender properties and the
 recipient table. The synthesized path is a required fixture (§3.5).
 
-Because this is a MAPI property reader rather than a library call, it is sized as its own
-unit of work and filed as [#21](https://github.com/mgd43b/manicule/issues/21). `.eml` ships
-in v1 regardless; `.msg` is not blocking.
+Because this is a MAPI property reader rather than a library call, it was sized as its own unit
+of work and filed as [#21](https://github.com/mgd43b/manicule/issues/21). **Built**, as
+`manicule.parsers.msg.MsgParser` over `olefile`, and built exactly as the shim above describes:
+the transport headers and the body are read out, reconstituted as an RFC 5322 message, and
+handed to `MailParser`. Attachments are reconstituted as MIME parts rather than read out of the
+MAPI storages separately, so a `.msg` attachment and a `.eml` attachment become members through
+one code path, under one identity scheme and one depth budget.
+
+Three details of the reader are worth having in the document rather than only in the code.
+
+**Only five headers are carried across** — `From`, `To`, `Cc`, `Date`, `Subject`, the ones this
+parser renders. The MIME headers beside them in the transport block are deliberately dropped: the
+body is rebuilt from MAPI properties, so a `Content-Transfer-Encoding` copied from the original
+would assert an encoding that no longer describes the bytes it labels.
+
+**Both string spellings are read rather than deduced from the flag.** `STORE_UNICODE_OK` signals
+it once for the file, but only one of `…001F` and `…001E` is present for any given property, so
+looking for both is determinate rather than a guess — and a file that disagrees with its own flag
+still reads.
+
+**`PidTagRecipientType` is `PT_LONG`, so it is not beside the strings.** A fixed-width property
+lives in the storage's own `__properties_version1.0` — eight reserved bytes, then sixteen per
+entry — and a reader looking for `__substg1.0_0C150003` finds nothing, defaults, and silently
+promotes every `Cc` to a `To`. `Bcc` is dropped rather than rendered: a header this reader
+invented, naming people the message deliberately did not name to its recipients, is not a fact
+about the message.
 
 ---
 
@@ -2554,6 +2591,7 @@ nobody when to re-check it.
 | **tree-sitter-language-pack** | MIT; grammars uniformly permissive by stated upstream policy | policy asserted at build time, not trusted (§8.1) |
 | **python-calamine**, **python-pptx**, **ruamel.yaml**, **markdown-it-py**, **olefile** | MIT / BSD-2-Clause | no obligations beyond attribution |
 | **selectolax** | wheel bundles **two** engines: lexbor (Apache-2.0) and Modest (**LGPL-2.1**) | import the lexbor backend only; see below |
+| **olefile** | BSD-2-Clause | the compound-file layer `.msg` is read through (§10) |
 | **extract-msg** | GPL-3.0 | **rejected**, as it was originally — see below |
 | **PyMuPDF** | **AGPL-3.0**, dual-licensed with an Artifex commercial license | **rejected**, and for a reason that outlived two relicenses — see below |
 
@@ -2570,9 +2608,12 @@ split in miniature. The version of this project that admitted `extract-msg` had 
 one dependency that actually needed copyleft — the MLX backend — costs a second `uv pip install`
 and buys the permissive license back for everything else.
 
-So §10's permissive routes are the plan, and
-[#21](https://github.com/mgd43b/manicule/issues/21) is a BSD-licensed reader or a hand-written
-MAPI property reader.
+So §10's permissive routes were the plan, and
+[#21](https://github.com/mgd43b/manicule/issues/21) shipped as the second of them: a hand-written
+MAPI property reader over `olefile` (BSD-2-Clause), which is the layer `extract-msg` itself sits
+on. The reader is about three hundred lines, which is what the copyleft objection actually cost —
+worth recording, because "we could not use the obvious library" is the kind of claim that reads
+as expensive until somebody writes down the number.
 
 ### PyMuPDF is refused under every license this project has carried
 

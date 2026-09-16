@@ -123,6 +123,7 @@ _MEDIA_TYPE_BY_SUFFIX: dict[str, str] = {
     ".ipynb": "application/x-ipynb+json",
     ".json": "application/json",
     ".md": "text/markdown",
+    ".msg": "application/vnd.ms-outlook",
     ".pdf": "application/pdf",
     ".toml": "application/toml",
     ".txt": "text/plain",

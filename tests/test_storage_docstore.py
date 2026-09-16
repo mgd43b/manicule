@@ -497,6 +497,89 @@ async def test_known_source_ids_yields_what_reconciliation_diffs_against(
     assert seen == {"1", "2"}
 
 
+async def test_a_derived_member_is_absent_from_what_reconciliation_diffs_against(
+    store: SqliteDocStore,
+) -> None:
+    """A member's source id was never in any inventory, so counting it makes it always missing.
+
+    The arithmetic is the defect: every member of every container lands in the missing set on
+    every pass, and the deletion ceiling becomes the only thing between a current document and
+    the trash. It narrows the denominator too — a corpus that is mostly archive members would
+    otherwise measure its missing fraction against a live count padded with documents no
+    inventory can contain.
+    """
+    container = make_document(source="confluence", source_id="bundle.zip")
+    await store.upsert_document(container)
+    await store.upsert_document(
+        make_document(
+            source="confluence",
+            source_id="zip:bundle.zip!/report.pdf",
+            container_id=container.id,
+            container_depth=1,
+        )
+    )
+
+    async with closing(store.known_source_ids("confluence")) as ids:
+        seen = {source_id async for source_id in ids}
+
+    assert seen == {"bundle.zip"}
+
+
+async def test_container_members_returns_what_a_re_expansion_is_diffed_against(
+    store: SqliteDocStore,
+) -> None:
+    """The stored children, because the question is which members have *gone*.
+
+    Ordered by source id so a container expanded twice retires its absent members in the same
+    order both times, which is what makes a run report comparable rather than merely correct.
+    """
+    container = make_document(source="confluence", source_id="bundle.zip")
+    other = make_document(source="confluence", source_id="other.zip")
+    await store.upsert_document(container)
+    await store.upsert_document(other)
+    for name in ("zip:bundle.zip!/b.txt", "zip:bundle.zip!/a.txt"):
+        await store.upsert_document(
+            make_document(source="confluence", source_id=name, container_id=container.id)
+        )
+    await store.upsert_document(
+        make_document(source="confluence", source_id="zip:other.zip!/c.txt", container_id=other.id)
+    )
+
+    members = await store.container_members(container.id)
+
+    assert [member.source_id for member in members] == [
+        "zip:bundle.zip!/a.txt",
+        "zip:bundle.zip!/b.txt",
+    ]
+
+
+async def test_hard_deleting_a_container_takes_its_members_with_it(
+    store: SqliteDocStore,
+) -> None:
+    """The cascade is enforced by the database, and this is what proves it still is.
+
+    ``container_id``'s foreign key has to be added inline in ``ADD COLUMN``, which costs SQLite
+    the constraint's *name* on reflection and therefore costs autogenerate the ability to
+    compare it — so the schema comparison is filtered and this behaviour is what holds the
+    cascade honest instead.
+    """
+    container = make_document(source="confluence", source_id="bundle.zip")
+    member = make_document(
+        source="confluence", source_id="zip:bundle.zip!/report.pdf", container_id=container.id
+    )
+    await store.upsert_document(container)
+    await store.upsert_document(member)
+    await store.replace_chunks(member.id, [make_chunk(member, 0, "the quarterly report")])
+
+    await store.delete_document(container.id)
+
+    assert await store.get_document(member.id) is None
+    assert await store.count_chunks(member.id) == 0, (
+        "the cascade runs at two levels — container to member, member to chunks — and the "
+        "second is what leaves a lexical index citing a document nothing can resolve"
+    )
+
+
 async def test_a_soft_deleted_document_is_absent_from_reconciliation(
     store: SqliteDocStore,
 ) -> None:

@@ -78,6 +78,7 @@ def test_no_parser_records_a_version_for_a_library_it_does_not_use() -> None:
         "lxml": ("docx", "pptx"),
         "markdown-it-py": ("markdown",),
         "nbformat": ("notebook",),
+        "olefile": ("msg",),
         "python-calamine": ("spreadsheet",),
         "python-docx": ("docx",),
         "python-pptx": ("pptx",),

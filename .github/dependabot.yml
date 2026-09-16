@@ -200,6 +200,7 @@ updates:
           - "python-pptx"
           - "python-calamine"
           - "nbformat"
+          - "olefile"
           - "markdown-it-py"
           - "ruamel*"
 
@@ -245,6 +246,7 @@ updates:
           - "python-pptx"
           - "python-calamine"
           - "nbformat"
+          - "olefile"
           - "markdown-it-py"
           - "ruamel*"
 

@@ -3383,11 +3383,29 @@ class IngestPipeline:
             blobs=blobs,
         )
         outcomes = [outcome]
-        queue: list[MemberOutcome] = list(members)
+        # Each member is queued beside the document it came out of. The queue is flat so that a
+        # nested container cannot starve the batch, and a flat queue is exactly where ownership
+        # would otherwise be lost: by the time a member of a member is drained, the document it
+        # belongs to is several iterations behind.
+        queue: list[tuple[str, MemberOutcome]] = [(outcome.document_id, item) for item in members]
+        # Which containers were expanded in this run, and to what. Populated even when the
+        # expansion produced nothing, because an archive emptied to zero members is exactly the
+        # case whose children all have to be retired — and it is the case a "did it yield
+        # members" test would skip.
+        derived: dict[str, set[str]] = {}
+        if not outcome.skipped and (
+            members or (existing is not None and existing.status is DocumentStatus.CONTAINER)
+        ):
+            derived[outcome.document_id] = set()
         while queue:
-            member = queue.pop(0)
+            owner, member = queue.pop(0)
+            derived.setdefault(owner, set()).add(member.source_id)
             if isinstance(member, MemberFailure):
-                outcomes.append(await self._record_member_failure(member, source))
+                outcomes.append(
+                    await self._record_member_failure(
+                        member, source, owner=owner, depth=member.depth
+                    )
+                )
                 continue
             member_raw = _member_raw(member)
             member_existing = await self._store.find_document(source, member_raw.source_id)
@@ -3401,9 +3419,15 @@ class IngestPipeline:
                 existing=member_existing,
                 force=retry_member,
                 blobs=blobs,
+                container_id=owner,
+                container_depth=member.depth,
             )
             outcomes.append(inner)
-            queue.extend(deeper)
+            queue.extend((inner.document_id, item) for item in deeper)
+            if deeper:
+                derived.setdefault(inner.document_id, set())
+        for container, present in derived.items():
+            outcomes.extend(await self._retire_absent_members(container, present))
         return outcomes
 
     async def _ingest_one(
@@ -3418,6 +3442,8 @@ class IngestPipeline:
         expected: DocumentRevision | None = None,
         retention: Retention | None = None,
         blobs: BlobSink | None = None,
+        container_id: str | None = None,
+        container_depth: int = 0,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """One document, and whatever it turned out to contain."""
         source_bytes = raw.as_bytes()
@@ -3462,6 +3488,8 @@ class IngestPipeline:
                     expected=expected,
                     retention=retention,
                     blobs=blobs,
+                    container_id=container_id,
+                    container_depth=container_depth,
                 )
             except _SupersededError as moved:
                 # Nothing was written, by construction: the guard fires on the first write this
@@ -3492,6 +3520,8 @@ class IngestPipeline:
         expected: DocumentRevision | None,
         retention: Retention | None,
         blobs: BlobSink | None,
+        container_id: str | None = None,
+        container_depth: int = 0,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """The part of one document's ingest that writes, under the lock and the guard.
 
@@ -3525,6 +3555,8 @@ class IngestPipeline:
                 version_token=version_token,
                 title=title,
                 retention=retention,
+                container_id=container_id,
+                container_depth=container_depth,
             )
             return failed, ()
         if transformed is None:
@@ -3543,6 +3575,8 @@ class IngestPipeline:
                 existing=existing,
                 expected=expected,
                 retention=retention,
+                container_id=container_id,
+                container_depth=container_depth,
             )
             return skipped, ()
         raw = transformed
@@ -3550,7 +3584,11 @@ class IngestPipeline:
         await self._advance(existing, DocumentStatus.PARSING)
 
         result, members = await self._parse(raw)
-        if members:
+        if members and not result.blocks:
+            # A container is a document with nothing of its own, and that is what the status
+            # says: zero chunks, its content being the documents its members became. A message
+            # with a body and an attachment is not that — it has text a reader would cite, and
+            # calling it a container would throw the body away to describe the attachment.
             result = container_result(len(members))
 
         document = await self._store_record(
@@ -3564,6 +3602,8 @@ class IngestPipeline:
             existing=existing,
             retention=retention,
             expected=expected,
+            container_id=container_id,
+            container_depth=container_depth,
         )
         if result.status is not DocumentStatus.PARSED:
             glossary_detail = ""
@@ -3599,19 +3639,57 @@ class IngestPipeline:
                 members,
             )
 
-        return (
-            await self._finish(
-                result,
-                document,
-                raw=raw,
-                existing=existing,
-                retention=retention,
-                expected=expected,
-            ),
-            (),
+        finished = await self._finish(
+            result,
+            document,
+            raw=raw,
+            existing=existing,
+            retention=retention,
+            expected=expected,
         )
+        # A document can have chunks *and* members — a message with a body and an attachment is
+        # the case — so the members travel with this outcome too. Returning none here was
+        # invisible while every member-producing document was a container and therefore never
+        # reached this branch.
+        if not members:
+            return finished, ()
+        return replace(finished, members=tuple(member.source_id for member in members)), members
 
-    async def _record_member_failure(self, member: MemberFailure, source: str) -> DocumentOutcome:
+    async def _retire_absent_members(
+        self, container_id: str, present: set[str]
+    ) -> list[DocumentOutcome]:
+        """Soft-delete the children this container no longer expands to.
+
+        **A reconcile, never a delete-then-insert.** Members still present keep their document
+        ids, and with them their ``document_versions`` chain and every citation that resolves
+        through them; a member that has gone is soft-deleted, so it is restorable inside the
+        grace period exactly like a document a connector stopped reporting. Re-minting ids for
+        two hundred unchanged members because one was removed is the cost this avoids, and the
+        history discarded doing it would not come back.
+
+        Called only for containers this run actually expanded. A container whose bytes were
+        unchanged is never expanded, so it derived nothing, and treating "derived nothing" as
+        "expands to nothing" would retire every member of every archive on the first sync that
+        found it unchanged — which is every sync after the first.
+        """
+        outcomes: list[DocumentOutcome] = []
+        for member in await self._store.container_members(container_id):
+            if member.source_id in present:
+                continue
+            await self._store.soft_delete_document(member.id)
+            outcomes.append(
+                DocumentOutcome(
+                    source_id=member.source_id,
+                    status=DocumentStatus.DELETED,
+                    document_id=member.id,
+                    detail="no longer present in the container that produced it",
+                )
+            )
+        return outcomes
+
+    async def _record_member_failure(
+        self, member: MemberFailure, source: str, *, owner: str | None = None, depth: int = 0
+    ) -> DocumentOutcome:
         """Store a member that could not become a document, with the reason it could not.
 
         Dropping it instead would make an archive's member set depend silently on what the
@@ -3641,6 +3719,8 @@ class IngestPipeline:
             title="",
             identifier=document_id(self._workspace, source, member.source_id),
             existing=await self._store.find_document(source, member.source_id),
+            container_id=owner,
+            container_depth=depth,
             retention=Retention(
                 omitted_reason="not retained: a member that could not be read has no bytes"
             ),
@@ -4357,6 +4437,8 @@ class IngestPipeline:
         existing: Document | None,
         retention: Retention,
         expected: DocumentRevision | None = None,
+        container_id: str | None = None,
+        container_depth: int = 0,
     ) -> Document:
         """Write the document row for whatever the chain concluded.
 
@@ -4442,6 +4524,20 @@ class IngestPipeline:
                 if canonical and canonical.title
                 else title or (existing.title if existing else "")
             ),
+            # Threaded from the expansion that produced this document, and falling back to
+            # what is already stored so that a re-parse — which rebuilds a `RawDocument` from
+            # retained bytes and knows nothing about any archive — does not orphan a member it
+            # was only repairing.
+            container_id=(
+                container_id
+                if container_id is not None
+                else (existing.container_id if existing else None)
+            ),
+            container_depth=(
+                container_depth
+                if container_id is not None
+                else (existing.container_depth if existing else 0)
+            ),
             content_hash=digest,
             version_token=version_token,
             original_ref=retention.ref,
@@ -4497,6 +4593,8 @@ class IngestPipeline:
         existing: Document | None,
         expected: DocumentRevision | None = None,
         retention: Retention | None = None,
+        container_id: str | None = None,
+        container_depth: int = 0,
     ) -> DocumentOutcome:
         retention = retention or Retention(
             omitted_reason="not retained: no retention was attempted for this document"
@@ -4512,6 +4610,8 @@ class IngestPipeline:
             existing=existing,
             retention=retention,
             expected=expected,
+            container_id=container_id,
+            container_depth=container_depth,
         )
         glossary_detail = ""
         if result.status is not DocumentStatus.FAILED:
@@ -4601,6 +4701,8 @@ class IngestPipeline:
         version_token: str | None = None,
         title: str = "",
         retention: Retention | None = None,
+        container_id: str | None = None,
+        container_depth: int = 0,
     ) -> DocumentOutcome:
         """Record a failure that happened before there was anything to store.
 
@@ -4637,6 +4739,8 @@ class IngestPipeline:
             identifier=document_id(self._workspace, source, source_id),
             existing=None,
             retention=retention,
+            container_id=container_id,
+            container_depth=container_depth,
         )
 
     async def _demote(

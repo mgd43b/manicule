@@ -172,6 +172,12 @@ CORPORA: dict[str, Corpus] = {
         required=("typical.drawio", "multi-page.drawio", "uncompressed.drawio"),
         min_blocks=6,
     ),
+    "msg": Corpus(
+        directory="msg",
+        media_types={".msg": parser_config.MSG_MEDIA_TYPE},
+        required=("typical.msg", "synthesized-headers.msg", "ansi.msg"),
+        min_blocks=8,
+    ),
     "email": Corpus(
         directory="mail",
         media_types={".eml": "message/rfc822"},

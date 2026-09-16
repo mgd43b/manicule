@@ -708,6 +708,19 @@ def _declared(document: Document) -> str:
     return record.source.source_id
 
 
+SCANNED_CORPUS_RATIO = 0.05
+"""The share of ``no_extractable_text`` documents above which a source is probably scanned.
+
+Five per cent, and the number is a judgement rather than a measurement — which is why it is a
+named constant an operator can read rather than a literal inside a sentence. Below it the
+explanation is ordinary: a spacer image, a blank page, a PDF that is genuinely one picture.
+Above it the explanation is usually the corpus, and the answer to a scanned corpus is OCR
+(`#23 <https://github.com/mgd43b/manicule/issues/23>`_).
+
+Public because the threshold is part of what the check means: a monitor reading the `facts` gets
+the number the state was decided against rather than having to know it.
+"""
+
 _IDENTITY_SCAN = 10_000
 """How many documents the identity dry run examines before it stops and says it stopped.
 
@@ -3093,6 +3106,9 @@ class ApplicationService:
         checks.append(await self._sessions_check())
         checks.append(await self._document_identity_check())
         checks.append(await self._document_content_check())
+        # After the two content checks and for the same reason they are adjacent: this one is
+        # also about what is *in* a document rather than about whether the machinery works.
+        checks.append(await self._extractable_text_check())
         checks.append(await self._wiki_provenance_check())
         checks.append(await self._grammar_check(fix=fix))
         checks.append(await self._vocabulary_check(fix=fix))
@@ -4062,6 +4078,83 @@ class ApplicationService:
                 },
             ),
             remedy=f"manicule document list --source {first.source}",
+        )
+
+    async def _extractable_text_check(self) -> r.Check:
+        """Sources whose documents are mostly text nothing could read out of them.
+
+        **The mechanism that makes an out-of-scope decision revisitable rather than forgotten.**
+        ``no_extractable_text`` is a first-class status precisely so that a document with nothing
+        readable in it is visible rather than indexed as an empty success
+        (``docs/parsing.md`` §6.5), and a handful of them is ordinary — a spacer image, a blank
+        page. A *share* of them is a different fact: past a few per cent the likely explanation
+        is that the corpus is scanned, and the answer to a scanned corpus is OCR, which manicule
+        does not do ([#23](https://github.com/mgd43b/manicule/issues/23)).
+
+        So this is the trigger that ticket names, and the reason it is a check rather than a note
+        in a document: nobody reads a document to discover that the thing they are looking at is
+        the thing it describes. ``degraded`` rather than ``failing`` because nothing is damaged —
+        the documents are stored, correctly, with the right status, and are selectable for
+        re-parse the day an engine exists. What is absent is a capability.
+
+        Counted in the database per source rather than by walking the corpus, so a large index
+        costs two counts per configured connector.
+        """
+        try:
+            store = await self._backend.documents()
+            sources = sorted(self.settings.connectors)
+            measured = {
+                source: (
+                    await store.count_documents(
+                        source=source, statuses=(DocumentStatus.NO_EXTRACTABLE_TEXT,)
+                    ),
+                    total,
+                )
+                for source in sources
+                if (total := await store.count_documents(source=source))
+            }
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            return r.Check(
+                name="extractable-text",
+                state="unknown",
+                detail=f"the corpus could not be examined: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        over = {
+            source: counts
+            for source, counts in measured.items()
+            if counts[0] / counts[1] > SCANNED_CORPUS_RATIO
+        }
+        share = {source: round(empty / total, 4) for source, (empty, total) in measured.items()}
+        if not over:
+            return r.Check(
+                name="extractable-text",
+                state="ok",
+                detail=(
+                    "no sources are configured, so there is no corpus to measure"
+                    if not measured
+                    else "every source yields text from all but a small share of its documents"
+                ),
+                facts={"sources": len(measured), "threshold": SCANNED_CORPUS_RATIO, **share},
+            )
+        named = ", ".join(
+            f"{source} ({empty}/{total})" for source, (empty, total) in sorted(over.items())
+        )
+        return r.Check(
+            name="extractable-text",
+            state="degraded",
+            detail=(
+                f"more than {SCANNED_CORPUS_RATIO:.0%} of the documents in {named} yielded no "
+                f"extractable text. A few such documents are ordinary; this many usually means "
+                f"the source is scanned, and manicule does not do OCR — so that content is "
+                f"stored and not searchable. The documents are kept with their status, so "
+                f"nothing is lost and they are selectable for re-parse if that changes."
+            ),
+            facts={"sources": len(measured), "threshold": SCANNED_CORPUS_RATIO, **share},
+            remedy=(
+                f"manicule document list --source {sorted(over)[0]} "
+                f"# then read a few: if they are scans, #23 is the ticket"
+            ),
         )
 
     async def _document_content_check(self) -> r.Check:

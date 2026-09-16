@@ -515,10 +515,25 @@ class ReconciliationJournalMixin(WorkspaceScoped):
         return row
 
     def _live_documents(self, run: models.ReconciliationRun) -> tuple[Any, ...]:
+        """What this connector's inventory is diffed against, and what it is not.
+
+        ``container_id IS NULL`` is the load-bearing clause. An archive member's source id is
+        ``zip:<container>!/<path>``: the connector never reported it and never could, so a
+        derived document is absent from every inventory by construction. Counting it makes
+        every member of every container a deletion candidate on every pass, and the ceiling is
+        then the only thing standing between a current document and the trash. Members are
+        reconciled against the container that owns them, when that container is re-expanded.
+
+        It narrows the denominator as well as the numerator, which is the half that is easy to
+        miss: a corpus that is mostly archive members would otherwise compute its missing
+        fraction against a live count padded with documents that can never be in an inventory,
+        making the ceiling read as comfortable while the proposal is entirely wrong.
+        """
         return (
             models.Document.workspace_id == self._workspace_id,
             models.Document.source == run.connector_name,
             models.Document.deleted_at.is_(None),
+            models.Document.container_id.is_(None),
         )
 
     async def _apply_candidates(

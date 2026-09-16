@@ -214,6 +214,13 @@ class MemoryIngestStore:
                 return self._with_lineage(document)
         return None
 
+    async def container_members(self, container_id: str) -> Sequence[Document]:
+        return tuple(
+            self._with_lineage(document)
+            for document in sorted(self.documents.values(), key=lambda item: item.source_id)
+            if document.container_id == container_id and document.id not in self.deleted_at
+        )
+
     async def dependent_documents(
         self, source: str, source_ids: Collection[SourceId]
     ) -> Sequence[Document]:
@@ -544,8 +551,17 @@ class MemoryIngestStore:
         self.watermarks[connector] = watermark
 
     async def known_source_ids(self, connector: str) -> AsyncIterator[SourceId]:
+        """Only what the connector itself supplied, matching the real store's predicate.
+
+        A fake that returned derived members too would let the exclusion regress while every
+        in-memory reconciliation test went on passing.
+        """
         for document in list(self.documents.values()):
-            if document.source == connector and document.id not in self.deleted_at:
+            if (
+                document.source == connector
+                and document.id not in self.deleted_at
+                and document.container_id is None
+            ):
                 yield document.source_id
 
     async def connector_metadata(self, connector: str) -> Metadata:
@@ -1028,11 +1044,16 @@ class BrokenRunner:
 
 
 class DictConnector:
-    """A connector over a dictionary, with a settable version token per document."""
+    """A connector over a dictionary, with a settable version token per document.
 
-    def __init__(self, documents: Mapping[str, str], *, name: str = "memory") -> None:
+    Bodies are ``str`` or ``bytes``, because a real connector returns bytes and a fake that
+    only accepted text would quietly confine every test to documents whose exact bytes do not
+    matter — which excludes a mail message, whose boundaries and CRLFs are the whole of it.
+    """
+
+    def __init__(self, documents: Mapping[str, str | bytes], *, name: str = "memory") -> None:
         self.name = name
-        self.documents = dict(documents)
+        self.documents: dict[str, str | bytes] = dict(documents)
         self.media_types: dict[str, str] = {}
         self.fetches: list[str] = []
         self.fail_fetch: set[str] = set()

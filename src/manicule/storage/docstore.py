@@ -187,6 +187,27 @@ class SqliteDocStore(
             ).scalar_one_or_none()
             return None if row is None else to_document(row)
 
+    async def container_members(self, container_id: str) -> Sequence[Document]:
+        """Every live document currently owned by one container, in ``source_id`` order.
+
+        Ordered so that a container re-expanded twice retires its absent members in the same
+        order both times, which is what makes the run report comparable rather than merely
+        correct. ``ix_documents_container_id`` covers the predicate.
+        """
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.Document)
+                    .where(
+                        models.Document.workspace_id == self._workspace_id,
+                        models.Document.container_id == container_id,
+                        models.Document.deleted_at.is_(None),
+                    )
+                    .order_by(models.Document.source_id)
+                )
+            ).scalars()
+            return [to_document(row) for row in rows]
+
     async def find_documents_by_uri(self, uri: str) -> Sequence[Document]:
         """Live documents of this workspace whose URI is exactly ``uri``.
 
@@ -1572,7 +1593,14 @@ class SqliteDocStore(
             row.run_metadata = cast("Any", merged)
 
     async def known_source_ids(self, connector: str) -> AsyncIterator[SourceId]:
-        """Every source id currently indexed for a connector.
+        """Every source id a connector itself supplied, currently indexed.
+
+        **Derived documents are excluded, and that is the whole point of the predicate.** A
+        member of an archive has a ``zip:<container>!/<path>`` source id that no connector
+        reported and none ever could, so including it puts every member of every container
+        permanently in reconciliation's missing set — where the only thing standing between a
+        current document and deletion is the ceiling. A container's own members are reconciled
+        against the container that owns them, by the expansion that derives them.
 
         Streamed rather than collected: reconciliation runs over whole corpora, and the diff
         does not need the list in memory at once.
@@ -1590,6 +1618,7 @@ class SqliteDocStore(
                     models.Document.workspace_id == self._workspace_id,
                     models.Document.source == connector,
                     models.Document.deleted_at.is_(None),
+                    models.Document.container_id.is_(None),
                 )
             )
             async for (source_id,) in result:

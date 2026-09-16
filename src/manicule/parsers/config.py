@@ -59,6 +59,8 @@ __all__ = [
     "DIAGRAM_MIDDLEWARE_NAME",
     "MAIL_MEDIA_TYPES",
     "MARKDOWN_MEDIA_TYPES",
+    "MSG_MEDIA_TYPE",
+    "MSG_MEDIA_TYPES",
     "NOTEBOOK_MEDIA_TYPE",
     "NOTEBOOK_MEDIA_TYPES",
     "PDF_MEDIA_TYPES",
@@ -79,6 +81,7 @@ __all__ = [
     "DiagramConfig",
     "MailConfig",
     "MarkdownConfig",
+    "MsgConfig",
     "NotebookConfig",
     "PdfConfig",
     "PlaintextConfig",
@@ -127,6 +130,11 @@ MARKDOWN_MEDIA_TYPES = frozenset({"text/markdown", "text/x-markdown", "text/mdx"
 Markdown with components rather than a format of its own."""
 
 WEB_MEDIA_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+
+MSG_MEDIA_TYPE = "application/vnd.ms-outlook"
+"""Outlook's own type for a ``.msg``, and what a mail export names the file with."""
+
+MSG_MEDIA_TYPES = frozenset({MSG_MEDIA_TYPE})
 
 DRAWIO_MEDIA_TYPE = "application/vnd.jgraph.mxfile"
 """draw.io's own type for an ``mxfile``, and the one Confluence reports for the attachment its
@@ -653,6 +661,46 @@ class MailConfig(BaseModel):
     thousand parts a hundred thousand documents. Lower than the archive's ten thousand because
     a message with a thousand attachments is already not a message anybody sent.
     """
+
+
+class MsgConfig(BaseModel):
+    """Configuration for :class:`~manicule.parsers.msg.MsgParser`."""
+
+    mail: MailConfig = Field(default_factory=MailConfig)
+    """How the reconstituted message is read.
+
+    The same configuration the ``.eml`` parser takes, held here rather than duplicated, because
+    ``.msg`` is a shim onto that parser and two settings for one behaviour would let a corpus
+    chunk the same message two ways depending on which file it arrived in."""
+
+    max_property_bytes: int = Field(
+        default=1024 * 1024,
+        ge=1,
+        description="Most bytes one MAPI string property may hold before it is refused.",
+    )
+    """Headers, a subject and a filename are all small. A property this large is a file that is
+    not what it claims to be, and reading it costs the memory before anything can check it."""
+
+    max_body_bytes: int = Field(
+        default=16 * 1024 * 1024,
+        ge=1,
+        description="Most bytes the plain or HTML body may hold before it is refused.",
+    )
+
+    max_attachments: int = Field(
+        default=64,
+        ge=0,
+        description="Most attachments one message contributes before the rest are ignored.",
+    )
+    """Separate from :attr:`MailConfig.max_members` and narrower on purpose: this bounds the
+    *reconstruction*, so a message declaring thousands of attachment storages costs a bounded
+    build rather than a bounded expansion of an unbounded message."""
+
+    max_attachment_bytes: int = Field(
+        default=64 * 1024 * 1024,
+        ge=1,
+        description="Most bytes one attachment may hold before it is refused.",
+    )
 
 
 class PlaintextConfig(BaseModel):
