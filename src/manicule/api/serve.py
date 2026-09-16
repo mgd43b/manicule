@@ -206,7 +206,7 @@ def server_for(
         msg = "an HTTP bind was resolved without a port"
         raise PolicyError(msg)
     if service.settings.logging.requests:
-        configure_request_logging()
+        configure_request_logging(service.settings)
     config = uvicorn.Config(
         app,
         # Passed explicitly, never left to the library's default. A default that happens to be

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 from unittest.mock import AsyncMock
@@ -185,18 +187,23 @@ async def test_unknown_methods_are_not_echoed(caplog: pytest.LogCaptureFixture) 
 
 
 @pytest.fixture
-def isolated_logger(monkeypatch: pytest.MonkeyPatch) -> None:
+def isolated_logger(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(request_logging.logger, "handlers", [])
     monkeypatch.setattr(request_logging.logger, "level", logging.NOTSET)
     monkeypatch.setattr(request_logging.logger, "propagate", True)
+    yield
+    for handler in request_logging.logger.handlers:
+        handler.close()
 
 
 @pytest.mark.usefixtures("isolated_logger")
 def test_startup_installs_one_json_stderr_handler_and_leaves_stdout_clean(
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
-    request_logging.configure_request_logging()
-    request_logging.configure_request_logging()
+    settings = Settings(data_dir=tmp_path)
+    request_logging.configure_request_logging(settings)
+    request_logging.configure_request_logging(settings)
     request_logging.record_request(
         surface="mcp", operation="search", outcome="ok", started=perf_counter()
     )
@@ -206,18 +213,20 @@ def test_startup_installs_one_json_stderr_handler_and_leaves_stdout_clean(
     event = json.loads(output.err)
     assert event["operation"] == "search"
     assert datetime.fromisoformat(event["timestamp"]).tzinfo == UTC
-    assert len(request_logging.logger.handlers) == 1
+    assert len(request_logging.logger.handlers) == 2
+    assert (tmp_path / "logs" / "requests.jsonl").read_text() == output.err
 
 
 @pytest.mark.usefixtures("isolated_logger")
-def test_an_embedders_explicit_logger_configuration_is_preserved() -> None:
+def test_an_embedders_explicit_logger_configuration_is_preserved(tmp_path: Path) -> None:
     handler = logging.NullHandler()
     request_logging.logger.addHandler(handler)
     request_logging.logger.setLevel(logging.WARNING)
-    request_logging.configure_request_logging()
+    request_logging.configure_request_logging(Settings(data_dir=tmp_path))
     assert request_logging.logger.handlers == [handler]
     assert request_logging.logger.level == logging.WARNING
     assert request_logging.logger.propagate is True
+    assert not (tmp_path / "logs").exists()
 
 
 def test_requests_default_on_and_the_environment_can_disable_them(
@@ -232,12 +241,12 @@ def test_requests_default_on_and_the_environment_can_disable_them(
 @pytest.mark.usefixtures("isolated_logger")
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_mcp_only_startup_keeps_raw_access_logs_off_and_honors_the_switch(
-    monkeypatch: pytest.MonkeyPatch, enabled: bool
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, tmp_path: Path
 ) -> None:
     run = AsyncMock()
     monkeypatch.setattr(FastMCP, "run_http_async", run)
     service = ApplicationService(
-        FakeBackend(settings=Settings(logging=LoggingSettings(requests=enabled)))
+        FakeBackend(settings=Settings(data_dir=tmp_path, logging=LoggingSettings(requests=enabled)))
     )
     await serve(service, transport="http")
     options = run.call_args.kwargs
@@ -251,9 +260,13 @@ async def test_mcp_only_startup_keeps_raw_access_logs_off_and_honors_the_switch(
 @pytest.mark.usefixtures("isolated_logger")
 async def test_stdio_startup_installs_the_same_stderr_sink(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     run = AsyncMock()
     monkeypatch.setattr(FastMCP, "run_stdio_async", run)
-    await serve(ApplicationService(FakeBackend()), transport="stdio")
+    await serve(
+        ApplicationService(FakeBackend(settings=Settings(data_dir=tmp_path))), transport="stdio"
+    )
     run.assert_awaited_once_with(show_banner=False)
-    assert len(request_logging.logger.handlers) == 1
+    assert len(request_logging.logger.handlers) == 2
+    assert (tmp_path / "logs" / "requests.jsonl").exists()

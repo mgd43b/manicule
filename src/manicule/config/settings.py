@@ -196,7 +196,17 @@ class TelemetrySettings(Section):
 class LoggingSettings(Section):
     requests: bool = Field(
         default=True,
-        description="Write content-free HTTP and MCP request summaries to local stderr.",
+        description="Write content-free HTTP and MCP request summaries to a local file and stderr.",
+    )
+    file: Path = Field(
+        default=Path("logs/requests.jsonl"),
+        description="Request log file. Relative paths are resolved beneath data_dir.",
+    )
+    max_bytes: int = Field(
+        default=10 * 1024 * 1024, ge=1, description="Rotate the request log at this many bytes."
+    )
+    backup_count: int = Field(
+        default=5, ge=1, description="Number of rotated request logs to keep."
     )
 
 
@@ -2055,6 +2065,7 @@ __all__ = [
     "GlossarySettings",
     "IngestSettings",
     "LlmSettings",
+    "LoggingSettings",
     "Mode",
     "OAuthProvider",
     "PluginSettings",

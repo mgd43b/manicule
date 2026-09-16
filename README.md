@@ -407,8 +407,9 @@ start --transport http` serves them on `127.0.0.1:8765`, and only there unless t
 things say otherwise. It prints where it is listening, and every path on it that you might want
 next:
 
-Transport request and MCP tool completions are available as local JSON Lines on stderr through
-the `manicule.requests` logger; see [`docs/surfaces.md` §9.7](docs/surfaces.md#97-request-and-tool-completion-logs).
+Transport request and MCP tool completions are available as local JSON Lines on stderr and in
+`<data_dir>/logs/requests.jsonl` through the `manicule.requests` logger; see
+[`docs/surfaces.md` §9.7](docs/surfaces.md#97-request-and-tool-completion-logs).
 
 ```console
 HTTP API on http://127.0.0.1:8765 (this machine only)

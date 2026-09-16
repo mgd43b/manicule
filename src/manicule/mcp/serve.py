@@ -190,7 +190,7 @@ async def serve(
         allow_unauthenticated=allow_unauthenticated,
     )
     if service.settings.logging.requests:
-        configure_request_logging()
+        configure_request_logging(service.settings)
     server = surface(service, transport=transport).server
     if address.transport == "stdio":
         await server.run_stdio_async(show_banner=False)

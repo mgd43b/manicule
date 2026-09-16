@@ -1467,10 +1467,36 @@ see. It is refused before `accept` and before the credential is read.
 ### 9.7 Request and tool completion logs
 
 The transport logs one completion record per HTTP request and one per MCP tool call. These are
-local operator diagnostics, emitted as JSON Lines to stderr through the `manicule.requests`
-logger. They are enabled by default for a local process; set `[logging] requests = false` or
-`MANICULE_LOGGING__REQUESTS=false` and restart the process to disable them. Configuration is
-read at transport startup, so changing it does not alter an already running server.
+local operator diagnostics, emitted as JSON Lines to stderr and to a persistent file through the
+`manicule.requests` logger. They are enabled by default for a local process; set
+`[logging] requests = false` or `MANICULE_LOGGING__REQUESTS=false` and restart the process to
+disable them. Configuration is read at transport startup, so changing it does not alter an
+already running server.
+
+The default file is `<data_dir>/logs/requests.jsonl` (for the default data directory, see
+[`deployment.md` §1](deployment.md#1-what-the-data-directory-contains)). It is opened in append mode and
+survives restarts. Rotation uses a 10 MiB `max_bytes` limit and keeps five backups as
+`requests.jsonl.1` through `.5`; the limit is approximate because one record may itself exceed
+the remaining space. The directory is created `0700` when new, and the log files are `0600`,
+including when an existing file is reopened. A pre-existing custom directory is not chmodded.
+An unwritable file or parent at startup is a configuration error with a corrective hint.
+
+The file and rotation settings can be changed alongside the switch:
+
+```toml
+[logging]
+requests = true
+file = "logs/requests.jsonl"       # relative to data_dir; absolute paths are accepted
+max_bytes = 10485760                # 10 MiB
+backup_count = 5
+```
+
+The corresponding environment names are `MANICULE_LOGGING__REQUESTS`,
+`MANICULE_LOGGING__FILE`, `MANICULE_LOGGING__MAX_BYTES`, and
+`MANICULE_LOGGING__BACKUP_COUNT`. A `~` in `logging.file` is expanded. To follow the default
+file across rotations, use `tail -F ~/.local/share/manicule/logs/requests.jsonl` in a standard
+local installation. Independent server processes should use different log files: rotation is
+owned by the one process serving a data directory.
 
 Every record has these fields:
 
@@ -1506,7 +1532,9 @@ including in MCP-only mode, because its path logging could expose bearer share t
 an external sink.
 
 An application embedding manicule can configure its own handler on `manicule.requests` before
-transport startup. Constructing the ASGI app or MCP server alone does not install a handler.
+transport startup; in that case manicule leaves the existing handlers alone and does not add its
+default file or stderr sinks. Constructing the ASGI app or MCP server alone does not install a
+handler.
 
 ### 9.8 Telemetry, and what a failed write costs
 
