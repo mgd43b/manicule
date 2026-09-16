@@ -13,8 +13,10 @@ corpus at 1024 dimensions it is about 1.3 GB of `float32` vectors held in RAM, b
 that carries a second copy of the corpus text.
 
 `quantization = "scalar"` with `on_disk_vectors = true` is the combination for a corpus of that
-size: search runs against an int8 copy of about 330 MB kept in RAM, while the originals stay on
-disk for the server to rescore against. The stored vectors, and every checksum over them, are
+size: search picks its candidates from an int8 copy of about 330 MB kept in RAM and scores only
+those against the originals, which stay on disk. Search asks for that rescoring explicitly,
+because Qdrant does not rescore scalar quantization by default and a score against the copy is a
+score no checksum covers. The stored vectors, and every checksum over them, are
 untouched. None of the seven changes which chunks a filter admits, so none is part of a
 collection's name and changing one re-embeds nothing; the graph and quantization settings move
 recall, which can move which admitted chunks reach the top of a ranking. `deployment.md` §6.5 has
@@ -34,8 +36,8 @@ and still reports the old value — which is what a Qdrant too old to know the f
 refuses to open and names every such setting, rather than leaving it reading as configured.
 
 **A collection manicule cannot use is now refused when it is opened.** Named vectors, the wrong
-size, a distance other than cosine, or a datatype other than `float32` — a collection made by
-hand, say, or restored from another installation's snapshot — used to fail every write with a
+size, a distance other than cosine, multivectors, or a datatype other than `float32` — a collection
+made by hand, say, or restored from another installation's snapshot — used to fail every write with a
 server error that named no cause, rank with scores nothing was calibrated against, or, for a
 `float16` or `uint8` datatype, read as entirely corrupt and drop out of search while every
 request succeeded. The refusal names `manicule reset-index`, or a `collection_prefix` of the

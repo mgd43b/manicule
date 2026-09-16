@@ -603,18 +603,18 @@ class QdrantSettings(Section):
     )
     quantization: Literal["none", "scalar"] = Field(
         default="none",
-        description="Keep an int8 copy of every vector, a quarter of its size, and search the "
-        "copy. The float32 originals are kept beside it — Qdrant can rescore candidates "
-        "against them, and every checksum over them is untouched — so on its own this adds "
-        "memory; paired with on_disk_vectors, it is what lets the originals leave RAM. "
-        "Setting it back to 'none' drops the copy.",
+        description="Keep an int8 copy of every vector, a quarter of its size, and pick search "
+        "candidates with it. The float32 originals are kept beside it and score the candidates "
+        "picked, so every score and checksum is still over them; which candidates are picked is "
+        "the recall this trades. On its own it adds memory; paired with on_disk_vectors, it is "
+        "what lets the originals leave RAM. Setting it back to 'none' drops the copy.",
     )
     quantization_always_ram: bool = Field(
         default=True,
         description="Hold the quantized copy in RAM even when on_disk_vectors puts the "
         "originals on disk. That pairing is what makes quantization a memory saving rather "
-        "than a latency cost, because the originals are read only to rescore. Read only when "
-        "quantization is 'scalar'.",
+        "than a latency cost, because a search then reads originals only for the candidates it "
+        "picked. Read only when quantization is 'scalar'.",
     )
     on_disk_vectors: bool = Field(
         default=False,

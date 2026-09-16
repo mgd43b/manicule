@@ -186,6 +186,14 @@ The bound that keeps both operations constant-memory over a corpus of any size. 
 accumulates across pages except integers.
 """
 
+RESCORED: Final = models.SearchParams(quantization=models.QuantizationSearchParams(rescore=True))
+"""Search parameters asking that a quantized collection score candidates against the originals.
+
+Sent on every ranked search rather than only when the configured shape quantizes, because a
+collection can carry quantization this handle's configuration did not ask for until the next
+prepare removes it, and on a collection with none it asks for nothing.
+"""
+
 RETRIEVE_PAGE: Final = 512
 """Ids per ``retrieve``. One request per document is small; one per corpus is not a request."""
 
@@ -541,7 +549,8 @@ def writable_vector(
     A collection bearing this store's name was made by this store, unless somebody made it by
     hand — on a dashboard, from a script, by restoring another installation's snapshot. Each
     property checked here is one whose mismatch nothing else refuses. The wrong size fails every
-    write with a server error that names no cause. Another distance ranks every query with
+    write with a server error that names no cause, and so does a multivector field, which wants a
+    matrix where this store writes a list. Another distance ranks every query with
     scores nothing here was calibrated against. And a datatype other than ``float32`` hands back
     numbers other than the ones written, so every checksum disagrees and the whole corpus reads
     as corrupt and drops out of search while every request succeeds — which is why the datatype
@@ -557,6 +566,8 @@ def writable_vector(
         problem = f"{vector.size}-dimension vectors, where the embedder produces {dimension}"
     elif vector.distance != models.Distance.COSINE:
         problem = f"vectors ranked by {vector.distance.value}, where this store ranks by cosine"
+    elif vector.multivector_config is not None:
+        problem = "multivectors, where this store writes one flat vector per point"
     elif vector.datatype not in (None, models.Datatype.FLOAT32):
         problem = (
             f"{vector.datatype.value} vectors, where every checksum is taken over the float32 "
@@ -874,6 +885,16 @@ class QdrantVectorStore:
         on the strength of bytes nothing vouches for. A search can therefore return fewer than
         ``k`` candidates over a damaged collection, which is the honest outcome.
 
+        **Under quantization the copy chooses and the originals score.** Qdrant does not rescore
+        a scalar-quantized search unless asked — measured on v1.17.0 and v1.19.1, where a query
+        identical to a stored vector scores 0.9994 against the int8 copy — so without
+        :data:`RESCORED` both the order and every score would be taken against bytes no checksum
+        covers, which is the argument above by another route. With it, the copy picks ``k``
+        candidates and the checksummed ``float32`` originals score and order them; which ``k`` the
+        copy picks is the recall ``storage.qdrant.quantization`` trades. On a collection with no
+        quantization the parameter asks for nothing. Local mode is sent none: it searches exactly,
+        so its scores are already the originals', and it warns about any search parameter.
+
         **A query with no direction.** The zero vector is not near anything and cosine
         similarity against it is undefined for every row, so ranking it would be inventing an
         order. Instead the store returns the first ``k`` points the filter admits, each scored
@@ -902,6 +923,7 @@ class QdrantVectorStore:
             collection_name=self._collection(fingerprint),
             query=query,
             query_filter=condition,
+            search_params=None if is_local(self._client) else RESCORED,
             limit=k,
             with_payload=True,
             with_vectors=True,

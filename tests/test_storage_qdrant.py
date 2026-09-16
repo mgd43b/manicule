@@ -1558,11 +1558,21 @@ async def test_local_mode_is_never_asked_to_reshape(
         (models.VectorParams(size=8, distance=models.Distance.COSINE), "8-dimension vectors"),
         (models.VectorParams(size=4, distance=models.Distance.DOT), "ranked by Dot"),
         (
+            models.VectorParams(
+                size=4,
+                distance=models.Distance.COSINE,
+                multivector_config=models.MultiVectorConfig(
+                    comparator=models.MultiVectorComparator.MAX_SIM
+                ),
+            ),
+            "multivectors",
+        ),
+        (
             {"dense": models.VectorParams(size=4, distance=models.Distance.COSINE)},
             "named vectors",
         ),
     ],
-    ids=["float16", "uint8", "wrong-size", "dot", "named"],
+    ids=["float16", "uint8", "wrong-size", "dot", "multivector", "named"],
 )
 async def test_a_collection_this_store_cannot_use_is_refused_before_it_is_written(
     store: QdrantVectorStore,
@@ -2023,8 +2033,11 @@ async def test_a_real_server_keeps_a_quantized_corpus_verifiable(
 
     A quantized copy that replaced what ``stored_vectors`` reads would fail every checksum, and
     the corpus would drop out of search while every request succeeded — the reason ``datatype``
-    is not offered at all. So the corpus is made large enough, and the threshold low enough,
-    that every point is in an indexed segment carrying the int8 copy before anything is read:
+    is not offered at all. And a score taken against the copy is a score no checksum covers: a
+    query identical to a stored vector scores 0.9994 there, so an exact 1.0 is what shows the
+    search was scored against the originals. The corpus is made large enough, and the threshold
+    low enough, that every point is in an indexed segment carrying the int8 copy before anything
+    is read:
     three points under the default threshold never leave a plain segment, and a test over those
     passes with quantization off.
     """
@@ -2055,5 +2068,8 @@ async def test_a_real_server_keeps_a_quantized_corpus_verifiable(
         assert [[result.chunk.id for result in found] for found in ranked] == [
             [f"chunk-{index}"] for index in probes
         ]
+        assert [found[0].score for found in ranked] == [pytest.approx(1.0, abs=1e-6)] * len(
+            probes
+        ), "scored against the int8 copy rather than the checksummed originals"
     finally:
         await _drop(server_store, server_client, 8)

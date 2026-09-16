@@ -1765,7 +1765,8 @@ runs, and against v1.17.0.
 bearing this store's name was made by this store unless somebody made it by hand — on a dashboard,
 from a script, by restoring another installation's snapshot. So one this store cannot write or
 verify is refused with `VectorStoreStateError` on every prepare: named vectors, a size other than
-the embedder's dimension, a distance other than cosine, or a datatype other than `float32`. Each is
+the embedder's dimension, a distance other than cosine, multivectors, or a datatype other than
+`float32`. Each is
 a mismatch nothing else refuses. The wrong size fails every write with a server error that names no
 cause, another distance ranks with scores nothing here was calibrated against, and another datatype
 is the next paragraph. The refusal names `manicule reset-index`, which discards this workspace's
@@ -1784,9 +1785,18 @@ verbatim from its source (§6.8), so a migrated row would arrive already corrupt
 `VectorParamsDiff` has no field for it, and a raw `PATCH` carrying one is accepted and ignored — so
 the setting could only ever have been the creation-only kind the paragraphs above refuse to be.
 Scalar quantization is the memory saving that keeps the checksummed originals: the int8 copy is
-what the graph searches, and the `float32` vectors are what a readback returns and what the server
-can rescore against. Search sends no quantization parameters, so whether it oversamples and
-rescores is left to the server's defaults.
+what the graph searches, and the `float32` vectors are what a readback returns and what every
+score is taken against.
+
+**Search asks for rescoring, because Qdrant's default would score against the copy.** Qdrant does
+not rescore a scalar-quantized search unless asked — on v1.17.0 and v1.19.1 a query identical to a
+stored vector scores 0.9994 against the int8 copy and 1.0 against the original — and a score taken
+against the copy is a score against bytes no checksum covers, which is exactly what `search`
+refuses to rank on elsewhere (a point whose vector fails its checksum is dropped rather than
+ranked). So every ranked search sends `rescore = true`: the copy picks the candidates, and the
+`float32` originals score and order them. Oversampling stays at Qdrant's default, so which
+candidates the copy picks is the recall quantization trades. On a collection without quantization
+the parameter asks for nothing, which is why it is sent regardless of the configured shape.
 
 **What this backend does not have, said plainly.**
 

@@ -975,7 +975,7 @@ set the setting to what the collection has.
 
 **The collection's vectors are checked as well.** A collection under this installation's name
 whose vectors manicule cannot write or verify — named vectors, the wrong size, a distance other
-than cosine, a datatype other than `float32`, as one made by hand or restored from another
+than cosine, multivectors, a datatype other than `float32`, as one made by hand or restored from another
 installation's snapshot can be — is refused rather than written into. `manicule reset-index`
 discards this workspace's collections for the next ingest to recreate; a `collection_prefix` of
 this installation's own leaves that collection alone instead.
@@ -998,8 +998,9 @@ on_disk_vectors = true     # the float32 originals, served from disk through the
 ```
 
 `quantization_always_ram` stays at its default, `true`. The copy in RAM with the originals on disk
-is the pairing that makes quantization a memory saving rather than a latency cost: search runs
-against the copy and reads the originals only to rescore. The graph settings answer a measured
+is the pairing that makes quantization a memory saving rather than a latency cost: a search picks
+its candidates from the copy and reads the originals only for those, to score them exactly —
+manicule asks for that rescoring, since Qdrant does not rescore scalar quantization by default. The graph settings answer a measured
 recall problem, not a memory one, and are best left at their defaults until there is one.
 
 **`manicule doctor` reports reachability, once the store has been built.** Component health in
