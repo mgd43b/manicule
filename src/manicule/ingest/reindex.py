@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Embedder, VectorStore
     from manicule.ingest.middleware import MiddlewareRunner
-    from manicule.ingest.pipeline import BlobSink, IngestPipeline
+    from manicule.ingest.pipeline import BlobSink, DocumentOutcome, IngestPipeline
     from manicule.ingest.ports import GlossaryStore, IngestStore
 
 
@@ -465,75 +465,92 @@ async def re_parse(
     """
     report = ReindexReport()
     for document in documents:
-        if document.original_ref is None:
-            report.note_unrepairable(document, NO_RETAINED_BYTES)
-            continue
-        data = await blobs.get(document.original_ref)
-        if data is None:
-            report.note_unrepairable(
-                document,
-                f"retained bytes {document.original_ref} are missing from the blob store; "
-                f"restore the data directory, or force a re-sync of this document",
-            )
-            continue
-        raw = RawDocument(
-            source_id=document.source_id,
-            uri=document.uri,
-            media_type=document.media_type,
-            content=data,
-            metadata=dict(document.metadata),
+        reached = await _re_parse_one(
+            document, pipeline=pipeline, blobs=blobs, reuse_vectors=reuse_vectors
         )
-        outcomes = await pipeline.ingest_raw(
-            raw,
-            source=document.source,
-            version_token=document.version_token,
-            title=document.title,
-            existing=document,
-            force=True,
-            expected=document.revision,
-            retention=Retention(ref=document.original_ref),
-            reuse_vectors=reuse_vectors,
-        )
-        for outcome in outcomes:
-            # Counted before the branching, and that is the point: the embed stage runs before
-            # anything below decides which list this document lands in, so what it cost is the
-            # same either way. The case that matters is a **store-stage failure** — the model
-            # has already run by the time an upsert fails — and counting only the documents a
-            # sweep managed to rebuild would report it as costing less the worse it went.
-            #
-            # Two things contribute zero here, for different reasons. A document superseded by a
-            # concurrent sync never reached the model: the guard fires on the re-parse's first
-            # write, which is before chunking. And a document that failed *inside* the embed
-            # stage left no accounting behind — an unknown number of batches had already gone —
-            # so zero is the honest floor rather than a guess at the figure.
-            report.note_embedding(outcome.embedding)
-            if outcome.superseded:
-                # Ahead of the two failure shapes below, because a superseded document is
-                # neither of them and would be read as one: it comes back carrying the status
-                # the *winner* left, which for a completed sync is `indexed`.
-                report.superseded.append(
-                    f"{outcome.document_id or outcome.source_id}: a newer revision was committed "
-                    f"while this was being re-parsed, so nothing from the older one was written"
-                )
-                continue
-            # Two shapes of failure, because the pipeline has two. A document that was not
-            # already working comes back ``failed``. A document that *was* ``indexed`` keeps its
-            # status, its chunks and its vectors — the pipeline refuses to let a transient error
-            # cost a working document — and the failure arrives as an ``indexed`` outcome
-            # carrying a detail. Reading only the status counts that second case as a repair,
-            # which is the worst available answer: the stored text is still the previous
-            # parser's, the lineage was deliberately not advanced, and the report says the
-            # document was rebuilt.
-            if outcome.status is DocumentStatus.FAILED or (
-                outcome.status is DocumentStatus.INDEXED and outcome.detail
-            ):
-                report.failures.append(
-                    f"{outcome.document_id or outcome.source_id}: {outcome.detail}"
-                )
-            else:
-                report.documents += 1
-                report.chunks += outcome.chunks
+        if isinstance(reached, str):
+            report.note_unrepairable(document, reached)
+            continue
+        for outcome in reached:
+            _fold_outcome(report, outcome)
     return report
+
+
+async def _re_parse_one(
+    document: Document, *, pipeline: IngestPipeline, blobs: BlobSink, reuse_vectors: bool
+) -> list[DocumentOutcome] | str:
+    """One document through the pipeline from its retained bytes, or why it could not go.
+
+    The outcomes are ``ingest_raw``'s and in its order: the document's own first, then one for
+    each member it contained. :func:`re_embed_all` depends on that order to judge a document by
+    its own outcome rather than by a member's.
+    """
+    if document.original_ref is None:
+        return NO_RETAINED_BYTES
+    data = await blobs.get(document.original_ref)
+    if data is None:
+        return (
+            f"retained bytes {document.original_ref} are missing from the blob store; "
+            f"restore the data directory, or force a re-sync of this document"
+        )
+    raw = RawDocument(
+        source_id=document.source_id,
+        uri=document.uri,
+        media_type=document.media_type,
+        content=data,
+        metadata=dict(document.metadata),
+    )
+    return await pipeline.ingest_raw(
+        raw,
+        source=document.source,
+        version_token=document.version_token,
+        title=document.title,
+        existing=document,
+        force=True,
+        expected=document.revision,
+        retention=Retention(ref=document.original_ref),
+        reuse_vectors=reuse_vectors,
+    )
+
+
+def _fold_outcome(report: ReindexReport, outcome: DocumentOutcome) -> None:
+    """One outcome of a re-parse, counted under the heading it belongs to."""
+    # Counted before the branching, and that is the point: the embed stage runs before
+    # anything below decides which list this document lands in, so what it cost is the
+    # same either way. The case that matters is a **store-stage failure** — the model
+    # has already run by the time an upsert fails — and counting only the documents a
+    # sweep managed to rebuild would report it as costing less the worse it went.
+    #
+    # Two things contribute zero here, for different reasons. A document superseded by a
+    # concurrent sync never reached the model: the guard fires on the re-parse's first
+    # write, which is before chunking. And a document that failed *inside* the embed
+    # stage left no accounting behind — an unknown number of batches had already gone —
+    # so zero is the honest floor rather than a guess at the figure.
+    report.note_embedding(outcome.embedding)
+    if outcome.superseded:
+        # Ahead of the two failure shapes below, because a superseded document is
+        # neither of them and would be read as one: it comes back carrying the status
+        # the *winner* left, which for a completed sync is `indexed`.
+        report.superseded.append(
+            f"{outcome.document_id or outcome.source_id}: a newer revision was committed "
+            f"while this was being re-parsed, so nothing from the older one was written"
+        )
+        return
+    # Two shapes of failure, because the pipeline has two. A document that was not
+    # already working comes back ``failed``. A document that *was* ``indexed`` keeps its
+    # status, its chunks and its vectors — the pipeline refuses to let a transient error
+    # cost a working document — and the failure arrives as an ``indexed`` outcome
+    # carrying a detail. Reading only the status counts that second case as a repair,
+    # which is the worst available answer: the stored text is still the previous
+    # parser's, the lineage was deliberately not advanced, and the report says the
+    # document was rebuilt.
+    if outcome.status is DocumentStatus.FAILED or (
+        outcome.status is DocumentStatus.INDEXED and outcome.detail
+    ):
+        report.failures.append(f"{outcome.document_id or outcome.source_id}: {outcome.detail}")
+    else:
+        report.documents += 1
+        report.chunks += outcome.chunks
 
 
 DEFAULT_SWEEP_BATCH = 25
@@ -838,6 +855,9 @@ class ReembedSweep:
     """One line per document with no retained bytes to re-parse, naming the reason."""
 
     failures: list[str] = field(default_factory=list[str])
+    """One line per failure: a selected document's own, and any member of one that failed while
+    it was re-parsed. Only the first kind is counted in ``failed``."""
+
     superseded_documents: list[str] = field(default_factory=list[str])
 
 
@@ -930,19 +950,35 @@ async def re_embed_all(
             return sweep
         for document in page:
             sweep.selected += 1
-            report = await re_parse([document], pipeline=pipeline, blobs=blobs, reuse_vectors=False)
-            sweep.embedding = _total(sweep.embedding, report.embedding)
-            if report.unrepairable:
-                sweep.unrepairable += 1
-                sweep.unrepairable_documents.extend(report.unrepairable)
-            elif report.failures:
-                sweep.failed += 1
-                sweep.failures.extend(report.failures)
-            elif report.superseded:
-                sweep.superseded += 1
-                sweep.superseded_documents.extend(report.superseded)
+            reached = await _re_parse_one(
+                document, pipeline=pipeline, blobs=blobs, reuse_vectors=False
+            )
+            # Judged by its own outcome, never by a member's. A document with a body and an
+            # attachment comes back as two outcomes, and one failed attachment would otherwise
+            # count a re-embedded document as failed — while a working member would count as a
+            # second document re-embedded, which the sweep reaches anyway in its own turn.
+            own, inside = ReindexReport(), ReindexReport()
+            if isinstance(reached, str):
+                own.note_unrepairable(document, reached)
             else:
-                sweep.reembedded += report.documents
+                _fold_outcome(own, reached[0])
+                for outcome in reached[1:]:
+                    _fold_outcome(inside, outcome)
+            sweep.embedding = _total(_total(sweep.embedding, own.embedding), inside.embedding)
+            # Named, and not counted: a member that failed is a document somebody has to look
+            # at, but it is not the one this pass selected.
+            sweep.failures.extend(inside.failures)
+            if own.unrepairable:
+                sweep.unrepairable += 1
+                sweep.unrepairable_documents.extend(own.unrepairable)
+            elif own.failures:
+                sweep.failed += 1
+                sweep.failures.extend(own.failures)
+            elif own.superseded:
+                sweep.superseded += 1
+                sweep.superseded_documents.extend(own.superseded)
+            else:
+                sweep.reembedded += 1
 
 
 DETECTION_IS_OFF = (

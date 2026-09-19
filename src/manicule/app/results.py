@@ -1394,7 +1394,8 @@ class ReembedSweepReport(Payload):
     """One line per unrepairable document: which it is and why."""
 
     failures: tuple[str, ...] = ()
-    """One line per failure. No list here fails the run — the rest of the corpus completes."""
+    """One line per failure: a selected document's own, and any member of one that failed while
+    it was re-parsed, which ``failed`` does not count. No list here fails the run."""
 
     superseded_documents: tuple[str, ...] = ()
     """One line per superseded document. No document text."""

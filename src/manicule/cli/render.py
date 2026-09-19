@@ -594,8 +594,9 @@ def render_reembed_sweep(out: Console, payload: r.ReembedSweepReport) -> None:
         out.print(f"[yellow]{escape(line)}[/yellow]")
     for line in payload.failures:
         out.print(f"[red]{escape(line)}[/red]")
+    # Dim, as the re-parse renderer prints them: not an action item, unlike the two above.
     for line in payload.superseded_documents:
-        out.print(escape(line))
+        out.print(f"[dim]{escape(line)}[/dim]")
 
 
 def render_stale_relations(out: Console, payload: r.StaleRelationReport) -> None:
