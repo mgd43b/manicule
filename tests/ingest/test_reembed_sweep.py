@@ -256,3 +256,62 @@ async def test_a_member_that_fails_does_not_count_its_document_as_failed() -> No
     assert (sweep.reembedded, sweep.failed) == (1, 0)
     assert any("member is encrypted" in line for line in sweep.failures), "still named"
     assert all(stored(vectors)[chunk_id] != vector for chunk_id, vector in before.items())
+
+
+async def test_a_member_is_embedded_once_in_its_own_turn_not_again_in_its_parents() -> None:
+    """A message and its attachment: every chunk of both goes to the model exactly once.
+
+    The parent's re-parse re-expands its members, but members are not forced — an attachment
+    whose bytes are unchanged is skipped there by change detection — so the one pass that
+    embeds it is its own, when the sweep selects it. A member can be embedded twice only when
+    the parent's re-parse produces one that differs from the stored row (a new member, or a
+    changed expander), and then the second pass is what leaves it wholly in the new space.
+    """
+    from email.message import EmailMessage  # noqa: PLC0415 - stdlib, and only this test needs it
+    from email.policy import SMTP  # noqa: PLC0415
+
+    from manicule.parsers.config import MailConfig  # noqa: PLC0415 - a parsing extra
+    from manicule.parsers.mail import MailParser  # noqa: PLC0415 - a parsing extra
+
+    message = EmailMessage()
+    message["From"] = "ana@example.test"
+    message["To"] = "platform@example.test"
+    message["Subject"] = "Where the retry budget went"
+    message["Date"] = "Tue, 03 Feb 2026 09:14:00 +0000"
+    message.set_content("The budget is netted down once for the fetch and once for the parse.\n")
+    message.add_attachment(
+        b"Measured over the whole quarter rather than at the peak.\n",
+        maintype="text",
+        subtype="plain",
+        filename="notes.txt",
+    )
+
+    store, vectors, blobs = fakes.MemoryIngestStore(), fakes.MemoryVectors(), fakes.MemoryBlobs()
+    original = fakes.CountingEmbedder()
+    await vectors.ensure_ready(original.fingerprint)
+
+    def pipeline_for(embedder: fakes.CountingEmbedder) -> IngestPipeline:
+        pipeline, _, _ = build(
+            store=store,
+            vectors=vectors,
+            blobs=blobs,
+            embedder=embedder,
+            parsers={"email": MailParser(MailConfig()), "lines": fakes.LineParser()},
+            chain=("email", "lines"),
+        )
+        return pipeline
+
+    connector = fakes.DictConnector({"m1": message.as_bytes(policy=SMTP)})
+    connector.media_types["m1"] = "message/rfc822"
+    await pipeline_for(original).run(connector)
+    indexed = [d for d in store.documents.values() if d.status is DocumentStatus.INDEXED]
+    assert len(indexed) == 2, "the fixture must be a message and an attachment, both indexed"
+    before = stored(vectors)
+
+    drifted = DriftedEmbedder()
+    sweep = await re_embed_all(store=store, pipeline=pipeline_for(drifted), blobs=blobs)
+
+    assert (sweep.selected, sweep.reembedded, sweep.failed) == (2, 2, 0)
+    assert sum(drifted.batches) == len(before), "every chunk reached the model exactly once"
+    assert sweep.chunks == len(before)
+    assert all(stored(vectors)[chunk_id] != vector for chunk_id, vector in before.items())

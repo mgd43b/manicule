@@ -956,6 +956,13 @@ async def re_embed_all(
     atomically. What it does not do is change the embedding space — a model with a
     different fingerprint is refused by the pipeline, and is ``manicule reembed``.
 
+    **A member is embedded in its own turn.** Re-parsing a document re-expands whatever it
+    contains, but members are not forced: one whose bytes are unchanged is skipped there by
+    change detection and re-embedded when the sweep selects it. A member is embedded twice only
+    when its parent's re-parse produces one that differs from the stored row — a member that is
+    new, or an expander that changed — and then the second pass is the one that leaves it
+    wholly in the current space. That extra work is not in the plan, which prices stored rows.
+
     **A document is the unit and the selection does not shrink**, since a re-embedded document
     is still indexed — so the cursor is the count seen. Stopping is safe at a document boundary.
     Resuming is running it again from the start, because nothing recorded tells a document this
