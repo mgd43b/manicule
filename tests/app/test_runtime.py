@@ -454,6 +454,27 @@ async def test_planning_a_corpus_re_parse_builds_no_pipeline_and_loads_no_model(
     assert report.reparsed == 0
 
 
+async def test_planning_a_re_embed_builds_no_pipeline_and_loads_no_model(
+    runtime: Runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The plan reads rows, for the reason the re-parse plan above does.
+
+    It matters more here. The run is refused outright when the configured model's fingerprint
+    disagrees with the index, and an operator deciding between this and ``manicule reembed`` is
+    exactly the one who needs the price of both.
+    """
+
+    async def refuse() -> object:
+        pytest.fail("a dry run built the ingest pipeline")
+
+    monkeypatch.setattr(runtime, "pipeline", refuse)
+
+    report = await ApplicationService(runtime).document_reembed(dry_run=True)
+
+    assert report.dry_run is True
+    assert (report.selected, report.chunks) == (0, 0), "an empty index has nothing to re-embed"
+
+
 async def test_resetting_an_empty_index_is_not_an_error(runtime: Runtime) -> None:
     """A reset has to be safe to run on an installation whose state nobody is sure of."""
     reset = await ApplicationService(runtime).reset_index()

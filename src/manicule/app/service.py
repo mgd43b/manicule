@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     from manicule.embedding.artifacts import WeightsPlan
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
     from manicule.generation.ports import ConversationRecord
+    from manicule.ingest.embedding import EmbeddingWork
     from manicule.ingest.pipeline import RunReport, Watching
     from manicule.ingest.reembed import ReembedRecovery, ReembedRun
     from manicule.parsers.config import SourceCodeConfig
@@ -167,6 +168,28 @@ Named rather than written as a literal because the number *is* the definition of
 definition is a definition, and a "conflict" reported with a single candidate is a warning a
 reader cannot act on.
 """
+
+
+def _embedding_cost(work: EmbeddingWork) -> r.EmbeddingCost:
+    """A sweep's embed-stage accounting, as the payload every surface renders.
+
+    Written once for the two sweeps that report it, so they cannot map it two ways. Field by
+    field rather than reflectively, because ``EmbeddingWork`` also counts the chunks it was
+    handed, and that is not a cost.
+    """
+    return r.EmbeddingCost(
+        reused=work.reused,
+        embedded=work.embedded,
+        input_changed=work.input_changed,
+        first_seen=work.first_seen,
+        repaired=work.repaired,
+        refreshed=work.refreshed,
+        forward_calls=work.forward_calls,
+        cache_hits=work.cache_hits,
+        vectors_new=work.vectors_new,
+        vectors_replaced=work.vectors_replaced,
+        vectors_backfilled=work.vectors_backfilled,
+    )
 
 
 def _reembed_run_report(run: ReembedRun) -> r.ReembedRunReport:
@@ -2700,18 +2723,46 @@ class ApplicationService:
             changed=sweep.changed,
             chunks_new=sweep.chunks_new,
             chunks_kept=sweep.chunks_kept,
-            embedding=r.EmbeddingCost(
-                reused=sweep.embedding.reused,
-                embedded=sweep.embedding.embedded,
-                input_changed=sweep.embedding.input_changed,
-                first_seen=sweep.embedding.first_seen,
-                repaired=sweep.embedding.repaired,
-                forward_calls=sweep.embedding.forward_calls,
-                cache_hits=sweep.embedding.cache_hits,
-                vectors_new=sweep.embedding.vectors_new,
-                vectors_replaced=sweep.embedding.vectors_replaced,
-                vectors_backfilled=sweep.embedding.vectors_backfilled,
-            ),
+            embedding=_embedding_cost(sweep.embedding),
+            unrepairable=sweep.unrepairable,
+            failed=sweep.failed,
+            unrepairable_documents=tuple(sweep.unrepairable_documents),
+            failures=tuple(sweep.failures),
+            superseded=sweep.superseded,
+            superseded_documents=tuple(sweep.superseded_documents),
+        )
+
+    async def document_reembed(
+        self, *, batch: int = DEFAULT_SWEEP_BATCH, dry_run: bool = False
+    ) -> r.ReembedSweepReport:
+        """Embed every indexed document again, reusing no stored vector. Touches no network.
+
+        **The repair for a model that moved without its fingerprint moving** — a served
+        embedder whose runtime was upgraded under the same weights, most plainly. Every
+        identity the index checks still agrees, so nothing selects a document as stale, and
+        every other path that rebuilds vectors reuses the ones already stored. This reuses
+        none, which is the whole of its reason to exist.
+
+        Each document is re-parsed from its retained bytes and committed the way a sync
+        commits it, so this runs on any vector store and search answers throughout. The
+        embedder's cache is per process and the command line starts a new one, so no vector
+        computed before the drift can be served from it. It does not change the embedding
+        space: a model with a different fingerprint is refused by the pipeline, and moving an
+        index between spaces is ``manicule reembed`` where the store has named generations, or
+        a derived reset and a re-sync where it has not.
+
+        Args:
+            batch: Documents per page of the selection.
+            dry_run: Report the documents and chunks a run would re-embed, and write nothing.
+        """
+        ingestion = await self._backend.ingestion()
+        sweep = await ingestion.reembed_all(batch=batch, dry_run=dry_run)
+        return r.ReembedSweepReport(
+            dry_run=sweep.dry_run,
+            selected=sweep.selected,
+            reembedded=sweep.reembedded,
+            chunks=sweep.chunks,
+            embedding=_embedding_cost(sweep.embedding),
             unrepairable=sweep.unrepairable,
             failed=sweep.failed,
             unrepairable_documents=tuple(sweep.unrepairable_documents),

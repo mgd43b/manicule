@@ -1073,6 +1073,14 @@ class EmbeddingCost(Payload):
     it. Found by reading the row rather than by trusting what it claims.
     """
 
+    refreshed: int = Field(default=0, ge=0)
+    """Of ``embedded``, those with a reusable vector that were embedded again on purpose.
+
+    Only ``document reindex --re-embed`` produces these: it is for a model whose output moved
+    while every identity the index checks did not, so the stored vector looks current and is
+    not trusted to be.
+    """
+
     forward_calls: int = Field(default=0, ge=0)
     """Batches the embedder was asked for. The number an accelerator's time is proportional to."""
 
@@ -1331,7 +1339,9 @@ class StaleReparseReport(Payload):
     """One line per unrepairable document: which it is, why, and what would repair it."""
 
     failures: tuple[str, ...] = ()
-    """One line per failure. Neither list fails the sweep — the rest of the corpus completes."""
+    """One line per failure: a selected document's own, and any member of one that failed while
+    it was re-parsed, which ``failed`` does not count. Neither list fails the sweep — the rest of
+    the corpus completes."""
 
     superseded: int = Field(default=0, ge=0)
     """Documents a newer revision overtook while this sweep was re-parsing them.
@@ -1344,6 +1354,53 @@ class StaleReparseReport(Payload):
 
     superseded_documents: tuple[str, ...] = ()
     """One line per superseded document: which it is and what overtook it. No document text."""
+
+
+class ReembedSweepReport(Payload):
+    """What a re-embed of every indexed document did.
+
+    Counts and the documents somebody has to act on, on :class:`StaleReparseReport`'s rule, and
+    for the same reason no field carries document text.
+    """
+
+    dry_run: bool = False
+    """Whether this was a plan. A dry run reports what a run would re-embed and does nothing."""
+
+    selected: int = Field(default=0, ge=0)
+    """Indexed documents: every document search serves."""
+
+    reembedded: int = Field(default=0, ge=0)
+    """Documents re-parsed and committed with every chunk freshly embedded."""
+
+    chunks: int = Field(default=0, ge=0)
+    """Chunks the model was given, or on a dry run the chunks stored for the documents a run
+    would re-embed.
+
+    The price. This verb reuses no stored vector, so every chunk is model input. A plan is
+    exact while the parser is unchanged, because the run re-parses.
+    """
+
+    embedding: EmbeddingCost = Field(default_factory=EmbeddingCost)
+    """What the run cost at the embedder. ``reused`` is zero by design."""
+
+    unrepairable: int = Field(default=0, ge=0)
+    """Documents with no retained bytes to re-parse. Only a forced re-sync reaches them."""
+
+    failed: int = Field(default=0, ge=0)
+    """Documents whose re-embed was attempted and did not finish."""
+
+    superseded: int = Field(default=0, ge=0)
+    """Documents a concurrent sync committed first, so this left them alone. Not a failure."""
+
+    unrepairable_documents: tuple[str, ...] = ()
+    """One line per unrepairable document: which it is and why."""
+
+    failures: tuple[str, ...] = ()
+    """One line per failure: a selected document's own, and any member of one that failed while
+    it was re-parsed, which ``failed`` does not count. No list here fails the run."""
+
+    superseded_documents: tuple[str, ...] = ()
+    """One line per superseded document. No document text."""
 
 
 class StaleRelationReport(Payload):
@@ -2849,6 +2906,7 @@ __all__ = [
     "ReembedCleanupReport",
     "ReembedPlanReport",
     "ReembedRunReport",
+    "ReembedSweepReport",
     "ResearchReportPayload",
     "ResearchSubQuestion",
     "ResetReport",

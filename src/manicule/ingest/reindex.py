@@ -8,6 +8,12 @@
 | :func:`re_parse` | ``blobs`` | 3 | none |
 | a forced sync | the source | 4 | yes, rate-limited, **may fail** |
 
+:func:`re_embed_all` is :func:`re_parse` over every indexed document with vector reuse
+switched off, reached from ``manicule document reindex --re-embed``: the repair for an embedder
+whose output moved while its fingerprint did not. It is not :func:`re_embed`, which rewrites
+rows in place and so reaches only the legacy publication; a document the pipeline has committed
+since publications existed can only change its vectors by publishing new ones.
+
 Only the last can fail for reasons outside the machine, and it is the only one that is not
 reproducible. Everything above it is a pure function of what is already stored. That is the
 whole return on retaining original bytes, and it is why ``--re-parse`` is a first-class verb
@@ -32,7 +38,7 @@ repair, and they are exactly the ones an operator needs named.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from manicule.core.content import LEGACY_PUBLICATION, DocumentStatus, RawDocument, Retention
 from manicule.core.errors import ContextOverflowError, PolicyError
@@ -56,7 +62,7 @@ if TYPE_CHECKING:
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Embedder, VectorStore
     from manicule.ingest.middleware import MiddlewareRunner
-    from manicule.ingest.pipeline import BlobSink, IngestPipeline
+    from manicule.ingest.pipeline import BlobSink, DocumentOutcome, IngestPipeline
     from manicule.ingest.ports import GlossaryStore, IngestStore
 
 
@@ -424,6 +430,7 @@ async def re_parse(
     *,
     pipeline: IngestPipeline,
     blobs: BlobSink,
+    reuse_vectors: bool = True,
 ) -> ReindexReport:
     """Run the current parser chain over retained bytes. Rung 3: no network.
 
@@ -451,77 +458,124 @@ async def re_parse(
     :attr:`~manicule.core.content.Document.revision` as the expected one makes that commit
     refuse instead; the document is reported ``superseded`` and nothing derived from the stale
     snapshot is written at all.
+
+    ``reuse_vectors=False`` sends every chunk to the model, reusable or not, and is what
+    :func:`re_embed_all` passes. Everything else about the document — the parse, the commit, the
+    publication flip, the guard — is the path a first ingest takes.
     """
     report = ReindexReport()
     for document in documents:
-        if document.original_ref is None:
-            report.note_unrepairable(document, NO_RETAINED_BYTES)
-            continue
-        data = await blobs.get(document.original_ref)
-        if data is None:
-            report.note_unrepairable(
-                document,
-                f"retained bytes {document.original_ref} are missing from the blob store; "
-                f"restore the data directory, or force a re-sync of this document",
-            )
-            continue
-        raw = RawDocument(
-            source_id=document.source_id,
-            uri=document.uri,
-            media_type=document.media_type,
-            content=data,
-            metadata=dict(document.metadata),
+        reached = await _re_parse_one(
+            document, pipeline=pipeline, blobs=blobs, reuse_vectors=reuse_vectors
         )
-        outcomes = await pipeline.ingest_raw(
-            raw,
-            source=document.source,
-            version_token=document.version_token,
-            title=document.title,
-            existing=document,
-            force=True,
-            expected=document.revision,
-            retention=Retention(ref=document.original_ref),
-        )
-        for outcome in outcomes:
-            # Counted before the branching, and that is the point: the embed stage runs before
-            # anything below decides which list this document lands in, so what it cost is the
-            # same either way. The case that matters is a **store-stage failure** — the model
-            # has already run by the time an upsert fails — and counting only the documents a
-            # sweep managed to rebuild would report it as costing less the worse it went.
-            #
-            # Two things contribute zero here, for different reasons. A document superseded by a
-            # concurrent sync never reached the model: the guard fires on the re-parse's first
-            # write, which is before chunking. And a document that failed *inside* the embed
-            # stage left no accounting behind — an unknown number of batches had already gone —
-            # so zero is the honest floor rather than a guess at the figure.
-            report.note_embedding(outcome.embedding)
-            if outcome.superseded:
-                # Ahead of the two failure shapes below, because a superseded document is
-                # neither of them and would be read as one: it comes back carrying the status
-                # the *winner* left, which for a completed sync is `indexed`.
-                report.superseded.append(
-                    f"{outcome.document_id or outcome.source_id}: a newer revision was committed "
-                    f"while this was being re-parsed, so nothing from the older one was written"
-                )
-                continue
-            # Two shapes of failure, because the pipeline has two. A document that was not
-            # already working comes back ``failed``. A document that *was* ``indexed`` keeps its
-            # status, its chunks and its vectors — the pipeline refuses to let a transient error
-            # cost a working document — and the failure arrives as an ``indexed`` outcome
-            # carrying a detail. Reading only the status counts that second case as a repair,
-            # which is the worst available answer: the stored text is still the previous
-            # parser's, the lineage was deliberately not advanced, and the report says the
-            # document was rebuilt.
-            if outcome.status is DocumentStatus.FAILED or (
-                outcome.status is DocumentStatus.INDEXED and outcome.detail
-            ):
-                report.failures.append(
-                    f"{outcome.document_id or outcome.source_id}: {outcome.detail}"
-                )
-            else:
-                report.documents += 1
-                report.chunks += outcome.chunks
+        if isinstance(reached, str):
+            report.note_unrepairable(document, reached)
+            continue
+        for outcome in reached:
+            _fold_outcome(report, outcome)
     return report
+
+
+async def _re_parse_one(
+    document: Document, *, pipeline: IngestPipeline, blobs: BlobSink, reuse_vectors: bool
+) -> list[DocumentOutcome] | str:
+    """One document through the pipeline from its retained bytes, or why it could not go.
+
+    The outcomes are ``ingest_raw``'s and in its order: the document's own first, then one for
+    each member it contained. :func:`re_embed_all` depends on that order to judge a document by
+    its own outcome rather than by a member's.
+    """
+    if document.original_ref is None:
+        return NO_RETAINED_BYTES
+    data = await blobs.get(document.original_ref)
+    if data is None:
+        return (
+            f"retained bytes {document.original_ref} are missing from the blob store; "
+            f"restore the data directory, or force a re-sync of this document"
+        )
+    raw = RawDocument(
+        source_id=document.source_id,
+        uri=document.uri,
+        media_type=document.media_type,
+        content=data,
+        metadata=dict(document.metadata),
+    )
+    return await pipeline.ingest_raw(
+        raw,
+        source=document.source,
+        version_token=document.version_token,
+        title=document.title,
+        existing=document,
+        force=True,
+        expected=document.revision,
+        retention=Retention(ref=document.original_ref),
+        reuse_vectors=reuse_vectors,
+    )
+
+
+async def _re_parse_judged(
+    document: Document, *, pipeline: IngestPipeline, blobs: BlobSink, reuse_vectors: bool = True
+) -> tuple[ReindexReport, ReindexReport]:
+    """Re-parse one selected document, and report its own outcome apart from its members'.
+
+    A sweep judges the document it selected by that document's outcome, never by a member's. A
+    message with a body and an attachment comes back as two outcomes, and folding them together
+    counted a message whose own re-parse succeeded as failed whenever its attachment did not —
+    while a working member counted as a second document repaired, which the sweep reaches
+    anyway in its own turn. The first report is the document's; the second is everything it
+    contained.
+    """
+    own, inside = ReindexReport(), ReindexReport()
+    reached = await _re_parse_one(
+        document, pipeline=pipeline, blobs=blobs, reuse_vectors=reuse_vectors
+    )
+    if isinstance(reached, str):
+        own.note_unrepairable(document, reached)
+        return own, inside
+    _fold_outcome(own, reached[0])
+    for outcome in reached[1:]:
+        _fold_outcome(inside, outcome)
+    return own, inside
+
+
+def _fold_outcome(report: ReindexReport, outcome: DocumentOutcome) -> None:
+    """One outcome of a re-parse, counted under the heading it belongs to."""
+    # Counted before the branching, and that is the point: the embed stage runs before
+    # anything below decides which list this document lands in, so what it cost is the
+    # same either way. The case that matters is a **store-stage failure** — the model
+    # has already run by the time an upsert fails — and counting only the documents a
+    # sweep managed to rebuild would report it as costing less the worse it went.
+    #
+    # Two things contribute zero here, for different reasons. A document superseded by a
+    # concurrent sync never reached the model: the guard fires on the re-parse's first
+    # write, which is before chunking. And a document that failed *inside* the embed
+    # stage left no accounting behind — an unknown number of batches had already gone —
+    # so zero is the honest floor rather than a guess at the figure.
+    report.note_embedding(outcome.embedding)
+    if outcome.superseded:
+        # Ahead of the two failure shapes below, because a superseded document is
+        # neither of them and would be read as one: it comes back carrying the status
+        # the *winner* left, which for a completed sync is `indexed`.
+        report.superseded.append(
+            f"{outcome.document_id or outcome.source_id}: a newer revision was committed "
+            f"while this was being re-parsed, so nothing from the older one was written"
+        )
+        return
+    # Two shapes of failure, because the pipeline has two. A document that was not
+    # already working comes back ``failed``. A document that *was* ``indexed`` keeps its
+    # status, its chunks and its vectors — the pipeline refuses to let a transient error
+    # cost a working document — and the failure arrives as an ``indexed`` outcome
+    # carrying a detail. Reading only the status counts that second case as a repair,
+    # which is the worst available answer: the stored text is still the previous
+    # parser's, the lineage was deliberately not advanced, and the report says the
+    # document was rebuilt.
+    if outcome.status is DocumentStatus.FAILED or (
+        outcome.status is DocumentStatus.INDEXED and outcome.detail
+    ):
+        report.failures.append(f"{outcome.document_id or outcome.source_id}: {outcome.detail}")
+    else:
+        report.documents += 1
+        report.chunks += outcome.chunks
 
 
 DEFAULT_SWEEP_BATCH = 25
@@ -599,6 +653,8 @@ class StaleSweep:
     """One line per document that cannot be repaired, naming the reason and the remedy."""
 
     failures: list[str] = field(default_factory=list[str])
+    """One line per failure: a selected document's own, and any member of one that failed while
+    it was re-parsed. Only the first kind is counted in ``failed``."""
 
     superseded: int = 0
     """Documents a newer revision overtook mid-repair, so the repair declined to commit.
@@ -734,13 +790,17 @@ async def re_parse_stale(
             # same arithmetic with one more way to get it wrong.
             left_behind += 1
             before = {chunk.id for chunk in await store.document_chunks(document.id)}
-            report = await re_parse([document], pipeline=pipeline, blobs=blobs)
+            report, inside = await _re_parse_judged(document, pipeline=pipeline, blobs=blobs)
             # Folded before the branching, for the reason `re_parse` folds it before its own:
             # the embed stage runs before any of the outcomes below is decided. A document with
             # no retained bytes contributes zero because nothing embedded it, and a superseded
             # one contributes zero because the commit guard drops it before it is chunked — but
             # a document that failed at the store contributes the passes it had already spent.
-            sweep.embedding = _total(sweep.embedding, report.embedding)
+            sweep.embedding = _total(_total(sweep.embedding, report.embedding), inside.embedding)
+            # Named, and not counted: a member that failed is a document somebody has to look
+            # at, but it is not the one this pass selected, and counting it here skipped the
+            # read-back below — leaving the cursor past a document that had left the selection.
+            sweep.failures.extend(inside.failures)
             if report.unrepairable:
                 sweep.unrepairable += 1
                 sweep.unrepairable_documents.extend(report.unrepairable)
@@ -784,6 +844,168 @@ async def _left_the_selection(
     """
     rebuilt = await store.get_document(document_id)
     return rebuilt is not None and rebuilt.parse_fp in current
+
+
+RE_EMBEDDABLE: Final = (DocumentStatus.INDEXED,)
+"""The documents a whole-corpus re-embed selects: the ones search is serving.
+
+A document in any other state has no published vectors to be wrong. One that failed is not in
+search; one an interrupted run left behind is the recovery sweep's to finish.
+"""
+
+
+@dataclass
+class ReembedSweep:
+    """What one whole-corpus re-embed did, in documents and in chunks."""
+
+    dry_run: bool = False
+    selected: int = 0
+    """Indexed documents, which is every document search serves."""
+
+    reembedded: int = 0
+    """Documents re-parsed and committed with every chunk freshly embedded. Zero on a plan."""
+
+    chunks: int = 0
+    """Chunks the model was given — or, on a plan, the chunks stored for the documents a run
+    would re-embed.
+
+    The price, and on a plan an exact one only while the parser is unchanged: the run re-parses,
+    so a document an upgraded parser would split differently is embedded as the new chunks
+    rather than the stored ones. ``document reindex --stale --dry-run`` is what names those.
+    """
+
+    embedding: EmbeddingWork = field(default_factory=EmbeddingWork)
+    """What the sweep cost at the embedder. ``reused`` is zero on every run, by design."""
+
+    unrepairable: int = 0
+    failed: int = 0
+    superseded: int = 0
+    """Documents a concurrent sync overtook, so this declined to commit. Not a failure."""
+
+    unrepairable_documents: list[str] = field(default_factory=list[str])
+    """One line per document with no retained bytes to re-parse, naming the reason."""
+
+    failures: list[str] = field(default_factory=list[str])
+    """One line per failure: a selected document's own, and any member of one that failed while
+    it was re-parsed. Only the first kind is counted in ``failed``."""
+
+    superseded_documents: list[str] = field(default_factory=list[str])
+
+
+async def plan_re_embed(*, store: IngestStore, batch: int = DEFAULT_SWEEP_BATCH) -> ReembedSweep:
+    """What :func:`re_embed_all` would do: the documents, the chunks, and the refusals.
+
+    A function rather than a flag on the sweep, for the reason :func:`plan_stale` gives: it
+    reads rows and builds nothing, so an index whose recorded fingerprint disagrees with the
+    configured model can still be priced — and the run, which builds the pipeline, is refused
+    for exactly that disagreement.
+
+    Like :func:`plan_stale`, it cannot see retained bytes that have gone missing from the blob
+    store, because finding that out is a blob read. Documents with no reference at all are
+    named here.
+
+    Args:
+        store: Where the selection is queried.
+        batch: Documents per page.
+
+    Returns:
+        A sweep marked ``dry_run``, carrying the selection, its stored chunk count, and the
+        documents that have no bytes to re-parse.
+    """
+    sweep = ReembedSweep(dry_run=True)
+    while True:
+        page = await select(store, statuses=RE_EMBEDDABLE, limit=batch, offset=sweep.selected)
+        if not page:
+            return sweep
+        for document in page:
+            sweep.selected += 1
+            if document.original_ref is None:
+                sweep.unrepairable += 1
+                sweep.unrepairable_documents.append(
+                    f"{document.id} ({document.uri}): {NO_RETAINED_BYTES}"
+                )
+                continue
+            sweep.chunks += len(await store.document_chunks(document.id))
+
+
+async def re_embed_all(
+    *,
+    store: IngestStore,
+    pipeline: IngestPipeline,
+    blobs: BlobSink,
+    batch: int = DEFAULT_SWEEP_BATCH,
+) -> ReembedSweep:
+    """Embed every indexed document's chunks again, reusing no stored vector. Rung 3.
+
+    **The repair for a model that moved without its fingerprint moving.** A served embedder pins
+    the weights it was given, not the runtime computing with them, so upgrading that runtime can
+    move every vector while every identity the index checks stays equal. Nothing selects those
+    documents, because by every recorded fact they are current, and every rebuild path reuses
+    the vectors they hold. This is :func:`re_parse` with that reuse switched off.
+
+    **Why a re-parse rather than a re-embed of the stored chunks.** The pipeline commits a
+    document under a publication addressed by its content, vectors included, and both built-in
+    stores keep that publication's rows immutable; new vectors are a new publication, staged
+    beside the old one and flipped to in one transaction. The re-parse path is the one that
+    already does that, under the commit guard and the reset epoch, so this reuses it rather than
+    opening a second route into the commit.
+
+    **It needs no named generations**, which is what ``manicule reembed`` needs and Qdrant does
+    not have: the per-document publication flip is how every sync already commits. Search
+    answers throughout, and each document moves from its old vectors to its new ones
+    atomically. What it does not do is change the embedding space — a model with a
+    different fingerprint is refused by the pipeline, and is ``manicule reembed``.
+
+    **A member is embedded in its own turn.** Re-parsing a document re-expands whatever it
+    contains, but members are not forced: one whose bytes are unchanged is skipped there by
+    change detection and re-embedded when the sweep selects it. A member is embedded twice only
+    when its parent's re-parse produces one that differs from the stored row — a member that is
+    new, or an expander that changed — and then the second pass is the one that leaves it
+    wholly in the current space. That extra work is not in the plan, which prices stored rows.
+
+    **A document is the unit and the selection does not shrink**, since a re-embedded document
+    is still indexed — so the cursor is the count seen. Stopping is safe at a document boundary.
+    Resuming is running it again from the start, because nothing recorded tells a document this
+    reached from one it did not: that is the premise it exists for.
+
+    Args:
+        store: Where the selection is queried.
+        pipeline: The current chain. The **same** object a sync would use, so the run is
+            refused by its fingerprint check and shares its embedding lock.
+        blobs: The retained bytes. The only source of content this reads.
+        batch: Documents per page.
+
+    Returns:
+        The counts, and one line per document that could not be re-embedded.
+    """
+    sweep = ReembedSweep()
+    while True:
+        page = await select(store, statuses=RE_EMBEDDABLE, limit=batch, offset=sweep.selected)
+        if not page:
+            # Chunks the model was given, failures included: a document that failed at the
+            # store had already been embedded, and the price is what was spent.
+            sweep.chunks = sweep.embedding.embedded
+            return sweep
+        for document in page:
+            sweep.selected += 1
+            own, inside = await _re_parse_judged(
+                document, pipeline=pipeline, blobs=blobs, reuse_vectors=False
+            )
+            sweep.embedding = _total(_total(sweep.embedding, own.embedding), inside.embedding)
+            # Named, and not counted: a member that failed is a document somebody has to look
+            # at, but it is not the one this pass selected.
+            sweep.failures.extend(inside.failures)
+            if own.unrepairable:
+                sweep.unrepairable += 1
+                sweep.unrepairable_documents.extend(own.unrepairable)
+            elif own.failures:
+                sweep.failed += 1
+                sweep.failures.extend(own.failures)
+            elif own.superseded:
+                sweep.superseded += 1
+                sweep.superseded_documents.extend(own.superseded)
+            else:
+                sweep.reembedded += 1
 
 
 DETECTION_IS_OFF = (
@@ -1369,14 +1591,18 @@ __all__ = [
     "NO_CHUNKS_TO_SCAN",
     "NO_RETAINED_BYTES",
     "NO_STORED_CHUNKS",
+    "RE_EMBEDDABLE",
     "GlossaryOutcome",
     "GlossarySweep",
+    "ReembedSweep",
     "ReindexReport",
     "StaleSweep",
+    "plan_re_embed",
     "plan_stale",
     "plan_stale_glossary",
     "plan_stale_relations",
     "re_embed",
+    "re_embed_all",
     "re_parse",
     "re_parse_stale",
     "redetect_glossary",

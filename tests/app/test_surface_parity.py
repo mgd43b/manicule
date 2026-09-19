@@ -179,6 +179,16 @@ def test_no_tool_re_parses_the_whole_corpus() -> None:
     )
 
 
+def test_no_tool_re_embeds_the_whole_corpus_in_place() -> None:
+    """``document reindex --re-embed`` is command line only, for ``--stale``'s reason.
+
+    It sends every chunk search serves back through the model and reuses none, so it costs
+    what the corpus costs and holds the accelerator for all of it — the unattended denial of
+    service the test above refuses a tool for, with no parser bump needed to start it.
+    """
+    assert "document_reembed" not in TOOL_NAMES
+
+
 def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
     """Corpus scans and accelerator work stay local; one aggregate journal read has parity."""
     assert "reembed_status" in TOOL_NAMES

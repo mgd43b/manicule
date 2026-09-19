@@ -1327,6 +1327,7 @@ of the blast-radius ladder (`storage.md` §1):
 | `repair` | `chunks` | 1–2 | none | `ingest.reindex.repair`, no command |
 | **re-embed** | `chunks.embed_text` | 2 | none | `reembed plan/start/execute/status/abandon/cleanup` |
 | **re-parse** | `blobs` | 3 | none | `document reindex <id>`, `document reindex --stale` |
+| **re-parse, reusing no vector** | `blobs` | 3 | none | `document reindex --re-embed` (§10.7) |
 | a forced sync | the source | 4 | yes, rate-limited, **may fail** | `index <path> --reindex`, for a path |
 
 **Rung 0 is below repair, and it is a rung of its own rather than a wider `--stale`.** Glossary
@@ -1342,7 +1343,8 @@ the *vectors themselves* are suspect — a reconfigured model, a restored `vecto
 a rebuild that stopped half way. Reuse would find every embedding input unchanged and skip every
 forward pass, so the one command that means "I do not trust these vectors" would succeed, report
 success, and change nothing. Every other path reuses; this one is the escape hatch, and an
-escape hatch that quietly does nothing is worse than none.
+escape hatch that quietly does nothing is worse than none. `document reindex --re-embed` is the
+same escape hatch for a model whose *space* did not change, on any vector store (§10.7).
 
 **Only the last one can fail for reasons outside the machine**, and it is the only one that is
 not reproducible. Everything above it is a pure function of what is already on disk. That is
@@ -1429,6 +1431,7 @@ reports the parts separately, because the remedy differs:
 | `embedding.reused` | vectors taken from the store | the embedding input was unchanged and a readable vector was found |
 | `embedding.input_changed` | chunks sent to the model | the input is new or has moved — including a chunk whose id survived |
 | `embedding.repaired` | chunks sent to the model | the input was unchanged and the stored vector was missing or unusable |
+| `embedding.refreshed` | chunks sent to the model | the input was unchanged and the vector reusable, and `--re-embed` asked for it anyway |
 | `embedding.forward_calls` | batches the model was asked for | the number accelerator time is proportional to |
 | `embedding.first_seen` | chunks sent to the model | the document held nothing to reuse — growth, not change |
 | `embedding.cache_hits` | chunks the embedder's warm cache served | the process-local layer, reported apart from durable reuse |
@@ -2269,6 +2272,47 @@ fenced owner is never taken over before lease expiry. The local CLI and authenti
 routes expose plan, start, resume, abandon and cleanup. `/ui/reembed` is read-only plan/status and
 contains no mutation controls or JavaScript handlers. MCP retains the aggregate read-only
 `reembed_status` tool. No network or browser surface lists opaque run ids.
+
+### 10.7 `document reindex --re-embed`, for a model that moved without its fingerprint
+
+```
+manicule document reindex --re-embed --dry-run    # documents and chunks a run would embed
+manicule document reindex --re-embed [--batch N]
+```
+
+**What it is for.** A served embedder pins the model it was given, not the runtime computing
+with it. Upgrading that runtime can move every vector while every field of `EmbedFingerprint`
+stays equal — measured on `qwen3-embedding:0.6b` across one Ollama upgrade (0.19.0 to 0.34.2),
+the same text came back at a cosine similarity as low as 0.99915, below the 0.9999 that the
+parity gate of `embeddings.md` §3.3 requires of two runtimes sharing an index. Nothing selects those documents, because by
+every recorded fact they are current, and every rebuild path reuses the vectors they hold. A
+corpus left alone ends up with its old documents in the old runtime's space and its new ones,
+and every query, in the new one.
+
+**What it does.** `--stale` over every indexed document with reuse switched off: each document
+is re-parsed from its retained bytes and every chunk goes to the model. The chunks that had a
+reusable vector are reported as `embedding.refreshed` rather than `input_changed`, because
+their text did not change.
+
+**Why a re-parse rather than a rung-2 re-embed of stored chunks.** The pipeline commits a
+document under a publication addressed by its content, vectors included, and both built-in
+stores keep that publication's rows immutable. New vectors are therefore a new publication,
+staged beside the old one and flipped to in one transaction — which is how every sync already
+commits, and is what `ingest.reindex.re_embed` cannot do: it rewrites rows in place, so it
+reaches only documents still in the `legacy` publication. Going through the re-parse path keeps
+the commit guard, the reset epoch and the per-document flip, rather than opening a second route
+into the commit.
+
+**Where it sits beside §10.6.** `manicule reembed` moves a corpus *between* embedding spaces and
+needs named generations, which only the built-in LanceDB store has. `--re-embed` stays in the
+space the index records — a different fingerprint is refused by the pipeline before any document
+is read — and needs nothing a sync does not, so it runs on Qdrant too. Search answers throughout;
+each document moves from its old vectors to its new ones atomically.
+
+**Stopping and resuming.** A document is the unit, so stopping is safe at a document boundary.
+Resuming is running it again from the start: nothing recorded distinguishes a document it
+reached from one it did not, which is the premise it exists for. A document with no retained
+bytes is named, on the plan and the run alike, and only a forced re-sync reaches it.
 
 ## 11. `reconcile()` and deletion
 

@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import (
         GlossarySweep,
+        ReembedSweep,
         ReindexReport,
         RelationSweep,
         StaleSweep,
@@ -1747,7 +1748,9 @@ class _Ingestion:
                 f"vector store implements named shadow generations, atomic publication, "
                 f"inspection and cleanup — the four things a re-embed swaps a whole generation "
                 f"with — and ordinary VectorStore methods cannot emulate them safely. Re-index "
-                f"instead, or move the corpus to 'lancedb' for the re-embed."
+                f"instead, or move the corpus to 'lancedb' for the re-embed. If the model is "
+                f"the one the index records and only its output moved, `manicule document "
+                f"reindex --re-embed` re-embeds on any store."
             )
 
     def _require_reembed_capacity(self, run: ReembedRun) -> None:
@@ -1805,6 +1808,25 @@ class _Ingestion:
             pipeline=await self._runtime.pipeline(),
             blobs=await self._runtime.blobs(),
         )
+
+    async def reembed_all(self, *, batch: int, dry_run: bool = False) -> ReembedSweep:
+        from manicule.ingest.reindex import plan_re_embed, re_embed_all  # noqa: PLC0415
+
+        store = await self._runtime.documents()
+        if dry_run:
+            # Before the pipeline, for the reason `_reparse_stale_guarded` gives: building one
+            # refuses an index the configured model disagrees with, and a plan reads rows.
+            return await plan_re_embed(
+                store=store,  # pyright: ignore[reportArgumentType] - it satisfies IngestStore
+                batch=batch,
+            )
+        async with self._runtime.derived_mutation_guard():
+            return await re_embed_all(
+                store=store,  # pyright: ignore[reportArgumentType] - it satisfies IngestStore
+                pipeline=await self._runtime.pipeline(),
+                blobs=await self._runtime.blobs(),
+                batch=batch,
+            )
 
     async def reparse_stale(self, *, batch: int, dry_run: bool = False) -> StaleSweep:
         if dry_run:

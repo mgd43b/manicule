@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import (
         GlossarySweep,
+        ReembedSweep,
         ReindexReport,
         RelationSweep,
         StaleSweep,
@@ -263,6 +264,22 @@ class Ingesting(Protocol):
         Which fingerprints count as current is decided here rather than passed in. A partial
         set makes every document its parser produced look stale, which is a repair that cannot
         end, so no surface is given the chance to supply one.
+        """
+        ...
+
+    async def reembed_all(self, *, batch: int, dry_run: bool = False) -> ReembedSweep:
+        """Re-parse every indexed document from retained bytes and embed all of it again.
+
+        On this port beside :meth:`reparse_stale` for the reason that one is here: the run goes
+        through the *same* pipeline a sync would, so it is refused by that pipeline's
+        fingerprint check and shares its embedding lock. The plan builds no pipeline, so an
+        index the configured model disagrees with can still be priced.
+
+        Not ``manicule reembed``, which stages a whole replacement generation and needs a
+        vector store with named generations. Each document here publishes its new vectors the
+        way a sync does, so it runs on any store — and it is for a model whose vectors moved
+        while its fingerprint did not, which is the one case every other path reuses its way
+        past.
         """
         ...
 

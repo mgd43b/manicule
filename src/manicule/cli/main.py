@@ -103,17 +103,19 @@ parser bump touched, and would find out from the elapsed time.
 """
 
 REINDEX_NEEDS_A_TARGET = (
-    "say what to re-parse: a document id, --stale for every document whose parse fingerprint "
-    "is no longer one an installed parser produces, or --stale-glossary for every document "
-    "whose glossary came from a detector this build has changed"
+    "say what to rebuild: a document id, --stale for every document whose parse fingerprint "
+    "is no longer one an installed parser produces, --stale-glossary for every document "
+    "whose glossary came from a detector this build has changed, --stale-relations for every "
+    "document a changed relation extractor has moved past, or --re-embed to embed every "
+    "indexed document again without reusing a stored vector"
 )
 
 REINDEX_IS_ONE_RUNG = (
-    "pass --stale or --stale-glossary, not both. They are different repairs at different "
-    "prices: --stale re-parses from retained bytes and re-embeds whatever moves, which is "
-    "corpus-sized GPU work, and --stale-glossary reads the chunks already stored and runs "
-    "regular expressions over them. Running them together would charge the second's job at "
-    "the first's price with no way to see which one did what."
+    "pass one of --stale, --stale-glossary, --stale-relations and --re-embed. They are "
+    "different repairs at different prices: --stale re-parses from retained bytes and "
+    "re-embeds whatever moves, which is corpus-sized GPU work, and --stale-glossary reads the "
+    "chunks already stored and runs regular expressions over them. Running them together would "
+    "charge the second's job at the first's price with no way to see which one did what."
 )
 """Why ``--stale --stale-glossary`` is refused rather than run in sequence.
 
@@ -134,8 +136,21 @@ GLOSSARY_IS_NOT_A_DOCUMENT_SWEEP = (
     "could mean that the id alone does not already do."
 )
 
+RE_EMBED_IS_NOT_A_DOCUMENT_SWEEP = (
+    "--re-embed replaces the vectors of every indexed document; an id names one document to "
+    "re-parse from its retained bytes. Re-parsing one document already re-embeds whatever of "
+    "it moved, so pass one or the other."
+)
+"""Why ``document reindex <id> --re-embed`` is refused rather than narrowed to one document.
+
+:data:`REINDEX_IS_ONE_OR_ALL`'s reason, for the verb where the two readings differ most: one is
+a document's worth of GPU time and the other is the corpus's, and nothing in the invocation says
+which the person meant.
+"""
+
 DRY_RUN_IS_A_SWEEP_OPTION = (
-    "--dry-run applies to --stale and --stale-glossary, which select documents before "
+    "--dry-run applies to the sweeps (--stale, --stale-glossary, --stale-relations and "
+    "--re-embed), which select documents before "
     "repairing them. Re-parsing one named document has no selection to plan, so a dry run of "
     "it would report nothing and look like a run that found nothing to do."
 )
@@ -666,6 +681,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "document_reindex_stale": r.StaleReparseReport,
     "document_redetect_glossary": r.StaleGlossaryReport,
     "document_rescan_relations": r.StaleRelationReport,
+    "document_reembed": r.ReembedSweepReport,
     "reembed_plan": r.ReembedPlanReport,
     "reembed_start": r.ReembedRunReport,
     "reembed_resume": r.ReembedRunReport,
@@ -1185,6 +1201,15 @@ def document_reindex(
             "past, and for every document none has scanned. Reads stored chunks.",
         ),
     ] = False,
+    re_embed: Annotated[
+        bool,
+        typer.Option(
+            "--re-embed",
+            help="Re-parse every indexed document from retained bytes and embed all of it "
+            "again, reusing no stored vector. For an embedder whose output moved while its "
+            "fingerprint did not.",
+        ),
+    ] = False,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="With a sweep: report the plan and write nothing."),
@@ -1211,15 +1236,27 @@ def document_reindex(
     ingest, so configuring the middleware — or correcting one of its rules — changes nothing
     already stored until this runs, and the first run after configuring one selects everything.
 
-    Stopping any of them is safe at a document boundary; running it again resumes.
+    `--re-embed` is `--stale` over every indexed document with vector reuse switched off: each
+    is re-parsed from its retained bytes and every chunk goes to the model. It is the repair for
+    an embedder whose output moved while every fingerprint the index checks stayed equal — a
+    served model's runtime upgraded under the same weights — which nothing else selects and
+    every other rebuild reuses its way past. Each document commits the way a sync does, so it
+    runs on any vector store and search keeps answering; a *different* model is refused, and is
+    `manicule reembed`.
+
+    Stopping any of them is safe at a document boundary. Running the stale sweeps again resumes;
+    running `--re-embed` again starts over, because nothing recorded says which documents it
+    reached.
     """
-    rungs = [stale, stale_glossary, stale_relations]
+    rungs = [stale, stale_glossary, stale_relations, re_embed]
     if sum(rungs) > 1:
         raise typer.BadParameter(REINDEX_IS_ONE_RUNG)
     if stale and document_id is not None:
         raise typer.BadParameter(REINDEX_IS_ONE_OR_ALL)
     if (stale_glossary or stale_relations) and document_id is not None:
         raise typer.BadParameter(GLOSSARY_IS_NOT_A_DOCUMENT_SWEEP)
+    if re_embed and document_id is not None:
+        raise typer.BadParameter(RE_EMBED_IS_NOT_A_DOCUMENT_SWEEP)
     if not any(rungs):
         if document_id is None:
             raise typer.BadParameter(REINDEX_NEEDS_A_TARGET)
@@ -1232,6 +1269,9 @@ def document_reindex(
         return
     if stale_relations:
         submit(Command("document_rescan_relations", {"batch": batch, "dry_run": dry_run}))
+        return
+    if re_embed:
+        submit(Command("document_reembed", {"batch": batch, "dry_run": dry_run}))
         return
     submit(Command("document_reindex_stale", {"batch": batch, "dry_run": dry_run}))
 

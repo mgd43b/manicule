@@ -81,7 +81,13 @@ from manicule.ingest.reembed import (
     ReembedRun,
     ReembedState,
 )
-from manicule.ingest.reindex import GlossarySweep, ReindexReport, RelationSweep, StaleSweep
+from manicule.ingest.reindex import (
+    GlossarySweep,
+    ReembedSweep,
+    ReindexReport,
+    RelationSweep,
+    StaleSweep,
+)
 from manicule.ingest.sweeps import SweepResult
 from manicule.retrieval.retriever import RetrievalResult
 from manicule.storage.organization import normalize_name
@@ -1208,6 +1214,21 @@ class FakeIngestion:
     async def rescan_stale_relations(self, *, batch: int, dry_run: bool = False) -> RelationSweep:
         self.relation_sweeps.append((batch, dry_run))
         return replace(self.relation_sweep, dry_run=dry_run)
+
+    reembed_sweeps: list[tuple[int, bool]] = field(default_factory=list[tuple[int, bool]])
+    """``(batch, dry_run)`` per in-place re-embed, so a test can show what reached the port."""
+
+    reembed_sweep: ReembedSweep = field(
+        default_factory=lambda: ReembedSweep(
+            selected=9, reembedded=6, chunks=23, failed=2, unrepairable=1
+        )
+    )
+    """What the in-place re-embed reports. Every number different, on the relation sweep's
+    reasoning above."""
+
+    async def reembed_all(self, *, batch: int, dry_run: bool = False) -> ReembedSweep:
+        self.reembed_sweeps.append((batch, dry_run))
+        return replace(self.reembed_sweep, dry_run=dry_run)
 
     async def redetect_stale_glossary(self, *, batch: int, dry_run: bool = False) -> GlossarySweep:
         self.glossary_sweeps.append((batch, dry_run))

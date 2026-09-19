@@ -718,7 +718,7 @@ async def test_the_partition_adds_up_however_the_work_falls() -> None:
 
     assert work.chunks == len(chunks)
     assert work.reused + work.embedded == work.chunks
-    assert work.input_changed + work.first_seen + work.repaired == work.embedded
+    assert work.input_changed + work.first_seen + work.repaired + work.refreshed == work.embedded
     assert work.vectors_new + work.vectors_replaced == work.embedded
     assert (work.reused, work.repaired, work.input_changed) == (1, 2, 1), (
         "one untouched, one whose row went missing, one whose row contradicts itself, and one "
@@ -728,6 +728,41 @@ async def test_the_partition_adds_up_however_the_work_falls() -> None:
         "the index holds chunks for this document, so nothing here is growth — the unmatched "
         "chunk is a change, and calling it new would price a narrow bump as a first sync"
     )
+
+
+async def test_with_reuse_off_every_chunk_is_embedded_and_the_reusable_ones_say_so() -> None:
+    """The same four verdicts, with reuse switched off: the partition still adds up.
+
+    What moves is one chunk. The untouched chunk has a reusable vector and is embedded anyway,
+    and it is counted as ``refreshed`` rather than ``input_changed`` — its input did not change,
+    and a report claiming it had would send an operator looking for an edit that never happened.
+    The other three are embedded for the reasons they were embedded before, and counted the same.
+    """
+    store, vectors, _, embedder = await indexed({"a": "alpha\nbeta\ngamma"})
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    stored = list(store.chunks[document.id])
+    vectors.rows.pop(stored[1].id)
+    vectors.rows[stored[2].id].embed_text = "no longer what this chunk says"
+    fresh = stored[0].model_copy(
+        update={"id": "brand-new", "text": "delta", "embed_text": "Doc > delta", "position": 3}
+    )
+    chunks = [*stored, fresh]
+    embedder.batches.clear()
+
+    _, work = await embed_or_reuse(
+        embedder,
+        chunks,
+        vectors=vectors,
+        previous={chunk.id: chunk.embed_text for chunk in stored},
+        reuse=False,
+    )
+
+    assert (work.reused, work.embedded) == (0, len(chunks))
+    assert sum(embedder.batches) == len(chunks), "every chunk reached the model"
+    assert work.input_changed + work.first_seen + work.repaired + work.refreshed == work.embedded
+    assert work.vectors_new + work.vectors_replaced == work.embedded
+    assert (work.refreshed, work.repaired, work.input_changed) == (1, 2, 1)
 
 
 async def test_a_document_lost_at_the_store_still_reports_what_it_spent_at_the_model() -> None:

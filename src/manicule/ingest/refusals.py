@@ -208,8 +208,11 @@ async def _refuse_embed_mismatch(
             "its obsolete derived identity, then retry the ingest."
             if chunks == 0
             else (
-                f"{chunks} stored chunk(s) would need re-embedding. `reindex --re-embed` reads "
-                "chunks.embed_text and touches neither the network nor a parser."
+                f"{chunks} stored chunk(s) would need re-embedding into the configured model's "
+                "space. On the built-in LanceDB store, `manicule reembed start` builds that "
+                "space beside the live one and swaps it in; on any other store, `manicule "
+                "reset-index --yes` and a re-sync rebuild it. `document reindex --re-embed` "
+                "does not: it re-embeds under the model the index already records."
             )
         )
         exc.add_note(note)
