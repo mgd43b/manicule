@@ -1339,7 +1339,9 @@ class StaleReparseReport(Payload):
     """One line per unrepairable document: which it is, why, and what would repair it."""
 
     failures: tuple[str, ...] = ()
-    """One line per failure. Neither list fails the sweep — the rest of the corpus completes."""
+    """One line per failure: a selected document's own, and any member of one that failed while
+    it was re-parsed, which ``failed`` does not count. Neither list fails the sweep — the rest of
+    the corpus completes."""
 
     superseded: int = Field(default=0, ge=0)
     """Documents a newer revision overtook while this sweep was re-parsing them.

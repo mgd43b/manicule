@@ -1282,3 +1282,53 @@ async def test_the_report_names_documents_without_quoting_what_is_in_them() -> N
     assert any(marker in data.decode() for data in blobs.data.values()), (
         "the fixture must still hold the marker, or this proves nothing"
     )
+
+
+async def test_a_member_that_fails_does_not_count_its_document_as_failed() -> None:
+    """The document is judged by its own outcome; the failed member is named, not counted.
+
+    A re-parse returns the document's outcome first and one per member after it, so a document
+    with a body and an attachment comes back as two. Classifying the two together counted a
+    document whose own re-parse succeeded as failed, and skipped the chunk comparison and the
+    cursor read-back that follow a repair — so a second run selected it again.
+    """
+    store, vectors, blobs = fakes.MemoryIngestStore(), fakes.MemoryVectors(), fakes.MemoryBlobs()
+    embedder = fakes.CountingEmbedder()
+    await vectors.ensure_ready(embedder.fingerprint)
+
+    def pipeline_at(library: str) -> IngestPipeline:
+        pipeline, _, _ = build(
+            store=store,
+            vectors=vectors,
+            blobs=blobs,
+            embedder=embedder,
+            parsers={"lines": fakes.ReadsAndExpands()},
+            parse_fingerprints=parse_versions(lines=library),
+        )
+        return pipeline
+
+    await pipeline_at("1").run(fakes.DictConnector({"message": "a body\nof two lines"}))
+    message = await store.find_document("memory", "message")
+    assert message is not None
+    assert message.status is DocumentStatus.INDEXED, "the fixture must have chunks of its own"
+
+    sweep = await re_parse_stale(
+        store=store,
+        pipeline=pipeline_at("2"),
+        blobs=blobs,
+        parse_fingerprints=fingerprints("2"),
+        batch=1,
+    )
+
+    # Two: the message, and the failed member's own row, which records no parse lineage and so
+    # is always selected. A batch of one is the point — a message miscounted as failed was
+    # never read back, so the cursor stayed past it and stepped over the member's row.
+    assert sweep.selected == 2
+    assert (sweep.reparsed, sweep.failed, sweep.unrepairable) == (1, 0, 1)
+    assert (sweep.unchanged, sweep.chunks_kept) == (1, 2)
+    assert any("member is encrypted" in line for line in sweep.failures), "still named"
+
+    again = await re_parse_stale(
+        store=store, pipeline=pipeline_at("2"), blobs=blobs, parse_fingerprints=fingerprints("2")
+    )
+    assert again.selected == 1, "only the member's row, which has no bytes to repair it from"

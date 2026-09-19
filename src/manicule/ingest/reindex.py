@@ -513,6 +513,31 @@ async def _re_parse_one(
     )
 
 
+async def _re_parse_judged(
+    document: Document, *, pipeline: IngestPipeline, blobs: BlobSink, reuse_vectors: bool = True
+) -> tuple[ReindexReport, ReindexReport]:
+    """Re-parse one selected document, and report its own outcome apart from its members'.
+
+    A sweep judges the document it selected by that document's outcome, never by a member's. A
+    message with a body and an attachment comes back as two outcomes, and folding them together
+    counted a message whose own re-parse succeeded as failed whenever its attachment did not —
+    while a working member counted as a second document repaired, which the sweep reaches
+    anyway in its own turn. The first report is the document's; the second is everything it
+    contained.
+    """
+    own, inside = ReindexReport(), ReindexReport()
+    reached = await _re_parse_one(
+        document, pipeline=pipeline, blobs=blobs, reuse_vectors=reuse_vectors
+    )
+    if isinstance(reached, str):
+        own.note_unrepairable(document, reached)
+        return own, inside
+    _fold_outcome(own, reached[0])
+    for outcome in reached[1:]:
+        _fold_outcome(inside, outcome)
+    return own, inside
+
+
 def _fold_outcome(report: ReindexReport, outcome: DocumentOutcome) -> None:
     """One outcome of a re-parse, counted under the heading it belongs to."""
     # Counted before the branching, and that is the point: the embed stage runs before
@@ -628,6 +653,8 @@ class StaleSweep:
     """One line per document that cannot be repaired, naming the reason and the remedy."""
 
     failures: list[str] = field(default_factory=list[str])
+    """One line per failure: a selected document's own, and any member of one that failed while
+    it was re-parsed. Only the first kind is counted in ``failed``."""
 
     superseded: int = 0
     """Documents a newer revision overtook mid-repair, so the repair declined to commit.
@@ -763,13 +790,17 @@ async def re_parse_stale(
             # same arithmetic with one more way to get it wrong.
             left_behind += 1
             before = {chunk.id for chunk in await store.document_chunks(document.id)}
-            report = await re_parse([document], pipeline=pipeline, blobs=blobs)
+            report, inside = await _re_parse_judged(document, pipeline=pipeline, blobs=blobs)
             # Folded before the branching, for the reason `re_parse` folds it before its own:
             # the embed stage runs before any of the outcomes below is decided. A document with
             # no retained bytes contributes zero because nothing embedded it, and a superseded
             # one contributes zero because the commit guard drops it before it is chunked — but
             # a document that failed at the store contributes the passes it had already spent.
-            sweep.embedding = _total(sweep.embedding, report.embedding)
+            sweep.embedding = _total(_total(sweep.embedding, report.embedding), inside.embedding)
+            # Named, and not counted: a member that failed is a document somebody has to look
+            # at, but it is not the one this pass selected, and counting it here skipped the
+            # read-back below — leaving the cursor past a document that had left the selection.
+            sweep.failures.extend(inside.failures)
             if report.unrepairable:
                 sweep.unrepairable += 1
                 sweep.unrepairable_documents.extend(report.unrepairable)
@@ -950,20 +981,9 @@ async def re_embed_all(
             return sweep
         for document in page:
             sweep.selected += 1
-            reached = await _re_parse_one(
+            own, inside = await _re_parse_judged(
                 document, pipeline=pipeline, blobs=blobs, reuse_vectors=False
             )
-            # Judged by its own outcome, never by a member's. A document with a body and an
-            # attachment comes back as two outcomes, and one failed attachment would otherwise
-            # count a re-embedded document as failed — while a working member would count as a
-            # second document re-embedded, which the sweep reaches anyway in its own turn.
-            own, inside = ReindexReport(), ReindexReport()
-            if isinstance(reached, str):
-                own.note_unrepairable(document, reached)
-            else:
-                _fold_outcome(own, reached[0])
-                for outcome in reached[1:]:
-                    _fold_outcome(inside, outcome)
             sweep.embedding = _total(_total(sweep.embedding, own.embedding), inside.embedding)
             # Named, and not counted: a member that failed is a document somebody has to look
             # at, but it is not the one this pass selected.

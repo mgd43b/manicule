@@ -850,6 +850,24 @@ class EmptyParser(LineParser):
         yield  # pragma: no cover - unreachable, present to make this an async generator
 
 
+class ReadsAndExpands(LineParser):
+    """Text of its own and one member that cannot be read: a message with an encrypted attachment.
+
+    The shape that is ``indexed`` *and* has members, so a sweep over indexed documents selects it
+    and its re-parse comes back as two outcomes — its own, then the member's. A pure container
+    never reaches such a sweep; its status is ``container``.
+    """
+
+    async def expand(self, raw: RawDocument) -> AsyncIterator[MemberOutcome]:
+        yield MemberFailure(
+            source_id=f"{raw.source_id}!/sealed",
+            uri=f"fake:{raw.uri}!/sealed",
+            status=DocumentStatus.FAILED,
+            reason="member is encrypted",
+            depth=1,
+        )
+
+
 class FakeArchive:
     """A container whose members are named in its own body, one per line."""
 

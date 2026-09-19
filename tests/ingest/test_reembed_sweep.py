@@ -12,18 +12,15 @@ from typing import TYPE_CHECKING, override
 
 from manicule.core.content import DocumentStatus
 from manicule.ingest.reindex import NO_RETAINED_BYTES, plan_re_embed, re_embed_all, re_parse
-from manicule.parsers.expansion import MemberFailure
 from tests.ingest import fakes
 from tests.ingest.test_pipeline import build, parse_versions
 from tests.ingest.test_reindex_sweep import corpus
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import Sequence
 
-    from manicule.core.content import RawDocument
     from manicule.core.embedding import Vector
     from manicule.ingest.pipeline import IngestPipeline
-    from manicule.parsers.expansion import MemberOutcome
 
 PAGES = {"a": "alpha\nbeta", "b": "gamma\ndelta\nepsilon", "c": "zeta"}
 """Three documents, so a batch of two pages the selection once and then stops on a short page."""
@@ -230,24 +227,6 @@ async def test_only_documents_search_is_serving_are_selected() -> None:
     assert plan.selected == run.selected == len(PAGES) - 1
 
 
-class ReadsAndExpands(fakes.LineParser):
-    """Text of its own and one member that cannot be read: a message with an encrypted attachment.
-
-    The shape that is ``indexed`` *and* has members, so the sweep selects it and its re-parse
-    comes back as two outcomes. A pure container never reaches the sweep; its status is
-    ``container``.
-    """
-
-    async def expand(self, raw: RawDocument) -> AsyncIterator[MemberOutcome]:
-        yield MemberFailure(
-            source_id=f"{raw.source_id}!/sealed",
-            uri=f"fake:{raw.uri}!/sealed",
-            status=DocumentStatus.FAILED,
-            reason="member is encrypted",
-            depth=1,
-        )
-
-
 async def test_a_member_that_fails_does_not_count_its_document_as_failed() -> None:
     """The document is judged by its own outcome; the failed member is named, not counted."""
     store, vectors, blobs = fakes.MemoryIngestStore(), fakes.MemoryVectors(), fakes.MemoryBlobs()
@@ -260,7 +239,7 @@ async def test_a_member_that_fails_does_not_count_its_document_as_failed() -> No
             vectors=vectors,
             blobs=blobs,
             embedder=embedder,
-            parsers={"lines": ReadsAndExpands()},
+            parsers={"lines": fakes.ReadsAndExpands()},
             parse_fingerprints=parse_versions(lines="1"),
         )
         return pipeline
