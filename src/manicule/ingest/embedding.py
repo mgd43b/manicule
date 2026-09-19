@@ -224,7 +224,8 @@ class EmbeddingWork:
     them:
 
     - ``reused + embedded == chunks``
-    - ``input_changed + first_seen + repaired == embedded == vectors_new + vectors_replaced``
+    - ``input_changed + first_seen + repaired + refreshed == embedded == vectors_new +
+      vectors_replaced``
 
     They are scoped to that function on purpose. A caller may build one of these by hand from
     what it knows — :func:`~manicule.ingest.reindex.re_embed` does, because it embeds
@@ -281,6 +282,16 @@ class EmbeddingWork:
     dimension, or one whose recorded identity contradicts the chunk stored beside it. Identity
     metadata asserting that a vector exists is not the same as the vector existing, so this
     group is found by looking rather than by trusting.
+    """
+
+    refreshed: int = 0
+    """Of ``embedded``, those with a reusable vector that the caller asked to be embedded anyway.
+
+    Only ``manicule document reindex --re-embed`` asks, and only because the reuse condition
+    cannot see what it is for: an embedder whose output moved while its fingerprint did not. By
+    every identity the index checks, these chunks are unchanged and their vectors current — so
+    counting them under ``input_changed`` would report a change to the text that did not
+    happen, and counting them nowhere would break the partition above.
     """
 
     forward_calls: int = 0
@@ -344,6 +355,7 @@ async def embed_or_reuse(
     target_batch_tokens: int = DEFAULT_TARGET_BATCH_TOKENS,
     maximum: int = MAX_BATCH,
     lock: AbstractAsyncContextManager[object] | None = None,
+    reuse: bool = True,
 ) -> tuple[list[Vector], EmbeddingWork]:
     """Embed only the chunks whose embedding input the index does not already hold a vector for.
 
@@ -387,6 +399,9 @@ async def embed_or_reuse(
             process-wide embedding lock across a vector-store read for every document — so a
             sweep and a sync running beside each other would serialize on a read they could
             have done concurrently, which is contention rather than the thing the lock is for.
+        reuse: ``False`` embeds every chunk, reusable or not, and counts the reusable ones as
+            ``refreshed``. The stored vectors are still read, so that the report can say which
+            chunks were reusable and which rows the new vectors replace.
 
     Returns:
         One vector per chunk, in the order the chunks were given, and what it cost.
@@ -408,6 +423,7 @@ async def embed_or_reuse(
     backfilled = 0
     repaired = 0
     first_seen = 0
+    refreshed = 0
     # Whether the caller looked and found the index holding nothing for these chunks at all.
     # **Not "this chunk id is new"**, which is a different and wrong test: a chunk id is derived
     # from its text, so a chunk whose text moved arrives with an id the index has never seen and
@@ -417,11 +433,13 @@ async def embed_or_reuse(
     for position, chunk in enumerate(chunks):
         verdict = verdicts[chunk.id]
         counts[verdict.state] += 1
-        if verdict.is_reusable:
+        if verdict.is_reusable and reuse:
             reused[position] = verdict.vector
             backfilled += 0 if verdict.identity_recorded else 1
             continue
-        if verdict.state is VectorState.CORRUPT or (
+        if verdict.is_reusable:
+            refreshed += 1
+        elif verdict.state is VectorState.CORRUPT or (
             verdict.state is VectorState.ABSENT and held.get(chunk.id) == chunk.embed_text
         ):
             repaired += 1
@@ -458,13 +476,14 @@ async def embed_or_reuse(
         chunks=len(chunks),
         reused=len(reused),
         embedded=len(pending),
-        input_changed=len(pending) - repaired - first_seen,
+        input_changed=len(pending) - repaired - first_seen - refreshed,
         first_seen=first_seen,
         repaired=repaired,
+        refreshed=refreshed,
         forward_calls=forward_calls,
         cache_hits=_cache_hits(embedder) - before_hits,
         vectors_new=counts[VectorState.ABSENT],
-        vectors_replaced=counts[VectorState.STALE] + counts[VectorState.CORRUPT],
+        vectors_replaced=counts[VectorState.STALE] + counts[VectorState.CORRUPT] + refreshed,
         vectors_backfilled=backfilled,
     )
 

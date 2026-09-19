@@ -411,6 +411,56 @@ async def test_a_dry_sweep_says_it_was_one_and_reaches_the_ingest_layer_as_one(
     assert report.reparsed == 0
 
 
+async def test_a_re_embed_carries_every_count_and_the_refreshed_cost_to_the_payload(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Every field of the sweep reaches the payload, ``refreshed`` above all.
+
+    ``refreshed`` is the number that says the run did what it was for: chunks whose stored
+    vector looked current and were embedded anyway. A payload that dropped it would report a
+    whole-corpus re-embed of unchanged text as an embedding run with no reason attached.
+    """
+    from manicule.ingest.embedding import EmbeddingWork  # noqa: PLC0415
+    from manicule.ingest.reindex import ReembedSweep  # noqa: PLC0415
+
+    backend.ingestion_.reembed_sweep = ReembedSweep(
+        selected=9,
+        reembedded=6,
+        chunks=23,
+        embedding=EmbeddingWork(chunks=23, embedded=23, refreshed=21, repaired=2, forward_calls=5),
+        unrepairable=1,
+        failed=1,
+        superseded=1,
+        unrepairable_documents=["doc-a (file:///a.md): no retained bytes"],
+        failures=["doc-b: the store refused the write"],
+        superseded_documents=["doc-c: a newer revision was committed while this was re-parsed"],
+    )
+
+    report = await service.document_reembed(batch=4)
+
+    assert backend.ingestion_.reembed_sweeps == [(4, False)]
+    assert (report.selected, report.reembedded, report.chunks) == (9, 6, 23)
+    assert (report.embedding.refreshed, report.embedding.repaired) == (21, 2)
+    assert report.embedding.forward_calls == 5
+    assert (report.unrepairable, report.failed, report.superseded) == (1, 1, 1)
+    assert report.unrepairable_documents == ("doc-a (file:///a.md): no retained bytes",)
+    assert report.failures == ("doc-b: the store refused the write",)
+    assert report.superseded_documents == (
+        "doc-c: a newer revision was committed while this was re-parsed",
+    )
+    assert report.dry_run is False
+
+
+async def test_a_re_embed_plan_reaches_the_ingest_layer_as_one(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """Declared and not passed, a plan would re-embed the corpus and then describe itself."""
+    report = await service.document_reembed(batch=8, dry_run=True)
+
+    assert backend.ingestion_.reembed_sweeps == [(8, True)]
+    assert report.dry_run is True
+
+
 # --- ingest --------------------------------------------------------------------------------
 
 

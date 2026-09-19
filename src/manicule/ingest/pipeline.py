@@ -3308,6 +3308,7 @@ class IngestPipeline:
         retention: Retention | None = None,
         force_members: bool = False,
         blobs: BlobSink | None = None,
+        reuse_vectors: bool = True,
     ) -> list[DocumentOutcome]:
         """Publish fetched bytes under the runtime-wide reset/publication barrier."""
         async with self._mutation_guard():
@@ -3323,6 +3324,7 @@ class IngestPipeline:
                 retention=retention,
                 force_members=force_members,
                 blobs=blobs,
+                reuse_vectors=reuse_vectors,
             )
 
     async def _assert_current_reset_epoch(self) -> None:
@@ -3346,6 +3348,7 @@ class IngestPipeline:
         retention: Retention | None = None,
         force_members: bool = False,
         blobs: BlobSink | None = None,
+        reuse_vectors: bool = True,
     ) -> list[DocumentOutcome]:
         """Everything from fetched bytes onwards, including anything found inside.
 
@@ -3378,6 +3381,11 @@ class IngestPipeline:
         acquisition and re-parse pass it so this shared derivation path never retains the same
         top-level snapshot twice. Container members are new derived documents and retain their
         own bytes normally.
+
+        ``reuse_vectors`` is the *top-level* document's too, on ``force``'s reasoning. ``False``
+        embeds every one of its chunks whether or not a stored vector is reusable, which is what
+        ``document reindex --re-embed`` needs and nothing else does. A member is a document of
+        its own, which that sweep selects in its own turn.
         """
         outcome, members = await self._ingest_one(
             raw,
@@ -3389,6 +3397,7 @@ class IngestPipeline:
             expected=expected,
             retention=retention,
             blobs=blobs,
+            reuse_vectors=reuse_vectors,
         )
         outcomes = [outcome]
         # Each member is queued beside the document it came out of. The queue is flat so that a
@@ -3455,6 +3464,7 @@ class IngestPipeline:
         blobs: BlobSink | None = None,
         container_id: str | None = None,
         container_depth: int = 0,
+        reuse_vectors: bool = True,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """One document, and whatever it turned out to contain."""
         source_bytes = raw.as_bytes()
@@ -3501,6 +3511,7 @@ class IngestPipeline:
                     blobs=blobs,
                     container_id=container_id,
                     container_depth=container_depth,
+                    reuse_vectors=reuse_vectors,
                 )
             except _SupersededError as moved:
                 # Nothing was written, by construction: the guard fires on the first write this
@@ -3533,6 +3544,7 @@ class IngestPipeline:
         blobs: BlobSink | None,
         container_id: str | None = None,
         container_depth: int = 0,
+        reuse_vectors: bool = True,
     ) -> tuple[DocumentOutcome, tuple[MemberOutcome, ...]]:
         """The part of one document's ingest that writes, under the lock and the guard.
 
@@ -3658,6 +3670,7 @@ class IngestPipeline:
             existing=existing,
             retention=retention,
             expected=expected,
+            reuse_vectors=reuse_vectors,
         )
         # A document can have chunks *and* members — a message with a body and an attachment is
         # the case — so the members travel with this outcome too. Returning none here was
@@ -3809,6 +3822,7 @@ class IngestPipeline:
         existing: Document | None,
         retention: Retention,
         expected: DocumentRevision | None = None,
+        reuse_vectors: bool = True,
     ) -> DocumentOutcome:
         """Chunk, embed and commit a document the chain produced text for.
 
@@ -3850,6 +3864,7 @@ class IngestPipeline:
                 target_batch_tokens=self._target_batch_tokens,
                 maximum=self._max_embed_batch,
                 lock=self._embedding,
+                reuse=reuse_vectors,
             )
         except _SupersededError:
             raise

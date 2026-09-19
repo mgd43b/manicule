@@ -376,6 +376,18 @@ ABSENT: tuple[tuple[str, str, Reach, str], ...] = (
         Reach.SHADOWED,
         "the same sweep where the per-document verb lives",
     ),
+    (
+        "POST",
+        "/api/v1/admin/re-embed",
+        Reach.UNROUTED,
+        "an in-place re-embed sends every indexed chunk back through the embedder",
+    ),
+    (
+        "POST",
+        "/api/v1/documents/re-embed",
+        Reach.SHADOWED,
+        "the same sweep where the per-document verb lives",
+    ),
 )
 """Operations that exist elsewhere in manicule and are deliberately not routes here.
 

@@ -418,6 +418,15 @@ a fingerprint this backend produces cannot equal one from any other runtime even
 which is what "portability is an allowlisted measurement, not an inference from a model name"
 means when applied to a runtime nobody has measured against the reference.
 
+**Upgrading the server does not change the fingerprint, and can change the vectors.**
+`weights_identity` pins the model's digest; the Ollama release computing with it is recorded
+nowhere, so an index built before an upgrade and a query embedded after it are compared as
+though they came from one runtime. Measured on `qwen3-embedding:0.6b` from 0.19.0 to 0.34.2: a
+minimum cosine similarity of 0.99915 over the same text — below the 0.9999 that §3.3's parity
+gate (`COSINE_TOLERANCE` in `manicule-mlx`'s `test_parity.py`) requires of two runtimes before
+they may share an index. `manicule document reindex --re-embed` is the repair (`ingest.md` §10.7): it embeds
+every indexed document again and reuses no stored vector, on any vector store.
+
 ### 3.5 MLX keeps every buffer it has finished with, and `ps` cannot see them
 
 This is the first defect a real corpus produced rather than a fixture. Indexing with MLX and

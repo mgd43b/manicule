@@ -814,6 +814,70 @@ def test_the_glossary_sweep_reports_the_same_counts_to_a_person_and_to_a_pipe(
     assert "expansion" not in machine, "a lineage report carries no definitions"
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["document", "reindex", "--re-embed"], (cli.DEFAULT_SWEEP_BATCH, False)),
+        (["document", "reindex", "--re-embed", "--dry-run"], (cli.DEFAULT_SWEEP_BATCH, True)),
+        (["document", "reindex", "--re-embed", "--batch", "5"], (5, False)),
+    ],
+)
+def test_the_re_embed_options_reach_the_port_rather_than_merely_parsing(
+    bound: ApplicationService, *, argv: list[str], expected: tuple[int, bool]
+) -> None:
+    """Declared and not wired, ``--dry-run`` would re-embed the corpus and then print a plan."""
+    result = run(["--json", *argv])
+    assert result.exit_code == 0
+    assert _ingestion(bound).reembed_sweeps == [expected]
+    assert _ingestion(bound).sweeps == [], "re-embedding must not re-parse anything"
+
+
+def test_a_re_embed_and_a_document_id_are_refused_together(bound: ApplicationService) -> None:
+    """One document's GPU time or the corpus's, and the invocation does not say which."""
+    assert "--re-embed" in cli.RE_EMBED_IS_NOT_A_DOCUMENT_SWEEP
+    result = run(["document", "reindex", _a_real_document(bound), "--re-embed"])
+    assert result.exit_code != 0
+    assert _ingestion(bound).reembed_sweeps == []
+    assert _ingestion(bound).reindexed == []
+
+
+def test_a_re_embed_is_one_rung_of_the_ladder(bound: ApplicationService) -> None:
+    """``--stale --re-embed`` is two corpus-sized passes, and neither says which was meant."""
+    assert "--re-embed" in cli.REINDEX_IS_ONE_RUNG
+    result = run(["document", "reindex", "--stale", "--re-embed"])
+    assert result.exit_code != 0
+    assert _ingestion(bound).reembed_sweeps == []
+    assert _ingestion(bound).sweeps == []
+
+
+def test_the_re_embed_reports_the_same_counts_to_a_person_and_to_a_pipe(
+    bound: ApplicationService,
+) -> None:
+    """One payload, two renderings, and the documents somebody has to act on named on both."""
+    _ingestion(bound).reembed_sweep.unrepairable_documents = ["doc-9 (file:///9.md): immutable"]
+
+    machine = json.loads(run(["--json", "document", "reindex", "--re-embed"]).stdout)["data"]
+    human = _laid_bare(run(["document", "reindex", "--re-embed"]).stdout)
+
+    assert machine["reembedded"] == 6
+    for field in ("selected", "reembedded", "chunks", "unrepairable", "failed"):
+        assert str(machine[field]) in human, f"{field} is in the envelope and not on the screen"
+    assert "doc-9" in human
+    assert machine["unrepairable_documents"] == ["doc-9 (file:///9.md): immutable"]
+
+
+def test_a_re_embed_plan_prices_the_run_in_chunks(bound: ApplicationService) -> None:
+    """Chunks are what the model is given, so a plan that omitted them priced nothing."""
+    machine = json.loads(run(["--json", "document", "reindex", "--re-embed", "--dry-run"]).stdout)[
+        "data"
+    ]
+    human = _laid_bare(run(["document", "reindex", "--re-embed", "--dry-run"]).stdout)
+
+    assert machine["dry_run"] is True
+    assert str(machine["chunks"]) in human
+    assert "dryrun" in human, "the plan says it is one (`_laid_bare` drops the space)"
+
+
 def test_an_export_consents_to_nothing_unless_the_flag_is_typed(
     bound: ApplicationService,
 ) -> None:
@@ -1040,6 +1104,7 @@ CLI_ONLY_OPS: frozenset[str] = frozenset(
         "auth_revoke_key",
         "backup",
         "completion",
+        "document_reembed",
         "document_reindex_stale",
         "reembed_plan",
         "reembed_start",
@@ -2512,6 +2577,7 @@ MINIMAL: dict[str, list[str]] = {
     "document_rescan_relations": ["document", "reindex", "--stale-relations"],
     "document_reindex": ["document", "reindex", "doc-1"],
     "document_reindex_stale": ["document", "reindex", "--stale"],
+    "document_reembed": ["document", "reindex", "--re-embed"],
     "import": ["import", "archive.tar.gz"],
     "index_path": ["index", "."],
     "init": ["init"],

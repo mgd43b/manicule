@@ -279,6 +279,7 @@ server and the built command tree.
 | `document_delete` | ✓ | `document delete` | what was removed, and how |
 | `document_reindex` | ✓ | `document reindex <id>` | what was repaired |
 | `document_reindex_stale` | — | `document reindex --stale` | counts for a corpus-wide re-parse |
+| `document_reembed` | — | `document reindex --re-embed` | counts for a corpus-wide re-embed that reuses no vector |
 | `reembed_plan` | — | `reembed plan` | aggregate cost and capacity estimates |
 | `reembed_start` | — | `reembed start <run-id>` | ownerless durable run under an id chosen before the call |
 | `reembed_resume` | — | `reembed execute` / `reembed resume` | aggregate durable progress/publication result |
@@ -385,23 +386,24 @@ incremental walk, and is not the same claim as `false`. Absent `enumeration_offs
 ### Operations with no MCP tool, and why
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
-`connector_sidecar`, `collection_orphans`, `document_reindex_stale`, the five mutating or
-corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs are
+`connector_sidecar`, `collection_orphans`, `document_reindex_stale`, `document_reembed`, the
+five mutating or corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs are
 command-line only. Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
 assistant can call unattended should not be able to do any of that. The forty-five tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
-surface. Four of these absences are asserted by name in `tests/app/test_surface_parity.py` —
-`collection_orphans`, `connector_sidecar`, `connector_login` and `document_reindex_stale`,
-each of which was argued about rather than obvious. The rest are held by the tool count and by
+surface. Five of these absences are asserted by name in `tests/app/test_surface_parity.py` —
+`collection_orphans`, `connector_sidecar`, `connector_login`, `document_reindex_stale` and
+`document_reembed`, each of which was argued about rather than obvious. The rest are held by the tool count and by
 this list.
 
 `document_reindex_stale` is there for a fourth reason, and it is the one that also keeps it off
 the HTTP surface (`tests/api/test_routes.py`). It re-parses, re-chunks and re-embeds every
 document a parser bump touched, and it takes as long as the corpus is long — so an unattended
 caller able to start one has the machine's accelerator for an hour, which is the argument
-already made for refusing a benchmark endpoint. `document_reindex` stays on every surface,
-because one document is a bound.
+already made for refusing a benchmark endpoint. `document_reembed` is off both for the same
+reason, more so: it sends every indexed chunk to the model and reuses none. `document_reindex`
+stays on every surface, because one document is a bound.
 
 MCP retains only `reembed_status`: an assistant cannot spend corpus-sized accelerator, disk and
 time unattended. Authenticated admin HTTP has plan/start/resume/abandon/cleanup parity. The Web

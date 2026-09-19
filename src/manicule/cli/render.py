@@ -569,6 +569,35 @@ def render_stale_reparse(out: Console, payload: r.StaleReparseReport) -> None:
         )
 
 
+def render_reembed_sweep(out: Console, payload: r.ReembedSweepReport) -> None:
+    """The re-embed's counts, and the documents somebody has to do something about.
+
+    Chunks beside documents on a plan as well as a run, because chunks are the price: this verb
+    reuses nothing, so the plan's chunk count is the number of inputs the model will be given.
+    """
+    if payload.dry_run:
+        out.print("[dim]dry run: nothing was embedded or written[/dim]")
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_row("selected", str(payload.selected))
+    if payload.dry_run:
+        table.add_row("chunks to re-embed", str(payload.chunks))
+    else:
+        table.add_row("re-embedded", str(payload.reembedded))
+        table.add_row("chunks re-embedded", str(payload.chunks))
+        table.add_row("  whose stored vector looked current", str(payload.embedding.refreshed))
+        table.add_row("forward calls", str(payload.embedding.forward_calls))
+        table.add_row("superseded by a newer sync", str(payload.superseded))
+    table.add_row("unrepairable", str(payload.unrepairable))
+    table.add_row("failed", str(payload.failed))
+    out.print(table)
+    for line in payload.unrepairable_documents:
+        out.print(f"[yellow]{escape(line)}[/yellow]")
+    for line in payload.failures:
+        out.print(f"[red]{escape(line)}[/red]")
+    for line in payload.superseded_documents:
+        out.print(escape(line))
+
+
 def render_stale_relations(out: Console, payload: r.StaleRelationReport) -> None:
     """The relation sweep's counts, and the documents whose chunks the chain could not read.
 
@@ -1625,6 +1654,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.StaleRelationReport: lambda out, p: render_stale_relations(
         out, _as(r.StaleRelationReport, p)
     ),
+    r.ReembedSweepReport: lambda out, p: render_reembed_sweep(out, _as(r.ReembedSweepReport, p)),
     r.ReembedPlanReport: lambda out, p: render_reembed_plan(out, _as(r.ReembedPlanReport, p)),
     r.ReembedRunReport: lambda out, p: render_reembed_run(out, _as(r.ReembedRunReport, p)),
     r.ReembedCleanupReport: lambda out, p: render_reembed_cleanup(

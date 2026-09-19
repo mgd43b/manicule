@@ -279,6 +279,7 @@ WRITERS: frozenset[str] = frozenset(
         "document_delete",
         "document_redetect_glossary",
         "document_rescan_relations",
+        "document_reembed",
         "document_reindex",
         "document_reindex_stale",
         "import",
