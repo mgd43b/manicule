@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.8](https://github.com/mgd43b/manicule/compare/v0.2.7...v0.2.8) (2026-09-19)
+
+
+### Features
+
+* **ingest:** re-embed every indexed document under an unchanged fingerprint ([#398](https://github.com/mgd43b/manicule/issues/398)) ([05783ed](https://github.com/mgd43b/manicule/commit/05783ed186e824ffdb2e57cbfef9e448bc294b89))
+
 ## [0.2.7](https://github.com/mgd43b/manicule/compare/v0.2.6...v0.2.7) (2026-09-16)
 
 
