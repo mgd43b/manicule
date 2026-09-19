@@ -177,7 +177,16 @@ Weights are pinned as part of vector identity, not merely downloaded by model na
 executed hub commit (or a digest for local weights) is recorded with the index. Only the
 built-in ONNX/MLX artifact pairs covered by the parity suite are portable across backends;
 custom remote weights must set an immutable `weights_revision`, and changing any artifact
-requires `reindex --re-embed` rather than reusing incomparable vectors.
+changes the fingerprint, so the index refuses it rather than reusing incomparable vectors. The
+move to the new model is `manicule reembed` on the built-in LanceDB store, or
+`manicule reset-index --yes` and a re-sync on any other.
+
+A served model is pinned by its digest, not by the server computing with it, so upgrading
+Ollama leaves the fingerprint unchanged and can still move the vectors: `qwen3-embedding:0.6b`
+went from Ollama 0.19.0 to 0.34.2 at a minimum cosine similarity of 0.99915 on the same text.
+`manicule document reindex --re-embed` re-embeds every indexed document under the fingerprint
+the index already records, reusing no stored vector, on any vector store and with search up
+throughout.
 
 Local model card/tokenizer inputs are content-addressed too, including when weights are
 separate; local `embedding.revision` claims are rejected. The MCP `index_status` result exposes
