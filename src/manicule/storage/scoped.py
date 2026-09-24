@@ -188,9 +188,9 @@ class _CommitCounter:
 def _info(connection: Connection) -> dict[Any, Any] | None:
     """The pooled connection's ``info``, or ``None`` for one that has been invalidated.
 
-    An invalidated connection — a statement cancelled under it, its driver gone — raises when
+    An invalidated connection — a statement canceled under it, its driver gone — raises when
     asked for ``info``, and these listeners run inside SQLAlchemy's own commit and rollback. A
-    listener that asked anyway would turn the ordinary unwinding of a cancelled request into a
+    listener that asked anyway would turn the ordinary unwinding of a canceled request into a
     ``PendingRollbackError`` raised from inside the rollback. Skipping it can only leave a mark
     behind, and a mark left behind costs one extra bump — the safe direction.
     """
