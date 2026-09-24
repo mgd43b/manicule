@@ -241,13 +241,15 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **41 relational tables**. The 29 outside the durable
-re-embedding snapshot set are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
-`acquisition_markers`, `chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
-`conversations`, `document_tags`, `document_versions`, `documents`, `glossary_aliases`,
-`glossary_entries`, `index_state`, `messages`, `plugins`, `query_logs`, `reconciliation_candidates`,
-`reconciliation_inventory_items`, `reconciliation_runs`, `source_dependencies`, `tags`,
-`vector_tombstones`, `workspace_members` and `workspaces`. Seven more make a re-embedding run
+The authoritative SQLAlchemy model has **44 relational tables**. The 32 outside the durable
+re-embedding snapshot set are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`,
+`auth_sessions`, `blobs`, `acquisition_markers`, `chunk_relations`, `chunks`,
+`collection_documents`, `collections`, `connectors`, `conversations`, `document_tags`,
+`document_versions`, `documents`, `glossary_aliases`, `glossary_entries`, `index_state`,
+`messages`, `plugins`, `query_logs`, `reconciliation_candidates`,
+`reconciliation_inventory_items`, `reconciliation_runs`, `security_alerts`,
+`source_dependencies`, `tags`, `users`, `vector_tombstones`, `workspace_members` and
+`workspaces`. Seven more make a re-embedding run
 durable without changing live reads until publication: `corpus_revision`,
 `reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
 `reembed_runs`, `reembed_shadow_generations` and `reembed_publication_receipts`.
@@ -259,7 +261,7 @@ Two content-addressed acquisition ledgers keep exact global backlog admission co
 `acquisition_blob_backlog` stores unfinished-record refcounts by hash, and
 `acquisition_backlog_capacity` stores their deduplicated byte total.
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 41.
+included in the 44.
 
 ### 4.1 The pre-#187 additions
 
