@@ -30,7 +30,8 @@ if TYPE_CHECKING:
     from datetime import datetime
     from pathlib import Path
 
-    from manicule.app.results import ApiKeySummary, Check
+    from manicule.app.people import Profile
+    from manicule.app.results import ApiKeySummary, Check, UserSummary
     from manicule.config.settings import Settings
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.ann import AnnIndexBuild, AnnIndexState
@@ -699,6 +700,104 @@ class Keys(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class MemberChange:
+    """A membership after one change, and what the change took with it.
+
+    ``sessions_revoked`` and ``keys_revoked`` are non-zero only for a disable, which ends every
+    browser session the person held in this workspace and revokes every key they minted in it —
+    in the same transaction as the disable, so there is no moment at which a disabled person
+    still holds a working credential.
+    """
+
+    member: UserSummary
+    previous_role: str
+    previously_disabled: bool
+    sessions_revoked: int = 0
+    keys_revoked: int = 0
+
+
+@runtime_checkable
+class Users(Protocol):
+    """People, their memberships of one workspace, and their browser sessions.
+
+    **A person is installation-wide; everything else here is scoped.** One person signing in to
+    two workspaces is one ``users`` row and two memberships, and every read and write of a
+    membership or a session carries this handle's workspace as a predicate — a session minted
+    for one workspace does not authenticate in another, for the reason an API key does not.
+
+    Identified by id everywhere. ``find_members`` accepts an address as a convenience for a
+    person at a terminal, and resolves it among *this* workspace's members only.
+    """
+
+    async def member_by_subject(self, provider: str, subject: str) -> UserSummary | None:
+        """This workspace's membership for one provider account, or ``None`` if it has none."""
+        ...
+
+    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+        """Record a sign-in: create or refresh the person, and make them a member if they are not.
+
+        ``role`` is used only when the membership is created. After that a person's role is
+        whatever an administrator has made it, and a sign-in never overwrites it — otherwise
+        every demotion would last until the demoted person next signed in.
+        """
+        ...
+
+    async def begin_session(self, user_id: str, *, max_age_s: int) -> tuple[str, str, str]:
+        """Start a browser session. Returns its id, its expiry, and the only copy of its token."""
+        ...
+
+    async def resolve_session(self, token: str) -> UserSummary | None:
+        """Which member this session token is, or ``None`` if it is not a usable one.
+
+        ``None`` covers unknown, revoked, expired, another workspace's, and a disabled or
+        removed membership, and deliberately does not say which — the reasoning
+        :meth:`Keys.verify` gives. Every one of those is a predicate of one statement over a
+        digest of the token, so there is no branch here to time.
+        """
+        ...
+
+    async def end_session(self, token: str) -> bool:
+        """Revoke one session by its token. ``False`` when it named nothing live here."""
+        ...
+
+    async def end_sessions(self, user_id: str) -> int:
+        """Revoke every live session one person holds in this workspace. Returns how many."""
+        ...
+
+    async def list_members(self) -> Sequence[UserSummary]:
+        """Every member of this workspace, with a count of live sessions each."""
+        ...
+
+    async def find_members(self, user_or_email: str) -> Sequence[UserSummary]:
+        """Members whose id is ``user_or_email``, or whose address is, ignoring case.
+
+        A sequence rather than one, because two accounts at two providers can report the same
+        address, and the caller — not this store — decides that two matches is a refusal.
+        """
+        ...
+
+    async def count_admins(self) -> int:
+        """Enabled administrators of this workspace."""
+        ...
+
+    async def update_member(
+        self, user_id: str, *, role: str | None = None, disabled: bool | None = None
+    ) -> MemberChange:
+        """Change one membership's role or standing, in one transaction.
+
+        Disabling revokes the person's sessions and their keys in the same transaction. A change
+        that would leave a workspace which has an enabled administrator with none is refused
+        inside that transaction too, so two administrators demoting each other at once cannot
+        both succeed.
+
+        Raises:
+            UnknownEntityError: No such member **in this workspace**.
+            PolicyError: The change would remove the last enabled administrator.
+        """
+        ...
+
+
 class RetainedBytes(Protocol):
     """Reading back the bytes a connector delivered, and nothing else.
 
@@ -772,6 +871,10 @@ class Backend(Protocol):
 
     async def keys(self) -> Keys: ...
 
+    async def users(self) -> Users:
+        """People, memberships and browser sessions for this workspace."""
+        ...
+
     async def component_checks(self) -> Sequence[Check]:
         """Health of whatever is already constructed, without constructing anything else."""
         ...
@@ -785,8 +888,10 @@ __all__ = [
     "Ingesting",
     "Keys",
     "Maintenance",
+    "MemberChange",
     "Organizing",
     "RetainedBytes",
     "Retrieving",
     "Telemetry",
+    "Users",
 ]

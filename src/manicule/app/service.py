@@ -45,6 +45,17 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from manicule.app import results as r
 from manicule.app.bind import is_loopback
+from manicule.app.caller import current
+from manicule.app.people import (
+    LAST_ADMIN,
+    LOGIN_PATH,
+    REFUSALS,
+    Refusal,
+    admission,
+    applicable_providers,
+    provider_for,
+    serving_problems,
+)
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
 from manicule.config.loader import load_settings
 from manicule.config.profiles import profile_config
@@ -53,6 +64,7 @@ from manicule.config.settings import (
     AuthoringSettings,
     BrowserProvider,
     ConnectorSettings,
+    Mode,
     Role,
     Settings,
     config_file,
@@ -66,6 +78,7 @@ from manicule.core.errors import (
     ConfigError,
     ManiculeError,
     PolicyError,
+    SignInRefusedError,
     UnknownComponentError,
     UnknownEntityError,
 )
@@ -98,7 +111,9 @@ if TYPE_CHECKING:
 
     from pydantic import SecretStr
 
+    from manicule.app.people import Profile
     from manicule.app.ports import Backend, Conversing
+    from manicule.config.settings import OAuthProvider
     from manicule.connectors.browser import BrowserSessionProvider
     from manicule.connectors.config import ConfluenceConfig
     from manicule.connectors.enriched import EnrichedProfile
@@ -3135,6 +3150,7 @@ class ApplicationService:
         checks: list[r.Check] = [
             self._configuration_check(),
             self._transport_check(),
+            self._sign_in_check(),
             self._plugin_check(),
         ]
         checks.append(await self._storage_check())
@@ -3230,7 +3246,23 @@ class ApplicationService:
             # the configuration says so.
             "unauthenticated_authoring_configured": self._serving_unauthenticated
             and self.settings.authoring.configured,
+            "installation_mode": self.settings.mode.value,
         }
+        if self.settings.mode is Mode.TEAM and mode is AuthMode.NONE:
+            # Before the loopback answer, because loopback does not help. Team mode means there
+            # is no operator-at-this-machine for an anonymous caller to be, so a socket without
+            # authentication is refused wherever it is bound — `--no-authentication` included.
+            return r.Check(
+                name="transport",
+                state="failing",
+                detail=(
+                    "mode is 'team' and security.auth.mode is 'none', so every server start is "
+                    "refused: in team mode every caller must present a credential, and an "
+                    "anonymous administrator is a single-operator arrangement."
+                ),
+                facts=facts,
+                remedy="manicule config set security.auth.mode api_key",
+            )
         if loopback:
             return r.Check(
                 name="transport",
@@ -3282,6 +3314,40 @@ class ApplicationService:
                 f"bound to {bound}, which is reachable from the network. "
                 f"Authentication is on ({mode.value})."
             ),
+            facts=facts,
+        )
+
+    def _sign_in_check(self) -> r.Check:
+        """Whether a served installation could complete a browser sign-in.
+
+        The same conditions ``build_app`` refuses to serve with, from the same function, so an
+        operator can learn them without starting a server that will not start. ``ok`` when
+        sign-in is not the configured mode: there is then nothing to be wrong.
+        """
+        mode = self.settings.security.auth.mode
+        applicable = [provider.type for provider in applicable_providers(self.settings)]
+        facts: dict[str, JsonValue] = {"auth_mode": mode.value, "providers": list(applicable)}
+        if mode is not AuthMode.OAUTH:
+            return r.Check(
+                name="sign_in",
+                state="ok",
+                detail=f"security.auth.mode is {mode.value!r}; no browser sign-in is offered",
+                facts=facts,
+            )
+        problems = serving_problems(self.settings)
+        facts["problems"] = list(problems)
+        if problems:
+            return r.Check(
+                name="sign_in",
+                state="failing",
+                detail="; ".join(problems),
+                facts=facts,
+                remedy="manicule config show",
+            )
+        return r.Check(
+            name="sign_in",
+            state="ok",
+            detail=f"sign-in through {', '.join(applicable)}",
             facts=facts,
         )
 
@@ -5306,6 +5372,12 @@ class ApplicationService:
         Counts are reported for the active workspace only. This handle is scoped to one
         tenant, and counting another's documents through it would be the breach the scope
         exists to prevent — reported as a number rather than as text, but a read all the same.
+
+        **The active workspace's mode is the configuration's; every other one's is the mode it
+        was last opened for writing under.** Configuration is what decides how this process
+        behaves, so it is the true answer for the workspace being served. For the rest there is
+        no process to ask, and the record a writer left on the workspace's row is the only
+        answer there is.
         """
         maintenance = await self._backend.maintenance()
         store = await self._backend.documents()
@@ -5314,13 +5386,13 @@ class ApplicationService:
         if self.workspace not in known:
             rows = [*rows, (self.workspace, self.workspace, self.settings.mode.value)]
         summaries: list[r.WorkspaceSummary] = []
-        for identifier, name, mode in sorted(rows):
+        for identifier, name, recorded in sorted(rows):
             active = identifier == self.workspace
             summaries.append(
                 r.WorkspaceSummary(
                     id=identifier,
                     name=name,
-                    mode=mode,
+                    mode=self.settings.mode.value if active else recorded,
                     active=active,
                     documents=await store.count_documents() if active else None,
                 )
@@ -5329,21 +5401,36 @@ class ApplicationService:
             active=self.workspace, count=len(summaries), workspaces=tuple(summaries)
         )
 
-    async def workspace_switch(self, name: str, *, create: bool = False) -> r.WorkspaceSwitched:
-        """Record a different active workspace in the config file.
+    async def workspace_switch(
+        self, name: str, *, create: bool = False, mode: str | None = None
+    ) -> r.WorkspaceSwitched:
+        """Record a different active workspace in the config file, and optionally its mode.
 
         It takes effect on the next start, and deliberately not on this one: half a process
         holding handles scoped to the old workspace and half to the new one is exactly the
         state in which a cross-tenant read stops being impossible.
 
+        ``mode`` — ``personal`` or ``team`` — is written in the same edit as the workspace, so
+        the file never names one without the other. It is installation configuration rather
+        than a property stored on the workspace: the next writer to open the workspace records
+        it on the workspace's row, which is where ``workspace list`` reads it back from.
+
         Raises:
-            ConfigError: The name is empty.
+            ConfigError: The name is empty, or ``mode`` is not one manicule has.
             UnknownEntityError: No such workspace, and ``create`` was not asked for.
         """
         wanted = name.strip()
         if not wanted:
             msg = "a workspace name cannot be empty"
             raise ConfigError(msg)
+        chosen: Mode | None = None
+        if mode is not None:
+            try:
+                chosen = Mode(mode.strip().lower())
+            except ValueError as exc:
+                allowed = ", ".join(item.value for item in Mode)
+                msg = f"no such mode {mode!r}. Available: {allowed}"
+                raise ConfigError(msg) from exc
         maintenance = await self._backend.maintenance()
         known = {row[0] for row in await maintenance.workspaces()}
         if wanted not in known and not create:
@@ -5351,8 +5438,29 @@ class ApplicationService:
             msg = f"no workspace named {wanted!r}. Known: {listed}. Pass create to make it."
             raise UnknownEntityError(msg)
         previous = self.workspace
-        change = await self.config_set("workspace", wanted, as_text=True)
-        return r.WorkspaceSwitched(previous=previous, active=wanted, path=change.path)
+        if chosen is None:
+            change = await self.config_set("workspace", wanted, as_text=True)
+            return r.WorkspaceSwitched(previous=previous, active=wanted, path=change.path)
+        path = config_file()
+
+        def mutate(document: dict[str, Any]) -> None:
+            document["workspace"] = wanted
+            document["mode"] = chosen.value
+
+        await asyncio.to_thread(_update_config, path, mutate)
+        detail = ""
+        if chosen is Mode.TEAM and self.settings.security.auth.mode is AuthMode.NONE:
+            # Recorded anyway, because the edit is valid configuration: team mode with
+            # authentication off is refused where a socket is made, not in the file. Saying so
+            # now spares the operator finding out from the next `manicule serve`.
+            detail = (
+                "team mode with security.auth.mode = 'none' cannot be served: every caller must "
+                "present a credential. Set security.auth.mode to 'api_key' or 'oauth' before "
+                "the next start."
+            )
+        return r.WorkspaceSwitched(
+            previous=previous, active=wanted, path=str(path), mode=chosen.value, detail=detail
+        )
 
     # --- plugins --------------------------------------------------------------------------
 
@@ -5506,12 +5614,7 @@ class ApplicationService:
         if not label:
             msg = "an API key needs a name, so that it can be revoked without guessing"
             raise ConfigError(msg)
-        try:
-            chosen = Role(role)
-        except ValueError as exc:
-            allowed = ", ".join(item.value for item in Role)
-            msg = f"no such role {role!r}. Available: {allowed}"
-            raise ConfigError(msg) from exc
+        chosen = _role(role)
         keys = await self._backend.keys()
         summary, secret = await keys.issue(label, role=chosen.value, expires_days=expires_days)
         # The record, never the secret. An audit trail that quoted the credential it was
@@ -6630,11 +6733,312 @@ class ApplicationService:
                     f"offered. Authenticate with an API key, or configure OAuth."
                 ),
             )
+        # Only the providers that apply to *this* workspace. One configured for another
+        # workspace is refused at its login path here, so listing it would advertise a sign-in
+        # this process will not perform.
+        applicable = applicable_providers(self.settings)
         return r.AuthProviders(
             mode=auth.mode.value,
-            count=len(auth.providers),
-            providers=tuple(provider.type for provider in auth.providers),
+            count=len(applicable),
+            providers=tuple(provider.type for provider in applicable),
+            login_paths=tuple(LOGIN_PATH.format(provider=provider.type) for provider in applicable),
         )
+
+    # --- people and sessions --------------------------------------------------------------
+
+    def sign_in_provider(self, provider_type: str) -> OAuthProvider:
+        """The configured provider a browser may sign in through here, by type.
+
+        Not an operation — it returns configuration, and the surface that asks is the one about
+        to speak the provider's protocol. It is on the service so that *which* provider applies
+        to this workspace is decided in one place: a login route that consulted the provider
+        list itself would be a second opinion about it.
+
+        Raises:
+            UnknownEntityError: No provider of that type applies to this workspace, or sign-in
+                is not the configured mode. One refusal for both, because the difference is not
+                the caller's business.
+        """
+        provider = provider_for(self.settings, provider_type)
+        if provider is None:
+            msg = f"there is no sign-in through {provider_type!r} for workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        return provider
+
+    async def sign_in(self, provider_type: str, profile: Profile) -> r.SignedIn:
+        """Admit a person an identity provider has vouched for, and start their session.
+
+        **Admission is decided on every sign-in, not only the first.** The provider's allowlist
+        is consulted as it stands now, so removing an address stops that person here the next
+        time; a disabled membership is refused whatever the allowlist says; and only then is the
+        person recorded, made a member if they were not one — in the provider's role, that once
+        — and given a session.
+
+        The refusal says which of three categories applied and no more: see
+        :class:`~manicule.core.errors.SignInRefusedError`.
+
+        **What the audit trail keeps of a refusal is the provider and the category — never the
+        address.** A refused address belongs to somebody who is not a member and never agreed to
+        be recorded by this installation, and a trail is kept indefinitely and read by every
+        administrator; the client address the row already carries says where the attempt came
+        from. A successful sign-in names the person by id, which is what every other row that
+        person causes will name them by.
+
+        Raises:
+            UnknownEntityError: No provider of that type applies here.
+            SignInRefusedError: The person is not admitted, their address is unverified where
+                one is required, or their membership is disabled.
+        """
+        provider = self.sign_in_provider(provider_type)
+        if profile.provider != provider.type:
+            msg = (
+                f"a {profile.provider!r} identity was presented to the {provider.type!r} "
+                f"sign-in; nothing was recorded"
+            )
+            raise ConfigError(msg)
+        refusal = admission(provider, profile)
+        users = await self._backend.users()
+        if refusal is None:
+            existing = await users.member_by_subject(profile.provider, profile.subject)
+            if existing is not None and existing.disabled:
+                refusal = Refusal.DISABLED
+        if refusal is not None:
+            await self._audit(
+                "auth.login_refused",
+                details={"provider": provider.type, "reason": refusal.value},
+            )
+            raise SignInRefusedError(REFUSALS[refusal], reason=refusal.value)
+        member = await users.admit(profile, role=provider.role.value)
+        self._require_member_here(member)
+        session_id, expires_at, token = await users.begin_session(
+            member.id, max_age_s=self.settings.security.auth.session_max_age_s
+        )
+        await self._audit(
+            "auth.login",
+            details={"user_id": member.id, "provider": provider.type, "session_id": session_id},
+            actor=member.id,
+        )
+        return r.SignedIn(user=member, session_id=session_id, expires_at=expires_at, token=token)
+
+    async def authenticate_session(self, token: str) -> r.Identity:
+        """Turn a browser's session token into an identity, or say plainly that it is not one.
+
+        The session counterpart of :meth:`authenticate`, and deliberately the same shape: every
+        way a session can be unusable — unknown, revoked, expired, another workspace's, a
+        disabled person's — is one ``None`` from the store and one unauthenticated identity
+        here. The role is the membership's as it stands now, read in the same statement, so a
+        demotion takes effect on the demoted person's very next request.
+
+        Only when ``security.auth.mode`` is ``oauth``. Under any other mode there is no
+        sign-in, so a session cookie — left over from before a configuration change — is not a
+        credential this installation accepts.
+        """
+        mode = self.settings.security.auth.mode
+        unauthenticated = r.Identity(
+            authenticated=False, mode=mode.value, role="", workspace=self.workspace
+        )
+        if mode is not AuthMode.OAUTH or not token:
+            return unauthenticated
+        users = await self._backend.users()
+        member = await users.resolve_session(token)
+        # The store's predicate is what refuses another workspace's session. This is the check
+        # on the way out, against the row in hand, and it fails closed: a member from anywhere
+        # else is an unauthenticated caller, not an error the caller could learn from.
+        if member is None or member.workspace != self.workspace or member.disabled:
+            return unauthenticated
+        return r.Identity(
+            authenticated=True,
+            mode=mode.value,
+            role=member.role,
+            workspace=member.workspace,
+            via="session",
+            user_id=member.id,
+            user_email=member.email,
+            user_name=member.name,
+        )
+
+    async def sign_out(self, token: str) -> r.SignedOut:
+        """End one browser session on the server.
+
+        Revoked rather than merely forgotten by the browser: a copy of the cookie taken before
+        the sign-out stops working at the same moment the original does. Succeeds whether or
+        not the token named a live session, because signing out twice is not an error.
+        """
+        ended = False
+        if token:
+            users = await self._backend.users()
+            ended = await users.end_session(token)
+        if ended:
+            await self._audit("auth.logout", details={})
+        return r.SignedOut(ended=ended)
+
+    async def user_list(self) -> r.UserList:
+        """Every member of this workspace, with how many browsers each is signed in with."""
+        users = await self._backend.users()
+        members = tuple(await users.list_members())
+        for member in members:
+            self._require_member_here(member)
+        return r.UserList(
+            count=len(members),
+            admins=sum(1 for member in members if member.role == "admin" and not member.disabled),
+            users=members,
+        )
+
+    async def user_update(
+        self, user: str, *, role: str | None = None, disabled: bool | None = None
+    ) -> r.UserUpdated:
+        """Change one member's role, their standing, or both, as one change.
+
+        Three rules, all here so that every surface has all three:
+
+        * **A workspace that has an enabled administrator keeps one.** A change that would take
+          the last one away is refused, with what to do instead. The command line gets the same
+          refusal: the operator at a terminal can always promote somebody first, so the rule
+          costs them an ordering rather than an ability.
+        * **Nobody disables themselves.** A disable ends every session the person holds, the
+          one making the request included, and revokes every key they minted — a click on one's
+          own row that no longer has anybody present to undo it. Demoting oneself is allowed,
+          because handing administration to somebody else is legitimate and the first rule
+          already stops it from leaving nobody in charge.
+        * **Disabling takes the person's credentials with it**, sessions and keys together, in
+          the store's one transaction.
+
+        Raises:
+            ConfigError: Neither a role nor a standing was given, or the role is not one
+                manicule has.
+            UnknownEntityError: No member matches ``user`` in this workspace.
+            AmbiguousHandleError: An address matched more than one member.
+            PolicyError: The change would leave no enabled administrator, or a person tried
+                to disable themselves.
+        """
+        if role is None and disabled is None:
+            msg = "nothing to change: give a role, a standing (disabled or enabled), or both"
+            raise ConfigError(msg)
+        wanted = _role(role) if role is not None else None
+        users = await self._backend.users()
+        member = await self._member(user)
+        caller = current()
+        if disabled and caller.user_id == member.id:
+            msg = (
+                "you cannot disable your own membership: it would end the session making this "
+                "request and revoke every key you minted, with nobody signed in to undo it. Ask "
+                "another administrator, or run `manicule auth disable-user` at the command line."
+            )
+            raise PolicyError(msg)
+        was_admin = member.role == Role.ADMIN.value and not member.disabled
+        new_role = wanted.value if wanted is not None else member.role
+        new_disabled = disabled if disabled is not None else member.disabled
+        stays_admin = new_role == Role.ADMIN.value and not new_disabled
+        if was_admin and not stays_admin and await users.count_admins() <= 1:
+            raise PolicyError(LAST_ADMIN.format(who=member.id, workspace=self.workspace))
+        change = await users.update_member(
+            member.id, role=wanted.value if wanted is not None else None, disabled=disabled
+        )
+        self._require_member_here(change.member)
+        if change.member.role != change.previous_role:
+            await self._audit(
+                "user.role_changed",
+                details={
+                    "user_id": change.member.id,
+                    "from": change.previous_role,
+                    "to": change.member.role,
+                },
+            )
+        if change.member.disabled and not change.previously_disabled:
+            await self._audit(
+                "user.disabled",
+                details={
+                    "user_id": change.member.id,
+                    "sessions_revoked": change.sessions_revoked,
+                    "keys_revoked": change.keys_revoked,
+                },
+            )
+        elif change.previously_disabled and not change.member.disabled:
+            await self._audit("user.enabled", details={"user_id": change.member.id})
+        return r.UserUpdated(
+            user=change.member,
+            previous_role=change.previous_role,
+            previously_disabled=change.previously_disabled,
+            sessions_revoked=change.sessions_revoked,
+            keys_revoked=change.keys_revoked,
+        )
+
+    async def user_set_role(self, user: str, role: str) -> r.UserUpdated:
+        """Change one member's role. See :meth:`user_update` for the rules it is held to."""
+        return await self.user_update(user, role=role)
+
+    async def user_disable(self, user: str) -> r.UserUpdated:
+        """Disable one member, ending their sessions and revoking their keys at once."""
+        return await self.user_update(user, disabled=True)
+
+    async def user_enable(self, user: str) -> r.UserUpdated:
+        """Enable a disabled member again, in the role they had.
+
+        Their sessions and keys stay revoked: re-enabling a person restores their membership,
+        not credentials they may have lost control of. They sign in again and mint new keys.
+        """
+        return await self.user_update(user, disabled=False)
+
+    async def user_sign_out(self, user: str) -> r.UserSignedOut:
+        """End every browser session one member holds in this workspace.
+
+        For a lost laptop or a shared machine: the person stays a member and may sign in again.
+        Their API keys are untouched — a key is revoked by name, on its own.
+        """
+        users = await self._backend.users()
+        member = await self._member(user)
+        revoked = await users.end_sessions(member.id)
+        await self._audit(
+            "user.signed_out", details={"user_id": member.id, "sessions_revoked": revoked}
+        )
+        refreshed = member.model_copy(update={"sessions": 0})
+        return r.UserSignedOut(user=refreshed, sessions_revoked=revoked)
+
+    async def _member(self, user: str) -> r.UserSummary:
+        """The one member of this workspace that ``user`` names, by id or by address.
+
+        Raises:
+            UnknownEntityError: Nothing matched, among this workspace's members.
+            AmbiguousHandleError: An address matched more than one member — two accounts at
+                two providers can report the same one — and each candidate's id is listed.
+        """
+        wanted = user.strip()
+        users = await self._backend.users()
+        found = list(await users.find_members(wanted))
+        for member in found:
+            self._require_member_here(member)
+        exact = [member for member in found if member.id == wanted]
+        if exact:
+            return exact[0]
+        if not found:
+            msg = f"no member {wanted!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        if len(found) > 1:
+            candidates = ", ".join(f"{member.id} ({member.provider})" for member in found)
+            msg = (
+                f"{wanted!r} is the address of {len(found)} members of workspace "
+                f"{self.workspace!r}: {candidates}. Name one by its id."
+            )
+            raise AmbiguousHandleError(msg)
+        return found[0]
+
+    def _require_member_here(self, member: r.UserSummary) -> None:
+        """Refuse a membership of another workspace on its way out of the service.
+
+        The people store scopes every statement by workspace, and that is where isolation is
+        enforced. This reads the row in hand, so a store that lost its predicate is refused
+        loudly rather than answering a question about somebody else's workspace.
+
+        Raises:
+            CrossWorkspaceError: It is another workspace's.
+        """
+        if member.workspace != self.workspace:
+            msg = (
+                f"the people store returned a membership of another workspace to workspace "
+                f"{self.workspace!r}. This is a store that ignored its scope; nothing was "
+                f"returned."
+            )
+            raise CrossWorkspaceError(msg)
 
     # --- helpers --------------------------------------------------------------------------
 
@@ -6647,24 +7051,37 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         require_owns(self.workspace, document)
 
-    async def _audit(self, event_type: str, *, details: Mapping[str, object]) -> None:
+    async def _audit(
+        self, event_type: str, *, details: Mapping[str, object], actor: str | None = None
+    ) -> None:
         """Record one security-relevant event, when auditing is switched on.
 
         Gated here rather than in the writer, so that "auditing is off" is a decision made
         once against configuration instead of a condition every call site repeats — and the
         admin surface reports the same switch alongside the entries, so an empty trail is
         never mistaken for a quiet one.
+
+        **Who and from where come from** :func:`~manicule.app.caller.current`, the caller the
+        surface that authenticated this request said it was acting for. ``actor`` overrides the
+        who for the one event whose subject is not yet the caller: a sign-in, where the request
+        arrived anonymous and the row is about the person it admitted.
         """
         audit = self.settings.security.audit
         if not audit.enabled:
             return
         if audit.events and event_type not in audit.events:
             return
+        caller = current()
         telemetry = await self._backend.telemetry()
         # Deliberately **not** wrapped the way `_record_query` is. An audit entry that cannot
         # be written must fail the operation it was auditing: a trail with holes in it is worse
         # than none, because the holes are invisible and the operation reported success.
-        await telemetry.record_audit(event_type, details=details)
+        await telemetry.record_audit(
+            event_type,
+            details=details,
+            actor=actor or caller.actor,
+            ip_address=caller.address or None,
+        )
 
     async def _record_query(
         self, query: Query, retrieved: RetrievalResult, *, started: float
@@ -8079,6 +8496,20 @@ def _read_toml(path: Path) -> dict[str, Any]:
         return {}
     with path.open("rb") as handle:
         return tomllib.load(handle)
+
+
+def _role(value: str) -> Role:
+    """A role by name, or a refusal listing the ones that exist.
+
+    Raises:
+        ConfigError: ``value`` is not a role manicule has.
+    """
+    try:
+        return Role(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in Role)
+        msg = f"no such role {value!r}. Available: {allowed}"
+        raise ConfigError(msg) from exc
 
 
 def _update_config(path: Path, mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:

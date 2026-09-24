@@ -282,9 +282,15 @@ BINDERS: Mapping[str, Binder] = {
     # `role` is `text` rather than `optional_text` deliberately: the command line declares a
     # default of "member", so it always sends a string, and a reader that accepted nothing
     # would let a caller mint a key with no role at all.
+    "auth_disable_user": lambda service, args, report: service.user_disable(args.text("user")),
+    "auth_enable_user": lambda service, args, report: service.user_enable(args.text("user")),
     "auth_revoke_key": lambda service, args, report: service.api_key_revoke(
         args.text("name_or_id")
     ),
+    "auth_set_role": lambda service, args, report: service.user_set_role(
+        args.text("user"), args.text("role")
+    ),
+    "auth_sign_out": lambda service, args, report: service.user_sign_out(args.text("user")),
     "collection_add": lambda service, args, report: service.collection_add(
         args.text("collection_id"), args.texts("document_ids")
     ),
@@ -412,7 +418,7 @@ BINDERS: Mapping[str, Binder] = {
         force=args.flag("force"), dry_run=args.flag("dry_run")
     ),
     "workspace_switch": lambda service, args, report: service.workspace_switch(
-        args.text("name"), create=args.flag("create")
+        args.text("name"), create=args.flag("create"), mode=args.optional_text("mode")
     ),
 }
 """Every operation that can be described as data, and how each becomes a service call.

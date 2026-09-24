@@ -1192,19 +1192,20 @@ async def test_the_whole_tree_is_validated_not_just_the_key_being_written(
 ) -> None:
     """Two settings that are each valid and jointly wrong is what ``policy_problems`` catches.
 
-    ``oauth`` is a valid mode and an empty provider list is a valid list. Together they are an
-    installation that demands a credential no configured provider can issue, and the refusal has
-    to happen when the second one is written rather than at the next start — because by then the
-    file says something the process will not run.
+    ``qdrant`` is a valid vector store and an empty ``vector_db_url`` is a valid default.
+    Together they are a store with nowhere to be, and the refusal has to happen when the second
+    one is written rather than at the next start — because by then the file says something the
+    process will not run.
 
-    This used to use a routable ``bind_host`` with ``auth.mode = none``, which is no longer a
-    *configuration* problem: it governs binding, and `policy_problems` is consulted by every
-    command including the ones that never bind. The bind refusal now lives at `resolve_bind` and
-    `build_app`; what is under test here is unchanged, which is that writing one key validates
-    the whole tree.
+    This used to use a routable ``bind_host`` with ``auth.mode = none``, and then ``oauth`` with
+    no provider; neither is a *configuration* problem any more. Both govern what a served
+    process may do, and `policy_problems` is consulted by every command including the ones that
+    serve nothing — so they are refused by `resolve_bind` and `build_app` and reported by
+    `doctor`. What is under test here is unchanged, which is that writing one key validates the
+    whole tree.
     """
     with pytest.raises(ConfigError):
-        await service.config_set("security.auth.mode", "oauth")
+        await service.config_set("storage.vector_db", "qdrant")
     assert not await asyncio.to_thread(config_home.exists), (
         "the file was written before validation refused it"
     )

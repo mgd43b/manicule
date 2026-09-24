@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Final, Self, cast, override
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from manicule.app.results import ApiKeySummary, Check, CheckState
+from manicule.app.results import ApiKeySummary, Check, CheckState, UserSummary
 from manicule.config.loader import load_settings
 from manicule.container import keys
 from manicule.container.container import Container, build_container
@@ -51,8 +51,10 @@ from manicule.plugins.manifest import ComponentKind
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Sequence
 
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.engine import CursorResult
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+    from manicule.app.people import Profile
     from manicule.app.ports import (
         Answering,
         Conversing,
@@ -60,11 +62,13 @@ if TYPE_CHECKING:
         Ingesting,
         Keys,
         Maintenance,
+        MemberChange,
         Organizing,
         ResetOutcome,
         RetainedBytes,
         Retrieving,
         Telemetry,
+        Users,
     )
     from manicule.config.settings import Settings
     from manicule.core.acquisition import AcquisitionRun
@@ -546,6 +550,10 @@ class Runtime:
         """API keys for this workspace."""
         return await self._once("keys", self._build_keys)
 
+    async def users(self) -> Users:
+        """People, their memberships of this workspace, and their browser sessions."""
+        return await self._once("users", self._build_users)
+
     async def component_checks(self) -> Sequence[Check]:
         """Health of what is already constructed. Constructs nothing.
 
@@ -668,6 +676,7 @@ class Runtime:
                 self._migrated = True
             if ensure is not None:
                 await ensure()
+                await self._record_mode(engine)
             # This is a storage-data migration rather than an Alembic schema rewrite: it must
             # validate content-addressed files before it can make them manifest GC roots.  A
             # writer holds the instance lock here, and no connector is constructed or called.
@@ -698,6 +707,33 @@ class Runtime:
             # Outside the lock, and the docstring above says why: one guarded insert of a row
             # nobody else is inserting, which no concurrent writer can be harmed by.
             await ensure()
+
+    async def _record_mode(self, engine: AsyncEngine) -> None:
+        """Write ``Settings.mode`` onto this workspace's row, when it says something else.
+
+        **Here, on a writer's open, and not in** ``ensure_workspace``. That helper names only the
+        columns the workspace table was created with, because the migration suites call it at
+        older revisions; this runs after :func:`~manicule.storage.migrator.upgrade` has brought
+        the schema to head, which is the only point at which the column is certainly there.
+
+        A writer rather than every process, because a reader is not what the column records:
+        ``workspace list`` wants the mode a workspace was last *used* under, and a ``search``
+        run with a different configuration file has not used it for anything.
+
+        Guarded by the value, so an unchanged mode costs one statement that matches nothing and
+        writes no row.
+        """
+        from sqlalchemy import update  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        mode = self._settings.mode.value
+        async with engine.begin() as connection:
+            await connection.execute(
+                update(models.Workspace)
+                .where(models.Workspace.id == self.workspace, models.Workspace.mode != mode)
+                .values(mode=mode)
+            )
 
     async def _storage_needs_initializing(self, engine: AsyncEngine) -> bool:
         """Whether the schema is behind head. A read, and the only thing that decides the lock.
@@ -853,6 +889,12 @@ class Runtime:
     async def _build_keys(self) -> Keys:
         await self.documents()
         return _Keys(self)
+
+    async def _build_users(self) -> Users:
+        # After the document store, which is what migrates the schema and creates this
+        # workspace's row — a membership is a foreign key to it.
+        await self.documents()
+        return _Users(self)
 
     async def blobs(self) -> BlobSink:
         """The blob capability used by runs whose resolved policy retains source bytes.
@@ -2212,6 +2254,386 @@ class _Keys:
             return _key_summary(row)
 
 
+class _Users:
+    """People, memberships and browser sessions, over one runtime's engine and workspace.
+
+    Persons are installation-wide rows and are read and written without a workspace predicate —
+    a person is the same person in every workspace. **Every membership and every session carries
+    this runtime's workspace in every statement**, and that is the whole of what makes a session
+    minted in one workspace useless in another.
+
+    A session token is generated here, hashed here and returned exactly once, the way
+    :class:`_Keys` treats a key: only the digest reaches the database, so a copy of it is not a
+    copy of anybody's session.
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    async def member_by_subject(self, provider: str, subject: str) -> UserSummary | None:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            row = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .join(models.WorkspaceMember, models.WorkspaceMember.user_id == models.User.id)
+                    .where(
+                        models.User.provider == provider,
+                        models.User.subject == subject,
+                        models.WorkspaceMember.workspace_id == self._runtime.workspace,
+                    )
+                )
+            ).first()
+        return None if row is None else _user_summary(row[0], row[1])
+
+    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        now = utcnow()
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            user = (
+                await session.execute(
+                    select(models.User).where(
+                        models.User.provider == profile.provider,
+                        models.User.subject == profile.subject,
+                    )
+                )
+            ).scalar_one_or_none()
+            if user is None:
+                user = models.User(
+                    id=secrets.token_hex(8),
+                    provider=profile.provider,
+                    subject=profile.subject,
+                    created_at=now,
+                )
+                session.add(user)
+            # What the provider says *now*, every time. An address that is no longer verified
+            # is no longer the address this person is known by, so it is cleared rather than
+            # kept from a sign-in when it was.
+            user.email = profile.verified_email or None
+            user.name = profile.name.strip() or None
+            user.last_login_at = now
+            await session.flush()
+            membership = (
+                await session.execute(
+                    select(models.WorkspaceMember).where(
+                        models.WorkspaceMember.workspace_id == self._runtime.workspace,
+                        models.WorkspaceMember.user_id == user.id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if membership is None:
+                # The provider's role, on the first sign-in only. After this it is whatever an
+                # administrator has made it, and nothing on this path writes it again.
+                membership = models.WorkspaceMember(
+                    workspace_id=self._runtime.workspace,
+                    user_id=user.id,
+                    role=role,
+                    created_at=now,
+                )
+                session.add(membership)
+                await session.flush()
+            return _user_summary(user, membership)
+
+    async def begin_session(self, user_id: str, *, max_age_s: int) -> tuple[str, str, str]:
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        # 256 bits from the operating system's generator. The cookie that carries it is also
+        # signed, but the signature is what refuses a forgery cheaply; this is what makes a
+        # session impossible to guess even for somebody holding the signing key.
+        token = secrets.token_urlsafe(32)
+        created = utcnow()
+        expires = created + timedelta(seconds=max_age_s)
+        row = models.AuthSession(
+            id=secrets.token_hex(8),
+            token_hash=_digest(token),
+            user_id=user_id,
+            workspace_id=self._runtime.workspace,
+            created_at=created,
+            expires_at=expires,
+        )
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            session.add(row)
+        return row.id, expires.isoformat(), token
+
+    async def resolve_session(self, token: str) -> UserSummary | None:
+        """Resolve a presented session token to its member, or ``None``.
+
+        Six predicates, all in the one statement: the digest matches, the session is **this**
+        workspace's, it has not been revoked, it has not expired, the person is a member of
+        this workspace, and that membership is not disabled. There is no branch that treats an
+        unknown token differently from a revoked one or a disabled person's, for the reason
+        :meth:`_Keys.verify` gives, and the comparison is over a digest, so nothing here can be
+        timed a byte at a time.
+
+        The membership is joined rather than trusted from the session row, so a role changed by
+        an administrator is the role the very next request carries.
+        """
+        from sqlalchemy import and_, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        if not token:
+            return None
+        now = utcnow()
+        workspace = self._runtime.workspace
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            row = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .select_from(models.AuthSession)
+                    .join(models.User, models.User.id == models.AuthSession.user_id)
+                    .join(
+                        models.WorkspaceMember,
+                        and_(
+                            models.WorkspaceMember.user_id == models.AuthSession.user_id,
+                            models.WorkspaceMember.workspace_id == models.AuthSession.workspace_id,
+                        ),
+                    )
+                    .where(
+                        models.AuthSession.token_hash == _digest(token),
+                        models.AuthSession.workspace_id == workspace,
+                        models.AuthSession.revoked_at.is_(None),
+                        models.AuthSession.expires_at > now,
+                        models.WorkspaceMember.disabled_at.is_(None),
+                    )
+                )
+            ).first()
+        return None if row is None else _user_summary(row[0], row[1])
+
+    async def end_session(self, token: str) -> bool:
+        from sqlalchemy import update  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        if not token:
+            return False
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            result = cast(
+                "CursorResult[object]",
+                await session.execute(
+                    update(models.AuthSession)
+                    .where(
+                        models.AuthSession.token_hash == _digest(token),
+                        models.AuthSession.workspace_id == self._runtime.workspace,
+                        models.AuthSession.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=utcnow())
+                ),
+            )
+        return bool(result.rowcount)
+
+    async def end_sessions(self, user_id: str) -> int:
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            return await self._revoke_sessions(session, user_id, utcnow())
+
+    async def list_members(self) -> Sequence[UserSummary]:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .join(models.WorkspaceMember, models.WorkspaceMember.user_id == models.User.id)
+                    .where(models.WorkspaceMember.workspace_id == self._runtime.workspace)
+                    .order_by(models.WorkspaceMember.created_at, models.User.id)
+                )
+            ).all()
+            live = await self._live_sessions(session)
+        return [_user_summary(row[0], row[1], sessions=live.get(row[0].id, 0)) for row in rows]
+
+    async def find_members(self, user_or_email: str) -> Sequence[UserSummary]:
+        from sqlalchemy import func, or_, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        wanted = user_or_email.strip()
+        if not wanted:
+            return []
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .join(models.WorkspaceMember, models.WorkspaceMember.user_id == models.User.id)
+                    .where(
+                        # Among this workspace's members only. An address resolved across the
+                        # installation would let a lookup here confirm who is a member elsewhere.
+                        models.WorkspaceMember.workspace_id == self._runtime.workspace,
+                        or_(
+                            models.User.id == wanted,
+                            func.lower(models.User.email) == wanted.lower(),
+                        ),
+                    )
+                    .order_by(models.User.id)
+                )
+            ).all()
+            live = await self._live_sessions(session)
+        return [_user_summary(row[0], row[1], sessions=live.get(row[0].id, 0)) for row in rows]
+
+    async def count_admins(self) -> int:
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            return await self._enabled_admins(session)
+
+    async def update_member(
+        self, user_id: str, *, role: str | None = None, disabled: bool | None = None
+    ) -> MemberChange:
+        from sqlalchemy import select, update  # noqa: PLC0415
+
+        from manicule.app.people import LAST_ADMIN  # noqa: PLC0415
+        from manicule.app.ports import MemberChange  # noqa: PLC0415
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        workspace = self._runtime.workspace
+        now = utcnow()
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            row = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .join(models.WorkspaceMember, models.WorkspaceMember.user_id == models.User.id)
+                    .where(
+                        models.WorkspaceMember.workspace_id == workspace,
+                        models.WorkspaceMember.user_id == user_id,
+                    )
+                )
+            ).first()
+            if row is None:
+                msg = f"no member {user_id!r} in workspace {workspace!r}"
+                raise UnknownEntityError(msg)
+            user, membership = row[0], row[1]
+            previous_role = membership.role
+            previously_disabled = membership.disabled_at is not None
+            new_role = role if role is not None else previous_role
+            new_disabled = disabled if disabled is not None else previously_disabled
+            was_admin = previous_role == "admin" and not previously_disabled
+            stays_admin = new_role == "admin" and not new_disabled
+            # In this transaction, after reading the row it is about to change. The service
+            # asked the same question a moment ago; asking it again here is what stops two
+            # administrators demoting each other at once from both being told yes.
+            if was_admin and not stays_admin and await self._enabled_admins(session) <= 1:
+                raise PolicyError(LAST_ADMIN.format(who=user_id, workspace=workspace))
+            membership.role = new_role
+            sessions_revoked = keys_revoked = 0
+            if new_disabled and not previously_disabled:
+                membership.disabled_at = now
+                sessions_revoked = await self._revoke_sessions(session, user_id, now)
+                revoked_keys = cast(
+                    "CursorResult[object]",
+                    await session.execute(
+                        update(models.ApiKey)
+                        .where(
+                            models.ApiKey.workspace_id == workspace,
+                            models.ApiKey.user_id == user_id,
+                            models.ApiKey.revoked_at.is_(None),
+                        )
+                        .values(revoked_at=now)
+                    ),
+                )
+                keys_revoked = int(revoked_keys.rowcount or 0)
+            elif previously_disabled and not new_disabled:
+                membership.disabled_at = None
+            await session.flush()
+            live = await self._live_sessions(session)
+            summary = _user_summary(user, membership, sessions=live.get(user.id, 0))
+        return MemberChange(
+            member=summary,
+            previous_role=previous_role,
+            previously_disabled=previously_disabled,
+            sessions_revoked=sessions_revoked,
+            keys_revoked=keys_revoked,
+        )
+
+    async def _revoke_sessions(self, session: AsyncSession, user_id: str, now: datetime) -> int:
+        from sqlalchemy import update  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        result = cast(
+            "CursorResult[object]",
+            await session.execute(
+                update(models.AuthSession)
+                .where(
+                    models.AuthSession.workspace_id == self._runtime.workspace,
+                    models.AuthSession.user_id == user_id,
+                    models.AuthSession.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            ),
+        )
+        return int(result.rowcount or 0)
+
+    async def _enabled_admins(self, session: AsyncSession) -> int:
+        from sqlalchemy import func, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        return int(
+            (
+                await session.execute(
+                    select(func.count()).where(
+                        models.WorkspaceMember.workspace_id == self._runtime.workspace,
+                        models.WorkspaceMember.role == "admin",
+                        models.WorkspaceMember.disabled_at.is_(None),
+                    )
+                )
+            ).scalar_one()
+        )
+
+    async def _live_sessions(self, session: AsyncSession) -> dict[str, int]:
+        """Unrevoked, unexpired sessions per person, in this workspace."""
+        from sqlalchemy import func, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        rows = (
+            await session.execute(
+                select(models.AuthSession.user_id, func.count())
+                .where(
+                    models.AuthSession.workspace_id == self._runtime.workspace,
+                    models.AuthSession.revoked_at.is_(None),
+                    models.AuthSession.expires_at > utcnow(),
+                )
+                .group_by(models.AuthSession.user_id)
+            )
+        ).all()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+
 class _Telemetry:
     """Query logs and the audit trail, over one runtime's engine and workspace.
 
@@ -3207,6 +3629,27 @@ def _key_summary(row: object) -> ApiKeySummary:
         created_at=_isoformat(getattr(row, "created_at", None)),
         expires_at=_isoformat(expires) or None,
         revoked=getattr(row, "revoked_at", None) is not None,
+    )
+
+
+def _digest(secret: str) -> str:
+    """The SHA-256 of a presented secret, which is the only form of one the database holds."""
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _user_summary(user: object, membership: object, *, sessions: int | None = None) -> UserSummary:
+    """One person as a member of one workspace, read off the two rows that say so."""
+    return UserSummary(
+        id=str(getattr(user, "id", "")),
+        provider=str(getattr(user, "provider", "")),
+        email=str(getattr(user, "email", None) or ""),
+        name=str(getattr(user, "name", None) or ""),
+        role=str(getattr(membership, "role", "")),
+        workspace=str(getattr(membership, "workspace_id", "")),
+        disabled=getattr(membership, "disabled_at", None) is not None,
+        created_at=_isoformat(getattr(membership, "created_at", None)),
+        last_login_at=_isoformat(getattr(user, "last_login_at", None)),
+        sessions=sessions,
     )
 
 

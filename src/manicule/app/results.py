@@ -1936,7 +1936,94 @@ class AuthProviders(Payload):
     mode: str
     count: int = Field(ge=0)
     providers: tuple[str, ...] = ()
+    login_paths: tuple[str, ...] = Field(
+        default=(),
+        description="Where a browser starts signing in, one per provider, in the same order.",
+    )
     detail: str = ""
+
+
+# --- people --------------------------------------------------------------------------------
+
+
+class UserSummary(Payload):
+    """One person, as a member of this workspace.
+
+    The person is installation-wide; everything else here — the role, whether they are
+    disabled, when they joined — is about their membership of *this* workspace, because a role
+    is a relationship between a person and a workspace rather than a property of the person.
+    """
+
+    id: str
+    provider: str
+    email: str = Field(default="", description="The verified address the provider last reported.")
+    name: str = ""
+    role: str
+    workspace: str
+    disabled: bool = False
+    created_at: str = Field(default="", description="When they became a member.")
+    last_login_at: str = ""
+    sessions: int | None = Field(
+        default=None,
+        ge=0,
+        description="Signed-in browsers that have not ended or expired. ``None`` when this "
+        "reading did not count them, which is different from none.",
+    )
+
+
+class UserList(Payload):
+    """Every member of this workspace, disabled ones included."""
+
+    count: int = Field(ge=0)
+    admins: int = Field(default=0, ge=0, description="Enabled administrators.")
+    users: tuple[UserSummary, ...] = ()
+
+
+class UserUpdated(Payload):
+    """A membership after a change to its role or its standing.
+
+    ``sessions_revoked`` and ``keys_revoked`` are what a disable took with it, in the same
+    transaction: every browser the person was signed in with, and every key they minted here.
+    """
+
+    user: UserSummary
+    previous_role: str
+    previously_disabled: bool
+    sessions_revoked: int = Field(default=0, ge=0)
+    keys_revoked: int = Field(default=0, ge=0)
+
+
+class UserSignedOut(Payload):
+    """Every browser session one person held in this workspace, ended."""
+
+    user: UserSummary
+    sessions_revoked: int = Field(ge=0)
+
+
+class SignedIn(Payload):
+    """A person admitted, and the session a browser now holds for them.
+
+    ``token`` is the only copy of the session's secret, exactly as an API key's is: only its
+    digest is stored. A surface puts it in a cookie and never displays it.
+    """
+
+    user: UserSummary
+    session_id: str
+    expires_at: str
+    token: str = Field(
+        repr=False,
+        description="The session secret. Set as a cookie, never shown, and never stored — only "
+        "its SHA-256 digest is kept.",
+    )
+
+
+class SignedOut(Payload):
+    """A browser session ended on the server, whether or not one was presented."""
+
+    ended: bool = Field(
+        description="Whether a live session was found and revoked. False for a cookie that "
+        "named nothing live, which is still a successful sign-out."
+    )
 
 
 # --- ingest --------------------------------------------------------------------------------
@@ -2645,6 +2732,11 @@ class WorkspaceSwitched(Payload):
     previous: str
     active: str
     path: str = Field(description="The file that recorded it.")
+    mode: str = Field(
+        default="",
+        description="The mode recorded beside it, when one was asked for; empty otherwise.",
+    )
+    detail: str = ""
 
 
 # --- plugins -------------------------------------------------------------------------------
@@ -2931,6 +3023,8 @@ __all__ = [
     "SharedCitationLabel",
     "SharedConversation",
     "SharedTurnPayload",
+    "SignedIn",
+    "SignedOut",
     "SourceReference",
     # `StaleReparseReport` is listed here for the first time, and it is not this change's.
     # #113 added the class and not the name, so `from manicule.app.results import *` produced a
@@ -2947,6 +3041,10 @@ __all__ = [
     "TrashList",
     "TrashedDocument",
     "UpgradeReport",
+    "UserList",
+    "UserSignedOut",
+    "UserSummary",
+    "UserUpdated",
     "VectorIndexReport",
     "VectorIndexState",
     "VectorSweepReport",
