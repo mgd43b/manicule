@@ -58,10 +58,6 @@ def _runtime(environment: Path) -> Runtime:
         embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
         llm={"generator": "scripted"},  # pyright: ignore[reportArgumentType]
         rag={"chunker": "block"},  # pyright: ignore[reportArgumentType]
-        # Citation verification against retained bytes reads the blob store in tasks of its
-        # own, which a one-sentence answer closes before they finish. None of that is about
-        # the cache, so there are no retained bytes for it to read.
-        storage={"retain_source_bytes": False},  # pyright: ignore[reportArgumentType]
     )
     assert settings.rag.cache.enabled, "the shipped default is what is under test"
     return Runtime(settings, discovery=found)

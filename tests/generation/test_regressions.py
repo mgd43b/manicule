@@ -9,10 +9,12 @@ the code looked right, and the guarantee was not being kept.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
-from typing import Any, override
+from typing import TYPE_CHECKING, Any, override
 
 import pytest
 from litellm.exceptions import APIConnectionError
@@ -23,7 +25,7 @@ from manicule.config.settings import RedactionMethod, RedactionSettings, Setting
 from manicule.core.anchors import HeadingAnchor
 from manicule.core.content import RawDocument
 from manicule.core.errors import ConfigError, ProviderTimeoutError
-from manicule.core.generation import FinishReason, Usage
+from manicule.core.generation import FinishReason, Token, Usage
 from manicule.core.protocols import generating
 from manicule.core.retrieval import RetrievalProfile
 from manicule.generation.answering import (
@@ -41,14 +43,18 @@ from manicule.generation.markers import ATTEMPT_PREFIX, MARKER_MAX_LEN, MarkerSc
 from manicule.generation.policy import EgressPolicy, filter_context
 from manicule.generation.redaction import Redactor
 from manicule.generation.verification import (
+    ChainRouter,
     CitationVerifier,
     OpenSource,
+    RetainedBytesResolver,
     UnverifiableSource,
     load_documents,
 )
 from manicule.retrieval.tokens import ContextTokenCounter
+from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.testing.normalize import contains_claimed_text
 from tests.generation.fakes import (
+    FakeChain,
     FakeDocuments,
     FakeParser,
     ProtocolOnlyGenerator,
@@ -62,6 +68,12 @@ from tests.generation.fakes import (
     settings,
 )
 from tests.generation.test_provider_and_budget import FakeStream, chunk, generator
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
+    from pathlib import Path
+
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
 ROLLBACK = "Roll back with `deploy --rollback`."
 EMAIL = "oncall@example.invalid"
@@ -412,11 +424,13 @@ def build(
     store: object = None,
     config: Settings | None = None,
     documents: object = None,
+    verifier: CitationVerifier | None = None,
 ) -> Answerer:
     resolved = config or settings()
     return Answerer(
         generator=generator_,  # pyright: ignore[reportArgumentType]
-        verifier=CitationVerifier(
+        verifier=verifier
+        or CitationVerifier(
             resolver(FakeParser(resolutions={"Rollback": f"## Rollback\n{ROLLBACK}"}))
         ),
         documents=documents or FakeDocuments({"doc-1": document()}),  # pyright: ignore[reportArgumentType]
@@ -540,6 +554,77 @@ async def test_the_estimate_describes_the_prompt_that_is_actually_sent() -> None
     assert with_history.trace.estimated_prompt_tokens > without.trace.estimated_prompt_tokens
     assert without.trace.history_tokens == 0
     assert with_history.trace.history_tokens > 0
+
+
+async def test_canceling_an_answer_mid_verification_leaves_no_connection_open(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unclosed_connections: Callable[[], list[str]],
+) -> None:
+    """The answer's close cancels the verification still reading retained bytes, and the read
+    was canceled wherever it happened to be — including inside the pool, opening the connection
+    its blob lookup needed. aiosqlite dropped the handle its thread had just opened and
+    SQLAlchemy never received it, so nothing could close it, and it surfaced later as a
+    warning against whichever test was running when the collector reached it.
+
+    Driven through the real blob store and engine, because a fake reader holds no connection
+    and could not strand one.
+    """
+    blobs = BlobStore(engine, data_dir)
+    stored = await blobs.put(f"# Rollback\n{ROLLBACK}\n".encode(), "text/markdown")
+    assert isinstance(stored, StoredBlob)
+    await engine.dispose()  # nothing idle, so verification opens a connection of its own
+    opening = threading.Event()
+    release = threading.Event()
+    connect = sqlite3.connect
+
+    def held_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        opening.set()
+        assert release.wait(timeout=5)
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", held_connect)
+
+    class Unanswered:
+        """A model that has produced nothing yet when the reader goes away."""
+
+        model_id = "fake/model"
+        context_window = 32768
+
+        def generate(self, query: Any, context: Any) -> AsyncIterator[Token]:
+            del query, context
+            return self._stream()
+
+        async def _stream(self) -> AsyncIterator[Token]:
+            await asyncio.Event().wait()
+            yield Token(finish_reason=FinishReason.STOP)  # pragma: no cover - never reached
+
+    parser = FakeParser(resolutions={"Rollback": f"## Rollback\n{ROLLBACK}"})
+    answers = build(
+        Unanswered(),
+        verifier=CitationVerifier(
+            RetainedBytesResolver(blobs=blobs, router=ChainRouter(FakeChain(parser)))
+        ),
+        documents=FakeDocuments({"doc-1": document(original_ref=stored.hash)}),
+    )
+
+    async def consume() -> None:
+        async with answering(answers, a_request()) as events:
+            async for _ in events:
+                pass
+
+    task = asyncio.create_task(consume())
+    assert await asyncio.to_thread(opening.wait, 5), "verification never reached the blob store"
+    task.cancel()
+    finished, _ = await asyncio.wait({task}, timeout=0.2)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await engine.dispose()
+    assert unclosed_connections() == [], "the canceled answer left a database connection open"
+    assert not finished, "the answer closed while its blob read was still opening a connection"
 
 
 async def test_the_history_budget_is_the_one_the_window_check_approved() -> None:

@@ -383,6 +383,16 @@ once-per-chunk cost, not a per-query one.
 **Started concurrently with the generation call**, since it needs no model output. On a warm
 cache it has finished before the request reaches the provider.
 
+**Closed with the answer, whichever finishes first.** Each document's checks run as a task of
+their own. When the answer ends before they do — a one-sentence reply that cites nothing, a
+reader who went away — closing the run cancels those tasks, waits for them, and records every
+slot still without a verdict as a drop. The wait has the close deadline, with one exception: a
+cancellation does not cut a blob lookup short. `BlobStore.get` finishes looking up its row, and
+hands the connection back to the pool, before it raises the cancellation, because a lookup
+canceled while the pool is still opening that connection strands it where nothing can close it
+(`storage.md` §3.1) — and this path cancels lookups on every answer that outruns its
+verification.
+
 **Bounded, and the bound is a failure rather than a bypass.** `citation_verify_timeout_s`
 defaults to 5.0, measured from the start of the answer, which is generous because the work
 began before the first token. A marker whose verification has not completed when the marker
