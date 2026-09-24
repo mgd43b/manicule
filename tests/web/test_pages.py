@@ -21,7 +21,9 @@ from pathlib import Path
 import pytest
 
 from manicule.api.security import Principal
+from manicule.app.caller import Caller, acting_as
 from manicule.app.service import ApplicationService
+from manicule.config.settings import Role
 from manicule.core.ann import AnnIndex, AnnIndexState, AnnLifecycle
 from manicule.core.errors import ManiculeError
 from manicule.web.areas import AREAS, NAVIGATION
@@ -463,17 +465,45 @@ def test_where_people_sign_in_the_refusal_offers_the_sign_in_and_not_the_api_key
 def test_a_viewer_may_not_read_the_administration_areas() -> None:
     """The pages take the floor the routes behind them take.
 
-    Query logs are what somebody asked, the audit trail names who did what, and the key list is
-    the installation's identities. A page that took less than its routes would be a way round
-    them.
+    Query logs are what somebody asked, the audit trail names who did what, and the member list
+    is the workspace's people. A page that took less than its routes would be a way round them.
+    The API keys page is not among them: its routes are viewer-floor, because which keys a caller
+    sees is the service's ownership rule rather than a role.
     """
     backend, _ = backend_with_a_document(security={"auth": {"mode": "api_key"}})
     secret = asyncio.run(ApplicationService(backend).api_key_create("reader", role="viewer")).secret
     with client_for(backend) as client:
         headers = {"X-API-Key": secret}
         assert client.get("/ui/documents", headers=headers).status_code == 200
-        for path in ("/ui/admin", "/ui/auth", "/ui/users", "/ui/connectors", "/ui/plugins"):
+        for path in ("/ui/admin", "/ui/users", "/ui/connectors", "/ui/plugins"):
             assert client.get(path, headers=headers).status_code == FORBIDDEN, path
+
+
+def test_the_api_keys_page_shows_a_non_administrator_only_the_keys_they_own() -> None:
+    """A reader's page whose rows are the service's ownership rule, not the page's.
+
+    A person who minted a key sees it and nobody else's; a key with no owner, presented by a
+    caller short of admin, sees none at all — including itself, which only the operator who
+    minted it may list.
+    """
+    backend, _ = backend_with_a_document(security={"auth": {"mode": "api_key"}})
+    service = ApplicationService(backend)
+    ownerless = asyncio.run(service.api_key_create("shared-reader", role="viewer"))
+    with acting_as(Caller(role=Role.MEMBER, user_id="u-ada")):
+        own = asyncio.run(service.api_key_create("ada-laptop", role="viewer"))
+    backend.keys_.memberships["u-ada"] = "member"
+    with client_for(backend) as client:
+        as_ada = client.get("/ui/auth", headers={"X-API-Key": own.secret})
+        as_nobody = client.get("/ui/auth", headers={"X-API-Key": ownerless.secret})
+    # The listing only: the page's "this request" panel names the presenting key, as it should.
+    ada_listing = as_ada.text.split("<h2>Keys</h2>", 1)[1]
+    nobody_listing = as_nobody.text.split("<h2>Keys</h2>", 1)[1]
+    assert as_ada.status_code == 200
+    assert "ada-laptop" in ada_listing
+    assert "shared-reader" not in ada_listing
+    assert as_nobody.status_code == 200
+    assert "ada-laptop" not in nobody_listing
+    assert "shared-reader" not in nobody_listing
 
 
 def test_the_stylesheet_and_the_script_are_constants() -> None:

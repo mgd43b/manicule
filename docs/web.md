@@ -115,7 +115,7 @@ the failure the page shows — same type, same message, same hint.
 | reembed | `/ui/reembed` | `reembed_plan`, `reembed_status` | admin |
 | lifecycle | `/ui/lifecycle` | dry runs of the lifecycle operations, `rebuild_plan`, `rebuild_status` | admin |
 | users | `/ui/users` | `user_list`, `auth_providers` | admin |
-| auth | `/ui/auth` | `api_key_list`, `auth_providers` | admin |
+| auth | `/ui/auth` | `api_key_list`, `auth_providers` | viewer — rows are the caller's own keys unless they administer |
 | layout | — | — | — |
 
 Plus two pages that take no credential at all, in a smaller frame with no navigation:

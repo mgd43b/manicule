@@ -622,8 +622,13 @@ async def settings(service: Service, caller: Operator) -> HTMLResponse:
 
 
 @router.get("/auth", name="ui_auth", summary="This workspace's API keys, and how it authenticates.")
-async def auth(service: Service, caller: Operator) -> HTMLResponse:
+async def auth(service: Service, caller: Reader) -> HTMLResponse:
     """The keys programs authenticate with, and what this installation demands of a caller.
+
+    A reader's page, because its routes are viewer-floor ones: which keys a caller sees, mints
+    and revokes is the service's ownership rule, not a role. An administrator sees every key in
+    the workspace; a signed-in person sees and manages the keys they minted; a caller who is
+    neither sees none.
 
     Keys only. People — who is a member, in what role, and whether they are enabled — are the
     people page's (:func:`users`), because a key and a membership are revoked, owned and
