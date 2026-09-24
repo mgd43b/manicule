@@ -1401,12 +1401,74 @@ Application-level bookkeeping covers only the write paths someone remembered.
 bump at the top of each write method is a per-method list with the same weakness one layer
 down: the method nobody annotates is the one that serves a stale ranking. The counter instead
 counts **committed transactions on the store's engine**, which is the closest thing SQLAlchemy
-has to a trigger — a write path cannot avoid committing, and a read cannot reach it, because a
-session closed without a commit rolls back. Verified in both directions: `upsert_document`,
-`replace_chunks` and `soft_delete_document` each move it, and `get_document`, `list_documents`
-and `search_lexical` do not. It over-counts, deliberately — a watermark write bumps it too, and
-so does a write through any other handle on the same database — and over-counting costs a cold
-cache while under-counting serves a ranking computed over a corpus that no longer exists.
+has to a trigger — a write path cannot avoid committing, and a session closed without a commit
+rolls back. One counter per engine, shared by every workspace's handle on it.
+
+**Counting every commit made the cache unreachable.** That was the first design, and it rested
+on "a read cannot reach it" — true of the store, and false of the service. Every search the
+service runs writes a `query_logs` row after retrieving, on the same engine, so the search's own
+record of itself moved the key and the next identical search always missed; `ask` did the same
+with the conversation turn it persists, and a spanning search with its audit entry. The cache hit
+only when the retriever was called directly, which no surface does.
+
+**So each statement is classified as it is sent, and the commit decides.** A listener on
+SQLAlchemy's `before_cursor_execute` marks the transaction the moment it sends a statement the
+counter cannot vouch for, before the statement runs; the commit bumps the counter only if the
+mark is set; commit and rollback both clear it. The counter can vouch for exactly two kinds of
+statement, both of which SQLAlchemy built rather than parsed from a string:
+
+| Statement | Moves the counter |
+|---|---|
+| a `SELECT`, or a `UNION` of them, built with SQLAlchemy | no — it writes nothing |
+| an `INSERT`, `UPDATE` or `DELETE` built with SQLAlchemy whose target is an exempt table | no |
+| an `INSERT`, `UPDATE` or `DELETE` built with SQLAlchemy on **any other table** | yes |
+| any `text()` statement or driver-level SQL, **whatever table it names** | yes |
+| DDL, a savepoint, anything else | yes |
+
+The exempt tables are the record of who asked what and of who may ask — `query_logs`,
+`audit_logs`, `security_alerts`, `conversations`, `messages`, `users`, `workspace_members`,
+`auth_sessions` and `api_keys` (`NON_CORPUS_TABLES` in `manicule.storage.scoped`). No query
+reads any of them, and most are written *because* somebody searched, asked or signed in.
+
+**It fails toward counting, on purpose, at every choice.** Over-counting costs a cold cache;
+under-counting serves a ranking computed over a corpus that no longer exists.
+
+- **An exemption list, not a list of tables that count.** A table missing from it — including
+  one added next year — counts. A list of the tables that count would fail the other way: the
+  table nobody added would be the stale ranking.
+- **A string is not a proof.** A `text()` insert into `query_logs` counts, because a statement
+  that says it writes the query log has only said so. Only a statement whose target SQLAlchemy
+  knows can be exempted.
+- **The whole transaction counts if one statement does.** A query-log row committed beside a
+  rewritten chunk does not hide the chunk.
+- **The exemption depends on three facts, and the test suite holds each of them:** no trigger
+  fires on an exempt table, since a trigger is a write its statement does not name; a
+  foreign-key action that starts at an exempt table ends at one — deleting a person cascades
+  into their memberships, sessions and keys, and deleting a query-log row nulls the turns that
+  pointed at it, all exempt; and no statement the retriever sends names an exempt table. A
+  retrieval that began reading one would make its writes change what a query returns, and it
+  would leave the list.
+
+What this cannot see is a write made on the raw driver connection, beneath SQLAlchemy — which no
+SQLAlchemy event can see, and which nothing in this project does.
+
+**A second engine for telemetry was the alternative, and it is worse.** Writing the query log,
+the audit trail and conversations through an engine the counter does not listen to would put two
+connection pools and two writer queues on one SQLite file, racing for its single writer rather
+than queueing for it (`writer_admission` in `manicule.storage.engine` is one queue per engine,
+precisely so that every writer waits in the same one); it would make "which engine does this
+write go through" a decision every call site makes, which is the per-call-site list again; and it
+would fail in the dangerous direction — a corpus write routed through the telemetry engine by
+mistake would never count. Classifying statements keeps one engine and one queue, and a
+statement nobody thought about counts.
+
+Verified in both directions. `upsert_document`, `replace_chunks`, `soft_delete_document`, adding
+a document to a collection, a raw `UPDATE chunks`, and a structured write to every table not on
+the list each move it. `get_document`, `list_documents`, `search_lexical`, a query-log row, an
+audit entry, an alert, a conversation turn and its feedback do not — and through the service,
+a repeated search, a search after an `ask` of the same words, and a repeated spanning search are
+each served from the cache. It still over-counts, deliberately — a watermark write bumps it, and
+so does a corpus write through any other handle on the same database.
 
 **An in-process counter is sufficient, and the reason is a property this project already
 enforces:** exactly one instance per data directory, held by an exclusive lock for the process
@@ -2119,7 +2181,7 @@ did, each fixed above rather than noted:
 | §4.1, §11.1 | The lexical trace records the query text the leg was **given**, not the escaped match string. Escaping belongs to the store; reproducing it in the stage would import a database driver into a package that needs none and hardcode one store's query language into a swappable leg |
 | §7.3, §12.1 | The token budgets were inherited, unreachable by a factor of three to five, and `precise` failed its own startup cross-check against the model this project ships with. They are now derived from what each profile can hold |
 | §8.2 | The suppression rule is about the **cause**, not about one named term: a degraded dense leg has to suppress the similarity component for exactly the reason a degraded lexical leg suppresses agreement |
-| §10.3 | "Bump on the write paths in the document store" is still a list. The counter counts **committed transactions**, which a write cannot avoid and a read cannot reach |
+| §10.3 | "Bump on the write paths in the document store" is still a list. The counter counts **committed transactions**, which a write cannot avoid. #13 found that a read *can* reach one — through the query-log row the service writes after it — and the counter now leaves out a commit that wrote only exempt tables |
 | §10.1 | A cache hit re-applies the **document-level** half of the filter, not the whole of it. `kinds` and `langs` are chunk properties with no column in a query over `documents`, so passing them made a query that worked on a miss raise on a hit. Nothing is dropped by narrowing it: those fields were applied when the ranking was computed, and a chunk id is content-derived, so the chunk behind a cached id is the same chunk of the same kind — what can have changed is exactly the document-level half |
 
 Two more that are additions rather than corrections. `manicule.retrieval.assembly.window_problem`

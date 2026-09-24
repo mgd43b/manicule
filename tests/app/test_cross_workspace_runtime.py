@@ -68,6 +68,7 @@ def _runtime(
     *,
     embedder: Any | None = None,
     writer: bool = True,
+    audit: bool = False,
     **rag: object,
 ) -> Runtime:
     """A runtime for ``workspace`` on the shared data directory, with a buildable pipeline."""
@@ -83,6 +84,7 @@ def _runtime(
         workspace=workspace,
         embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
         rag={"chunker": "block", **rag},  # pyright: ignore[reportArgumentType]
+        security={"audit": {"enabled": audit}},  # pyright: ignore[reportArgumentType]
     )
     return Runtime(settings, discovery=found, writer=writer)
 
@@ -161,8 +163,9 @@ async def test_the_ordinary_search_is_unchanged_by_a_spanning_one_beside_it(
 
     Run after a spanning search of the same words, so that anything the two shared — a cached
     ranking, a bound leg, an opened handle — would show up here as a beta passage or as a
-    ranking without the lexical leg. Which of the two scopes a cache key separates is held in
-    ``tests/retrieval/test_spanning.py``, where no query-log commit moves the key between calls.
+    ranking without the lexical leg. The cache is live across all three: a search's own
+    query-log row does not move the key, so the spanning ranking is still cached when the
+    ordinary search asks, and only the workspace set in the key keeps it from being served.
     """
     async with _runtime(corpus, "alpha") as opened:
         service = ApplicationService(opened)
@@ -170,11 +173,32 @@ async def test_the_ordinary_search_is_unchanged_by_a_spanning_one_beside_it(
         ordinary = await service.search("orchard")
         named = await service.search("orchard", workspaces=["alpha"])
 
+    assert ordinary.cached is False, "the spanning ranking was served to a one-workspace search"
+    assert named.cached is True, "naming only this workspace is the ordinary search, cached"
     assert {hit.workspace for hit in spanning.hits} == {"alpha", "beta"}
     assert _titles(ordinary) == [("alpha-high", "alpha"), ("alpha-low", "alpha")]
     assert set(ordinary.hits[0].scores) >= {"dense", "lexical", "rrf"}
     assert [hit.model_dump() for hit in named.hits] == [hit.model_dump() for hit in ordinary.hits]
     assert named.workspaces == ordinary.workspaces == ("alpha",)
+
+
+async def test_a_repeated_spanning_search_is_served_from_the_cache(corpus: Path) -> None:
+    """A spanning search writes a query-log row and an audit entry, and neither of them ranks.
+
+    Audited on purpose: the audit entry is the record a spanning search writes and an ordinary
+    one does not, so it is the write this path adds to the ones that used to move the key.
+    """
+    async with _runtime(corpus, "alpha", audit=True) as opened:
+        service = ApplicationService(opened)
+        first = await service.search("orchard", workspaces=["alpha", "beta"], limit=5)
+        second = await service.search("orchard", workspaces=["alpha", "beta"], limit=5)
+        telemetry = await opened.telemetry()
+        audited = (await telemetry.audit_logs(event_type="search.cross_workspace"))[1]
+
+    assert audited == 2, "both searches must have written their audit entry"
+    assert first.cached is False
+    assert second.cached is True, "a spanning search's own records invalidated its ranking"
+    assert _titles(second) == _titles(first)
 
 
 async def test_a_workspace_whose_best_passage_is_deleted_still_offers_its_next_best(

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### A repeated search is served from the query cache
+
+The query cache never hit through the CLI, HTTP, MCP or the web. Its invalidation counter counted
+every committed transaction on the database, and every search records itself in the query log
+after it runs — so the search's own log row invalidated the ranking it had just cached, and the
+next identical search ran the whole pipeline again. An answer's conversation turn and a spanning
+search's audit entry did the same.
+
+A commit that wrote only the record of who asked what — the query log, the audit trail and its
+alerts, conversations and their turns, and the people, memberships, sessions and keys that
+identify a caller — no longer moves the counter. Everything else still does, including any raw
+SQL statement whatever table it names, so a change to the corpus still invalidates every cached
+ranking at once. `retrieval.md` §10.3 has the rule. Nothing to configure, and no ranking changes:
+a hit re-hydrates the same ids through the same join as before.
+
 ### A Qdrant collection's memory and search settings are now configuration
 
 Seven settings under `storage.qdrant` shape the collections manicule keeps on a Qdrant server:

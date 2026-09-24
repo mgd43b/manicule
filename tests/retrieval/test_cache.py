@@ -5,12 +5,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from sqlalchemy import delete, false, insert, text, update
 
 from manicule.core.content import BlockKind
 from manicule.core.retrieval import Candidate, Filter, PipelineIdentity, Query, SupportsGeneration
+from manicule.generation.ports import Feedback, StoredMessage
 from manicule.retrieval.cache import L1QueryCache, cache_key, rehydrate
 from manicule.retrieval.prefilter import join_filter
+from manicule.storage import models
+from manicule.storage.conversations import SqliteConversationStore
 from manicule.storage.docstore import SqliteDocStore
+from manicule.storage.engine import session_factory
+from manicule.storage.scoped import NON_CORPUS_TABLES
 from tests.retrieval.fakes import SCOPE, a_query
 from tests.storage_helpers import make_chunk, make_document
 
@@ -35,7 +41,7 @@ def test_the_document_store_reports_a_generation_counter(store: SqliteDocStore) 
     assert isinstance(store, SupportsGeneration)
 
 
-async def test_every_committed_write_moves_the_counter(store: SqliteDocStore) -> None:
+async def test_every_committed_corpus_write_moves_the_counter(store: SqliteDocStore) -> None:
     """It counts *commits*, not calls to the write methods somebody remembered to instrument.
 
     The same reasoning that puts lexical-index synchronization in triggers rather than in
@@ -79,6 +85,181 @@ async def test_a_write_through_another_handle_still_invalidates(
     await other.ensure_workspace()
 
     assert store.generation > settled
+
+
+async def test_recording_who_asked_what_leaves_the_counter_alone(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """A search's query-log row, an audit entry, an alert, a conversation and its turns.
+
+    Each is written *because* somebody asked something, after the ranking was computed, and no
+    query reads any of them. When these moved the counter, every search through the service
+    invalidated its own cached ranking and the next identical search always missed.
+    """
+    await _live(store)
+    settled = store.generation
+
+    async with session_factory(engine).begin() as session:
+        session.add(models.QueryLog(id="q1", workspace_id=store.workspace_id, query="auth"))
+        session.add(models.AuditLog(id="a1", event_type="search.cross_workspace", details={}))
+        session.add(
+            models.SecurityAlert(
+                id="s1", workspace_id=store.workspace_id, kind="key_abuse", subject="key-1"
+            )
+        )
+    conversations = SqliteConversationStore(engine, workspace_id=store.workspace_id)
+    await conversations.ensure_workspace()
+    conversation = await conversations.create_conversation(title="auth")
+    turn = await conversations.append(
+        StoredMessage(conversation_id=conversation, role="assistant", content="Weekly.")
+    )
+    await conversations.record_feedback(turn, feedback=Feedback.POSITIVE)
+    await conversations.rename_conversation(conversation, "rotation")
+
+    assert store.generation == settled
+
+
+@pytest.mark.parametrize("table", sorted(models.Base.metadata.tables))
+async def test_only_the_exempt_tables_can_be_written_without_moving_the_counter(
+    store: SqliteDocStore, engine: AsyncEngine, table: str
+) -> None:
+    """Every table the schema declares, written the way the store writes: a structured statement.
+
+    Both directions from one list, so a table added later is covered the day it is added —
+    and it counts, because it is not on the exemption list, which is the direction that costs
+    a cold cache rather than a stale ranking. The delete matches no row; the counter is not
+    about what a statement did, it is about what it could have done.
+    """
+    settled = store.generation
+
+    async with engine.begin() as connection:
+        await connection.execute(delete(models.Base.metadata.tables[table]).where(false()))
+
+    moved = store.generation > settled
+    assert moved is (table not in NON_CORPUS_TABLES)
+
+
+async def test_raw_sql_counts_even_when_it_names_an_exempt_table(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """A string that looks like an insert into the query log is not a proof that it is one.
+
+    Only a statement SQLAlchemy built has a target the counter can read. A ``text()`` statement
+    is classified by nothing but its own claim, and trusting that claim is the wrong direction
+    to be wrong in — so it counts, whatever table it names.
+    """
+    settled = store.generation
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO query_logs (id, workspace_id, query, created_at) "
+                "VALUES ('raw', :workspace, 'auth', datetime('now'))"
+            ),
+            {"workspace": store.workspace_id},
+        )
+
+    assert store.generation > settled
+
+
+async def test_a_record_committed_beside_a_corpus_write_does_not_hide_it(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """One statement the counter cannot vouch for is enough to count the whole transaction."""
+    chunks = await _live(store)
+    settled = store.generation
+
+    async with session_factory(engine).begin() as session:
+        session.add(models.QueryLog(id="q1", workspace_id=store.workspace_id, query="auth"))
+        await session.execute(
+            update(models.Chunk).where(models.Chunk.id == chunks[0].id).values(text="rewritten")
+        )
+
+    assert store.generation > settled
+
+
+async def test_a_rolled_back_write_neither_counts_nor_lingers(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """The mark belongs to one transaction and is cleared when that transaction ends.
+
+    Rolled back, the corpus is as it was, so nothing needs invalidating. And a mark left behind
+    would make the *next* commit on the same pooled connection count — a query-log row
+    invalidating the cache because of a write that never happened.
+    """
+    chunks = await _live(store)
+    settled = store.generation
+
+    async with engine.connect() as connection:
+        await connection.execute(
+            update(models.Chunk).where(models.Chunk.id == chunks[0].id).values(text="rewritten")
+        )
+        await connection.rollback()
+        await connection.execute(
+            insert(models.QueryLog).values(id="q1", workspace_id=store.workspace_id, query="a")
+        )
+        await connection.commit()
+
+    assert store.generation == settled
+
+
+async def test_changing_a_collection_s_membership_moves_the_counter(store: SqliteDocStore) -> None:
+    """Membership decides what a collection-scoped query may return.
+
+    The key already changes when it does, because it is computed from the membership resolved
+    to document ids. The counter moves as well, which is what keeps that true for a reader of
+    membership that is ever added somewhere other than the retriever's own resolution.
+    """
+    chunks = await _live(store)
+    collection = await store.create_collection("handbook")
+    settled = store.generation
+
+    await store.add_to_collection(collection.id, [chunks[0].document_id])
+
+    assert store.generation > settled
+
+
+async def test_no_trigger_fires_on_a_table_whose_writes_do_not_count(engine: AsyncEngine) -> None:
+    """A trigger is a write the statement that fired it does not name.
+
+    The counter classifies an insert into the query log by its target. A trigger on the query
+    log that also wrote to ``chunks`` would be a corpus write that never counted — so the
+    exemption holds only while there are none, and this is where adding one fails.
+    """
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            text("SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger'")
+        )
+        triggers = {(name, table) for name, table in rows}
+
+    assert {(name, table) for name, table in triggers if table in NON_CORPUS_TABLES} == set()
+    assert triggers, "the schema has triggers elsewhere; a query returning none proves nothing"
+
+
+async def test_a_cascade_starting_at_an_exempt_table_ends_at_one(engine: AsyncEngine) -> None:
+    """A foreign-key action is the other write a statement does not name.
+
+    Deleting a person cascades into their memberships, sessions and keys, and deleting a query
+    log nulls the turns that pointed at it. Each is exempt, so each cascade is too. A cascade
+    from an exempt table into one that is not would be a corpus write under an exempt statement.
+    """
+    async with engine.connect() as connection:
+        tables = [
+            name
+            for (name,) in await connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type = 'table'")
+            )
+        ]
+        reached: set[tuple[str, str]] = set()
+        for child in tables:
+            keys = await connection.execute(text(f"PRAGMA foreign_key_list('{child}')"))
+            for key in keys.mappings():
+                acts = {key["on_delete"], key["on_update"]} - {"NO ACTION", "RESTRICT"}
+                if key["table"] in NON_CORPUS_TABLES and acts:
+                    reached.add((str(key["table"]), child))
+
+    assert reached, "there are cascades out of exempt tables; finding none would prove nothing"
+    assert {(parent, child) for parent, child in reached if child not in NON_CORPUS_TABLES} == set()
 
 
 def test_the_key_separates_two_pipelines(store: SqliteDocStore) -> None:
