@@ -1322,7 +1322,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | conversations | `GET`/`POST /api/v1/conversations`, `GET /api/v1/conversations/{id}/messages`, `PATCH`/`DELETE /api/v1/conversations/{id}`, `POST`/`DELETE /api/v1/conversations/{id}/share`, `GET /shared/{token}` |
 | collections | `GET`/`POST /api/v1/collections`, `PATCH`/`DELETE /api/v1/collections/{id}`, `POST /api/v1/collections/{id}/name`, `GET`/`PUT`/`DELETE /api/v1/collections/{id}/rule`, `GET /api/v1/collections/{id}/counts`, `GET /api/v1/collections/{id}/documents`, `POST`/`DELETE /api/v1/collections/{id}/documents/{docId}` |
 | tags | `GET`/`POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`, `POST`/`DELETE /api/v1/documents/{docId}/tags/{tagId}` |
-| admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
+| admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/alerts`, `POST /api/v1/admin/alerts/{id}/acknowledge`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
 | plugins | `GET /api/v1/plugins`, `GET /api/v1/plugins/search`, `POST`/`DELETE /api/v1/plugins/{name}` |
 | auth | `GET /auth/providers`, `GET /auth/session`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}` |
 | workbench | `GET /api/v1/workbench?document_id=…` |
@@ -1354,7 +1354,28 @@ the page sends. On the websocket, where a browser cannot set headers, it travels
 subprotocol back.
 
 Roles are a floor: `viewer` reads, `member` writes, `admin` administers. A route asks for the
-least it needs.
+least it needs — **with one deliberate exception.** `GET`/`POST /api/v1/auth/keys` and
+`DELETE /api/v1/auth/keys/{nameOrId}` ask only for a viewer floor, because *who may mint, see or
+revoke what key* is not a role question the route can answer on its own: it is decided by
+`ApplicationService.api_key_create/list/revoke` against `manicule.app.caller.current()`. The
+local operator and an administrator may mint any role, and the key they mint is unowned
+(`user_id` null) — provisioned for the installation rather than tied to one person. Any other
+caller must have a `user_id` (a key with none may not mint at all), may request a role no higher
+than their own, and the new key is owned by them. Listing and revoking follow the same split: an
+admin or the local operator sees and may revoke every key in the workspace; anyone else sees and
+may revoke only keys they own, and revoking somebody else's key by id fails exactly as an
+unknown id would — the same non-disclosure `Keys.verify` already practices for a bad secret.
+
+A key additionally carries `allowed_ips` (CIDR ranges it may be presented from; empty means
+anywhere) and `rate_limit` (its own requests-per-minute ceiling, replacing
+`security.rate_limit.per_minute` — see §9.10). Both are validated by the service at mint time —
+a malformed CIDR is refused by name, on the same `ip_network(..., strict=False)` rule
+`security.transport.trusted_proxies` uses, and `rate_limit` must be at least 1. A key owned by a
+person resolves only while that person's membership in this workspace exists and is not
+disabled, and its *effective* role is `min(key's own role, owner's current membership role)` —
+so demoting or removing the owner demotes or disables their keys without a second write to any
+of them. `ApiKeySummary` reports `user_id`, `allowed_ips` and `rate_limit` alongside the fields
+it always has; it never reports a secret.
 
 **A refusal names the same operation a success would.** A refused request never reaches its
 service call, so `op` comes from the matched route — and every route therefore carries an
@@ -1560,6 +1581,24 @@ The two writes this surface makes are treated **differently on purpose**:
 - **A failed audit write fails the operation it was auditing.** A trail with holes in it is
   worse than none, because the holes are invisible and the operation reported success.
 
+**Every row names who did it and from where.** `identify`, the MCP mount guard and the
+websocket handshake each resolve a principal and then run the rest of the request inside
+`with acting_as(principal.caller):` — the one context manager `manicule.app.caller` provides —
+so `_audit` reads the acting caller's key id (or signed-in person, or `"anonymous"`) and address
+off `manicule.app.caller.current()` rather than recording neither. Nothing that reaches the
+service outside those three entry points calls it: the command line and stdio MCP never call
+`acting_as` at all, so `current()`'s own default — the local operator — is what a row from
+either of those records, as `"local"` with no address.
+
+Audited events now cover, beyond key minting and share links: `auth.failed` (a presented
+credential that did not authenticate — the header it arrived in, `bearer` or `x-api-key`, and
+never its value), `config.changed` (the dotted key only, never the value — a value can be a
+credential even when the name is not one `secret_setting` recognizes), `workspace.switched`,
+`collection.created`/`collection.deleted`, `plugin.added`/`plugin.removed`,
+`document.accessed` (see §9.11 — the same instrumentation point as `export_volume`),
+`security.alert` and `security.alert_acknowledged`. `api_key.created` now carries the owner,
+`allowed_ips` and `rate_limit` alongside the id, name and role it always has.
+
 ### 9.9 Search quality
 
 `GET /api/v1/admin/search-quality` **reports**; it does not measure. `manicule.evaluation` is
@@ -1570,6 +1609,76 @@ reads that harness's own store and renders its own report.
 `available: false` means nobody has judged any pairs — which is the truth, and is not a score
 of zero. `is_evidence: false` means the query set behind the numbers is an **example** one, and
 the harness's caveat travels with it. See [`evaluation.md`](evaluation.md).
+
+### 9.10 Rate limiting and 429s
+
+`security.rate_limit` (`manicule.app.throttle`) is an in-process token bucket in front of every
+network surface — HTTP, the MCP mount, and the websocket handshake. Two buckets, both bounded to
+`max_tracked` distinct entries with the least-recently-touched evicted first:
+
+- **A caller bucket**, keyed `key:<id>` for a presented API key, `user:<id>` for a signed-in
+  person with no key, else `addr:<address>`. Refilled at `per_minute` tokens per minute, holding
+  at most `burst` at once. A key's own `rate_limit` (§9.2) replaces **both** numbers for that
+  key's bucket alone — capacity equal to the rate, so a key capped at, say, 5 requests per minute
+  cannot still burst up to the installation's default just because its bucket happened to be
+  full from disuse.
+- **A failed-authentication bucket per address**, refilled at `failed_auth_per_minute` — its own
+  rate is also its capacity, for the same reason. It is consulted **before** a presented
+  credential is checked at all: an address that has already exhausted it is refused without this
+  process hashing and looking up whatever it sent. It is charged only when a presented credential
+  turns out not to work, never for a request with no credential and never for one that succeeds.
+  **A correct key from an address that has exhausted this bucket is still refused** — brute force
+  from an address stops that address, including on the one guess that would have been the real
+  key, or the whole protection is defeated by the first correct attempt an attacker makes.
+
+`identify` runs both checks ahead of routing, so a request bound for the MCP mount is metered by
+the identical bucket an ordinary route would spend — the mount's own guard does not charge a
+second time, which would meter it more strictly than everything else for no reason anyone
+configured. The websocket has no `identify` to run inside (an HTTP middleware never sees a
+websocket scope), so its handshake repeats both checks itself, once, before `accept`; the charge
+covers the whole connection rather than each message on it, because metering every message at
+the same per-minute rate an HTTP client spends one request at a time would let one long-lived
+socket ask far more of the corpus than an HTTP caller ever could for the same charge.
+
+`/healthz` and `/readyz` are exempt from both buckets: a process supervisor polls them on a fixed
+schedule that has nothing to do with load, and the point of a liveness probe is that it cannot be
+made to fail by load.
+
+A refusal is `RateLimitedError`, mapped to **429** with a `Retry-After` header (whole seconds,
+rounded up) — the ordinary envelope over HTTP and the MCP mount, and the browser surface's HTML
+refusal page for a `/ui` request. `security.rate_limit.enabled = false` turns both buckets off;
+every method then reports every request admitted.
+
+### 9.11 Security alerts
+
+`security.alerts` (`manicule.app.alerts`) detects four patterns over sliding windows of
+`window_s` seconds, each firing at most once per window per subject:
+
+| Kind | Trigger | Subject |
+|---|---|---|
+| `brute_force` | `failed_auth_threshold` failed authentications from one address | the address |
+| `key_abuse` | `key_address_threshold` distinct addresses presenting one key, **or** `failed_auth_threshold` rate-limit refusals of one key | the key id |
+| `export_volume` | `export_document_threshold` distinct documents whose content one caller reads | the actor |
+
+"Content" means `document_get` with `chunks=true` and `document_resolve` with `content=true` —
+the two operations that hand back a document's stored text or bytes rather than a title, a
+status, or a ranked passage. Search hits are deliberately not counted: a search result is a short
+passage ranked for relevance, which is the corpus's core function rather than an export, and
+counting it here would flag ordinary use and scale with how often somebody searches rather than
+with how much of the corpus they have read. The local operator is not monitored for export
+volume — they already hold every authority the command line gives them, including `export`, so
+there is no boundary here for an alert to be evidence of crossing — but `document.accessed` is
+still audited for every caller, local included (§9.8).
+
+An alert is persisted to the workspace's `security_alerts` (`docs/storage.md`), logged at
+`WARNING` with no document text or credential, and audited as `security.alert` — all three
+**independently of `security.audit.enabled`**: the row and the log are the alert, and only the
+extra `audit_logs` entry follows that switch. `GET /api/v1/admin/alerts` lists them
+(`?unacknowledged_only=true` to filter), `POST /api/v1/admin/alerts/{id}/acknowledge` clears one
+and audits `security.alert_acknowledged` naming who. `manicule doctor` reports a `degraded`
+`security_alerts` check while any are unacknowledged, naming the count and
+`manicule auth alerts` / `manicule auth ack-alert <id>`. `security.alerts.enabled = false` turns
+detection off; nothing is persisted or logged. Not exposed over MCP.
 
 ---
 

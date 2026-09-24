@@ -241,13 +241,13 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **41 relational tables**. The 29 outside the durable
+The authoritative SQLAlchemy model has **44 relational tables**. The 32 outside the durable
 re-embedding snapshot set are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
-`acquisition_markers`, `chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
+`acquisition_markers`, `auth_sessions`, `chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
 `conversations`, `document_tags`, `document_versions`, `documents`, `glossary_aliases`,
 `glossary_entries`, `index_state`, `messages`, `plugins`, `query_logs`, `reconciliation_candidates`,
-`reconciliation_inventory_items`, `reconciliation_runs`, `source_dependencies`, `tags`,
-`vector_tombstones`, `workspace_members` and `workspaces`. Seven more make a re-embedding run
+`reconciliation_inventory_items`, `reconciliation_runs`, `security_alerts`, `source_dependencies`, `tags`,
+`users`, `vector_tombstones`, `workspace_members` and `workspaces`. Seven more make a re-embedding run
 durable without changing live reads until publication: `corpus_revision`,
 `reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
 `reembed_runs`, `reembed_shadow_generations` and `reembed_publication_receipts`.
@@ -259,7 +259,7 @@ Two content-addressed acquisition ledgers keep exact global backlog admission co
 `acquisition_blob_backlog` stores unfinished-record refcounts by hash, and
 `acquisition_backlog_capacity` stores their deduplicated byte total.
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 41.
+included in the 44.
 
 ### 4.1 The pre-#187 additions
 
@@ -678,7 +678,7 @@ floats**, enforced at construction. A float's text form depends on how it was co
 setting arriving by two routes yields two different table names and a spurious refusal.
 Anything fractional is carried as a string.
 
-### 4.7 The other twelve, and what changed
+### 4.7 The other fifteen, and what changed
 
 | Table | Kept as-is | Changed, and why |
 |---|---|---|
@@ -694,7 +694,8 @@ Anything fractional is carried as a string.
 | `messages` | `role`, `content`, `sources JSON`, `confidence_score`, `response_time_ms` | `role` gets a `CHECK`. **`sources` embeds `Anchor`s**, so it inherits the ⚠️ lock from `contracts.md` §1 — a stored conversation's citations must keep resolving. Index `(conversation_id, created_at)` |
 | `query_logs` | everything | `workspace_id` keeps `ON DELETE CASCADE`. Query text is user content scoped to a workspace; retaining it past workspace deletion is a data-retention problem, not a feature. [#15](https://github.com/mgd43b/manicule/issues/15) exports what it needs rather than treating live rows as an archive |
 | `audit_logs` | everything, **including no foreign key** | Deliberate and now documented: `workspace_id` and `user_id` are plain `TEXT`. An audit log that cascades away when the thing it audits is deleted is not an audit log. Index `(workspace_id, created_at)` added alongside `(event_type, created_at)` |
-| `api_keys` | `key_hash UNIQUE`, `key_prefix`, `scopes`, `rate_limit`, `expires_at`, `last_used_at`, `revoked_at`, `allowed_ips` | `idx_api_keys_hash` **dropped** — `UNIQUE` already creates that index, so it was a second copy of the same B-tree maintained on every write |
+| `api_keys` | `key_hash UNIQUE`, `key_prefix`, `expires_at`, `last_used_at`, `revoked_at` | `idx_api_keys_hash` **dropped** — `UNIQUE` already creates that index, so it was a second copy of the same B-tree maintained on every write. **`scopes` removed** — nothing ever read it, and an unread column is coverage that cannot fail. **Added:** `user_id` (nullable FK `users`, `ON DELETE CASCADE`; `NULL` means minted on behalf of the installation by an administrator or the local operator), `allowed_ips JSON` (CIDR ranges the key may be presented from; empty means anywhere — checked in `_Keys.verify`, not in SQL, because SQLite has no CIDR containment operator), and `rate_limit` (requests per minute, `CHECK (rate_limit IS NULL OR rate_limit > 0)`, replacing `security.rate_limit.per_minute` for this key alone — enforced by `manicule.app.throttle`, `docs/surfaces.md` §9.10). An owned key's effective role is `min(key.role, owner's current WorkspaceMember.role)`, read with a `LEFT JOIN` in the same statement as every other `verify` predicate rather than a branch after it |
+| `security_alerts` | — (new table) | `id` PK, `workspace_id`, `kind` (`CHECK` — `brute_force`/`key_abuse`/`export_volume`), `subject`, `details JSON`, `created_at`, `acknowledged_at`, `acknowledged_by`. No foreign keys, on `audit_logs`' own reasoning: an alert about a key or an address must outlive the row it names. Index `(workspace_id, created_at)`. Written by `manicule.app.alerts.AlertMonitor` through `ApplicationService.record_security_alert`, independently of whether `security.audit.enabled` is set — see `docs/surfaces.md` §9.11 |
 | `plugins` | `name` PK, `type`, `version`, `config JSON`, `status` | **`permissions` column removed**, per `contracts.md` §5. And this table becomes the actual plugin registry rather than a JSON file beside the database, so plugin state is inside the same transactional and backup boundary as everything else |
 
 > **Prior art.** The `plugins` table is created by `001_initial.sql` and never read or

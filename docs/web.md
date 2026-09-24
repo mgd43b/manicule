@@ -111,7 +111,7 @@ the failure the page shows — same type, same message, same hint.
 | plugins | `/ui/plugins` | `plugin_list`, `plugin_health` | admin |
 | settings | `/ui/settings` | `doctor`, `index_status` | admin |
 | workspaces | `/ui/workspaces` | `workspace_list` | viewer |
-| admin | `/ui/admin` | `index_status`, `search_quality`, `query_logs`, `audit_log`, `plugin_health`, `connector_list` | admin |
+| admin | `/ui/admin` | `index_status`, `search_quality`, `query_logs`, `audit_log`, `security_alerts`, `plugin_health`, `connector_list` | admin |
 | auth | `/ui/auth` | `api_key_list`, `auth_providers` | admin |
 | layout | — | — | — |
 
@@ -195,6 +195,11 @@ the three arriving on its own.
 manicule is **single-user oriented** until it is feature complete, and this surface reflects
 that: no user management, no roles UI, no invitations, no login screens. The auth area is one
 person looking at their own API keys and at what this installation currently demands of a caller.
+The key table now shows an owner, allowed IPs and a rate limit per key — API-key ownership
+(`docs/surfaces.md` §9.2) is a service-layer property independent of this page, and the page
+renders it for whoever this admin-floor route already admits, which is still the local operator
+or an administrator rather than a signed-in person choosing between their own keys and somebody
+else's.
 
 Workspaces are **not** multi-user — one person with several corpora. Workspace scoping is a
 correctness property and is enforced on every read: as a predicate in the store, and as identity

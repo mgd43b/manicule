@@ -390,12 +390,23 @@ API keys (prefixed, SHA-256 hashed, scoped, expiring) · roles admin/member/view
 rate limiting · OAuth SSO (Google, GitHub) · workspace isolation enforced on every query ·
 audit log · security alerts · PII redaction. **Carries over.**
 
+**Built:** API keys now carry an owner, `allowed_ips` and a per-key `rate_limit`, capped and
+scoped by the caller's own role and membership (`docs/surfaces.md` §9.2); in-process rate
+limiting over every network surface (§9.10); sliding-window security alerts for brute force, key
+sharing and export volume (§9.11); and audit coverage broadened to authentication failures,
+configuration changes, workspace switches, collection and plugin changes, content reads and the
+alerts themselves (§9.8) — the caller context (key id, signed-in person, address) is now wired
+onto every network surface, so `_audit` has an actor and an address to record instead of neither.
+PII redaction (`security.data_policy.auto_redact`) predates this slice and is unrelated to it.
+**Still open:** OAuth SSO, sessions, and per-query workspace isolation across more than one
+tenant — team mode's identity half.
+
 | | Choice |
 |---|---|
 | OAuth | **authlib** |
 | Sessions | **itsdangerous** signed cookies, HttpOnly, SameSite=Strict |
 | API keys | stdlib `secrets` + `hashlib` |
-| Rate limiting | in-process token bucket |
+| Rate limiting | in-process token bucket — **built**, `manicule.app.throttle` |
 
 Worth keeping from OpenDocuments: its trusted-proxy handling is genuinely good — proper
 CIDR allowlists, no naive `X-Forwarded-For` trust. Port that logic, not the defaults.
