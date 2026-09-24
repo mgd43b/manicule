@@ -88,6 +88,12 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   five passages. Bounded before it starts: `research.max_cycles` rounds of at most
   `research.max_sub_questions` searches, inside `research.timeout_s`.
 - `--workspace/-w` — run one command in another workspace, without editing configuration.
+- `search --workspaces a,b` — an administrator's search spanning named workspaces: one scoped
+  search per workspace, merged into one ranking by cosine similarity, every hit naming the
+  workspace it came from. Not `-w`, which runs a command *in* one other workspace; this searches
+  several *from* this one, and includes this one only if it is named. Bounded by
+  `rag.cross_workspace_limit`, and refused whole — never narrowed — for a workspace that is
+  unknown, unindexed or embedded by a different model.
 - `index --stats` — counts grouped by source, media type and status.
 - `index --source` — the source name documents are recorded under. It is part of their
   identity, so it is a decision rather than a constant.
@@ -130,7 +136,9 @@ network by construction, and a socket has to replace that property rather than a
 authoring is the one exception, bounded by configuration and gated by a **member floor** rather
 than by authentication itself. A viewer key does not clear that floor. An anonymous caller on an
 installation with `security.auth.mode = none` does, because that mode resolves them to an
-administrator — which is what `--no-authentication` on a network bind hands out.
+administrator — which is what `--no-authentication` on a network bind hands out. `search` takes
+`workspaces` for an administrator's search spanning several workspaces, and over a socket that one
+argument raises its floor to **admin**, the floor `GET /api/v1/search?workspaces=…` asks for too.
 
 - [x] `ask`
 - [x] `collection_add`
@@ -394,6 +402,9 @@ is a feature list entry, not a feature.
   exists as a setting because the right value depends on corpus size rather than on manicule.
 - `rag.chunker`, `rag.pipeline`, `rag.reranker` — a retrieval pipeline is a declared list of
   stages, so two pipelines can be compared by configuration rather than by editing code.
+- `rag.cross_workspace_limit` — the most workspaces one administrator's search may span (8 by
+  default, 2 to 64). Each is its own scoped search, so this bounds the work one request can ask
+  for.
 - `rag.glossary.*` — glossary-aware acronym retrieval: whether ingest reads definitions out of
   documents, whether a query naming one is expanded, how confident an entry has to be before a
   query acts on it, and which extra words to treat as ordinary English. There is deliberately no

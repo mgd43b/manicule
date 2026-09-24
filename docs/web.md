@@ -104,7 +104,7 @@ the failure the page shows — same type, same message, same hint.
 |---|---|---|---|
 | dashboard | `/ui` | `stats`, `doctor`, `workspace_list` | viewer |
 | chat | `/ui/chat`, `/ui/chat/{id}` | `conversation_list`, `conversation_messages` | viewer |
-| documents | `/ui/documents`, `/ui/documents/{id}`, `/ui/documents/trash`, `/ui/search` | `document_list`, `workbench`, `document_trash`, `search` | viewer |
+| documents | `/ui/documents`, `/ui/documents/{id}`, `/ui/documents/trash`, `/ui/search` | `document_list`, `workbench`, `document_trash`, `search`, `workspace_list` | viewer; admin to search other workspaces |
 | collections | `/ui/collections` | `collection_list`, `tag_list` | viewer |
 | connectors | `/ui/connectors` | `connector_list` | admin |
 | health | `/ui/health` | `doctor` | viewer |
@@ -125,6 +125,15 @@ inside, and `tests/web/test_pages.py` asserts that by checking every page templa
 listing is a viewer's and whose *health* is an admin's — the page takes the higher one rather
 than rendering a different page per role. A template with a role branch in it is a policy
 decision in a template.
+
+**The search page's floor follows its arguments, as its route's does.** `GET /api/v1/search` is
+a viewer's until it is given workspaces other than its own, and then it is an administrator's
+([`surfaces.md`](surfaces.md) §7); `/ui/search` asks the same question the same way, and a
+hand-made URL from a reader below admin is refused as a page. The workspace picker is offered
+only to an administrator — the handler reads `workspace_list` for one and hands the template an
+empty list for anyone else, so the template renders what it is given and carries no role branch.
+Each hit of a spanning search carries a workspace label, and a passage from another workspace is
+named rather than linked, because this workspace's document page cannot open it.
 
 **Every page is a `GET`.** Mutations go from the browser to the JSON API routes that already
 exist, with a JSON content type. The browser surface introduces no write path of its own, which

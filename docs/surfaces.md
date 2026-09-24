@@ -267,7 +267,7 @@ server and the built command tree.
 |---|---|---|---|
 | `ask` | ✓ | `ask` | answer, citations, confidence |
 | `research` | ✓ | `research` | report, citations, the searches it ran |
-| `search` | ✓ | `search` | ranked passages |
+| `search` | ✓ | `search` | ranked passages — across several workspaces, for an administrator, with `workspaces` |
 | `index_path` | ✓ | `index <path>` | run counters |
 | `index_changes` | — | `index --watch` | run counters |
 | `index_status` | ✓ | `index` | counts, fingerprints, and whether vector search is still exhaustive |
@@ -552,8 +552,9 @@ support even when `hits[]` contains fluent-looking text; `medium` and `high` sti
 the passages. `confidence_reason` is the human explanation and may be reworded, so clients branch
 on the band and the fields below rather than parsing it.
 
-For `search`, a client verifies `collections[]` before using the result and treats
-`truncated: true` as a partial result: ranked candidates were dropped to fit the context budget.
+For `search`, a client verifies `collections[]` — and `workspaces[]`, when it asked for
+several — before using the result and treats `truncated: true` as a partial result: ranked
+candidates were dropped to fit the context budget.
 For `ask`, four fields distinguish states that an empty citation list cannot:
 
 - `corpus_consulted: false` — retrieval did not run, which is not evidence of absence.
@@ -639,11 +640,27 @@ unattended surface at all is that all of it is bounded before the run starts —
 
 `expansions[]`, `conflicts[]`, `explicit_definition`, `query`, `profile`, `count`, `hits[]`,
 `confidence`, `confidence_band`, `confidence_reason`, `expanded_query`, `route`, `cached`,
-`truncated`, `elapsed_ms`, `collections[]`.
+`truncated`, `elapsed_ms`, `collections[]`, `workspaces[]`.
 
-Each hit carries the passage, its document, its anchor, its effective `score` **and** `scores`
-— the score every pipeline stage gave it. The per-stage history is kept because "reranking
-helped" is only checkable while the pre-rerank score survives.
+Each hit carries the passage, its document, its anchor, the `workspace` it came from, its
+effective `score` **and** `scores` — the score every pipeline stage gave it. The per-stage
+history is kept because "reranking helped" is only checkable while the pre-rerank score survives.
+
+**`workspaces` is the one argument that reaches past this workspace**, and it is an
+administrator's. Every surface takes it — `GET /api/v1/search?workspaces=a&workspaces=b`, the
+`search` tool's `workspaces` list, `manicule search QUERY --workspaces a,b`, and the search page's
+workspace picker — and every surface hands it to the one service method that owns the rule
+(§7). Naming none, or only the serving workspace, is the ordinary search on the ordinary path;
+naming others merges one scoped search per named workspace into one ranking by cosine
+([`retrieval.md`](retrieval.md) §3.2), with every hit's `workspace` saying where it came from
+and `workspaces[]` echoing what ran. The serving workspace is searched only when it is named.
+A spanning search consults no glossary, so `expansions[]` and `conflicts[]` are empty and
+`expanded_query` is blank, and its route is always `retrieve`. `ask` and `research` take no
+such argument: spanning tenants in an answer is a disclosure decision nobody has made.
+
+`--workspaces` is not `--workspace`/`-w`: the global option runs a whole command *in* one other
+workspace, and this one searches several *from* this one. The help text says so where both are
+listed.
 
 ### `document_resolve` → `DocumentResolved`
 
@@ -1143,7 +1160,9 @@ mode and no flag.
 
 **And the exception is not conditional on authentication.** `security.auth.mode` decides *who
 may call* `document_create` — `manicule.mcp.server.require_network_member` enforces a member
-floor — and never whether the socket carries it. Those were briefly one question, and the answer
+floor — and never whether the socket carries it. `search` has a floor of its own for one
+argument: asked to span workspaces, it asks `require_network_admin` for the admin floor
+`GET /api/v1/search` asks for, since the mount's guard admits a viewer (§7). Those were briefly one question, and the answer
 made the deployment authoring exists for impossible: manicule serving a memory corpus to
 assistants on machines running no manicule of their own, which could search it and not write to
 it. A read-only network surface makes that deployment pointless, which is the sentence this
@@ -1256,7 +1275,9 @@ covers each of the three modes by name.
 ## 7. Tenancy
 
 Everything is scoped to one workspace, and the scope is enforced twice by two mechanisms that
-cannot fail the same way.
+cannot fail the same way. The one exception — an administrator's search spanning named
+workspaces — is enforced the same two ways, once per workspace, and is described at the end of
+this section.
 
 **In the store**, as a predicate: the handle carries the workspace and no method takes one
 (`manicule.storage.scoped`). This is where isolation is enforced.
@@ -1285,6 +1306,27 @@ and be useless.
 `tests/web/test_tenancy.py` does it a third time, through the pages and against the same broken
 stores, asserting on the **rendered HTML** — because a page is where a leak would actually be
 read, and a title that never reached a payload could still reach a heading or a link.
+
+**A search spanning workspaces is the deliberate exception, and it widens nothing else.** It is
+`search` with `workspaces` (§5), and three things hold it:
+
+- **Who.** The service refuses it to any caller short of the admin role, which makes it a rule
+  on every surface at once. The HTTP route, the network MCP tool and the search page also ask
+  for the admin floor, through the service's own `crosses_workspaces` so the two cannot disagree
+  about which requests span — which puts the refusal in each surface's ordinary 403 before a
+  workspace is opened. Over stdio and at the command line the caller is the operator at this
+  machine, who holds every authority the process has.
+- **How many.** `rag.cross_workspace_limit` bounds the workspaces one request may name (8 by
+  default, 2 to 64), because each is its own scoped search.
+- **Every hit, in its own workspace.** Each workspace is searched through its own scoped store,
+  with the dense leg's join inside it, and each hit's identity is then checked by the arithmetic
+  above against the workspace whose search returned it. A hit claimed by no workspace or by two
+  is refused whole, exactly as a foreign document is on one workspace.
+  `tests/app/test_cross_workspace.py` drives this against the same deliberately broken stores.
+
+It is recorded once, in the serving workspace's query log — where it ran, by whoever ran it —
+and audited as `search.cross_workspace` with the workspaces it spanned and its hit count, never
+its text.
 
 ---
 
@@ -1354,7 +1396,8 @@ the page sends. On the websocket, where a browser cannot set headers, it travels
 subprotocol back.
 
 Roles are a floor: `viewer` reads, `member` writes, `admin` administers. A route asks for the
-least it needs.
+least it needs — and one asks for more when an argument asks for more: `GET /api/v1/search` is a
+viewer's until it is given workspaces other than its own, when it is an administrator's (§7).
 
 **A refusal names the same operation a success would.** A refused request never reaches its
 service call, so `op` comes from the matched route — and every route therefore carries an

@@ -426,7 +426,7 @@ the sections above.
 | **Hardware detection** | CPU and RAM probing to recommend a model during `init` | Keep, and extend — detect Apple Silicon and unified memory to pick the embedding backend |
 | **Plugin compatibility** | `checkCompatibility` against a declared `coreVersion` | Keep. Version mismatch is a loud error, not a runtime surprise |
 | **Community registry** | GitHub-hosted list of community plugins, browsable and installable | Keep. Decide whether install stays admin-only — in OpenDocuments it shells out to a package manager |
-| **Cross-workspace search** | Admin-only search spanning workspaces | Keep, gated on team mode |
+| **Cross-workspace search** | Admin-only search spanning workspaces | **Built** (#13): admin-only, bounded by `rag.cross_workspace_limit`, N scoped searches merged on cosine — `docs/retrieval.md` §3.2 |
 
 ### HTTP surface is larger than "11 route groups"
 
