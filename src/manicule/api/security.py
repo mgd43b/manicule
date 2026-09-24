@@ -151,6 +151,7 @@ class Principal:
             key_id=identity.key_id or None,
             user_id=identity.user_id or None,
             address=self.address,
+            rate_limit=identity.rate_limit,
         )
 
 
@@ -185,7 +186,9 @@ def beneath_mcp(path: str) -> bool:
     return path == MCP or path.startswith(f"{MCP}/")
 
 
-async def identify(service: ApplicationService, request: Request | WebSocket) -> Identity:
+async def identify(
+    service: ApplicationService, request: Request | WebSocket, *, address: str = ""
+) -> Identity:
     """Who this request is, from a header credential or — for a browser — a session cookie.
 
     The order is the rule. A header credential is always the answer when one is presented, so
@@ -193,6 +196,11 @@ async def identify(service: ApplicationService, request: Request | WebSocket) ->
     under ``oauth``, and outside the MCP mount is the cookie consulted, and its signature is
     checked before the service is asked anything: a forged or expired cookie is refused for the
     cost of a hash.
+
+    ``address`` is the client address the proxy policy resolved, handed to
+    :meth:`~manicule.app.service.ApplicationService.authenticate` so a key limited to
+    ``allowed_ips`` is refused from anywhere else. Empty means none could be established, and
+    such a key is then refused rather than trusted.
     """
     if isinstance(request, WebSocket):
         header, _ = websocket_token(request)
@@ -208,7 +216,7 @@ async def identify(service: ApplicationService, request: Request | WebSocket) ->
         return await service.authenticate_session(
             session_token(settings, request.cookies.get(SESSION_COOKIE))
         )
-    return await service.authenticate(header)
+    return await service.authenticate(header, address=address)
 
 
 async def resolve(
@@ -222,16 +230,14 @@ async def resolve(
     refuses. :func:`identify` is what decides which credential a request is presenting.
     """
     client = request.client
-    return Principal(
-        identity=await identify(service, request),
-        address=policy.client_address(
-            peer=client.host if client is not None else None,
-            # Through the constant, not a literal. The header manicule reads is a decision
-            # `manicule.api.proxy` makes once, and a second spelling here is how a rename ends
-            # up reading a header nothing sends.
-            forwarded_for=request.headers.get(FORWARDED_FOR),
-        ),
+    address = policy.client_address(
+        peer=client.host if client is not None else None,
+        # Through the constant, not a literal. The header manicule reads is a decision
+        # `manicule.api.proxy` makes once, and a second spelling here is how a rename ends
+        # up reading a header nothing sends.
+        forwarded_for=request.headers.get(FORWARDED_FOR),
     )
+    return Principal(identity=await identify(service, request, address=address), address=address)
 
 
 def require(principal: Principal, floor: Role) -> Principal:

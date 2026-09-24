@@ -29,6 +29,7 @@ from manicule.app.ports import (
     ResetOutcome,
     RetainedBytes,
     Retrieving,
+    SecurityAlerts,
     Telemetry,
     Users,
 )
@@ -1433,18 +1434,29 @@ class FakeMaintenance:
 class FakeKeys:
     """API keys, held in memory.
 
-    ``owners`` maps a key id to the person who minted it, for the tests of a disable revoking a
-    person's keys. Absent is the operator at the command line, as ``api_keys.user_id`` is NULL.
+    A key's owner is its summary's ``user_id``; ``None`` is the operator at the command line, as
+    ``api_keys.user_id`` is NULL. ``memberships`` stands in for the real store's join against
+    :class:`~manicule.storage.models.WorkspaceMember`: a mapping from user id to that person's
+    current role, or absent for a person who is not a member here at all. ``None`` for a role
+    means "a member row exists and is disabled" — present in the map, unusable — which is a
+    state a test needs to be able to construct and that plain absence cannot represent.
     """
 
     issued: list[ApiKeySummary] = field(default_factory=list[ApiKeySummary])
     workspace: str = "default"
     secrets: dict[str, ApiKeySummary] = field(default_factory=dict[str, ApiKeySummary])
     revoked: set[str] = field(default_factory=set[str])
-    owners: dict[str, str] = field(default_factory=dict[str, str])
+    memberships: dict[str, str | None] = field(default_factory=dict[str, "str | None"])
 
     async def issue(
-        self, name: str, *, role: str, expires_days: int | None = None
+        self,
+        name: str,
+        *,
+        role: str,
+        expires_days: int | None = None,
+        user_id: str | None = None,
+        allowed_ips: Sequence[str] = (),
+        rate_limit: int | None = None,
     ) -> tuple[ApiKeySummary, str]:
         summary = ApiKeySummary(
             id=f"key-{len(self.issued)}",
@@ -1458,36 +1470,108 @@ class FakeKeys:
                 if expires_days
                 else None
             ),
+            user_id=user_id,
+            allowed_ips=tuple(allowed_ips),
+            rate_limit=rate_limit,
         )
         self.issued.append(summary)
         secret = f"mnk_secret_{summary.id}"
         self.secrets[secret] = summary
         return summary, secret
 
-    async def list_keys(self) -> Sequence[ApiKeySummary]:
-        return list(self.issued)
+    async def list_keys(self, *, owner: str | None = None) -> Sequence[ApiKeySummary]:
+        if owner is None:
+            return list(self.issued)
+        return [summary for summary in self.issued if summary.user_id == owner]
 
-    async def revoke(self, name_or_id: str) -> ApiKeySummary:
+    async def revoke(
+        self, name_or_id: str, *, restrict_to_owner: str | None = None
+    ) -> ApiKeySummary:
         for summary in self.issued:
             if name_or_id in {summary.id, summary.name}:
+                if restrict_to_owner is not None and summary.user_id != restrict_to_owner:
+                    break
                 self.revoked.add(summary.id)
                 return summary
         msg = f"no API key named {name_or_id!r} in workspace {self.workspace!r}"
         raise UnknownEntityError(msg)
 
-    async def verify(self, secret: str) -> ApiKeySummary | None:
+    async def verify(self, secret: str, *, address: str = "") -> ApiKeySummary | None:
         """Resolve a secret the same way the real store does: by lookup, then by predicate.
 
         Revoked and expired keys are refused here rather than merely absent from ``issued``,
         because "the key exists and is no longer usable" is the case a surface test has to be
-        able to construct.
+        able to construct. An owned key additionally resolves only while ``memberships`` names a
+        live role for its owner, capped at the lesser of the two roles — see ``memberships``'
+        own docstring for what a disabled membership looks like here.
         """
         summary = self.secrets.get(secret)
         if summary is None or summary.id in self.revoked:
             return None
         if summary.expires_at and datetime.fromisoformat(summary.expires_at) <= datetime.now(UTC):
             return None
-        return summary
+        if summary.allowed_ips and not _address_in(address, summary.allowed_ips):
+            return None
+        if summary.user_id is None:
+            return summary
+        member_role = self.memberships.get(summary.user_id)
+        if summary.user_id not in self.memberships or member_role is None:
+            return None
+        rank = {"viewer": 0, "member": 1, "admin": 2}
+        effective = summary.role if rank[summary.role] <= rank[member_role] else member_role
+        return summary.model_copy(update={"role": effective})
+
+
+def _address_in(address: str, allowed_ips: Sequence[str]) -> bool:
+    from ipaddress import ip_address, ip_network  # noqa: PLC0415 - only this fake needs it
+
+    if not address:
+        return False
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        return False
+    return any(parsed in ip_network(entry, strict=False) for entry in allowed_ips)
+
+
+@dataclass
+class FakeSecurityAlerts:
+    """Recorded security alerts, held in memory."""
+
+    alerts: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+
+    async def record_alert(self, kind: str, subject: str, *, details: Mapping[str, object]) -> str:
+        identifier = f"alert-{len(self.alerts)}"
+        self.alerts.append(
+            {
+                "id": identifier,
+                "kind": kind,
+                "subject": subject,
+                "details": dict(details),
+                "created_at": datetime.now(UTC).isoformat(),
+                "acknowledged_at": None,
+                "acknowledged_by": None,
+            }
+        )
+        return identifier
+
+    async def list_alerts(
+        self, *, unacknowledged_only: bool = False, limit: int = 50, offset: int = 0
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        chosen = [
+            row
+            for row in reversed(self.alerts)
+            if not unacknowledged_only or row["acknowledged_at"] is None
+        ]
+        return chosen[offset : offset + limit], len(chosen)
+
+    async def acknowledge_alert(self, alert_id: str, *, by: str) -> Mapping[str, object] | None:
+        for row in self.alerts:
+            if row["id"] == alert_id:
+                row["acknowledged_at"] = datetime.now(UTC).isoformat()
+                row["acknowledged_by"] = by
+                return row
+        return None
 
 
 @dataclass
@@ -1689,7 +1773,7 @@ class FakeUsers:
             sessions_revoked = await self.end_sessions(user_id)
             if isinstance(self.keys, FakeKeys):
                 for summary in self.keys.issued:
-                    owned = self.keys.owners.get(summary.id) == user_id
+                    owned = summary.user_id == user_id
                     if owned and summary.id not in self.keys.revoked:
                         self.keys.revoked.add(summary.id)
                         keys_revoked += 1
@@ -1760,6 +1844,7 @@ class FakeBackend:
     telemetry_: FakeTelemetry = field(default_factory=FakeTelemetry)
     keys_: FakeKeys = field(default_factory=FakeKeys)
     users_: FakeUsers = field(default_factory=FakeUsers)
+    security_alerts_: FakeSecurityAlerts = field(default_factory=FakeSecurityAlerts)
     retained_: FakeRetained = field(default_factory=FakeRetained)
     generator_: FakeGenerator = field(default_factory=FakeGenerator)
     discovery: Discovery | None = None
@@ -1807,6 +1892,9 @@ class FakeBackend:
         # a test minted there — which is the property being tested, not a convenience.
         self.users_.keys = self.keys_
         return self.users_
+
+    async def security_alerts(self) -> SecurityAlerts:
+        return self.security_alerts_
 
     async def component_checks(self) -> Sequence[Check]:
         return list(self.checks)

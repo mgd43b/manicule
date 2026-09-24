@@ -42,6 +42,36 @@
   {% if panels.audit.ok %}
   <article class="card"><h2>Audit rows</h2><p class="figure">{{ panels.audit.data.total }}</p></article>
   {% endif %}
+  {% if panels.alerts.ok %}
+  <article class="card"><h2>Open alerts</h2><p class="figure">{{ panels.alerts.data.total }}</p></article>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>Security alerts</h2>
+  <p class="muted" data-alert-status role="status" aria-live="polite"></p>
+  {% if panels.alerts.ok %}
+    {% if panels.alerts.data.alerts %}
+    <table>
+      <thead><tr><th>When</th><th>Kind</th><th>Subject</th><th>Details</th><th></th></tr></thead>
+      <tbody>
+        {% for row in panels.alerts.data.alerts %}
+        <tr>
+          <td>{{ row.created_at }}</td>
+          <td>{{ row.kind }}</td>
+          <td>{{ row.subject }}</td>
+          <td>{% for key, value in row.details | items %}<span class="pill">{{ key }}={{ value }}</span> {% endfor %}</td>
+          <td class="actions">
+            {% if not row.acknowledged_at %}
+            <button type="button" class="ghost" data-ack-alert="{{ row.id }}">Acknowledge</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}{{ m.empty('No unacknowledged alerts.') }}{% endif %}
+  {% else %}{{ m.failed(panels.alerts) }}{% endif %}
 </section>
 
 <section class="panel">

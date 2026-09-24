@@ -267,6 +267,7 @@ WRITERS: frozenset[str] = frozenset(
         "auth_enable_user",
         "auth_set_role",
         "auth_sign_out",
+        "auth_ack_alert",
         "collection_add",
         "collection_create",
         "collection_delete",

@@ -1492,6 +1492,27 @@ def render_user_signed_out(out: Console, payload: r.UserSignedOut) -> None:
     )
 
 
+def render_security_alerts(out: Console, payload: r.SecurityAlertList) -> None:
+    if not payload.alerts:
+        out.print("[dim]no alerts recorded[/dim]")
+        return
+    table = Table("when", "kind", "subject", "acknowledged", box=None, pad_edge=False)
+    for alert in payload.alerts:
+        table.add_row(
+            escape(alert.created_at),
+            escape(alert.kind),
+            escape(alert.subject),
+            escape(alert.acknowledged_by) if alert.acknowledged_by else "no",
+        )
+    out.print(table)
+
+
+def render_security_alert_acknowledged(out: Console, payload: r.SecurityAlertAcknowledged) -> None:
+    out.print(
+        f"acknowledged [bold]{escape(payload.id)}[/bold] as {escape(payload.acknowledged_by)}"
+    )
+
+
 def render_connector_signed_in(out: Console, payload: r.ConnectorSignedIn) -> None:
     """What was captured, where it went, and when it stops working. Never the session itself."""
     if payload.forgotten:
@@ -1774,6 +1795,10 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.UserList: lambda out, p: render_users(out, _as(r.UserList, p)),
     r.UserUpdated: lambda out, p: render_user_updated(out, _as(r.UserUpdated, p)),
     r.UserSignedOut: lambda out, p: render_user_signed_out(out, _as(r.UserSignedOut, p)),
+    r.SecurityAlertList: lambda out, p: render_security_alerts(out, _as(r.SecurityAlertList, p)),
+    r.SecurityAlertAcknowledged: lambda out, p: render_security_alert_acknowledged(
+        out, _as(r.SecurityAlertAcknowledged, p)
+    ),
     r.CollectionSummary: lambda out, p: render_collection(out, _as(r.CollectionSummary, p)),
     r.CollectionList: lambda out, p: render_collections(out, _as(r.CollectionList, p)),
     r.CollectionDeleted: lambda out, p: render_collection_deleted(out, _as(r.CollectionDeleted, p)),

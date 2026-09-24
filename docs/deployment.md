@@ -1065,6 +1065,34 @@ schedule, and nothing manicule ships does that for you.
 `qdrant` extra ships in it too, but an installation opts into the networked backend by one
 setting rather than having it chosen for them.
 
+### 6.6 Rate limits, security alerts and the audit trail
+
+Every served process metering itself — `security.rate_limit` — costs a handful of dictionaries
+and touches no store, so it needs no operational attention beyond the defaults being sane for
+the traffic actually expected: `per_minute` and `burst` per caller, `failed_auth_per_minute` per
+address for failed authentications, and `max_tracked` bounding memory. `docs/surfaces.md` §9.10
+is the reference; the one thing worth planning for at deployment time is that the buckets are
+**per process**, not shared across replicas — a caller spread across two served processes behind
+a load balancer gets two independent buckets, effectively doubling its ceiling. A single-process
+deployment (the only kind manicule serves today; there is no shared bucket store) does not have
+this problem.
+
+`security.alerts` writes to `security_alerts` (`docs/storage.md`) and logs at `WARNING`,
+independently of whether `security.audit` is on. An operator who wants to be notified rather than
+having to poll `manicule auth alerts` should watch the process's own log output for lines from
+the `manicule.app` logger naming `security alert`, or poll `GET /api/v1/admin/alerts` on a
+schedule. There is no push notification or webhook delivery for an alert yet — `security.audit`
+declares a `destination` of `local`, `syslog` or `webhook`, but only `local` (the `audit_logs`
+table) is wired to anything today; the other two values are accepted and currently do nothing,
+which `manicule doctor` does not yet flag.
+
+`security.audit` (`docs/surfaces.md` §9.8) is off by default, on the same reasoning as
+`telemetry` — a trail nobody asked for is a trail that has to be secured, retained and eventually
+explained to someone. Turning it on costs one row per audited event, written on the same
+connection an operation's own writes use, so a failed audit write fails the operation: plan
+capacity for the relational store accordingly if `security.audit.enabled = true` on a busy
+deployment, the same way `docs/storage.md` already asks for `query_logs`.
+
 ## 7. Still open
 
 Not settled here, and deliberately:

@@ -45,6 +45,10 @@
     </select>
     <label for="key-days">Expires in (days)</label>
     <input id="key-days" name="expires_days" type="number" min="1" max="3650" inputmode="numeric">
+    <label for="key-rate-limit">Rate limit (requests/minute)</label>
+    <input id="key-rate-limit" name="rate_limit" type="number" min="1" inputmode="numeric">
+    <label for="key-allowed-ips">Allowed IPs (comma-separated CIDRs)</label>
+    <input id="key-allowed-ips" name="allowed_ips" autocomplete="off" placeholder="anywhere">
     <button type="submit">Mint</button>
   </form>
   <p class="secret" data-secret hidden></p>
@@ -53,13 +57,16 @@
   {% if panels.api_keys.ok %}
     {% if panels.api_keys.data.keys %}
     <table>
-      <thead><tr><th>Name</th><th>Prefix</th><th>Role</th><th>Created</th><th>Expires</th><th>State</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Prefix</th><th>Role</th><th>Owner</th><th>Allowed IPs</th><th>Rate limit</th><th>Created</th><th>Expires</th><th>State</th><th></th></tr></thead>
       <tbody>
         {% for key in panels.api_keys.data.keys %}
         <tr>
           <td>{{ key.name }}</td>
           <td><code>{{ key.prefix }}</code></td>
           <td>{{ key.role }}</td>
+          <td>{{ key.user_id or 'installation' }}</td>
+          <td>{{ key.allowed_ips | join(', ') if key.allowed_ips else 'anywhere' }}</td>
+          <td>{{ key.rate_limit if key.rate_limit is not none else 'default' }}</td>
           <td>{{ key.created_at }}</td>
           <td>{{ key.expires_at or 'never' }}</td>
           <td>{{ 'revoked' if key.revoked else 'live' }}</td>

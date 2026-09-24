@@ -70,6 +70,7 @@ if TYPE_CHECKING:
         ResetOutcome,
         RetainedBytes,
         Retrieving,
+        SecurityAlerts,
         Telemetry,
         Users,
     )
@@ -584,6 +585,10 @@ class Runtime:
         """People, their memberships of this workspace, and their browser sessions."""
         return await self._once("users", self._build_users)
 
+    async def security_alerts(self) -> SecurityAlerts:
+        """Recorded security alerts for this workspace."""
+        return await self._once("security_alerts", self._build_security_alerts)
+
     async def component_checks(self) -> Sequence[Check]:
         """Health of what is already constructed. Constructs nothing.
 
@@ -940,6 +945,10 @@ class Runtime:
         # workspace's row — a membership is a foreign key to it.
         await self.documents()
         return _Users(self)
+
+    async def _build_security_alerts(self) -> SecurityAlerts:
+        await self.documents()
+        return _SecurityAlerts(self)
 
     async def blobs(self) -> BlobSink:
         """The blob capability used by runs whose resolved policy retains source bytes.
@@ -2164,6 +2173,49 @@ class _Ingestion:
         return report
 
 
+_ROLE_RANK: dict[str, int] = {"viewer": 0, "member": 1, "admin": 2}
+"""Least authority first, over the plain strings the schema stores.
+
+A second copy of :data:`manicule.app.caller.RANK` rather than an import of it: that table is
+keyed by the :class:`~manicule.config.settings.Role` enum, and this module compares role columns
+straight out of the database, where a `CHECK` constraint has already proven they are one of
+these three strings — converting to the enum and back would buy nothing but an import cycle risk
+between the composition root and the caller module it constructs callers for.
+"""
+
+
+def _capped_role(key_role: str, member_role: str) -> str:
+    """The lesser of a key's own role and its owner's current membership role."""
+    return key_role if _ROLE_RANK[key_role] <= _ROLE_RANK[member_role] else member_role
+
+
+def _address_permitted(address: str, allowed_ips: object) -> bool:
+    """Whether ``address`` falls inside one of ``allowed_ips``. Empty ``allowed_ips`` means any.
+
+    Not expressible in the SQL statement — SQLite has no CIDR containment operator — so it is
+    checked here, in Python, after the statement has already ruled out every key this address
+    could not possibly matter for. An address that fails to parse, or an empty one, matches
+    nothing: the safe direction for a predicate whose failure mode is admitting a caller.
+    """
+    from ipaddress import ip_address, ip_network  # noqa: PLC0415
+
+    if not isinstance(allowed_ips, list) or not allowed_ips:
+        return True
+    if not address:
+        return False
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        return False
+    for entry in cast("list[object]", allowed_ips):
+        try:
+            if parsed in ip_network(str(entry), strict=False):
+                return True
+        except ValueError:  # pragma: no cover - the service validates entries before storing
+            continue
+    return False
+
+
 class _Keys:
     """API keys, over one runtime's engine and workspace.
 
@@ -2176,7 +2228,14 @@ class _Keys:
         self._runtime = runtime
 
     async def issue(
-        self, name: str, *, role: str, expires_days: int | None = None
+        self,
+        name: str,
+        *,
+        role: str,
+        expires_days: int | None = None,
+        user_id: str | None = None,
+        allowed_ips: Sequence[str] = (),
+        rate_limit: int | None = None,
     ) -> tuple[ApiKeySummary, str]:
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
@@ -2192,9 +2251,10 @@ class _Keys:
             key_hash=digest,
             key_prefix=secret[: len(KEY_PREFIX) + 6],
             workspace_id=self._runtime.workspace,
-            user_id=None,
+            user_id=user_id,
             role=role,
-            allowed_ips=[],
+            allowed_ips=list(allowed_ips),
+            rate_limit=rate_limit,
             expires_at=expires,
             created_at=created,
         )
@@ -2203,20 +2263,21 @@ class _Keys:
             session.add(row)
         return _key_summary(row), secret
 
-    async def list_keys(self) -> Sequence[ApiKeySummary]:
+    async def list_keys(self, *, owner: str | None = None) -> Sequence[ApiKeySummary]:
         from sqlalchemy import select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
 
+        clauses = [models.ApiKey.workspace_id == self._runtime.workspace]
+        if owner is not None:
+            clauses.append(models.ApiKey.user_id == owner)
         sessions = session_factory(self._runtime.require_engine())
         async with sessions() as session:
             rows = (
                 (
                     await session.execute(
-                        select(models.ApiKey)
-                        .where(models.ApiKey.workspace_id == self._runtime.workspace)
-                        .order_by(models.ApiKey.created_at)
+                        select(models.ApiKey).where(*clauses).order_by(models.ApiKey.created_at)
                     )
                 )
                 .scalars()
@@ -2224,20 +2285,34 @@ class _Keys:
             )
         return [_key_summary(row) for row in rows]
 
-    async def verify(self, secret: str) -> ApiKeySummary | None:
+    async def verify(self, secret: str, *, address: str = "") -> ApiKeySummary | None:
         """Resolve a presented secret to its key, or ``None``.
 
-        Four predicates, all in the statement: the digest matches, the key belongs to **this**
-        workspace, it has not been revoked, and it has not expired. The digest is what is
-        compared — the plaintext is never stored — so there is no string comparison here to
-        time a byte at a time, and no branch that treats an unknown key differently from a
-        revoked one.
+        Every predicate that SQL can express is in the one statement: the digest matches, the
+        key belongs to **this** workspace, it has not been revoked, it has not expired, and —
+        for a key a person owns — that person's membership here exists and is not disabled. The
+        last of those is a ``LEFT JOIN`` against :class:`~manicule.storage.models.WorkspaceMember`
+        rather than a second query, so an owner who was removed or disabled fails resolution in
+        the same round trip as an expired key rather than in a branch after it.
+
+        An unowned key (``user_id IS NULL``) has no membership to check, and the ``OR`` in the
+        ``WHERE`` clause is what lets the join's absence for that row satisfy the predicate
+        trivially — it is not a special case, it is the join finding nothing to disqualify.
+
+        ``allowed_ips`` cannot be expressed in SQL — see :func:`_address_permitted` — so it is
+        the one predicate checked in Python, after the statement has already narrowed to at
+        most one row.
+
+        The digest is what is compared — the plaintext is never stored — so there is no string
+        comparison here to time a byte at a time, and no branch that treats an unknown key
+        differently from a revoked one, an expired one, or one presented from the wrong place:
+        all of them return ``None``.
 
         ``last_used_at`` is deliberately **not** updated. It would turn every authenticated
         read into a write, serializing the whole API behind SQLite's single writer, and
         "when was this key last used" is a question the audit trail answers without that cost.
         """
-        from sqlalchemy import or_, select  # noqa: PLC0415
+        from sqlalchemy import and_, or_, select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
@@ -2250,48 +2325,70 @@ class _Keys:
         sessions = session_factory(self._runtime.require_engine())
         async with sessions() as session:
             row = (
-                (
-                    await session.execute(
-                        select(models.ApiKey).where(
-                            models.ApiKey.key_hash == digest,
-                            models.ApiKey.workspace_id == self._runtime.workspace,
-                            models.ApiKey.revoked_at.is_(None),
-                            or_(
-                                models.ApiKey.expires_at.is_(None),
-                                models.ApiKey.expires_at > now,
-                            ),
-                        )
+                await session.execute(
+                    select(
+                        models.ApiKey,
+                        models.WorkspaceMember.role,
+                        models.User.email,
+                        models.User.name,
+                    )
+                    .outerjoin(
+                        models.WorkspaceMember,
+                        and_(
+                            models.WorkspaceMember.workspace_id == models.ApiKey.workspace_id,
+                            models.WorkspaceMember.user_id == models.ApiKey.user_id,
+                            models.WorkspaceMember.disabled_at.is_(None),
+                        ),
+                    )
+                    .outerjoin(models.User, models.User.id == models.ApiKey.user_id)
+                    .where(
+                        models.ApiKey.key_hash == digest,
+                        models.ApiKey.workspace_id == self._runtime.workspace,
+                        models.ApiKey.revoked_at.is_(None),
+                        or_(
+                            models.ApiKey.expires_at.is_(None),
+                            models.ApiKey.expires_at > now,
+                        ),
+                        or_(
+                            models.ApiKey.user_id.is_(None),
+                            models.WorkspaceMember.role.is_not(None),
+                        ),
                     )
                 )
-                .scalars()
-                .first()
-            )
-        return None if row is None else _key_summary(row)
+            ).first()
+        if row is None:
+            return None
+        key_row, member_role, user_email, user_name = row
+        if not _address_permitted(address, key_row.allowed_ips):
+            return None
+        effective_role = (
+            key_row.role if member_role is None else _capped_role(key_row.role, member_role)
+        )
+        return _key_summary(
+            key_row, role=effective_role, user_email=user_email, user_name=user_name
+        )
 
-    async def revoke(self, name_or_id: str) -> ApiKeySummary:
+    async def revoke(
+        self, name_or_id: str, *, restrict_to_owner: str | None = None
+    ) -> ApiKeySummary:
         from sqlalchemy import or_, select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
         from manicule.storage.types import utcnow  # noqa: PLC0415
 
+        clauses = [
+            # Scoped to this workspace, and not as a courtesy: a revoke that could reach
+            # another tenant's key is a denial-of-service across the boundary the whole design
+            # exists to hold.
+            models.ApiKey.workspace_id == self._runtime.workspace,
+            or_(models.ApiKey.id == name_or_id, models.ApiKey.name == name_or_id),
+        ]
+        if restrict_to_owner is not None:
+            clauses.append(models.ApiKey.user_id == restrict_to_owner)
         sessions = session_factory(self._runtime.require_engine())
         async with sessions.begin() as session:
-            row = (
-                (
-                    await session.execute(
-                        select(models.ApiKey).where(
-                            # Scoped to this workspace, and not as a courtesy: a revoke that
-                            # could reach another tenant's key is a denial-of-service across
-                            # the boundary the whole design exists to hold.
-                            models.ApiKey.workspace_id == self._runtime.workspace,
-                            or_(models.ApiKey.id == name_or_id, models.ApiKey.name == name_or_id),
-                        )
-                    )
-                )
-                .scalars()
-                .first()
-            )
+            row = (await session.execute(select(models.ApiKey).where(*clauses))).scalars().first()
             if row is None:
                 msg = f"no API key named {name_or_id!r} in workspace {self._runtime.workspace!r}"
                 raise UnknownEntityError(msg)
@@ -3143,6 +3240,93 @@ class _Telemetry:
         ], int(total)
 
 
+class _SecurityAlerts:
+    """Recorded alerts, over one runtime's engine and workspace.
+
+    No foreign keys, on :class:`~manicule.app.runtime._Telemetry`'s own reasoning for the audit
+    log: an alert about a key or an address must outlive the row it names.
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    async def record_alert(self, kind: str, subject: str, *, details: Mapping[str, object]) -> str:
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        identifier = secrets.token_hex(8)
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            session.add(
+                models.SecurityAlert(
+                    id=identifier,
+                    workspace_id=self._runtime.workspace,
+                    kind=kind,
+                    subject=subject,
+                    details=dict(details),
+                )
+            )
+        return identifier
+
+    async def list_alerts(
+        self, *, unacknowledged_only: bool = False, limit: int = 50, offset: int = 0
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        from sqlalchemy import func, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        clauses = [models.SecurityAlert.workspace_id == self._runtime.workspace]
+        if unacknowledged_only:
+            clauses.append(models.SecurityAlert.acknowledged_at.is_(None))
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            total = (
+                await session.execute(select(func.count(models.SecurityAlert.id)).where(*clauses))
+            ).scalar_one()
+            rows = (
+                (
+                    await session.execute(
+                        select(models.SecurityAlert)
+                        .where(*clauses)
+                        .order_by(models.SecurityAlert.created_at.desc(), models.SecurityAlert.id)
+                        .limit(max(limit, 0))
+                        .offset(max(offset, 0))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [_alert_row(row) for row in rows], int(total)
+
+    async def acknowledge_alert(self, alert_id: str, *, by: str) -> Mapping[str, object] | None:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            row = (
+                (
+                    await session.execute(
+                        select(models.SecurityAlert).where(
+                            models.SecurityAlert.id == alert_id,
+                            models.SecurityAlert.workspace_id == self._runtime.workspace,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if row is None:
+                return None
+            row.acknowledged_at = utcnow()
+            row.acknowledged_by = by
+            return _alert_row(row)
+
+
 class _Maintenance:
     """Whole-installation operations, over one runtime's engine and data directory."""
 
@@ -3975,18 +4159,42 @@ class _Maintenance:
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
 
 
-def _key_summary(row: object) -> ApiKeySummary:
-    """One key's record, without anything that could be used as one."""
+def _key_summary(
+    row: object,
+    *,
+    role: str | None = None,
+    user_email: str | None = None,
+    user_name: str | None = None,
+) -> ApiKeySummary:
+    """One key's record, without anything that could be used as one.
+
+    Args:
+        role: Overrides the stored ``role`` column. :meth:`_Keys.verify` passes the *effective*
+            role — capped by the owner's current membership — while every other caller lets the
+            key's own stored role stand: the record a listing shows is what was granted, not
+            what one particular caller's membership currently permits.
+    """
     expires = getattr(row, "expires_at", None)
+    allowed_ips: object = getattr(row, "allowed_ips", None)
+    allowed_ips_tuple: tuple[str, ...] = (
+        tuple(str(entry) for entry in cast("list[object]", allowed_ips))
+        if isinstance(allowed_ips, list)
+        else ()
+    )
     return ApiKeySummary(
         id=str(getattr(row, "id", "")),
         name=str(getattr(row, "name", "")),
         prefix=str(getattr(row, "key_prefix", "")),
-        role=str(getattr(row, "role", "")),
+        role=role if role is not None else str(getattr(row, "role", "")),
         workspace=str(getattr(row, "workspace_id", "")),
         created_at=_isoformat(getattr(row, "created_at", None)),
         expires_at=_isoformat(expires) or None,
         revoked=getattr(row, "revoked_at", None) is not None,
+        user_id=getattr(row, "user_id", None),
+        user_email=user_email,
+        user_name=user_name,
+        allowed_ips=allowed_ips_tuple,
+        rate_limit=getattr(row, "rate_limit", None),
     )
 
 
@@ -4009,6 +4217,23 @@ def _user_summary(user: object, membership: object, *, sessions: int | None = No
         last_login_at=_isoformat(getattr(user, "last_login_at", None)),
         sessions=sessions,
     )
+
+
+def _alert_row(row: object) -> Mapping[str, object]:
+    """One alert row as a plain mapping, the shape :class:`Telemetry` rows already use."""
+    details: object = getattr(row, "details", None)
+    details_dict: dict[str, object] = (
+        cast("dict[str, object]", details) if isinstance(details, dict) else {}
+    )
+    return {
+        "id": getattr(row, "id", ""),
+        "kind": getattr(row, "kind", ""),
+        "subject": getattr(row, "subject", ""),
+        "details": details_dict,
+        "created_at": _isoformat(getattr(row, "created_at", None)),
+        "acknowledged_at": _isoformat(getattr(row, "acknowledged_at", None)) or None,
+        "acknowledged_by": getattr(row, "acknowledged_by", None),
+    }
 
 
 def _isoformat(value: object) -> str:

@@ -34,6 +34,7 @@ from manicule.core.errors import (
     FingerprintMismatchError,
     ManiculeError,
     PolicyError,
+    RateLimitedError,
     StorageBusyError,
     UnknownComponentError,
     UnknownEntityError,
@@ -99,6 +100,11 @@ _HINTS: dict[type[Exception], str] = {
         "Another writer holds durable storage. Retry the same operation — durable work "
         "resumes from its last committed prefix, and a read that was refused the writer slot "
         "changed nothing."
+    ),
+    RateLimitedError: (
+        "Wait the number of seconds the message names, then retry — an HTTP response also "
+        "carries the same figure as its 'Retry-After' header. Raise security.rate_limit in "
+        "configuration if this caller legitimately needs a higher ceiling."
     ),
     RebuildRefusedError: (
         "Inspect `rebuild plan` for aggregate missing-input and capacity estimates, then retry."
@@ -274,6 +280,7 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         "workspace_list",
         "auth_list_keys",
         "auth_users",
+        "auth_alerts",
         # Reads of configuration and of what is installed. These touch no data directory at
         # all; they are named rather than left to the default because the default is "writer",
         # and a command that takes an exclusive lock to print a setting would be absurd.

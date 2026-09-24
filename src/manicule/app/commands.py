@@ -278,6 +278,8 @@ BINDERS: Mapping[str, Binder] = {
         args.text("name"),
         role=args.text("role"),
         expires_days=args.optional_count("expires_days"),
+        allowed_ips=args.texts("allowed_ips"),
+        rate_limit=args.optional_count("rate_limit"),
     ),
     # `role` is `text` rather than `optional_text` deliberately: the command line declares a
     # default of "member", so it always sends a string, and a reader that accepted nothing
@@ -291,6 +293,9 @@ BINDERS: Mapping[str, Binder] = {
         args.text("user"), args.text("role")
     ),
     "auth_sign_out": lambda service, args, report: service.user_sign_out(args.text("user")),
+    "auth_ack_alert": lambda service, args, report: service.security_alert_acknowledge(
+        args.text("alert_id")
+    ),
     "collection_add": lambda service, args, report: service.collection_add(
         args.text("collection_id"), args.texts("document_ids")
     ),

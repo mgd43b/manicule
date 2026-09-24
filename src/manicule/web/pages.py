@@ -485,6 +485,10 @@ async def admin(
                 "quality": ("search_quality", service.search_quality),
                 "queries": ("query_logs", lambda: service.query_logs(limit=limit, offset=offset)),
                 "audit": ("audit_log", lambda: service.audit_log(limit=limit, offset=offset)),
+                "alerts": (
+                    "security_alerts",
+                    lambda: service.security_alerts(unacknowledged_only=True, limit=limit),
+                ),
                 "plugins": ("plugin_health", service.plugin_health),
                 "connectors": ("connector_list", service.connector_list),
             },

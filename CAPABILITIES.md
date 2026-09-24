@@ -122,6 +122,12 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 - `connector sync --acquire-only`, `connector snapshot`, `connector verify`, and `rebuild
   plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
   connector-free derived publication with no separate settlement command.
+- `auth create-key --allow-ip <cidr>` (repeatable) and `auth create-key --rate-limit <n>` — a
+  key's own address scope and its own requests-per-minute ceiling, validated at mint time.
+  `docs/surfaces.md` §9.2.
+- `auth alerts [--all]` and `auth ack-alert <id>` — list and clear recorded security alerts.
+  `--all` includes acknowledged ones; without it, only the open ones a person still has to
+  look at. `docs/surfaces.md` §9.11.
 
 ## MCP tools — 46
 
@@ -291,6 +297,14 @@ name — an absence with no test is an absence that comes back.
   creating one. A browser session is created only by signing in through a provider, and a
   program presents a key on every request instead; `docs/surfaces.md` §9.2.1
 
+### Added, because the endpoints above could not do their job without them
+
+- `GET /api/v1/admin/alerts` and `POST /api/v1/admin/alerts/:id/acknowledge` — the security
+  alerts of `security.alerts`. Admin-only; not exposed over MCP. `docs/surfaces.md` §9.11.
+- Every request over this surface, over the MCP mount, and the websocket handshake, is now
+  metered by `security.rate_limit` — a 429 with a `Retry-After` header, not a new route.
+  `docs/surfaces.md` §9.10.
+
 ## File types — 18
 
 Ticket: #4
@@ -424,3 +438,15 @@ is a feature list entry, not a feature.
   `llm.provider`, which names the **vendor**. The two answer different questions and
   conflating them made the default configuration unrunnable: one implementation reaches every
   vendor through a `base_url`, so the component is not a function of the vendor.
+- `security.rate_limit.*` — the in-process token bucket in front of every network surface: one
+  bucket per caller (`enabled`, `per_minute`, `burst`), a separate one per address for failed
+  authentication (`failed_auth_per_minute`), and `max_tracked` bounding how many distinct
+  callers are remembered at once, least-recently-touched evicted first. A caller-side dial has
+  no home in a settings extraction that only ever saw a single-operator installation.
+  `docs/surfaces.md` §9.10.
+- `security.alerts.*` — sliding-window detection of brute force, key sharing and export-volume
+  patterns (`enabled`, `window_s`, `failed_auth_threshold`, `key_address_threshold`,
+  `export_document_threshold`). `docs/surfaces.md` §9.11.
+- `api_keys.allowed_ips` / `api_keys.rate_limit` — per-key CIDR scoping and a per-key override
+  of `security.rate_limit.per_minute`, set at mint time rather than in the config file: a key is
+  an identity issued to one caller, and its own bounds belong beside it. `docs/surfaces.md` §9.2.

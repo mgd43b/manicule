@@ -56,11 +56,18 @@ def hash_token(token: str) -> str:
     so there is no dictionary to defend against and a work factor would defend against nothing
     while slowing every read of a shared link.
 
-    **There is no rate limiter in front of this**, and the entropy is what carries the
-    property rather than a limit on attempts — 256 bits is not guessable at any request rate.
-    Rate limiting belongs to Operations (#14) and is worth having for the resource cost of an
-    unauthenticated route; it is not what makes the token safe, and saying it was would be a
-    guarantee resting on something that does not exist.
+    **The entropy is what carries the property, not a limit on attempts** — 256 bits is not
+    guessable at any request rate a limiter would leave available. `security.rate_limit`
+    (`manicule.app.throttle`) exists now and does meter `GET /shared/{token}` like every other
+    HTTP route: `identify` charges the request's caller bucket, keyed by address since a share
+    link presents no API key. What it does not do is single this route out for the failed-auth
+    treatment — a wrong or expired share token is resolved deep inside
+    :meth:`~manicule.app.service.ApplicationService.shared_conversation` as an ordinary refusal,
+    not as an unauthenticated *credential*, so it never reaches the address-scoped
+    failed-authentication bucket `security.rate_limit.failed_auth_per_minute` describes. The
+    ordinary caller bucket still bounds the resource cost of an unauthenticated route from one
+    address; it is not what makes the token itself safe, and saying it was would be a guarantee
+    resting on something that does not exist.
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 

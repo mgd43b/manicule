@@ -751,8 +751,16 @@
       keyForm.addEventListener("submit", function (event) {
         event.preventDefault();
         var days = keyForm.elements.expires_days.value;
+        var rateLimit = keyForm.elements.rate_limit.value;
+        var allowedIps = keyForm.elements.allowed_ips.value;
         var body = { name: keyForm.elements.name.value, role: keyForm.elements.role.value };
         if (days) { body.expires_days = Number(days); }
+        if (rateLimit) { body.rate_limit = Number(rateLimit); }
+        if (allowedIps) {
+          body.allowed_ips = allowedIps.split(",").map(function (entry) {
+            return entry.trim();
+          }).filter(function (entry) { return entry.length > 0; });
+        }
         var submit = keyForm.querySelector('[type="submit"]');
         runAction(submit, keyStatus, "Minting…", function () {
           return json("POST", "/api/v1/auth/keys", body);
@@ -799,6 +807,11 @@
     });
     act("[data-user-sign-out]", userStatus, "Signing out…", "Signed out everywhere.", function (element) {
       return json("POST", "/api/v1/auth/users/" + encodeURIComponent(element.getAttribute("data-user-sign-out")) + "/sign-out");
+    });
+
+    var alertStatus = document.querySelector("[data-alert-status]");
+    act("[data-ack-alert]", alertStatus, "Acknowledging…", "Acknowledged.", function (element) {
+      return json("POST", "/api/v1/admin/alerts/" + encodeURIComponent(element.getAttribute("data-ack-alert")) + "/acknowledge")
     });
   }
 

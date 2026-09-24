@@ -562,9 +562,12 @@ async def test_disabling_a_member_ends_their_sessions_and_revokes_the_keys_they_
     backend = service.fake
     signed = await service.sign_in("google", _profile())
     backend.users_.add_member("admin", role="admin")
-    theirs = await service.api_key_create("alice-laptop", role="member")
+    with acting_as(Caller(role=Role.MEMBER, user_id=signed.user.id)):
+        theirs = await service.api_key_create("alice-laptop", role="member")
     operators = await service.api_key_create("ci", role="viewer")
-    backend.keys_.owners[theirs.key.id] = signed.user.id
+    backend.keys_.memberships[signed.user.id] = "member"
+    assert theirs.key.user_id == signed.user.id
+    assert await backend.keys_.verify(theirs.secret) is not None, "the control failed"
 
     with acting_as(Caller(role=Role.ADMIN, user_id="admin", address="192.0.2.7")):
         updated = await service.user_disable(signed.user.id)

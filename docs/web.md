@@ -111,7 +111,7 @@ the failure the page shows — same type, same message, same hint.
 | plugins | `/ui/plugins` | `plugin_list`, `plugin_health` | admin |
 | settings | `/ui/settings` | `doctor`, `index_status` | admin |
 | workspaces | `/ui/workspaces` | `workspace_list` | viewer |
-| admin | `/ui/admin` | `index_status`, `search_quality`, `query_logs`, `audit_log`, `plugin_health`, `connector_list` | admin |
+| admin | `/ui/admin` | `index_status`, `search_quality`, `query_logs`, `audit_log`, `security_alerts`, `plugin_health`, `connector_list` | admin |
 | reembed | `/ui/reembed` | `reembed_plan`, `reembed_status` | admin |
 | lifecycle | `/ui/lifecycle` | dry runs of the lifecycle operations, `rebuild_plan`, `rebuild_status` | admin |
 | users | `/ui/users` | `user_list`, `auth_providers` | admin |
@@ -222,7 +222,8 @@ workspace with their role, standing and live sessions, a role select, disable or
 `POST /api/v1/auth/users/{id}/sign-out` through the page's script, exactly as the key buttons
 call the key routes; every rule — the last administrator stays one, nobody disables themselves,
 a disable takes the person's sessions and keys with it — is the service's, and a refusal is
-shown in the service's words. The API keys page is for keys only.
+shown in the service's words. The API keys page is for keys only, and shows each key's owner,
+allowed addresses and rate limit ([`surfaces.md` §9.2](surfaces.md#92-identity)).
 
 **A workspace is shared, not partitioned.** Several people may be members of one workspace, and
 every member can read all of it: roles decide what a person may *do*, not which documents they

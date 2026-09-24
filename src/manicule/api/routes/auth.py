@@ -1,11 +1,22 @@
 """Identity: who this request is, how a browser signs in, and the people and keys that make one.
 
-**A program presents a key; a person at a browser signs in.** A key is minted by an
-administrator and presented on every request in a header. A browser cannot attach a header to
-a page load, so under ``security.auth.mode = 'oauth'`` a person signs in through an identity
-provider instead, and the browser holds a session cookie from then on. Both arrive at the same
-principal through :func:`~manicule.api.security.identify`, and every route below that takes a
-floor is held to it whichever credential was presented.
+**A program presents a key; a person at a browser signs in.** A key is minted at the command
+line or by a signed-in person, and presented on every request in a header. A browser cannot
+attach a header to a page load, so under ``security.auth.mode = 'oauth'`` a person signs in
+through an identity provider instead, and the browser holds a session cookie from then on. Both
+arrive at the same principal through :func:`~manicule.api.security.identify`, and every route
+below that takes a floor is held to it whichever credential was presented.
+
+**Minting, listing and revoking a key are viewer-floor routes, and the service decides the
+rest.** That reads oddly next to "an authenticated caller may administer keys" until the
+ownership rule is in view: :meth:`~manicule.app.service.ApplicationService.api_key_create`
+refuses a caller with no ``user_id`` and no admin authority outright, caps a non-admin's
+requested role at their own, and scopes what
+:meth:`~manicule.app.service.ApplicationService.api_key_list` and
+:meth:`~manicule.app.service.ApplicationService.api_key_revoke` show or touch to keys that
+caller owns. Asking for more than viewer here would be a second, looser copy of that rule — the
+floor a route asks for is "is there a caller at all", and the service is where "what may *this*
+caller do" is decided once.
 
 **The sign-in is three routes and nothing decides anything in them.** ``GET /auth/login/{type}``
 sends the browser to the provider with a fresh ``state`` and a PKCE challenge, carrying both in
@@ -48,7 +59,7 @@ from manicule.api.cookies import (
 )
 from manicule.api.envelopes import BAD_REQUEST, FORBIDDEN, NOT_FOUND, as_response, status_for
 from manicule.api.models import KeyBody, UserPatch
-from manicule.api.security import AdminPrincipal, AnonymousPrincipal
+from manicule.api.security import AdminPrincipal, AnonymousPrincipal, ViewerPrincipal
 from manicule.app.dispatch import run_op
 from manicule.core.errors import UnknownEntityError
 
@@ -255,12 +266,12 @@ async def logout(request: Request, service: Service, caller: AnonymousPrincipal)
 
 
 @router.post("/api/v1/auth/keys", name="api_key_create", summary="Mint an API key.")
-async def create_key(service: Service, caller: AdminPrincipal, body: KeyBody) -> Response:
+async def create_key(service: Service, caller: ViewerPrincipal, body: KeyBody) -> Response:
     """Return the only copy of a key's secret.
 
-    Admin-only, and audited. A key is an identity: anything that can mint one can mint one
-    with a role it does not itself have unless something stops it, and being an admin is what
-    stops it here.
+    Audited, and the ownership and role-cap rule the module docstring describes is enforced by
+    the service against :func:`~manicule.app.caller.current` — not by this route's floor, which
+    only asks that a caller exists at all.
     """
     del caller
     return as_response(
@@ -268,25 +279,34 @@ async def create_key(service: Service, caller: AdminPrincipal, body: KeyBody) ->
             "api_key_create",
             service.workspace,
             lambda: service.api_key_create(
-                body.name, role=body.role, expires_days=body.expires_days
+                body.name,
+                role=body.role,
+                expires_days=body.expires_days,
+                allowed_ips=body.allowed_ips,
+                rate_limit=body.rate_limit,
             ),
         )
     )
 
 
-@router.get("/api/v1/auth/keys", name="api_key_list", summary="Every key in this workspace.")
-async def list_keys(service: Service, caller: AdminPrincipal) -> Response:
-    """Records, never secrets. Only digests are stored, so there is no secret to return."""
+@router.get("/api/v1/auth/keys", name="api_key_list", summary="This caller's keys.")
+async def list_keys(service: Service, caller: ViewerPrincipal) -> Response:
+    """Records, never secrets. Only digests are stored, so there is no secret to return.
+
+    Every key in the workspace for an admin or the local operator; only the caller's own
+    otherwise — see :meth:`~manicule.app.service.ApplicationService.api_key_list`.
+    """
     del caller
     return as_response(await run_op("api_key_list", service.workspace, service.api_key_list))
 
 
 @router.delete("/api/v1/auth/keys/{name_or_id}", name="api_key_revoke", summary="Revoke a key.")
-async def revoke_key(service: Service, caller: AdminPrincipal, name_or_id: str) -> Response:
-    """Immediate, and scoped to this workspace.
+async def revoke_key(service: Service, caller: ViewerPrincipal, name_or_id: str) -> Response:
+    """Immediate, and scoped to this workspace and — for a non-admin caller — to keys they own.
 
-    A revoke that could reach another tenant's key would be a denial of service across the
-    boundary the whole design exists to hold, so the lookup is workspace-scoped in the store.
+    A revoke that could reach another tenant's key, or another person's, would be a denial of
+    service across a boundary the whole design exists to hold, so both scopes are enforced in
+    the store's own lookup.
     """
     del caller
     return as_response(
