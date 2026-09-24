@@ -10,7 +10,7 @@ each is made false here, on its own, by writing the row the ordinary path cannot
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import select, update
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from manicule.app.ports import Users
+    from manicule.app.results import UserSummary
 
 
 def _profile(email: str = "alice@example.org", *, subject: str = "alice") -> Profile:
@@ -268,3 +269,39 @@ async def test_a_reader_does_not_rewrite_the_recorded_mode(manicule_environment:
         await reader.documents()
         recorded = {row[0]: row[2] for row in await (await reader.maintenance()).workspaces()}
     assert recorded["alpha"] == "team"
+
+
+async def test_a_first_sign_in_that_loses_the_race_to_create_the_person_still_succeeds(
+    runtime: Runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two tabs, one account, neither of which has signed in before.
+
+    Both find no row and the second insert loses to the unique constraint. That race cannot be
+    produced on demand through one engine, which serializes the two, so it is staged: the first
+    attempt lets a rival sign-in complete and then fails exactly as the losing insert does. The
+    retry must find the rival's row, so both sign-ins are one person.
+    """
+    from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
+
+    from manicule.app import runtime as runtime_module  # noqa: PLC0415
+
+    users = await runtime.users()
+    store = runtime_module._Users  # pyright: ignore[reportPrivateUsage] - the store under test
+    real = store._admit_once  # pyright: ignore[reportPrivateUsage] - the seam the race is at
+    attempts: list[str] = []
+
+    async def losing_once(self: Any, profile: Profile, *, role: str) -> UserSummary:
+        attempts.append(profile.subject)
+        if len(attempts) == 1:
+            await real(self, profile, role=role)
+            raise IntegrityError("INSERT INTO users", {}, Exception("UNIQUE constraint failed"))
+        return await real(self, profile, role=role)
+
+    monkeypatch.setattr(store, "_admit_once", losing_once)
+    member = await users.admit(_profile(), role="member")
+
+    assert len(attempts) == 2
+    sessions = session_factory(runtime.require_engine())
+    async with sessions() as session:
+        people = (await session.execute(select(models.User.id))).scalars().all()
+    assert people == [member.id]

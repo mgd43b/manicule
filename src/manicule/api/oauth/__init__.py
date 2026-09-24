@@ -34,7 +34,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 import httpx
-from authlib.integrations.httpx_client import AsyncOAuth2Client, OAuthError
+from authlib.common.errors import AuthlibBaseError
+from authlib.integrations.httpx_client import AsyncOAuth2Client
 
 from manicule.api.cookies import SignInTransaction
 from manicule.app.people import Profile
@@ -177,7 +178,10 @@ async def complete(
             if provider.type == "google":
                 return await _google(client)
             return await _github(client)
-    except OAuthError as exc:
+    except AuthlibBaseError as exc:
+        # The library's own base, which both the provider's refusal (`OAuthError`) and the
+        # protocol checks it makes before sending anything derive from. Only the short error
+        # code is kept; a provider's description is free text another site chose.
         error = str(getattr(exc, "error", "") or "an error")
         msg = f"the {provider.type} sign-in failed while {step}: the provider answered {error}"
         raise SignInFailedError(msg) from exc

@@ -338,6 +338,30 @@ def test_the_cookie_does_not_authenticate_the_mcp_mount() -> None:
     assert envelope(refused)["op"] == "mcp"
 
 
+def test_the_cookie_opens_the_chat_websocket_from_this_origin_and_no_other() -> None:
+    """The handshake resolves the same way the routes do, after its own origin check.
+
+    A browser applies no cross-origin policy to a websocket, so the origin check before the
+    credential is looked at is what stops another site's page spending the cookie there.
+    """
+    from starlette.websockets import WebSocketDisconnect  # noqa: PLC0415
+
+    with client_with(oauth_backend(), FakeIdentityProvider()) as client:
+        with pytest.raises(WebSocketDisconnect), client.websocket_connect("/api/v1/chat/ws"):
+            pass  # the control: no cookie yet, so the handshake is refused
+        sign_in(client)
+        with client.websocket_connect("/api/v1/chat/ws") as socket:
+            socket.send_text('{"question": "does the client retry"}')
+            assert socket.receive_json()["event"]
+        with (
+            pytest.raises(WebSocketDisconnect),
+            client.websocket_connect(
+                "/api/v1/chat/ws", headers={"Origin": "https://attacker.example.com"}
+            ),
+        ):
+            pass
+
+
 def test_a_header_credential_wins_over_the_cookie() -> None:
     """A program's key is never overridden by a browser's ambient cookie — even a bad key."""
     with client_with(oauth_backend(), FakeIdentityProvider()) as client:

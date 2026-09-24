@@ -2292,6 +2292,22 @@ class _Users:
         return None if row is None else _user_summary(row[0], row[1])
 
     async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+        """Create or refresh the person, and make them a member of this workspace if needed.
+
+        **Twice at most.** Two first sign-ins of one account at the same moment — two tabs, a
+        person who clicked twice — both find no row, and the second insert loses to the
+        unique constraint on ``(provider, subject)`` or on the membership's key. That is not a
+        failure of anything the person did, so the loser runs again and finds the row the
+        winner wrote. A second loss would be something else, and propagates.
+        """
+        from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
+
+        try:
+            return await self._admit_once(profile, role=role)
+        except IntegrityError:
+            return await self._admit_once(profile, role=role)
+
+    async def _admit_once(self, profile: Profile, *, role: str) -> UserSummary:
         from sqlalchemy import select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
