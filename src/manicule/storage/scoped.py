@@ -156,9 +156,10 @@ class _CommitCounter:
             conn.info[_WROTE] = True
 
     def _committed(self, connection: Connection) -> None:
-        if connection.info.pop(_WROTE, False):
+        info = _info(connection)
+        if info is not None and info.pop(_WROTE, False):
             self._value += 1
-            connection.info[_LANDING] = True
+            info[_LANDING] = True
 
     def _landed(self, info: dict[Any, Any]) -> None:
         """The commit announced on this connection has returned; move the counter again."""
@@ -166,18 +167,36 @@ class _CommitCounter:
             self._value += 1
 
     def _began(self, connection: Connection) -> None:
-        self._landed(connection.info)
+        info = _info(connection)
+        if info is not None:
+            self._landed(info)
 
     def _checked_in(self, _dbapi_connection: object, record: ConnectionPoolEntry) -> None:
         self._landed(record.info)
 
     @staticmethod
     def _rolled_back(connection: Connection) -> None:
-        connection.info.pop(_WROTE, None)
+        info = _info(connection)
+        if info is not None:
+            info.pop(_WROTE, None)
 
     @property
     def value(self) -> int:
         return self._value
+
+
+def _info(connection: Connection) -> dict[Any, Any] | None:
+    """The pooled connection's ``info``, or ``None`` for one that has been invalidated.
+
+    An invalidated connection — a statement cancelled under it, its driver gone — raises when
+    asked for ``info``, and these listeners run inside SQLAlchemy's own commit and rollback. A
+    listener that asked anyway would turn the ordinary unwinding of a cancelled request into a
+    ``PendingRollbackError`` raised from inside the rollback. Skipping it can only leave a mark
+    behind, and a mark left behind costs one extra bump — the safe direction.
+    """
+    if connection.invalidated:
+        return None
+    return connection.info
 
 
 _COUNTERS: weakref.WeakKeyDictionary[Engine, _CommitCounter] = weakref.WeakKeyDictionary()
