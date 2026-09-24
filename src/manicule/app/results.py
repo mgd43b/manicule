@@ -506,6 +506,15 @@ class Anchored(Payload):
 class SearchHit(Anchored):
     """One ranked passage."""
 
+    workspace: str = Field(
+        default="",
+        description="The workspace this passage came from. The serving workspace on an ordinary "
+        "search; on one spanning several, the workspace whose own scoped search returned it — "
+        "which is what an administrator reading a merged ranking needs in order to act on any "
+        "line of it, and what the identity check proved before the hit was returned. Every "
+        "search sets it; the empty default is what a payload recorded before the field existed "
+        "parses to, and it makes no claim.",
+    )
     score: float
     scores: dict[str, float] = Field(
         default_factory=dict,
@@ -692,6 +701,16 @@ class SearchResult(Glossed):
     reported here. Without it a scoped search and a workspace-wide search that happened to
     return the same passages are indistinguishable in a log.
     """
+
+    workspaces: tuple[str, ...] = Field(
+        default=(),
+        description="The workspaces this search ran over, in the order the caller named them: "
+        "the serving workspace alone on an ordinary search, and every named one on an "
+        "administrator's search spanning several. Echoed for the reason ``collections`` is — a "
+        "caller reads the scope that actually ran rather than assuming its argument arrived — "
+        "and never widened beyond what was named. Every search sets it; empty is what a payload "
+        "recorded before the field existed parses to.",
+    )
 
 
 class AnswerCitation(Anchored):

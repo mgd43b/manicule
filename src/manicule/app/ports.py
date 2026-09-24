@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
+    from manicule.retrieval.spanning import WorkspaceLeg
     from manicule.storage.vector_migration import VectorMigration
 
 
@@ -169,6 +170,61 @@ class Retrieving(Protocol):
     """
 
     async def retrieve(self, query: Query) -> RetrievalResult: ...
+
+
+@runtime_checkable
+class RetrievingAcross(Protocol):
+    """Retrieval that can span several workspaces, one scoped leg each, merged.
+
+    Separate from :class:`Retrieving` rather than a method on it, so that a retriever which can
+    only ever search its own workspace — every test double, and any retrieval a plugin supplies
+    — is still a complete one. The service asks for this capability by name and refuses a
+    cross-workspace search when it is absent, rather than falling back to searching one.
+    """
+
+    async def retrieve_across(
+        self, query: Query, legs: Sequence[WorkspaceLeg]
+    ) -> RetrievalResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class OpenedWorkspace:
+    """One workspace on this data directory, opened for reading by a search that spans several.
+
+    Every handle is scoped to :attr:`name` by construction. :attr:`documents` and
+    :attr:`organization` are what the service reads through — the collections a name resolves
+    to, and the documents a hit's identity is checked against — and :attr:`leg` is what
+    retrieval searches.
+    """
+
+    name: str
+    documents: DocumentSurface
+    organization: Organizing
+    leg: WorkspaceLeg
+
+
+@runtime_checkable
+class SpansWorkspaces(Protocol):
+    """A backend that can open the other workspaces on its data directory for reading.
+
+    The workspace registry an administrator's cross-workspace search needs, and optional for the
+    reason :class:`RetrievingAcross` is: a backend that serves one workspace and can open no
+    other is a complete backend, and the service refuses the search rather than narrowing it.
+    """
+
+    async def open_workspaces(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
+        """Read handles on each named workspace, in the order named.
+
+        Raises:
+            UnknownEntityError: A name is not a workspace on this data directory. The message
+                lists the ones that are.
+            VectorStoreStateError: A named workspace has no index yet, so there is nothing of
+                it to search.
+            FingerprintMismatchError: A named workspace's index was embedded by a different
+                model than the one this process searches with, so its cosines are not on the
+                scale the merge compares.
+        """
+        ...
 
 
 @runtime_checkable
@@ -785,8 +841,11 @@ __all__ = [
     "Ingesting",
     "Keys",
     "Maintenance",
+    "OpenedWorkspace",
     "Organizing",
     "RetainedBytes",
     "Retrieving",
+    "RetrievingAcross",
+    "SpansWorkspaces",
     "Telemetry",
 ]
