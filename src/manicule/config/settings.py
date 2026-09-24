@@ -1904,8 +1904,11 @@ class Settings(BaseSettings):
         """The configuration with every secret replaced by a placeholder.
 
         This is what ``config show`` and the configuration API return. Returning the live
-        object instead would hand out every API key, OAuth client secret and webhook signing
-        key to anyone allowed to read configuration.
+        object instead would hand out every API key, OAuth client secret, session signing key
+        and webhook signing key to anyone allowed to read configuration.
+
+        Masking *credentials*, and unrelated to :class:`RedactionSettings`, which removes
+        personal data from text sent to a model. Same word, two features.
         """
         dumped: Any = self.model_dump(mode="json")
         return _mask(dumped, type(self))

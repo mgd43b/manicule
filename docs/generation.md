@@ -1125,6 +1125,14 @@ batch:
 | — | The model's answer | It has already left. Redacting the reply protects nothing and would rewrite the answer, which §3.4 refuses |
 | — | The system prompt and slot labels | manicule's own text, not user content |
 
+**Text sent to an embedder is not on this path, and that is a boundary rather than a gap.** A
+redacted chunk embeds as a vector of the redaction, so the index would stop finding the very
+passages a question names. Every embedding backend manicule ships runs on this machine or on an
+endpoint the operator configured, and an embedding endpoint that leaves the machine is governed
+by the startup refusal instead: with `cloud_allowed = false`, `Settings.policy_problems()`
+refuses any selected endpoint — embedding included — that is not on this machine. A hosted
+embedder added later is covered by that refusal and not by `auto_redact`.
+
 **Redacting the query is the correction the prior art most needs** — a user pasting a
 customer's email into the chat box currently ships it to the provider verbatim and stores it in
 plaintext — and it has a cost worth naming: retrieval already ran on the *unredacted* query, so

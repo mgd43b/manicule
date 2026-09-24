@@ -2166,10 +2166,11 @@ nobody reads. It raises `InsecureTargetError`, which describes the *destination*
 the operation carrying the bytes, so a caller has one thing to catch for both.
 
 **What is genuinely not storage's to decide** stays with the security surface
-([#13](https://github.com/mgd43b/manicule/issues/13),
-[#19](https://github.com/mgd43b/manicule/issues/19)): encryption at rest and its key
+([#19](https://github.com/mgd43b/manicule/issues/19)): encryption at rest and its key
 management, whether retention is opt-out per connector, and the deployment-guide wording. The
-disclosure itself is discharged here.
+disclosure itself is discharged here. Team mode ([#13](https://github.com/mgd43b/manicule/issues/13))
+changed who may *reach* the data directory's contents through the surfaces, not how the
+directory is protected on disk.
 
 ---
 
@@ -2878,8 +2879,7 @@ one.
   added by a migration when it earns one.
 - **Encryption at rest, and its key management.** §7.1 states what the data directory now
   contains and sets its permissions; encrypting it is a different problem with a key-handling
-  design behind it, and belongs to [#13](https://github.com/mgd43b/manicule/issues/13) /
-  [#19](https://github.com/mgd43b/manicule/issues/19).
+  design behind it, and belongs to [#19](https://github.com/mgd43b/manicule/issues/19).
 - **Any store other than SQLite.** Settled in `PLAN.md` §2 and not reopened here.
 - **The full `Filter` shape.** Open when this was written; settled since, in
   [`retrieval.md`](retrieval.md) §3 and built by
