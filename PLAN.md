@@ -393,13 +393,19 @@ audit log · security alerts · PII redaction. **Carries over.**
 **Built:** API keys now carry an owner, `allowed_ips` and a per-key `rate_limit`, capped and
 scoped by the caller's own role and membership (`docs/surfaces.md` §9.2); in-process rate
 limiting over every network surface (§9.10); sliding-window security alerts for brute force, key
-sharing and export volume (§9.11); and audit coverage broadened to authentication failures,
+sharing and export volume (§9.11); audit coverage broadened to authentication failures,
 configuration changes, workspace switches, collection and plugin changes, content reads and the
 alerts themselves (§9.8) — the caller context (key id, signed-in person, address) is now wired
 onto every network surface, so `_audit` has an actor and an address to record instead of neither.
-PII redaction (`security.data_policy.auto_redact`) predates this slice and is unrelated to it.
-**Still open:** OAuth SSO, sessions, and per-query workspace isolation across more than one
-tenant — team mode's identity half.
+The identity half is built too: OAuth sign-in through Google and GitHub, a signed browser
+session, and the people-admin surface (`manicule auth users|set-role|disable-user|enable-user|
+sign-out`, `docs/surfaces.md` §9.2.1) — after which `mode = "team"` refuses to serve without
+authentication, anonymous administrator included (§6, "Team mode takes the way out away"). And
+cross-workspace search (§16) is the per-query isolation across more than one tenant this
+section's goal list named. PII redaction (`security.data_policy.auto_redact`) predates this
+slice and is unrelated to it. What is left is delivery, not the record: `security.audit`
+accepts a `syslog` or `webhook` destination and only `local` is wired to anything
+(`docs/deployment.md` §6.6, [#14](https://github.com/mgd43b/manicule/issues/14)).
 
 | | Choice |
 |---|---|
@@ -464,6 +470,11 @@ Real, found in the source, worth not reproducing.
 5. **PII redaction does something other than advertised.** It runs at ingest, permanently
    destroying data in the index, while the docs claim it protects data sent to cloud
    models. Pick one behavior, build it, document it.
+   **Fixed:** redaction happens at the generation boundary, not at ingest —
+   `docs/generation.md` §7, decided in `docs/ingest.md` §3.4. It predates team mode
+   ([#13](https://github.com/mgd43b/manicule/issues/13)) and is unrelated to it; a *refusal to
+   ingest* content matching a rule is the coherent version of what this defect was misfilling,
+   and is its own ticket, [#28](https://github.com/mgd43b/manicule/issues/28).
 6. **The evaluation harness scores at chance.** Its test embedder is
    `sin(sum of character codes)`. Twelve retrieval features rest on it.
 
