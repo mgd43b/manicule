@@ -36,7 +36,7 @@ drift would show up as citations that pass CI and fail in production.
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import logging
 import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
@@ -50,6 +50,8 @@ from manicule.core.protocols import CLOSE_DEADLINE_S, Parser
 from manicule.core.retrieval import Candidate, Context
 from manicule.generation.answers import CitationDrop, DropReason, Verification
 from manicule.testing.normalize import contains_claimed_text, normalize
+
+_log = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -289,12 +291,65 @@ class SlotVerdict:
         return self.drop is None and self.document is not None
 
 
+class Stragglers:
+    """Verification tasks that an answer's close stopped waiting for, held until they finish.
+
+    :meth:`VerificationRun.aclose` cancels its tasks and waits for them only until its
+    deadline. A task still running then has been canceled and has not yet honored it: it is
+    finishing a step that runs to its end before a cancellation is raised — the engine opening
+    a connection (``docs/storage.md`` §3.1) — or it is in code that ignores cancellation, such as
+    a parser that catches :exc:`BaseException`. The answer is not held for it, and nothing it
+    concludes reaches that answer, because the close has already recorded every slot's verdict
+    and the first verdict wins.
+
+    It still has to be held by something. An event loop keeps only a weak reference to a task,
+    so an unreferenced one can be collected mid-flight, and a task that is merely forgotten
+    runs on into the engine's disposal. So it is held here until it finishes, its outcome is
+    consumed then, and whoever owns the engine awaits :meth:`wait` before disposing of it — for
+    the runtime that is the first step of :meth:`~manicule.app.runtime.Runtime.aclose`.
+    """
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def __len__(self) -> int:
+        return len(self._tasks)
+
+    def adopt(self, task: asyncio.Task[None]) -> None:
+        """Hold ``task`` until it finishes, then let it go and consume its outcome."""
+        self._tasks.add(task)
+        task.add_done_callback(self._finished)
+
+    def _finished(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled():
+            # Consumed rather than reported: the answer it was checking has been delivered.
+            task.exception()
+
+    async def wait(self) -> None:
+        """Return once every straggler, including any adopted meanwhile, has finished.
+
+        Without a deadline, deliberately. Each of these has already been canceled, so what is
+        left of it is a step that finishes before raising — opening a connection, which this
+        wait must outlast or it leaves that step working against an engine already disposed —
+        or code that ignores cancellation outright, which ``asyncio.run`` would wait for at the
+        end of the process anyway.
+        """
+        while self._tasks:
+            await asyncio.wait(set(self._tasks))
+
+
 class CitationVerifier:
     """Verifies the passages of a context, concurrently with the model call.
 
     Construct one per process and call :meth:`start` per answer. The run it returns has
     already begun working by the time it is handed back, so on a warm cache it has finished
     before the request reaches the provider.
+
+    ``stragglers`` is where a run's close leaves the checks it stopped waiting for. Pass the
+    owner's own when the verifier may be replaced while the owner lives — the runtime rebuilds
+    its answer path after a reset — so the checks outlive the verifier that started them and
+    are still awaited before the engine goes.
     """
 
     def __init__(
@@ -303,10 +358,17 @@ class CitationVerifier:
         *,
         timeout_s: float = 5.0,
         cache_entries: int = 10_000,
+        stragglers: Stragglers | None = None,
     ) -> None:
         self._resolver = resolver
         self._timeout_s = timeout_s
         self._cache = _Cache(limit=cache_entries)
+        self._stragglers = stragglers if stragglers is not None else Stragglers()
+
+    @property
+    def stragglers(self) -> Stragglers:
+        """Checks a run's close stopped waiting for, and that are still running."""
+        return self._stragglers
 
     @property
     def ceiling(self) -> Verification:
@@ -348,6 +410,7 @@ class CitationVerifier:
             cache=self._cache,
             ceiling=self.ceiling,
             deadline=began + self._timeout_s,
+            stragglers=self._stragglers,
         )
 
 
@@ -368,6 +431,7 @@ class VerificationRun:
         cache: _Cache,
         ceiling: Verification,
         deadline: float,
+        stragglers: Stragglers,
     ) -> None:
         self._passages = tuple(passages)
         self._documents = dict(documents)
@@ -375,6 +439,7 @@ class VerificationRun:
         self._cache = cache
         self._ceiling = ceiling
         self._deadline = deadline
+        self._stragglers = stragglers
         self._verdicts: dict[int, SlotVerdict] = {}
         self._ready: dict[int, asyncio.Event] = {}
         self._tasks: list[asyncio.Task[None]] = []
@@ -620,24 +685,44 @@ class VerificationRun:
         verdict and an event nobody will set — exactly the state that makes a later
         :meth:`verdict` sit out its whole budget with nothing in flight.
 
-        The wait is bounded for the same reason the provider close is: this runs in a caller's
-        ``finally``, and a parser doing long blocking work inside its own cleanup must not be
-        able to stall request teardown indefinitely. The one read it does not cut short is a
-        blob lookup already under way: ``BlobStore.get`` finishes it before raising the
-        cancellation, because a lookup canceled while the pool is opening its connection
-        strands that connection (``docs/storage.md`` §3.1).
+        **Returns by ``deadline_s``, whatever the tasks do.** This runs in a caller's
+        ``finally``, and a task can outlast its cancellation: the engine finishes opening a
+        connection before it raises one (``docs/storage.md`` §3.1), and a parser may catch
+        :exc:`BaseException` or block in its own cleanup. So the wait is
+        :func:`asyncio.wait` with a timeout rather than a gather under one — a gather that is
+        itself canceled still waits for every child, so the deadline bounded nothing.
+
+        A task still running at the deadline, or when this close is itself canceled, is a
+        straggler. It keeps running, canceled, with nothing waiting on it here; its slots have
+        already been settled below, so nothing it concludes afterwards reaches the answer; and it
+        is handed to the verifier's :class:`Stragglers`, which holds it until it finishes and is
+        awaited before the engine is disposed. So a straggler strands no connection: one it was
+        opening is closed by the engine before the cancellation is raised, and one it holds goes
+        back to a pool that is disposed only after the straggler has finished.
         """
-        for task in self._tasks:
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
             task.cancel()
-        if self._tasks:
-            with contextlib.suppress(TimeoutError):
-                async with asyncio.timeout(deadline_s):
-                    await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
-        self._settle_remaining(
-            range(1, len(self._passages) + 1),
-            "verification was closed before it finished",
-        )
+        try:
+            if tasks:
+                await asyncio.wait(tasks, timeout=deadline_s)
+        finally:
+            late = [task for task in tasks if not task.done()]
+            for task in tasks:
+                if task.done() and not task.cancelled():
+                    task.exception()
+            for task in late:
+                self._stragglers.adopt(task)
+            if late:
+                _log.warning(
+                    "%d citation check(s) were still running when their answer closed; they "
+                    "finish in the background and are awaited before the engine is disposed",
+                    len(late),
+                )
+            self._settle_remaining(
+                range(1, len(self._passages) + 1),
+                "verification was closed before it finished",
+            )
 
 
 __all__ = [
@@ -650,6 +735,7 @@ __all__ = [
     "ParserChainLike",
     "RetainedBytesResolver",
     "SlotVerdict",
+    "Stragglers",
     "UnverifiableSource",
     "VerificationRun",
     "load_documents",

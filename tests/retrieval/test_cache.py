@@ -492,10 +492,10 @@ async def test_a_connection_invalidated_mid_transaction_rolls_back_cleanly(
 ) -> None:
     """The counter's rollback listener must not be what fails a rollback.
 
-    An invalidated connection — a statement cancelled under it, or its driver gone — has no
+    An invalidated connection — a statement canceled under it, or its driver gone — has no
     ``info`` to read, and asking for it raises. A listener that asked would turn the ordinary
-    unwinding of a cancelled request into a ``PendingRollbackError`` raised from inside the
-    rollback, and the task would not end cancelled. A mark it cannot clear only ever costs one
+    unwinding of a canceled request into a ``PendingRollbackError`` raised from inside the
+    rollback, and the task would not end canceled. A mark it cannot clear only ever costs one
     extra bump.
     """
     chunks = await _live(store)

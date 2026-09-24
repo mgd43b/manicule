@@ -10,6 +10,7 @@ and the model replaced.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,6 +19,7 @@ from manicule.app.runtime import Runtime
 from manicule.app.service import ApplicationService
 from manicule.config.settings import Settings
 from manicule.container import keys
+from manicule.generation.verification import VerificationRun
 from manicule.plugins.registry import discover
 from tests.fakes import HashEmbedder
 from tests.generation.fakes import ScriptedGenerator
@@ -96,3 +98,62 @@ async def test_an_answer_that_outruns_its_verification_leaves_no_connection_open
     assert answered.text == ANSWER
     assert reads, "nothing read the retained bytes, so nothing here was verified against them"
     assert unclosed_connections() == [], "the answer left a database connection open"
+
+
+async def test_shutdown_waits_for_a_citation_check_the_answer_stopped_waiting_for(
+    indexed: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unclosed_connections: Callable[[], list[str]],
+) -> None:
+    """An answer's close waits for its citation checks only until its deadline, and a check
+    can outlast that: canceled, it may still be finishing a read. The runtime is what disposes
+    the engine that read goes through, so shutting down waits for it first. Disposing under it
+    would leave the read's connection outside any pool anything will ever dispose.
+    """
+    close = VerificationRun.aclose
+
+    async def promptly(run: VerificationRun, deadline_s: float = 0.05) -> None:
+        del deadline_s  # the shipped deadline is five seconds, and this needs it to pass
+        await close(run, deadline_s=0.05)
+
+    monkeypatch.setattr(VerificationRun, "aclose", promptly)
+    runtime = _runtime(indexed)
+    runtime.acquire()
+    blobs = await runtime.blobs()
+    read = blobs.get
+    reading = asyncio.Event()
+    release = asyncio.Event()
+
+    async def straggling(digest: str) -> bytes | None:
+        """A read that finishes before it honors a cancellation, however many arrive — the way
+        the engine finishes opening a connection — and reads through the engine to do it."""
+        reading.set()
+        canceled: asyncio.CancelledError | None = None
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError as error:
+                canceled = error
+        data = await read(digest)
+        if canceled is not None:
+            raise canceled
+        return data
+
+    monkeypatch.setattr(blobs, "get", straggling)
+    asking = asyncio.create_task(ApplicationService(runtime).ask(QUESTION, limit=5))
+    try:
+        answered_in_time, _ = await asyncio.wait({asking}, timeout=5)
+        if not answered_in_time:
+            release.set()  # the close is waiting on the check, so only this ends the answer
+        answered = await asking
+    finally:
+        closing = asyncio.create_task(runtime.aclose())
+        early, _ = await asyncio.wait({closing}, timeout=0.2)
+        release.set()
+        await closing
+
+    assert answered_in_time, "the answer's close waited past its deadline for a check"
+    assert answered.text == ANSWER
+    assert reading.is_set(), "no citation check reached the blob store, so none was left running"
+    assert not early, "shutdown disposed the engine while a citation check was still reading it"
+    assert unclosed_connections() == [], "the check left running stranded a connection"

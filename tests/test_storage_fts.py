@@ -200,7 +200,7 @@ async def test_concurrent_searches_do_not_exhaust_the_connection_pool(
 
     ``search_lexical`` ran its FTS statement and then, *still inside* its own session, called
     ``get_chunks`` — which opens a session of its own. One search therefore held two of the
-    engine's connections at once, and the engine is built with no pool arguments: on
+    engine's connections at once, and the engine's pool is sized by SQLAlchemy's defaults: on
     ``sqlite+aiosqlite`` over a file that is an ``AsyncAdaptedQueuePool`` of 5 with 10 overflow,
     fifteen for the whole process. Hold-and-wait, with the usual consequence — a search waiting
     for a connection only another search can release.

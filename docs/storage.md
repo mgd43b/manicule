@@ -120,17 +120,30 @@ the only placement that covers every connection the pool will ever open. A test 
 web request produce `SQLITE_BUSY` immediately rather than after a wait. WAL permits many
 readers with one writer; manicule keeps a single write path and lets readers run concurrently.
 
-**A cancellation that lands while the pool is opening a connection strands it.** Opening one
-means awaiting `aiosqlite`, whose thread creates the `sqlite3` handle, and then running the
-`connect` listener above. Canceled inside `aiosqlite`, the connection stops its thread without
-closing the handle that thread has just opened; canceled inside the listener, SQLAlchemy
-discards a connection it never finished setting up. Either way nothing holds it, so neither
-the session nor the engine's disposal closes it, and it surfaces later as a `ResourceWarning`
-from the garbage collector. Once a connection is in the pool, cancellation is safe: SQLAlchemy
-invalidates and closes a connection whose statement was canceled. So a read that its callers
-cancel as a matter of course finishes its lookup before it raises the cancellation.
-`BlobStore.get` is that read — citation verification cancels it whenever an answer ends before
-its verification does (`generation.md` §3.7).
+**Opening a connection is one step, and a canceled caller cannot split it.** Opening one is
+several awaits: `aiosqlite` starting a thread that creates the `sqlite3` handle, then every
+`connect` listener — the one above, and SQLAlchemy's own, which register SQL functions and, on
+an engine's first connection, inspect the database. A cancellation that landed in any of them
+stranded the connection. Canceled inside `aiosqlite`, the connection stopped its thread without
+closing the handle that thread had just opened; canceled inside a listener, SQLAlchemy dropped
+a pool entry it had not finished building, with the connection in it. Either way nothing held
+it, so neither the session nor the engine's disposal could close it, and it surfaced later as a
+`ResourceWarning` from the garbage collector. Callers are canceled as a matter of course — a
+reader who goes away, a request past its deadline, an answer that ends before its citation
+checks (`generation.md` §3.7) — so this was a leaked handle per canceled request, from any read.
+
+So `create_engine` builds the pool that SQLAlchemy would choose for a file database, with one
+difference: a new entry is built — the driver's connect and every `connect` listener — in a task
+and greenlet of its own. A caller canceled meanwhile waits for it to finish opening, closes it,
+and then raises the cancellation; to the pool this is a connection attempt that raised, so its
+accounting is untouched. The wait is the time the open was taking anyway. The other way a
+connection opens is an entry already in the pool reopening: a statement canceled mid-flight
+makes SQLAlchemy close its connection and return the entry empty, and the entry reconnects on
+its next checkout. A listener interrupted there is already SQLAlchemy's to close, because the
+entry holds the connection by then, but a handle `aiosqlite` never handed over is not; a
+`do_connect` listener opens the driver connection the same way for that path too. Once a
+connection is in the pool, cancellation is safe: SQLAlchemy invalidates and closes a
+connection whose statement was canceled.
 
 Blob filenames are content addresses, while compression is a property of their stored
 representation. Concurrent writers publish with an atomic no-clobber hard link and then read the

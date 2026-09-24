@@ -385,13 +385,19 @@ cache it has finished before the request reaches the provider.
 
 **Closed with the answer, whichever finishes first.** Each document's checks run as a task of
 their own. When the answer ends before they do — a one-sentence reply that cites nothing, a
-reader who went away — closing the run cancels those tasks, waits for them, and records every
-slot still without a verdict as a drop. The wait has the close deadline, with one exception: a
-cancellation does not cut a blob lookup short. `BlobStore.get` finishes looking up its row, and
-hands the connection back to the pool, before it raises the cancellation, because a lookup
-canceled while the pool is still opening that connection strands it where nothing can close it
-(`storage.md` §3.1) — and this path cancels lookups on every answer that outruns its
-verification.
+reader who went away — closing the run cancels those tasks, waits for them until the close
+deadline and no longer, and records every slot still without a verdict as a drop. The deadline
+holds whatever the tasks do. A canceled check can outlast its cancellation: the engine finishes
+opening a connection before it raises one, because a connection abandoned half-open is one
+nothing can close (`storage.md` §3.1), and a parser may catch the cancellation or block in its
+own cleanup. The close does not wait for either past its deadline.
+
+A check still running at the deadline keeps running, canceled, with nothing waiting on it. It
+changes nothing about the answer: every slot already has its verdict, and the first verdict
+wins. It is not abandoned either. The verifier holds it until it finishes, a connection it was
+opening is closed by the engine before its cancellation is raised, and the runtime waits for
+every such check before it disposes of the engine or closes the parsers the check reads with,
+so none of them is left reading from something already gone.
 
 **Bounded, and the bound is a failure rather than a bypass.** `citation_verify_timeout_s`
 defaults to 5.0, measured from the start of the answer, which is generous because the work
