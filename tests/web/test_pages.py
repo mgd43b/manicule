@@ -2,7 +2,7 @@
 
 Two kinds of assertion, matching ``tests/api/test_routes.py``:
 
-**Coverage.** Each of the twelve areas has a page that answers, checked from the mounted routes
+**Coverage.** Each of the areas has a page that answers, checked from the mounted routes
 rather than from a list in somebody's head. ``layout`` is the one area with no page of its own,
 and that is asserted as a property of the templates rather than waved away.
 
