@@ -627,6 +627,102 @@ async def test_canceling_an_answer_mid_verification_leaves_no_connection_open(
     assert not finished, "the answer closed while its blob read was still opening a connection"
 
 
+async def test_closing_a_run_returns_by_its_deadline_past_a_check_that_ignores_cancellation() -> (
+    None
+):
+    """The close canceled its tasks and then awaited a ``gather`` under a timeout — and a gather
+    that is itself canceled still waits for every child. So a parser or resolver that catches
+    the cancellation held the answer's teardown open for as long as it liked, past the deadline
+    whose whole purpose is that it cannot.
+
+    The check is left running rather than waited for, and it is not left unowned: the verifier
+    holds it until it finishes, and nothing it concludes afterwards changes the closed run.
+    """
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Deaf:
+        """Swallows every cancellation and finishes its read once released."""
+
+        can_resolve = True
+
+        async def open(self, document: object) -> Any:
+            del document
+            entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            return OpenSource(FakeParser(resolutions={"Rollback": ROLLBACK}), _raw())
+
+    verifier = CitationVerifier(Deaf(), timeout_s=30.0)
+    passages = (candidate(chunk_id="c1", document_id="doc-1", text=ROLLBACK),)
+    run = verifier.start(context(passages), {"doc-1": document()})
+    await entered.wait()
+
+    closing = asyncio.create_task(run.aclose(deadline_s=0.05))
+    finished, _ = await asyncio.wait({closing}, timeout=2.0)
+    release.set()  # before any assertion, so a failing run still lets its check end
+    await closing
+
+    assert finished, "the close waited past its deadline for a check that ignores cancellation"
+    held = len(verifier.stragglers)
+    await verifier.stragglers.wait()
+    verdict = await run.verdict(1)
+    assert held == 1, "the check left running was not held by anything"
+    assert len(verifier.stragglers) == 0, "a finished check is let go"
+    assert verdict.drop is not None, "a check that finished after the close does not rewrite it"
+    assert verdict.drop.detail == "verification was closed before it finished"
+
+
+async def test_a_check_left_running_past_the_close_still_closes_its_connection(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unclosed_connections: Callable[[], list[str]],
+) -> None:
+    """The check the close most often leaves behind is not a misbehaving parser: it is a blob
+    read whose connection the engine is still opening, which finishes opening before it raises
+    the cancellation (``docs/storage.md`` §3.1). Past the close's deadline nobody is waiting for
+    it, so it has to close that connection on its own — and it must not be waiting on the close
+    either, or the deadline is the time a connection takes to open.
+    """
+    blobs = BlobStore(engine, data_dir)
+    stored = await blobs.put(f"# Rollback\n{ROLLBACK}\n".encode(), "text/markdown")
+    assert isinstance(stored, StoredBlob)
+    await engine.dispose()  # nothing idle, so the check opens a connection of its own
+    opening = threading.Event()
+    release = threading.Event()
+    connect = sqlite3.connect
+
+    def held_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        opening.set()
+        assert release.wait(timeout=5)
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", held_connect)
+    parser = FakeParser(resolutions={"Rollback": f"## Rollback\n{ROLLBACK}"})
+    verifier = CitationVerifier(
+        RetainedBytesResolver(blobs=blobs, router=ChainRouter(FakeChain(parser))), timeout_s=30.0
+    )
+    passages = (candidate(chunk_id="c1", document_id="doc-1", text=ROLLBACK),)
+    run = verifier.start(context(passages), {"doc-1": document(original_ref=stored.hash)})
+    assert await asyncio.to_thread(opening.wait, 5), "verification never reached the blob store"
+
+    closing = asyncio.create_task(run.aclose(deadline_s=0.05))
+    finished, _ = await asyncio.wait({closing}, timeout=2.0)
+    held = len(verifier.stragglers)
+    release.set()
+    await closing
+    await verifier.stragglers.wait()
+    await engine.dispose()
+
+    assert finished, "the close waited past its deadline for a connection to finish opening"
+    assert held == 1, "the check still opening a connection was not held by anything"
+    assert unclosed_connections() == [], "the check left running stranded its connection"
+
+
 async def test_the_history_budget_is_the_one_the_window_check_approved() -> None:
     """A default of 1024 could spend twice what the ``fast`` profile reserved — the prompt
     overflow the startup refusal exists to prevent, arriving from inside."""

@@ -96,6 +96,7 @@ if TYPE_CHECKING:
         VectorStore,
     )
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
+    from manicule.generation.verification import Stragglers
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
@@ -252,6 +253,9 @@ class Runtime:
         self._health: _Observation | None = None
         self._health_lock = asyncio.Lock()
         self._workspaces = _Workspaces(self)
+        self._stragglers: Stragglers | None = None
+        """Citation checks an answer stopped waiting for. Made with the first answer path and kept
+        across rebuilds of it, so a check outlives the verifier that started it."""
 
     # --- lifecycle --------------------------------------------------------------------------
 
@@ -331,8 +335,15 @@ class Runtime:
         write — a cache flush, a final status — and an engine disposed first turns that into a
         connection error during shutdown, which is reported as a teardown failure and is not
         one.
+
+        Before either, the citation checks an answer's close stopped waiting for are waited
+        out (:class:`~manicule.generation.verification.Stragglers`). They read through the
+        engine and a parser from the container, and a check still running when those close
+        would be reading from something already gone.
         """
         try:
+            if self._stragglers is not None:
+                await self._stragglers.wait()
             close_error: Exception | None = None
             try:
                 # First, while the engine they read their publication pointers through is open.
@@ -876,6 +887,7 @@ class Runtime:
             ChainRouter,
             CitationVerifier,
             RetainedBytesResolver,
+            Stragglers,
         )
         from manicule.storage.conversations import SqliteConversationStore  # noqa: PLC0415
 
@@ -889,9 +901,15 @@ class Runtime:
         # The same handle the surfaces use, not a second one. Two stores over one engine is
         # two places a share link can be minted from and two opinions about what is deleted.
         conversations = cast("SqliteConversationStore", await self.conversations())
+        if self._stragglers is None:
+            self._stragglers = Stragglers()
         return Answerer(
             generator=generator,
-            verifier=CitationVerifier(resolver, timeout_s=settings.llm.citation_verify_timeout_s),
+            verifier=CitationVerifier(
+                resolver,
+                timeout_s=settings.llm.citation_verify_timeout_s,
+                stragglers=self._stragglers,
+            ),
             documents=store,
             settings=settings,
             policy=EgressPolicy.of(settings, settings.workspace),
