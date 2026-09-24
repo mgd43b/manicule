@@ -311,16 +311,23 @@ def render_search(out: Console, payload: r.SearchResult) -> None:
             "[/dim]manicule index[dim] reports what is there, and "
             "[/dim]manicule index <path>[dim] adds to it[/dim]"
         )
+    # A search spanning workspaces names each hit's, because a merged ranking is read line by
+    # line and a line an administrator cannot place is a line they cannot act on. An ordinary
+    # search does not: every hit is this workspace's, and saying so on each would be noise.
+    spanning = len(payload.workspaces) > 1
     for position, hit in enumerate(payload.hits, start=1):
         heading = " / ".join(hit.heading_path)
         title = hit.title or hit.uri
+        where = f"[cyan]{escape(hit.workspace)}[/cyan] " if spanning else ""
         out.print(
-            f"[bold]{position}.[/bold] {escape(title)}"
+            f"[bold]{position}.[/bold] {where}{escape(title)}"
             f"[dim] {escape(heading)}  score {hit.score:.4f}[/dim]"
         )
         out.print(Text(_clip(hit.text), style="none"))
         out.print(f"[dim]{escape(hit.uri)} · {escape(_anchor_summary(hit.anchor))}[/dim]\n")
     summary = [f"{payload.count} hit(s)", f"profile {payload.profile}"]
+    if spanning:
+        summary.append(f"across {', '.join(payload.workspaces)}")
     if payload.confidence is not None:
         summary.append(f"confidence {payload.confidence:.2f} ({payload.confidence_band})")
     if payload.explicit_definition:

@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, cast, override
 
 from manicule.app.ports import (
     Answering,
@@ -23,6 +23,7 @@ from manicule.app.ports import (
     Ingesting,
     Keys,
     Maintenance,
+    OpenedWorkspace,
     Organizing,
     ResetOutcome,
     RetainedBytes,
@@ -90,6 +91,7 @@ from manicule.ingest.reindex import (
 )
 from manicule.ingest.sweeps import SweepResult
 from manicule.retrieval.retriever import RetrievalResult
+from manicule.retrieval.spanning import WorkspaceLeg
 from manicule.storage.organization import normalize_name
 from manicule.storage.vector_migration import VectorMigration
 
@@ -97,6 +99,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 
     from manicule.core.fingerprints import GlossaryFingerprint
+    from manicule.core.protocols import DocStore, VectorStore
     from manicule.core.retrieval import Filter
     from manicule.generation.answering import AnswerRequest, AnswerResult
     from manicule.plugins.registry import Discovery
@@ -1559,6 +1562,123 @@ class FakeBackend:
         return list(self.checks)
 
 
+@dataclass
+class SpanningRetriever(FakeRetriever):
+    """A retriever that can span workspaces, returning scripted attributed candidates.
+
+    ``across`` is ``(origins, candidate)`` per candidate, in ranked order: the workspaces whose
+    search returned it, as a real merge records them. Scripting the origins rather than deriving
+    them is what lets a test hand the service a hit claimed by the wrong workspace, by none, or
+    by two — the attributions a real merge only produces over a store that ignored its scope.
+    """
+
+    across: list[tuple[tuple[str, ...], Candidate]] = field(
+        default_factory=list[tuple[tuple[str, ...], Candidate]]
+    )
+    seen_across: list[tuple[Query, list[str]]] = field(
+        default_factory=list[tuple[Query, list[str]]]
+    )
+
+    async def retrieve_across(self, query: Query, legs: Sequence[WorkspaceLeg]) -> RetrievalResult:
+        self.seen_across.append((query, [leg.workspace for leg in legs]))
+        candidates = [candidate for _, candidate in self.across]
+        return RetrievalResult(
+            context=Context(query=query, passages=tuple(candidates)),
+            candidates=candidates,
+            confidence=Confidence(score=0.4, band=ConfidenceBand.LOW, reason="scripted"),
+            origins={candidate.chunk.id: origins for origins, candidate in self.across},
+        )
+
+
+@dataclass
+class SpanningBackend(FakeBackend):
+    """A backend whose data directory holds other workspaces, which it can open.
+
+    The serving workspace opens as this backend's own store and organization, as the runtime's
+    registry opens it; every other name opens from :attr:`others` or is refused as unknown.
+    """
+
+    others: dict[str, tuple[FakeStore, FakeOrganization]] = field(
+        default_factory=dict[str, tuple[FakeStore, FakeOrganization]]
+    )
+    opened: list[list[str]] = field(default_factory=list[list[str]])
+    """Every request to open workspaces, in order — empty when a refusal came first."""
+
+    async def open_workspaces(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
+        self.opened.append(list(names))
+        handles: list[OpenedWorkspace] = []
+        for name in names:
+            if name == self.workspace:
+                store, organization = self.store, self.organization_
+            elif name in self.others:
+                store, organization = self.others[name]
+            else:
+                msg = f"no workspace {name!r} on this data directory"
+                raise UnknownEntityError(msg)
+            handles.append(
+                OpenedWorkspace(
+                    name=name,
+                    documents=store,
+                    organization=organization,
+                    leg=WorkspaceLeg(
+                        workspace=name,
+                        docstore=cast("DocStore", store),
+                        vectors=cast("VectorStore", object()),
+                    ),
+                )
+            )
+        return handles
+
+    @property
+    def spanning(self) -> SpanningRetriever:
+        """The retriever, typed as the spanning one it always is here."""
+        retriever = self.retriever_
+        if not isinstance(retriever, SpanningRetriever):  # pragma: no cover - a test replaced it
+            msg = "this backend's retriever was replaced with one that cannot span"
+            raise TypeError(msg)
+        return retriever
+
+
+def spanning_backend(
+    serving: str = "alpha", other: str = "beta", **settings: Any
+) -> SpanningBackend:
+    """``serving`` and ``other`` side by side, one runbook each, and a retriever spanning both.
+
+    The scripted ranking puts ``other``'s runbook first, so an attribution a surface got wrong
+    shows up as the first hit rather than hiding at the end.
+    """
+    serving_store = FakeStore(workspace_id=serving)
+    serving_doc = serving_store.add(
+        make_document(serving, source_id=f"{serving}.md", title=f"{serving.title()} runbook")
+    )
+    other_store = FakeStore(workspace_id=other)
+    other_doc = other_store.add(
+        make_document(other, source_id=f"{other}.md", title=f"{other.title()} runbook")
+    )
+    backend = SpanningBackend(
+        settings=Settings(workspace=serving, **settings),
+        store=serving_store,
+        organization_=FakeOrganization(workspace_id=serving),
+        retriever_=SpanningRetriever(),
+        others={other: (other_store, FakeOrganization(workspace_id=other))},
+    )
+    backend.keys_.workspace = serving
+    backend.maintenance_.workspace_rows = [
+        (serving, serving, "team"),
+        (other, other, "team"),
+    ]
+
+    def candidate(document: Document, score: float) -> Candidate:
+        return Candidate(chunk=make_chunk(document), score=score, scores={"dense": score})
+
+    backend.spanning.across = [
+        ((other,), candidate(other_doc, 0.9)),
+        ((serving,), candidate(serving_doc, 0.7)),
+    ]
+    backend.spanning.candidates = [candidate(serving_doc, 0.7)]
+    return backend
+
+
 __all__ = [
     "FakeAnswerer",
     "FakeBackend",
@@ -1569,6 +1689,9 @@ __all__ = [
     "FakeRetriever",
     "FakeStore",
     "LeakyStore",
+    "SpanningBackend",
+    "SpanningRetriever",
     "make_chunk",
     "make_document",
+    "spanning_backend",
 ]

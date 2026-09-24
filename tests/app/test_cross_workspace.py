@@ -14,35 +14,29 @@ from __future__ import annotations
 
 import inspect
 import json
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import Any
 
 import pytest
 
 from manicule.app.caller import Caller, acting_as
 from manicule.app.dispatch import run_op
-from manicule.app.ports import OpenedWorkspace
 from manicule.app.service import ApplicationService
 from manicule.app.tenancy import CrossWorkspaceError
 from manicule.config.settings import Role, Settings
 from manicule.core.errors import ConfigError, PolicyError, UnknownEntityError
-from manicule.core.retrieval import Candidate, Confidence, ConfidenceBand, Context, Query
-from manicule.retrieval.retriever import RetrievalResult
-from manicule.retrieval.spanning import WorkspaceLeg
+from manicule.core.retrieval import Candidate
 from tests.app.fakes import (
     FakeBackend,
     FakeOrganization,
     FakeRetriever,
     FakeStore,
     LeakyStore,
+    SpanningBackend,
+    SpanningRetriever,
     make_chunk,
     make_document,
+    spanning_backend,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from manicule.core.protocols import DocStore, VectorStore
 
 ALPHA = "alpha"
 BETA = "beta"
@@ -52,95 +46,13 @@ FOREIGN_TEXT = "Everyone in gamma earns exactly nine hundred thousand"
 """Content no workspace in these searches may see. Distinctive, so a leak is greppable."""
 
 
-@dataclass
-class SpanningRetriever(FakeRetriever):
-    """Returns scripted ``(workspace, candidate)`` pairs, attributed as a real merge would."""
-
-    across: list[tuple[tuple[str, ...], Candidate]] = field(
-        default_factory=list[tuple[tuple[str, ...], Candidate]]
-    )
-    seen_across: list[tuple[Query, list[str]]] = field(
-        default_factory=list[tuple[Query, list[str]]]
-    )
-
-    async def retrieve_across(self, query: Query, legs: Sequence[WorkspaceLeg]) -> RetrievalResult:
-        self.seen_across.append((query, [leg.workspace for leg in legs]))
-        candidates = [candidate for _, candidate in self.across]
-        return RetrievalResult(
-            context=Context(query=query, passages=tuple(candidates)),
-            candidates=candidates,
-            confidence=Confidence(score=0.4, band=ConfidenceBand.LOW, reason="scripted"),
-            origins={candidate.chunk.id: origins for origins, candidate in self.across},
-        )
-
-
-@dataclass
-class SpanningBackend(FakeBackend):
-    """A backend whose data directory holds other workspaces it can open."""
-
-    others: dict[str, tuple[FakeStore, FakeOrganization]] = field(
-        default_factory=dict[str, tuple[FakeStore, FakeOrganization]]
-    )
-    opened: list[list[str]] = field(default_factory=list[list[str]])
-
-    async def open_workspaces(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
-        self.opened.append(list(names))
-        handles: list[OpenedWorkspace] = []
-        for name in names:
-            if name == self.workspace:
-                store, organization = self.store, self.organization_
-            elif name in self.others:
-                store, organization = self.others[name]
-            else:
-                msg = f"no workspace {name!r}"
-                raise UnknownEntityError(msg)
-            handles.append(
-                OpenedWorkspace(
-                    name=name,
-                    documents=store,
-                    organization=organization,
-                    leg=WorkspaceLeg(
-                        workspace=name,
-                        docstore=cast("DocStore", store),
-                        vectors=cast("VectorStore", object()),
-                    ),
-                )
-            )
-        return handles
-
-
-def _backend(**settings: object) -> SpanningBackend:
-    """Alpha serving, beta beside it, each holding one document; the retriever spans both."""
-    alpha_store = FakeStore(workspace_id=ALPHA)
-    alpha_store.add(make_document(ALPHA, source_id="alpha.md", title="Alpha runbook"))
-    beta_store = FakeStore(workspace_id=BETA)
-    beta_store.add(make_document(BETA, source_id="beta.md", title="Beta runbook"))
-    backend = SpanningBackend(
-        settings=Settings(workspace=ALPHA, **settings),  # pyright: ignore[reportArgumentType]
-        store=alpha_store,
-        organization_=FakeOrganization(workspace_id=ALPHA),
-        retriever_=SpanningRetriever(),
-        others={BETA: (beta_store, FakeOrganization(workspace_id=BETA))},
-    )
-    retriever = backend.retriever_
-    assert isinstance(retriever, SpanningRetriever)
-    retriever.across = [
-        ((BETA,), _candidate(beta_store, "beta.md", 0.9)),
-        ((ALPHA,), _candidate(alpha_store, "alpha.md", 0.7)),
-    ]
-    retriever.candidates = [_candidate(alpha_store, "alpha.md", 0.7)]
-    return backend
-
-
-def _candidate(store: FakeStore, source_id: str, score: float) -> Candidate:
-    document = next(doc for doc in store.documents.values() if doc.source_id == source_id)
-    return Candidate(chunk=make_chunk(document), score=score, scores={"dense": score})
+def _backend(**settings: Any) -> SpanningBackend:
+    """Alpha serving, beta beside it, each holding one runbook; the retriever spans both."""
+    return spanning_backend(ALPHA, BETA, **settings)
 
 
 def _spanning(backend: SpanningBackend) -> SpanningRetriever:
-    retriever = backend.retriever_
-    assert isinstance(retriever, SpanningRetriever)
-    return retriever
+    return backend.spanning
 
 
 # --- when a search is an ordinary one ----------------------------------------------------------

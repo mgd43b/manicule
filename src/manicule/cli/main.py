@@ -51,7 +51,7 @@ from manicule.core.version import CORE_VERSION
 from manicule.generation.answers import EventKind
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     from pydantic import JsonValue
     from rich.console import Console
@@ -256,6 +256,21 @@ Both declarations are the same option, so two spellings of the help would be two
 
 WORKSPACE_HELP = "Run in this workspace instead of the configured one."
 """One sentence for ``--workspace``, for the same reason :data:`JSON_HELP` is one sentence."""
+
+WORKSPACES_HELP = (
+    "Search these workspaces together, comma-separated (a,b), merged into one ranking whose "
+    "hits each name their workspace. An administrator's search. Not --workspace/-w, which runs "
+    "the whole command in one other workspace: this searches several from this one, and "
+    "includes this one only if it is named."
+)
+"""Why ``--workspaces`` and ``--workspace`` are two options and not one.
+
+They differ by a letter and do different things, so the help says so where both are listed:
+``-w b search x`` is an ordinary search run *in* ``b``, and ``search x --workspaces a,b`` is one
+search *across* ``a`` and ``b``, merged. Folding one into the other would make the plural a way
+to change which workspace a command runs in, and the singular a way to widen a search.
+"""
+
 
 WORKSPACE_NAMED_TWICE = (
     "--workspace was given twice with different values, {before!r} before the command and "
@@ -936,8 +951,16 @@ def search(
         list[str] | None,
         typer.Option(help="Restrict to these collections, by name. Repeat to union them."),
     ] = None,
+    workspaces: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--workspaces",
+            help=WORKSPACES_HELP,
+        ),
+    ] = None,
 ) -> None:
     """Rank passages for a query, without asking a model anything."""
+    spanned = _workspace_list(workspaces)
     emit(
         "search",
         lambda service: service.search(
@@ -947,8 +970,21 @@ def search(
             sources=tuple(source or ()),
             media_types=tuple(media_type or ()),
             collections=tuple(collection or ()),
+            workspaces=spanned,
         ),
     )
+
+
+def _workspace_list(values: Sequence[str] | None) -> tuple[str, ...] | None:
+    """``--workspaces a,b --workspaces c`` as ``("a", "b", "c")``; ``None`` when not given.
+
+    Blank pieces are kept rather than dropped, so that ``a,,b`` reaches the service and is
+    refused there — one refusal for every surface, rather than a command line that quietly
+    searched fewer workspaces than it was given.
+    """
+    if not values:
+        return None
+    return tuple(piece for value in values for piece in value.split(","))
 
 
 # --- index ------------------------------------------------------------------------------------
