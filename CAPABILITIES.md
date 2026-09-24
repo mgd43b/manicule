@@ -128,6 +128,12 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 - `auth alerts [--all]` and `auth ack-alert <id>` — list and clear recorded security alerts.
   `--all` includes acknowledged ones; without it, only the open ones a person still has to
   look at. `docs/surfaces.md` §9.11.
+- `auth users`, `auth set-role <user> <role>`, `auth disable-user <user>`,
+  `auth enable-user <user>` and `auth sign-out <user>` — the people-admin surface: list members
+  with role, standing and live session count; change a role (the last enabled administrator
+  cannot be demoted); disable or re-enable a membership (disabling revokes every session and key
+  the member holds, in one transaction); end every session a member holds without disabling
+  them. `docs/surfaces.md` §9.2.1.
 
 ## MCP tools — 46
 
@@ -304,6 +310,11 @@ name — an absence with no test is an absence that comes back.
 - Every request over this surface, over the MCP mount, and the websocket handshake, is now
   metered by `security.rate_limit` — a 429 with a `Retry-After` header, not a new route.
   `docs/surfaces.md` §9.10.
+- `GET /api/v1/auth/users`, `PATCH /api/v1/auth/users/:user` and
+  `POST /api/v1/auth/users/:user/sign-out` — the people-admin surface `mode = "team"` needs and
+  a single-operator build has no one to apply it to: list members with role, standing and live
+  session count; change a role or disable/enable a membership; end every session a member holds.
+  Admin-only. `docs/surfaces.md` §9.2.1.
 
 ## File types — 18
 

@@ -1634,9 +1634,9 @@ and cannot read the runbook. That is a weaker guarantee than checking it themsel
 honestly labeled as an attestation rather than dressed up as a link they could follow.
 
 Sharing is an explicit act whose confirmation states exactly what becomes public, in those
-terms. And because a document *title* can itself be sensitive, team mode can disable sharing
-entirely — one switch, in `security`, rather than a per-field disclosure policy nobody will
-configure correctly.
+terms. And because a document *title* can itself be sensitive, an operator can disable sharing
+entirely — `security.sharing.enabled`, one switch independent of `mode`, rather than a
+per-field disclosure policy nobody will configure correctly.
 
 ### 11.4 Revocation and expiry are not optional
 
