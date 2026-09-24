@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.9](https://github.com/mgd43b/manicule/compare/v0.2.8...v0.2.9) (2026-09-24)
+
+
+### Features
+
+* **security:** team mode — people and sign-in, rate limits, alerts, cross-workspace search ([#405](https://github.com/mgd43b/manicule/issues/405)) ([7152ce3](https://github.com/mgd43b/manicule/commit/7152ce375fe201c1bd8d74a71482723c7d03fe41))
+
 ## [0.2.8](https://github.com/mgd43b/manicule/compare/v0.2.7...v0.2.8) (2026-09-19)
 
 
