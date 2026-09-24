@@ -44,8 +44,11 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from manicule.app import results as r
+from manicule.app.alerts import AlertMonitor
 from manicule.app.bind import is_loopback
+from manicule.app.caller import RANK, current
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
+from manicule.app.throttle import RateLimiter
 from manicule.config.loader import load_settings
 from manicule.config.profiles import profile_config
 from manicule.config.settings import (
@@ -98,6 +101,8 @@ if TYPE_CHECKING:
 
     from pydantic import SecretStr
 
+    from manicule.app.alerts import AlertEvent
+    from manicule.app.caller import Caller
     from manicule.app.ports import Backend, Conversing
     from manicule.connectors.browser import BrowserSessionProvider
     from manicule.connectors.config import ConfluenceConfig
@@ -822,6 +827,19 @@ class ApplicationService:
         the exclusive create in :func:`_write_authored`, which is what makes the default refusal
         atomic rather than merely checked.
         """
+
+        self.rate_limiter = RateLimiter(backend.settings.security.rate_limit)
+        """The caller and failed-auth token buckets. One instance for this service's whole
+        life, so a network surface charges the same buckets on every request rather than
+        starting fresh each time — see :mod:`manicule.app.throttle`."""
+
+        self.alert_monitor = AlertMonitor(
+            backend.settings.security.alerts,
+            max_tracked=backend.settings.security.rate_limit.max_tracked,
+        )
+        """Sliding-window detection of the four patterns :mod:`manicule.app.alerts` names.
+        Bounded by the rate limiter's own ``max_tracked`` rather than a second setting: both
+        are answering "how many distinct callers does this process remember at once"."""
 
     def serving_on(self, host: str) -> None:
         """Record the address this process bound, for :meth:`doctor` to judge instead of the file.
@@ -2144,6 +2162,10 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         require_owns(self.workspace, document)
         stored: Sequence[Chunk] = await store.document_chunks(document_id) if chunks else ()
+        if chunks:
+            # The metadata-only path (`chunks=False`) hands back a title and a status, not the
+            # document's content, so it is not instrumented — see `_record_content_read`.
+            await self._record_content_read(document_id)
         return r.DocumentDetail(
             document=_summary(document, chunk_count=len(stored) if chunks else None),
             chunks=tuple(
@@ -2222,6 +2244,11 @@ class ApplicationService:
             else None
         )
         body = await self._retained_body(document) if content else _Body()
+        if content and body.text is not None:
+            # Not instrumented when `content=False`, or when it was asked for and the store had
+            # none to give — `body.text is None` there, on `unavailable_reason`'s own rule that
+            # "asked for and not held" is not a read of anything.
+            await self._record_content_read(document.id)
         return r.DocumentResolved(
             document=_summary(document),
             resolved_by=resolved_by,
@@ -3155,6 +3182,7 @@ class ApplicationService:
         checks.append(await self._authoring_check())
         checks.append(await self._collection_membership_check())
         checks.append(await self._sessions_check())
+        checks.append(await self._security_alerts_check())
         checks.append(await self._document_identity_check())
         checks.append(await self._document_content_check())
         # After the two content checks and for the same reason they are adjacent: this one is
@@ -3966,6 +3994,31 @@ class ApplicationService:
             if isinstance(base_url, str):
                 held[base_url] = _text(row.get("account"))
         return held
+
+    async def _security_alerts_check(self) -> r.Check:
+        """Whether any recorded security alert is still waiting for a person to look at it.
+
+        ``degraded``, not ``failing``: an alert names a pattern worth attention, not evidence
+        that this installation is broken — the corpus and every check above this one can be
+        perfectly healthy while an address hammers authentication. The remedy names the exact
+        commands to review and clear it, on the rule every other remedy here follows.
+        """
+        store = await self._backend.security_alerts()
+        _rows, total = await store.list_alerts(unacknowledged_only=True, limit=1, offset=0)
+        if total == 0:
+            return r.Check(
+                name="security_alerts",
+                state="ok",
+                detail="no unacknowledged security alerts",
+                facts={"unacknowledged": 0},
+            )
+        return r.Check(
+            name="security_alerts",
+            state="degraded",
+            detail=f"{total} unacknowledged security alert(s)",
+            facts={"unacknowledged": total},
+            remedy="manicule auth alerts; manicule auth ack-alert <id>",
+        )
 
     async def _document_identity_check(self) -> r.Check:
         """Documents keyed on where they sit while the file beside them declares a page id.
@@ -5288,6 +5341,10 @@ class ApplicationService:
             _validate_structural_chunker_config(document, parts)
 
         await asyncio.to_thread(_update_config, path, mutate)
+        # The key only, never the value: a value can be a credential even when the name is not
+        # one `secret_setting` recognizes, and the audit trail is exactly the durable, exported
+        # artifact `secret_setting` exists to keep secrets out of.
+        await self._audit("config.changed", details={"key": key})
         return r.ConfigChange(key=key, previous=previous, value=parsed, path=str(path))
 
     async def _current_value(self, parts: Sequence[str]) -> JsonValue:
@@ -5352,6 +5409,7 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         previous = self.workspace
         change = await self.config_set("workspace", wanted, as_text=True)
+        await self._audit("workspace.switched", details={"previous": previous, "active": wanted})
         return r.WorkspaceSwitched(previous=previous, active=wanted, path=change.path)
 
     # --- plugins --------------------------------------------------------------------------
@@ -5462,6 +5520,7 @@ class ApplicationService:
                 ),
             )
         change = await self._set_plugin_lists(name, enabled=True)
+        await self._audit("plugin.added", details={"name": name})
         return r.PluginChanged(
             name=name, enabled=True, installed=True, path=change, detail="enabled at next start"
         )
@@ -5479,6 +5538,7 @@ class ApplicationService:
             msg = f"no plugin named {name!r} is installed. Installed: {known}"
             raise UnknownEntityError(msg)
         change = await self._set_plugin_lists(name, enabled=False)
+        await self._audit("plugin.removed", details={"name": name})
         return r.PluginChanged(
             name=name,
             enabled=False,
@@ -5495,12 +5555,35 @@ class ApplicationService:
     # --- api keys -------------------------------------------------------------------------
 
     async def api_key_create(
-        self, name: str, *, role: str = "member", expires_days: int | None = None
+        self,
+        name: str,
+        *,
+        role: str = "member",
+        expires_days: int | None = None,
+        allowed_ips: Sequence[str] = (),
+        rate_limit: int | None = None,
     ) -> r.ApiKeyIssued:
         """Mint an API key for this workspace.
 
+        **Ownership and the role cap, decided from** :func:`~manicule.app.caller.current`.
+        The local operator and an administrator may mint any role, and the key they mint is
+        *unowned* — ``user_id`` is ``None``, on the same convention
+        :class:`~manicule.storage.models.ApiKey` already uses for a key the local operator
+        mints: it is provisioned on behalf of the installation rather than tied to whoever is
+        holding admin authority at the moment they minted it, which matters once a signed-in
+        administrator is a caller this process can have. A caller with a role below admin may
+        mint a key only at or below that role, and only for themselves — ``user_id`` is their
+        own — so a member cannot hand out an admin key and a key always has an owner whose
+        membership can later demote or revoke it. A non-admin caller with no ``user_id`` at all
+        — a member or viewer key that is itself unowned — cannot mint anything: there would be
+        nobody for the new key to belong to, and minting an unowned key from a non-admin
+        authority would let it outlive the very membership that justified it.
+
         Raises:
-            ConfigError: The name is empty, or the role is not one manicule has.
+            ConfigError: The name is empty, the role is not one manicule has, an entry in
+                ``allowed_ips`` is not an address or a CIDR range, or ``rate_limit`` is not a
+                positive number of requests per minute.
+            PolicyError: The caller may not mint a key at all, or not one with this role.
         """
         label = name.strip()
         if not label:
@@ -5512,30 +5595,72 @@ class ApplicationService:
             allowed = ", ".join(item.value for item in Role)
             msg = f"no such role {role!r}. Available: {allowed}"
             raise ConfigError(msg) from exc
+        if rate_limit is not None and rate_limit < 1:
+            msg = f"rate_limit must be at least 1 request per minute, got {rate_limit}"
+            raise ConfigError(msg)
+        cidrs = _validated_cidrs(allowed_ips)
+        owner = _key_owner_for(current(), chosen)
         keys = await self._backend.keys()
-        summary, secret = await keys.issue(label, role=chosen.value, expires_days=expires_days)
+        summary, secret = await keys.issue(
+            label,
+            role=chosen.value,
+            expires_days=expires_days,
+            user_id=owner,
+            allowed_ips=cidrs,
+            rate_limit=rate_limit,
+        )
         # The record, never the secret. An audit trail that quoted the credential it was
         # recording the creation of would be a copy of every key ever minted.
         await self._audit(
             "api_key.created",
-            details={"id": summary.id, "name": summary.name, "role": summary.role},
+            details={
+                "id": summary.id,
+                "name": summary.name,
+                "role": summary.role,
+                "owner": summary.user_id,
+                "allowed_ips": list(summary.allowed_ips),
+                "rate_limit": summary.rate_limit,
+            },
         )
         return r.ApiKeyIssued(key=summary, secret=secret)
 
     async def api_key_list(self) -> r.ApiKeyList:
-        """Every key in this workspace. Never a secret — only digests are stored."""
-        keys = await self._backend.keys()
-        listed = tuple(await keys.list_keys())
+        """Keys in this workspace: every one for an admin or the local operator, else only the
+        caller's own.
+
+        Never a secret — only digests are stored.
+        """
+        caller = current()
+        if caller.is_local or caller.holds(Role.ADMIN):
+            keys = await self._backend.keys()
+            listed = tuple(await keys.list_keys())
+        elif caller.user_id:
+            keys = await self._backend.keys()
+            listed = tuple(await keys.list_keys(owner=caller.user_id))
+        else:
+            # A non-admin caller with no user_id — an unowned key's own holder — owns nothing.
+            listed = ()
         return r.ApiKeyList(count=len(listed), keys=listed)
 
     async def api_key_revoke(self, name_or_id: str) -> r.ApiKeyRevoked:
-        """Revoke a key.
+        """Revoke a key: any key in this workspace for an admin or the local operator, else only
+        one the caller owns.
 
         Raises:
-            UnknownEntityError: No key by that name or id **in this workspace**.
+            UnknownEntityError: No key by that name or id **in this workspace**, or it exists
+                but belongs to somebody else — reported identically, so a non-admin caller
+                cannot use this to discover what keys other people hold.
         """
+        caller = current()
         keys = await self._backend.keys()
-        summary = await keys.revoke(name_or_id)
+        if caller.is_local or caller.holds(Role.ADMIN):
+            summary = await keys.revoke(name_or_id)
+        elif caller.user_id:
+            summary = await keys.revoke(name_or_id, restrict_to_owner=caller.user_id)
+        else:
+            # A non-admin caller with no user_id owns nothing, ever.
+            msg = f"no API key named {name_or_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
         await self._audit("api_key.revoked", details={"id": summary.id, "name": summary.name})
         return r.ApiKeyRevoked(id=summary.id, name=summary.name, revoked=True)
 
@@ -6054,7 +6179,13 @@ class ApplicationService:
             NameInUseError: A collection of that name already exists here.
         """
         store = await self._backend.organization()
-        return _collection(await store.create_collection(name, description=description, rule=rule))
+        created = _collection(
+            await store.create_collection(name, description=description, rule=rule)
+        )
+        await self._audit(
+            "collection.created", details={"collection_id": created.id, "name": created.name}
+        )
+        return created
 
     async def collection_list(self) -> r.CollectionList:
         """Every collection in this workspace."""
@@ -6072,6 +6203,7 @@ class ApplicationService:
         """
         store = await self._backend.organization()
         await store.delete_collection(collection_id)
+        await self._audit("collection.deleted", details={"collection_id": collection_id})
         return r.CollectionDeleted(collection_id=collection_id, deleted=True)
 
     async def collection_add(
@@ -6476,6 +6608,53 @@ class ApplicationService:
             ),
         )
 
+    async def security_alerts(
+        self, *, unacknowledged_only: bool = False, limit: int = 50, offset: int = 0
+    ) -> r.SecurityAlertList:
+        """A page of recorded security alerts, newest first.
+
+        Recorded independently of ``security.audit.enabled`` — see
+        :meth:`record_security_alert` — so this list is not empty just because auditing is off.
+        """
+        store = await self._backend.security_alerts()
+        rows, total = await store.list_alerts(
+            unacknowledged_only=unacknowledged_only, limit=limit, offset=offset
+        )
+        return r.SecurityAlertList(
+            total=total,
+            count=len(rows),
+            limit=limit,
+            offset=offset,
+            unacknowledged_only=unacknowledged_only,
+            alerts=tuple(
+                r.SecurityAlert(
+                    id=_text(row.get("id")),
+                    kind=_text(row.get("kind")),
+                    subject=_text(row.get("subject")),
+                    details=_json_object(row.get("details")),
+                    created_at=_text(row.get("created_at")),
+                    acknowledged_at=_text_or_none(row.get("acknowledged_at")),
+                    acknowledged_by=_text_or_none(row.get("acknowledged_by")),
+                )
+                for row in rows
+            ),
+        )
+
+    async def security_alert_acknowledge(self, alert_id: str) -> r.SecurityAlertAcknowledged:
+        """Mark one alert acknowledged, recording who did it.
+
+        Raises:
+            UnknownEntityError: No such alert in this workspace.
+        """
+        store = await self._backend.security_alerts()
+        actor = current().actor
+        row = await store.acknowledge_alert(alert_id, by=actor)
+        if row is None:
+            msg = f"no security alert {alert_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        await self._audit("security.alert_acknowledged", details={"id": alert_id})
+        return r.SecurityAlertAcknowledged(id=alert_id, acknowledged=True, acknowledged_by=actor)
+
     async def search_quality(self) -> r.SearchQuality:
         """What the evaluation harness has recorded, rendered by the harness itself.
 
@@ -6576,7 +6755,7 @@ class ApplicationService:
 
     # --- identity -------------------------------------------------------------------------
 
-    async def authenticate(self, secret: str) -> r.Identity:
+    async def authenticate(self, secret: str, *, address: str = "") -> r.Identity:
         """Turn a presented API key into an identity, or say plainly that it is not one.
 
         The whole decision lives here rather than in the surface that received the header, so
@@ -6587,6 +6766,11 @@ class ApplicationService:
         When ``security.auth.mode`` is ``none`` this reports an unauthenticated identity
         rather than inventing one — and it is the bind policy, not this method, that stops an
         unauthenticated installation being reachable from anywhere but loopback.
+
+        Args:
+            address: The presenting client's address, passed to
+                :meth:`~manicule.app.ports.Keys.verify` so a key with a non-empty
+                ``allowed_ips`` is refused from anywhere else.
         """
         mode = self.settings.security.auth.mode
         if mode is AuthMode.NONE:
@@ -6598,7 +6782,7 @@ class ApplicationService:
                 authenticated=False, mode=mode.value, role="", workspace=self.workspace
             )
         keys = await self._backend.keys()
-        summary = await keys.verify(secret)
+        summary = await keys.verify(secret, address=address)
         if summary is None:
             return r.Identity(
                 authenticated=False, mode=mode.value, role="", workspace=self.workspace
@@ -6611,7 +6795,20 @@ class ApplicationService:
             key_name=summary.name,
             workspace=summary.workspace,
             via="key",
+            user_id=summary.user_id or "",
+            user_email=summary.user_email or "",
+            user_name=summary.user_name or "",
+            rate_limit=summary.rate_limit,
         )
+
+    async def record_failed_authentication(self, *, credential_kind: str) -> None:
+        """Audit a presented credential that did not authenticate.
+
+        Never the credential's value — only which *kind* it was (``bearer`` or ``x-api-key``)
+        — and the address is whatever :func:`~manicule.app.caller.current` reports, which the
+        surface has already set with :func:`~manicule.app.caller.acting_as` before calling this.
+        """
+        await self._audit("auth.failed", details={"credential_kind": credential_kind})
 
     async def auth_providers(self) -> r.AuthProviders:
         """Which identity providers are configured, by name and type only.
@@ -6654,6 +6851,12 @@ class ApplicationService:
         once against configuration instead of a condition every call site repeats — and the
         admin surface reports the same switch alongside the entries, so an empty trail is
         never mistaken for a quiet one.
+
+        ``actor`` and ``ip_address`` come from :func:`~manicule.app.caller.current`, which the
+        network surfaces set with :func:`~manicule.app.caller.acting_as` before calling into
+        the service — see that module's docstring. **Every one of them, always**: a call site
+        that used to pass neither left every row with no actor at all, which made an audit
+        trail exist without answering the one question an audit trail is for.
         """
         audit = self.settings.security.audit
         if not audit.enabled:
@@ -6661,10 +6864,71 @@ class ApplicationService:
         if audit.events and event_type not in audit.events:
             return
         telemetry = await self._backend.telemetry()
+        caller = current()
         # Deliberately **not** wrapped the way `_record_query` is. An audit entry that cannot
         # be written must fail the operation it was auditing: a trail with holes in it is worse
         # than none, because the holes are invisible and the operation reported success.
-        await telemetry.record_audit(event_type, details=details)
+        await telemetry.record_audit(
+            event_type, details=details, actor=caller.actor, ip_address=caller.address or None
+        )
+
+    async def record_security_alert(self, event: AlertEvent | None) -> None:
+        """Persist, log and audit one alert :attr:`alert_monitor` decided to fire.
+
+        Recorded even when auditing is off — the ``security_alerts`` row and the warning log
+        are the alert; ``security.alert`` in the audit trail is a second, optional view of the
+        same fact and follows ``audit.enabled`` like everything else :meth:`_audit` writes.
+
+        Args:
+            event: ``None`` when nothing crossed a threshold, which every ``record_*`` method on
+                :class:`~manicule.app.alerts.AlertMonitor` returns far more often than not — a
+                caller passes whatever came back without checking first, on the same rule
+                :meth:`_audit` follows for "is auditing on".
+        """
+        if event is None:
+            return
+        store = await self._backend.security_alerts()
+        alert_id = await store.record_alert(event.kind, event.subject, details=event.details)
+        # WARNING, not ERROR: nothing has failed. A pattern worth a person's attention is not
+        # a defect in this installation, and neither the subject nor the details carry document
+        # text or a credential — see `AlertEvent`.
+        _log.warning(
+            "security alert %s: kind=%s subject=%s details=%s",
+            alert_id,
+            event.kind,
+            event.subject,
+            event.details,
+        )
+        await self._audit(
+            "security.alert",
+            details={"id": alert_id, "kind": event.kind, "subject": event.subject, **event.details},
+        )
+
+    async def _record_content_read(self, document_id: str) -> None:
+        """Instrument one read of a document's actual content: :meth:`document_get` with
+        ``chunks=True`` and :meth:`document_resolve` with ``content=True`` — the two places
+        manicule hands a caller a document's stored text or bytes, rather than a title, a
+        status, or a ranked passage.
+
+        **Search hits are deliberately not instrumented.** Search returns short passages
+        ranked for relevance, which is the corpus's core function rather than an export;
+        counting every hit here would flag ordinary use as a security event, and would fire in
+        proportion to how often somebody searches rather than to how much of the corpus they
+        have actually read.
+
+        **The local operator is not monitored for export volume.** They already hold every
+        authority the command line gives them, including ``manicule export``, so flagging their
+        own reads is noise with no security value — there is no boundary here for an alert to
+        be evidence of crossing. The audit trail still records the read regardless of who made
+        it: ``document.accessed`` is gated by ``security.audit.enabled`` like every other event,
+        never by who the caller is.
+        """
+        await self._audit("document.accessed", details={"document_id": document_id})
+        caller = current()
+        if caller.is_local:
+            return
+        event = self.alert_monitor.record_document_read(caller.actor, document_id)
+        await self.record_security_alert(event)
 
     async def _record_query(
         self, query: Query, retrieved: RetrievalResult, *, started: float
@@ -8172,6 +8436,50 @@ def _config_key_parts(key: str) -> list[str]:
     if len(raw) >= component_field_parts and raw[:2] == ["plugins", "config"]:
         return [*raw[:2], f"{raw[2]}.{raw[3]}", *raw[4:]]
     return raw
+
+
+def _validated_cidrs(allowed_ips: Sequence[str]) -> tuple[str, ...]:
+    """Every entry as a network, on :class:`~manicule.config.settings.TransportSettings`'s own
+    rule for ``trusted_proxies``: ``ip_network(..., strict=False)``, so a bare host address means
+    that single host.
+
+    Raises:
+        ConfigError: An entry is not an address or a CIDR range, naming it.
+    """
+    from ipaddress import ip_network  # noqa: PLC0415
+
+    for entry in allowed_ips:
+        try:
+            ip_network(entry, strict=False)
+        except ValueError as exc:
+            msg = f"{entry!r} is not an address or a CIDR range for allowed_ips ({exc})"
+            raise ConfigError(msg) from exc
+    return tuple(allowed_ips)
+
+
+def _key_owner_for(caller: Caller, requested_role: Role) -> str | None:
+    """Who a newly minted key belongs to, and the role cap that comes with not being an admin.
+
+    See :meth:`ApplicationService.api_key_create` for the reasoning; this is only the rule.
+
+    Raises:
+        PolicyError: The caller may not mint a key at all, or not one with ``requested_role``.
+    """
+    if caller.is_local or caller.holds(Role.ADMIN):
+        return None
+    if not caller.user_id:
+        msg = (
+            "minting an API key requires being signed in, an administrator, or the local "
+            "operator — this caller is none of those"
+        )
+        raise PolicyError(msg)
+    if caller.role is not None and RANK[requested_role] > RANK[caller.role]:
+        msg = (
+            f"cannot mint a key with role {requested_role.value!r}: that is more authority "
+            f"than this caller holds ({caller.role.value!r})"
+        )
+        raise PolicyError(msg)
+    return caller.user_id
 
 
 def _validate_structural_chunker_config(

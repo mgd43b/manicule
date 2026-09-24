@@ -1102,6 +1102,8 @@ CLI_ONLY_OPS: frozenset[str] = frozenset(
         "auth_create_key",
         "auth_list_keys",
         "auth_revoke_key",
+        "auth_alerts",
+        "auth_ack_alert",
         "backup",
         "completion",
         "document_reembed",
@@ -2555,6 +2557,7 @@ def test_connector_sidecar_reports_which_profiles_ran(
 MINIMAL: dict[str, list[str]] = {
     "auth_create_key": ["auth", "create-key", "ci"],
     "auth_revoke_key": ["auth", "revoke-key", "ci"],
+    "auth_ack_alert": ["auth", "ack-alert", "alert-1"],
     "collection_add": ["collection", "add", "col-1", "doc-1"],
     "collection_create": ["collection", "create", "runbooks"],
     "collection_delete": ["collection", "delete", "col-1"],

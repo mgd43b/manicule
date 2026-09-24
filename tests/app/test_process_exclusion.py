@@ -260,6 +260,7 @@ WRITERS: frozenset[str] = frozenset(
     {
         "auth_create_key",
         "auth_revoke_key",
+        "auth_ack_alert",
         "collection_add",
         "collection_create",
         "collection_delete",

@@ -356,6 +356,20 @@ class RedactionError(GenerationError):
     """
 
 
+class RateLimitedError(ManiculeError):
+    """A caller has exhausted its token bucket, or an address has exhausted its failed-auth one.
+
+    Carries ``retry_after_s`` so the surface that raises it — the HTTP middleware, the MCP
+    mount guard, the websocket handshake — can tell the caller how long to wait without
+    inventing a number of its own. Rounded up by whoever renders it, never down: a caller told
+    to wait less than the bucket actually needs will just be refused again.
+    """
+
+    def __init__(self, message: str, *, retry_after_s: float) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
 class TokenStateError(ManiculeError):
     """A backend returned something other than per-token hidden states.
 
@@ -404,6 +418,7 @@ __all__ = [
     "ProviderRateLimitError",
     "ProviderRequestError",
     "ProviderTimeoutError",
+    "RateLimitedError",
     "ReconciliationRefusedError",
     "RedactionError",
     "StorageBusyError",

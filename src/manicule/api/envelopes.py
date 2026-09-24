@@ -37,6 +37,7 @@ FORBIDDEN = 403
 NOT_FOUND = 404
 CONFLICT = 409
 UNPROCESSABLE = 422
+TOO_MANY_REQUESTS = 429
 SERVER_ERROR = 500
 SERVICE_UNAVAILABLE = 503
 
@@ -52,6 +53,7 @@ STATUS_BY_ERROR: dict[str, int] = {
     "UnknownConversationError": NOT_FOUND,
     "NameInUseError": CONFLICT,
     "FingerprintMismatchError": CONFLICT,
+    "RateLimitedError": TOO_MANY_REQUESTS,
     "ConfigError": BAD_REQUEST,
     "ValueError": BAD_REQUEST,
     "CapacityRefusedError": SERVICE_UNAVAILABLE,
@@ -141,6 +143,7 @@ __all__ = [
     "SERVER_ERROR",
     "SERVICE_UNAVAILABLE",
     "STATUS_BY_ERROR",
+    "TOO_MANY_REQUESTS",
     "UNAUTHORIZED",
     "UNPROCESSABLE",
     "as_response",

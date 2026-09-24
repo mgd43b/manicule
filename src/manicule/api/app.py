@@ -48,6 +48,7 @@ than deciding again.
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI, Request
@@ -60,7 +61,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from manicule.api.envelopes import AUTH_ERRORS, malformed, refusal
 from manicule.api.origins import FETCH_SITE, ORIGIN, REFUSAL, permitted
-from manicule.api.proxy import ProxyPolicy
+from manicule.api.proxy import FORWARDED_FOR, ProxyPolicy
 from manicule.api.routes import (
     admin,
     auth,
@@ -73,17 +74,28 @@ from manicule.api.routes import (
     workbench,
 )
 from manicule.api.routes import health as health_routes
-from manicule.api.security import require, resolve
+from manicule.api.security import API_KEY_HEADER, BEARER, require, resolve, token_of
 from manicule.api.widget import router as widget_router
 from manicule.app import frontdoor
 from manicule.app.bind import is_loopback, require_authoring_authentication
+from manicule.app.caller import Caller, acting_as
 from manicule.app.request_logging_http import RequestLoggingMiddleware
+from manicule.app.throttle import caller_key
 from manicule.config.settings import AuthMode, Role
-from manicule.core.errors import PolicyError
+from manicule.core.errors import PolicyError, RateLimitedError
 from manicule.core.version import CORE_VERSION
 from manicule.mcp.serve import surface as mcp_surface
 
 NOT_FOUND = 404
+
+RATE_LIMIT_EXEMPT_PATHS = frozenset({"/healthz", "/readyz"})
+"""Liveness and readiness probes: exempt because a process supervisor or a container
+orchestrator hits these on a fixed schedule that has nothing to do with how busy the process
+is, and the whole point of a liveness probe is that it cannot be made to fail by load — the
+same reason ``docs/surfaces.md`` §5 gives for ``/healthz`` opening no store. Refusing one with
+429 would turn "this process is fine but busy" into "restart this process", which is the
+opposite of what the probe exists to prevent.
+"""
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -92,6 +104,7 @@ if TYPE_CHECKING:
 
     from manicule.app.bind import Bind
     from manicule.app.service import ApplicationService
+    from manicule.config.settings import Settings
 
 logger = logging.getLogger("manicule.api")
 
@@ -215,7 +228,10 @@ def frame_policy(origins: tuple[str, ...]) -> str:
     return f"default-src 'none'; frame-ancestors {ancestors}"
 
 
-def build_app(
+def build_app(  # noqa: PLR0915 - assembling every route group, middleware and refusal
+    # exactly once is the point of the module; splitting it for a line count would put the
+    # security header, the rate limit and the cross-site check back at risk of disagreeing
+    # about what a request is, the failure this function's own docstring exists to prevent.
     service: ApplicationService,
     *,
     bind: Bind | None = None,
@@ -332,22 +348,78 @@ def build_app(
     async def identify(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        """Refuse a cross-site write, resolve the caller, and dress the response.
+        """Meter, authenticate, refuse a cross-site write, run the request with its caller in
+        force, and dress the response.
 
-        All three here rather than per dependency, so that the address decision — which reads
-        a header and a socket peer — happens in exactly one place, every route including the
-        ones that need no credential sees the same principal, and the cross-site refusal
-        applies to routes that do not exist yet.
+        All of it here rather than per dependency, so that the address decision — which reads a
+        header and a socket peer — happens in exactly one place, every route including the ones
+        that need no credential sees the same principal, and no route can be the one that forgot
+        to ask for a rate-limit check or forgot to declare the caller acting on the operation it
+        runs. :func:`~manicule.app.caller.acting_as` is entered around ``call_next`` alone, once
+        the caller is fully decided and charged — so a refusal built above never runs under a
+        caller's identity, and every service call downstream, over HTTP and over the MCP mount
+        this application carries, runs under this request's.
+
+        Order matters and follows :class:`~manicule.config.settings.RateLimitSettings`'s own
+        docstring: the failed-authentication bucket is consulted *before* a presented credential
+        is checked at all, so an address that has already used up its guesses is refused without
+        this process hashing and looking up whatever it sent; only a credential that was
+        presented and did not work charges that bucket, so a correct key never spends it and an
+        anonymous request never does either.
         """
-        request.state.principal = await resolve(service, app.state.proxy_policy, request)
-        response = _refuse_cross_site(service, request) or await call_next(request)
-        for header, value in SECURITY_HEADERS.items():
-            response.headers.setdefault(header, value)
-        response.headers.setdefault(
-            "Content-Security-Policy",
-            frame_policy(settings.security.transport.widget_allowed_domains),
-        )
-        return response
+        if request.url.path in RATE_LIMIT_EXEMPT_PATHS:
+            request.state.principal = await resolve(service, app.state.proxy_policy, request)
+            return _dress_response(
+                _refuse_cross_site(service, request) or await call_next(request), settings
+            )
+
+        limiter = service.rate_limiter
+        address = _client_address(app.state.proxy_policy, request)
+        unavailable = limiter.failed_auth_available(address)
+        if not unavailable.allowed:
+            return _refuse_rate_limit(
+                request,
+                service,
+                settings,
+                web=web,
+                message=f"too many failed authentications from this address; retry in "
+                f"{unavailable.retry_after_s:.0f}s",
+                retry_after_s=unavailable.retry_after_s,
+            )
+
+        principal = await resolve(service, app.state.proxy_policy, request)
+        if token_of(request) and not principal.identity.authenticated:
+            limiter.charge_failed_auth(address)
+            with acting_as(Caller(address=address)):
+                await service.record_security_alert(
+                    service.alert_monitor.record_failed_auth(address)
+                )
+                await service.record_failed_authentication(
+                    credential_kind=_credential_kind(request)
+                )
+
+        caller = principal.caller
+        charged = limiter.charge_caller(caller_key(caller), rate_limit=caller.rate_limit)
+        if not charged.allowed:
+            if caller.key_id:
+                with acting_as(caller):
+                    await service.record_security_alert(
+                        service.alert_monitor.record_rate_limited(caller.key_id)
+                    )
+            return _refuse_rate_limit(
+                request,
+                service,
+                settings,
+                web=web,
+                message=f"rate limit exceeded for this caller; retry in "
+                f"{charged.retry_after_s:.0f}s",
+                retry_after_s=charged.retry_after_s,
+            )
+
+        request.state.principal = principal
+        with acting_as(caller):
+            response = _refuse_cross_site(service, request) or await call_next(request)
+        return _dress_response(response, settings)
 
     async def refuse(request: Request, exc: Exception) -> JSONResponse:
         """Render an authentication or authorization refusal as the ordinary envelope."""
@@ -458,6 +530,19 @@ def _admits_only_a_caller_the_routes_would_admit(
     dry-running tools only, so the writes are absent rather than merely unreachable. The floor
     is the same question the routes answer — *is this caller admitted at all* — asked in the
     one place a mount can be asked it.
+
+    **Rate limiting needs none of this.** ``identify`` charges every request's bucket
+    unconditionally, before routing decides where the request goes — this mount is reached only
+    through that routing, on the same request, in the same task — so a request already spent its
+    charge before it ever reaches this guard. A second charge here would meter traffic to
+    ``/mcp/`` twice as strictly as the identical request to a plain route, which is not "the same
+    caller limit" applied to a second surface; it is a different, tighter one nobody configured.
+    :func:`~manicule.app.caller.acting_as` **is** re-entered below, explicitly, rather than
+    trusted to have survived the trip through routing — a defensive redundancy `identify`'s own
+    ``with acting_as(caller):`` should already provide, kept because a mount is exactly the kind
+    of ASGI boundary a future change to how it is served could quietly hand a request to a new
+    task, and a caller silently reverting to the local operator there would fail in the
+    permissive direction rather than the safe one.
     """
 
     async def guard(scope: Scope, receive: Receive, send: Send) -> None:
@@ -479,7 +564,8 @@ def _admits_only_a_caller_the_routes_would_admit(
             # is itself an ASGI application, so the refusal needs no separate rendering path.
             await refusal("mcp", service.workspace, exc)(scope, receive, send)
             return
-        await mounted(scope, receive, send)
+        with acting_as(principal.caller):
+            await mounted(scope, receive, send)
 
     return guard
 
@@ -519,6 +605,78 @@ def _op_of(request: Request) -> str:
     route = request.scope.get("route")
     name = getattr(route, "name", "")
     return name or "request"
+
+
+def _client_address(policy: ProxyPolicy, request: Request) -> str:
+    """The address :func:`~manicule.api.security.resolve` would compute, read early.
+
+    Rate limiting needs this **before** a credential is checked at all — the failed-auth bucket
+    is consulted ahead of :func:`~manicule.api.security.resolve` itself — so it is computed here
+    rather than taken from the :class:`~manicule.api.security.Principal` that call produces.
+    :func:`~manicule.api.security.resolve` computes the identical value the ordinary way once
+    resolution does run; the two are never expected to disagree, because both read the same
+    policy over the same request.
+    """
+    client = request.client
+    return policy.client_address(
+        peer=client.host if client is not None else None,
+        forwarded_for=request.headers.get(FORWARDED_FOR),
+    )
+
+
+def _credential_kind(request: Request) -> str:
+    """Which header carried a presented credential. Never its value.
+
+    Only ever read after confirming a credential *was* presented, so the fallback here is
+    unreachable in practice — kept explicit rather than asserted, because a refusal path is the
+    wrong place for an assertion to be the thing that fails loudly.
+    """
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith(BEARER):
+        return "bearer"
+    if request.headers.get(API_KEY_HEADER, ""):
+        return "x-api-key"
+    return "unknown"
+
+
+def _dress_response(response: Response, settings: Settings) -> Response:
+    """The headers every response carries, applied once regardless of what produced it."""
+    for header, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    response.headers.setdefault(
+        "Content-Security-Policy", frame_policy(settings.security.transport.widget_allowed_domains)
+    )
+    return response
+
+
+def _refuse_rate_limit(
+    request: Request,
+    service: ApplicationService,
+    settings: Settings,
+    *,
+    web: bool,
+    message: str,
+    retry_after_s: float,
+) -> Response:
+    """A 429, as a page for a browser and as the ordinary envelope for everyone else.
+
+    Built directly rather than raised: an exception from ``identify`` would reach only
+    :class:`~starlette.middleware.errors.ServerErrorMiddleware`, which sits outside every
+    registered exception handler and would render a bare 500 — the handlers Starlette wires into
+    :class:`~starlette.exceptions.ExceptionMiddleware` sit *inside* user middleware, wrapping
+    only the router, so they never see something ``identify`` raises itself. The cross-site
+    refusal beside this one follows the same rule for the same reason.
+    """
+    if web:
+        from manicule.web.security import is_page_request, rate_limited_page  # noqa: PLC0415
+
+        if is_page_request(request):
+            return rate_limited_page(request, message, retry_after_s=retry_after_s)
+    response = refusal(
+        _op_of(request), service.workspace, RateLimitedError(message, retry_after_s=retry_after_s)
+    )
+    response.headers["Retry-After"] = str(max(1, math.ceil(retry_after_s)))
+    return _dress_response(response, settings)
 
 
 def _require_auth_for_wide_bind(

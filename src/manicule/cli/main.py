@@ -727,6 +727,8 @@ PAYLOADS: dict[str, type[Payload]] = {
     "auth_create_key": r.ApiKeyIssued,
     "auth_list_keys": r.ApiKeyList,
     "auth_revoke_key": r.ApiKeyRevoked,
+    "auth_alerts": r.SecurityAlertList,
+    "auth_ack_alert": r.SecurityAlertAcknowledged,
     "collection_create": r.CollectionSummary,
     "collection_list": r.CollectionList,
     "collection_rename": r.CollectionSummary,
@@ -1939,9 +1941,32 @@ def auth_create_key(
     name: Annotated[str, typer.Argument(help="A label for the key.")],
     role: Annotated[str, typer.Option(help="admin, member or viewer.")] = "member",
     expires_days: Annotated[int | None, typer.Option(help="Days until it expires.")] = None,
+    allow_ip: Annotated[
+        list[str] | None,
+        typer.Option("--allow-ip", help="A CIDR range the key may be presented from. Repeatable."),
+    ] = None,
+    rate_limit: Annotated[
+        int | None,
+        typer.Option(help="Requests per minute for this key, replacing the installation default."),
+    ] = None,
 ) -> None:
     """Mint an API key for this workspace. The secret is shown once and never stored."""
-    submit(Command("auth_create_key", {"name": name, "role": role, "expires_days": expires_days}))
+    # Cast rather than annotated, on `collection_add`'s own reasoning: `list` is invariant, so
+    # `list[str]` is never a `list[JsonValue]` however it is spelled, and every list of strings
+    # is a list of JSON values.
+    allowed_ips = cast("list[JsonValue]", list(allow_ip or []))
+    submit(
+        Command(
+            "auth_create_key",
+            {
+                "name": name,
+                "role": role,
+                "expires_days": expires_days,
+                "allowed_ips": allowed_ips,
+                "rate_limit": rate_limit,
+            },
+        )
+    )
 
 
 @auth_app.command("list-keys")
@@ -1956,6 +1981,27 @@ def auth_revoke_key(
 ) -> None:
     """Revoke an API key. Immediate, and irreversible."""
     submit(Command("auth_revoke_key", {"name_or_id": name_or_id}))
+
+
+@auth_app.command("alerts")
+def auth_alerts(
+    all_: Annotated[
+        bool, typer.Option("--all", help="Include acknowledged alerts, not just open ones.")
+    ] = False,
+) -> None:
+    """List recorded security alerts: brute force, key abuse, export volume."""
+    emit(
+        "auth_alerts",
+        lambda service: service.security_alerts(unacknowledged_only=not all_),
+    )
+
+
+@auth_app.command("ack-alert")
+def auth_ack_alert(
+    alert_id: Annotated[str, typer.Argument(help="The alert's id.")],
+) -> None:
+    """Acknowledge one security alert."""
+    submit(Command("auth_ack_alert", {"alert_id": alert_id}))
 
 
 # --- plugin -----------------------------------------------------------------------------------

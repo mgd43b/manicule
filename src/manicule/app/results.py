@@ -1924,6 +1924,11 @@ class Identity(Payload):
     )
     user_email: str = ""
     user_name: str = ""
+    rate_limit: int | None = Field(
+        default=None,
+        description="This caller's own requests-per-minute cap, when the presented key carries "
+        "one. ``None`` means the installation's configured default applies.",
+    )
 
 
 class AuthProviders(Payload):
@@ -2382,11 +2387,12 @@ class Check(Payload):
 
     ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``plugins``,
     ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
-    ``authoring``, ``collection-membership``, ``sessions``, ``document-identity``,
-    ``document-content``, ``extractable-text``, ``wiki-provenance``, ``grammars``,
-    ``vocabularies``, ``models``, and ``component:<kind>:<name>`` for anything already
-    constructed. ``vector_backend`` is emitted too and had been missing from this list since it
-    was added, which is the drift this enumeration exists to prevent and is now corrected.
+    ``authoring``, ``collection-membership``, ``sessions``, ``security_alerts``,
+    ``document-identity``, ``document-content``, ``extractable-text``, ``wiki-provenance``,
+    ``grammars``, ``vocabularies``, ``models``, and ``component:<kind>:<name>`` for anything
+    already constructed. ``vector_backend`` is emitted too and had been missing from this list
+    since it was added, which is the drift this enumeration exists to prevent and is now
+    corrected.
 
     It is what a monitor selects on, so a name is chosen once and does not move with the
     wording — which is why the two spellings in that list stay as they are rather than being
@@ -2821,6 +2827,26 @@ class ApiKeySummary(Payload):
     created_at: str = ""
     expires_at: str | None = None
     revoked: bool = False
+    user_id: str | None = Field(
+        default=None,
+        description="The person who minted it, or ``None`` for a key minted by an "
+        "administrator or the local operator on behalf of the installation.",
+    )
+    user_email: str | None = Field(
+        default=None,
+        description="The owner's address, when this summary was built from a resolved "
+        "authentication rather than a listing — populated there because the join is already "
+        "being paid for, and not on every row of a listing where it would not be.",
+    )
+    user_name: str | None = None
+    allowed_ips: tuple[str, ...] = Field(
+        default=(), description="CIDR ranges the key may be presented from. Empty means anywhere."
+    )
+    rate_limit: int | None = Field(
+        default=None,
+        description="Requests per minute for this key, replacing the installation's default "
+        "when set.",
+    )
 
 
 class ApiKeyIssued(Payload):
@@ -2846,6 +2872,42 @@ class ApiKeyRevoked(Payload):
     id: str
     name: str
     revoked: bool
+
+
+class SecurityAlert(Payload):
+    """One recorded pattern: brute force, key abuse, or export volume.
+
+    ``details`` carries only counts and window lengths — see
+    :class:`~manicule.app.alerts.AlertEvent` — never a credential, an address history or
+    document text.
+    """
+
+    id: str
+    kind: str
+    subject: str
+    details: dict[str, JsonValue] = Field(default_factory=dict)
+    created_at: str = ""
+    acknowledged_at: str | None = None
+    acknowledged_by: str | None = None
+
+
+class SecurityAlertList(Payload):
+    """A page of the alert list, newest first."""
+
+    total: int = Field(ge=0)
+    count: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+    unacknowledged_only: bool = False
+    alerts: tuple[SecurityAlert, ...] = ()
+
+
+class SecurityAlertAcknowledged(Payload):
+    """The outcome of acknowledging one alert."""
+
+    id: str
+    acknowledged: bool
+    acknowledged_by: str = ""
 
 
 __all__ = [
@@ -2925,6 +2987,9 @@ __all__ = [
     "SearchHit",
     "SearchQuality",
     "SearchResult",
+    "SecurityAlert",
+    "SecurityAlertAcknowledged",
+    "SecurityAlertList",
     "ServerAddress",
     "ShareCreated",
     "ShareRevoked",

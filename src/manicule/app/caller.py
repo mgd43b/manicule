@@ -60,6 +60,16 @@ class Caller:
     address: str = ""
     """The client address, as the proxy policy resolved it. Empty when there was none."""
 
+    rate_limit: int | None = None
+    """This caller's own requests-per-minute cap, when a presented key carries one.
+
+    ``None`` means "no override" — the caller is metered at
+    ``security.rate_limit.per_minute`` like everyone else. Carried here rather than looked up
+    again at the point of charging, because the key row that named it has already been read
+    once, by whichever surface resolved this caller; reading it a second time would be a second
+    place the two could disagree.
+    """
+
     @property
     def is_local(self) -> bool:
         """Whether this is the operator at this machine rather than a network caller."""

@@ -670,31 +670,71 @@ class Keys(Protocol):
     """
 
     async def issue(
-        self, name: str, *, role: str, expires_days: int | None = None
+        self,
+        name: str,
+        *,
+        role: str,
+        expires_days: int | None = None,
+        user_id: str | None = None,
+        allowed_ips: Sequence[str] = (),
+        rate_limit: int | None = None,
     ) -> tuple[ApiKeySummary, str]:
         """Mint a key. Returns its record and the secret, which exists only here.
 
         The secret is returned once and never stored — only a digest is. A lost key is
         reissued rather than recovered, which is the property that makes a leaked backup not
         also a leaked credential.
+
+        Args:
+            user_id: The person who owns this key, or ``None`` for a key minted on behalf of
+                the installation — by an administrator or the local operator. An owned key's
+                effective role is capped by its owner's current membership; see :meth:`verify`.
+            allowed_ips: CIDR ranges the key may be presented from. Empty means anywhere.
+                Validated by the service before this is called.
+            rate_limit: Requests per minute for this key, replacing the installation's
+                default. Validated by the service before this is called.
         """
         ...
 
-    async def list_keys(self) -> Sequence[ApiKeySummary]: ...
-
-    async def revoke(self, name_or_id: str) -> ApiKeySummary:
-        """Revoke a key by name or id. Immediate."""
+    async def list_keys(self, *, owner: str | None = None) -> Sequence[ApiKeySummary]:
+        """Every key in this workspace, or only those owned by ``owner`` when one is given."""
         ...
 
-    async def verify(self, secret: str) -> ApiKeySummary | None:
+    async def revoke(
+        self, name_or_id: str, *, restrict_to_owner: str | None = None
+    ) -> ApiKeySummary:
+        """Revoke a key by name or id. Immediate.
+
+        Args:
+            restrict_to_owner: When given, only a key owned by this user may be revoked; a key
+                that exists but belongs to somebody else is reported the same way a key that
+                does not exist at all is, so a non-admin caller cannot use this to discover
+                what keys other people hold.
+
+        Raises:
+            UnknownEntityError: No such key in this workspace, or it exists but
+                ``restrict_to_owner`` does not own it.
+        """
+        ...
+
+    async def verify(self, secret: str, *, address: str = "") -> ApiKeySummary | None:
         """Which key this secret is, or ``None`` if it is not a usable one.
 
-        ``None`` covers unknown, revoked, expired and belonging-to-another-workspace, and
-        deliberately does not say which. Telling a caller that the key they presented is
-        merely *expired* confirms it was once real, which is a fact worth having if you are
-        collecting them.
+        ``None`` covers unknown, revoked, expired, belonging-to-another-workspace, presented
+        from outside its ``allowed_ips``, and owned by a person whose membership here is gone
+        or disabled — and deliberately does not say which. Telling a caller that the key they
+        presented is merely *expired* confirms it was once real, which is a fact worth having
+        if you are collecting them.
 
         The comparison is over a digest, so nothing here can be timed into a byte at a time.
+
+        The returned summary's ``role`` is the *effective* role: for an owned key this is
+        ``min(key.role, owner's current membership role)``, so a demoted owner's keys are
+        demoted with them without a second write.
+
+        Args:
+            address: The presenting client's address, checked against ``allowed_ips`` when the
+                key has any. Treated as outside every range when empty.
         """
         ...
 
@@ -720,6 +760,31 @@ class RetainedBytes(Protocol):
         ``None`` rather than raising, because "collected since" is an ordinary state on the
         retention path rather than a failure — see ``docs/storage.md`` §7.
         """
+        ...
+
+
+@runtime_checkable
+class SecurityAlerts(Protocol):
+    """Recorded patterns — brute force, key abuse, export volume — for one workspace.
+
+    Written by :class:`~manicule.app.service.ApplicationService` when
+    :class:`~manicule.app.alerts.AlertMonitor` fires, and read by the admin surface. No
+    foreign keys, on :class:`AuditLog`'s own reasoning restated for a second table: an alert
+    about a key must outlive the key it names.
+    """
+
+    async def record_alert(self, kind: str, subject: str, *, details: Mapping[str, object]) -> str:
+        """Persist one alert and return its id."""
+        ...
+
+    async def list_alerts(
+        self, *, unacknowledged_only: bool = False, limit: int = 50, offset: int = 0
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        """A page of alerts, newest first, and the total row count."""
+        ...
+
+    async def acknowledge_alert(self, alert_id: str, *, by: str) -> Mapping[str, object] | None:
+        """Mark one alert acknowledged, or ``None`` if no such alert exists in this workspace."""
         ...
 
 
@@ -772,6 +837,8 @@ class Backend(Protocol):
 
     async def keys(self) -> Keys: ...
 
+    async def security_alerts(self) -> SecurityAlerts: ...
+
     async def component_checks(self) -> Sequence[Check]:
         """Health of whatever is already constructed, without constructing anything else."""
         ...
@@ -788,5 +855,6 @@ __all__ = [
     "Organizing",
     "RetainedBytes",
     "Retrieving",
+    "SecurityAlerts",
     "Telemetry",
 ]

@@ -1419,6 +1419,27 @@ def render_api_key_revoked(out: Console, payload: r.ApiKeyRevoked) -> None:
     out.print(f"revoked [bold]{escape(payload.name)}[/bold] ({payload.id})")
 
 
+def render_security_alerts(out: Console, payload: r.SecurityAlertList) -> None:
+    if not payload.alerts:
+        out.print("[dim]no alerts recorded[/dim]")
+        return
+    table = Table("when", "kind", "subject", "acknowledged", box=None, pad_edge=False)
+    for alert in payload.alerts:
+        table.add_row(
+            escape(alert.created_at),
+            escape(alert.kind),
+            escape(alert.subject),
+            escape(alert.acknowledged_by) if alert.acknowledged_by else "no",
+        )
+    out.print(table)
+
+
+def render_security_alert_acknowledged(out: Console, payload: r.SecurityAlertAcknowledged) -> None:
+    out.print(
+        f"acknowledged [bold]{escape(payload.id)}[/bold] as {escape(payload.acknowledged_by)}"
+    )
+
+
 def render_connector_signed_in(out: Console, payload: r.ConnectorSignedIn) -> None:
     """What was captured, where it went, and when it stops working. Never the session itself."""
     if payload.forgotten:
@@ -1698,6 +1719,10 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.ApiKeyIssued: lambda out, p: render_api_key_issued(out, _as(r.ApiKeyIssued, p)),
     r.ApiKeyList: lambda out, p: render_api_keys(out, _as(r.ApiKeyList, p)),
     r.ApiKeyRevoked: lambda out, p: render_api_key_revoked(out, _as(r.ApiKeyRevoked, p)),
+    r.SecurityAlertList: lambda out, p: render_security_alerts(out, _as(r.SecurityAlertList, p)),
+    r.SecurityAlertAcknowledged: lambda out, p: render_security_alert_acknowledged(
+        out, _as(r.SecurityAlertAcknowledged, p)
+    ),
     r.CollectionSummary: lambda out, p: render_collection(out, _as(r.CollectionSummary, p)),
     r.CollectionList: lambda out, p: render_collections(out, _as(r.CollectionList, p)),
     r.CollectionDeleted: lambda out, p: render_collection_deleted(out, _as(r.CollectionDeleted, p)),

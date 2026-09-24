@@ -68,6 +68,8 @@ OPERATIONS: frozenset[str] = frozenset(TOOL_NAMES) | {
     "reembed_start",
     "rebuild_run",
     "search_quality",
+    "security_alerts",
+    "security_alert_acknowledge",
     "shared_conversation",
     "tag_create",
     "tag_delete",

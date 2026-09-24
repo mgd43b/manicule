@@ -119,6 +119,38 @@ def refused_page(request: Request, exc: Exception) -> HTMLResponse:
     return html_response(body, status=status)
 
 
+def rate_limited_page(request: Request, message: str, *, retry_after_s: float) -> HTMLResponse:
+    """Render a 429 as a page, on :func:`refused_page`'s own template and shape.
+
+    A function of its own rather than a third branch there: that one is reached only through
+    :class:`PageRefusedError`, which the per-route dependency raises *after* a route has been
+    matched, and a rate-limit refusal is decided one layer up — in the ``identify`` middleware,
+    before routing has chosen a page at all. ``message`` already names how long to wait; the
+    ``Retry-After`` header repeats it for a client that reads headers instead of prose.
+    """
+    import math  # noqa: PLC0415 - avoids a module-level dependency for one call site
+
+    from manicule.api.envelopes import TOO_MANY_REQUESTS  # noqa: PLC0415 - avoids a cycle
+    from manicule.web.rendering import (  # noqa: PLC0415 - avoids a cycle
+        ENVIRONMENT,
+        STYLESHEET_PATH,
+        html_response,
+    )
+
+    body = ENVIRONMENT.get_template("refused.html").render(
+        {
+            "title": "Rate limited",
+            "message": message,
+            "status": TOO_MANY_REQUESTS,
+            "path": request.url.path,
+            "stylesheet": STYLESHEET_PATH,
+        }
+    )
+    response = html_response(body, status=TOO_MANY_REQUESTS)
+    response.headers["Retry-After"] = str(max(1, math.ceil(retry_after_s)))
+    return response
+
+
 UI_PREFIX = "/ui"
 """The prefix a request must be under to be answered with a page rather than an envelope."""
 
@@ -184,5 +216,6 @@ __all__ = [
     "Reader",
     "is_page_request",
     "not_found_page",
+    "rate_limited_page",
     "refused_page",
 ]

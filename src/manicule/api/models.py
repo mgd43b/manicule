@@ -149,6 +149,16 @@ class KeyBody(Body):
     name: str = Field(min_length=1, max_length=200)
     role: str = Field(default="member", description="``admin``, ``member`` or ``viewer``.")
     expires_days: int | None = Field(default=None, ge=1, le=3650)
+    allowed_ips: tuple[str, ...] = Field(
+        default=(),
+        max_length=100,
+        description="CIDR ranges the key may be presented from. Empty means anywhere.",
+    )
+    rate_limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="Requests per minute for this key, replacing the installation's default.",
+    )
 
 
 class SyncBody(Body):

@@ -138,6 +138,7 @@ class Principal:
             key_id=identity.key_id or None,
             user_id=identity.user_id or None,
             address=self.address,
+            rate_limit=identity.rate_limit,
         )
 
 
