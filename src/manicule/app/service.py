@@ -1456,9 +1456,9 @@ class ApplicationService:
             claimed = origins.get(candidate.chunk.id, ())
             if len(claimed) != 1 or claimed[0] not in handles:
                 msg = (
-                    f"a passage in a search spanning {len(handles)} workspaces was returned by "
-                    f"{len(claimed)} of their searches, where a passage belongs to exactly one "
-                    f"of them. A store ignored its scope; nothing was returned."
+                    f"a passage in a search spanning {len(handles)} workspaces was not returned "
+                    f"by exactly one of their searches, and a passage belongs to exactly one "
+                    f"workspace. A store ignored its scope; nothing was returned."
                 )
                 raise CrossWorkspaceError(msg)
             claims.append(claimed[0])

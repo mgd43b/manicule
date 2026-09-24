@@ -2323,13 +2323,17 @@ class _Workspaces:
 
         runtime = self._runtime
         await runtime.documents()
-        embedder = await runtime.embedder()
         async with self._lock:
+            # Names first, then the model, then every workspace's index, and only then a single
+            # handle: an unknown name is refused without loading an embedder to refuse it, and
+            # an unsearchable workspace is refused before any other workspace has been opened.
             states = await self._states(names)
+            embedder = await runtime.embedder()
+            for name in names:
+                self._require_searchable(name, states[name], embedder.fingerprint)
             opened: list[OpenedWorkspace] = []
             for name in names:
                 state = states[name]
-                self._require_searchable(name, state, embedder.fingerprint)
                 if name == runtime.workspace:
                     documents: DocumentSurface = await runtime.documents()
                     organization: Organizing = await runtime.organization()
