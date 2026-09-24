@@ -6,9 +6,10 @@ import asyncio
 import errno
 import json
 import os
+import sqlite3
 import stat
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -270,6 +271,43 @@ async def test_canceled_staging_write_is_joined_before_cancellation_returns(
     staging = blobs.root / "acquisition-staging"
     assert not list(blobs._stage_partial_root().glob("*.partial"))  # pyright: ignore[reportPrivateUsage]
     assert len([path for path in staging.iterdir() if path.is_file()]) == 1
+
+
+async def test_a_read_canceled_while_its_connection_opens_does_not_strand_it(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unclosed_connections: Callable[[], list[str]],
+) -> None:
+    """``get`` is what citation verification reads through, and an answer that ends first
+    cancels it. Canceled while the pool was opening a connection, that connection belonged to
+    nobody: aiosqlite dropped the handle its thread had just opened and SQLAlchemy never
+    received it, so neither the session nor the engine's disposal could close it."""
+    blobs = BlobStore(engine, data_dir)
+    stored = await blobs.put(b"retained for a citation", "text/plain")
+    assert isinstance(stored, StoredBlob)
+    await engine.dispose()  # nothing idle, so the read has to open a connection of its own
+    opening = threading.Event()
+    release = threading.Event()
+    connect = sqlite3.connect
+
+    def held_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        opening.set()
+        assert release.wait(timeout=5)
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", held_connect)
+    task = asyncio.create_task(blobs.get(stored.hash))
+    assert await asyncio.to_thread(opening.wait, 5)
+    task.cancel()
+    finished, _ = await asyncio.wait({task}, timeout=0.2)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await engine.dispose()
+    assert unclosed_connections() == [], "the canceled read left its connection open"
+    assert not finished, "the read returned while its connection was still being opened"
 
 
 async def test_retaining_acquired_bytes_waits_in_the_writer_queue(

@@ -507,7 +507,11 @@ class BlobStore:
 
     @staticmethod
     async def _joined_async_call[T](call: Coroutine[Any, Any, T]) -> T:
-        """Finish an async durability sequence before honoring repeated cancellation."""
+        """Finish an async sequence before honoring repeated cancellation.
+
+        For work that interrupting would leave half-done: a durability sequence, or a lookup
+        whose connection the pool may still be opening (:meth:`get`).
+        """
         work = asyncio.create_task(call)
         current = asyncio.current_task()
         cancellation: asyncio.CancelledError | None = None
@@ -1517,9 +1521,20 @@ class BlobStore:
         cls._fsync_directory(path.parent)
 
     async def get(self, digest: str) -> bytes | None:
-        """Read retained bytes back, or ``None`` if they are not held."""
-        async with self._sessions() as session:
-            row = await session.get(models.Blob, digest)
+        """Read retained bytes back, or ``None`` if they are not held.
+
+        **The row lookup runs to its end even when the caller is canceled.** Citation
+        verification reads through here in tasks of its own and cancels them whenever the
+        answer finishes first, so a cancellation arriving mid-lookup is routine rather than
+        rare. One that lands while the pool is opening a connection strands it: aiosqlite drops
+        the handle its thread has just opened and SQLAlchemy never receives it, so neither the
+        session nor the engine's disposal can close it. Joined, the lookup hands its connection
+        back to the pool and the cancellation is raised straight after.
+
+        The file read that follows is not joined. Its thread finishes and closes its own
+        descriptor whatever happens to the task awaiting it, so there is nothing to strand.
+        """
+        row = await self._joined_async_call(self._blob_row(digest))
         if row is None or row.algo.startswith(GC_PENDING_PREFIX):
             return None
         path = self._authoritative_path(digest)
@@ -1538,6 +1553,10 @@ class BlobStore:
         with os.fdopen(descriptor, "rb") as handle:
             raw = handle.read()
         return gzip.decompress(raw) if compression == "gzip" else raw
+
+    async def _blob_row(self, digest: str) -> models.Blob | None:
+        async with self._sessions() as session:
+            return await session.get(models.Blob, digest)
 
     async def get_bounded(self, digest: str, *, max_bytes: int) -> bytes | None:
         """Read at most ``max_bytes`` of verified-size input into memory.

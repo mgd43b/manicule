@@ -120,6 +120,18 @@ the only placement that covers every connection the pool will ever open. A test 
 web request produce `SQLITE_BUSY` immediately rather than after a wait. WAL permits many
 readers with one writer; manicule keeps a single write path and lets readers run concurrently.
 
+**A cancellation that lands while the pool is opening a connection strands it.** Opening one
+means awaiting `aiosqlite`, whose thread creates the `sqlite3` handle, and then running the
+`connect` listener above. Canceled inside `aiosqlite`, the connection stops its thread without
+closing the handle that thread has just opened; canceled inside the listener, SQLAlchemy
+discards a connection it never finished setting up. Either way nothing holds it, so neither
+the session nor the engine's disposal closes it, and it surfaces later as a `ResourceWarning`
+from the garbage collector. Once a connection is in the pool, cancellation is safe: SQLAlchemy
+invalidates and closes a connection whose statement was canceled. So a read that its callers
+cancel as a matter of course finishes its lookup before it raises the cancellation.
+`BlobStore.get` is that read — citation verification cancels it whenever an answer ends before
+its verification does (`generation.md` §3.7).
+
 Blob filenames are content addresses, while compression is a property of their stored
 representation. Concurrent writers publish with an atomic no-clobber hard link and then read the
 winning representation before recording its descriptor. This remains coherent across processes:
