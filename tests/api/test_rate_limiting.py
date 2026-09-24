@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 
+from fastapi.testclient import TestClient
+
 from manicule.app.service import ApplicationService
-from tests.api.support import backend_with_a_document, client_for, envelope
+from tests.api.support import app_for, backend_with_a_document, client_for, envelope
 from tests.app.fakes import FakeBackend
 
 TOO_MANY_REQUESTS = 429
@@ -91,14 +93,14 @@ def test_a_per_key_rate_limit_overrides_the_installation_default() -> None:
     assert capped.status_code == TOO_MANY_REQUESTS
 
 
-def test_the_failed_auth_bucket_refuses_even_a_correct_key_from_the_same_address() -> None:
-    """Brute force from an address stops *that address* — not only the guesses it made.
+def test_guessing_past_the_budget_is_refused_and_a_working_key_from_that_address_is_not() -> None:
+    """Brute force from an address is slowed; nobody sharing that address is signed out by it.
 
-    Once an address has exhausted its failed-authentication budget, every further request from
-    it is refused before a credential is even checked, including one that would have worked.
-    That is deliberate: the bucket metering *guesses* has to hold even when the very next guess
-    would have been the real key, or an attacker who eventually stumbles onto — or steals — a
-    valid key defeats the whole protection on the first correct attempt.
+    Behind a proxy nobody configured as trusted, or one office's NAT, every caller has the same
+    address. A bucket that refused *correct* credentials once somebody had spent it would let
+    one client with a stale key lock every member out — and would buy nothing, because a key is
+    256 bits and a session is signed. So failures past the budget are refused with 429 and a
+    working key from the very same address goes through.
     """
     backend = _throttled(burst=100, per_minute=6000, auth={"mode": "api_key"})
     backend.settings.security.rate_limit.failed_auth_per_minute = 2
@@ -108,9 +110,38 @@ def test_the_failed_auth_bucket_refuses_even_a_correct_key_from_the_same_address
         bad = {"X-API-Key": "mnk_wrong"}
         assert client.get("/api/v1/documents", headers=bad).status_code == UNAUTHORIZED
         assert client.get("/api/v1/documents", headers=bad).status_code == UNAUTHORIZED
+        guessing = client.get("/api/v1/documents", headers=bad)
         good = {"X-API-Key": issued.secret}
-        refused = client.get("/api/v1/documents", headers=good)
-    assert refused.status_code == TOO_MANY_REQUESTS
+        working = client.get("/api/v1/documents", headers=good)
+        anonymous = client.get("/healthz")
+    assert guessing.status_code == TOO_MANY_REQUESTS
+    assert "Retry-After" in guessing.headers
+    assert working.status_code == OK
+    assert anonymous.status_code == OK
+
+
+def test_one_key_arriving_from_many_addresses_raises_a_key_abuse_alert() -> None:
+    """The same secret from more places than one person's devices explain is a leaked key.
+
+    ``security.alerts.key_address_threshold`` distinct addresses within the window fire one
+    ``key_abuse`` alert naming the key — and one fewer fires nothing.
+    """
+    backend = _throttled(burst=100, per_minute=6000, auth={"mode": "api_key"})
+    backend.settings.security.alerts.key_address_threshold = 3
+    service = ApplicationService(backend)
+    issued = asyncio.run(service.api_key_create("shared", role="viewer"))
+    headers = {"X-API-Key": issued.secret}
+    # One application — one monitor — reached from three addresses.
+    app = app_for(backend)
+    for last in (1, 2):
+        with TestClient(app, client=(f"203.0.113.{last}", 41234)) as client:
+            assert client.get("/api/v1/documents", headers=headers).status_code == OK
+    assert backend.security_alerts_.alerts == []
+    with TestClient(app, client=("203.0.113.3", 41234)) as client:
+        assert client.get("/api/v1/documents", headers=headers).status_code == OK
+    assert [(alert["kind"], alert["subject"]) for alert in backend.security_alerts_.alerts] == [
+        ("key_abuse", issued.key.id)
+    ]
 
 
 def test_a_successful_authentication_never_spends_the_failed_auth_budget() -> None:

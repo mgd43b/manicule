@@ -457,9 +457,9 @@ class RateLimitSettings(Section):
 
     One bucket per caller — the API key, the signed-in person, or, for a caller presenting
     neither, the client address as :class:`~manicule.api.proxy.ProxyPolicy` resolves it. A
-    separate, much smaller bucket per address meters **failed** authentication, and it is
-    charged before a presented credential is checked, so guessing keys costs the guesser
-    rather than the database.
+    separate, much smaller bucket per address meters **failed** authentication: a header
+    credential that did not work is charged to it, and once it is spent such requests are
+    refused with 429. A credential that works is never refused by it, whoever shares the address.
     """
 
     enabled: bool = True

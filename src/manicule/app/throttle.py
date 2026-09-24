@@ -243,26 +243,21 @@ class RateLimiter:
     def enabled(self) -> bool:
         return self._enabled
 
-    def failed_auth_available(self, address: str) -> RateDecision:
-        """Whether ``address`` may attempt one more authentication, without charging it yet.
+    def charge_failed_auth(self, address: str) -> RateDecision:
+        """Record one failed authentication from ``address``, and say whether it was within budget.
 
-        Consulted before a presented credential is checked at all, so an address that has
-        already exhausted this bucket is refused without a single hash comparison against the
-        key store — guessing costs the guesser a round trip, never the database a lookup.
+        Only ever called after a presented credential turned out not to work — a request that
+        offered nothing, or one whose credential checked out, never touches this bucket, because
+        neither is a guess. **So a working credential is never refused by it**, whoever else
+        shares the address: behind a proxy nobody configured as trusted, or one office's NAT,
+        every caller has the same address, and a bucket that refused correct keys once one
+        client had spent it would let a single stale key sign everybody out. A key is 256 bits
+        and a session cookie is signed, so refusing a correct one buys no protection from
+        guessing; what this bucket bounds is how fast an address may keep guessing.
         """
         if not self._enabled:
             return RateDecision(allowed=True)
-        return self._failed_auth.available(_address_key(address))
-
-    def charge_failed_auth(self, address: str) -> None:
-        """Record one failed authentication from ``address``.
-
-        Only ever called after a presented credential turned out not to work — a request that
-        offered nothing, or one whose key checked out, never touches this bucket, because
-        neither is a guess.
-        """
-        if self._enabled:
-            self._failed_auth.take(_address_key(address))
+        return self._failed_auth.take(_address_key(address))
 
     def charge_caller(self, key: str, *, rate_limit: int | None = None) -> RateDecision:
         """Charge ``key`` — see :func:`caller_key` — for one ordinary request.

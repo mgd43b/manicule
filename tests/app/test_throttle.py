@@ -112,15 +112,14 @@ def test_disabled_means_unlimited() -> None:
     limiter = RateLimiter(RateLimitSettings(enabled=False, burst=1, per_minute=1))
     for _ in range(50):
         assert limiter.charge_caller("addr:anyone").allowed is True
-        assert limiter.failed_auth_available("addr:anyone").allowed is True
+        assert limiter.charge_failed_auth("addr:anyone").allowed is True
 
 
-def test_the_failed_auth_bucket_is_consulted_before_a_credential_is_checked() -> None:
-    """Exhausting the failed-auth bucket refuses further attempts without touching a credential.
+def test_failed_authentications_are_admitted_up_to_the_budget_and_refused_after() -> None:
+    """The address's allowance of failures is exactly ``failed_auth_per_minute``.
 
-    This is the address-level throttle: once an address's budget for *guessing* is spent,
-    :meth:`~manicule.app.throttle.RateLimiter.failed_auth_available` says so — the caller of
-    this method is expected to refuse before it ever looks a presented key up.
+    Each failure is charged as it happens; the one past the budget is refused with how long to
+    wait, and a refill after that wait admits one more.
     """
     clock = FakeClock()
     limiter = RateLimiter(
@@ -128,32 +127,13 @@ def test_the_failed_auth_bucket_is_consulted_before_a_credential_is_checked() ->
         clock=clock,
     )
     address = "203.0.113.5"
-    assert limiter.failed_auth_available(address).allowed is True
-    limiter.charge_failed_auth(address)
-    assert limiter.failed_auth_available(address).allowed is True
-    limiter.charge_failed_auth(address)
-    decision = limiter.failed_auth_available(address)
-    assert decision.allowed is False
-    assert decision.retry_after_s > 0
-
-
-def test_a_correct_credential_never_charges_the_failed_auth_bucket() -> None:
-    """Charging only ever happens for a credential that did not authenticate — see the
-    docstring of :meth:`~manicule.app.throttle.RateLimiter.charge_failed_auth`. A caller
-    verifying this from outside can only observe it by *not* charging and checking availability
-    stays intact, which is what this test does.
-    """
-    clock = FakeClock()
-    limiter = RateLimiter(
-        RateLimitSettings(enabled=True, failed_auth_per_minute=1, per_minute=600, burst=600),
-        clock=clock,
-    )
-    address = "203.0.113.9"
-    # A caller that authenticated successfully must never reach `charge_failed_auth` at all —
-    # simulated here by simply not calling it — so the bucket stays full for a genuine failure.
-    assert limiter.failed_auth_available(address).allowed is True
-    limiter.charge_failed_auth(address)
-    assert limiter.failed_auth_available(address).allowed is False
+    assert limiter.charge_failed_auth(address).allowed is True
+    assert limiter.charge_failed_auth(address).allowed is True
+    refused = limiter.charge_failed_auth(address)
+    assert refused.allowed is False
+    assert refused.retry_after_s > 0
+    clock.advance(refused.retry_after_s)
+    assert limiter.charge_failed_auth(address).allowed is True
 
 
 def test_charge_caller_uses_the_override_as_both_rate_and_capacity() -> None:

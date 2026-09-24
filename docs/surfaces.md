@@ -1844,13 +1844,15 @@ network surface — HTTP, the MCP mount, and the websocket handshake. Two bucket
   cannot still burst up to the installation's default just because its bucket happened to be
   full from disuse.
 - **A failed-authentication bucket per address**, refilled at `failed_auth_per_minute` — its own
-  rate is also its capacity, for the same reason. It is consulted **before** a presented
-  credential is checked at all: an address that has already exhausted it is refused without this
-  process hashing and looking up whatever it sent. It is charged only when a presented credential
-  turns out not to work, never for a request with no credential and never for one that succeeds.
-  **A correct key from an address that has exhausted this bucket is still refused** — brute force
-  from an address stops that address, including on the one guess that would have been the real
-  key, or the whole protection is defeated by the first correct attempt an attacker makes.
+  rate is also its capacity, for the same reason. It is charged by a header credential that did
+  not work (never by a request with no credential, never by one that succeeded, never by a stale
+  session cookie, and never under `auth.mode = 'none'`, where nothing is checked), and once it is
+  spent such requests are refused with 429. **A working credential from the same address is never
+  refused by it.** Behind a proxy nobody configured as trusted, or one office's NAT, every caller
+  shares an address, and a bucket that refused correct keys would let one client with a stale key
+  lock every member out — for nothing, since a key is 256 bits and a session cookie is signed.
+  What it bounds is how fast an address may keep guessing; a failure past the budget is not
+  audited as `auth.failed`, so a guesser at full speed does not write the trail at full speed.
 
 `identify` runs both checks ahead of routing, so a request bound for the MCP mount is metered by
 the identical bucket an ordinary route would spend — the mount's own guard does not charge a

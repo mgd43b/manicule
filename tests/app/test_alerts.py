@@ -119,3 +119,23 @@ def test_memory_is_bounded_by_max_tracked() -> None:
     monitor.record_failed_auth("addr-c")  # a third subject evicts the least-recently-touched: "a"
     # "a"'s one recorded failure is gone, so one more is not yet the threshold of two.
     assert monitor.record_failed_auth("addr-a") is None
+
+
+def test_a_document_read_again_counts_from_its_latest_read() -> None:
+    """A distinct value is dated by when it was last seen, not when it was first seen.
+
+    Two documents read at the start of the window, one of them read again near its end: once
+    the window has moved past the first reads, only the re-read document is still counted —
+    and reading one document a thousand times is still one document.
+    """
+    monitor, clock = _monitor(window_s=60, export_document_threshold=3)
+    monitor.record_document_read("user:ada", "doc-a")
+    monitor.record_document_read("user:ada", "doc-b")
+    clock.advance(50)
+    for _ in range(1000):
+        assert monitor.record_document_read("user:ada", "doc-a") is None
+    clock.advance(20)
+    # doc-b's only read is now 70 s old and out of the window; doc-a's latest is 20 s old.
+    assert monitor.record_document_read("user:ada", "doc-c") is None
+    clock.advance(1)
+    assert monitor.record_document_read("user:ada", "doc-d") is not None

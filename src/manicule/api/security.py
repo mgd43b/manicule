@@ -55,9 +55,10 @@ from fastapi import Depends, Request, WebSocket
 
 from manicule.api.cookies import SESSION_COOKIE, session_token
 from manicule.api.proxy import FORWARDED_FOR
-from manicule.app.caller import RANK, Caller
+from manicule.app.caller import RANK, Caller, acting_as
 from manicule.app.frontdoor import MCP
 from manicule.app.results import Identity
+from manicule.app.throttle import RateDecision
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import ManiculeError
 
@@ -181,6 +182,85 @@ def websocket_token(websocket: WebSocket) -> tuple[str, str | None]:
     return "", None
 
 
+def credential_kind(request: Request | WebSocket) -> str:
+    """Which header credential a request presented — never its value — or empty for none.
+
+    ``bearer`` or ``x-api-key`` exactly when :func:`token_of` would read one, and ``subprotocol``
+    for a websocket that offered its key the one way a browser can. A session cookie is not a
+    kind here: it is signed, so it cannot be guessed, and a stale one is ordinary browser state.
+    """
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith(BEARER):
+        return "bearer" if authorization[len(BEARER) :].strip() else ""
+    if request.headers.get(API_KEY_HEADER, "").strip():
+        return "x-api-key"
+    if isinstance(request, WebSocket) and websocket_token(request)[0]:
+        return "subprotocol"
+    return ""
+
+
+def failed_credential(principal: Principal, request: Request | WebSocket) -> str:
+    """The kind of header credential this request presented and that did not authenticate.
+
+    Empty when nothing was presented, when it worked, and under ``security.auth.mode = 'none'``,
+    where no credential is checked: a header a client happens to send to such an installation —
+    a key configured for a server later served with ``--no-authentication``, say — is ignored
+    rather than counted as a guess, or an ordinary client would be throttled out of an
+    installation that asks it for nothing.
+    """
+    identity = principal.identity
+    if identity.authenticated or identity.mode == AuthMode.NONE.value:
+        return ""
+    return credential_kind(request)
+
+
+async def account_for_credential(
+    service: ApplicationService, principal: Principal, request: Request | WebSocket
+) -> RateDecision:
+    """What the rate limiter and the alert monitor learn from the credential a request presented.
+
+    One place for both surfaces that authenticate a connection — the HTTP middleware and the
+    websocket handshake — so neither can be the one that forgot a check:
+
+    * **A header credential that did not work** is charged to its address's failed-
+      authentication bucket, counted toward a ``brute_force`` alert, and audited while the
+      bucket has budget; past it, the refusal the caller builds from the returned decision is
+      the record, so a guesser at full speed does not write the audit trail at full speed.
+    * **A key that did work** is counted toward a ``key_abuse`` alert by the addresses it
+      arrives from: the same secret from more places than one person's devices explain.
+
+    Returns the failed-authentication decision; ``allowed`` for anything that was not a guess.
+    """
+    address = principal.address
+    guessed = failed_credential(principal, request)
+    if guessed:
+        guessing = service.rate_limiter.charge_failed_auth(address)
+        with acting_as(principal.caller):
+            await service.record_security_alert(service.alert_monitor.record_failed_auth(address))
+            if guessing.allowed:
+                await service.record_failed_authentication(credential_kind=guessed)
+        return guessing
+    identity = principal.identity
+    if identity.authenticated and identity.via == "key" and identity.key_id:
+        with acting_as(principal.caller):
+            await service.record_security_alert(
+                service.alert_monitor.record_key_presentation(identity.key_id, address)
+            )
+    return RateDecision(allowed=True)
+
+
+def client_address(policy: ProxyPolicy, request: Request | WebSocket) -> str:
+    """The address this request came from, as the proxy policy decides it. Empty for none."""
+    client = request.client
+    return policy.client_address(
+        peer=client.host if client is not None else None,
+        # Through the constant, not a literal. The header manicule reads is a decision
+        # `manicule.api.proxy` makes once, and a second spelling here is how a rename ends
+        # up reading a header nothing sends.
+        forwarded_for=request.headers.get(FORWARDED_FOR),
+    )
+
+
 def beneath_mcp(path: str) -> bool:
     """Whether ``path`` is the MCP mount or anything under it."""
     return path == MCP or path.startswith(f"{MCP}/")
@@ -229,14 +309,7 @@ async def resolve(
     are reachable through the same resolution as everything else. :func:`require` is what
     refuses. :func:`identify` is what decides which credential a request is presenting.
     """
-    client = request.client
-    address = policy.client_address(
-        peer=client.host if client is not None else None,
-        # Through the constant, not a literal. The header manicule reads is a decision
-        # `manicule.api.proxy` makes once, and a second spelling here is how a rename ends
-        # up reading a header nothing sends.
-        forwarded_for=request.headers.get(FORWARDED_FOR),
-    )
+    address = client_address(policy, request)
     return Principal(identity=await identify(service, request, address=address), address=address)
 
 

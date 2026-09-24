@@ -67,7 +67,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from manicule.api.envelopes import AUTH_ERRORS, malformed, refusal
 from manicule.api.origins import FETCH_SITE, ORIGIN, REFUSAL, permitted
-from manicule.api.proxy import FORWARDED_FOR, ProxyPolicy
+from manicule.api.proxy import ProxyPolicy
 from manicule.api.routes import (
     admin,
     auth,
@@ -80,14 +80,7 @@ from manicule.api.routes import (
     workbench,
 )
 from manicule.api.routes import health as health_routes
-from manicule.api.security import (
-    API_KEY_HEADER,
-    BEARER,
-    Principal,
-    require,
-    resolve,
-    token_of,
-)
+from manicule.api.security import account_for_credential, require, resolve
 from manicule.api.widget import router as widget_router
 from manicule.app import frontdoor
 from manicule.app.bind import (
@@ -391,12 +384,11 @@ def build_app(  # noqa: PLR0915 - assembling every route group, middleware and r
         caller's identity, and every service call downstream, over HTTP and over the MCP mount
         this application carries, runs under this request's.
 
-        Order matters and follows :class:`~manicule.config.settings.RateLimitSettings`'s own
-        docstring: the failed-authentication bucket is consulted *before* a presented credential
-        is checked at all, so an address that has already used up its guesses is refused without
-        this process hashing and looking up whatever it sent; only a credential that was
-        presented and did not work charges that bucket, so a correct key never spends it and an
-        anonymous request never does either.
+        Two buckets, per :class:`~manicule.config.settings.RateLimitSettings`. The address's
+        failed-authentication bucket is charged only by a header credential that did not work,
+        and refuses only such a request once spent — a correct key or session from the same
+        address is never refused by it, and an anonymous request never touches it. Then every
+        request that got that far charges its caller's bucket.
         """
         if request.url.path in RATE_LIMIT_EXEMPT_PATHS:
             request.state.principal = await resolve(service, app.state.proxy_policy, request)
@@ -405,29 +397,18 @@ def build_app(  # noqa: PLR0915 - assembling every route group, middleware and r
             )
 
         limiter = service.rate_limiter
-        address = _client_address(app.state.proxy_policy, request)
-        unavailable = limiter.failed_auth_available(address)
-        if not unavailable.allowed:
+        principal = await resolve(service, app.state.proxy_policy, request)
+        guessing = await account_for_credential(service, principal, request)
+        if not guessing.allowed:
             return _refuse_rate_limit(
                 request,
                 service,
                 settings,
                 web=web,
                 message=f"too many failed authentications from this address; retry in "
-                f"{unavailable.retry_after_s:.0f}s",
-                retry_after_s=unavailable.retry_after_s,
+                f"{guessing.retry_after_s:.0f}s",
+                retry_after_s=guessing.retry_after_s,
             )
-
-        principal = await resolve(service, app.state.proxy_policy, request)
-        if _failed_authentication(principal, presented=bool(token_of(request))):
-            limiter.charge_failed_auth(address)
-            with acting_as(principal.caller):
-                await service.record_security_alert(
-                    service.alert_monitor.record_failed_auth(address)
-                )
-                await service.record_failed_authentication(
-                    credential_kind=_credential_kind(request)
-                )
 
         caller = principal.caller
         charged = limiter.charge_caller(caller_key(caller), rate_limit=caller.rate_limit)
@@ -655,55 +636,6 @@ def _require_a_sign_in_that_can_complete(service: ApplicationService) -> None:
         joined = "\n  - ".join(problems)
         msg = f"refusing to serve browser sign-in as configured:\n  - {joined}"
         raise PolicyError(msg)
-
-
-def _client_address(policy: ProxyPolicy, request: Request) -> str:
-    """The address :func:`~manicule.api.security.resolve` would compute, read early.
-
-    Rate limiting needs this **before** a credential is checked at all — the failed-auth bucket
-    is consulted ahead of :func:`~manicule.api.security.resolve` itself — so it is computed here
-    rather than taken from the :class:`~manicule.api.security.Principal` that call produces.
-    :func:`~manicule.api.security.resolve` computes the identical value the ordinary way once
-    resolution does run; the two are never expected to disagree, because both read the same
-    policy over the same request.
-    """
-    client = request.client
-    return policy.client_address(
-        peer=client.host if client is not None else None,
-        forwarded_for=request.headers.get(FORWARDED_FOR),
-    )
-
-
-def _failed_authentication(principal: Principal, *, presented: bool) -> bool:
-    """Whether this request presented a header credential that did not authenticate.
-
-    Only when authentication is configured. Under ``security.auth.mode = 'none'`` no credential
-    is ever checked, so an ``Authorization`` header a client happens to send — a key configured
-    for a server that was later served with ``--no-authentication``, say — is ignored rather than
-    counted as a guess; counting it would throttle an ordinary client out of an installation that
-    asks it for nothing.
-
-    Only a *header* credential. A session cookie is signed, so it cannot be guessed, and one
-    that no longer resolves — expired, revoked, from before a key rotation — is ordinary browser
-    state rather than an attack.
-    """
-    identity = principal.identity
-    return presented and identity.mode != AuthMode.NONE.value and not identity.authenticated
-
-
-def _credential_kind(request: Request) -> str:
-    """Which header carried a presented credential. Never its value.
-
-    Only ever read after confirming a credential *was* presented, so the fallback here is
-    unreachable in practice — kept explicit rather than asserted, because a refusal path is the
-    wrong place for an assertion to be the thing that fails loudly.
-    """
-    authorization = request.headers.get("authorization", "")
-    if authorization.lower().startswith(BEARER):
-        return "bearer"
-    if request.headers.get(API_KEY_HEADER, ""):
-        return "x-api-key"
-    return "unknown"
 
 
 def _dress_response(response: Response, settings: Settings) -> Response:

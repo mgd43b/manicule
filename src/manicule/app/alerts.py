@@ -93,40 +93,46 @@ class _CountWindow:
 
 
 class _DistinctWindow:
-    """Subject -> recent (timestamp, value) pairs; reports distinct values within the window.
+    """Subject -> each distinct value's last sighting; reports distinct values within the window.
 
     The shape :meth:`AlertMonitor.record_key_presentation` and
     :meth:`AlertMonitor.record_document_read` both need: not "how many times", but "how many
     different addresses" or "how many different documents" — a caller re-reading the one
     document it always reads must never look like an export.
+
+    **One entry per distinct value, ordered by when it was last seen**, so a repeat moves an entry
+    rather than adding one and the expired values are always at the front. Recording costs the
+    same whether a caller has made ten requests in the window or ten thousand, and what is held
+    per subject is bounded by how many *different* values it presented, not by how often.
     """
 
     def __init__(self, *, window_s: float, max_tracked: int) -> None:
         self._window_s = window_s
         self._max_tracked = max_tracked
-        self._entries: OrderedDict[str, deque[tuple[float, str]]] = OrderedDict()
+        self._entries: OrderedDict[str, OrderedDict[str, float]] = OrderedDict()
 
     def record(self, subject: str, value: str, now: float) -> int:
-        entries = self._touch(subject)
-        entries.append((now, value))
-        self._evict(entries, now)
-        return len({item[1] for item in entries})
+        seen = self._touch(subject)
+        seen[value] = now
+        seen.move_to_end(value)
+        cutoff = now - self._window_s
+        while seen:
+            oldest = next(iter(seen.values()))
+            if oldest >= cutoff:
+                break
+            seen.popitem(last=False)
+        return len(seen)
 
-    def _touch(self, subject: str) -> deque[tuple[float, str]]:
-        entries = self._entries.get(subject)
-        if entries is not None:
+    def _touch(self, subject: str) -> OrderedDict[str, float]:
+        seen = self._entries.get(subject)
+        if seen is not None:
             self._entries.move_to_end(subject)
-            return entries
-        entries = deque[tuple[float, str]]()
-        self._entries[subject] = entries
+            return seen
+        seen = OrderedDict[str, float]()
+        self._entries[subject] = seen
         if len(self._entries) > self._max_tracked:
             self._entries.popitem(last=False)
-        return entries
-
-    def _evict(self, entries: deque[tuple[float, str]], now: float) -> None:
-        cutoff = now - self._window_s
-        while entries and entries[0][0] < cutoff:
-            entries.popleft()
+        return seen
 
 
 class AlertMonitor:

@@ -374,6 +374,11 @@ class Retriever:
 
         with tracing.installed() as frame:
             ranked: list[tuple[str, list[Candidate]]] = []
+            # One leg after another, on purpose. Every leg embeds the same query text: run in
+            # turn, the first computes the vector and the rest are served from the embedder's
+            # cache, where run together each would miss and compute it again. And the legs
+            # record into one trace frame, whose spans would otherwise land in whatever order
+            # the legs happened to finish — a trace that differs between two runs of one search.
             for leg, scoped in resolved:
                 if scoped is None:
                     # The named collections hold nothing in this workspace. That is a leg that

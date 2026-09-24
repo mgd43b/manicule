@@ -39,11 +39,10 @@ from pydantic import ValidationError
 from manicule.api.context import policy_of, service_of
 from manicule.api.models import AskBody
 from manicule.api.origins import HANDSHAKE_REFUSAL, ORIGIN, handshake_permitted
-from manicule.api.proxy import FORWARDED_FOR
 from manicule.api.security import (
-    API_KEY_HEADER,
-    BEARER,
     Principal,
+    account_for_credential,
+    client_address,
     identify,
     require,
     websocket_token,
@@ -53,7 +52,7 @@ from manicule.app.caller import acting_as
 from manicule.app.dispatch import error_info
 from manicule.app.results import failed
 from manicule.app.throttle import caller_key
-from manicule.config.settings import AuthMode, Role
+from manicule.config.settings import Role
 from manicule.core.errors import ManiculeError
 
 if TYPE_CHECKING:
@@ -71,16 +70,6 @@ RATE_LIMITED = 4029
 """The close code for "too many requests". RFC 6455 §7.4.2 reserves 4000-4999 for private use;
 there is no registered websocket equivalent of HTTP 429, so this mirrors its number instead of
 inventing an unrelated one."""
-
-
-def _credential_kind(websocket: WebSocket) -> str:
-    """Which header — or the subprotocol — carried a presented credential. Never its value."""
-    authorization = websocket.headers.get("authorization", "")
-    if authorization.lower().startswith(BEARER):
-        return "bearer"
-    if websocket.headers.get(API_KEY_HEADER, ""):
-        return "x-api-key"
-    return "subprotocol"
 
 
 # ``name="ask"``, the same as the two HTTP chat routes, because it is the same operation and
@@ -116,41 +105,24 @@ async def chat_socket(websocket: WebSocket) -> None:
         )
         return
 
-    client = websocket.client
-    address = policy.client_address(
-        peer=client.host if client is not None else None,
-        forwarded_for=websocket.headers.get(FORWARDED_FOR),
-    )
+    address = client_address(policy, websocket)
     limiter = service.rate_limiter
-    # Consulted before a presented credential is even read — see
-    # `manicule.app.throttle.RateLimiter.failed_auth_available` — so an address that has
-    # already exhausted its failed-authentication budget is refused without this process
-    # hashing and looking up whatever it sent.
-    unavailable = limiter.failed_auth_available(address)
-    if not unavailable.allowed:
-        await websocket.close(
-            code=RATE_LIMITED,
-            reason=f"too many failed authentications; retry in {unavailable.retry_after_s:.0f}s"[
-                :120
-            ],
-        )
-        return
 
     # The same decision every HTTP route gets, header first and a signed-in browser's session
     # cookie after it — reached here, after the origin check above, because a cookie is exactly
     # the ambient credential a cross-origin handshake would otherwise be spending. Only a header
     # credential that fails is a failed authentication: a session cookie is signed, so it cannot
     # be guessed, and a stale one is ordinary browser state rather than an attack.
-    token, subprotocol = websocket_token(websocket)
+    _, subprotocol = websocket_token(websocket)
     identity = await identify(service, websocket, address=address)
     principal = Principal(identity=identity, address=address)
-    if token and identity.mode != AuthMode.NONE.value and not identity.authenticated:
-        # Under `auth.mode = 'none'` nothing is checked, so a header a client happens to send is
-        # not a guess — see `manicule.api.app._failed_authentication`.
-        limiter.charge_failed_auth(address)
-        with acting_as(principal.caller):
-            await service.record_security_alert(service.alert_monitor.record_failed_auth(address))
-            await service.record_failed_authentication(credential_kind=_credential_kind(websocket))
+    guessing = await account_for_credential(service, principal, websocket)
+    if not guessing.allowed:
+        await websocket.close(
+            code=RATE_LIMITED,
+            reason=f"too many failed authentications; retry in {guessing.retry_after_s:.0f}s"[:120],
+        )
+        return
     try:
         require(principal, Role.MEMBER)
     except ManiculeError as exc:
