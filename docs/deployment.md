@@ -347,6 +347,63 @@ then decides is which of the **host's** interfaces see it, and `-p PORT:PORT` de
 them. The guard inside the container cannot make that
 choice for you and does not try to.
 
+### 4.1 Running for a team
+
+The pieces above compose into one path; this section is that path, not new mechanism. Every
+fact below is documented once, at the reference cited — this is where they meet.
+
+**Choose the mode, then the credential.** `mode = "team"` says several people share this
+installation, and it is stricter than the personal-mode binding rule above: a team installation
+with `security.auth.mode = "none"` is refused wherever a socket is made, loopback included, and
+`--no-authentication` is refused rather than honored — there is no anonymous operator to fall
+back to (`docs/surfaces.md` §6, "Team mode takes the way out away"). A program still authenticates
+with `security.auth.mode = "api_key"`; a person at a browser needs
+`security.auth.mode = "oauth"`.
+
+**Sign-in configuration** is one `[security.auth]` block plus one `[[security.auth.providers]]`
+table per identity provider — the exact shape, with `example.org` in place of a real domain, is
+`docs/surfaces.md` §9.2.1. Two things from that shape matter specifically at deployment time:
+
+- `redirect_uri` must be this deployment's own `https://<host>/auth/callback/<type>`, registered
+  with the provider, and never derived from the request — a `Host` header is not a trusted
+  source for where an authorization code gets sent.
+- `session_secret` and every provider's `client_secret` are credentials, and `manicule config
+  set` refuses outright to set one (`ConfigError`, naming the key) rather than accepting and
+  then silently dropping it. Supply them as environment variables —
+  `MANICULE_SECURITY__AUTH__SESSION_SECRET`, and `MANICULE_SECURITY__AUTH__PROVIDERS` as a JSON
+  list of the provider tables — or write them directly into a config file only the account
+  running manicule can read; `docs/surfaces.md` §9.2.1 has both forms. The config file, unlike
+  the data directory, is not what `manicule backup` or `manicule export` copies, but a
+  hand-written secret in it is still a secret on disk: keep it out of version control the same
+  way §1 and §2 ask of everything else that can read the corpus.
+
+**Behind a TLS-terminating reverse proxy**, two settings point in different directions and both
+need to be right:
+
+- `security.transport.enforce_https` (default on) governs what the *browser* is told, not what
+  manicule's own socket receives: it marks the session and sign-in cookies `Secure` and requires
+  `redirect_uri` to be `https://`. Leave it on — the browser really did speak HTTPS to the
+  proxy, even though the proxy's own connection to manicule behind it is plain HTTP. Turning it
+  off is for a plain-HTTP network an operator owns outright, not for "there's a proxy in front."
+- `security.transport.trusted_proxies` must name the proxy's own address (or the network it
+  connects from), or every caller behind it is attributed to the proxy's peer address instead of
+  its own — collapsing every rate-limit bucket, alert subject and audited address onto one
+  entry (`docs/surfaces.md` §9.3). An empty list, the default, is correct only when nothing sits
+  in front of manicule at all.
+
+**Bootstrapping the first administrator** is a one-time step, not a setting: give one provider
+`role = "admin"` with an `allowed_emails`/`allowed_domains` entry naming only that person, sign
+in once, then narrow the provider back to `role = "member"` for everyone who signs in after —
+or let people sign in as members from the start and promote one from the command line, which
+runs as the operator at the machine rather than over the network:
+`manicule auth set-role <user-id-or-address> admin`. A workspace that has an enabled
+administrator always keeps one; the command line cannot demote or disable the last one either
+(`docs/surfaces.md` §9.2.1, "The first administrator").
+
+**Rate limits, security alerts and the audit trail** are the operational surface a team
+deployment watches day to day, sized and wired at §6.6 below — nothing about them is specific to
+how the installation is reached, so they are not repeated here.
+
 ---
 
 ## 5. The container
