@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Annotated
 from fastapi import Depends, Request, WebSocket
 
 from manicule.api.proxy import FORWARDED_FOR
+from manicule.app.caller import RANK
 from manicule.app.results import Identity
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import ManiculeError
@@ -70,9 +71,6 @@ query string — writes the credential into the server's access log. The subprot
 the one field a browser *can* set, so the key travels there and the server echoes the chosen
 subprotocol back.
 """
-
-_RANK: dict[Role, int] = {Role.VIEWER: 0, Role.MEMBER: 1, Role.ADMIN: 2}
-"""Least authority first. A route asks for a floor, not for an exact role."""
 
 
 class UnauthenticatedError(ManiculeError):
@@ -186,7 +184,7 @@ def require(principal: Principal, floor: Role) -> Principal:
             "'Authorization: Bearer <key>' or 'X-API-Key: <key>'."
         )
         raise UnauthenticatedError(msg)
-    if _RANK[principal.role] < _RANK[floor]:
+    if RANK[principal.role] < RANK[floor]:
         msg = (
             f"this operation needs the {floor.value!r} role or higher; this key has "
             f"{principal.role.value!r}."
