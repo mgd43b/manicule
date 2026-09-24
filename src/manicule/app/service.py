@@ -1333,6 +1333,7 @@ class ApplicationService:
         """
         started = time.monotonic()
         self._require_admin_to_span(spanned)
+        await self._require_standing_to_span(spanned)
         bound = self.settings.rag.cross_workspace_limit
         if len(spanned) > bound:
             msg = (
@@ -1411,6 +1412,42 @@ class ApplicationService:
             f"this caller was admitted to, which is an administrator's decision to make."
         )
         raise PolicyError(msg)
+
+    async def _require_standing_to_span(self, spanned: Sequence[str]) -> None:
+        """Refuse to reach a workspace the signed-in caller was never admitted to.
+
+        Being an administrator is a relationship with *this* workspace. A person who administers
+        it and has no membership of another has no standing there, so a search spanning both
+        would read a corpus nobody let them see. So a caller who is a person — signed in, or
+        presenting a key they minted — must hold an enabled membership of every other workspace
+        named.
+
+        Two callers carry no person and pass: the operator at this machine, who holds every
+        workspace on it already, and a key with no owner, which only that operator can mint and
+        which is therefore their delegate.
+
+        Raises:
+            PolicyError: The caller is a person without an enabled membership of a named
+                workspace. The message names those workspaces — the caller named them — and
+                nothing about who does belong to them.
+        """
+        caller = current()
+        if caller.is_local or caller.user_id is None:
+            return
+        others = [name for name in spanned if name != self.workspace]
+        if not others:
+            return
+        users = await self._backend.users()
+        standing = await users.standing_in(caller.user_id, others)
+        missing = [name for name in others if name not in standing]
+        if missing:
+            msg = (
+                f"a search spanning workspaces reaches only workspaces the caller is a member "
+                f"of, and this caller has no enabled membership of "
+                f"{', '.join(repr(name) for name in missing)}. Administering this workspace "
+                f"is not standing in another; an administrator of that workspace can admit you."
+            )
+            raise PolicyError(msg)
 
     async def _collections_across(
         self, opened: Sequence[OpenedWorkspace], names: Sequence[str]

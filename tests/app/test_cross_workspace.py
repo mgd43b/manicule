@@ -121,6 +121,76 @@ async def test_an_administrator_and_the_local_operator_can(caller: Caller) -> No
     assert result.workspaces == (ALPHA, BETA)
 
 
+def _person(backend: SpanningBackend, *, member_of: dict[str, bool]) -> str:
+    """One signed-in person, an admin of alpha, with the other memberships named.
+
+    ``member_of`` maps a workspace to whether that membership is disabled.
+    """
+    users = backend.users_
+    users.people["u-ada"] = {"provider": "github", "subject": "1", "email": None, "name": "Ada"}
+    users.memberships[(ALPHA, "u-ada")] = {"role": "admin", "disabled": False}
+    for workspace, disabled in member_of.items():
+        users.memberships[(workspace, "u-ada")] = {"role": "viewer", "disabled": disabled}
+    return "u-ada"
+
+
+async def test_administering_this_workspace_is_not_standing_in_another() -> None:
+    """A person who administers alpha and was never admitted to beta cannot read beta.
+
+    The admin role is a relationship with the serving workspace. Without this check, anybody an
+    administrator of one workspace could become would read every corpus on the installation.
+    Refused before anything is opened, so the refusal reveals nothing about beta either.
+    """
+    backend = _backend()
+    service = ApplicationService(backend)
+    person = _person(backend, member_of={})
+
+    with (
+        acting_as(Caller(role=Role.ADMIN, user_id=person)),
+        pytest.raises(PolicyError, match="no enabled membership of 'beta'"),
+    ):
+        await service.search("runbook", workspaces=[ALPHA, BETA])
+
+    assert backend.opened == []
+    assert _spanning(backend).seen_across == []
+
+
+async def test_a_disabled_membership_is_no_standing_either() -> None:
+    """Disabling somebody in beta must stop them reading beta by way of alpha."""
+    backend = _backend()
+    service = ApplicationService(backend)
+    person = _person(backend, member_of={BETA: True})
+
+    with (
+        acting_as(Caller(role=Role.ADMIN, user_id=person)),
+        pytest.raises(PolicyError, match="'beta'"),
+    ):
+        await service.search("runbook", workspaces=[ALPHA, BETA])
+
+
+async def test_a_person_admitted_to_every_named_workspace_may_span_them() -> None:
+    """The positive control: any enabled role there is standing, since roles gate actions."""
+    backend = _backend()
+    service = ApplicationService(backend)
+    person = _person(backend, member_of={BETA: False})
+
+    with acting_as(Caller(role=Role.ADMIN, user_id=person)):
+        result = await service.search("runbook", workspaces=[ALPHA, BETA])
+
+    assert result.workspaces == (ALPHA, BETA)
+
+
+async def test_a_key_with_no_owner_is_the_operators_delegate() -> None:
+    """Only the operator at this machine mints an ownerless key, so it spans as they would."""
+    backend = _backend()
+    service = ApplicationService(backend)
+
+    with acting_as(Caller(role=Role.ADMIN, key_id="k-operator")):
+        result = await service.search("runbook", workspaces=[ALPHA, BETA])
+
+    assert result.workspaces == (ALPHA, BETA)
+
+
 @pytest.mark.parametrize(("limit", "named"), [(3, 3), (8, 8)])
 async def test_the_configured_bound_admits_exactly_its_own_count(limit: int, named: int) -> None:
     """The edge on the accepting side: ``cross_workspace_limit`` workspaces is allowed."""

@@ -135,6 +135,32 @@ async def test_a_session_minted_in_one_workspace_does_not_authenticate_in_anothe
         )
 
 
+async def test_standing_names_only_the_enabled_memberships_among_those_asked_about(
+    manicule_environment: Path,
+) -> None:
+    """The one unscoped read in the people store answers one narrow question, and only that.
+
+    A person admitted to beta and gamma, disabled in gamma, and never admitted to delta. Asked
+    from alpha about all three, the answer is beta alone: a disabled membership is no standing,
+    and a workspace nobody asked about is never reported.
+    """
+    data_dir = manicule_environment / "data"
+    profile = _profile(subject="ada", email="ada@example.org")
+    user_id = ""
+    for workspace in ("beta", "gamma"):
+        async with Runtime.open(data_dir=data_dir, workspace=workspace) as opened:
+            user_id = (await (await opened.users()).admit(profile, role="viewer")).id
+    async with Runtime.open(data_dir=data_dir, workspace="gamma") as gamma:
+        await (await gamma.users()).update_member(user_id, disabled=True)
+
+    async with Runtime.open(data_dir=data_dir, workspace="alpha") as alpha:
+        users = await alpha.users()
+        assert await users.standing_in(user_id, ["beta", "gamma", "delta"]) == {"beta"}
+        assert await users.standing_in(user_id, ["gamma"]) == frozenset()
+        assert await users.standing_in(user_id, []) == frozenset()
+        assert await users.standing_in("somebody-else", ["beta"]) == frozenset()
+
+
 async def test_a_role_change_is_what_the_next_resolve_reports(runtime: Runtime) -> None:
     users = await runtime.users()
     await _signed_in(users, role="admin", subject="root")

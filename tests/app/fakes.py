@@ -1654,6 +1654,13 @@ class FakeUsers:
             and not membership.get("disabled")
         )
 
+    async def standing_in(self, user_id: str, workspaces: Sequence[str]) -> frozenset[str]:
+        return frozenset(
+            workspace
+            for (workspace, member), membership in self.memberships.items()
+            if member == user_id and workspace in workspaces and not membership.get("disabled")
+        )
+
     async def update_member(
         self, user_id: str, *, role: str | None = None, disabled: bool | None = None
     ) -> MemberChange:

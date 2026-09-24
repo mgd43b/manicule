@@ -837,6 +837,17 @@ class Users(Protocol):
         """Enabled administrators of this workspace."""
         ...
 
+    async def standing_in(self, user_id: str, workspaces: Sequence[str]) -> frozenset[str]:
+        """Which of ``workspaces`` this person holds an enabled membership of.
+
+        **The one read here that is not scoped to this handle's workspace**, and it is narrow on
+        purpose: one person, the workspaces a caller already named, and nothing back but the
+        names that matched. It exists so that an administrator's search spanning workspaces
+        reaches only workspaces that person was admitted to — being an administrator *here* is
+        not standing *there*.
+        """
+        ...
+
     async def update_member(
         self, user_id: str, *, role: str | None = None, disabled: bool | None = None
     ) -> MemberChange:

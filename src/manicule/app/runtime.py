@@ -2843,6 +2843,27 @@ class _Users:
         async with sessions() as session:
             return await self._enabled_admins(session)
 
+    async def standing_in(self, user_id: str, workspaces: Sequence[str]) -> frozenset[str]:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        if not workspaces:
+            return frozenset()
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.WorkspaceMember.workspace_id).where(
+                        models.WorkspaceMember.user_id == user_id,
+                        models.WorkspaceMember.workspace_id.in_(list(workspaces)),
+                        models.WorkspaceMember.disabled_at.is_(None),
+                    )
+                )
+            ).scalars()
+            return frozenset(str(row) for row in rows)
+
     async def update_member(
         self, user_id: str, *, role: str | None = None, disabled: bool | None = None
     ) -> MemberChange:

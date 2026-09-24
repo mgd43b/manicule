@@ -1349,6 +1349,11 @@ read, and a title that never reached a payload could still reach a heading or a 
   about which requests span — which puts the refusal in each surface's ordinary 403 before a
   workspace is opened. Over stdio and at the command line the caller is the operator at this
   machine, who holds every authority the process has.
+- **Where.** The admin role is a relationship with the serving workspace, not with the others.
+  A caller who is a person — signed in, or presenting a key they minted — must hold an enabled
+  membership of every other workspace named, or the search is refused before any is opened.
+  The operator at this machine passes, and so does a key with no owner, which only that
+  operator can mint and which is therefore their delegate.
 - **How many.** `rag.cross_workspace_limit` bounds the workspaces one request may name (8 by
   default, 2 to 64), because each is its own scoped search.
 - **Every hit, in its own workspace.** Each workspace is searched through its own scoped store,

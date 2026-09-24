@@ -293,7 +293,10 @@ consequences worth stating:
 N is bounded by configuration — `rag.cross_workspace_limit`, 8 by default and at most 64 — and
 the feature is an administrator's: the application service refuses a search naming any
 workspace but the serving one to a caller short of the admin role (`PLAN.md` §16), and the
-network surfaces ask for the same floor so the refusal is their ordinary 403.
+network surfaces ask for the same floor so the refusal is their ordinary 403. Administering the
+serving workspace is not standing in the others, so a caller who is a person — signed in, or
+presenting a key they minted — must also hold an enabled membership of every other workspace
+named ([`surfaces.md`](surfaces.md) §7).
 
 **What exists, and how it keeps the rule.** #6 settled the merge and left the store's refusal
 holding the line until something could hand out N store handles; #13 built that and the merge
