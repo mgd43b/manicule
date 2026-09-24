@@ -11,6 +11,10 @@ on this surface one of those is a hole. So the handshake resolves a principal an
 before ``accept``, and the refusal is a close code rather than a JSON body, because a client
 that never completed a handshake has nowhere to read a body from.
 
+**A signed-in browser needs no subprotocol.** Under ``security.auth.mode = 'oauth'`` the
+handshake carries the session cookie like any other same-origin request, and it is resolved by
+:func:`~manicule.api.security.identify` — the function every HTTP route's principal comes from.
+
 **The credential is never a query parameter.** A browser cannot set headers on a ``WebSocket``,
 and the usual workaround puts the key in the URL — where it lands in the access log, the
 browser history and any ``Referer`` the page sends. manicule reads it from the subprotocol
@@ -35,11 +39,19 @@ from pydantic import ValidationError
 from manicule.api.context import policy_of, service_of
 from manicule.api.models import AskBody
 from manicule.api.origins import HANDSHAKE_REFUSAL, ORIGIN, handshake_permitted
-from manicule.api.proxy import FORWARDED_FOR
-from manicule.api.security import Principal, require, websocket_token
+from manicule.api.security import (
+    Principal,
+    account_for_credential,
+    client_address,
+    identify,
+    require,
+    websocket_token,
+)
 from manicule.api.streaming import answer_frames
+from manicule.app.caller import acting_as
 from manicule.app.dispatch import error_info
 from manicule.app.results import failed
+from manicule.app.throttle import caller_key
 from manicule.config.settings import Role
 from manicule.core.errors import ManiculeError
 
@@ -53,6 +65,11 @@ POLICY_VIOLATION = 1008
 
 INVALID_PAYLOAD = 1007
 """The close code for a message this server cannot read."""
+
+RATE_LIMITED = 4029
+"""The close code for "too many requests". RFC 6455 §7.4.2 reserves 4000-4999 for private use;
+there is no registered websocket equivalent of HTTP 429, so this mirrors its number instead of
+inventing an unrelated one."""
 
 
 # ``name="ask"``, the same as the two HTTP chat routes, because it is the same operation and
@@ -88,15 +105,24 @@ async def chat_socket(websocket: WebSocket) -> None:
         )
         return
 
-    token, subprotocol = websocket_token(websocket)
-    client = websocket.client
-    principal = Principal(
-        identity=await service.authenticate(token),
-        address=policy.client_address(
-            peer=client.host if client is not None else None,
-            forwarded_for=websocket.headers.get(FORWARDED_FOR),
-        ),
-    )
+    address = client_address(policy, websocket)
+    limiter = service.rate_limiter
+
+    # The same decision every HTTP route gets, header first and a signed-in browser's session
+    # cookie after it — reached here, after the origin check above, because a cookie is exactly
+    # the ambient credential a cross-origin handshake would otherwise be spending. Only a header
+    # credential that fails is a failed authentication: a session cookie is signed, so it cannot
+    # be guessed, and a stale one is ordinary browser state rather than an attack.
+    _, subprotocol = websocket_token(websocket)
+    identity = await identify(service, websocket, address=address)
+    principal = Principal(identity=identity, address=address)
+    guessing = await account_for_credential(service, principal, websocket)
+    if not guessing.allowed:
+        await websocket.close(
+            code=RATE_LIMITED,
+            reason=f"too many failed authentications; retry in {guessing.retry_after_s:.0f}s"[:120],
+        )
+        return
     try:
         require(principal, Role.MEMBER)
     except ManiculeError as exc:
@@ -106,19 +132,41 @@ async def chat_socket(websocket: WebSocket) -> None:
         await websocket.close(code=POLICY_VIOLATION, reason=str(exc)[:120])
         return
 
+    caller = principal.caller
+    charged = limiter.charge_caller(caller_key(caller), rate_limit=caller.rate_limit)
+    if not charged.allowed:
+        if caller.key_id:
+            with acting_as(caller):
+                await service.record_security_alert(
+                    service.alert_monitor.record_rate_limited(caller.key_id)
+                )
+        await websocket.close(
+            code=RATE_LIMITED,
+            reason=f"rate limit exceeded; retry in {charged.retry_after_s:.0f}s"[:120],
+        )
+        return
+
     await websocket.accept(subprotocol=subprotocol)
     try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                body = AskBody.model_validate_json(raw)
-            except ValidationError as exc:
-                await websocket.send_json(
-                    failed("ask", service.workspace, error_info(ValueError(str(exc)))).as_json()
-                )
-                await websocket.close(code=INVALID_PAYLOAD, reason="unreadable message")
-                return
-            await _answer(websocket, service, body)
+        # One charge for the whole connection, taken above, not one per message. A long-lived
+        # socket exists precisely so several questions share one connection, and metering each
+        # message against the same per-minute budget an HTTP caller spends one request at a
+        # time would let a socket ask far more of the corpus than an HTTP client ever could for
+        # the same charge — or, the other way, would need a second number nobody has configured
+        # to give a socket a fair share. The handshake is the one place this surface already
+        # authenticates and authorizes, so it is where the budget is spent too.
+        with acting_as(caller):
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    body = AskBody.model_validate_json(raw)
+                except ValidationError as exc:
+                    await websocket.send_json(
+                        failed("ask", service.workspace, error_info(ValueError(str(exc)))).as_json()
+                    )
+                    await websocket.close(code=INVALID_PAYLOAD, reason="unreadable message")
+                    return
+                await _answer(websocket, service, body)
     except WebSocketDisconnect:
         # The client went away. Not an error, and not something to log as one: the generator
         # is closed by the cancellation that follows, which is what releases the open response
@@ -139,4 +187,4 @@ async def _answer(websocket: WebSocket, service: ApplicationService, body: AskBo
         await websocket.send_json({"event": name, "data": payload})
 
 
-__all__ = ["INVALID_PAYLOAD", "POLICY_VIOLATION", "router"]
+__all__ = ["INVALID_PAYLOAD", "POLICY_VIOLATION", "RATE_LIMITED", "router"]

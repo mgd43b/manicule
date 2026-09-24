@@ -291,6 +291,43 @@ async def audit_logs(
     )
 
 
+@router.get("/alerts", name="security_alerts", summary="Recorded security alerts, newest first.")
+async def security_alerts(
+    service: Service,
+    caller: AdminPrincipal,
+    *,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    unacknowledged_only: Annotated[bool, Query()] = False,
+) -> Response:
+    """Brute force, key abuse and export volume — recorded independently of
+    ``security.audit.enabled``, so this list is not empty just because auditing is off.
+    """
+    del caller
+    return await respond(
+        "security_alerts",
+        service,
+        lambda: service.security_alerts(
+            unacknowledged_only=unacknowledged_only, limit=limit, offset=offset
+        ),
+    )
+
+
+@router.post(
+    "/alerts/{alert_id}/acknowledge",
+    name="security_alert_acknowledge",
+    summary="Acknowledge one security alert.",
+)
+async def acknowledge_alert(service: Service, caller: AdminPrincipal, alert_id: str) -> Response:
+    """Records who acknowledged it, and audits ``security.alert_acknowledged``."""
+    del caller
+    return await respond(
+        "security_alert_acknowledge",
+        service,
+        lambda: service.security_alert_acknowledge(alert_id),
+    )
+
+
 @router.get(
     "/search-quality", name="search_quality", summary="What the evaluation harness has recorded."
 )

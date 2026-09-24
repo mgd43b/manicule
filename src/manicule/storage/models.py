@@ -154,6 +154,13 @@ class Workspace(Base):
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     mode: Mapped[str] = mapped_column(Text, nullable=False, default="personal")
+    """The ``mode`` this workspace was last opened for writing under.
+
+    A record, not the authority: ``Settings.mode`` decides how a process behaves. What this
+    column adds is the answer for a workspace no process is serving right now, which is the
+    only place ``workspace list`` can read it from.
+    """
+
     settings: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=dict)
     derived_reset_epoch: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
@@ -164,12 +171,47 @@ class Workspace(Base):
     __table_args__ = (CheckConstraint("mode IN ('personal', 'team')", name="mode_is_known"),)
 
 
+class User(Base):
+    """A person, as an identity provider vouched for them.
+
+    **Installation-wide, not per workspace**: one person signing in to two workspaces is one
+    row here and two in :class:`WorkspaceMember`. What they may do lives on the membership,
+    because a role is a relationship between a person and a workspace rather than a property
+    of the person.
+
+    Identified by ``(provider, subject)`` — the provider's own stable, opaque account id — and
+    never by email. An address can be changed, recycled or unverified; the subject is what the
+    provider promises is the same account next time.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    email: Mapped[str | None] = mapped_column(Text)
+    """The verified address the provider last reported. Display and admission only."""
+
+    name: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+
+    __table_args__ = (
+        UniqueConstraint("provider", "subject"),
+        CheckConstraint("provider IN ('google', 'github')", name="provider_is_known"),
+    )
+
+
 class WorkspaceMember(Base):
     """Who may see a workspace, and in what role.
 
     Carries no API key column. The prior art kept a raw, unhashed key here, which is
     precisely what ``api_keys.key_hash`` exists to avoid; :class:`ApiKey` is the only key
     store.
+
+    A disabled membership is kept rather than deleted, so that the person's history in the
+    audit trail still names somebody, and so that re-enabling them restores the role an
+    administrator gave them rather than the provider's default.
     """
 
     __tablename__ = "workspace_members"
@@ -177,13 +219,46 @@ class WorkspaceMember(Base):
     workspace_id: Mapped[str] = mapped_column(
         ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
     )
-    user_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
     role: Mapped[str] = mapped_column(Text, nullable=False, default="member")
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    disabled_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
 
     __table_args__ = (
         CheckConstraint("role IN ('admin', 'member', 'viewer')", name="role_is_known"),
+        Index("ix_workspace_members_user_id", "user_id"),
         WITHOUT_ROWID,
+    )
+
+
+class AuthSession(Base):
+    """A signed-in browser.
+
+    Server-side on purpose. A cookie that carried the identity itself could only be revoked by
+    rotating the key that signs every cookie; a row can be revoked on its own — at sign-out,
+    when a membership is disabled, or when an administrator signs a person out everywhere.
+
+    Only a digest of the token is stored, exactly as for :class:`ApiKey`, so a copy of the
+    database is not a copy of anybody's session.
+    """
+
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+
+    __table_args__ = (
+        Index("ix_auth_sessions_workspace_id", "workspace_id"),
+        Index("ix_auth_sessions_user_id", "user_id"),
     )
 
 
@@ -1222,11 +1297,20 @@ class ApiKey(Base):
     workspace_id: Mapped[str] = mapped_column(
         ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
     )
-    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    """The signed-in person who minted it, or ``NULL`` for the operator at the command line.
+
+    A key belongs to its minter: it is revoked with them when their membership is disabled, and
+    a key they minted can never hold more authority than they did.
+    """
+
     role: Mapped[str] = mapped_column(Text, nullable=False, default="member")
-    scopes: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=list)
     allowed_ips: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=list)
+    """CIDR ranges the key may be presented from. Empty means anywhere."""
+
     rate_limit: Mapped[int | None] = mapped_column(Integer)
+    """Requests per minute for this key, replacing ``security.rate_limit.per_minute``."""
+
     expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     last_used_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     revoked_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
@@ -1234,7 +1318,9 @@ class ApiKey(Base):
 
     __table_args__ = (
         CheckConstraint("role IN ('admin', 'member', 'viewer')", name="role_is_known"),
+        CheckConstraint("rate_limit IS NULL OR rate_limit > 0", name="rate_limit_is_positive"),
         Index("ix_api_keys_workspace_id", "workspace_id"),
+        Index("ix_api_keys_user_id", "user_id"),
     )
 
 
@@ -1258,6 +1344,34 @@ class AuditLog(Base):
     __table_args__ = (
         Index("ix_audit_logs_event_type_created_at", "event_type", "created_at"),
         Index("ix_audit_logs_workspace_id_created_at", "workspace_id", "created_at"),
+    )
+
+
+class SecurityAlert(Base):
+    """A pattern of use worth a person's attention: brute force, key abuse, export volume.
+
+    Recorded whether or not auditing is on, because an alert nobody could see is not one. No
+    foreign keys, for the audit log's reason: an alert about a key must outlive the key.
+    """
+
+    __tablename__ = "security_alerts"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    """What the alert is about: a client address, an API key id, or an actor."""
+
+    details: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    acknowledged_by: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('brute_force', 'key_abuse', 'export_volume')", name="kind_is_known"
+        ),
+        Index("ix_security_alerts_workspace_id_created_at", "workspace_id", "created_at"),
     )
 
 

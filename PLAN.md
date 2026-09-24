@@ -390,12 +390,29 @@ API keys (prefixed, SHA-256 hashed, scoped, expiring) · roles admin/member/view
 rate limiting · OAuth SSO (Google, GitHub) · workspace isolation enforced on every query ·
 audit log · security alerts · PII redaction. **Carries over.**
 
+**Built:** API keys now carry an owner, `allowed_ips` and a per-key `rate_limit`, capped and
+scoped by the caller's own role and membership (`docs/surfaces.md` §9.2); in-process rate
+limiting over every network surface (§9.10); sliding-window security alerts for brute force, key
+sharing and export volume (§9.11); audit coverage broadened to authentication failures,
+configuration changes, workspace switches, collection and plugin changes, content reads and the
+alerts themselves (§9.8) — the caller context (key id, signed-in person, address) is now wired
+onto every network surface, so `_audit` has an actor and an address to record instead of neither.
+The identity half is built too: OAuth sign-in through Google and GitHub, a signed browser
+session, and the people-admin surface (`manicule auth users|set-role|disable-user|enable-user|
+sign-out`, `docs/surfaces.md` §9.2.1) — after which `mode = "team"` refuses to serve without
+authentication, anonymous administrator included (§6, "Team mode takes the way out away"). And
+cross-workspace search (§16) is the per-query isolation across more than one tenant this
+section's goal list named. PII redaction (`security.data_policy.auto_redact`) predates this
+slice and is unrelated to it. What is left is delivery, not the record: `security.audit`
+accepts a `syslog` or `webhook` destination and only `local` is wired to anything
+(`docs/deployment.md` §6.6, [#14](https://github.com/mgd43b/manicule/issues/14)).
+
 | | Choice |
 |---|---|
 | OAuth | **authlib** |
 | Sessions | **itsdangerous** signed cookies, HttpOnly, SameSite=Strict |
 | API keys | stdlib `secrets` + `hashlib` |
-| Rate limiting | in-process token bucket |
+| Rate limiting | in-process token bucket — **built**, `manicule.app.throttle` |
 
 Worth keeping from OpenDocuments: its trusted-proxy handling is genuinely good — proper
 CIDR allowlists, no naive `X-Forwarded-For` trust. Port that logic, not the defaults.
@@ -426,13 +443,18 @@ the sections above.
 | **Hardware detection** | CPU and RAM probing to recommend a model during `init` | Keep, and extend — detect Apple Silicon and unified memory to pick the embedding backend |
 | **Plugin compatibility** | `checkCompatibility` against a declared `coreVersion` | Keep. Version mismatch is a loud error, not a runtime surprise |
 | **Community registry** | GitHub-hosted list of community plugins, browsable and installable | Keep. Decide whether install stays admin-only — in OpenDocuments it shells out to a package manager |
-| **Cross-workspace search** | Admin-only search spanning workspaces | Keep, gated on team mode |
+| **Cross-workspace search** | Admin-only search spanning workspaces | **Built** (#13): admin-only, bounded by `rag.cross_workspace_limit`, N scoped searches merged on cosine — `docs/retrieval.md` §3.2 |
 
 ### HTTP surface is larger than "11 route groups"
 
 **52 endpoints**, not 11: admin 12 · collections 6 · conversations 6 · documents 6 ·
 auth 5 · tags 5 · health 4 · plugins 4 · chat 3 · workbench 1, plus a websocket channel.
 The workbench is a single read-only endpoint behind a `document:read` scope.
+
+That count is the audited system's, taken when this plan was written, and it is kept as the
+record of what was audited. manicule's own surface is counted where it is enforced: the route
+groups and every deliberate absence in `tests/api/test_routes.py`, and the routes themselves in
+[`docs/surfaces.md`](docs/surfaces.md) §9 and `CAPABILITIES.md`.
 
 
 ---
@@ -453,6 +475,11 @@ Real, found in the source, worth not reproducing.
 5. **PII redaction does something other than advertised.** It runs at ingest, permanently
    destroying data in the index, while the docs claim it protects data sent to cloud
    models. Pick one behavior, build it, document it.
+   **Fixed:** redaction happens at the generation boundary, not at ingest —
+   `docs/generation.md` §7, decided in `docs/ingest.md` §3.4. It predates team mode
+   ([#13](https://github.com/mgd43b/manicule/issues/13)) and is unrelated to it; a *refusal to
+   ingest* content matching a rule is the coherent version of what this defect was misfilling,
+   and is its own ticket, [#28](https://github.com/mgd43b/manicule/issues/28).
 6. **The evaluation harness scores at chance.** Its test embedder is
    `sin(sum of character codes)`. Twelve retrieval features rest on it.
 

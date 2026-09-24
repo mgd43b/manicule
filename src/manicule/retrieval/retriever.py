@@ -25,8 +25,9 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from manicule.core.errors import ConfigError
 from manicule.core.glossary import QueryExpansion, normalize_acronym
-from manicule.core.protocols import CollectionStore, TagStore
+from manicule.core.protocols import CollectionStore, Reranker, TagStore
 from manicule.core.retrieval import (
     Candidate,
     Confidence,
@@ -37,6 +38,7 @@ from manicule.core.retrieval import (
 from manicule.retrieval import trace as tracing
 from manicule.retrieval.cache import L1QueryCache, cache_key, rehydrate
 from manicule.retrieval.confidence import score_confidence
+from manicule.retrieval.dense import DenseStage
 from manicule.retrieval.expansion import (
     GLOSSARY_SCORE_KEY,
     ExpansionPolicy,
@@ -47,8 +49,16 @@ from manicule.retrieval.expansion import (
 )
 from manicule.retrieval.hydration import visible_documents
 from manicule.retrieval.prefilter import join_filter
+from manicule.retrieval.profile import retrieval_depth
 from manicule.retrieval.router import QueryRouter, Routing, UtilityKind
 from manicule.retrieval.runner import PipelineRunner
+from manicule.retrieval.spanning import (
+    WorkspaceLeg,
+    leg_query,
+    merge_on_similarity,
+    rehydrate_across,
+    require_one_leg_per_workspace,
+)
 from manicule.retrieval.trace import GlossaryReport, RetrievalTrace, Route
 from manicule.retrieval.utility import UtilityAnswer, handlers_for
 
@@ -109,7 +119,20 @@ class RetrievalResult:
 
     Every match carries the entry it resolved through, and every entry carries the chunk it was
     read out of. That is what makes "never present an expansion without citation provenance" a
-    property of the type rather than a rule each surface has to remember."""
+    property of the type rather than a rule each surface has to remember.
+
+    Also ``None`` on a cross-workspace search, which consults no glossary at all — see
+    :meth:`Retriever.retrieve_across` for why a definition cannot be looked up across
+    workspaces."""
+
+    origins: dict[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]])
+    """Chunk id to the workspaces whose leg returned it, on a cross-workspace search.
+
+    Empty on every single-workspace run, whose candidates are all the serving workspace's. On a
+    cross-workspace one it is what a hit's workspace is read from — kept from the merge rather
+    than reconstructed afterwards, because a chunk id does not say which workspace minted it —
+    and it is what the application service checks each chunk's identity against, one workspace
+    at a time. A chunk with two origins is a store that ignored its scope."""
 
     @property
     def cites_the_corpus(self) -> bool:
@@ -118,7 +141,13 @@ class RetrievalResult:
 
 
 class Retriever:
-    """One workspace's retrieval, end to end."""
+    """One workspace's retrieval, end to end — and, on request, several workspaces' merged.
+
+    :meth:`retrieve` is the whole of a single workspace's pipeline. :meth:`retrieve_across` is
+    an administrator's search spanning workspaces, built from this retriever's own dense leg,
+    reranker, profiles, assembler and cache, and bound to handles the caller opened for each
+    workspace; ``docs/retrieval.md`` §3.2 is its rule.
+    """
 
     def __init__(
         self,
@@ -156,6 +185,8 @@ class Retriever:
         self._utility = dict(utility_handlers or handlers_for(docstore))
         self._glossary = glossary
         self._expansion = expansion or ExpansionPolicy()
+        self._bound: dict[str, tuple[DocStore, VectorStore, DenseStage]] = {}
+        """Per workspace of a cross-workspace search, the dense leg bound to its handles."""
 
     @property
     def cache_available(self) -> bool:
@@ -178,7 +209,22 @@ class Retriever:
         )
 
     async def retrieve(self, query: Query) -> RetrievalResult:
-        """Route, expand, retrieve, assemble and score one query."""
+        """Route, expand, retrieve, assemble and score one query.
+
+        Raises:
+            ValueError: The query names more than one workspace. This is one workspace's
+                pipeline, and its stages would each have to refuse the filter or — in a store
+                that did not — answer for one workspace a question asked of several. A search
+                spanning workspaces is :meth:`retrieve_across`, and ``ask`` and ``research``,
+                which reach retrieval only through this method, cannot span them at all.
+        """
+        if len(query.filter.workspace_ids) > 1:
+            named = ", ".join(repr(name) for name in sorted(query.filter.workspace_ids))
+            msg = (
+                f"this query names workspaces {named}, and retrieve() searches one. A search "
+                f"spanning workspaces is one scoped leg per workspace, merged — retrieve_across()."
+            )
+            raise ValueError(msg)
         started = time.perf_counter()
         routing = self._router.route(query.text) if self._router else Routing()
         if routing.bypasses_retrieval:
@@ -207,7 +253,7 @@ class Retriever:
         expansion = await resolve_expansion(query, self._glossary, self._expansion)
 
         identity = self.identity(query)
-        key = self._key(query, identity, expansion)
+        key = self._key(query, identity, expansion.expanded)
         if key is not None:
             hit = await self._from_cache(key, query, identity, started, expansion)
             if hit is not None:
@@ -274,6 +320,227 @@ class Retriever:
             ),
             routing=routing,
             expansion=expansion,
+        )
+
+    async def retrieve_across(self, query: Query, legs: Sequence[WorkspaceLeg]) -> RetrievalResult:
+        """Search several workspaces as one: a scoped dense leg each, merged, reranked once.
+
+        ``docs/retrieval.md`` §3.2 is the rule and :mod:`manicule.retrieval.spanning` states its
+        consequences. What this method adds is the order they happen in:
+
+        1. **Membership resolves per workspace**, through each leg's own store, because a
+           collection belongs to one workspace and only its store can say what is in it.
+        2. **Each leg runs this pipeline's dense stage, bound to that workspace's handles**,
+           through a runner of its own — its own over-fetch, its own hydrating join, and the
+           same runtime scope assertion this retriever's runner applies.
+        3. **The legs merge on the dense leg's cosine**, the one score every workspace put on
+           one scale.
+        4. **The pipeline's reranker, when it has one, scores the merged pool once** — its own
+           head of it, under its own truncation rule — so the final order is the reranker's.
+        5. **The merged list is re-trimmed to this pipeline's depth only then**, after every
+           leg has filtered: trimming first is the top-k trap in its cross-workspace form.
+
+        Four things a single-workspace run does are deliberately not done here, and each is a
+        decision rather than an omission. **Lexical and fusion do not run**: BM25's IDF is the
+        whole index's, so it cannot rank one workspace against another, and RRF over legs that
+        share no chunk ranks the workspaces rather than the passages. **No route is taken**: the
+        router's utility answers — counts, listings — are facts about one workspace, and an
+        administrator who asked to search several has asked for the corpus to be consulted.
+        **No glossary is consulted**: a definition is one workspace's, two workspaces may define
+        one acronym two ways — which expansion reports as a conflict and never resolves — and a
+        promoted definition carries no cosine for the merge to place it by. **Agreement is not
+        scored**: confidence is computed over the merged passages with the one leg that ran,
+        so its agreement component is suppressed with the reason that sentence gives rather
+        than scored zero.
+
+        Raises:
+            ValueError: The legs do not cover the query's workspaces exactly once each.
+            ConfigError: This pipeline has no dense stage, so there is no cosine to merge on.
+        """
+        started = time.perf_counter()
+        require_one_leg_per_workspace(query, legs)
+        dense, reranker = self._spanning_stages()
+        identity = self._spanning_identity(query, dense.name, reranker)
+
+        resolved: list[tuple[WorkspaceLeg, Query | None]] = [
+            (leg, await resolve_membership(leg.docstore, leg_query(query, leg.workspace)))
+            for leg in legs
+        ]
+        key = self._key(query, identity)
+        if key is not None:
+            hit = await self._across_from_cache(key, query, resolved, started)
+            if hit is not None:
+                return hit
+
+        with tracing.installed() as frame:
+            ranked: list[tuple[str, list[Candidate]]] = []
+            # One leg after another, on purpose. Every leg embeds the same query text: run in
+            # turn, the first computes the vector and the rest are served from the embedder's
+            # cache, where run together each would miss and compute it again. And the legs
+            # record into one trace frame, whose spans would otherwise land in whatever order
+            # the legs happened to finish — a trace that differs between two runs of one search.
+            for leg, scoped in resolved:
+                if scoped is None:
+                    # The named collections hold nothing in this workspace. That is a leg that
+                    # matches nothing, not one that matches everything — see `resolve_membership`.
+                    ranked.append((leg.workspace, []))
+                    continue
+                runner = PipelineRunner(
+                    [self._leg_stage(dense, leg)],
+                    docstore=leg.docstore,
+                    assert_scope=self._runner.asserts_scope,
+                )
+                ranked.append((leg.workspace, (await runner.run(scoped)).candidates))
+            merged = merge_on_similarity(ranked, stage=dense.name)
+            candidates = merged.candidates
+            if reranker is not None:
+                candidates = (
+                    await PipelineRunner([reranker]).run(query, seed=candidates)
+                ).candidates
+            candidates = candidates[: retrieval_depth(self._profiles.for_query(query), query)]
+            origins = {
+                candidate.chunk.id: merged.origins[candidate.chunk.id] for candidate in candidates
+            }
+            context = self._assembler.assemble(query, candidates)
+            assembly = frame.assembly
+            spans = tuple(frame.spans)
+            incomparable = list(frame.incomparable)
+
+        exhausted = _exhausted_budget(spans)
+        if exhausted:
+            incomparable.append(tracing.Shortfall.EXHAUSTED_BUDGET.value)
+        if key is not None:
+            self._cache.put(
+                key,
+                L1QueryCache.record(
+                    candidates,
+                    identity,
+                    incomparable=incomparable,
+                    exhausted_budget=exhausted,
+                    origins=origins,
+                ),
+            )
+        return RetrievalResult(
+            context=context,
+            candidates=candidates,
+            confidence=_spanning_confidence(context, identity, exhausted_budget=exhausted),
+            trace=RetrievalTrace(
+                route=Route.RETRIEVE,
+                pipeline=identity,
+                cached=False,
+                total_ms=(time.perf_counter() - started) * 1000.0,
+                stages=spans,
+                assembly=assembly,
+                glossary=self._declined(),
+                incomparable=tuple(dict.fromkeys(incomparable)),
+            ),
+            routing=Routing(),
+            expansion=None,
+            origins=origins,
+        )
+
+    def _spanning_stages(self) -> tuple[DenseStage, Reranker | None]:
+        """The dense leg every workspace runs, and the reranker the merged pool gets, if any.
+
+        Raises:
+            ConfigError: No stage in this pipeline is the dense leg. A cross-workspace merge is
+                defined on cosine and nothing else, so a pipeline without one has no merge to
+                perform — refused by name rather than merged on whatever scores there are.
+        """
+        stages = self._runner.stages
+        dense = next((stage for stage in stages if isinstance(stage, DenseStage)), None)
+        if dense is None:
+            msg = (
+                f"a cross-workspace search merges on the dense leg's cosine similarity, and this "
+                f"pipeline ({', '.join(self._runner.names) or 'no stages'}) has no dense stage. "
+                f"Every other score in it is relative to one workspace's corpus, so there is "
+                f"nothing the workspaces could be merged on. Add 'dense' to rag.pipeline."
+            )
+            raise ConfigError(msg)
+        reranker = next((stage for stage in stages if isinstance(stage, Reranker)), None)
+        return dense, reranker
+
+    def _leg_stage(self, dense: DenseStage, leg: WorkspaceLeg) -> DenseStage:
+        """``dense`` bound to ``leg``'s handles, kept while those handles are the same objects.
+
+        Kept because the bound stage caches its live fraction per generation, and a leg rebuilt
+        on every query would pay two counts per workspace per search to relearn it.
+        """
+        bound = self._bound.get(leg.workspace)
+        if bound is not None and bound[0] is leg.docstore and bound[1] is leg.vectors:
+            return bound[2]
+        stage = dense.for_workspace(leg.workspace, vectors=leg.vectors, docstore=leg.docstore)
+        self._bound[leg.workspace] = (leg.docstore, leg.vectors, stage)
+        return stage
+
+    def _spanning_identity(
+        self, query: Query, dense: str, reranker: Reranker | None
+    ) -> PipelineIdentity:
+        """What produces a cross-workspace ranking: the dense leg, then the reranker if any.
+
+        A different identity from the single-workspace pipeline's on purpose — lexical and
+        fusion did not run — so neither a confidence nor a cached ranking of one can be taken
+        for the other's.
+        """
+        return PipelineIdentity(
+            stages=(dense, reranker.name) if reranker is not None else (dense,),
+            profile=query.profile,
+            overrides=dict(self._profiles.overrides),  # pyright: ignore[reportArgumentType]
+            rrf_k=None,
+            reranker_model_id=reranker.model_id if reranker is not None else None,
+            embed_fingerprint=self._embed_fingerprint,
+        )
+
+    def _declined(self) -> GlossaryReport | None:
+        """The glossary's report on a search that did not consult it.
+
+        ``consulted=False`` when a glossary is wired and was declined, and ``None`` when none is
+        wired at all — the two statements the report's own field distinguishes.
+        """
+        return None if self._glossary is None else GlossaryReport(consulted=False)
+
+    async def _across_from_cache(
+        self,
+        key: str,
+        query: Query,
+        resolved: Sequence[tuple[WorkspaceLeg, Query | None]],
+        started: float,
+    ) -> RetrievalResult | None:
+        """A cached cross-workspace ranking, re-joined through every workspace it came from."""
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        joins = {
+            leg.workspace: (leg.docstore, join_filter(scoped.filter))
+            for leg, scoped in resolved
+            if scoped is not None
+        }
+        rebuilt = await rehydrate_across(entry, joins)
+        if rebuilt is None:
+            self._cache.evict(key)
+            return None
+        candidates, origins = rebuilt
+        with tracing.installed() as frame:
+            context = self._assembler.assemble(query, candidates)
+            assembly = frame.assembly
+        return RetrievalResult(
+            context=context,
+            candidates=candidates,
+            confidence=_spanning_confidence(
+                context, entry.identity, exhausted_budget=entry.exhausted_budget
+            ),
+            trace=RetrievalTrace(
+                route=Route.RETRIEVE,
+                pipeline=entry.identity,
+                cached=True,
+                total_ms=(time.perf_counter() - started) * 1000.0,
+                assembly=assembly,
+                glossary=self._declined(),
+                incomparable=(CACHED_RUN, *entry.incomparable),
+            ),
+            routing=Routing(),
+            expansion=None,
+            origins=origins,
         )
 
     async def _definitions(
@@ -382,52 +649,8 @@ class Retriever:
         )
 
     async def _resolve_membership(self, query: Query) -> Query | None:
-        """Turn ``collection_ids`` and ``tag_ids`` into ``document_ids``, or refuse.
-
-        ``None`` means *no document can match*, and it is not the same as an empty result.
-        A filter's set-valued fields default to empty and an empty field restricts nothing, so
-        resolving an empty collection into ``document_ids=frozenset()`` would hand the legs a
-        filter that searches the whole workspace — the narrowest request anyone can make,
-        answered with the widest possible result, ranked and plausible. The caller returns no
-        candidates instead.
-
-        The import is deferred rather than module-level on purpose. ``manicule.retrieval``
-        imports nothing from ``manicule.storage`` — the property ``prefilter``'s docstring
-        already protects when it restates a constant rather than importing it — and this is
-        the one place that needs a function living over there. Deferring keeps the package's
-        module graph as it was, and the cost is paid only by a query that names a collection.
-
-        Raises:
-            ValueError: The store cannot resolve membership. Refused rather than dropped: a
-                silently ignored restriction returns rows the filter was written to exclude,
-                and the search still looks like it worked.
-        """
-        scope = query.filter
-        if not (scope.collection_ids or scope.tag_ids):
-            return query
-
-        from manicule.storage.organization import resolve_filter  # noqa: PLC0415 - only here
-
-        store = self._docstore
-        if not isinstance(store, CollectionStore) or not isinstance(store, TagStore):
-            named = " and ".join(sorted(scope.restricting_fields & {"collection_ids", "tag_ids"}))
-            msg = (
-                f"this query restricts on {named}, and the document store behind it resolves "
-                f"neither collections nor tags. Refused rather than dropped: applying the rest "
-                f"of the filter would return documents the caller asked to exclude, and the "
-                f"result would look like an ordinary search."
-            )
-            # `ValueError`, not the `TypeError` the isinstance test suggests. This is the same
-            # refusal `_require_honorable` makes when a store is handed a field it has no
-            # column for, and it reaches a caller as one kind of thing: a filter that cannot
-            # be honored here. Splitting it by which layer noticed would make the surfaces
-            # report two different errors for one cause.
-            raise ValueError(msg)  # noqa: TRY004
-
-        resolved = await resolve_filter(scope, collections=store, tags=store)
-        if resolved is None:
-            return None
-        return query.model_copy(update={"filter": resolved})
+        """This workspace's :func:`resolve_membership`."""
+        return await resolve_membership(self._docstore, query)
 
     def _matches_nothing(self, query: Query, routing: Routing, started: float) -> RetrievalResult:
         """The answer when membership resolved to no document at all.
@@ -497,17 +720,20 @@ class Retriever:
             utility=answer,
         )
 
-    def _key(
-        self, query: Query, identity: PipelineIdentity, expansion: QueryExpansion
-    ) -> str | None:
+    def _key(self, query: Query, identity: PipelineIdentity, expanded: str = "") -> str | None:
+        """The cache key for ``query``, or ``None`` when nothing may be cached.
+
+        The serving workspace's generation counter, on a cross-workspace search too. It counts
+        commits on the *engine* every workspace's store shares (``manicule.storage.scoped``), so a
+        corpus write to any workspace on this data directory moves it — which is what a cached
+        ranking spanning several of them needs, and why no second counter per workspace is kept.
+        """
         if not self._cache.enabled:
             return None
         store = self._docstore
         if not isinstance(store, SupportsGeneration):
             return None
-        return cache_key(
-            query, generation=store.generation, identity=identity, expanded=expansion.expanded
-        )
+        return cache_key(query, generation=store.generation, identity=identity, expanded=expanded)
 
     async def _from_cache(
         self,
@@ -587,6 +813,80 @@ class Retriever:
         )
 
 
+async def resolve_membership(store: DocStore, query: Query) -> Query | None:
+    """Turn ``collection_ids`` and ``tag_ids`` into ``document_ids`` through ``store``, or refuse.
+
+    ``None`` means *no document can match*, and it is not the same as an empty result. A
+    filter's set-valued fields default to empty and an empty field restricts nothing, so
+    resolving an empty collection into ``document_ids=frozenset()`` would hand the legs a filter
+    that searches the whole workspace — the narrowest request anyone can make, answered with the
+    widest possible result, ranked and plausible. The caller returns no candidates instead.
+
+    A function of the store rather than a method of one retriever, because a cross-workspace
+    search resolves membership once per workspace, through that workspace's own scoped store:
+    a collection is a workspace's, and only its own store can say what is in it.
+
+    The import is deferred rather than module-level on purpose. ``manicule.retrieval`` imports
+    nothing from ``manicule.storage`` — the property ``prefilter``'s docstring already protects
+    when it restates a constant rather than importing it — and this is the one place that needs a
+    function living over there. Deferring keeps the package's module graph as it was, and the
+    cost is paid only by a query that names a collection.
+
+    Raises:
+        ValueError: The store cannot resolve membership. Refused rather than dropped: a
+            silently ignored restriction returns rows the filter was written to exclude, and the
+            search still looks like it worked.
+    """
+    scope = query.filter
+    if not (scope.collection_ids or scope.tag_ids):
+        return query
+
+    from manicule.storage.organization import resolve_filter  # noqa: PLC0415 - only here
+
+    if not isinstance(store, CollectionStore) or not isinstance(store, TagStore):
+        named = " and ".join(sorted(scope.restricting_fields & {"collection_ids", "tag_ids"}))
+        msg = (
+            f"this query restricts on {named}, and the document store behind it resolves "
+            f"neither collections nor tags. Refused rather than dropped: applying the rest "
+            f"of the filter would return documents the caller asked to exclude, and the "
+            f"result would look like an ordinary search."
+        )
+        # `ValueError`, not the `TypeError` the isinstance test suggests. This is the same
+        # refusal `_require_honorable` makes when a store is handed a field it has no column
+        # for, and it reaches a caller as one kind of thing: a filter that cannot be honored
+        # here. Splitting it by which layer noticed would make the surfaces report two
+        # different errors for one cause.
+        raise ValueError(msg)  # noqa: TRY004
+
+    resolved = await resolve_filter(scope, collections=store, tags=store)
+    if resolved is None:
+        return None
+    return query.model_copy(update={"filter": resolved})
+
+
+def _spanning_confidence(
+    context: Context, identity: PipelineIdentity, *, exhausted_budget: bool
+) -> Confidence:
+    """Confidence over a cross-workspace search's merged passages, with the one leg that ran.
+
+    The same function the single-workspace pipeline uses, given the stages this search declares:
+    the dense leg first and the reranker after it, when one ran — read off the identity, so a
+    cached ranking is scored by what produced it rather than by what is configured now.
+    Similarity reads each passage's cosine and takes the strongest per document, and documents
+    are distinct across workspaces by construction, so combining them combines independent
+    evidence. Agreement is suppressed — one leg cannot agree with itself — and lowers the
+    ceiling rather than scoring zero, with the reason the suppression itself gives.
+    """
+    stages = identity.stages
+    return score_confidence(
+        context.passages,
+        identity=identity,
+        legs=stages[:1],
+        rerank_stage=stages[1] if len(stages) > 1 else None,
+        exhausted_budget=exhausted_budget,
+    )
+
+
 def _cites_a_definition(query: Query, expansion: QueryExpansion, context: Context) -> bool:
     """Whether this result answers a question about a term by showing that term's definition.
 
@@ -655,9 +955,7 @@ async def build_retriever(container: Container, *, vectors: VectorStore | None =
     recorded result names what actually ran rather than what was asked for.
     """
     from manicule.container import keys  # noqa: PLC0415 - avoids a package-level import cycle
-    from manicule.core.protocols import Reranker  # noqa: PLC0415
     from manicule.retrieval.assembly import ContextAssembler  # noqa: PLC0415
-    from manicule.retrieval.dense import DenseStage  # noqa: PLC0415
     from manicule.retrieval.fusion import RRFStage  # noqa: PLC0415
     from manicule.retrieval.ports import GlossarySource  # noqa: PLC0415
     from manicule.retrieval.profile import Profiles  # noqa: PLC0415
@@ -723,4 +1021,5 @@ __all__ = [
     "RetrievalResult",
     "Retriever",
     "build_retriever",
+    "resolve_membership",
 ]

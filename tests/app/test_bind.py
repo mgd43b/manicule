@@ -288,6 +288,54 @@ def test_an_out_of_range_port_is_refused_before_a_socket_exists() -> None:
         resolve_bind(Settings(), port=70000)
 
 
+# --- team mode --------------------------------------------------------------------------------
+
+TEAM = {"mode": "team"}
+
+
+def test_team_mode_without_authentication_is_refused_even_on_loopback() -> None:
+    """Loopback is tolerable unauthenticated because the caller is the operator at this machine.
+
+    In team mode several people share the installation, so there is no such operator for an
+    anonymous caller to be — and the refusal holds on the one address every other rule admits.
+    """
+    with pytest.raises(PolicyError, match="team mode"):
+        resolve_bind(Settings(**TEAM))  # pyright: ignore[reportArgumentType]
+
+
+def test_no_authentication_is_refused_in_team_mode_rather_than_waiving_anything() -> None:
+    """The flag makes every anonymous caller an administrator, which is one operator's arrangement.
+
+    Refused rather than ignored, because an operator who typed it believes it did something —
+    and refused even with authentication configured, where it would otherwise be a no-op nobody
+    noticed they were relying on.
+    """
+    with pytest.raises(PolicyError, match="single-operator"):
+        resolve_bind(Settings(**TEAM), allow_unauthenticated=True)  # pyright: ignore[reportArgumentType]
+    with pytest.raises(PolicyError, match="--no-authentication"):
+        resolve_bind(
+            Settings(**TEAM, **AUTHENTICATED),  # pyright: ignore[reportArgumentType]
+            allow_unauthenticated=True,
+        )
+
+
+def test_team_mode_with_authentication_binds_like_any_other_installation() -> None:
+    """The control: team mode asks for a credential, not for anything else."""
+    assert resolve_bind(Settings(**TEAM, **AUTHENTICATED)).loopback  # pyright: ignore[reportArgumentType]
+    wide = resolve_bind(
+        Settings(**TEAM, **AUTHENTICATED),  # pyright: ignore[reportArgumentType]
+        host=EVERYWHERE,
+        allow_public=True,
+    )
+    assert not wide.loopback
+
+
+def test_personal_mode_keeps_its_unauthenticated_loopback() -> None:
+    """The shipped posture is unchanged by team mode existing."""
+    assert resolve_bind(Settings()).loopback
+    assert resolve_bind(Settings(), allow_unauthenticated=True).loopback
+
+
 # --- the check that survives a future server ------------------------------------------------
 
 

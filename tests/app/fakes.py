@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, cast, override
 
 from manicule.app.ports import (
     Answering,
@@ -23,13 +23,17 @@ from manicule.app.ports import (
     Ingesting,
     Keys,
     Maintenance,
+    MemberChange,
+    OpenedWorkspace,
     Organizing,
     ResetOutcome,
     RetainedBytes,
     Retrieving,
+    SecurityAlerts,
     Telemetry,
+    Users,
 )
-from manicule.app.results import ApiKeySummary, Check
+from manicule.app.results import ApiKeySummary, Check, UserSummary
 from manicule.app.tenancy import belongs_to
 from manicule.config.settings import Settings
 from manicule.core.acquisition import AcquisitionRun
@@ -41,7 +45,7 @@ from manicule.core.embedding import (
     VectorChecksumBackfill,
     VectorChecksumCoverage,
 )
-from manicule.core.errors import NameInUseError, UnknownEntityError
+from manicule.core.errors import NameInUseError, PolicyError, UnknownEntityError
 from manicule.core.generation import FinishReason, Token
 from manicule.core.glossary import QueryExpansion
 from manicule.core.ids import chunk_id, content_hash, document_id
@@ -90,13 +94,16 @@ from manicule.ingest.reindex import (
 )
 from manicule.ingest.sweeps import SweepResult
 from manicule.retrieval.retriever import RetrievalResult
+from manicule.retrieval.spanning import WorkspaceLeg
 from manicule.storage.organization import normalize_name
 from manicule.storage.vector_migration import VectorMigration
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 
+    from manicule.app.people import Profile
     from manicule.core.fingerprints import GlossaryFingerprint
+    from manicule.core.protocols import DocStore, VectorStore
     from manicule.core.retrieval import Filter
     from manicule.generation.answering import AnswerRequest, AnswerResult
     from manicule.plugins.registry import Discovery
@@ -1425,15 +1432,31 @@ class FakeMaintenance:
 
 @dataclass
 class FakeKeys:
-    """API keys, held in memory."""
+    """API keys, held in memory.
+
+    A key's owner is its summary's ``user_id``; ``None`` is the operator at the command line, as
+    ``api_keys.user_id`` is NULL. ``memberships`` stands in for the real store's join against
+    :class:`~manicule.storage.models.WorkspaceMember`: a mapping from user id to that person's
+    current role, or absent for a person who is not a member here at all. ``None`` for a role
+    means "a member row exists and is disabled" — present in the map, unusable — which is a
+    state a test needs to be able to construct and that plain absence cannot represent.
+    """
 
     issued: list[ApiKeySummary] = field(default_factory=list[ApiKeySummary])
     workspace: str = "default"
     secrets: dict[str, ApiKeySummary] = field(default_factory=dict[str, ApiKeySummary])
     revoked: set[str] = field(default_factory=set[str])
+    memberships: dict[str, str | None] = field(default_factory=dict[str, "str | None"])
 
     async def issue(
-        self, name: str, *, role: str, expires_days: int | None = None
+        self,
+        name: str,
+        *,
+        role: str,
+        expires_days: int | None = None,
+        user_id: str | None = None,
+        allowed_ips: Sequence[str] = (),
+        rate_limit: int | None = None,
     ) -> tuple[ApiKeySummary, str]:
         summary = ApiKeySummary(
             id=f"key-{len(self.issued)}",
@@ -1447,36 +1470,343 @@ class FakeKeys:
                 if expires_days
                 else None
             ),
+            user_id=user_id,
+            allowed_ips=tuple(allowed_ips),
+            rate_limit=rate_limit,
         )
         self.issued.append(summary)
         secret = f"mnk_secret_{summary.id}"
         self.secrets[secret] = summary
         return summary, secret
 
-    async def list_keys(self) -> Sequence[ApiKeySummary]:
-        return list(self.issued)
+    async def list_keys(self, *, owner: str | None = None) -> Sequence[ApiKeySummary]:
+        if owner is None:
+            return list(self.issued)
+        return [summary for summary in self.issued if summary.user_id == owner]
 
-    async def revoke(self, name_or_id: str) -> ApiKeySummary:
+    async def revoke(
+        self, name_or_id: str, *, restrict_to_owner: str | None = None
+    ) -> ApiKeySummary:
         for summary in self.issued:
             if name_or_id in {summary.id, summary.name}:
+                if restrict_to_owner is not None and summary.user_id != restrict_to_owner:
+                    break
                 self.revoked.add(summary.id)
                 return summary
         msg = f"no API key named {name_or_id!r} in workspace {self.workspace!r}"
         raise UnknownEntityError(msg)
 
-    async def verify(self, secret: str) -> ApiKeySummary | None:
+    async def verify(self, secret: str, *, address: str = "") -> ApiKeySummary | None:
         """Resolve a secret the same way the real store does: by lookup, then by predicate.
 
         Revoked and expired keys are refused here rather than merely absent from ``issued``,
         because "the key exists and is no longer usable" is the case a surface test has to be
-        able to construct.
+        able to construct. An owned key additionally resolves only while ``memberships`` names a
+        live role for its owner, capped at the lesser of the two roles — see ``memberships``'
+        own docstring for what a disabled membership looks like here.
         """
         summary = self.secrets.get(secret)
         if summary is None or summary.id in self.revoked:
             return None
         if summary.expires_at and datetime.fromisoformat(summary.expires_at) <= datetime.now(UTC):
             return None
-        return summary
+        if summary.allowed_ips and not _address_in(address, summary.allowed_ips):
+            return None
+        if summary.user_id is None:
+            return summary
+        member_role = self.memberships.get(summary.user_id)
+        if summary.user_id not in self.memberships or member_role is None:
+            return None
+        rank = {"viewer": 0, "member": 1, "admin": 2}
+        effective = summary.role if rank[summary.role] <= rank[member_role] else member_role
+        return summary.model_copy(update={"role": effective})
+
+
+def _address_in(address: str, allowed_ips: Sequence[str]) -> bool:
+    from ipaddress import ip_address, ip_network  # noqa: PLC0415 - only this fake needs it
+
+    if not address:
+        return False
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        return False
+    return any(parsed in ip_network(entry, strict=False) for entry in allowed_ips)
+
+
+@dataclass
+class FakeSecurityAlerts:
+    """Recorded security alerts, held in memory."""
+
+    alerts: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+
+    async def record_alert(self, kind: str, subject: str, *, details: Mapping[str, object]) -> str:
+        identifier = f"alert-{len(self.alerts)}"
+        self.alerts.append(
+            {
+                "id": identifier,
+                "kind": kind,
+                "subject": subject,
+                "details": dict(details),
+                "created_at": datetime.now(UTC).isoformat(),
+                "acknowledged_at": None,
+                "acknowledged_by": None,
+            }
+        )
+        return identifier
+
+    async def list_alerts(
+        self, *, unacknowledged_only: bool = False, limit: int = 50, offset: int = 0
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        chosen = [
+            row
+            for row in reversed(self.alerts)
+            if not unacknowledged_only or row["acknowledged_at"] is None
+        ]
+        return chosen[offset : offset + limit], len(chosen)
+
+    async def acknowledge_alert(self, alert_id: str, *, by: str) -> Mapping[str, object] | None:
+        for row in self.alerts:
+            if row["id"] == alert_id:
+                row["acknowledged_at"] = datetime.now(UTC).isoformat()
+                row["acknowledged_by"] = by
+                return row
+        return None
+
+
+@dataclass
+class FakeUsers:
+    """People, memberships and sessions, held in memory and scoped the way the real store is.
+
+    ``workspace`` is this handle's tenant, and every membership and session read filters on it.
+    ``resolves`` counts every call to :meth:`resolve_session`, so a surface test can prove a
+    forged cookie was refused *before* anything was looked up rather than by the lookup.
+
+    ``guards_last_admin`` is the store's own last-administrator check, on by default like the
+    real store's. A test that wants to see the *service's* check fire turns it off, which is the
+    fake breaking its half of the bargain on purpose.
+    """
+
+    workspace: str = "default"
+    people: dict[str, dict[str, object]] = field(default_factory=dict[str, dict[str, object]])
+    memberships: dict[tuple[str, str], dict[str, object]] = field(
+        default_factory=dict[tuple[str, str], dict[str, object]]
+    )
+    sessions: dict[str, dict[str, object]] = field(default_factory=dict[str, dict[str, object]])
+    keys: Keys | None = None
+    resolves: int = 0
+    guards_last_admin: bool = True
+
+    def _summary(self, user_id: str, workspace: str) -> UserSummary:
+        person = self.people[user_id]
+        membership = self.memberships[(workspace, user_id)]
+        return UserSummary(
+            id=user_id,
+            provider=str(person["provider"]),
+            email=str(person.get("email") or ""),
+            name=str(person.get("name") or ""),
+            role=str(membership["role"]),
+            workspace=workspace,
+            disabled=bool(membership.get("disabled")),
+            created_at=str(membership.get("created_at", "")),
+            last_login_at=str(person.get("last_login_at", "")),
+            sessions=self._live(user_id, workspace),
+        )
+
+    def _live(self, user_id: str, workspace: str) -> int:
+        now = datetime.now(UTC)
+        return sum(
+            1
+            for record in self.sessions.values()
+            if record["user_id"] == user_id
+            and record["workspace"] == workspace
+            and not record.get("revoked")
+            and cast("datetime", record["expires_at"]) > now
+        )
+
+    def _by_subject(self, provider: str, subject: str) -> str | None:
+        for user_id, person in self.people.items():
+            if person["provider"] == provider and person["subject"] == subject:
+                return user_id
+        return None
+
+    async def member_by_subject(self, provider: str, subject: str) -> UserSummary | None:
+        user_id = self._by_subject(provider, subject)
+        if user_id is None or (self.workspace, user_id) not in self.memberships:
+            return None
+        return self._summary(user_id, self.workspace)
+
+    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+        user_id = self._by_subject(profile.provider, profile.subject)
+        now = datetime.now(UTC).isoformat()
+        if user_id is None:
+            user_id = f"user-{len(self.people)}"
+            self.people[user_id] = {"provider": profile.provider, "subject": profile.subject}
+        self.people[user_id].update(
+            email=profile.verified_email or None, name=profile.name or None, last_login_at=now
+        )
+        self.memberships.setdefault(
+            (self.workspace, user_id), {"role": role, "disabled": False, "created_at": now}
+        )
+        return self._summary(user_id, self.workspace)
+
+    def add_member(
+        self,
+        user_id: str,
+        *,
+        role: str = "member",
+        email: str = "",
+        provider: str = "google",
+        workspace: str | None = None,
+        disabled: bool = False,
+    ) -> None:
+        """Seed one member directly, for a test that is not about signing in."""
+        self.people.setdefault(
+            user_id,
+            {"provider": provider, "subject": f"sub-{user_id}", "email": email, "name": ""},
+        )
+        self.memberships[(workspace or self.workspace, user_id)] = {
+            "role": role,
+            "disabled": disabled,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+
+    async def begin_session(self, user_id: str, *, max_age_s: int) -> tuple[str, str, str]:
+        token = f"session-token-{len(self.sessions)}"
+        expires = datetime.now(UTC) + timedelta(seconds=max_age_s)
+        self.sessions[token] = {
+            "id": f"session-{len(self.sessions)}",
+            "user_id": user_id,
+            "workspace": self.workspace,
+            "expires_at": expires,
+            "revoked": False,
+        }
+        return str(self.sessions[token]["id"]), expires.isoformat(), token
+
+    async def resolve_session(self, token: str) -> UserSummary | None:
+        self.resolves += 1
+        record = self.sessions.get(token)
+        if record is None or record["workspace"] != self.workspace or record.get("revoked"):
+            return None
+        if cast("datetime", record["expires_at"]) <= datetime.now(UTC):
+            return None
+        membership = self.memberships.get((self.workspace, str(record["user_id"])))
+        if membership is None or membership.get("disabled"):
+            return None
+        return self._summary(str(record["user_id"]), self.workspace)
+
+    async def end_session(self, token: str) -> bool:
+        record = self.sessions.get(token)
+        if record is None or record["workspace"] != self.workspace or record.get("revoked"):
+            return False
+        record["revoked"] = True
+        return True
+
+    async def end_sessions(self, user_id: str) -> int:
+        ended = 0
+        for record in self.sessions.values():
+            if (
+                record["user_id"] == user_id
+                and record["workspace"] == self.workspace
+                and not record.get("revoked")
+            ):
+                record["revoked"] = True
+                ended += 1
+        return ended
+
+    async def list_members(self) -> Sequence[UserSummary]:
+        return [
+            self._summary(user_id, workspace)
+            for (workspace, user_id) in self.memberships
+            if workspace == self.workspace
+        ]
+
+    async def find_members(self, user_or_email: str) -> Sequence[UserSummary]:
+        wanted = user_or_email.strip().lower()
+        return [
+            member
+            for member in await self.list_members()
+            if member.id.lower() == wanted or (member.email and member.email.lower() == wanted)
+        ]
+
+    async def count_admins(self) -> int:
+        return sum(
+            1
+            for (workspace, _), membership in self.memberships.items()
+            if workspace == self.workspace
+            and membership["role"] == "admin"
+            and not membership.get("disabled")
+        )
+
+    async def standing_in(self, user_id: str, workspaces: Sequence[str]) -> frozenset[str]:
+        return frozenset(
+            workspace
+            for (workspace, member), membership in self.memberships.items()
+            if member == user_id and workspace in workspaces and not membership.get("disabled")
+        )
+
+    async def update_member(
+        self, user_id: str, *, role: str | None = None, disabled: bool | None = None
+    ) -> MemberChange:
+        membership = self.memberships.get((self.workspace, user_id))
+        if membership is None:
+            msg = f"no member {user_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        previous_role = str(membership["role"])
+        previously_disabled = bool(membership.get("disabled"))
+        new_role = role if role is not None else previous_role
+        new_disabled = disabled if disabled is not None else previously_disabled
+        was_admin = previous_role == "admin" and not previously_disabled
+        stays_admin = new_role == "admin" and not new_disabled
+        if (
+            self.guards_last_admin
+            and was_admin
+            and not stays_admin
+            and await self.count_admins() <= 1
+        ):
+            msg = f"{user_id} is the last enabled administrator"
+            raise PolicyError(msg)
+        membership["role"] = new_role
+        membership["disabled"] = new_disabled
+        sessions_revoked = keys_revoked = 0
+        if new_disabled and not previously_disabled:
+            sessions_revoked = await self.end_sessions(user_id)
+            if isinstance(self.keys, FakeKeys):
+                for summary in self.keys.issued:
+                    owned = summary.user_id == user_id
+                    if owned and summary.id not in self.keys.revoked:
+                        self.keys.revoked.add(summary.id)
+                        keys_revoked += 1
+        return MemberChange(
+            member=self._summary(user_id, self.workspace),
+            previous_role=previous_role,
+            previously_disabled=previously_disabled,
+            sessions_revoked=sessions_revoked,
+            keys_revoked=keys_revoked,
+        )
+
+
+@dataclass
+class LeakyUsers(FakeUsers):
+    """A people store that ignores its workspace scope. **Deliberately broken.**
+
+    It resolves a session whatever workspace minted it, and lists every membership it holds,
+    whichever workspace it belongs to — what the store looks like written without the
+    ``WHERE workspace_id = ...`` its every statement carries. It exists so the service's own
+    check on the way out can be seen to fire; against a correct store that check never would.
+    """
+
+    @override
+    async def resolve_session(self, token: str) -> UserSummary | None:
+        self.resolves += 1
+        record = self.sessions.get(token)
+        if record is None:
+            return None
+        return self._summary(str(record["user_id"]), str(record["workspace"]))
+
+    @override
+    async def list_members(self) -> Sequence[UserSummary]:
+        return [self._summary(user_id, workspace) for (workspace, user_id) in self.memberships]
 
 
 @dataclass
@@ -1513,6 +1843,8 @@ class FakeBackend:
     conversations_: FakeConversations = field(default_factory=FakeConversations)
     telemetry_: FakeTelemetry = field(default_factory=FakeTelemetry)
     keys_: FakeKeys = field(default_factory=FakeKeys)
+    users_: FakeUsers = field(default_factory=FakeUsers)
+    security_alerts_: FakeSecurityAlerts = field(default_factory=FakeSecurityAlerts)
     retained_: FakeRetained = field(default_factory=FakeRetained)
     generator_: FakeGenerator = field(default_factory=FakeGenerator)
     discovery: Discovery | None = None
@@ -1555,8 +1887,134 @@ class FakeBackend:
     async def keys(self) -> Keys:
         return self.keys_
 
+    async def users(self) -> Users:
+        # The same key store the backend hands the service, so a disable here revokes the keys
+        # a test minted there — which is the property being tested, not a convenience.
+        self.users_.keys = self.keys_
+        return self.users_
+
+    async def security_alerts(self) -> SecurityAlerts:
+        return self.security_alerts_
+
     async def component_checks(self) -> Sequence[Check]:
         return list(self.checks)
+
+
+@dataclass
+class SpanningRetriever(FakeRetriever):
+    """A retriever that can span workspaces, returning scripted attributed candidates.
+
+    ``across`` is ``(origins, candidate)`` per candidate, in ranked order: the workspaces whose
+    search returned it, as a real merge records them. Scripting the origins rather than deriving
+    them is what lets a test hand the service a hit claimed by the wrong workspace, by none, or
+    by two — the attributions a real merge only produces over a store that ignored its scope.
+    """
+
+    across: list[tuple[tuple[str, ...], Candidate]] = field(
+        default_factory=list[tuple[tuple[str, ...], Candidate]]
+    )
+    seen_across: list[tuple[Query, list[str]]] = field(
+        default_factory=list[tuple[Query, list[str]]]
+    )
+
+    async def retrieve_across(self, query: Query, legs: Sequence[WorkspaceLeg]) -> RetrievalResult:
+        self.seen_across.append((query, [leg.workspace for leg in legs]))
+        candidates = [candidate for _, candidate in self.across]
+        return RetrievalResult(
+            context=Context(query=query, passages=tuple(candidates)),
+            candidates=candidates,
+            confidence=Confidence(score=0.4, band=ConfidenceBand.LOW, reason="scripted"),
+            origins={candidate.chunk.id: origins for origins, candidate in self.across},
+        )
+
+
+@dataclass
+class SpanningBackend(FakeBackend):
+    """A backend whose data directory holds other workspaces, which it can open.
+
+    The serving workspace opens as this backend's own store and organization, as the runtime's
+    registry opens it; every other name opens from :attr:`others` or is refused as unknown.
+    """
+
+    others: dict[str, tuple[FakeStore, FakeOrganization]] = field(
+        default_factory=dict[str, tuple[FakeStore, FakeOrganization]]
+    )
+    opened: list[list[str]] = field(default_factory=list[list[str]])
+    """Every request to open workspaces, in order — empty when a refusal came first."""
+
+    async def open_workspaces(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
+        self.opened.append(list(names))
+        handles: list[OpenedWorkspace] = []
+        for name in names:
+            if name == self.workspace:
+                store, organization = self.store, self.organization_
+            elif name in self.others:
+                store, organization = self.others[name]
+            else:
+                msg = f"no workspace {name!r} on this data directory"
+                raise UnknownEntityError(msg)
+            handles.append(
+                OpenedWorkspace(
+                    name=name,
+                    documents=store,
+                    organization=organization,
+                    leg=WorkspaceLeg(
+                        workspace=name,
+                        docstore=cast("DocStore", store),
+                        vectors=cast("VectorStore", object()),
+                    ),
+                )
+            )
+        return handles
+
+    @property
+    def spanning(self) -> SpanningRetriever:
+        """The retriever, typed as the spanning one it always is here."""
+        retriever = self.retriever_
+        if not isinstance(retriever, SpanningRetriever):  # pragma: no cover - a test replaced it
+            msg = "this backend's retriever was replaced with one that cannot span"
+            raise TypeError(msg)
+        return retriever
+
+
+def spanning_backend(
+    serving: str = "alpha", other: str = "beta", **settings: Any
+) -> SpanningBackend:
+    """``serving`` and ``other`` side by side, one runbook each, and a retriever spanning both.
+
+    The scripted ranking puts ``other``'s runbook first, so an attribution a surface got wrong
+    shows up as the first hit rather than hiding at the end.
+    """
+    serving_store = FakeStore(workspace_id=serving)
+    serving_doc = serving_store.add(
+        make_document(serving, source_id=f"{serving}.md", title=f"{serving.title()} runbook")
+    )
+    other_store = FakeStore(workspace_id=other)
+    other_doc = other_store.add(
+        make_document(other, source_id=f"{other}.md", title=f"{other.title()} runbook")
+    )
+    backend = SpanningBackend(
+        settings=Settings(workspace=serving, **settings),
+        store=serving_store,
+        organization_=FakeOrganization(workspace_id=serving),
+        retriever_=SpanningRetriever(),
+        others={other: (other_store, FakeOrganization(workspace_id=other))},
+    )
+    backend.keys_.workspace = serving
+    backend.maintenance_.workspace_rows = [
+        (serving, serving, "team"),
+        (other, other, "team"),
+    ]
+
+    def candidate(document: Document, score: float) -> Candidate:
+        return Candidate(chunk=make_chunk(document), score=score, scores={"dense": score})
+
+    backend.spanning.across = [
+        ((other,), candidate(other_doc, 0.9)),
+        ((serving,), candidate(serving_doc, 0.7)),
+    ]
+    backend.spanning.candidates = [candidate(serving_doc, 0.7)]
+    return backend
 
 
 __all__ = [
@@ -1568,7 +2026,12 @@ __all__ = [
     "FakeRetained",
     "FakeRetriever",
     "FakeStore",
+    "FakeUsers",
     "LeakyStore",
+    "LeakyUsers",
+    "SpanningBackend",
+    "SpanningRetriever",
     "make_chunk",
     "make_document",
+    "spanning_backend",
 ]

@@ -1,4 +1,4 @@
-"""Twelve areas, each a page that runs operations and renders their envelopes.
+"""The areas, each a page that runs operations and renders their envelopes.
 
 Every handler here has the same three lines: admit the reader, run one or more operations
 through :func:`~manicule.web.rendering.panel`, render. There is no fourth line, and a page that
@@ -35,7 +35,7 @@ policy decision in a template.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Query
 
@@ -45,9 +45,14 @@ from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from manicule.api.context import Service
+from manicule.api.security import Principal, require
+from manicule.config.settings import Role
 from manicule.web.areas import AREAS, NAVIGATION
 from manicule.web.rendering import SCRIPT, STYLESHEET, PanelCall, panel, panels, render
 from manicule.web.security import Guest, Operator, Reader
+
+if TYPE_CHECKING:
+    from manicule.app.results import Payload
 
 router = APIRouter(prefix="/ui", tags=["web"])
 
@@ -268,6 +273,7 @@ async def search(
     q: Annotated[str, Query()] = "",
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
     profile: Annotated[str | None, Query()] = None,
+    workspaces: Annotated[list[str] | None, Query()] = None,
 ) -> HTMLResponse:
     """The cheap half of ``ask``: ranked passages, each with the score every stage gave it.
 
@@ -278,7 +284,21 @@ async def search(
     with a traceback frame naming this file's path on the server — into a browser window, which
     is both a dead end for the reader and an unnecessary disclosure. Blank renders the form with
     nothing under it instead, which is the state the page is *for* before a query is typed.
+
+    **Searching several workspaces is an administrator's**, and this page takes the floor the
+    route behind it takes: ``GET /api/v1/search`` asks for an admin when it is given other
+    workspaces, and so does this, inside the operation so the refusal is the page the operation's
+    failure renders. The workspace picker is offered only to a reader who holds that role —
+    decided here rather than in the template, which renders whatever list it is handed — and
+    the service refuses anyone else however the request was made.
     """
+    spanned = tuple(workspaces) if workspaces else None
+    extra = {
+        "query": q if q.strip() else "",
+        "profile": profile or "",
+        "workspace_choices": await _workspace_choices(service, caller),
+        "selected_workspaces": spanned or (),
+    }
     if not q.strip():
         return render(
             "search.html",
@@ -287,21 +307,43 @@ async def search(
             service=service,
             caller=caller,
             panels={},
-            extra={"query": "", "profile": profile or ""},
+            extra=extra,
         )
+
+    async def searched() -> Payload:
+        if service.crosses_workspaces(spanned):
+            require(caller, Role.ADMIN)
+        return await service.search(q, limit=limit, profile=profile, workspaces=spanned)
+
     return render(
         "search.html",
         area="documents",
         title="Search",
         service=service,
         caller=caller,
-        panels={
-            "search": await panel(
-                "search", service, lambda: service.search(q, limit=limit, profile=profile)
-            )
-        },
+        panels={"search": await panel("search", service, searched)},
         primary="search",
-        extra={"query": q, "profile": profile or ""},
+        extra=extra,
+    )
+
+
+async def _workspace_choices(service: Service, caller: Principal) -> tuple[str, ...]:
+    """The workspaces an administrator may search together, and nothing for anyone else.
+
+    Empty rather than refused for a reader below admin: the ordinary search is theirs, and a
+    picker that is not offered is the honest rendering of a choice they do not have. A listing
+    that fails leaves the picker out rather than failing the page — the search is still a search.
+    """
+    if not caller.caller.holds(Role.ADMIN):
+        return ()
+    listed = await panel("workspace_list", service, service.workspace_list)
+    if not listed.ok:
+        return ()
+    rows = listed.data.get("workspaces")
+    if not isinstance(rows, list):
+        return ()
+    return tuple(
+        str(row["id"]) for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)
     )
 
 
@@ -443,6 +485,10 @@ async def admin(
                 "quality": ("search_quality", service.search_quality),
                 "queries": ("query_logs", lambda: service.query_logs(limit=limit, offset=offset)),
                 "audit": ("audit_log", lambda: service.audit_log(limit=limit, offset=offset)),
+                "alerts": (
+                    "security_alerts",
+                    lambda: service.security_alerts(unacknowledged_only=True, limit=limit),
+                ),
                 "plugins": ("plugin_health", service.plugin_health),
                 "connectors": ("connector_list", service.connector_list),
             },
@@ -575,14 +621,18 @@ async def settings(service: Service, caller: Operator) -> HTMLResponse:
 # --- auth -------------------------------------------------------------------------------------
 
 
-@router.get("/auth", name="ui_auth", summary="This person's API keys, and how they authenticate.")
-async def auth(service: Service, caller: Operator) -> HTMLResponse:
-    """One person managing their own keys. There is no user administration here.
+@router.get("/auth", name="ui_auth", summary="This workspace's API keys, and how it authenticates.")
+async def auth(service: Service, caller: Reader) -> HTMLResponse:
+    """The keys programs authenticate with, and what this installation demands of a caller.
 
-    manicule is single-user until it is feature complete; roles, invitations and identity
-    providers belong to team mode ([#13](https://github.com/mgd43b/manicule/issues/13)). What
-    this page is for is the two things a single operator needs: the keys that exist, and what
-    this installation currently demands of a caller.
+    A reader's page, because its routes are viewer-floor ones: which keys a caller sees, mints
+    and revokes is the service's ownership rule, not a role. An administrator sees every key in
+    the workspace; a signed-in person sees and manages the keys they minted; a caller who is
+    neither sees none.
+
+    Keys only. People — who is a member, in what role, and whether they are enabled — are the
+    people page's (:func:`users`), because a key and a membership are revoked, owned and
+    reasoned about differently, and one page carrying both would blur which control does what.
 
     Records, never secrets. Only digests are stored, so there is no secret to render — a key's
     one copy is in the response that minted it.
@@ -600,11 +650,67 @@ async def auth(service: Service, caller: Operator) -> HTMLResponse:
                 "providers": ("auth_providers", service.auth_providers),
             },
         ),
-        extra={"key_id": caller.identity.key_id, "key_name": caller.identity.key_name},
+        extra={
+            "key_id": caller.identity.key_id,
+            "key_name": caller.identity.key_name,
+            "credential": {"key": "an API key", "session": "a signed-in browser"}.get(
+                caller.identity.via, ""
+            ),
+        },
     )
 
 
-# --- the one page with no credential ------------------------------------------------------------
+# --- people ---------------------------------------------------------------------------------
+
+
+@router.get("/users", name="ui_users", summary="The people who are members of this workspace.")
+async def users(service: Service, caller: Operator) -> HTMLResponse:
+    """Members, their roles and standing, and the controls an administrator uses on them.
+
+    Admin-only, like the API route it reads. Every control on it calls the JSON API; the rules
+    those calls are held to are the service's, and a refusal is shown in the service's words.
+    """
+    return render(
+        "users.html",
+        area="users",
+        title="People",
+        service=service,
+        caller=caller,
+        panels=await panels(
+            service,
+            {
+                "users": ("user_list", service.user_list),
+                "providers": ("auth_providers", service.auth_providers),
+            },
+        ),
+        extra={"me": caller.identity.user_id},
+    )
+
+
+# --- the two pages with no credential -------------------------------------------------------------
+
+
+@router.get(
+    "/login", name="ui_login", summary="Sign in, or learn how this installation authenticates."
+)
+async def login(service: Service, caller: Guest) -> HTMLResponse:
+    """Links to every provider that applies to this workspace, and nothing to type.
+
+    Anonymous, because it is how a person without a credential gets one. Where nobody signs in —
+    ``security.auth.mode`` of ``none`` or ``api_key`` — it says how this installation does
+    authenticate instead, rather than offering a sign-in that the login routes would refuse.
+    """
+    return render(
+        "login.html",
+        area="",
+        title="Sign in",
+        service=service,
+        caller=caller,
+        panels={
+            "providers": await panel("auth_providers", service, service.auth_providers),
+        },
+        layout="bare.html",
+    )
 
 
 @router.get(

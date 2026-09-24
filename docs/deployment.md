@@ -86,6 +86,11 @@ an account with access to exactly what the index is meant to hold. An admin toke
 everything an admin can see, into a directory that is a verbatim copy, on a machine whose file
 permissions are now the only access control left.
 
+**Team mode does not change this.** Every member of a workspace can search all of it; a role
+decides what a person may *do* — read, write, administer — and not which documents they may see
+([`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session)). Content some
+members must not read belongs in a workspace they are not members of.
+
 ---
 
 ## 2. Filesystem permissions
@@ -269,14 +274,17 @@ mutating tool is absent from it rather than refused on it, for the reason
 gives. Over stdio, where one client talks to one process down a pipe, the whole surface is
 offered.
 
-The browser surface is for the loopback, single-operator installation. A browser cannot attach a
-header to a page load and this build has no session cookie, so with `security.auth.mode` set to
-anything but `none` a page load carries no credential and is refused — with a page saying so.
-That is deliberate rather than a gap; [`web.md` §5](web.md#5-what-a-browser-cannot-present-said-plainly)
-explains it, and an interactive login belongs to
-[#13](https://github.com/mgd43b/manicule/issues/13). The practical consequence for a deployment
-is that publishing a port gets you the API and the widget, and the pages will refuse — which is
-the safe direction for the surface that renders the corpus.
+What the browser surface does on a published port depends on how the installation
+authenticates. A browser cannot attach a header to a page load, so with `security.auth.mode =
+api_key` a page load carries no credential and is refused — with a page saying so — and
+publishing a port gets you the API and the widget while the pages refuse, which is the safe
+direction for the surface that renders the corpus. With `security.auth.mode = oauth` people sign
+in through Google or GitHub at `/ui/login` and the pages work for them; that needs
+`security.auth.session_secret`, a provider whose `redirect_uri` is this deployment's own
+`https://<host>/auth/callback/<type>`, and an allowlist, and `manicule serve` refuses to start
+without them. [`web.md` §5](web.md#5-what-a-browser-can-present-said-plainly) says what a
+browser can present in each mode, and
+[`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session) is the sign-in.
 
 **Publish to host loopback, with authentication on.**
 
@@ -338,6 +346,63 @@ authentication is on, or `--no-authentication` is in the command that started it
 then decides is which of the **host's** interfaces see it, and `-p PORT:PORT` decides all of
 them. The guard inside the container cannot make that
 choice for you and does not try to.
+
+### 4.1 Running for a team
+
+The pieces above compose into one path; this section is that path, not new mechanism. Every
+fact below is documented once, at the reference cited — this is where they meet.
+
+**Choose the mode, then the credential.** `mode = "team"` says several people share this
+installation, and it is stricter than the personal-mode binding rule above: a team installation
+with `security.auth.mode = "none"` is refused wherever a socket is made, loopback included, and
+`--no-authentication` is refused rather than honored — there is no anonymous operator to fall
+back to (`docs/surfaces.md` §6, "Team mode takes the way out away"). A program still authenticates
+with `security.auth.mode = "api_key"`; a person at a browser needs
+`security.auth.mode = "oauth"`.
+
+**Sign-in configuration** is one `[security.auth]` block plus one `[[security.auth.providers]]`
+table per identity provider — the exact shape, with `example.org` in place of a real domain, is
+`docs/surfaces.md` §9.2.1. Two things from that shape matter specifically at deployment time:
+
+- `redirect_uri` must be this deployment's own `https://<host>/auth/callback/<type>`, registered
+  with the provider, and never derived from the request — a `Host` header is not a trusted
+  source for where an authorization code gets sent.
+- `session_secret` and every provider's `client_secret` are credentials, and `manicule config
+  set` refuses outright to set one (`ConfigError`, naming the key) rather than accepting and
+  then silently dropping it. Supply them as environment variables —
+  `MANICULE_SECURITY__AUTH__SESSION_SECRET`, and `MANICULE_SECURITY__AUTH__PROVIDERS` as a JSON
+  list of the provider tables — or write them directly into a config file only the account
+  running manicule can read; `docs/surfaces.md` §9.2.1 has both forms. The config file, unlike
+  the data directory, is not what `manicule backup` or `manicule export` copies, but a
+  hand-written secret in it is still a secret on disk: keep it out of version control the same
+  way §1 and §2 ask of everything else that can read the corpus.
+
+**Behind a TLS-terminating reverse proxy**, two settings point in different directions and both
+need to be right:
+
+- `security.transport.enforce_https` (default on) governs what the *browser* is told, not what
+  manicule's own socket receives: it marks the session and sign-in cookies `Secure` and requires
+  `redirect_uri` to be `https://`. Leave it on — the browser really did speak HTTPS to the
+  proxy, even though the proxy's own connection to manicule behind it is plain HTTP. Turning it
+  off is for a plain-HTTP network an operator owns outright, not for "there's a proxy in front."
+- `security.transport.trusted_proxies` must name the proxy's own address (or the network it
+  connects from), or every caller behind it is attributed to the proxy's peer address instead of
+  its own — collapsing every rate-limit bucket, alert subject and audited address onto one
+  entry (`docs/surfaces.md` §9.3). An empty list, the default, is correct only when nothing sits
+  in front of manicule at all.
+
+**Bootstrapping the first administrator** is a one-time step, not a setting: give one provider
+`role = "admin"` with an `allowed_emails`/`allowed_domains` entry naming only that person, sign
+in once, then narrow the provider back to `role = "member"` for everyone who signs in after —
+or let people sign in as members from the start and promote one from the command line, which
+runs as the operator at the machine rather than over the network:
+`manicule auth set-role <user-id-or-address> admin`. A workspace that has an enabled
+administrator always keeps one; the command line cannot demote or disable the last one either
+(`docs/surfaces.md` §9.2.1, "The first administrator").
+
+**Rate limits, security alerts and the audit trail** are the operational surface a team
+deployment watches day to day, sized and wired at §6.6 below — nothing about them is specific to
+how the installation is reached, so they are not repeated here.
 
 ---
 
@@ -1056,6 +1121,34 @@ schedule, and nothing manicule ships does that for you.
 `lancedb` stays the default everywhere, including in the published container image (§5) — the
 `qdrant` extra ships in it too, but an installation opts into the networked backend by one
 setting rather than having it chosen for them.
+
+### 6.6 Rate limits, security alerts and the audit trail
+
+Every served process metering itself — `security.rate_limit` — costs a handful of dictionaries
+and touches no store, so it needs no operational attention beyond the defaults being sane for
+the traffic actually expected: `per_minute` and `burst` per caller, `failed_auth_per_minute` per
+address for failed authentications, and `max_tracked` bounding memory. `docs/surfaces.md` §9.10
+is the reference; the one thing worth planning for at deployment time is that the buckets are
+**per process**, not shared across replicas — a caller spread across two served processes behind
+a load balancer gets two independent buckets, effectively doubling its ceiling. A single-process
+deployment (the only kind manicule serves today; there is no shared bucket store) does not have
+this problem.
+
+`security.alerts` writes to `security_alerts` (`docs/storage.md`) and logs at `WARNING`,
+independently of whether `security.audit` is on. An operator who wants to be notified rather than
+having to poll `manicule auth alerts` should watch the process's own log output for lines from
+the `manicule.app` logger naming `security alert`, or poll `GET /api/v1/admin/alerts` on a
+schedule. There is no push notification or webhook delivery for an alert yet — `security.audit`
+declares a `destination` of `local`, `syslog` or `webhook`, but only `local` (the `audit_logs`
+table) is wired to anything today; the other two values are accepted and currently do nothing,
+which `manicule doctor` does not yet flag.
+
+`security.audit` (`docs/surfaces.md` §9.8) is off by default, on the same reasoning as
+`telemetry` — a trail nobody asked for is a trail that has to be secured, retained and eventually
+explained to someone. Turning it on costs one row per audited event, written on the same
+connection an operation's own writes use, so a failed audit write fails the operation: plan
+capacity for the relational store accordingly if `security.audit.enabled = true` on a busy
+deployment, the same way `docs/storage.md` already asks for `query_logs`.
 
 ## 7. Still open
 

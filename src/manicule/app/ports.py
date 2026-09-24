@@ -30,7 +30,8 @@ if TYPE_CHECKING:
     from datetime import datetime
     from pathlib import Path
 
-    from manicule.app.results import ApiKeySummary, Check
+    from manicule.app.people import Profile
+    from manicule.app.results import ApiKeySummary, Check, UserSummary
     from manicule.config.settings import Settings
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.ann import AnnIndexBuild, AnnIndexState
@@ -67,6 +68,7 @@ if TYPE_CHECKING:
     from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
+    from manicule.retrieval.spanning import WorkspaceLeg
     from manicule.storage.vector_migration import VectorMigration
 
 
@@ -169,6 +171,61 @@ class Retrieving(Protocol):
     """
 
     async def retrieve(self, query: Query) -> RetrievalResult: ...
+
+
+@runtime_checkable
+class RetrievingAcross(Protocol):
+    """Retrieval that can span several workspaces, one scoped leg each, merged.
+
+    Separate from :class:`Retrieving` rather than a method on it, so that a retriever which can
+    only ever search its own workspace — every test double, and any retrieval a plugin supplies
+    — is still a complete one. The service asks for this capability by name and refuses a
+    cross-workspace search when it is absent, rather than falling back to searching one.
+    """
+
+    async def retrieve_across(
+        self, query: Query, legs: Sequence[WorkspaceLeg]
+    ) -> RetrievalResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class OpenedWorkspace:
+    """One workspace on this data directory, opened for reading by a search that spans several.
+
+    Every handle is scoped to :attr:`name` by construction. :attr:`documents` and
+    :attr:`organization` are what the service reads through — the collections a name resolves
+    to, and the documents a hit's identity is checked against — and :attr:`leg` is what
+    retrieval searches.
+    """
+
+    name: str
+    documents: DocumentSurface
+    organization: Organizing
+    leg: WorkspaceLeg
+
+
+@runtime_checkable
+class SpansWorkspaces(Protocol):
+    """A backend that can open the other workspaces on its data directory for reading.
+
+    The workspace registry an administrator's cross-workspace search needs, and optional for the
+    reason :class:`RetrievingAcross` is: a backend that serves one workspace and can open no
+    other is a complete backend, and the service refuses the search rather than narrowing it.
+    """
+
+    async def open_workspaces(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
+        """Read handles on each named workspace, in the order named.
+
+        Raises:
+            UnknownEntityError: A name is not a workspace on this data directory. The message
+                lists the ones that are.
+            VectorStoreStateError: A named workspace has no index yet, so there is nothing of
+                it to search.
+            FingerprintMismatchError: A named workspace's index was embedded by a different
+                model than the one this process searches with, so its cosines are not on the
+                scale the merge compares.
+        """
+        ...
 
 
 @runtime_checkable
@@ -670,31 +727,180 @@ class Keys(Protocol):
     """
 
     async def issue(
-        self, name: str, *, role: str, expires_days: int | None = None
+        self,
+        name: str,
+        *,
+        role: str,
+        expires_days: int | None = None,
+        user_id: str | None = None,
+        allowed_ips: Sequence[str] = (),
+        rate_limit: int | None = None,
     ) -> tuple[ApiKeySummary, str]:
         """Mint a key. Returns its record and the secret, which exists only here.
 
         The secret is returned once and never stored — only a digest is. A lost key is
         reissued rather than recovered, which is the property that makes a leaked backup not
         also a leaked credential.
+
+        Args:
+            user_id: The person who owns this key, or ``None`` for a key minted on behalf of
+                the installation — by an administrator or the local operator. An owned key's
+                effective role is capped by its owner's current membership; see :meth:`verify`.
+            allowed_ips: CIDR ranges the key may be presented from. Empty means anywhere.
+                Validated by the service before this is called.
+            rate_limit: Requests per minute for this key, replacing the installation's
+                default. Validated by the service before this is called.
         """
         ...
 
-    async def list_keys(self) -> Sequence[ApiKeySummary]: ...
-
-    async def revoke(self, name_or_id: str) -> ApiKeySummary:
-        """Revoke a key by name or id. Immediate."""
+    async def list_keys(self, *, owner: str | None = None) -> Sequence[ApiKeySummary]:
+        """Every key in this workspace, or only those owned by ``owner`` when one is given."""
         ...
 
-    async def verify(self, secret: str) -> ApiKeySummary | None:
+    async def revoke(
+        self, name_or_id: str, *, restrict_to_owner: str | None = None
+    ) -> ApiKeySummary:
+        """Revoke a key by name or id. Immediate.
+
+        Args:
+            restrict_to_owner: When given, only a key owned by this user may be revoked; a key
+                that exists but belongs to somebody else is reported the same way a key that
+                does not exist at all is, so a non-admin caller cannot use this to discover
+                what keys other people hold.
+
+        Raises:
+            UnknownEntityError: No such key in this workspace, or it exists but
+                ``restrict_to_owner`` does not own it.
+        """
+        ...
+
+    async def verify(self, secret: str, *, address: str = "") -> ApiKeySummary | None:
         """Which key this secret is, or ``None`` if it is not a usable one.
 
-        ``None`` covers unknown, revoked, expired and belonging-to-another-workspace, and
-        deliberately does not say which. Telling a caller that the key they presented is
-        merely *expired* confirms it was once real, which is a fact worth having if you are
-        collecting them.
+        ``None`` covers unknown, revoked, expired, belonging-to-another-workspace, presented
+        from outside its ``allowed_ips``, and owned by a person whose membership here is gone
+        or disabled — and deliberately does not say which. Telling a caller that the key they
+        presented is merely *expired* confirms it was once real, which is a fact worth having
+        if you are collecting them.
 
         The comparison is over a digest, so nothing here can be timed into a byte at a time.
+
+        The returned summary's ``role`` is the *effective* role: for an owned key this is
+        ``min(key.role, owner's current membership role)``, so a demoted owner's keys are
+        demoted with them without a second write.
+
+        Args:
+            address: The presenting client's address, checked against ``allowed_ips`` when the
+                key has any. Treated as outside every range when empty.
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class MemberChange:
+    """A membership after one change, and what the change took with it.
+
+    ``sessions_revoked`` and ``keys_revoked`` are non-zero only for a disable, which ends every
+    browser session the person held in this workspace and revokes every key they minted in it —
+    in the same transaction as the disable, so there is no moment at which a disabled person
+    still holds a working credential.
+    """
+
+    member: UserSummary
+    previous_role: str
+    previously_disabled: bool
+    sessions_revoked: int = 0
+    keys_revoked: int = 0
+
+
+@runtime_checkable
+class Users(Protocol):
+    """People, their memberships of one workspace, and their browser sessions.
+
+    **A person is installation-wide; everything else here is scoped.** One person signing in to
+    two workspaces is one ``users`` row and two memberships, and every read and write of a
+    membership or a session carries this handle's workspace as a predicate — a session minted
+    for one workspace does not authenticate in another, for the reason an API key does not.
+
+    Identified by id everywhere. ``find_members`` accepts an address as a convenience for a
+    person at a terminal, and resolves it among *this* workspace's members only.
+    """
+
+    async def member_by_subject(self, provider: str, subject: str) -> UserSummary | None:
+        """This workspace's membership for one provider account, or ``None`` if it has none."""
+        ...
+
+    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+        """Record a sign-in: create or refresh the person, and make them a member if they are not.
+
+        ``role`` is used only when the membership is created. After that a person's role is
+        whatever an administrator has made it, and a sign-in never overwrites it — otherwise
+        every demotion would last until the demoted person next signed in.
+        """
+        ...
+
+    async def begin_session(self, user_id: str, *, max_age_s: int) -> tuple[str, str, str]:
+        """Start a browser session. Returns its id, its expiry, and the only copy of its token."""
+        ...
+
+    async def resolve_session(self, token: str) -> UserSummary | None:
+        """Which member this session token is, or ``None`` if it is not a usable one.
+
+        ``None`` covers unknown, revoked, expired, another workspace's, and a disabled or
+        removed membership, and deliberately does not say which — the reasoning
+        :meth:`Keys.verify` gives. Every one of those is a predicate of one statement over a
+        digest of the token, so there is no branch here to time.
+        """
+        ...
+
+    async def end_session(self, token: str) -> bool:
+        """Revoke one session by its token. ``False`` when it named nothing live here."""
+        ...
+
+    async def end_sessions(self, user_id: str) -> int:
+        """Revoke every live session one person holds in this workspace. Returns how many."""
+        ...
+
+    async def list_members(self) -> Sequence[UserSummary]:
+        """Every member of this workspace, with a count of live sessions each."""
+        ...
+
+    async def find_members(self, user_or_email: str) -> Sequence[UserSummary]:
+        """Members whose id is ``user_or_email``, or whose address is, ignoring case.
+
+        A sequence rather than one, because two accounts at two providers can report the same
+        address, and the caller — not this store — decides that two matches is a refusal.
+        """
+        ...
+
+    async def count_admins(self) -> int:
+        """Enabled administrators of this workspace."""
+        ...
+
+    async def standing_in(self, user_id: str, workspaces: Sequence[str]) -> frozenset[str]:
+        """Which of ``workspaces`` this person holds an enabled membership of.
+
+        **The one read here that is not scoped to this handle's workspace**, and it is narrow on
+        purpose: one person, the workspaces a caller already named, and nothing back but the
+        names that matched. It exists so that an administrator's search spanning workspaces
+        reaches only workspaces that person was admitted to — being an administrator *here* is
+        not standing *there*.
+        """
+        ...
+
+    async def update_member(
+        self, user_id: str, *, role: str | None = None, disabled: bool | None = None
+    ) -> MemberChange:
+        """Change one membership's role or standing, in one transaction.
+
+        Disabling revokes the person's sessions and their keys in the same transaction. A change
+        that would leave a workspace which has an enabled administrator with none is refused
+        inside that transaction too, so two administrators demoting each other at once cannot
+        both succeed.
+
+        Raises:
+            UnknownEntityError: No such member **in this workspace**.
+            PolicyError: The change would remove the last enabled administrator.
         """
         ...
 
@@ -720,6 +926,31 @@ class RetainedBytes(Protocol):
         ``None`` rather than raising, because "collected since" is an ordinary state on the
         retention path rather than a failure — see ``docs/storage.md`` §7.
         """
+        ...
+
+
+@runtime_checkable
+class SecurityAlerts(Protocol):
+    """Recorded patterns — brute force, key abuse, export volume — for one workspace.
+
+    Written by :class:`~manicule.app.service.ApplicationService` when
+    :class:`~manicule.app.alerts.AlertMonitor` fires, and read by the admin surface. No
+    foreign keys, on :class:`AuditLog`'s own reasoning restated for a second table: an alert
+    about a key must outlive the key it names.
+    """
+
+    async def record_alert(self, kind: str, subject: str, *, details: Mapping[str, object]) -> str:
+        """Persist one alert and return its id."""
+        ...
+
+    async def list_alerts(
+        self, *, unacknowledged_only: bool = False, limit: int = 50, offset: int = 0
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        """A page of alerts, newest first, and the total row count."""
+        ...
+
+    async def acknowledge_alert(self, alert_id: str, *, by: str) -> Mapping[str, object] | None:
+        """Mark one alert acknowledged, or ``None`` if no such alert exists in this workspace."""
         ...
 
 
@@ -772,6 +1003,12 @@ class Backend(Protocol):
 
     async def keys(self) -> Keys: ...
 
+    async def users(self) -> Users:
+        """People, memberships and browser sessions for this workspace."""
+        ...
+
+    async def security_alerts(self) -> SecurityAlerts: ...
+
     async def component_checks(self) -> Sequence[Check]:
         """Health of whatever is already constructed, without constructing anything else."""
         ...
@@ -785,8 +1022,14 @@ __all__ = [
     "Ingesting",
     "Keys",
     "Maintenance",
+    "MemberChange",
+    "OpenedWorkspace",
     "Organizing",
     "RetainedBytes",
     "Retrieving",
+    "RetrievingAcross",
+    "SecurityAlerts",
+    "SpansWorkspaces",
     "Telemetry",
+    "Users",
 ]

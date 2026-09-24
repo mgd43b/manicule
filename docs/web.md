@@ -1,4 +1,4 @@
-# The browser surface: twelve areas, no build step
+# The browser surface: fifteen areas, no build step
 
 `manicule.web`. Server-rendered HTML over the same `ApplicationService` the command line, the
 MCP server and the HTTP API are adapters over. It is mounted on the same application as the API
@@ -98,27 +98,31 @@ the failure the page shows — same type, same message, same hint.
 
 ---
 
-## 3. The twelve areas
+## 3. The fifteen areas
 
 | Area | Page | Reads | Floor |
 |---|---|---|---|
 | dashboard | `/ui` | `stats`, `doctor`, `workspace_list` | viewer |
 | chat | `/ui/chat`, `/ui/chat/{id}` | `conversation_list`, `conversation_messages` | viewer |
-| documents | `/ui/documents`, `/ui/documents/{id}`, `/ui/documents/trash`, `/ui/search` | `document_list`, `workbench`, `document_trash`, `search` | viewer |
+| documents | `/ui/documents`, `/ui/documents/{id}`, `/ui/documents/trash`, `/ui/search` | `document_list`, `workbench`, `document_trash`, `search`, `workspace_list` | viewer; admin to search other workspaces |
 | collections | `/ui/collections` | `collection_list`, `tag_list` | viewer |
 | connectors | `/ui/connectors` | `connector_list` | admin |
 | health | `/ui/health` | `doctor` | viewer |
 | plugins | `/ui/plugins` | `plugin_list`, `plugin_health` | admin |
 | settings | `/ui/settings` | `doctor`, `index_status` | admin |
 | workspaces | `/ui/workspaces` | `workspace_list` | viewer |
-| admin | `/ui/admin` | `index_status`, `search_quality`, `query_logs`, `audit_log`, `plugin_health`, `connector_list` | admin |
-| auth | `/ui/auth` | `api_key_list`, `auth_providers` | admin |
+| admin | `/ui/admin` | `index_status`, `search_quality`, `query_logs`, `audit_log`, `security_alerts`, `plugin_health`, `connector_list` | admin |
+| reembed | `/ui/reembed` | `reembed_plan`, `reembed_status` | admin |
+| lifecycle | `/ui/lifecycle` | dry runs of the lifecycle operations, `rebuild_plan`, `rebuild_status` | admin |
+| users | `/ui/users` | `user_list`, `auth_providers` | admin |
+| auth | `/ui/auth` | `api_key_list`, `auth_providers` | viewer — rows are the caller's own keys unless they administer |
 | layout | — | — | — |
 
-Plus `GET /ui/shared/{token}`, which takes no credential at all, and two constants:
-`/ui/static/manicule.css` and `/ui/static/manicule.js`.
+Plus two pages that take no credential at all, in a smaller frame with no navigation:
+`GET /ui/shared/{token}`, a shared conversation, and `GET /ui/login`, the sign-in page. And two
+constants: `/ui/static/manicule.css` and `/ui/static/manicule.js`.
 
-`layout` is the one area that is not a page: it is the frame the other eleven are rendered
+`layout` is the one area that is not a page: it is the frame the other fourteen are rendered
 inside, and `tests/web/test_pages.py` asserts that by checking every page template extends it.
 
 **Each page asks for the floor its routes ask for.** Where an area spans two — plugins, whose
@@ -126,9 +130,20 @@ listing is a viewer's and whose *health* is an admin's — the page takes the hi
 than rendering a different page per role. A template with a role branch in it is a policy
 decision in a template.
 
+**The search page's floor follows its arguments, as its route's does.** `GET /api/v1/search` is
+a viewer's until it is given workspaces other than its own, and then it is an administrator's
+([`surfaces.md`](surfaces.md) §7); `/ui/search` asks the same question the same way, and a
+hand-made URL from a reader below admin is refused as a page. The workspace picker is offered
+only to an administrator — the handler reads `workspace_list` for one and hands the template an
+empty list for anyone else, so the template renders what it is given and carries no role branch.
+Each hit of a spanning search carries a workspace label, and a passage from another workspace is
+named rather than linked, because this workspace's document page cannot open it.
+
 **Every page is a `GET`.** Mutations go from the browser to the JSON API routes that already
 exist, with a JSON content type. The browser surface introduces no write path of its own, which
-is what makes §6 the whole boundary rather than half of it.
+is what makes §6 the whole boundary rather than half of it. The one form that posts — **Sign
+out**, in the frame — posts to `/auth/logout`, an API route that ends the caller's own session,
+so that signing out works with the script switched off.
 
 ---
 
@@ -171,32 +186,48 @@ written under, asserted the same way, against what the route served.
 
 ---
 
-## 5. What a browser cannot present, said plainly
+## 5. What a browser can present, said plainly
 
-There is no session cookie in this build, deliberately: a key is presented on every request, and
-a signed cookie would be a second credential type with its own expiry, revocation and CSRF story.
-A browser cannot attach a header to a top-level navigation.
+A browser cannot attach a header to a top-level navigation, so what a page load carries depends
+on `security.auth.mode`, and so does what this surface says when it refuses one:
 
-So on an installation with `security.auth.mode = api_key`, **a page load carries no credential
-and this surface refuses it** — with an HTML page that says so and says what to use instead,
-rather than a JSON envelope in a browser window.
+- **`none`** — the posture manicule ships as: one person, on loopback, where the caller is the
+  operator at this machine and holds the authority the command line already gives them. Nothing
+  is presented and nothing is refused for want of it. Serving that same unauthenticated surface
+  off loopback takes `manicule serve --no-authentication` alongside `--allow-public-bind`
+  ([`deployment.md` §4](deployment.md#4-binding-a-port)), and it hands every caller on that
+  address the same authority — so it is for a network an operator owns, and `--no-web` is worth
+  considering beside it. Team mode refuses it outright.
+- **`api_key`** — a key is presented on every request in a header, and there is **no session
+  cookie in this mode**. A page load carries no credential, so this surface refuses it — with an
+  HTML page that says so and points at the HTTP API and the command line, rather than a JSON
+  envelope in a browser window.
+- **`oauth`** — people sign in. `/ui/login` links to each provider that applies to this
+  workspace; after the provider sends the browser back, it holds a session cookie that
+  authenticates pages, the JSON API the page's script calls, and the websocket — never the MCP
+  mount. An unauthenticated page load is **refused with a link to sign in** rather than
+  redirected there: a `303` would answer every protected page with a success status to a program,
+  a monitor or a cached link, where the refusal keeps the status the API would have used. The
+  frame names the signed-in person and carries a **Sign out** button — a plain form posting to
+  `/auth/logout`, so it works with the script off.
 
-That is a real limitation rather than a bug, and the configuration this surface is *for* is the
-one manicule ships as: one person, on loopback, with `auth.mode = none`, where the caller is the
-operator at this machine and holds the authority the command line already gives them. Serving
-that same unauthenticated surface off loopback takes `manicule serve --no-authentication`
-alongside `--allow-public-bind` ([`deployment.md` §4](deployment.md#4-binding-a-port)), and it
-hands every caller on that address the same authority — so it is for a network an operator owns,
-and `--no-web` is worth considering beside it. An
-interactive login belongs to team mode ([#13](https://github.com/mgd43b/manicule/issues/13)),
-where the session, its revocation and its CSRF story can be designed together instead of one of
-the three arriving on its own.
+How the sign-in works, what each cookie carries and why, how a session is revoked, who is
+admitted and how the first administrator comes to exist are one section of
+[`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session), and are not repeated
+here.
 
-manicule is **single-user oriented** until it is feature complete, and this surface reflects
-that: no user management, no roles UI, no invitations, no login screens. The auth area is one
-person looking at their own API keys and at what this installation currently demands of a caller.
+**People are administered on the People page** (`/ui/users`, admin): every member of this
+workspace with their role, standing and live sessions, a role select, disable or enable, and
+*sign out everywhere*. Each control calls `PATCH /api/v1/auth/users/{id}` or
+`POST /api/v1/auth/users/{id}/sign-out` through the page's script, exactly as the key buttons
+call the key routes; every rule — the last administrator stays one, nobody disables themselves,
+a disable takes the person's sessions and keys with it — is the service's, and a refusal is
+shown in the service's words. The API keys page is for keys only, and shows each key's owner,
+allowed addresses and rate limit ([`surfaces.md` §9.2](surfaces.md#92-identity)).
 
-Workspaces are **not** multi-user — one person with several corpora. Workspace scoping is a
+**A workspace is shared, not partitioned.** Several people may be members of one workspace, and
+every member can read all of it: roles decide what a person may *do*, not which documents they
+may see. A corpus some people must not read belongs in another workspace. Workspace scoping is a
 correctness property and is enforced on every read: as a predicate in the store, and as identity
 arithmetic at the surface. `tests/web/test_tenancy.py` drives the pages against the same
 deliberately broken stores `tests/api/test_tenancy.py` uses — ones that ignore the workspace
@@ -273,9 +304,11 @@ unless configuration named that site.**
 
 The question only arises with a browser surface, because cross-site request forgery needs a
 browser that will attach *ambient* authority to a request some other page caused — and manicule's
-ambient case is the one it ships as: loopback with no credential at all. A page on the internet
-cannot read the response, but with a "simple" request it does not need to. A form `POST` is sent
-and its effect happens; CORS hides the reply and nothing else.
+ambient case is the one it ships as: loopback with no credential at all. Where people sign in
+there is a second one, the session cookie; it is `SameSite=Strict`, so a browser does not attach
+it to a request another site caused, and this check is the half of the defense that holds even
+if one did. A page on the internet cannot read the response, but with a "simple" request it does
+not need to. A form `POST` is sent and its effect happens; CORS hides the reply and nothing else.
 
 Two signals, and the first cannot be forged:
 

@@ -21,10 +21,15 @@ AREAS: tuple[str, ...] = (
     "admin",
     "reembed",
     "lifecycle",
+    "users",
     "auth",
     "layout",
 )
 """All areas. ``layout`` is the one that is not a page.
+
+The sign-in page and the shared conversation are pages that are not areas: they are rendered
+in the bare frame for a reader with no credential, and a navigation entry for either would be
+a link offered to people it is not for.
 
 It is the frame every other area is rendered inside, and ``tests/web/test_pages.py`` asserts it
 by checking that every template extends it — not by looking for a route that does not exist.
@@ -42,6 +47,7 @@ NAVIGATION: tuple[tuple[str, str, str], ...] = (
     ("admin", "/ui/admin", "Admin"),
     ("reembed", "/ui/reembed", "Re-embed"),
     ("lifecycle", "/ui/lifecycle", "Lifecycle"),
+    ("users", "/ui/users", "People"),
     ("auth", "/ui/auth", "API keys"),
     ("settings", "/ui/settings", "Settings"),
 )

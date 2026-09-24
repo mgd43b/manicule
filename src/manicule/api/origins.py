@@ -8,6 +8,13 @@ whoever can reach the port. A page on the internet cannot read the response (the
 header to let it), but with a "simple" request it does not need to: ``POST`` from a form, or
 ``fetch`` with no unusual header, is **sent** and its effect happens.
 
+The second ambient case is a signed-in browser's session cookie, under
+``security.auth.mode = 'oauth'``. It is ``SameSite=Strict``, so a browser does not attach it to
+a request another site caused — and this check is the half of that defense that does not rely
+on the browser having done so (:mod:`manicule.api.cookies`). Every unsafe route is behind it,
+signing out included, because it runs before routing rather than on the routes somebody
+remembered.
+
 So an unsafe method that a browser says came from somewhere else is refused unless configuration
 named that somewhere.
 

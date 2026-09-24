@@ -347,7 +347,7 @@ shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifec
 | **MCP** | `manicule start --mcp-only` | 45 tools over stdio, which opens no socket; 27 at `/mcp/` when served over a port — the read-only ones, plus `document_create` |
 | **Command line** | `manicule <command>` | 32 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
-| **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 12 areas of server-rendered HTML, 11 in the navigation |
+| **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 15 areas of server-rendered HTML, 14 in the navigation, and a sign-in page |
 
 They are adapters over one application service, and `tests/app/test_surface_parity.py` holds
 them to it: for the same operation and the same arguments the CLI under `--json`, the MCP tool
@@ -447,13 +447,15 @@ same envelope the CLI prints under `--json`.
 ### The browser surface
 
 The functional operator and inspection console, not the primary knowledge-work interface. It is
-server-rendered HTML at `/ui`, on the same socket, with eleven areas in its navigation: a
+server-rendered HTML at `/ui`, on the same socket, with fourteen areas in its navigation: a
 dashboard; chat with streaming citations, confidence and feedback; documents, their chunks, the
 trash and restore; collections and tags; connectors; plugins; workspaces; health; an admin
-dashboard; your own API keys; and settings. Command palette on `Ctrl`/`Cmd`+`K`, keyboard
-navigation, dark mode. `manicule start --no-web` prints `browser surface    off (--no-web)`,
-keeps the API, and answers 404 for every `/ui` path — and `/` lists the surfaces that are still
-there rather than redirecting to one that is not.
+dashboard; re-embedding and lifecycle plans; the people who are members of the workspace; API
+keys; and settings. Where people sign in (`security.auth.mode = "oauth"`), `/ui/login` offers
+Google and GitHub and the frame carries a sign-out; `docs/surfaces.md` §9.2.1 is how that works.
+Command palette on `Ctrl`/`Cmd`+`K`, keyboard navigation, dark mode. `manicule start --no-web`
+prints `browser surface    off (--no-web)`, keeps the API, and answers 404 for every `/ui` path
+— and `/` lists the surfaces that are still there rather than redirecting to one that is not.
 
 ![The manicule browser surface: a search for "how are citations verified" over this repository's own docs, showing ten ranked passages, the confidence band with the sentence explaining it, and each hit labeled with the document and the heading path the passage came from](docs/images/browser-search.png)
 
@@ -729,7 +731,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/mcp` | Forty-five MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/extension` | A Chrome extension that hands this browser's Confluence session to a local manicule. No build step |
-| `src/manicule/web` | Twelve areas of HTML — eleven pages and the frame they render inside. No build step, no new operation |
+| `src/manicule/web` | Fifteen areas of HTML — fourteen pages and the frame they render inside — plus a sign-in page. No build step, no new operation |
 | `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
 | `packages/manicule-plugin-wikilinks` | Turns `[[wikilinks]]` into typed chunk relations. A plugin doing real work |
 | `packages/manicule-ollama` | Embedding on an Ollama server, for a host that cannot embed in process |

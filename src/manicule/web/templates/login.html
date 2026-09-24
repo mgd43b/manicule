@@ -1,0 +1,55 @@
+{#
+  Signing in, or — where nobody signs in — how this installation authenticates instead.
+
+  In the bare frame, like the shared conversation: a person arriving here has no credential, so
+  a navigation listing every area would describe the installation to somebody who may reach none
+  of it. The links are the ones `auth_providers` reports for this workspace and no others, so a
+  provider configured for another workspace is not offered here to be refused there.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+{% if person %}
+<div class="panel">
+  <p>You are signed in as <strong>{{ person }}</strong>.</p>
+  <p><a href="/ui">Go to the dashboard</a></p>
+</div>
+{% endif %}
+
+{% if panels.providers.ok %}
+  {% set listed = panels.providers.data %}
+  {% if listed.login_paths %}
+  <div class="panel">
+    <ul class="providers">
+      {% for path in listed.login_paths %}
+      {% set kind = listed.providers[loop.index0] %}
+      <li><a href="{{ path }}">Sign in with {{ 'Google' if kind == 'google' else 'GitHub' if kind == 'github' else kind }}</a></li>
+      {% endfor %}
+    </ul>
+    <p class="muted">
+      You will be sent to the provider and back. Whether you are admitted, and in what role, is
+      this workspace's decision, made again every time you sign in.
+    </p>
+  </div>
+  {% elif listed.mode == 'none' %}
+  <div class="panel">
+    <p>
+      Nobody signs in here. This installation asks for no credential: it serves the person at
+      the machine it runs on, with the authority the command line already gives them.
+    </p>
+    <p><a href="/ui">Go to the dashboard</a></p>
+  </div>
+  {% elif listed.mode == 'api_key' %}
+  <div class="panel">
+    <p>
+      Nobody signs in here. This installation authenticates with API keys, presented in a header
+      on every request — which a browser cannot do for a page load. Use the HTTP API or the
+      command line.
+    </p>
+  </div>
+  {% else %}
+  <div class="panel"><p>{{ listed.detail or 'No sign-in is offered for this workspace.' }}</p></div>
+  {% endif %}
+{% else %}{{ m.failed(panels.providers) }}{% endif %}
+{% endblock %}
+{% block foot %}manicule{% endblock %}

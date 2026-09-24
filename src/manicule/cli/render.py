@@ -311,16 +311,23 @@ def render_search(out: Console, payload: r.SearchResult) -> None:
             "[/dim]manicule index[dim] reports what is there, and "
             "[/dim]manicule index <path>[dim] adds to it[/dim]"
         )
+    # A search spanning workspaces names each hit's, because a merged ranking is read line by
+    # line and a line an administrator cannot place is a line they cannot act on. An ordinary
+    # search does not: every hit is this workspace's, and saying so on each would be noise.
+    spanning = len(payload.workspaces) > 1
     for position, hit in enumerate(payload.hits, start=1):
         heading = " / ".join(hit.heading_path)
         title = hit.title or hit.uri
+        where = f"[cyan]{escape(hit.workspace)}[/cyan] " if spanning else ""
         out.print(
-            f"[bold]{position}.[/bold] {escape(title)}"
+            f"[bold]{position}.[/bold] {where}{escape(title)}"
             f"[dim] {escape(heading)}  score {hit.score:.4f}[/dim]"
         )
         out.print(Text(_clip(hit.text), style="none"))
         out.print(f"[dim]{escape(hit.uri)} · {escape(_anchor_summary(hit.anchor))}[/dim]\n")
     summary = [f"{payload.count} hit(s)", f"profile {payload.profile}"]
+    if spanning:
+        summary.append(f"across {escape(', '.join(payload.workspaces))}")
     if payload.confidence is not None:
         summary.append(f"confidence {payload.confidence:.2f} ({payload.confidence_band})")
     if payload.explicit_definition:
@@ -1121,7 +1128,11 @@ def render_workspace_switched(out: Console, payload: r.WorkspaceSwitched) -> Non
     out.print(
         f"active workspace: {escape(payload.previous)} → [bold]{escape(payload.active)}[/bold]"
     )
+    if payload.mode:
+        out.print(f"mode: [bold]{escape(payload.mode)}[/bold]")
     out.print(f"[dim]written to {escape(payload.path)}; it takes effect at the next start[/dim]")
+    if payload.detail:
+        out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
 
 
 def render_plugins(out: Console, payload: r.PluginList) -> None:
@@ -1419,6 +1430,89 @@ def render_api_key_revoked(out: Console, payload: r.ApiKeyRevoked) -> None:
     out.print(f"revoked [bold]{escape(payload.name)}[/bold] ({payload.id})")
 
 
+def _person(user: r.UserSummary) -> str:
+    """How a member is named in a line: their name or address, and always their id."""
+    label = user.name or user.email
+    return f"{escape(label)} ({escape(user.id)})" if label else escape(user.id)
+
+
+def render_users(out: Console, payload: r.UserList) -> None:
+    if not payload.users:
+        out.print("[dim]nobody has signed in to this workspace[/dim]")
+        return
+    table = Table(
+        "id",
+        "name",
+        "email",
+        "provider",
+        "role",
+        "standing",
+        "sessions",
+        "last sign-in",
+        box=None,
+        pad_edge=False,
+    )
+    for user in payload.users:
+        table.add_row(
+            escape(user.id),
+            escape(user.name or "—"),
+            escape(user.email or "—"),
+            escape(user.provider),
+            escape(user.role),
+            "disabled" if user.disabled else "enabled",
+            "—" if user.sessions is None else str(user.sessions),
+            escape(user.last_login_at or "never"),
+        )
+    out.print(table)
+    out.print(f"[dim]{payload.admins} enabled administrator(s)[/dim]")
+
+
+def render_user_updated(out: Console, payload: r.UserUpdated) -> None:
+    user = payload.user
+    if user.role != payload.previous_role:
+        out.print(
+            f"{_person(user)}: role {escape(payload.previous_role)} → "
+            f"[bold]{escape(user.role)}[/bold]"
+        )
+    if user.disabled != payload.previously_disabled:
+        out.print(f"{_person(user)}: [bold]{'disabled' if user.disabled else 'enabled'}[/bold]")
+    if payload.sessions_revoked or payload.keys_revoked:
+        out.print(
+            f"[dim]ended {payload.sessions_revoked} session(s) and revoked "
+            f"{payload.keys_revoked} API key(s)[/dim]"
+        )
+    if user.role == payload.previous_role and user.disabled == payload.previously_disabled:
+        out.print(f"{_person(user)}: unchanged ({escape(user.role)})")
+
+
+def render_user_signed_out(out: Console, payload: r.UserSignedOut) -> None:
+    out.print(
+        f"{_person(payload.user)}: ended {payload.sessions_revoked} session(s); "
+        f"they may sign in again"
+    )
+
+
+def render_security_alerts(out: Console, payload: r.SecurityAlertList) -> None:
+    if not payload.alerts:
+        out.print("[dim]no alerts recorded[/dim]")
+        return
+    table = Table("when", "kind", "subject", "acknowledged", box=None, pad_edge=False)
+    for alert in payload.alerts:
+        table.add_row(
+            escape(alert.created_at),
+            escape(alert.kind),
+            escape(alert.subject),
+            escape(alert.acknowledged_by) if alert.acknowledged_by else "no",
+        )
+    out.print(table)
+
+
+def render_security_alert_acknowledged(out: Console, payload: r.SecurityAlertAcknowledged) -> None:
+    out.print(
+        f"acknowledged [bold]{escape(payload.id)}[/bold] as {escape(payload.acknowledged_by)}"
+    )
+
+
 def render_connector_signed_in(out: Console, payload: r.ConnectorSignedIn) -> None:
     """What was captured, where it went, and when it stops working. Never the session itself."""
     if payload.forgotten:
@@ -1698,6 +1792,13 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.ApiKeyIssued: lambda out, p: render_api_key_issued(out, _as(r.ApiKeyIssued, p)),
     r.ApiKeyList: lambda out, p: render_api_keys(out, _as(r.ApiKeyList, p)),
     r.ApiKeyRevoked: lambda out, p: render_api_key_revoked(out, _as(r.ApiKeyRevoked, p)),
+    r.UserList: lambda out, p: render_users(out, _as(r.UserList, p)),
+    r.UserUpdated: lambda out, p: render_user_updated(out, _as(r.UserUpdated, p)),
+    r.UserSignedOut: lambda out, p: render_user_signed_out(out, _as(r.UserSignedOut, p)),
+    r.SecurityAlertList: lambda out, p: render_security_alerts(out, _as(r.SecurityAlertList, p)),
+    r.SecurityAlertAcknowledged: lambda out, p: render_security_alert_acknowledged(
+        out, _as(r.SecurityAlertAcknowledged, p)
+    ),
     r.CollectionSummary: lambda out, p: render_collection(out, _as(r.CollectionSummary, p)),
     r.CollectionList: lambda out, p: render_collections(out, _as(r.CollectionList, p)),
     r.CollectionDeleted: lambda out, p: render_collection_deleted(out, _as(r.CollectionDeleted, p)),

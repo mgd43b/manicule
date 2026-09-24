@@ -267,7 +267,7 @@ server and the built command tree.
 |---|---|---|---|
 | `ask` | ✓ | `ask` | answer, citations, confidence |
 | `research` | ✓ | `research` | report, citations, the searches it ran |
-| `search` | ✓ | `search` | ranked passages |
+| `search` | ✓ | `search` | ranked passages — across several workspaces, for an administrator, with `workspaces` |
 | `index_path` | ✓ | `index <path>` | run counters |
 | `index_changes` | — | `index --watch` | run counters |
 | `index_status` | ✓ | `index` | counts, fingerprints, and whether vector search is still exhaustive |
@@ -306,7 +306,7 @@ server and the built command tree.
 | `config_get` | ✓ | `config get` / `config show` | configuration, redacted |
 | `config_set` | ✓ | `config set` | the key, before and after |
 | `workspace_list` | ✓ | `workspace list` | workspaces, active marked |
-| `workspace_switch` | ✓ | `workspace switch` | previous and current |
+| `workspace_switch` | ✓ | `workspace switch [--mode personal\|team]` | previous and current, and the mode recorded beside it |
 | `plugin_list` | ✓ | `plugin list` | installed plugins and components |
 | `plugin_add` | ✓ | `plugin add` | what was enabled |
 | `plugin_remove` | ✓ | `plugin remove` | what was disabled |
@@ -333,6 +333,7 @@ server and the built command tree.
 | `start` / `stop` | — | `start` / `stop` | the address, and whether it is loopback |
 | `completion` | — | `completion` | a shell script |
 | `auth_create_key` / `auth_list_keys` / `auth_revoke_key` | — | `auth …` | API keys |
+| `auth_users` / `auth_set_role` / `auth_disable_user` / `auth_enable_user` / `auth_sign_out` | — | `auth users`, `auth set-role`, `auth disable-user`, `auth enable-user`, `auth sign-out` | members of this workspace, and what a change took with it |
 
 ### 4.0.1 Shared lifecycle status
 
@@ -387,8 +388,9 @@ incremental walk, and is not the same claim as `false`. Absent `enumeration_offs
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
 `connector_sidecar`, `collection_orphans`, `document_reindex_stale`, `document_reembed`, the
-five mutating or corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs are
-command-line only. Each of them either destroys data, mints a credential, writes into the
+five mutating or corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs — keys
+and people alike — have no tool; the `auth` verbs are on the HTTP surface for an administrator
+too (§9.2). Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
 assistant can call unattended should not be able to do any of that. The forty-five tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
@@ -552,8 +554,9 @@ support even when `hits[]` contains fluent-looking text; `medium` and `high` sti
 the passages. `confidence_reason` is the human explanation and may be reworded, so clients branch
 on the band and the fields below rather than parsing it.
 
-For `search`, a client verifies `collections[]` before using the result and treats
-`truncated: true` as a partial result: ranked candidates were dropped to fit the context budget.
+For `search`, a client verifies `collections[]` — and `workspaces[]`, when it asked for
+several — before using the result and treats `truncated: true` as a partial result: ranked
+candidates were dropped to fit the context budget.
 For `ask`, four fields distinguish states that an empty citation list cannot:
 
 - `corpus_consulted: false` — retrieval did not run, which is not evidence of absence.
@@ -639,11 +642,27 @@ unattended surface at all is that all of it is bounded before the run starts —
 
 `expansions[]`, `conflicts[]`, `explicit_definition`, `query`, `profile`, `count`, `hits[]`,
 `confidence`, `confidence_band`, `confidence_reason`, `expanded_query`, `route`, `cached`,
-`truncated`, `elapsed_ms`, `collections[]`.
+`truncated`, `elapsed_ms`, `collections[]`, `workspaces[]`.
 
-Each hit carries the passage, its document, its anchor, its effective `score` **and** `scores`
-— the score every pipeline stage gave it. The per-stage history is kept because "reranking
-helped" is only checkable while the pre-rerank score survives.
+Each hit carries the passage, its document, its anchor, the `workspace` it came from, its
+effective `score` **and** `scores` — the score every pipeline stage gave it. The per-stage
+history is kept because "reranking helped" is only checkable while the pre-rerank score survives.
+
+**`workspaces` is the one argument that reaches past this workspace**, and it is an
+administrator's. Every surface takes it — `GET /api/v1/search?workspaces=a&workspaces=b`, the
+`search` tool's `workspaces` list, `manicule search QUERY --workspaces a,b`, and the search page's
+workspace picker — and every surface hands it to the one service method that owns the rule
+(§7). Naming none, or only the serving workspace, is the ordinary search on the ordinary path;
+naming others merges one scoped search per named workspace into one ranking by cosine
+([`retrieval.md`](retrieval.md) §3.2), with every hit's `workspace` saying where it came from
+and `workspaces[]` echoing what ran. The serving workspace is searched only when it is named.
+A spanning search consults no glossary, so `expansions[]` and `conflicts[]` are empty and
+`expanded_query` is blank, and its route is always `retrieve`. `ask` and `research` take no
+such argument: spanning tenants in an answer is a disclosure decision nobody has made.
+
+`--workspaces` is not `--workspace`/`-w`: the global option runs a whole command *in* one other
+workspace, and this one searches several *from* this one. The help text says so where both are
+listed.
 
 ### `document_resolve` → `DocumentResolved`
 
@@ -862,10 +881,12 @@ the shape of this payload and moves only when the shape does, which is what a co
 behavior actually wants — `manicule_version` and the envelope's `version` both move with every
 release whether or not anything changed.
 
-Checks, in the order `doctor` emits them: `configuration`, `transport`, `plugins`, `storage`,
-`permissions`, `index`, `vector_integrity`, `vector_backend`, `glossary`, `connectors`,
-`authoring`, `collection-membership`, `sessions`, `document-identity`, `document-content`,
-`extractable-text`, `wiki-provenance`, `grammars`, `vocabularies`, `models`, and
+Checks, in the order `doctor` emits them: `configuration`, `transport`, `sign_in`, `plugins`,
+`storage`, `permissions`, `index`, `vector_integrity`, `vector_backend`, `glossary`,
+`connectors`, `authoring`, `collection-membership`, `sessions`, `security_alerts`,
+`document-identity`,
+`document-content`, `extractable-text`, `wiki-provenance`, `grammars`, `vocabularies`, `models`,
+and
 `component:<kind>:<name>` for anything already constructed.
 
 `extractable-text` is `degraded` when more than 5% of a source's documents ended
@@ -922,7 +943,14 @@ It is never `failing`. Nothing stored is damaged and nothing is lost, which is t
 `transport` reports the bind: `ok` for loopback, `degraded` for a non-loopback bind with
 authentication on, and `failing` for one without it — including when `--no-authentication` made
 that deliberate, where the wording says so and the remedy becomes "configure authentication"
-rather than "bind loopback".
+rather than "bind loopback". In team mode with no authentication it is `failing` on any address,
+loopback included, because every server start will be refused (§6); `facts.installation_mode`
+says which mode was read.
+
+`sign_in` is `ok` when `security.auth.mode` is not `oauth` — there is no browser sign-in to get
+wrong — and otherwise lists every condition `build_app` would refuse to serve with (§9.2.1): a
+signing key, a provider that applies to this workspace, a `redirect_uri` that is this
+installation's callback, and an allowlist that admits somebody.
 
 **It judges the address this process actually took**, not the one configuration holds. `--host`
 is a command-line option, so a server started with `--host 0.0.0.0` leaves
@@ -1108,6 +1136,23 @@ A rule about what may *listen* belongs where something listens. It is enforced a
 above and nowhere else, and `doctor`'s `transport` check reports the same condition as a finding
 for anybody who wants to know without serving.
 
+#### Team mode takes the way out away
+
+Everything above about an anonymous caller rests on there being one operator for that caller to
+be. `mode = "team"` says there is not — several people share the installation — so **a team
+installation with `security.auth.mode = none` is refused wherever a socket is made, loopback
+included**, and `--no-authentication` is refused rather than allowed to waive it: an anonymous
+administrator is a single-operator arrangement by definition. The refusal is
+`manicule.app.bind.require_team_authentication`, called from `resolve_bind` and from `build_app`
+for the reason each of the other refusals is repeated in both, and `doctor`'s `transport` check
+reports it as failing without serving. It is not a `policy_problems` entry, for the same reason
+the wide-bind rule is not: `manicule index` in a team installation opens no socket.
+
+`workspace switch NAME --mode team` writes the mode beside the workspace in one edit of the
+configuration file. The mode is installation configuration; what a workspace row records is the
+mode a **writer** last opened it under, which is where `workspace list` reads the mode of every
+workspace but the one being served.
+
 ### 6.1 MCP over a socket carries the read-only tools and one named write
 
 The endpoint is `/mcp` on the same port, and a client is configured with the trailing slash:
@@ -1143,7 +1188,9 @@ mode and no flag.
 
 **And the exception is not conditional on authentication.** `security.auth.mode` decides *who
 may call* `document_create` — `manicule.mcp.server.require_network_member` enforces a member
-floor — and never whether the socket carries it. Those were briefly one question, and the answer
+floor — and never whether the socket carries it. `search` has a floor of its own for one
+argument: asked to span workspaces, it asks `require_network_admin` for the admin floor
+`GET /api/v1/search` asks for, since the mount's guard admits a viewer (§7). Those were briefly one question, and the answer
 made the deployment authoring exists for impossible: manicule serving a memory corpus to
 assistants on machines running no manicule of their own, which could search it and not write to
 it. A read-only network surface makes that deployment pointless, which is the sentence this
@@ -1194,6 +1241,12 @@ see; what they share is the process — one `Runtime`, one pipeline, one session
 schedule — which is right, because each of those is a fact about the process rather than about a
 caller. `tests/api/test_both_surfaces.py` drives two clients at once over a real socket and
 proves each is answered with what it asked for.
+
+For the same reason **a browser's session cookie is not a credential here** (§9.2.1): a caller
+presents its key on every call. An assistant running in a browser tab would otherwise inherit
+whoever happens to be signed in there, which is ambient authority of exactly the kind this mount
+has none of. `tests/api/test_signin.py` asserts the cookie that reads the API is refused on the
+mount in the same breath.
 
 **Every other write operation is reachable where a person is present**: at the command line, over
 stdio, and over the control socket of `docs/deployment.md` §6.1. Widening that set is its own
@@ -1256,7 +1309,9 @@ covers each of the three modes by name.
 ## 7. Tenancy
 
 Everything is scoped to one workspace, and the scope is enforced twice by two mechanisms that
-cannot fail the same way.
+cannot fail the same way. The one exception — an administrator's search spanning named
+workspaces — is enforced the same two ways, once per workspace, and is described at the end of
+this section.
 
 **In the store**, as a predicate: the handle carries the workspace and no method takes one
 (`manicule.storage.scoped`). This is where isolation is enforced.
@@ -1285,6 +1340,32 @@ and be useless.
 `tests/web/test_tenancy.py` does it a third time, through the pages and against the same broken
 stores, asserting on the **rendered HTML** — because a page is where a leak would actually be
 read, and a title that never reached a payload could still reach a heading or a link.
+
+**A search spanning workspaces is the deliberate exception, and it widens nothing else.** It is
+`search` with `workspaces` (§5), and three things hold it:
+
+- **Who.** The service refuses it to any caller short of the admin role, which makes it a rule
+  on every surface at once. The HTTP route, the network MCP tool and the search page also ask
+  for the admin floor, through the service's own `crosses_workspaces` so the two cannot disagree
+  about which requests span — which puts the refusal in each surface's ordinary 403 before a
+  workspace is opened. Over stdio and at the command line the caller is the operator at this
+  machine, who holds every authority the process has.
+- **Where.** The admin role is a relationship with the serving workspace, not with the others.
+  A caller who is a person — signed in, or presenting a key they minted — must hold an enabled
+  membership of every other workspace named, or the search is refused before any is opened.
+  The operator at this machine passes, and so does a key with no owner, which only that
+  operator can mint and which is therefore their delegate.
+- **How many.** `rag.cross_workspace_limit` bounds the workspaces one request may name (8 by
+  default, 2 to 64), because each is its own scoped search.
+- **Every hit, in its own workspace.** Each workspace is searched through its own scoped store,
+  with the dense leg's join inside it, and each hit's identity is then checked by the arithmetic
+  above against the workspace whose search returned it. A hit claimed by no workspace or by two
+  is refused whole, exactly as a foreign document is on one workspace.
+  `tests/app/test_cross_workspace.py` drives this against the same deliberately broken stores.
+
+It is recorded once, in the serving workspace's query log — where it ran, by whoever ran it —
+and audited as `search.cross_workspace` with the workspaces it spanned and its hit count, never
+its text.
 
 ---
 
@@ -1322,15 +1403,15 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | conversations | `GET`/`POST /api/v1/conversations`, `GET /api/v1/conversations/{id}/messages`, `PATCH`/`DELETE /api/v1/conversations/{id}`, `POST`/`DELETE /api/v1/conversations/{id}/share`, `GET /shared/{token}` |
 | collections | `GET`/`POST /api/v1/collections`, `PATCH`/`DELETE /api/v1/collections/{id}`, `POST /api/v1/collections/{id}/name`, `GET`/`PUT`/`DELETE /api/v1/collections/{id}/rule`, `GET /api/v1/collections/{id}/counts`, `GET /api/v1/collections/{id}/documents`, `POST`/`DELETE /api/v1/collections/{id}/documents/{docId}` |
 | tags | `GET`/`POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`, `POST`/`DELETE /api/v1/documents/{docId}/tags/{tagId}` |
-| admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
+| admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/alerts`, `POST /api/v1/admin/alerts/{id}/acknowledge`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
 | plugins | `GET /api/v1/plugins`, `GET /api/v1/plugins/search`, `POST`/`DELETE /api/v1/plugins/{name}` |
-| auth | `GET /auth/providers`, `GET /auth/session`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}` |
+| auth | `GET /auth/providers`, `GET /auth/session`, `GET /auth/login/{provider}`, `GET /auth/callback/{provider}`, `POST /auth/logout`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}`, `GET /api/v1/auth/users`, `PATCH /api/v1/auth/users/{user}`, `POST /api/v1/auth/users/{user}/sign-out` |
 | workbench | `GET /api/v1/workbench?document_id=…` |
 | websocket chat | `WS /api/v1/chat/ws` |
 | mcp | `POST /mcp/` — the read-only tool surface of §6.1, plus `document_create`. Authentication decides who may call that write, not whether it is carried |
 
 Plus the embeddable widget: `GET /widget/widget.js` and a static page at `GET /widget`, and the
-browser surface at `/ui` — twelve areas of server-rendered HTML over the same service, mounted on
+browser surface at `/ui` — fifteen areas of server-rendered HTML over the same service, mounted on
 the same application. It is not a twelfth route group: it publishes no operation of its own, and
 [`web.md`](web.md) is its document.
 
@@ -1353,8 +1434,43 @@ the page sends. On the websocket, where a browser cannot set headers, it travels
 `Sec-WebSocket-Protocol` header as `manicule.api-key.<key>` and the server echoes the
 subprotocol back.
 
+With `oauth`, keys work exactly as above, and **a person at a browser signs in** through Google
+or GitHub instead — §9.2.1. A request presenting no header credential is then resolved from the
+browser's session cookie, if it carries one. A header always wins over a cookie, valid or not,
+and the cookie is **never** honored beneath the MCP mount, which is stateless by design (§6.1):
+an assistant running in a browser tab must not inherit whoever is signed in there.
+`manicule.api.security.identify` is the one place that decision is made, for HTTP routes, pages
+and the websocket alike. `GET /auth/session` reports `via` — `key` or `session` — and, for a
+signed-in person, their user id, address and name.
+
 Roles are a floor: `viewer` reads, `member` writes, `admin` administers. A route asks for the
-least it needs.
+least it needs — and one asks for more when an argument asks for more: `GET /api/v1/search` is a
+viewer's until it is given workspaces other than its own, when it is an administrator's (§7).
+
+**The key routes are the deliberate exception the other way.** `GET`/`POST /api/v1/auth/keys` and
+`DELETE /api/v1/auth/keys/{nameOrId}` ask only for a viewer floor, because *who may mint, see or
+revoke what key* is not a role question the route can answer on its own: it is decided by
+`ApplicationService.api_key_create/list/revoke` against `manicule.app.caller.current()`. **A
+person's key is theirs**, whatever their role: an administrator may mint any role and anyone else
+no higher than their own, and either way the key is owned by its minter, so their membership
+demotes or revokes it — a disabled administrator's keys go with them, and a key they mint
+reaches no workspace they were never admitted to. **Only the operator at this machine mints an
+unowned key** (`user_id` null), and so does an unowned admin key, acting as that operator's
+delegate; a caller short of admin with no `user_id` may not mint at all. Listing and revoking follow the same split: an
+admin or the local operator sees and may revoke every key in the workspace; anyone else sees and
+may revoke only keys they own, and revoking somebody else's key by id fails exactly as an
+unknown id would — the same non-disclosure `Keys.verify` already practices for a bad secret.
+
+A key additionally carries `allowed_ips` (CIDR ranges it may be presented from; empty means
+anywhere) and `rate_limit` (its own requests-per-minute ceiling, replacing
+`security.rate_limit.per_minute` — see §9.10). Both are validated by the service at mint time —
+a malformed CIDR is refused by name, on the same `ip_network(..., strict=False)` rule
+`security.transport.trusted_proxies` uses, and `rate_limit` must be at least 1. A key owned by a
+person resolves only while that person's membership in this workspace exists and is not
+disabled, and its *effective* role is `min(key's own role, owner's current membership role)` —
+so demoting or removing the owner demotes or disables their keys without a second write to any
+of them. `ApiKeySummary` reports `user_id`, `allowed_ips` and `rate_limit` alongside the fields
+it always has; it never reports a secret.
 
 **A refusal names the same operation a success would.** A refused request never reaches its
 service call, so `op` comes from the matched route — and every route therefore carries an
@@ -1368,7 +1484,135 @@ operator — which is tolerable because that configuration is refused twice on a
 loopback (§6), and reachable off loopback only by a person typing `--no-authentication`. On
 that bind the "operator" is anything that can route to the port — able to read the index and to
 author into the configured source. That is the exposure the flag buys, named at startup and
-reported by `manicule doctor` for as long as it holds.
+reported by `manicule doctor` for as long as it holds. In team mode it is not available at all
+(§6, "Team mode takes the way out away").
+
+#### 9.2.1 Signing in, and the browser session
+
+The one description of how a person signs in; [`web.md` §5](web.md#5-what-a-browser-can-present-said-plainly)
+points here rather than repeating it.
+
+**Configuration.** The shape, as it would sit in the configuration file:
+
+```toml
+mode = "team"
+
+[security.auth]
+mode = "oauth"
+session_secret = "…"          # at least 32 characters; see below
+
+[[security.auth.providers]]
+type = "google"
+client_id = "…apps.googleusercontent.com"
+client_secret = "…"
+redirect_uri = "https://manicule.example.org/auth/callback/google"
+allowed_domains = ["example.org"]
+role = "member"
+```
+
+`session_secret` and every `client_secret` are credentials, and `manicule config set` refuses to
+write one. Set them in the environment instead —
+`MANICULE_SECURITY__AUTH__SESSION_SECRET`, and `MANICULE_SECURITY__AUTH__PROVIDERS` as a JSON list
+of the provider tables above — or keep them in a configuration file only the account running
+manicule can read.
+
+`redirect_uri` is required and never derived from the request, because a `Host` header would
+then choose where the provider sends the authorization code. It must be the callback registered
+with the provider, and `https` unless it names a loopback host or
+`security.transport.enforce_https` is off.
+
+**The flow.** `GET /auth/login/{google|github}` generates a random `state` and a PKCE verifier,
+puts both in the `manicule_signin` cookie, and redirects to the provider with the `state`, the
+S256 challenge and the configured `redirect_uri`. The provider sends the browser back to
+`GET /auth/callback/{provider}`, which requires the cookie, compares `state` in constant time,
+deletes the cookie whatever happens next, exchanges the code with the verifier (authlib, over
+`httpx`), and asks the provider who signed in — Google's OpenID userinfo (`sub`,
+`email_verified`), or GitHub's numeric account `id` and the address `/user/emails` marks
+primary, verified only if GitHub says so. The service then decides. Every outcome is an HTML
+page: a refusal at the status the API would have used, or a short page that moves the browser
+on. Neither carries a code, a token or a provider's error text.
+
+**Admission**, decided by `ApplicationService.sign_in` on **every** sign-in rather than
+remembered from the first — so removing an address stops that person at their next one:
+
+- the provider must apply to this workspace: `workspace` unset, or naming the one being served;
+- `allow_any_user = true` admits every account the provider authenticates; otherwise the address
+  must be **verified** and either match an `allowed_emails` entry exactly, or have its part after
+  the `@` equal an `allowed_domains` entry exactly — `team.example.org` is not `example.org`;
+- a disabled membership is refused whatever the allowlist says.
+
+A refusal says *not admitted*, *address not verified* or *disabled*, and never which allowlist
+entry was consulted. The audit trail records `auth.login_refused` with the provider and that
+category, and **not the address**: it belongs to somebody who is not a member. A first sign-in
+creates the person (installation-wide, keyed by provider and account id — never by address) and
+their membership in the provider's `role`; after that, the role is whatever an administrator
+made it, and a sign-in never overwrites it.
+
+**The two cookies.** Both are `itsdangerous` timed signatures keyed by
+`security.auth.session_secret` (at least 32 characters), each with its own salt, so a forged or
+over-age cookie is refused for the cost of a hash — before anything is looked up.
+
+| | `manicule_session` | `manicule_signin` |
+|---|---|---|
+| Carries | a random 256-bit token; the database keeps only its SHA-256 | one sign-in's `state`, PKCE verifier and provider |
+| `HttpOnly` | yes — page script cannot read it | yes |
+| `SameSite` | `Strict` — attached to no request another site caused | `Lax` — the provider's return is a cross-site top-level `GET`, which `Strict` would withhold |
+| `Path` | `/` | `/auth/callback` |
+| `Max-Age` | `security.auth.session_max_age_s`, not extended by use | ten minutes |
+| `Secure` | when `security.transport.enforce_https` | the same |
+
+**Why the callback answers with a page.** The session cookie is `Strict`, and the callback is
+the end of a redirect chain that began on the provider's site. A browser withholds a `Strict`
+cookie from any further redirect in that chain, so redirecting from the callback would deliver
+the person to the dashboard signed out. A page ends the chain; its
+`<meta http-equiv="refresh">` — and an ordinary link, for a browser that ignores it — starts a
+navigation on this origin, which carries the cookie. There is no script on it: the browser
+surface's policy forbids inline script.
+
+**Sessions are rows, so they are revocable one at a time.** The cookie names a row in
+`auth_sessions`; nothing about the person is in it. A session is usable only while its row is
+this workspace's, unrevoked and unexpired and its person's membership is enabled — all one
+statement, with no branch that distinguishes an unknown token from a revoked one. The role is
+read from the membership in that same statement, so a demotion takes effect on the next request.
+A session minted for one workspace authenticates in no other. It ends when:
+
+- the person signs out — `POST /auth/logout` revokes the row, so a copy of the cookie stops
+  working at the same moment, and clears the cookie; a form post is sent on to `/ui/login`;
+- an administrator signs them out everywhere, or disables them — a disable also revokes every
+  key they minted, in the same transaction;
+- it expires, or `session_secret` changes — which signs every browser out at once, deliberately.
+
+**Cross-site requests.** Two defenses, each holding without the other: `SameSite=Strict` keeps a
+browser from attaching the cookie to a request another site caused, and §9.6.1's refusal of an
+unsafe method from another origin runs before routing on every route — `POST /auth/logout`
+included. CORS never allows credentials, so a listed origin such as the widget's presents a key
+instead.
+
+**What a role is, and is not.** Team mode does not make the index permission-aware. Every member
+of a workspace can read the whole workspace; roles decide what a person may *do* — `viewer`
+reads, `member` writes, `admin` administers people, keys and the installation — not which
+documents they may see. A corpus some people must not read belongs in another workspace.
+
+**The first administrator.** Either give one provider `role = "admin"` with an allowlist that
+names only that person, sign in, and then narrow the provider back to `member`; or let people
+sign in as members and promote one from the command line, which runs as the operator at the
+machine: `manicule auth set-role <user-id-or-address> admin`. A workspace that has an enabled
+administrator always keeps one — the last one cannot be demoted or disabled, on any surface,
+the command line included, because promoting somebody first is always possible. Nobody can
+disable themselves.
+
+**Refused at serve time, reported by `doctor`.** Under `oauth`, `build_app` refuses to serve —
+and `doctor`'s `sign_in` check reports as failing — a missing or short `session_secret`, no
+provider that applies to the served workspace, two applicable providers of one type, a
+`redirect_uri` that does not end with `/auth/callback/<type>` or is plain `http` on a
+non-loopback host while `enforce_https` is on, and a provider that admits nobody. None of these
+is a `policy_problems` entry: none of them stops a command that serves nothing.
+
+**People over HTTP**, all admin: `GET /api/v1/auth/users` lists members with their role,
+standing and live session count; `PATCH /api/v1/auth/users/{user}` takes `role` and/or
+`disabled`; `POST /api/v1/auth/users/{user}/sign-out` ends every session the member holds.
+`{user}` is a user id, or an address that names exactly one member of this workspace — two
+accounts at two providers can share one, and then the id is required.
 
 ### 9.3 Whose address a request has
 
@@ -1394,8 +1638,9 @@ deliberately cross-origin.
 - **CORS is explicit or absent.** With no `security.transport.allowed_origins` the middleware
   is not installed, which means same-origin. Configuration refuses `*` outright: a wildcard
   over a document index means any page a user visits can read it.
-- **Credentials are never permitted cross-origin.** A key is presented per request; there is no
-  cookie to attach, and `allow-credentials` is the ingredient a CSRF needs.
+- **Credentials are never permitted cross-origin.** A key is presented per request, and the one
+  cookie that is a credential — a signed-in browser's session — is `SameSite=Strict` and for this
+  origin's own pages. `allow-credentials` stays off, because it is the ingredient a CSRF needs.
 - **Framing is refused unless somebody named the frames.** Every response carries
   `frame-ancestors`, naming `security.transport.widget_allowed_domains` and `'none'` when that
   is empty.
@@ -1462,7 +1707,7 @@ before routing.
 
 The threat needs a browser holding *ambient* authority, which is the posture manicule ships as:
 loopback with `security.auth.mode = none`, where there is no credential and the caller is whoever
-can reach the port. CORS hides the **response** to a cross-origin request and does not stop a
+can reach the port. A signed-in browser's session cookie is the other case (§9.2.1). CORS hides the **response** to a cross-origin request and does not stop a
 "simple" one being sent, so a form `POST` from a page the operator merely visited would take
 effect. `Sec-Fetch-Site` is the primary signal because page script cannot set it; `Origin`
 compared against `Host` is the fallback. A request with neither header — every non-browser
@@ -1560,6 +1805,24 @@ The two writes this surface makes are treated **differently on purpose**:
 - **A failed audit write fails the operation it was auditing.** A trail with holes in it is
   worse than none, because the holes are invisible and the operation reported success.
 
+**Every row names who did it and from where.** `identify`, the MCP mount guard and the
+websocket handshake each resolve a principal and then run the rest of the request inside
+`with acting_as(principal.caller):` — the one context manager `manicule.app.caller` provides —
+so `_audit` reads the acting caller's key id (or signed-in person, or `"anonymous"`) and address
+off `manicule.app.caller.current()` rather than recording neither. Nothing that reaches the
+service outside those three entry points calls it: the command line and stdio MCP never call
+`acting_as` at all, so `current()`'s own default — the local operator — is what a row from
+either of those records, as `"local"` with no address.
+
+Audited events now cover, beyond key minting and share links: `auth.failed` (a presented
+credential that did not authenticate — the header it arrived in, `bearer` or `x-api-key`, and
+never its value), `config.changed` (the dotted key only, never the value — a value can be a
+credential even when the name is not one `secret_setting` recognizes), `workspace.switched`,
+`collection.created`/`collection.deleted`, `plugin.added`/`plugin.removed`,
+`document.accessed` (see §9.11 — the same instrumentation point as `export_volume`),
+`security.alert` and `security.alert_acknowledged`. `api_key.created` now carries the owner,
+`allowed_ips` and `rate_limit` alongside the id, name and role it always has.
+
 ### 9.9 Search quality
 
 `GET /api/v1/admin/search-quality` **reports**; it does not measure. `manicule.evaluation` is
@@ -1570,6 +1833,78 @@ reads that harness's own store and renders its own report.
 `available: false` means nobody has judged any pairs — which is the truth, and is not a score
 of zero. `is_evidence: false` means the query set behind the numbers is an **example** one, and
 the harness's caveat travels with it. See [`evaluation.md`](evaluation.md).
+
+### 9.10 Rate limiting and 429s
+
+`security.rate_limit` (`manicule.app.throttle`) is an in-process token bucket in front of every
+network surface — HTTP, the MCP mount, and the websocket handshake. Two buckets, both bounded to
+`max_tracked` distinct entries with the least-recently-touched evicted first:
+
+- **A caller bucket**, keyed `key:<id>` for a presented API key, `user:<id>` for a signed-in
+  person with no key, else `addr:<address>`. Refilled at `per_minute` tokens per minute, holding
+  at most `burst` at once. A key's own `rate_limit` (§9.2) replaces **both** numbers for that
+  key's bucket alone — capacity equal to the rate, so a key capped at, say, 5 requests per minute
+  cannot still burst up to the installation's default just because its bucket happened to be
+  full from disuse.
+- **A failed-authentication bucket per address**, refilled at `failed_auth_per_minute` — its own
+  rate is also its capacity, for the same reason. It is charged by a header credential that did
+  not work (never by a request with no credential, never by one that succeeded, never by a stale
+  session cookie, and never under `auth.mode = 'none'`, where nothing is checked), and once it is
+  spent such requests are refused with 429. **A working credential from the same address is never
+  refused by it.** Behind a proxy nobody configured as trusted, or one office's NAT, every caller
+  shares an address, and a bucket that refused correct keys would let one client with a stale key
+  lock every member out — for nothing, since a key is 256 bits and a session cookie is signed.
+  What it bounds is how fast an address may keep guessing; a failure past the budget is not
+  audited as `auth.failed`, so a guesser at full speed does not write the trail at full speed.
+
+`identify` runs both checks ahead of routing, so a request bound for the MCP mount is metered by
+the identical bucket an ordinary route would spend — the mount's own guard does not charge a
+second time, which would meter it more strictly than everything else for no reason anyone
+configured. The websocket has no `identify` to run inside (an HTTP middleware never sees a
+websocket scope), so its handshake repeats both checks itself, once, before `accept`; the charge
+covers the whole connection rather than each message on it, because metering every message at
+the same per-minute rate an HTTP client spends one request at a time would let one long-lived
+socket ask far more of the corpus than an HTTP caller ever could for the same charge.
+
+`/healthz` and `/readyz` are exempt from both buckets: a process supervisor polls them on a fixed
+schedule that has nothing to do with load, and the point of a liveness probe is that it cannot be
+made to fail by load.
+
+A refusal is `RateLimitedError`, mapped to **429** with a `Retry-After` header (whole seconds,
+rounded up) — the ordinary envelope over HTTP and the MCP mount, and the browser surface's HTML
+refusal page for a `/ui` request. `security.rate_limit.enabled = false` turns both buckets off;
+every method then reports every request admitted.
+
+### 9.11 Security alerts
+
+`security.alerts` (`manicule.app.alerts`) detects four patterns over sliding windows of
+`window_s` seconds, each firing at most once per window per subject:
+
+| Kind | Trigger | Subject |
+|---|---|---|
+| `brute_force` | `failed_auth_threshold` failed authentications from one address | the address |
+| `key_abuse` | `key_address_threshold` distinct addresses presenting one key, **or** `failed_auth_threshold` rate-limit refusals of one key | the key id |
+| `export_volume` | `export_document_threshold` distinct documents whose content one caller reads | the actor |
+
+"Content" means `document_get` with `chunks=true` and `document_resolve` with `content=true` —
+the two operations that hand back a document's stored text or bytes rather than a title, a
+status, or a ranked passage. Search hits are deliberately not counted: a search result is a short
+passage ranked for relevance, which is the corpus's core function rather than an export, and
+counting it here would flag ordinary use and scale with how often somebody searches rather than
+with how much of the corpus they have read. The local operator is not monitored for export
+volume — they already hold every authority the command line gives them, including `export`, so
+there is no boundary here for an alert to be evidence of crossing — but `document.accessed` is
+still audited for every caller, local included (§9.8).
+
+An alert is persisted to the workspace's `security_alerts` (`docs/storage.md`), logged at
+`WARNING` with no document text or credential, and audited as `security.alert` — all three
+**independently of `security.audit.enabled`**: the row and the log are the alert, and only the
+extra `audit_logs` entry follows that switch. `GET /api/v1/admin/alerts` lists them
+(`?unacknowledged_only=true` to filter), `POST /api/v1/admin/alerts/{id}/acknowledge` clears one
+and audits `security.alert_acknowledged` naming who. `manicule doctor` reports a `degraded`
+`security_alerts` check while any are unacknowledged, naming the count and
+`manicule auth alerts` / `manicule auth ack-alert <id>`. `security.alerts.enabled = false` turns
+detection off; nothing is persisted or logged. Not exposed over MCP.
 
 ---
 

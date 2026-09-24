@@ -34,6 +34,7 @@ from manicule.core.errors import (
     FingerprintMismatchError,
     ManiculeError,
     PolicyError,
+    RateLimitedError,
     StorageBusyError,
     UnknownComponentError,
     UnknownEntityError,
@@ -76,11 +77,13 @@ _HINTS: dict[type[Exception], str] = {
         "`manicule document list`, `connector list`, `workspace list` — shows what exists."
     ),
     # The opposite remedy to UnknownEntityError's, which is why it is a type of its own: the
-    # document is there and the handle is not one. Every candidate is already named in the
-    # message, so this says what to do with them rather than repeating them.
+    # thing is there and the handle is not one. Every candidate is already named in the
+    # message, so this says what to do with them rather than repeating them — for both of the
+    # lookups that raise it, because the hint is printed under both.
     AmbiguousHandleError: (
-        "A URI is display data, not identity. Re-request with the `source` and `source_id` of "
-        "the candidate you want, or with its document id — both are listed above."
+        "That handle is display data, not identity. Re-request with an identity from the "
+        "candidates listed above: a document's `source` and `source_id` or its document id, or "
+        "a member's user id."
     ),
     FingerprintMismatchError: (
         "The index was built by a different chunker or embedder. Re-index, or point at the "
@@ -97,6 +100,11 @@ _HINTS: dict[type[Exception], str] = {
         "Another writer holds durable storage. Retry the same operation — durable work "
         "resumes from its last committed prefix, and a read that was refused the writer slot "
         "changed nothing."
+    ),
+    RateLimitedError: (
+        "Wait the number of seconds the message names, then retry — an HTTP response also "
+        "carries the same figure as its 'Retry-After' header. Raise security.rate_limit in "
+        "configuration if this caller legitimately needs a higher ceiling."
     ),
     RebuildRefusedError: (
         "Inspect `rebuild plan` for aggregate missing-input and capacity estimates, then retry."
@@ -271,6 +279,8 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         "snapshot_verify",
         "workspace_list",
         "auth_list_keys",
+        "auth_users",
+        "auth_alerts",
         # Reads of configuration and of what is installed. These touch no data directory at
         # all; they are named rather than left to the default because the default is "writer",
         # and a command that takes an exclusive lock to print a setting would be absurd.

@@ -1,0 +1,33 @@
+{#
+  The page a browser lands on when a sign-in succeeds, and the reason it exists at all.
+
+  The session cookie is `SameSite=Strict`, and this response is the last step of a redirect
+  chain that began on the identity provider's site. A browser withholds a Strict cookie from any
+  further redirect in that chain, so redirecting from here would deliver the person to the
+  dashboard signed out. This page ends the chain instead, and the navigation below begins on
+  this origin — which is a same-site request, and carries the cookie.
+
+  A `<meta http-equiv="refresh">` rather than script, because the browser surface's policy
+  forbids inline script and this page is held to it; and a plain link beside it for the browser
+  that ignores the refresh. Standalone, like the refusal page: nothing on it names what the
+  installation holds.
+#}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="refresh" content="0;url={{ next }}">
+<title>{{ title }} · manicule</title>
+<link rel="stylesheet" href="{{ stylesheet }}">
+</head>
+<body class="bare">
+<main id="main">
+  <h1>{{ title }}</h1>
+  <div class="panel">
+    <p class="message">Signed in as <strong>{{ person }}</strong>, {{ role }} of workspace <strong>{{ workspace }}</strong>.</p>
+    <p><a href="{{ next }}">Continue</a></p>
+  </div>
+</main>
+</body>
+</html>

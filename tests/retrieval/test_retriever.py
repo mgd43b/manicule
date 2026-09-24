@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from sqlalchemy import text as sql
 
 from manicule.config.settings import QueryCacheSettings, RagSettings, Settings
 from manicule.container import keys
@@ -241,6 +242,31 @@ async def test_a_write_makes_the_next_query_a_miss(store: SqliteDocStore) -> Non
     after = await retriever.retrieve(a_query("authentication"))
 
     assert not after.trace.cached
+
+
+async def test_a_raw_sql_write_to_the_corpus_makes_the_next_query_a_miss(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """Rewritten text is a change only the counter can see.
+
+    Every chunk id in the cached ranking still exists and its document is still live, so the
+    ranking re-hydrates cleanly — over text it was never computed from. And it is written as a
+    ``text()`` statement, the one kind whose target the counter cannot read, which is why it
+    counts rather than being guessed at.
+    """
+    chunks = await _corpus(store)
+    retriever = _retriever(store, chunks, cache=L1QueryCache(entries=8))
+
+    first = await retriever.retrieve(a_query("authentication"))
+    async with engine.begin() as connection:
+        await connection.execute(
+            sql("UPDATE chunks SET text = 'unrelated prose about the tide' WHERE id = :id"),
+            {"id": first.candidates[0].chunk.id},
+        )
+    after = await retriever.retrieve(a_query("authentication"))
+
+    assert first.trace.cached is False
+    assert after.trace.cached is False, "a ranking computed over the old text was served"
 
 
 async def test_a_store_with_no_generation_counter_disables_the_cache(

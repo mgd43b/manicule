@@ -50,6 +50,7 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from manicule.app.dispatch import run_op
+from manicule.config.settings import Role
 from manicule.core.organization import CollectionRule
 from manicule.core.version import CORE_VERSION
 from manicule.mcp.request_logging import RequestLoggingMiddleware
@@ -66,7 +67,9 @@ INSTRUCTIONS = """\
 Search and question-answering over a self-hosted document index.
 
 Every tool returns the same envelope: `ok`, `op`, `workspace`, and then `data` or `error`.
-Read `ok` first. Everything is scoped to one workspace and nothing crosses between them.
+Read `ok` first. Everything is scoped to one workspace and nothing crosses between them, with
+one exception an administrator asks for by name: `search(workspaces=[...])` searches several
+workspaces and merges them into one ranking, and every hit names the workspace it came from.
 
 `search` ranks passages and asks no model anything; `ask` answers in prose with citations.
 Every citation resolves to a real location in a real document, and one that could not be
@@ -331,10 +334,36 @@ async def require_network_member(service: ApplicationService) -> None:
         UnauthenticatedError: Authentication is configured and no usable key was presented.
         ForbiddenError: A valid key without member authority.
     """
+    await _require_network_floor(service, Role.MEMBER)
+
+
+async def require_network_admin(service: ApplicationService) -> None:
+    """Refuse a socket caller who is not an administrator. A no-op over stdio.
+
+    The floor ``search`` asks for when it is asked to span workspaces — the one read on this
+    surface that reaches past the workspace it serves (``docs/retrieval.md`` §3.2). The mount's
+    guard admits a viewer, because it carries the read surface, and ``GET /api/v1/search`` asks
+    for an admin when it is given other workspaces; a tool that asked for less would be a way
+    round that route. The service refuses a non-administrator too, and that is the rule: this
+    is the same refusal arriving as the surface's own ``ForbiddenError``, whatever identity the
+    service has been told it is acting for.
+
+    Stdio is exempt for the reason :func:`require_network_member` gives: the caller there is the
+    operator at this machine, who already holds every authority the process has.
+
+    Raises:
+        UnauthenticatedError: Authentication is configured and no usable key was presented.
+        ForbiddenError: A valid key without admin authority.
+    """
+    await _require_network_floor(service, Role.ADMIN)
+
+
+async def _require_network_floor(service: ApplicationService, floor: Role) -> None:
+    """Hold a socket caller to ``floor``, resolving them when nothing upstream did."""
     from fastmcp.server.dependencies import get_http_request  # noqa: PLC0415 - HTTP only
 
     from manicule.api.proxy import ProxyPolicy  # noqa: PLC0415 - keeps FastAPI off stdio
-    from manicule.api.security import Role, require, resolve  # noqa: PLC0415
+    from manicule.api.security import require, resolve  # noqa: PLC0415
 
     try:
         request = get_http_request()
@@ -344,7 +373,7 @@ async def require_network_member(service: ApplicationService) -> None:
     principal = getattr(request.state, "principal", None)
     if principal is None:
         principal = await resolve(service, ProxyPolicy.of(service.settings), request)
-    require(principal, Role.MEMBER)
+    require(principal, floor)
 
 
 type Tool = Callable[..., Awaitable[dict[str, Any]]]
@@ -808,6 +837,7 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         sources: list[str] | None = None,
         media_types: list[str] | None = None,
         collections: list[str] | None = None,
+        workspaces: list[str] | None = None,
     ) -> dict[str, Any]:
         """Rank passages for a query without asking a model anything.
 
@@ -837,6 +867,14 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         is recorded in the local query log, which notes that a search happened and changes
         nothing any search, answer or listing reports.
 
+        **`workspaces` is an administrator's search across several workspaces**, and the only
+        thing here that reaches past this one. Each named workspace is searched on its own and
+        the results merged into one ranking by similarity; every hit's `workspace` says where it
+        came from, and `data.workspaces` repeats the ones that ran. This workspace is searched
+        only if it is named. A caller who is not an administrator is refused, and so is a
+        workspace that does not exist, has nothing indexed, or was indexed with a different
+        embedding model — refused, never quietly left out. Omit it for an ordinary search.
+
         Args:
             query: What to search for.
             limit: How many passages to return.
@@ -846,14 +884,18 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             collections: Restrict to these collections, named as ``collection_list`` reports
                 them. Several union; a collection combined with a source keeps only what is in
                 both. A name that is not a collection here refuses the call rather than
-                searching the whole workspace.
+                searching the whole workspace. With ``workspaces``, every named workspace must
+                have a collection of each name.
+            workspaces: Search these workspaces together, as an administrator. Omit it to
+                search this workspace alone.
 
         Returns:
             An envelope whose ``data.hits`` are ranked passages, each with its document, its
-            anchor and the score every pipeline stage gave it. ``data.collections`` repeats
-            the scope the search ran under. ``data.confidence`` and ``data.confidence_band``
-            describe support in those passages, not the probability that a later answer is
-            correct; ``none`` and ``low`` are insufficient support even when hits are present.
+            anchor, the workspace it came from and the score every pipeline stage gave it.
+            ``data.collections`` and ``data.workspaces`` repeat the scope the search ran
+            under. ``data.confidence`` and ``data.confidence_band`` describe support in those
+            passages, not the probability that a later answer is correct; ``none`` and ``low``
+            are insufficient support even when hits are present.
             ``data.confidence_reason`` is explanatory prose, not a state to parse.
             ``data.truncated=true`` means ranked candidates were dropped to fit the context
             budget, so narrow the question or scope, or retry once with ``precise`` if its cost
@@ -863,17 +905,26 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             ``confidence_reason``, and read it *beside* ``confidence`` rather than as a larger
             one — it moves no number.
         """
-        return await dispatch(
-            "search",
-            lambda: service.search(
+        spanned = tuple(workspaces) if workspaces else None
+
+        async def searched() -> Payload:
+            # Checked inside the dispatched call, as `document_create`'s floor is, so a refusal
+            # is the ordinary envelope rather than a transport error. The question is the
+            # service's own, so the floor fires exactly when the service would call the search
+            # an administrator's.
+            if service.crosses_workspaces(spanned):
+                await require_network_admin(service)
+            return await service.search(
                 query,
                 limit=limit,
                 profile=profile,
                 sources=tuple(sources or ()),
                 media_types=tuple(media_types or ()),
                 collections=tuple(collections or ()),
-            ),
-        )
+                workspaces=spanned,
+            )
+
+        return await dispatch("search", searched)
 
     # --- ingest ---------------------------------------------------------------------------
 
@@ -1451,5 +1502,6 @@ __all__ = [
     "build_server",
     "build_surface",
     "hints",
+    "require_network_admin",
     "require_network_member",
 ]

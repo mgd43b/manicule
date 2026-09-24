@@ -506,6 +506,15 @@ class Anchored(Payload):
 class SearchHit(Anchored):
     """One ranked passage."""
 
+    workspace: str = Field(
+        default="",
+        description="The workspace this passage came from. The serving workspace on an ordinary "
+        "search; on one spanning several, the workspace whose own scoped search returned it — "
+        "which is what an administrator reading a merged ranking needs in order to act on any "
+        "line of it, and what the identity check proved before the hit was returned. Every "
+        "search sets it; the empty default is what a payload recorded before the field existed "
+        "parses to, and it makes no claim.",
+    )
     score: float
     scores: dict[str, float] = Field(
         default_factory=dict,
@@ -692,6 +701,16 @@ class SearchResult(Glossed):
     reported here. Without it a scoped search and a workspace-wide search that happened to
     return the same passages are indistinguishable in a log.
     """
+
+    workspaces: tuple[str, ...] = Field(
+        default=(),
+        description="The workspaces this search ran over, in the order the caller named them: "
+        "the serving workspace alone on an ordinary search, and every named one on an "
+        "administrator's search spanning several. Echoed for the reason ``collections`` is — a "
+        "caller reads the scope that actually ran rather than assuming its argument arrived — "
+        "and never widened beyond what was named. Every search sets it; empty is what a payload "
+        "recorded before the field existed parses to.",
+    )
 
 
 class AnswerCitation(Anchored):
@@ -1914,6 +1933,21 @@ class Identity(Payload):
     key_id: str = ""
     key_name: str = ""
     workspace: str = ""
+    via: str = Field(
+        default="",
+        description="How the caller authenticated: ``key``, ``session``, or empty for nobody.",
+    )
+    user_id: str = Field(
+        default="",
+        description="The signed-in person, or the person who minted the key presented.",
+    )
+    user_email: str = ""
+    user_name: str = ""
+    rate_limit: int | None = Field(
+        default=None,
+        description="This caller's own requests-per-minute cap, when the presented key carries "
+        "one. ``None`` means the installation's configured default applies.",
+    )
 
 
 class AuthProviders(Payload):
@@ -1926,7 +1960,94 @@ class AuthProviders(Payload):
     mode: str
     count: int = Field(ge=0)
     providers: tuple[str, ...] = ()
+    login_paths: tuple[str, ...] = Field(
+        default=(),
+        description="Where a browser starts signing in, one per provider, in the same order.",
+    )
     detail: str = ""
+
+
+# --- people --------------------------------------------------------------------------------
+
+
+class UserSummary(Payload):
+    """One person, as a member of this workspace.
+
+    The person is installation-wide; everything else here — the role, whether they are
+    disabled, when they joined — is about their membership of *this* workspace, because a role
+    is a relationship between a person and a workspace rather than a property of the person.
+    """
+
+    id: str
+    provider: str
+    email: str = Field(default="", description="The verified address the provider last reported.")
+    name: str = ""
+    role: str
+    workspace: str
+    disabled: bool = False
+    created_at: str = Field(default="", description="When they became a member.")
+    last_login_at: str = ""
+    sessions: int | None = Field(
+        default=None,
+        ge=0,
+        description="Signed-in browsers that have not ended or expired. ``None`` when this "
+        "reading did not count them, which is different from none.",
+    )
+
+
+class UserList(Payload):
+    """Every member of this workspace, disabled ones included."""
+
+    count: int = Field(ge=0)
+    admins: int = Field(default=0, ge=0, description="Enabled administrators.")
+    users: tuple[UserSummary, ...] = ()
+
+
+class UserUpdated(Payload):
+    """A membership after a change to its role or its standing.
+
+    ``sessions_revoked`` and ``keys_revoked`` are what a disable took with it, in the same
+    transaction: every browser the person was signed in with, and every key they minted here.
+    """
+
+    user: UserSummary
+    previous_role: str
+    previously_disabled: bool
+    sessions_revoked: int = Field(default=0, ge=0)
+    keys_revoked: int = Field(default=0, ge=0)
+
+
+class UserSignedOut(Payload):
+    """Every browser session one person held in this workspace, ended."""
+
+    user: UserSummary
+    sessions_revoked: int = Field(ge=0)
+
+
+class SignedIn(Payload):
+    """A person admitted, and the session a browser now holds for them.
+
+    ``token`` is the only copy of the session's secret, exactly as an API key's is: only its
+    digest is stored. A surface puts it in a cookie and never displays it.
+    """
+
+    user: UserSummary
+    session_id: str
+    expires_at: str
+    token: str = Field(
+        repr=False,
+        description="The session secret. Set as a cookie, never shown, and never stored — only "
+        "its SHA-256 digest is kept.",
+    )
+
+
+class SignedOut(Payload):
+    """A browser session ended on the server, whether or not one was presented."""
+
+    ended: bool = Field(
+        description="Whether a live session was found and revoked. False for a cookie that "
+        "named nothing live, which is still a successful sign-out."
+    )
 
 
 # --- ingest --------------------------------------------------------------------------------
@@ -2370,13 +2491,15 @@ class Stats(Payload):
 class Check(Payload):
     """One diagnostic.
 
-    ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``plugins``,
+    ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``sign_in``,
+    ``plugins``,
     ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
-    ``authoring``, ``collection-membership``, ``sessions``, ``document-identity``,
-    ``document-content``, ``extractable-text``, ``wiki-provenance``, ``grammars``,
-    ``vocabularies``, ``models``, and ``component:<kind>:<name>`` for anything already
-    constructed. ``vector_backend`` is emitted too and had been missing from this list since it
-    was added, which is the drift this enumeration exists to prevent and is now corrected.
+    ``authoring``, ``collection-membership``, ``sessions``, ``security_alerts``,
+    ``document-identity``, ``document-content``, ``extractable-text``, ``wiki-provenance``,
+    ``grammars``, ``vocabularies``, ``models``, and ``component:<kind>:<name>`` for anything
+    already constructed. ``vector_backend`` is emitted too and had been missing from this list
+    since it was added, which is the drift this enumeration exists to prevent and is now
+    corrected.
 
     It is what a monitor selects on, so a name is chosen once and does not move with the
     wording — which is why the two spellings in that list stay as they are rather than being
@@ -2635,6 +2758,11 @@ class WorkspaceSwitched(Payload):
     previous: str
     active: str
     path: str = Field(description="The file that recorded it.")
+    mode: str = Field(
+        default="",
+        description="The mode recorded beside it, when one was asked for; empty otherwise.",
+    )
+    detail: str = ""
 
 
 # --- plugins -------------------------------------------------------------------------------
@@ -2811,6 +2939,26 @@ class ApiKeySummary(Payload):
     created_at: str = ""
     expires_at: str | None = None
     revoked: bool = False
+    user_id: str | None = Field(
+        default=None,
+        description="The person who minted it, or ``None`` for a key minted by an "
+        "administrator or the local operator on behalf of the installation.",
+    )
+    user_email: str | None = Field(
+        default=None,
+        description="The owner's address, when this summary was built from a resolved "
+        "authentication rather than a listing — populated there because the join is already "
+        "being paid for, and not on every row of a listing where it would not be.",
+    )
+    user_name: str | None = None
+    allowed_ips: tuple[str, ...] = Field(
+        default=(), description="CIDR ranges the key may be presented from. Empty means anywhere."
+    )
+    rate_limit: int | None = Field(
+        default=None,
+        description="Requests per minute for this key, replacing the installation's default "
+        "when set.",
+    )
 
 
 class ApiKeyIssued(Payload):
@@ -2836,6 +2984,42 @@ class ApiKeyRevoked(Payload):
     id: str
     name: str
     revoked: bool
+
+
+class SecurityAlert(Payload):
+    """One recorded pattern: brute force, key abuse, or export volume.
+
+    ``details`` carries only counts and window lengths — see
+    :class:`~manicule.app.alerts.AlertEvent` — never a credential, an address history or
+    document text.
+    """
+
+    id: str
+    kind: str
+    subject: str
+    details: dict[str, JsonValue] = Field(default_factory=dict)
+    created_at: str = ""
+    acknowledged_at: str | None = None
+    acknowledged_by: str | None = None
+
+
+class SecurityAlertList(Payload):
+    """A page of the alert list, newest first."""
+
+    total: int = Field(ge=0)
+    count: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+    unacknowledged_only: bool = False
+    alerts: tuple[SecurityAlert, ...] = ()
+
+
+class SecurityAlertAcknowledged(Payload):
+    """The outcome of acknowledging one alert."""
+
+    id: str
+    acknowledged: bool
+    acknowledged_by: str = ""
 
 
 __all__ = [
@@ -2915,12 +3099,17 @@ __all__ = [
     "SearchHit",
     "SearchQuality",
     "SearchResult",
+    "SecurityAlert",
+    "SecurityAlertAcknowledged",
+    "SecurityAlertList",
     "ServerAddress",
     "ShareCreated",
     "ShareRevoked",
     "SharedCitationLabel",
     "SharedConversation",
     "SharedTurnPayload",
+    "SignedIn",
+    "SignedOut",
     "SourceReference",
     # `StaleReparseReport` is listed here for the first time, and it is not this change's.
     # #113 added the class and not the name, so `from manicule.app.results import *` produced a
@@ -2937,6 +3126,10 @@ __all__ = [
     "TrashList",
     "TrashedDocument",
     "UpgradeReport",
+    "UserList",
+    "UserSignedOut",
+    "UserSummary",
+    "UserUpdated",
     "VectorIndexReport",
     "VectorIndexState",
     "VectorSweepReport",

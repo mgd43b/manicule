@@ -290,16 +290,47 @@ consequences worth stating:
   computed over the whole `chunks_fts` index while relevance is being judged per workspace;
   merging on it would rank the workspaces against each other rather than the chunks.
 
-N is bounded by configuration and the feature is gated on team mode.
+N is bounded by configuration — `rag.cross_workspace_limit`, 8 by default and at most 64 — and
+the feature is an administrator's: the application service refuses a search naming any
+workspace but the serving one to a caller short of the admin role (`PLAN.md` §16), and the
+network surfaces ask for the same floor so the refusal is their ordinary 403. Administering the
+serving workspace is not standing in the others, so a caller who is a person — signed in, or
+presenting a key they minted — must also hold an enabled membership of every other workspace
+named ([`surfaces.md`](surfaces.md) §7).
 
-**What #6 built, and what waits for team mode.** The rule above is a rule about *merging*, and
-merging needs N store handles. Obtaining them is a workspace registry — team-mode plumbing in
-the storage layer, not a retrieval question — and it does not exist. What ships with the
-pipeline is the property that makes waiting safe rather than risky: `SqliteDocStore` refuses a
-filter naming a workspace it does not serve, with a message pointing at the fan-out, so a
-cross-workspace query today is an error naming its own remedy rather than a query that quietly
-answers about one workspace. The merge itself lands in the same change as the registry, and the
-rule it must follow is settled above.
+**What exists, and how it keeps the rule.** #6 settled the merge and left the store's refusal
+holding the line until something could hand out N store handles; #13 built that and the merge
+together.
+
+- **The registry** is `manicule.app.runtime._Workspaces`, behind
+  `Runtime.open_workspaces`. It opens the other workspaces of the serving process's data
+  directory for reading, sharing the one engine and the one embedder rather than building a
+  runtime per workspace: a workspace opens only if the embedding fingerprint its index recorded
+  matches the one this process searches with, which is what makes the shared model's cosines
+  one scale — and a workspace that is unknown, has no index, or was embedded by another model
+  refuses the whole search rather than being left out of it. On the embedded backend it opens
+  the workspace's own directory; any other backend is asked through
+  `MultiWorkspaceVectorStore`, which opens and never prepares.
+- **The fan-out and the merge** are `Retriever.retrieve_across` and
+  `manicule.retrieval.spanning`. Each workspace runs the pipeline's own dense stage, bound to
+  that workspace's handles, with its own over-fetch and its own hydrating join; the legs merge
+  on cosine; the pipeline's reranker, when it has one, scores the merged pool once; and only
+  then is the list re-trimmed to the pipeline's depth — trimming before the legs had filtered
+  would be the top-`k` trap (§4.2) in its cross-workspace form. Lexical, fusion, routing and
+  glossary expansion do not run: BM25 and RRF are ruled out above, a utility answer is one
+  workspace's fact, and a definition is one workspace's too.
+- **Attribution is kept, and checked.** Every merged candidate records which workspaces
+  returned it, every hit names its workspace, and the application service checks each hit's
+  identity in the workspace whose search returned it — the §4.2 join inside each leg and the
+  surface's arithmetic after it, per workspace, exactly as on one. A hit claimed by no
+  workspace or by two is refused.
+- **Confidence** is the ordinary function over the merged passages with the one leg that ran,
+  so its agreement component is suppressed with a reason rather than scored zero.
+
+`SqliteDocStore` still refuses a filter naming a workspace it does not serve, and the
+single-workspace `Retriever.retrieve` now refuses a query naming more than one, so `ask` and
+`research` — which reach retrieval only through it — cannot span workspaces at all.
+Cross-workspace is a search, and only a search.
 
 ### 3.3 The split, settled as a rule rather than as a constant
 
@@ -385,29 +416,33 @@ traded against a worse one. It is a storage change and it becomes a storage tick
 trace shows the condition occurring, not before. Nothing about correctness depends on it: the
 post-filter plan is always correct, only slower.
 
-### 3.4 What this costs in already-merged code
+### 3.4 What this cost in already-merged code
 
-The shape above is not what shipped, so closing the question has a bill, and it is a small one.
-Filed as [#36](https://github.com/mgd43b/manicule/issues/36) rather than done here, because this
-document owns no code and two implementation tickets are in flight, and **paid there** — the
-list below is what that ticket did, kept as the record of why each item was necessary:
+The shape above was not what had shipped, so closing the question had a bill, and it was a
+small one. It was filed as [#36](https://github.com/mgd43b/manicule/issues/36) rather than paid
+here, because this document owns no code, and #36 paid it. The list is kept as the record of
+what each item changed and why it was necessary:
 
-- `Filter()` no longer constructs. `predicate_for` uses `default = Filter()` as a comparison
-  sentinel and `filter.is_empty` as a short-circuit; both need replacing with a comparison
-  against declared field defaults.
-- `PUSHED_DOWN_FILTER_FIELDS` gains `langs`, and needs a companion set naming `workspace_ids` as
-  **deliberately not pushed down**. This is the delicate one: the current code raises on any
-  field it cannot honor, and that refusal is doing real work. It must keep raising for
-  everything except the one field whose enforcement moved somewhere stronger, and the exemption
-  has to be a named constant with the reason attached, not an omission.
-- `SqliteDocStore._require_same_workspace` compares a scalar; it becomes a subset check, and the
-  fan-out in §3.2 means it will only ever see its own workspace.
-- The exemption above is the one place a security field is knowingly dropped by a store, so it
-  gets a structural guard rather than a comment: `manicule.testing` grows
-  `assert_pipeline_enforces_scope(pipeline, docstore, query)`, which runs a pipeline against a
-  fixture holding soft-deleted, `pending` and foreign-workspace chunks and asserts that **no
-  stage's output** contains one. A dense stage that skipped the join fails it. The same check is
-  available as an opt-in runtime assertion in the pipeline runner, off by default.
+- **`Filter()` no longer constructs.** `predicate_for` had used `default = Filter()` as a
+  comparison sentinel and `filter.is_empty` as a short-circuit; both were replaced by
+  `Filter.restricting_fields`, which compares each field against its own declared default.
+- **`PUSHED_DOWN_FILTER_FIELDS` gained `langs`, and `EXEMPT_FILTER_FIELDS` names
+  `workspace_ids` as deliberately not pushed down.** Both live in
+  `manicule.storage.vector_schema`, shared by the two backends. This was the delicate one: the
+  store raises on any field it cannot honor, and that refusal does real work, so it still
+  raises for everything except the one field whose enforcement moved somewhere stronger — and
+  the exemption is a named constant with its reason attached rather than an omission.
+- **The document store's workspace check became a subset check.** It is
+  `WorkspaceScoped._require_honorable` in `manicule.storage.scoped` now, and with the fan-out
+  of §3.2 a store only ever sees its own workspace; one handed a filter reaching past it is
+  refused.
+- **The exemption got a structural guard rather than a comment**, because it is the one place
+  a store knowingly drops a security field.
+  `manicule.testing.assert_pipeline_enforces_scope(pipeline, docstore, query)` runs a pipeline
+  against a fixture holding soft-deleted, `pending` and foreign-workspace chunks and fails if
+  **any stage's output** contains one, so a dense stage that skipped the join fails it. The
+  same check is the opt-in runtime assertion `rag.assert_scope` in the pipeline runner, off by
+  default — and it holds every leg of a cross-workspace search too.
 
 ---
 
@@ -1300,6 +1335,11 @@ content-caching version invites:
 shortened list would be correct but misleading — the ranking was computed over a candidate set
 that no longer exists, and the replacement for the dropped candidate was never considered.
 
+A cross-workspace ranking (§3.2) is cached the same way, with one addition: the entry records
+which workspace returned each id, because a chunk id cannot say which workspace minted it, and a
+hit re-hydrates each id through **that workspace's** store and join. An id whose workspace the
+search did not open is one no store can vouch for, and makes the entry stale like any other drop.
+
 ### 10.2 The key
 
 A hash over the canonical form of, in order:
@@ -1323,7 +1363,11 @@ Notes on four of those:
   like a corpus with nothing more in it — the §4.4 failure arriving through the cache.
 
 - **The whole `Filter`, not just the workspace.** Two filters produce two different rankings; a
-  key that omits one is a cache that answers a different question.
+  key that omits one is a cache that answers a different question. The workspace *set* is part
+  of it, and that is what keeps an administrator's cross-workspace ranking (§3.2) and one
+  workspace's ranking of the same words apart — served to each other, the first would show a
+  single-workspace caller other tenants' passages, and the second would report a search that
+  says it spanned several and looked at one.
 - **The pipeline declaration and the reranker id.** Comparing two pipelines is #15's entire
   method, and a cache that cannot tell them apart would serve pipeline A's ranking as pipeline
   B's result. #15 also runs with the cache **disabled**, which is a configuration flag rather
@@ -1357,12 +1401,83 @@ Application-level bookkeeping covers only the write paths someone remembered.
 bump at the top of each write method is a per-method list with the same weakness one layer
 down: the method nobody annotates is the one that serves a stale ranking. The counter instead
 counts **committed transactions on the store's engine**, which is the closest thing SQLAlchemy
-has to a trigger — a write path cannot avoid committing, and a read cannot reach it, because a
-session closed without a commit rolls back. Verified in both directions: `upsert_document`,
-`replace_chunks` and `soft_delete_document` each move it, and `get_document`, `list_documents`
-and `search_lexical` do not. It over-counts, deliberately — a watermark write bumps it too, and
-so does a write through any other handle on the same database — and over-counting costs a cold
-cache while under-counting serves a ranking computed over a corpus that no longer exists.
+has to a trigger — a write path cannot avoid committing, and a session closed without a commit
+rolls back. One counter per engine, shared by every workspace's handle on it.
+
+**Counting every commit made the cache unreachable.** That was the first design, and it rested
+on "a read cannot reach it" — true of the store, and false of the service. Every search the
+service runs writes a `query_logs` row after retrieving, on the same engine, so the search's own
+record of itself moved the key and the next identical search always missed; `ask` did the same
+with the conversation turn it persists, and a spanning search with its audit entry. The cache hit
+only when the retriever was called directly, which no surface does.
+
+**So each statement is classified as it is sent, and the commit decides.** A listener on
+SQLAlchemy's `before_cursor_execute` marks the transaction the moment it sends a statement the
+counter cannot vouch for, before the statement runs; the commit bumps the counter only if the
+mark is set; commit and rollback both clear it. The counter can vouch for exactly two kinds of
+statement, both of which SQLAlchemy built rather than parsed from a string:
+
+| Statement | Moves the counter |
+|---|---|
+| a `SELECT`, or a `UNION` of them, built with SQLAlchemy | no — it writes nothing |
+| an `INSERT`, `UPDATE` or `DELETE` built with SQLAlchemy whose target is an exempt table | no |
+| an `INSERT`, `UPDATE` or `DELETE` built with SQLAlchemy on **any other table** | yes |
+| any `text()` statement or driver-level SQL, **whatever table it names** | yes |
+| DDL, a savepoint, anything else | yes |
+
+The exempt tables are the record of who asked what and of who may ask — `query_logs`,
+`audit_logs`, `security_alerts`, `conversations`, `messages`, `users`, `workspace_members`,
+`auth_sessions` and `api_keys` (`NON_CORPUS_TABLES` in `manicule.storage.scoped`). No query
+reads any of them, and most are written *because* somebody searched, asked or signed in.
+
+**It fails toward counting, on purpose, at every choice.** Over-counting costs a cold cache;
+under-counting serves a ranking computed over a corpus that no longer exists.
+
+- **An exemption list, not a list of tables that count.** A table missing from it — including
+  one added next year — counts. A list of the tables that count would fail the other way: the
+  table nobody added would be the stale ranking.
+- **A string is not a proof.** A `text()` insert into `query_logs` counts, because a statement
+  that says it writes the query log has only said so. Only a statement whose target SQLAlchemy
+  knows can be exempted.
+- **The whole transaction counts if one statement does.** A query-log row committed beside a
+  rewritten chunk does not hide the chunk.
+- **The exemption depends on three facts, and the test suite holds each of them:** no trigger
+  fires on an exempt table, since a trigger is a write its statement does not name; a
+  foreign-key action that starts at an exempt table ends at one — deleting a person cascades
+  into their memberships, sessions and keys, and deleting a query-log row nulls the turns that
+  pointed at it, all exempt; and no statement the retriever sends names an exempt table. A
+  retrieval that began reading one would make its writes change what a query returns, and it
+  would leave the list.
+
+What this cannot see is a write made on the raw driver connection, beneath SQLAlchemy — which no
+SQLAlchemy event can see, and which nothing in this project does.
+
+**A counted commit moves the counter twice: when it is announced, and once it has landed.**
+SQLAlchemy's `commit` event fires *before* the database commits. A counter moved only there
+leaves a window in which a concurrent search reads the new value and the old rows, and caches a
+ranking of a corpus that is about to stop existing — under the key every later search will use,
+for as long as the entry lives. So the counter moves again when the connection is next seen
+after the commit returned: its next `begin`, or its return to the pool. A ranking computed
+inside the window is keyed to the value in between, which is gone before anybody could be
+served it.
+
+**A second engine for telemetry was the alternative, and it is worse.** Writing the query log,
+the audit trail and conversations through an engine the counter does not listen to would put two
+connection pools and two writer queues on one SQLite file, racing for its single writer rather
+than queueing for it (`writer_admission` in `manicule.storage.engine` is one queue per engine,
+precisely so that every writer waits in the same one); it would make "which engine does this
+write go through" a decision every call site makes, which is the per-call-site list again; and it
+would fail in the dangerous direction — a corpus write routed through the telemetry engine by
+mistake would never count. Classifying statements keeps one engine and one queue, and a
+statement nobody thought about counts.
+
+Verified in both directions. `upsert_document`, `replace_chunks`, `soft_delete_document`, adding
+a document to a collection, a raw `UPDATE chunks`, and a structured write to every table not on
+the list each move it. `get_document`, `list_documents`, `search_lexical`, a query-log row, an
+audit entry, an alert, a conversation turn and its feedback do not — and through the service,
+a repeated search, a search after an `ask` of the same words, and a repeated spanning search are
+each served from the cache. It still over-counts, deliberately — a watermark write bumps it, and
+so does a corpus write through any other handle on the same database.
 
 **An in-process counter is sufficient, and the reason is a property this project already
 enforces:** exactly one instance per data directory, held by an exclusive lock for the process
@@ -2001,7 +2116,7 @@ Calls made in the absence of a stated position.
 | Stages run sequentially; concurrency deliberately declined for measurement clarity | §2.2 |
 | Stage names unique within a pipeline; the container refuses duplicates | §2.2 |
 | `Filter` settled: `workspace_ids` required/non-empty, `sources` and `langs` set-valued, `extra` removed | §3.1 |
-| Cross-workspace search is N scoped queries merged on cosine, never one unscoped query, never RRF | §3.2 |
+| Cross-workspace search is N scoped queries merged on cosine, never one unscoped query, never RRF; an administrator's, bounded by `rag.cross_workspace_limit`, and search-only | §3.2 |
 | The pre-filter/post-filter split is a rule with recorded inputs, not a constant | §3.3 |
 | "No join-requiring field set" and "resolved to the empty set" are opposite instructions, not one case | §3.3 |
 | The hydrating join lives *inside* the dense stage, so scope is a per-stage invariant | §2.4, §4.2 |
@@ -2061,7 +2176,7 @@ out here because a reader of the other documents will not have seen it coming.
 
 | Ticket | What | Why not here |
 |---|---|---|
-| [#36](https://github.com/mgd43b/manicule/issues/36) | **Reshape `Filter` to the settled form** (§3.1, §3.4), and add `assert_pipeline_enforces_scope` | It changes `manicule.core.retrieval` and both stores — merged code owned by #1 and #2 — while two implementation tickets are in flight. It is also worth landing as its own reviewable change, because it moves a security boundary |
+| [#36](https://github.com/mgd43b/manicule/issues/36) | **Reshape `Filter` to the settled form** (§3.1, §3.4), and add `assert_pipeline_enforces_scope` — landed | It changed `manicule.core.retrieval` and both stores — merged code owned by #1 and #2 — while two implementation tickets were in flight, and it was worth landing as its own reviewable change, because it moved a security boundary |
 
 ## Appendix E: what #6 changed in this document
 
@@ -2070,12 +2185,12 @@ did, each fixed above rather than noted:
 
 | Where | What building it showed |
 |---|---|
-| §3.2 | The cross-workspace **merge rule** is a retrieval decision and is settled; the **fan-out** needs a workspace registry that is team-mode storage plumbing. The store's refusal is what holds the line meanwhile, and it names its own remedy |
+| §3.2 | The cross-workspace **merge rule** is a retrieval decision and is settled; the **fan-out** needed a workspace registry, which is storage plumbing rather than a retrieval question. #6 shipped the rule and the store's refusal; #13 shipped the registry and the merge together, and the refusal still stands for any single store handed a filter reaching past its workspace |
 | §3.3 | Resolution has to stop one row past `prefilter_id_limit`, and the count it records is then a lower bound. A figure recorded as exact when it is not would skew the distribution the threshold is to be set from |
 | §4.1, §11.1 | The lexical trace records the query text the leg was **given**, not the escaped match string. Escaping belongs to the store; reproducing it in the stage would import a database driver into a package that needs none and hardcode one store's query language into a swappable leg |
 | §7.3, §12.1 | The token budgets were inherited, unreachable by a factor of three to five, and `precise` failed its own startup cross-check against the model this project ships with. They are now derived from what each profile can hold |
 | §8.2 | The suppression rule is about the **cause**, not about one named term: a degraded dense leg has to suppress the similarity component for exactly the reason a degraded lexical leg suppresses agreement |
-| §10.3 | "Bump on the write paths in the document store" is still a list. The counter counts **committed transactions**, which a write cannot avoid and a read cannot reach |
+| §10.3 | "Bump on the write paths in the document store" is still a list. The counter counts **committed transactions**, which a write cannot avoid. #13 found that a read *can* reach one — through the query-log row the service writes after it — and the counter now leaves out a commit that wrote only exempt tables |
 | §10.1 | A cache hit re-applies the **document-level** half of the filter, not the whole of it. `kinds` and `langs` are chunk properties with no column in a query over `documents`, so passing them made a query that worked on a miss raise on a hit. Nothing is dropped by narrowing it: those fields were applied when the ranking was computed, and a chunk id is content-derived, so the chunk behind a cached id is the same chunk of the same kind — what can have changed is exactly the document-level half |
 
 Two more that are additions rather than corrections. `manicule.retrieval.assembly.window_problem`

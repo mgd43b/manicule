@@ -1,4 +1,4 @@
-"""The browser surface: twelve areas of server-rendered HTML over the one application service.
+"""The browser surface: fifteen areas of server-rendered HTML over the one application service.
 
 A fourth adapter, under exactly the rules the other three are written to. It parses a request,
 calls one service method through :func:`~manicule.app.dispatch.run_op`, and renders the

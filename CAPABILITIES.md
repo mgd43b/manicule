@@ -43,7 +43,9 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   so manicule reports the command that would install one and runs nothing. `docs/surfaces.md` §8
 - [x] `list-keys` → `auth list-keys`
 - [x] `list` → `document list`, `connector list`, `workspace list`, `plugin list`
-- [ ] `login` — OAuth. #13
+- [ ] ~~`login`~~ — a command-line sign-in. The command line runs as the operator at this
+  machine and needs no credential; people sign in from a browser, through Google or GitHub, at
+  `/ui/login`. `docs/surfaces.md` §9.2.1
 - [ ] ~~`publish`~~ — publishing a plugin. That is a package index's job
 - [x] `remove <name>` → `plugin remove`
 - [x] `reset` → `reset-index`
@@ -79,7 +81,9 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 - [x] start — option `-p, --port <port>`
 - [x] upgrade — option `--skip-backup`
 - [x] upgrade — option `--version <version>`
-- [ ] workspace — option `--mode <mode>` — personal or team. #13 owns team mode
+- [x] workspace — option `--mode <mode>` → `workspace switch NAME --mode personal|team`, written
+  beside the workspace in one edit. A team installation refuses to serve without authentication,
+  `--no-authentication` included
 
 ### Added, because the commands above could not do their job without them
 
@@ -88,6 +92,12 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   five passages. Bounded before it starts: `research.max_cycles` rounds of at most
   `research.max_sub_questions` searches, inside `research.timeout_s`.
 - `--workspace/-w` — run one command in another workspace, without editing configuration.
+- `search --workspaces a,b` — an administrator's search spanning named workspaces: one scoped
+  search per workspace, merged into one ranking by cosine similarity, every hit naming the
+  workspace it came from. Not `-w`, which runs a command *in* one other workspace; this searches
+  several *from* this one, and includes this one only if it is named. Bounded by
+  `rag.cross_workspace_limit`, and refused whole — never narrowed — for a workspace that is
+  unknown, unindexed or embedded by a different model.
 - `index --stats` — counts grouped by source, media type and status.
 - `index --source` — the source name documents are recorded under. It is part of their
   identity, so it is a decision rather than a constant.
@@ -112,6 +122,18 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 - `connector sync --acquire-only`, `connector snapshot`, `connector verify`, and `rebuild
   plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
   connector-free derived publication with no separate settlement command.
+- `auth create-key --allow-ip <cidr>` (repeatable) and `auth create-key --rate-limit <n>` — a
+  key's own address scope and its own requests-per-minute ceiling, validated at mint time.
+  `docs/surfaces.md` §9.2.
+- `auth alerts [--all]` and `auth ack-alert <id>` — list and clear recorded security alerts.
+  `--all` includes acknowledged ones; without it, only the open ones a person still has to
+  look at. `docs/surfaces.md` §9.11.
+- `auth users`, `auth set-role <user> <role>`, `auth disable-user <user>`,
+  `auth enable-user <user>` and `auth sign-out <user>` — the people-admin surface: list members
+  with role, standing and live session count; change a role (the last enabled administrator
+  cannot be demoted); disable or re-enable a membership (disabling revokes every session and key
+  the member holds, in one transaction); end every session a member holds without disabling
+  them. `docs/surfaces.md` §9.2.1.
 
 ## MCP tools — 46
 
@@ -130,7 +152,9 @@ network by construction, and a socket has to replace that property rather than a
 authoring is the one exception, bounded by configuration and gated by a **member floor** rather
 than by authentication itself. A viewer key does not clear that floor. An anonymous caller on an
 installation with `security.auth.mode = none` does, because that mode resolves them to an
-administrator — which is what `--no-authentication` on a network bind hands out.
+administrator — which is what `--no-authentication` on a network bind hands out. `search` takes
+`workspaces` for an administrator's search spanning several workspaces, and over a socket that one
+argument raises its floor to **admin**, the floor `GET /api/v1/search?workspaces=…` asks for too.
 
 - [x] `ask`
 - [x] `collection_add`
@@ -246,8 +270,8 @@ name — an absence with no test is an absence that comes back.
 - [x] `GET    /api/v1/tags`
 - [x] `GET    /api/v1/workbench`
 - [x] `GET    /api/v1/workspaces`
-- [ ] ~~`GET    /auth/callback/:provider`~~ — OAuth. #13
-- [ ] ~~`GET    /auth/login/:provider`~~ — OAuth. #13
+- [x] `GET    /auth/callback/:provider` — Google and GitHub, with PKCE; answers with a page
+- [x] `GET    /auth/login/:provider`
 - [x] `GET    /auth/providers`
 - [x] `PATCH  /api/v1/collections/:id` — the description. Renaming is its own route: it can
   fail with a 409 and describing cannot, and one route returning either status depending on
@@ -274,11 +298,28 @@ name — an absence with no test is an absence that comes back.
 - [ ] ~~`POST   /api/v1/documents/upload`~~ — accepting bytes over HTTP is an ingest path with no filesystem permission check and no path the operator chose. `manicule index <path>` is the ingest this build offers
 - [ ] ~~`POST   /api/v1/plugins/install`~~ — installing a plugin fetches and executes code with this process's full authority. `POST /api/v1/plugins/:name` enables one that is already installed
 - [x] `POST   /api/v1/tags`
-- [ ] ~~`POST   /auth/logout`~~ — there is no session cookie in this build — a key is presented on every request — so there is nothing to log out of. `GET /auth/session` reports who a request is
+- [x] `POST   /auth/logout` — revokes the browser's session on the server, not only its cookie
 - [x] `POST   /auth/session` — as `GET /auth/session`, which *reports* an identity rather than
-  creating one. There is no session cookie in this build: a key is presented on every request,
-  and a signed cookie would be a second credential type with its own expiry, revocation and
-  CSRF story
+  creating one. A browser session is created only by signing in through a provider, and a
+  program presents a key on every request instead; `docs/surfaces.md` §9.2.1
+
+### Added, because the endpoints above could not do their job without them
+
+- `GET /api/v1/admin/alerts` and `POST /api/v1/admin/alerts/:id/acknowledge` — the security
+  alerts of `security.alerts`. Admin-only; not exposed over MCP. `docs/surfaces.md` §9.11.
+- Every request over this surface, over the MCP mount, and the websocket handshake, is now
+  metered by `security.rate_limit` — a 429 with a `Retry-After` header, not a new route.
+  `docs/surfaces.md` §9.10.
+- `GET /api/v1/auth/keys`, `POST /api/v1/auth/keys` and `DELETE /api/v1/auth/keys/:nameOrId` —
+  minting, listing and revoking API keys, which the endpoints above assume exist and never
+  create. Viewer-floor routes, because who may see, mint and revoke which key is the service's
+  ownership rule rather than a role: an administrator manages every key, anyone else only the
+  keys they minted, at no more than their own role. `docs/surfaces.md` §9.2.
+- `GET /api/v1/auth/users`, `PATCH /api/v1/auth/users/:user` and
+  `POST /api/v1/auth/users/:user/sign-out` — the people-admin surface `mode = "team"` needs and
+  a single-operator build has no one to apply it to: list members with role, standing and live
+  session count; change a role or disable/enable a membership; end every session a member holds.
+  Admin-only. `docs/surfaces.md` §9.2.1.
 
 ## File types — 18
 
@@ -394,6 +435,9 @@ is a feature list entry, not a feature.
   exists as a setting because the right value depends on corpus size rather than on manicule.
 - `rag.chunker`, `rag.pipeline`, `rag.reranker` — a retrieval pipeline is a declared list of
   stages, so two pipelines can be compared by configuration rather than by editing code.
+- `rag.cross_workspace_limit` — the most workspaces one administrator's search may span (8 by
+  default, 2 to 64). Each is its own scoped search, so this bounds the work one request can ask
+  for.
 - `rag.glossary.*` — glossary-aware acronym retrieval: whether ingest reads definitions out of
   documents, whether a query naming one is expanded, how confident an entry has to be before a
   query acts on it, and which extra words to treat as ordinary English. There is deliberately no
@@ -410,3 +454,15 @@ is a feature list entry, not a feature.
   `llm.provider`, which names the **vendor**. The two answer different questions and
   conflating them made the default configuration unrunnable: one implementation reaches every
   vendor through a `base_url`, so the component is not a function of the vendor.
+- `security.rate_limit.*` — the in-process token bucket in front of every network surface: one
+  bucket per caller (`enabled`, `per_minute`, `burst`), a separate one per address for failed
+  authentication (`failed_auth_per_minute`), and `max_tracked` bounding how many distinct
+  callers are remembered at once, least-recently-touched evicted first. A caller-side dial has
+  no home in a settings extraction that only ever saw a single-operator installation.
+  `docs/surfaces.md` §9.10.
+- `security.alerts.*` — sliding-window detection of brute force, key sharing and export-volume
+  patterns (`enabled`, `window_s`, `failed_auth_threshold`, `key_address_threshold`,
+  `export_document_threshold`). `docs/surfaces.md` §9.11.
+- `api_keys.allowed_ips` / `api_keys.rate_limit` — per-key CIDR scoping and a per-key override
+  of `security.rate_limit.per_minute`, set at mint time rather than in the config file: a key is
+  an identity issued to one caller, and its own bounds belong beside it. `docs/surfaces.md` §9.2.

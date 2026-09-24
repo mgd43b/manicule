@@ -19,6 +19,17 @@ non-loopback bind with no auth is refused twice: by
 :func:`~manicule.app.bind.resolve_bind` before a socket exists, and by
 :func:`~manicule.api.app.build_app` before an application exists.
 
+**A browser that signed in presents a session cookie instead of a header.** Under
+``security.auth.mode = 'oauth'`` a request carrying no header credential is resolved from the
+``manicule_session`` cookie, if it has one — its signature first, then
+:meth:`~manicule.app.service.ApplicationService.authenticate_session`. A header always wins: a
+request presenting a key is that key, valid or not, whatever cookie the browser also sent. And
+the cookie is **not** honored beneath the MCP mount, which is stateless by design
+(``docs/surfaces.md`` §6.1) — a protocol client presents its key on every call, and an assistant
+running in a browser tab must not inherit whatever the person in that tab is signed in as.
+:mod:`manicule.api.cookies` says why each cookie attribute is what it is, and how a cookie
+cannot be spent by another site.
+
 ``manicule serve --no-authentication`` satisfies both refusals, and it is the one case where
 the assumption above does not hold: the anonymous administrator below is then anything that can
 route to the port. **Nothing here bounds that, and the honest thing is to say so rather than to
@@ -42,8 +53,12 @@ from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Depends, Request, WebSocket
 
+from manicule.api.cookies import SESSION_COOKIE, session_token
 from manicule.api.proxy import FORWARDED_FOR
+from manicule.app.caller import RANK, Caller, acting_as
+from manicule.app.frontdoor import MCP
 from manicule.app.results import Identity
+from manicule.app.throttle import RateDecision
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import ManiculeError
 
@@ -70,9 +85,6 @@ query string — writes the credential into the server's access log. The subprot
 the one field a browser *can* set, so the key travels there and the server echoes the chosen
 subprotocol back.
 """
-
-_RANK: dict[Role, int] = {Role.VIEWER: 0, Role.MEMBER: 1, Role.ADMIN: 2}
-"""Least authority first. A route asks for a floor, not for an exact role."""
 
 
 class UnauthenticatedError(ManiculeError):
@@ -120,8 +132,28 @@ class Principal:
 
     @property
     def actor(self) -> str:
-        """Who to record in the audit trail. The key's id, or the local operator."""
-        return self.identity.key_id or ("local" if not self.identity.authenticated else "")
+        """Who to record in the audit trail. See :attr:`manicule.app.caller.Caller.actor`."""
+        return self.caller.actor
+
+    @property
+    def caller(self) -> Caller:
+        """This principal as the service sees it, for :func:`manicule.app.caller.acting_as`.
+
+        The unauthenticated caller of an installation with ``auth.mode = none`` is the local
+        operator, for the reason :attr:`role` gives; every other caller carries the role this
+        request resolved to, so the service can never hold a network caller to less than the
+        surface did.
+        """
+        identity = self.identity
+        if not identity.authenticated and identity.mode == AuthMode.NONE.value:
+            return Caller(address=self.address)
+        return Caller(
+            role=self.role,
+            key_id=identity.key_id or None,
+            user_id=identity.user_id or None,
+            address=self.address,
+            rate_limit=identity.rate_limit,
+        )
 
 
 def token_of(request: Request | WebSocket) -> str:
@@ -150,6 +182,123 @@ def websocket_token(websocket: WebSocket) -> tuple[str, str | None]:
     return "", None
 
 
+def credential_kind(request: Request | WebSocket) -> str:
+    """Which header credential a request presented — never its value — or empty for none.
+
+    ``bearer`` or ``x-api-key`` exactly when :func:`token_of` would read one, and ``subprotocol``
+    for a websocket that offered its key the one way a browser can. A session cookie is not a
+    kind here: it is signed, so it cannot be guessed, and a stale one is ordinary browser state.
+    """
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith(BEARER):
+        return "bearer" if authorization[len(BEARER) :].strip() else ""
+    if request.headers.get(API_KEY_HEADER, "").strip():
+        return "x-api-key"
+    if isinstance(request, WebSocket) and websocket_token(request)[0]:
+        return "subprotocol"
+    return ""
+
+
+def failed_credential(principal: Principal, request: Request | WebSocket) -> str:
+    """The kind of header credential this request presented and that did not authenticate.
+
+    Empty when nothing was presented, when it worked, and under ``security.auth.mode = 'none'``,
+    where no credential is checked: a header a client happens to send to such an installation —
+    a key configured for a server later served with ``--no-authentication``, say — is ignored
+    rather than counted as a guess, or an ordinary client would be throttled out of an
+    installation that asks it for nothing.
+    """
+    identity = principal.identity
+    if identity.authenticated or identity.mode == AuthMode.NONE.value:
+        return ""
+    return credential_kind(request)
+
+
+async def account_for_credential(
+    service: ApplicationService, principal: Principal, request: Request | WebSocket
+) -> RateDecision:
+    """What the rate limiter and the alert monitor learn from the credential a request presented.
+
+    One place for both surfaces that authenticate a connection — the HTTP middleware and the
+    websocket handshake — so neither can be the one that forgot a check:
+
+    * **A header credential that did not work** is charged to its address's failed-
+      authentication bucket, counted toward a ``brute_force`` alert, and audited while the
+      bucket has budget; past it, the refusal the caller builds from the returned decision is
+      the record, so a guesser at full speed does not write the audit trail at full speed.
+    * **A key that did work** is counted toward a ``key_abuse`` alert by the addresses it
+      arrives from: the same secret from more places than one person's devices explain.
+
+    Returns the failed-authentication decision; ``allowed`` for anything that was not a guess.
+    """
+    address = principal.address
+    guessed = failed_credential(principal, request)
+    if guessed:
+        guessing = service.rate_limiter.charge_failed_auth(address)
+        with acting_as(principal.caller):
+            await service.record_security_alert(service.alert_monitor.record_failed_auth(address))
+            if guessing.allowed:
+                await service.record_failed_authentication(credential_kind=guessed)
+        return guessing
+    identity = principal.identity
+    if identity.authenticated and identity.via == "key" and identity.key_id:
+        with acting_as(principal.caller):
+            await service.record_security_alert(
+                service.alert_monitor.record_key_presentation(identity.key_id, address)
+            )
+    return RateDecision(allowed=True)
+
+
+def client_address(policy: ProxyPolicy, request: Request | WebSocket) -> str:
+    """The address this request came from, as the proxy policy decides it. Empty for none."""
+    client = request.client
+    return policy.client_address(
+        peer=client.host if client is not None else None,
+        # Through the constant, not a literal. The header manicule reads is a decision
+        # `manicule.api.proxy` makes once, and a second spelling here is how a rename ends
+        # up reading a header nothing sends.
+        forwarded_for=request.headers.get(FORWARDED_FOR),
+    )
+
+
+def beneath_mcp(path: str) -> bool:
+    """Whether ``path`` is the MCP mount or anything under it."""
+    return path == MCP or path.startswith(f"{MCP}/")
+
+
+async def identify(
+    service: ApplicationService, request: Request | WebSocket, *, address: str = ""
+) -> Identity:
+    """Who this request is, from a header credential or — for a browser — a session cookie.
+
+    The order is the rule. A header credential is always the answer when one is presented, so
+    a program's key is never overridden by a browser's ambient cookie. Only with no header,
+    under ``oauth``, and outside the MCP mount is the cookie consulted, and its signature is
+    checked before the service is asked anything: a forged or expired cookie is refused for the
+    cost of a hash.
+
+    ``address`` is the client address the proxy policy resolved, handed to
+    :meth:`~manicule.app.service.ApplicationService.authenticate` so a key limited to
+    ``allowed_ips`` is refused from anywhere else. Empty means none could be established, and
+    such a key is then refused rather than trusted.
+    """
+    if isinstance(request, WebSocket):
+        header, _ = websocket_token(request)
+    else:
+        header = token_of(request)
+    settings = service.settings
+    if (
+        not header
+        and settings.security.auth.mode is AuthMode.OAUTH
+        and SESSION_COOKIE in request.cookies
+        and not beneath_mcp(request.url.path)
+    ):
+        return await service.authenticate_session(
+            session_token(settings, request.cookies.get(SESSION_COOKIE))
+        )
+    return await service.authenticate(header, address=address)
+
+
 async def resolve(
     service: ApplicationService, policy: ProxyPolicy, request: Request | WebSocket
 ) -> Principal:
@@ -158,19 +307,10 @@ async def resolve(
     A missing or unusable key produces an *unauthenticated* principal rather than an error,
     so that the anonymous routes — health, a shared conversation link, the provider list —
     are reachable through the same resolution as everything else. :func:`require` is what
-    refuses.
+    refuses. :func:`identify` is what decides which credential a request is presenting.
     """
-    client = request.client
-    return Principal(
-        identity=await service.authenticate(token_of(request)),
-        address=policy.client_address(
-            peer=client.host if client is not None else None,
-            # Through the constant, not a literal. The header manicule reads is a decision
-            # `manicule.api.proxy` makes once, and a second spelling here is how a rename ends
-            # up reading a header nothing sends.
-            forwarded_for=request.headers.get(FORWARDED_FOR),
-        ),
-    )
+    address = client_address(policy, request)
+    return Principal(identity=await identify(service, request, address=address), address=address)
 
 
 def require(principal: Principal, floor: Role) -> Principal:
@@ -180,15 +320,23 @@ def require(principal: Principal, floor: Role) -> Principal:
         UnauthenticatedError: Authentication is configured and no usable key was presented.
         ForbiddenError: A valid key without the authority this route needs.
     """
-    if principal.identity.mode != AuthMode.NONE.value and not principal.identity.authenticated:
+    identity = principal.identity
+    if identity.mode != AuthMode.NONE.value and not identity.authenticated:
         msg = (
             "this installation requires authentication. Present an API key as "
-            "'Authorization: Bearer <key>' or 'X-API-Key: <key>'."
+            "'Authorization: Bearer <key>' or 'X-API-Key: <key>'"
         )
-        raise UnauthenticatedError(msg)
-    if _RANK[principal.role] < _RANK[floor]:
+        if identity.mode == AuthMode.OAUTH.value:
+            # The login routes rather than the browser surface's page, because those exist
+            # whether or not the browser surface is served; `/auth/providers` lists them.
+            msg += ", or sign in from a browser — GET /auth/providers lists where"
+        raise UnauthenticatedError(f"{msg}.")
+    if RANK[principal.role] < RANK[floor]:
+        credential = {"key": "this key has", "session": "you have"}.get(
+            identity.via, "this caller has"
+        )
         msg = (
-            f"this operation needs the {floor.value!r} role or higher; this key has "
+            f"this operation needs the {floor.value!r} role or higher; {credential} "
             f"{principal.role.value!r}."
         )
         raise ForbiddenError(msg)
@@ -245,6 +393,8 @@ __all__ = [
     "UnauthenticatedError",
     "ViewerPrincipal",
     "anonymous",
+    "beneath_mcp",
+    "identify",
     "require",
     "resolve",
     "token_of",

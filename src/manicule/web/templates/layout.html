@@ -29,9 +29,18 @@
   </form>
   <div class="who">
     <span class="pill" title="Workspace">{{ workspace }}</span>
+    {% if person %}<span class="pill" title="Signed in as">{{ person }}</span>{% endif %}
     <span class="pill" title="Role">{{ role }}</span>
     <button type="button" class="ghost" data-palette-open aria-keyshortcuts="Control+K">Go to…</button>
     <button type="button" class="ghost" data-theme-toggle aria-label="Switch color scheme">Theme</button>
+    {# A plain form rather than a scripted button, so signing out works with the script
+       disabled. It is a same-origin POST, which the cross-site refusal admits and the session
+       cookie's SameSite=Strict already requires. #}
+    {% if person %}
+    <form class="signout" method="post" action="/auth/logout">
+      <button type="submit" class="ghost">Sign out</button>
+    </form>
+    {% endif %}
   </div>
 </header>
 

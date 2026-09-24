@@ -263,7 +263,10 @@ Two constraints ride along and both are enforced:
   private LAN, or a cluster behind an ingress that authenticates for us. That is the target
   deployment: MCP over HTTPS behind a PKI, with no manicule on the laptop at all. It opens both
   doors at once, `document_create` and `POST /api/v1/documents`, because they are the same write
-  and an anonymous administrator clears the member floor on either.
+  and an anonymous administrator clears the member floor on either. In team mode the waiver does
+  not exist: several people share that installation, so there is no one operator for an
+  anonymous caller to be, and the flag is refused
+  ([`surfaces.md` §6](surfaces.md#team-mode-takes-the-way-out-away)).
 - **Scope is a configured writable collection**, not any collection the workspace holds. Creating a
   collection is therefore not also the act of granting write access to it.
 

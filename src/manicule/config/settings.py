@@ -171,7 +171,15 @@ class Section(BaseModel):
 
 
 class Mode(StrEnum):
-    """Whether this installation serves one person or a team."""
+    """Whether this installation serves one person or a team.
+
+    The difference is who a caller *without* a credential is. In ``personal`` mode, with
+    ``security.auth.mode = none``, it is the operator at this machine, holding the authority the
+    command line already gives them. In ``team`` mode there is no such person: several people
+    share the installation, so every caller must present a credential and a served process with
+    authentication off is refused — ``--no-authentication`` included, because an anonymous
+    administrator is a single-operator arrangement by definition.
+    """
 
     PERSONAL = "personal"
     TEAM = "team"
@@ -337,15 +345,90 @@ class Role(StrEnum):
 
 
 class OAuthProvider(Section):
+    """One identity provider a person may sign in through.
+
+    Signing in admits a person to **one** workspace, in the role named here, the first time
+    they arrive; after that their role is whatever an administrator has made it. Admission is
+    re-checked on every sign-in rather than only the first, so removing an address from
+    ``allowed_emails`` stops that person at their next sign-in instead of never.
+    """
+
     type: Literal["google", "github"]
     client_id: str = Field(min_length=1)
     client_secret: SecretStr
-    redirect_uri: str | None = None
-    workspace: str | None = None
-    role: Role = Role.MEMBER
-    allowed_emails: tuple[str, ...] = ()
-    allowed_domains: tuple[str, ...] = ()
-    allow_any_user: bool = False
+    redirect_uri: str | None = Field(
+        default=None,
+        description="The callback registered with the provider, "
+        "``https://<host>/auth/callback/<type>``. Required to serve: deriving it from the "
+        "request would let a ``Host`` header choose where the provider sends the code.",
+    )
+    workspace: str | None = Field(
+        default=None,
+        description="The workspace this provider admits people to. Unset means whichever "
+        "workspace the process serves; set, the provider is offered only by a process serving "
+        "that workspace.",
+    )
+    role: Role = Field(
+        default=Role.MEMBER, description="The role a person holds the first time they sign in."
+    )
+    allowed_emails: tuple[str, ...] = Field(
+        default=(), description="Verified addresses admitted by exact, case-insensitive match."
+    )
+    allowed_domains: tuple[str, ...] = Field(
+        default=(),
+        description="Domains whose verified addresses are admitted, e.g. ``example.org``. "
+        "Exact match on the part after the ``@`` — a subdomain is a different domain.",
+    )
+    allow_any_user: bool = Field(
+        default=False,
+        description="Admit every account the provider will authenticate. For GitHub that is "
+        "anybody on the internet with an account, which is why it is its own switch rather "
+        "than what an empty allowlist means.",
+    )
+
+    @field_validator("allowed_emails", "allowed_domains")
+    @classmethod
+    def _entries_are_normalized(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Lower-cased and stripped, and a blank entry refused.
+
+        Compared case-insensitively at sign-in, so the stored form is the compared form: an
+        allowlist that held ``Alice@Example.org`` and matched ``alice@example.org`` only
+        because a comparison remembered to fold case is one refactor from not matching it.
+
+        Raises:
+            ValueError: An entry is empty, or a domain entry carries an ``@``.
+        """
+        normalized: list[str] = []
+        for entry in value:
+            text = entry.strip().lower()
+            if not text:
+                msg = "an OAuth provider allowlist contains an empty entry"
+                raise ValueError(msg)
+            normalized.append(text)
+        return tuple(normalized)
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def _domains_are_domains(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """A domain entry is a domain, not an address and not a pattern.
+
+        Raises:
+            ValueError: An entry carries ``@`` or ``*``.
+        """
+        for entry in value:
+            if "@" in entry or "*" in entry:
+                msg = (
+                    f"allowed_domains entry {entry!r} is not a domain. Write the part after "
+                    f"the '@' exactly (example.org); an address belongs in allowed_emails, and "
+                    f"there is no wildcard."
+                )
+                raise ValueError(msg)
+        return value
+
+    @property
+    def admits_anybody(self) -> bool:
+        """Whether any sign-in could ever be admitted through this provider."""
+        return self.allow_any_user or bool(self.allowed_emails) or bool(self.allowed_domains)
 
 
 class AuthSettings(Section):
@@ -354,7 +437,81 @@ class AuthSettings(Section):
         description="``none`` is only permitted while every interface is bound to loopback.",
     )
     providers: tuple[OAuthProvider, ...] = ()
-    session_max_age_s: int = Field(default=60 * 60 * 24 * 7, ge=60)
+    session_secret: SecretStr | None = Field(
+        default=None,
+        description="Key signing the browser's session and sign-in cookies, at least 32 "
+        "characters. Required when ``mode = 'oauth'``. Changing it signs every browser out, "
+        "which is also how to do that deliberately.",
+    )
+    session_max_age_s: int = Field(
+        default=60 * 60 * 24 * 7,
+        ge=60,
+        description="How long a browser session lasts from sign-in. Not extended by use: a "
+        "session that renews itself on every request never ends for anybody who keeps a tab "
+        "open.",
+    )
+
+
+class RateLimitSettings(Section):
+    """The in-process token bucket in front of every network surface.
+
+    One bucket per caller — the API key, the signed-in person, or, for a caller presenting
+    neither, the client address as :class:`~manicule.api.proxy.ProxyPolicy` resolves it. A
+    separate, much smaller bucket per address meters **failed** authentication: a header
+    credential that did not work is charged to it, and once it is spent such requests are
+    refused with 429. A credential that works is never refused by it, whoever shares the address.
+    """
+
+    enabled: bool = True
+    per_minute: int = Field(
+        default=600, ge=1, description="Sustained requests per minute for one caller."
+    )
+    burst: int = Field(default=120, ge=1, description="Requests one caller may make at once.")
+    failed_auth_per_minute: int = Field(
+        default=10,
+        ge=1,
+        description="Failed authentications per minute one address may make. Past it, "
+        "requests from that address presenting a credential that does not work are refused "
+        "with 429 until the bucket refills; a working credential from the same address never "
+        "is.",
+    )
+    max_tracked: int = Field(
+        default=10_000,
+        ge=100,
+        description="Callers remembered at once. The least recently seen is forgotten first, "
+        "so memory is bounded however many addresses arrive.",
+    )
+
+
+class AlertSettings(Section):
+    """Security alerts: patterns in how the installation is being used, not single events.
+
+    An alert is recorded in the workspace's alert list, logged at warning, and audited when
+    auditing is on. Each fires at most once per subject per window, so a sustained attack
+    produces one alert per window rather than one per request.
+    """
+
+    enabled: bool = True
+    window_s: int = Field(
+        default=300, ge=10, description="The sliding window every threshold is counted over."
+    )
+    failed_auth_threshold: int = Field(
+        default=20,
+        ge=1,
+        description="Failed authentications from one address within the window: brute force.",
+    )
+    key_address_threshold: int = Field(
+        default=5,
+        ge=2,
+        description="Distinct client addresses presenting one API key within the window: a key "
+        "that has leaked, or is being shared.",
+    )
+    export_document_threshold: int = Field(
+        default=500,
+        ge=1,
+        description="Documents whose content one caller reads within the window: an export "
+        "happening through an interface that was not meant for one.",
+    )
 
 
 class TransportSettings(Section):
@@ -366,7 +523,13 @@ class TransportSettings(Section):
         "is an open document index, so binding wider requires authentication to be on.",
     )
     port: int = Field(default=8765, ge=1, le=65535)
-    enforce_https: bool = True
+    enforce_https: bool = Field(
+        default=True,
+        description="Browser credentials require HTTPS: the session and sign-in cookies carry "
+        "``Secure``, and an OAuth ``redirect_uri`` must be ``https://`` unless it names a "
+        "loopback host. Off only for a plain-HTTP network an operator owns, where a cookie "
+        "marked ``Secure`` would never be sent back.",
+    )
     trusted_proxies: tuple[str, ...] = Field(
         default=(),
         description="CIDR ranges whose forwarded-for headers are believed. Empty means none "
@@ -512,6 +675,8 @@ class SecuritySettings(Section):
     audit: AuditSettings = Field(default_factory=AuditSettings)
     storage: AtRestSettings = Field(default_factory=AtRestSettings)
     sharing: SharingSettings = Field(default_factory=SharingSettings)
+    rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
+    alerts: AlertSettings = Field(default_factory=AlertSettings)
 
 
 class WebhookSettings(Section):
@@ -1338,6 +1503,13 @@ class RagSettings(Section):
         "candidate per stage; on, it holds a live pipeline to the property that makes the "
         "vector store's ``workspace_ids`` exemption safe.",
     )
+    cross_workspace_limit: int = Field(
+        default=8,
+        ge=2,
+        le=64,
+        description="The most workspaces one administrator's search may span. Each is its own "
+        "scoped query, so this bounds the work one request can ask for.",
+    )
 
 
 class ConnectorSettings(Section):
@@ -1734,8 +1906,11 @@ class Settings(BaseSettings):
         """The configuration with every secret replaced by a placeholder.
 
         This is what ``config show`` and the configuration API return. Returning the live
-        object instead would hand out every API key, OAuth client secret and webhook signing
-        key to anyone allowed to read configuration.
+        object instead would hand out every API key, OAuth client secret, session signing key
+        and webhook signing key to anyone allowed to read configuration.
+
+        Masking *credentials*, and unrelated to :class:`RedactionSettings`, which removes
+        personal data from text sent to a model. Same word, two features.
         """
         dumped: Any = self.model_dump(mode="json")
         return _mask(dumped, type(self))
@@ -1762,6 +1937,12 @@ class Settings(BaseSettings):
         :func:`~manicule.api.app._require_auth_for_wide_bind` before an application does. Both
         refuse, both take ``--no-authentication`` to waive, and ``doctor``'s ``transport`` check
         reports the same condition as a finding for anybody who wants to know without serving.
+
+        ``security.auth.mode = 'oauth'`` with no provider left for the same reason: it stops a
+        browser from signing in, not ``manicule index`` from running.
+        :func:`~manicule.app.people.serving_problems` holds it with the rest of what a sign-in
+        needs, ``build_app`` refuses to serve with any of it, and ``doctor``'s ``sign_in`` check
+        reports it.
         """
         problems: list[str] = []
 
@@ -1807,9 +1988,6 @@ class Settings(BaseSettings):
         problems.extend(self._source_restriction_problems())
         problems.extend(self._vector_store_problems())
         problems.extend(self._dispatch_problems())
-
-        if self.security.auth.mode is AuthMode.OAUTH and not self.security.auth.providers:
-            problems.append("security.auth.mode is 'oauth' but no OAuth providers are configured")
 
         if self.security.audit.destination is AuditDestination.WEBHOOK and not self.events.webhooks:
             problems.append("security.audit.destination is 'webhook' but events.webhooks is empty")

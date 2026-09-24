@@ -149,6 +149,32 @@ class KeyBody(Body):
     name: str = Field(min_length=1, max_length=200)
     role: str = Field(default="member", description="``admin``, ``member`` or ``viewer``.")
     expires_days: int | None = Field(default=None, ge=1, le=3650)
+    allowed_ips: tuple[str, ...] = Field(
+        default=(),
+        max_length=100,
+        description="CIDR ranges the key may be presented from. Empty means anywhere.",
+    )
+    rate_limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="Requests per minute for this key, replacing the installation's default.",
+    )
+
+
+class UserPatch(Body):
+    """A change to one member: a role, a standing, or both.
+
+    Both optional, and a body with neither is the service's to refuse rather than this model's:
+    "nothing to change" is a rule about the operation, and a rule written here would be one the
+    command line does not have.
+    """
+
+    role: str | None = Field(default=None, description="``admin``, ``member`` or ``viewer``.")
+    disabled: bool | None = Field(
+        default=None,
+        description="``true`` disables the membership — ending the person's sessions and "
+        "revoking their keys — and ``false`` enables it again.",
+    )
 
 
 class SyncBody(Body):
@@ -170,4 +196,5 @@ __all__ = [
     "ShareBody",
     "SyncBody",
     "TagBody",
+    "UserPatch",
 ]

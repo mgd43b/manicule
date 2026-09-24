@@ -260,6 +260,14 @@ WRITERS: frozenset[str] = frozenset(
     {
         "auth_create_key",
         "auth_revoke_key",
+        # Memberships and sessions are rows in the data directory's database, and a disable
+        # revokes keys in the same transaction as it writes the membership — so each of these
+        # takes the directory exactly as minting a key does.
+        "auth_disable_user",
+        "auth_enable_user",
+        "auth_set_role",
+        "auth_sign_out",
+        "auth_ack_alert",
         "collection_add",
         "collection_create",
         "collection_delete",

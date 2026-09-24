@@ -31,17 +31,19 @@ from typing import TYPE_CHECKING, Any, Final, Self, cast, override
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from manicule.app.results import ApiKeySummary, Check, CheckState
+from manicule.app.results import ApiKeySummary, Check, CheckState, UserSummary
 from manicule.config.loader import load_settings
 from manicule.container import keys
 from manicule.container.container import Container, build_container
 from manicule.core.content import RawDocument
 from manicule.core.errors import (
     ConfigError,
+    FingerprintMismatchError,
     ManiculeError,
     PolicyError,
     UnknownEntityError,
     VectorMigrationError,
+    VectorStoreStateError,
 )
 from manicule.core.lifecycle import HealthReport, HealthState
 from manicule.ingest.capacity import CapacityRefusedError
@@ -51,8 +53,10 @@ from manicule.plugins.manifest import ComponentKind
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Sequence
 
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.engine import CursorResult
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+    from manicule.app.people import Profile
     from manicule.app.ports import (
         Answering,
         Conversing,
@@ -60,20 +64,29 @@ if TYPE_CHECKING:
         Ingesting,
         Keys,
         Maintenance,
+        MemberChange,
+        OpenedWorkspace,
         Organizing,
         ResetOutcome,
         RetainedBytes,
         Retrieving,
+        SecurityAlerts,
         Telemetry,
+        Users,
     )
     from manicule.config.settings import Settings
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.ann import AnnIndexBuild, AnnIndexState
-    from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
+    from manicule.core.embedding import (
+        EmbedFingerprint,
+        VectorChecksumBackfill,
+        VectorChecksumCoverage,
+    )
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.protocols import (
         AdoptingVectorStore,
         Connector,
+        DocStore,
         Embedder,
         Generator,
         InspectableVectorStore,
@@ -83,6 +96,7 @@ if TYPE_CHECKING:
         VectorStore,
     )
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
+    from manicule.generation.verification import Stragglers
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
@@ -104,7 +118,7 @@ if TYPE_CHECKING:
     )
     from manicule.storage.source_lifecycle import ResetPreparation
     from manicule.storage.vector_migration import VectorMigration
-    from manicule.storage.vectors import LanceVectorStore
+    from manicule.storage.vectors import LanceVectorStore, PublishedLanceVectorStore
 
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
@@ -238,6 +252,10 @@ class Runtime:
         self._derived_mutation_lock = asyncio.Lock()
         self._health: _Observation | None = None
         self._health_lock = asyncio.Lock()
+        self._workspaces = _Workspaces(self)
+        self._stragglers: Stragglers | None = None
+        """Citation checks an answer stopped waiting for. Made with the first answer path and kept
+        across rebuilds of it, so a check outlives the verifier that started it."""
 
     # --- lifecycle --------------------------------------------------------------------------
 
@@ -317,30 +335,29 @@ class Runtime:
         write — a cache flush, a final status — and an engine disposed first turns that into a
         connection error during shutdown, which is reported as a teardown failure and is not
         one.
+
+        Before either, the citation checks an answer's close stopped waiting for are waited
+        out (:class:`~manicule.generation.verification.Stragglers`). They read through the
+        engine and a parser from the container, and a check still running when those close
+        would be reading from something already gone.
         """
         try:
+            if self._stragglers is not None:
+                await self._stragglers.wait()
             close_error: Exception | None = None
             try:
-                await self._container.aclose()
-            except Exception as error:  # noqa: BLE001 - teardown must still close vector handles
+                # First, while the engine they read their publication pointers through is open.
+                await self._workspaces.aclose()
+            except Exception as error:  # noqa: BLE001 - teardown must still close the rest
                 close_error = error
             try:
-                vectors = self._slots.get("vectors")
-                if vectors is not None and vectors.value is not None:
-                    from manicule.core.protocols import (  # noqa: PLC0415
-                        PublicationBoundVectorStore,
-                    )
-
-                    if isinstance(vectors.value, PublicationBoundVectorStore):
-                        await vectors.value.teardown()
-            except Exception as vector_error:
+                await self._close_components()
+            except Exception as error:
                 if close_error is None:
                     raise
-                close_error.add_note(
-                    f"closing the published vector handle also failed: {vector_error}"
-                )
+                close_error.add_note(f"closing this workspace's components also failed: {error}")
             if close_error is not None:
-                raise close_error  # noqa: TRY301 - preserve the container's original exception
+                raise close_error  # noqa: TRY301 - preserve the first exception
         except Exception as during_teardown:
             if pending is None:
                 raise
@@ -358,6 +375,27 @@ class Runtime:
                 if self._lock is not None:
                     self._lock.release()
                     self._lock = None
+
+    async def _close_components(self) -> None:
+        """Close the container, then the published vector handle it does not own."""
+        close_error: Exception | None = None
+        try:
+            await self._container.aclose()
+        except Exception as error:  # noqa: BLE001 - teardown must still close vector handles
+            close_error = error
+        try:
+            vectors = self._slots.get("vectors")
+            if vectors is not None and vectors.value is not None:
+                from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
+
+                if isinstance(vectors.value, PublicationBoundVectorStore):
+                    await vectors.value.teardown()
+        except Exception as vector_error:
+            if close_error is None:
+                raise
+            close_error.add_note(f"closing the published vector handle also failed: {vector_error}")
+        if close_error is not None:
+            raise close_error
 
     # --- what the service is given ----------------------------------------------------------
 
@@ -546,6 +584,22 @@ class Runtime:
         """API keys for this workspace."""
         return await self._once("keys", self._build_keys)
 
+    async def open_workspaces(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
+        """Read handles on each named workspace of this data directory, for a spanning search.
+
+        Satisfies :class:`~manicule.app.ports.SpansWorkspaces`; the registry behind it is
+        :class:`_Workspaces`, whose docstring says what is shared and what is opened.
+        """
+        return await self._workspaces.open(names)
+
+    async def users(self) -> Users:
+        """People, their memberships of this workspace, and their browser sessions."""
+        return await self._once("users", self._build_users)
+
+    async def security_alerts(self) -> SecurityAlerts:
+        """Recorded security alerts for this workspace."""
+        return await self._once("security_alerts", self._build_security_alerts)
+
     async def component_checks(self) -> Sequence[Check]:
         """Health of what is already constructed. Constructs nothing.
 
@@ -668,6 +722,7 @@ class Runtime:
                 self._migrated = True
             if ensure is not None:
                 await ensure()
+                await self._record_mode(engine)
             # This is a storage-data migration rather than an Alembic schema rewrite: it must
             # validate content-addressed files before it can make them manifest GC roots.  A
             # writer holds the instance lock here, and no connector is constructed or called.
@@ -699,6 +754,33 @@ class Runtime:
             # nobody else is inserting, which no concurrent writer can be harmed by.
             await ensure()
 
+    async def _record_mode(self, engine: AsyncEngine) -> None:
+        """Write ``Settings.mode`` onto this workspace's row, when it says something else.
+
+        **Here, on a writer's open, and not in** ``ensure_workspace``. That helper names only the
+        columns the workspace table was created with, because the migration suites call it at
+        older revisions; this runs after :func:`~manicule.storage.migrator.upgrade` has brought
+        the schema to head, which is the only point at which the column is certainly there.
+
+        A writer rather than every process, because a reader is not what the column records:
+        ``workspace list`` wants the mode a workspace was last *used* under, and a ``search``
+        run with a different configuration file has not used it for anything.
+
+        Guarded by the value, so an unchanged mode costs one statement that matches nothing and
+        writes no row.
+        """
+        from sqlalchemy import update  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        mode = self._settings.mode.value
+        async with engine.begin() as connection:
+            await connection.execute(
+                update(models.Workspace)
+                .where(models.Workspace.id == self.workspace, models.Workspace.mode != mode)
+                .values(mode=mode)
+            )
+
     async def _storage_needs_initializing(self, engine: AsyncEngine) -> bool:
         """Whether the schema is behind head. A read, and the only thing that decides the lock.
 
@@ -726,45 +808,60 @@ class Runtime:
         under it. Neither question imports LanceDB to ask it: ``manicule.storage.config`` is a
         pydantic module, and the protocol lives in core.
         """
+        await self.documents()
+        store = await self._container.aget(keys.VECTOR_STORE)
+        if self.publishes_lance(store):
+            return await self.published_vectors(self.workspace)
+        return store
+
+    def publishes_lance(self, store: object) -> bool:
+        """Whether vectors are the embedded backend's, and so opened as a published directory."""
         from manicule.core.protocols import PublicationAwareVectorStore  # noqa: PLC0415
         from manicule.storage.config import VECTOR_STORE_NAME  # noqa: PLC0415
 
-        await self.documents()
-        store = await self._container.aget(keys.VECTOR_STORE)
-        if self._settings.storage.vector_db == VECTOR_STORE_NAME and isinstance(
+        return self._settings.storage.vector_db == VECTOR_STORE_NAME and isinstance(
             store, PublicationAwareVectorStore
-        ):
-            from sqlalchemy import select  # noqa: PLC0415
+        )
 
-            from manicule.storage import models  # noqa: PLC0415
-            from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
+    async def published_vectors(self, workspace: str) -> PublishedLanceVectorStore:
+        """The handle that follows ``workspace``'s publication pointer in the embedded backend.
 
-            async with self.require_engine().connect() as connection:
-                row = (
-                    await connection.execute(
-                        select(
-                            models.IndexState.vector_namespace,
-                            models.Workspace.derived_reset_epoch,
-                        )
-                        .select_from(models.Workspace)
-                        .outerjoin(
-                            models.IndexState,
-                            models.IndexState.workspace_id == models.Workspace.id,
-                        )
-                        .where(models.Workspace.id == self.workspace)
+        Parametrized by workspace because two callers need it: this workspace's vectors, and —
+        for a search spanning several — another workspace's on the same data directory, which
+        lives in its own directory under the same root and is bound to its own index identity
+        and reset epoch in exactly the same way.
+        """
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import VECTORS_DIRNAME  # noqa: PLC0415
+        from manicule.storage.vector_paths import workspace_vector_directory  # noqa: PLC0415
+        from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
+
+        async with self.require_engine().connect() as connection:
+            row = (
+                await connection.execute(
+                    select(
+                        models.IndexState.vector_namespace,
+                        models.Workspace.derived_reset_epoch,
                     )
-                ).one()
-            identity_namespace = row.vector_namespace
-            return PublishedLanceVectorStore(
-                await self.vector_directory(),
-                self.require_engine(),
-                workspace_id=self.workspace,
-                identity_namespace=(
-                    None if identity_namespace is None else str(identity_namespace)
-                ),
-                expected_reset_epoch=int(row.derived_reset_epoch),
-            )
-        return store
+                    .select_from(models.Workspace)
+                    .outerjoin(
+                        models.IndexState,
+                        models.IndexState.workspace_id == models.Workspace.id,
+                    )
+                    .where(models.Workspace.id == workspace)
+                )
+            ).one()
+        identity_namespace = row.vector_namespace
+        root = self._settings.data_dir / VECTORS_DIRNAME
+        return PublishedLanceVectorStore(
+            root if identity_namespace == "legacy" else workspace_vector_directory(root, workspace),
+            self.require_engine(),
+            workspace_id=workspace,
+            identity_namespace=None if identity_namespace is None else str(identity_namespace),
+            expected_reset_epoch=int(row.derived_reset_epoch),
+        )
 
     async def _build_prepared_vectors(self) -> VectorStore:
         store = await self.vectors()
@@ -790,6 +887,7 @@ class Runtime:
             ChainRouter,
             CitationVerifier,
             RetainedBytesResolver,
+            Stragglers,
         )
         from manicule.storage.conversations import SqliteConversationStore  # noqa: PLC0415
 
@@ -803,9 +901,15 @@ class Runtime:
         # The same handle the surfaces use, not a second one. Two stores over one engine is
         # two places a share link can be minted from and two opinions about what is deleted.
         conversations = cast("SqliteConversationStore", await self.conversations())
+        if self._stragglers is None:
+            self._stragglers = Stragglers()
         return Answerer(
             generator=generator,
-            verifier=CitationVerifier(resolver, timeout_s=settings.llm.citation_verify_timeout_s),
+            verifier=CitationVerifier(
+                resolver,
+                timeout_s=settings.llm.citation_verify_timeout_s,
+                stragglers=self._stragglers,
+            ),
             documents=store,
             settings=settings,
             policy=EgressPolicy.of(settings, settings.workspace),
@@ -853,6 +957,16 @@ class Runtime:
     async def _build_keys(self) -> Keys:
         await self.documents()
         return _Keys(self)
+
+    async def _build_users(self) -> Users:
+        # After the document store, which is what migrates the schema and creates this
+        # workspace's row — a membership is a foreign key to it.
+        await self.documents()
+        return _Users(self)
+
+    async def _build_security_alerts(self) -> SecurityAlerts:
+        await self.documents()
+        return _SecurityAlerts(self)
 
     async def blobs(self) -> BlobSink:
         """The blob capability used by runs whose resolved policy retains source bytes.
@@ -2077,6 +2191,49 @@ class _Ingestion:
         return report
 
 
+_ROLE_RANK: dict[str, int] = {"viewer": 0, "member": 1, "admin": 2}
+"""Least authority first, over the plain strings the schema stores.
+
+A second copy of :data:`manicule.app.caller.RANK` rather than an import of it: that table is
+keyed by the :class:`~manicule.config.settings.Role` enum, and this module compares role columns
+straight out of the database, where a `CHECK` constraint has already proven they are one of
+these three strings — converting to the enum and back would buy nothing but an import cycle risk
+between the composition root and the caller module it constructs callers for.
+"""
+
+
+def _capped_role(key_role: str, member_role: str) -> str:
+    """The lesser of a key's own role and its owner's current membership role."""
+    return key_role if _ROLE_RANK[key_role] <= _ROLE_RANK[member_role] else member_role
+
+
+def _address_permitted(address: str, allowed_ips: object) -> bool:
+    """Whether ``address`` falls inside one of ``allowed_ips``. Empty ``allowed_ips`` means any.
+
+    Not expressible in the SQL statement — SQLite has no CIDR containment operator — so it is
+    checked here, in Python, after the statement has already ruled out every key this address
+    could not possibly matter for. An address that fails to parse, or an empty one, matches
+    nothing: the safe direction for a predicate whose failure mode is admitting a caller.
+    """
+    from ipaddress import ip_address, ip_network  # noqa: PLC0415
+
+    if not isinstance(allowed_ips, list) or not allowed_ips:
+        return True
+    if not address:
+        return False
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        return False
+    for entry in cast("list[object]", allowed_ips):
+        try:
+            if parsed in ip_network(str(entry), strict=False):
+                return True
+        except ValueError:  # pragma: no cover - the service validates entries before storing
+            continue
+    return False
+
+
 class _Keys:
     """API keys, over one runtime's engine and workspace.
 
@@ -2089,7 +2246,14 @@ class _Keys:
         self._runtime = runtime
 
     async def issue(
-        self, name: str, *, role: str, expires_days: int | None = None
+        self,
+        name: str,
+        *,
+        role: str,
+        expires_days: int | None = None,
+        user_id: str | None = None,
+        allowed_ips: Sequence[str] = (),
+        rate_limit: int | None = None,
     ) -> tuple[ApiKeySummary, str]:
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
@@ -2105,10 +2269,10 @@ class _Keys:
             key_hash=digest,
             key_prefix=secret[: len(KEY_PREFIX) + 6],
             workspace_id=self._runtime.workspace,
-            user_id=self._runtime.workspace,
+            user_id=user_id,
             role=role,
-            scopes=[],
-            allowed_ips=[],
+            allowed_ips=list(allowed_ips),
+            rate_limit=rate_limit,
             expires_at=expires,
             created_at=created,
         )
@@ -2117,20 +2281,21 @@ class _Keys:
             session.add(row)
         return _key_summary(row), secret
 
-    async def list_keys(self) -> Sequence[ApiKeySummary]:
+    async def list_keys(self, *, owner: str | None = None) -> Sequence[ApiKeySummary]:
         from sqlalchemy import select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
 
+        clauses = [models.ApiKey.workspace_id == self._runtime.workspace]
+        if owner is not None:
+            clauses.append(models.ApiKey.user_id == owner)
         sessions = session_factory(self._runtime.require_engine())
         async with sessions() as session:
             rows = (
                 (
                     await session.execute(
-                        select(models.ApiKey)
-                        .where(models.ApiKey.workspace_id == self._runtime.workspace)
-                        .order_by(models.ApiKey.created_at)
+                        select(models.ApiKey).where(*clauses).order_by(models.ApiKey.created_at)
                     )
                 )
                 .scalars()
@@ -2138,20 +2303,34 @@ class _Keys:
             )
         return [_key_summary(row) for row in rows]
 
-    async def verify(self, secret: str) -> ApiKeySummary | None:
+    async def verify(self, secret: str, *, address: str = "") -> ApiKeySummary | None:
         """Resolve a presented secret to its key, or ``None``.
 
-        Four predicates, all in the statement: the digest matches, the key belongs to **this**
-        workspace, it has not been revoked, and it has not expired. The digest is what is
-        compared — the plaintext is never stored — so there is no string comparison here to
-        time a byte at a time, and no branch that treats an unknown key differently from a
-        revoked one.
+        Every predicate that SQL can express is in the one statement: the digest matches, the
+        key belongs to **this** workspace, it has not been revoked, it has not expired, and —
+        for a key a person owns — that person's membership here exists and is not disabled. The
+        last of those is a ``LEFT JOIN`` against :class:`~manicule.storage.models.WorkspaceMember`
+        rather than a second query, so an owner who was removed or disabled fails resolution in
+        the same round trip as an expired key rather than in a branch after it.
+
+        An unowned key (``user_id IS NULL``) has no membership to check, and the ``OR`` in the
+        ``WHERE`` clause is what lets the join's absence for that row satisfy the predicate
+        trivially — it is not a special case, it is the join finding nothing to disqualify.
+
+        ``allowed_ips`` cannot be expressed in SQL — see :func:`_address_permitted` — so it is
+        the one predicate checked in Python, after the statement has already narrowed to at
+        most one row.
+
+        The digest is what is compared — the plaintext is never stored — so there is no string
+        comparison here to time a byte at a time, and no branch that treats an unknown key
+        differently from a revoked one, an expired one, or one presented from the wrong place:
+        all of them return ``None``.
 
         ``last_used_at`` is deliberately **not** updated. It would turn every authenticated
         read into a write, serializing the whole API behind SQLite's single writer, and
         "when was this key last used" is a question the audit trail answers without that cost.
         """
-        from sqlalchemy import or_, select  # noqa: PLC0415
+        from sqlalchemy import and_, or_, select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
@@ -2164,53 +2343,773 @@ class _Keys:
         sessions = session_factory(self._runtime.require_engine())
         async with sessions() as session:
             row = (
-                (
-                    await session.execute(
-                        select(models.ApiKey).where(
-                            models.ApiKey.key_hash == digest,
-                            models.ApiKey.workspace_id == self._runtime.workspace,
-                            models.ApiKey.revoked_at.is_(None),
-                            or_(
-                                models.ApiKey.expires_at.is_(None),
-                                models.ApiKey.expires_at > now,
-                            ),
-                        )
+                await session.execute(
+                    select(
+                        models.ApiKey,
+                        models.WorkspaceMember.role,
+                        models.User.email,
+                        models.User.name,
+                    )
+                    .outerjoin(
+                        models.WorkspaceMember,
+                        and_(
+                            models.WorkspaceMember.workspace_id == models.ApiKey.workspace_id,
+                            models.WorkspaceMember.user_id == models.ApiKey.user_id,
+                            models.WorkspaceMember.disabled_at.is_(None),
+                        ),
+                    )
+                    .outerjoin(models.User, models.User.id == models.ApiKey.user_id)
+                    .where(
+                        models.ApiKey.key_hash == digest,
+                        models.ApiKey.workspace_id == self._runtime.workspace,
+                        models.ApiKey.revoked_at.is_(None),
+                        or_(
+                            models.ApiKey.expires_at.is_(None),
+                            models.ApiKey.expires_at > now,
+                        ),
+                        or_(
+                            models.ApiKey.user_id.is_(None),
+                            models.WorkspaceMember.role.is_not(None),
+                        ),
                     )
                 )
-                .scalars()
-                .first()
-            )
-        return None if row is None else _key_summary(row)
+            ).first()
+        if row is None:
+            return None
+        key_row, member_role, user_email, user_name = row
+        if not _address_permitted(address, key_row.allowed_ips):
+            return None
+        effective_role = (
+            key_row.role if member_role is None else _capped_role(key_row.role, member_role)
+        )
+        return _key_summary(
+            key_row, role=effective_role, user_email=user_email, user_name=user_name
+        )
 
-    async def revoke(self, name_or_id: str) -> ApiKeySummary:
+    async def revoke(
+        self, name_or_id: str, *, restrict_to_owner: str | None = None
+    ) -> ApiKeySummary:
         from sqlalchemy import or_, select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
         from manicule.storage.types import utcnow  # noqa: PLC0415
 
+        clauses = [
+            # Scoped to this workspace, and not as a courtesy: a revoke that could reach
+            # another tenant's key is a denial-of-service across the boundary the whole design
+            # exists to hold.
+            models.ApiKey.workspace_id == self._runtime.workspace,
+            or_(models.ApiKey.id == name_or_id, models.ApiKey.name == name_or_id),
+        ]
+        if restrict_to_owner is not None:
+            clauses.append(models.ApiKey.user_id == restrict_to_owner)
         sessions = session_factory(self._runtime.require_engine())
         async with sessions.begin() as session:
-            row = (
-                (
-                    await session.execute(
-                        select(models.ApiKey).where(
-                            # Scoped to this workspace, and not as a courtesy: a revoke that
-                            # could reach another tenant's key is a denial-of-service across
-                            # the boundary the whole design exists to hold.
-                            models.ApiKey.workspace_id == self._runtime.workspace,
-                            or_(models.ApiKey.id == name_or_id, models.ApiKey.name == name_or_id),
-                        )
-                    )
-                )
-                .scalars()
-                .first()
-            )
+            row = (await session.execute(select(models.ApiKey).where(*clauses))).scalars().first()
             if row is None:
                 msg = f"no API key named {name_or_id!r} in workspace {self._runtime.workspace!r}"
                 raise UnknownEntityError(msg)
             row.revoked_at = utcnow()
             return _key_summary(row)
+
+
+@dataclass(slots=True)
+class _OpenedVectors:
+    """One other workspace's vector handle, and the index state it was opened against."""
+
+    state: tuple[str, str | None, int]
+    """``(embedding fingerprint, vector namespace, reset epoch)`` when this handle was opened.
+
+    Compared on every search rather than trusted: another process may reset that workspace or
+    re-embed it under another model, and a handle bound to the old identity would either refuse
+    with a message about rebuilding the runtime or — worse — search a space nobody checked.
+    """
+
+    vectors: VectorStore
+
+
+class _Workspaces:
+    """The workspace registry: read handles on the other workspaces of this data directory.
+
+    What an administrator's cross-workspace search needs (``docs/retrieval.md`` §3.2), and the
+    storage half of it only — the fan-out and the merge are retrieval's. Three things are true of
+    every handle it hands out, and each is why it is built this way rather than as a second
+    :class:`Runtime` per workspace.
+
+    **The engine is shared.** Every workspace's rows are in the one SQLite file, so each
+    workspace's document store is the ordinary scoped store over this runtime's engine — one
+    connection pool, one opinion about the schema, and a commit counter that already sees every
+    workspace's writes (``manicule.storage.scoped``).
+
+    **The embedder is shared, and that is what the fingerprint check licenses.** A cross-workspace
+    merge compares cosines, which are comparable only when one model produced every vector. So a
+    workspace is opened only if the embedding fingerprint its index recorded matches the one this
+    process searches with, and then the query is embedded once, by this process's model, for every
+    workspace. A second runtime per workspace would load a second copy of the same model to embed
+    the same query into the same space — gigabytes, for nothing — and would make it possible to
+    search a workspace in a space the others are not in.
+
+    **Nothing here writes.** A workspace that has recorded no index is refused rather than
+    prepared, and one whose vectors came from another model is refused rather than searched: a
+    cross-workspace search is a read of corpora the caller is not ingesting into. The serving
+    workspace is the one exception to "opened here" — it is this runtime's own documents and
+    prepared vectors, not a second handle on them.
+
+    Handles are cached for the life of the runtime and closed with it. The document store never
+    goes stale — it carries a workspace, not an index — and a vector handle is reopened whenever
+    the index state it was opened against has moved.
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+        self._stores: dict[str, SqliteDocStore] = {}
+        self._vectors: dict[str, _OpenedVectors] = {}
+        self._lock = asyncio.Lock()
+
+    async def open(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
+        """Open each named workspace, in order, or refuse the whole request.
+
+        All or nothing, and checked before anything is searched: a workspace that is unknown,
+        unindexed or in another model's space refuses the search that named it, because a
+        merged ranking with one workspace silently missing is a partial answer reported as a
+        whole one.
+        """
+        from manicule.app.ports import OpenedWorkspace as Opened  # noqa: PLC0415
+        from manicule.retrieval.spanning import WorkspaceLeg  # noqa: PLC0415
+
+        runtime = self._runtime
+        await runtime.documents()
+        async with self._lock:
+            # Names first, then the model, then every workspace's index, and only then a single
+            # handle: an unknown name is refused without loading an embedder to refuse it, and
+            # an unsearchable workspace is refused before any other workspace has been opened.
+            states = await self._states(names)
+            embedder = await runtime.embedder()
+            for name in names:
+                self._require_searchable(name, states[name], embedder.fingerprint)
+            opened: list[OpenedWorkspace] = []
+            for name in names:
+                state = states[name]
+                if name == runtime.workspace:
+                    documents: DocumentSurface = await runtime.documents()
+                    organization: Organizing = await runtime.organization()
+                    docstore = cast("DocStore", documents)
+                    vectors = await runtime.prepared_vectors()
+                else:
+                    store = self._store(name)
+                    documents, organization, docstore = store, store, store
+                    vectors = await self._vectors_for(name, state, embedder.fingerprint)
+                opened.append(
+                    Opened(
+                        name=name,
+                        documents=documents,
+                        organization=organization,
+                        leg=WorkspaceLeg(workspace=name, docstore=docstore, vectors=vectors),
+                    )
+                )
+            return opened
+
+    async def aclose(self) -> None:
+        """Release every vector handle this registry opened. The engine is the runtime's."""
+        opened = list(self._vectors.values())
+        self._vectors.clear()
+        failures: list[Exception] = []
+        for handle in opened:
+            teardown = getattr(handle.vectors, "teardown", None)
+            if teardown is None:
+                continue
+            try:
+                await teardown()
+            except Exception as error:  # noqa: BLE001 - collected, then reported together
+                failures.append(error)
+        if failures:
+            msg = "errors while closing other workspaces' vector handles"
+            raise ExceptionGroup(msg, failures)
+
+    async def _states(self, names: Sequence[str]) -> dict[str, tuple[str | None, str | None, int]]:
+        """Each named workspace's recorded embedding, vector namespace and reset epoch.
+
+        One statement for every workspace this data directory holds, so an unknown name can be
+        refused with the list of known ones in the same breath.
+
+        Raises:
+            UnknownEntityError: A name is not a workspace here.
+        """
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        async with self._runtime.require_engine().connect() as connection:
+            rows = (
+                await connection.execute(
+                    select(
+                        models.Workspace.id,
+                        models.IndexState.embed_fingerprint,
+                        models.IndexState.vector_namespace,
+                        models.Workspace.derived_reset_epoch,
+                    )
+                    .select_from(models.Workspace)
+                    .outerjoin(
+                        models.IndexState,
+                        models.IndexState.workspace_id == models.Workspace.id,
+                    )
+                )
+            ).all()
+        known = {
+            str(row.id): (
+                None if row.embed_fingerprint is None else str(row.embed_fingerprint),
+                None if row.vector_namespace is None else str(row.vector_namespace),
+                int(row.derived_reset_epoch),
+            )
+            for row in rows
+        }
+        unknown = [name for name in names if name not in known]
+        if unknown:
+            named = ", ".join(repr(name) for name in unknown)
+            msg = (
+                f"no workspace {named} on this data directory. Workspaces here: "
+                f"{', '.join(sorted(known)) or 'none'}. Nothing was searched: a search that "
+                f"quietly skipped a workspace it was asked for would report a partial answer as "
+                f"a whole one."
+            )
+            raise UnknownEntityError(msg)
+        return {name: known[name] for name in names}
+
+    @staticmethod
+    def _require_searchable(
+        name: str, state: tuple[str | None, str | None, int], searching: EmbedFingerprint
+    ) -> None:
+        """Refuse a workspace with no index, or one embedded by a different model.
+
+        Raises:
+            VectorStoreStateError: It has recorded no index.
+            FingerprintMismatchError: It records a different embedding model.
+        """
+        from manicule.core.embedding import EmbedFingerprint as Fingerprint  # noqa: PLC0415
+
+        recorded, _namespace, _epoch = state
+        if recorded is None:
+            msg = (
+                f"workspace {name!r} has no index yet — nothing in it has been embedded — so "
+                f"there is nothing of it to search. Index into it first (`manicule -w {name} "
+                f"index <path>`), or leave it out of the search."
+            )
+            raise VectorStoreStateError(msg)
+        built = Fingerprint.model_validate_json(recorded)
+        if not built.matches(searching):
+            msg = (
+                f"workspace {name!r} was embedded with {built.describe()}, and this process "
+                f"searches with {searching.describe()}. Cosines from two models are not one "
+                f"scale, so the two cannot be merged into one ranking; the search is refused "
+                f"rather than run without {name!r}. Re-embed one of them onto the other's model, "
+                f"or search them separately."
+            )
+            raise FingerprintMismatchError(msg)
+
+    def _store(self, name: str) -> SqliteDocStore:
+        """``name``'s scoped document store, over this runtime's engine. Built once."""
+        from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+        store = self._stores.get(name)
+        if store is None:
+            settings = self._runtime.settings
+            store = SqliteDocStore(
+                self._runtime.require_engine(),
+                workspace_id=name,
+                data_dir=settings.data_dir,
+                max_journal_records=settings.ingest.max_journal_records,
+                max_journal_metadata_bytes=settings.ingest.max_journal_metadata_bytes,
+                max_acquired_blob_backlog_bytes=settings.ingest.max_acquired_blob_backlog_bytes,
+                min_disk_headroom_bytes=settings.ingest.min_disk_headroom_bytes,
+            )
+            self._stores[name] = store
+        return store
+
+    async def _vectors_for(
+        self,
+        name: str,
+        state: tuple[str | None, str | None, int],
+        searching: EmbedFingerprint,
+    ) -> VectorStore:
+        """``name``'s vectors, opened for reading in ``searching``'s space.
+
+        The embedded backend opens the workspace's own directory, bound to its index identity
+        and reset epoch as this runtime's own handle is. Any other backend is asked to open it,
+        through :class:`~manicule.core.protocols.MultiWorkspaceVectorStore`, because only the
+        store knows how its workspaces are laid out — and a backend that cannot is refused by
+        name rather than guessed at.
+
+        Raises:
+            ConfigError: The configured vector store cannot open another workspace.
+            VectorStoreStateError: The workspace's vectors are not there to open.
+            FingerprintMismatchError: The vectors on disk are another model's.
+        """
+        from manicule.core.protocols import MultiWorkspaceVectorStore  # noqa: PLC0415
+
+        key = (searching.canonical(), state[1], state[2])
+        cached = self._vectors.get(name)
+        if cached is not None and cached.state == key:
+            return cached.vectors
+        if cached is not None:
+            del self._vectors[name]
+            teardown = getattr(cached.vectors, "teardown", None)
+            if teardown is not None:
+                await teardown()
+
+        configured = await self._runtime.container.aget(keys.VECTOR_STORE)
+        vectors: VectorStore
+        if self._runtime.publishes_lance(configured):
+            published = await self._runtime.published_vectors(name)
+            physical = await published.physical_fingerprint()
+            if physical is None:
+                await published.teardown()
+                msg = (
+                    f"workspace {name!r} records an index, and its vector directory holds none. "
+                    f"The record and the disk disagree; reset that workspace's index rather than "
+                    f"searching half of it."
+                )
+                raise VectorStoreStateError(msg)
+            try:
+                physical.require_match(searching)
+                await published.ensure_ready(searching)
+            except BaseException:
+                await published.teardown()
+                raise
+            vectors = published
+        elif isinstance(configured, MultiWorkspaceVectorStore):
+            vectors = await configured.open_workspace(name, searching)
+        else:
+            msg = (
+                f"the configured vector store ({type(configured).__name__}) cannot open another "
+                f"workspace's vectors, so a search spanning workspaces cannot run on it. Search "
+                f"each workspace on its own."
+            )
+            raise ConfigError(msg)
+        self._vectors[name] = _OpenedVectors(state=key, vectors=vectors)
+        return vectors
+
+
+class _Users:
+    """People, memberships and browser sessions, over one runtime's engine and workspace.
+
+    Persons are installation-wide rows and are read and written without a workspace predicate —
+    a person is the same person in every workspace. **Every membership and every session carries
+    this runtime's workspace in every statement**, and that is the whole of what makes a session
+    minted in one workspace useless in another.
+
+    A session token is generated here, hashed here and returned exactly once, the way
+    :class:`_Keys` treats a key: only the digest reaches the database, so a copy of it is not a
+    copy of anybody's session.
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    async def member_by_subject(self, provider: str, subject: str) -> UserSummary | None:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            row = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .join(models.WorkspaceMember, models.WorkspaceMember.user_id == models.User.id)
+                    .where(
+                        models.User.provider == provider,
+                        models.User.subject == subject,
+                        models.WorkspaceMember.workspace_id == self._runtime.workspace,
+                    )
+                )
+            ).first()
+        return None if row is None else _user_summary(row[0], row[1])
+
+    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+        """Create or refresh the person, and make them a member of this workspace if needed.
+
+        **Twice at most.** Two first sign-ins of one account at the same moment — two tabs, a
+        person who clicked twice — both find no row, and the second insert loses to the
+        unique constraint on ``(provider, subject)`` or on the membership's key. That is not a
+        failure of anything the person did, so the loser runs again and finds the row the
+        winner wrote. A second loss would be something else, and propagates.
+        """
+        from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
+
+        try:
+            return await self._admit_once(profile, role=role)
+        except IntegrityError:
+            return await self._admit_once(profile, role=role)
+
+    async def _admit_once(self, profile: Profile, *, role: str) -> UserSummary:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        now = utcnow()
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            user = (
+                await session.execute(
+                    select(models.User).where(
+                        models.User.provider == profile.provider,
+                        models.User.subject == profile.subject,
+                    )
+                )
+            ).scalar_one_or_none()
+            if user is None:
+                user = models.User(
+                    id=secrets.token_hex(8),
+                    provider=profile.provider,
+                    subject=profile.subject,
+                    created_at=now,
+                )
+                session.add(user)
+            # What the provider says *now*, every time. An address that is no longer verified
+            # is no longer the address this person is known by, so it is cleared rather than
+            # kept from a sign-in when it was.
+            user.email = profile.verified_email or None
+            user.name = profile.name.strip() or None
+            user.last_login_at = now
+            await session.flush()
+            membership = (
+                await session.execute(
+                    select(models.WorkspaceMember).where(
+                        models.WorkspaceMember.workspace_id == self._runtime.workspace,
+                        models.WorkspaceMember.user_id == user.id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if membership is None:
+                # The provider's role, on the first sign-in only. After this it is whatever an
+                # administrator has made it, and nothing on this path writes it again.
+                membership = models.WorkspaceMember(
+                    workspace_id=self._runtime.workspace,
+                    user_id=user.id,
+                    role=role,
+                    created_at=now,
+                )
+                session.add(membership)
+                await session.flush()
+            return _user_summary(user, membership)
+
+    async def begin_session(self, user_id: str, *, max_age_s: int) -> tuple[str, str, str]:
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        # 256 bits from the operating system's generator. The cookie that carries it is also
+        # signed, but the signature is what refuses a forgery cheaply; this is what makes a
+        # session impossible to guess even for somebody holding the signing key.
+        token = secrets.token_urlsafe(32)
+        created = utcnow()
+        expires = created + timedelta(seconds=max_age_s)
+        row = models.AuthSession(
+            id=secrets.token_hex(8),
+            token_hash=_digest(token),
+            user_id=user_id,
+            workspace_id=self._runtime.workspace,
+            created_at=created,
+            expires_at=expires,
+        )
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            session.add(row)
+        return row.id, expires.isoformat(), token
+
+    async def resolve_session(self, token: str) -> UserSummary | None:
+        """Resolve a presented session token to its member, or ``None``.
+
+        Six predicates, all in the one statement: the digest matches, the session is **this**
+        workspace's, it has not been revoked, it has not expired, the person is a member of
+        this workspace, and that membership is not disabled. There is no branch that treats an
+        unknown token differently from a revoked one or a disabled person's, for the reason
+        :meth:`_Keys.verify` gives, and the comparison is over a digest, so nothing here can be
+        timed a byte at a time.
+
+        The membership is joined rather than trusted from the session row, so a role changed by
+        an administrator is the role the very next request carries.
+        """
+        from sqlalchemy import and_, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        if not token:
+            return None
+        now = utcnow()
+        workspace = self._runtime.workspace
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            row = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .select_from(models.AuthSession)
+                    .join(models.User, models.User.id == models.AuthSession.user_id)
+                    .join(
+                        models.WorkspaceMember,
+                        and_(
+                            models.WorkspaceMember.user_id == models.AuthSession.user_id,
+                            models.WorkspaceMember.workspace_id == models.AuthSession.workspace_id,
+                        ),
+                    )
+                    .where(
+                        models.AuthSession.token_hash == _digest(token),
+                        models.AuthSession.workspace_id == workspace,
+                        models.AuthSession.revoked_at.is_(None),
+                        models.AuthSession.expires_at > now,
+                        models.WorkspaceMember.disabled_at.is_(None),
+                    )
+                )
+            ).first()
+        return None if row is None else _user_summary(row[0], row[1])
+
+    async def end_session(self, token: str) -> bool:
+        from sqlalchemy import update  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        if not token:
+            return False
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            result = cast(
+                "CursorResult[object]",
+                await session.execute(
+                    update(models.AuthSession)
+                    .where(
+                        models.AuthSession.token_hash == _digest(token),
+                        models.AuthSession.workspace_id == self._runtime.workspace,
+                        models.AuthSession.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=utcnow())
+                ),
+            )
+        return bool(result.rowcount)
+
+    async def end_sessions(self, user_id: str) -> int:
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            return await self._revoke_sessions(session, user_id, utcnow())
+
+    async def list_members(self) -> Sequence[UserSummary]:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .join(models.WorkspaceMember, models.WorkspaceMember.user_id == models.User.id)
+                    .where(models.WorkspaceMember.workspace_id == self._runtime.workspace)
+                    .order_by(models.WorkspaceMember.created_at, models.User.id)
+                )
+            ).all()
+            live = await self._live_sessions(session)
+        return [_user_summary(row[0], row[1], sessions=live.get(row[0].id, 0)) for row in rows]
+
+    async def find_members(self, user_or_email: str) -> Sequence[UserSummary]:
+        from sqlalchemy import func, or_, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        wanted = user_or_email.strip()
+        if not wanted:
+            return []
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .join(models.WorkspaceMember, models.WorkspaceMember.user_id == models.User.id)
+                    .where(
+                        # Among this workspace's members only. An address resolved across the
+                        # installation would let a lookup here confirm who is a member elsewhere.
+                        models.WorkspaceMember.workspace_id == self._runtime.workspace,
+                        or_(
+                            models.User.id == wanted,
+                            func.lower(models.User.email) == wanted.lower(),
+                        ),
+                    )
+                    .order_by(models.User.id)
+                )
+            ).all()
+            live = await self._live_sessions(session)
+        return [_user_summary(row[0], row[1], sessions=live.get(row[0].id, 0)) for row in rows]
+
+    async def count_admins(self) -> int:
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            return await self._enabled_admins(session)
+
+    async def standing_in(self, user_id: str, workspaces: Sequence[str]) -> frozenset[str]:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        if not workspaces:
+            return frozenset()
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            rows = (
+                await session.execute(
+                    select(models.WorkspaceMember.workspace_id).where(
+                        models.WorkspaceMember.user_id == user_id,
+                        models.WorkspaceMember.workspace_id.in_(list(workspaces)),
+                        models.WorkspaceMember.disabled_at.is_(None),
+                    )
+                )
+            ).scalars()
+            return frozenset(str(row) for row in rows)
+
+    async def update_member(
+        self, user_id: str, *, role: str | None = None, disabled: bool | None = None
+    ) -> MemberChange:
+        from sqlalchemy import select, update  # noqa: PLC0415
+
+        from manicule.app.people import LAST_ADMIN  # noqa: PLC0415
+        from manicule.app.ports import MemberChange  # noqa: PLC0415
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory, writer_admission  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        workspace = self._runtime.workspace
+        now = utcnow()
+        engine = self._runtime.require_engine()
+        sessions = session_factory(engine)
+        # In the engine's one writer queue, for the whole transaction. The last-administrator
+        # count below is read before the change is written, and SQLite takes no lock for a
+        # read: without the queue two demotions each count two administrators, both write, and
+        # the workspace is left with none.
+        async with writer_admission(engine), sessions.begin() as session:
+            row = (
+                await session.execute(
+                    select(models.User, models.WorkspaceMember)
+                    .join(models.WorkspaceMember, models.WorkspaceMember.user_id == models.User.id)
+                    .where(
+                        models.WorkspaceMember.workspace_id == workspace,
+                        models.WorkspaceMember.user_id == user_id,
+                    )
+                )
+            ).first()
+            if row is None:
+                msg = f"no member {user_id!r} in workspace {workspace!r}"
+                raise UnknownEntityError(msg)
+            user, membership = row[0], row[1]
+            previous_role = membership.role
+            previously_disabled = membership.disabled_at is not None
+            new_role = role if role is not None else previous_role
+            new_disabled = disabled if disabled is not None else previously_disabled
+            was_admin = previous_role == "admin" and not previously_disabled
+            stays_admin = new_role == "admin" and not new_disabled
+            # In this transaction, after reading the row it is about to change. The service
+            # asked the same question a moment ago; asking it again here is what stops two
+            # administrators demoting each other at once from both being told yes.
+            if was_admin and not stays_admin and await self._enabled_admins(session) <= 1:
+                raise PolicyError(LAST_ADMIN.format(who=user_id, workspace=workspace))
+            membership.role = new_role
+            sessions_revoked = keys_revoked = 0
+            if new_disabled and not previously_disabled:
+                membership.disabled_at = now
+                sessions_revoked = await self._revoke_sessions(session, user_id, now)
+                revoked_keys = cast(
+                    "CursorResult[object]",
+                    await session.execute(
+                        update(models.ApiKey)
+                        .where(
+                            models.ApiKey.workspace_id == workspace,
+                            models.ApiKey.user_id == user_id,
+                            models.ApiKey.revoked_at.is_(None),
+                        )
+                        .values(revoked_at=now)
+                    ),
+                )
+                keys_revoked = int(revoked_keys.rowcount or 0)
+            elif previously_disabled and not new_disabled:
+                membership.disabled_at = None
+            await session.flush()
+            live = await self._live_sessions(session)
+            summary = _user_summary(user, membership, sessions=live.get(user.id, 0))
+        return MemberChange(
+            member=summary,
+            previous_role=previous_role,
+            previously_disabled=previously_disabled,
+            sessions_revoked=sessions_revoked,
+            keys_revoked=keys_revoked,
+        )
+
+    async def _revoke_sessions(self, session: AsyncSession, user_id: str, now: datetime) -> int:
+        from sqlalchemy import update  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        result = cast(
+            "CursorResult[object]",
+            await session.execute(
+                update(models.AuthSession)
+                .where(
+                    models.AuthSession.workspace_id == self._runtime.workspace,
+                    models.AuthSession.user_id == user_id,
+                    models.AuthSession.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            ),
+        )
+        return int(result.rowcount or 0)
+
+    async def _enabled_admins(self, session: AsyncSession) -> int:
+        from sqlalchemy import func, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        return int(
+            (
+                await session.execute(
+                    select(func.count()).where(
+                        models.WorkspaceMember.workspace_id == self._runtime.workspace,
+                        models.WorkspaceMember.role == "admin",
+                        models.WorkspaceMember.disabled_at.is_(None),
+                    )
+                )
+            ).scalar_one()
+        )
+
+    async def _live_sessions(self, session: AsyncSession) -> dict[str, int]:
+        """Unrevoked, unexpired sessions per person, in this workspace."""
+        from sqlalchemy import func, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        rows = (
+            await session.execute(
+                select(models.AuthSession.user_id, func.count())
+                .where(
+                    models.AuthSession.workspace_id == self._runtime.workspace,
+                    models.AuthSession.revoked_at.is_(None),
+                    models.AuthSession.expires_at > utcnow(),
+                )
+                .group_by(models.AuthSession.user_id)
+            )
+        ).all()
+        return {str(row[0]): int(row[1]) for row in rows}
 
 
 class _Telemetry:
@@ -2362,6 +3261,93 @@ class _Telemetry:
             }
             for row in rows
         ], int(total)
+
+
+class _SecurityAlerts:
+    """Recorded alerts, over one runtime's engine and workspace.
+
+    No foreign keys, on :class:`~manicule.app.runtime._Telemetry`'s own reasoning for the audit
+    log: an alert about a key or an address must outlive the row it names.
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    async def record_alert(self, kind: str, subject: str, *, details: Mapping[str, object]) -> str:
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        identifier = secrets.token_hex(8)
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            session.add(
+                models.SecurityAlert(
+                    id=identifier,
+                    workspace_id=self._runtime.workspace,
+                    kind=kind,
+                    subject=subject,
+                    details=dict(details),
+                )
+            )
+        return identifier
+
+    async def list_alerts(
+        self, *, unacknowledged_only: bool = False, limit: int = 50, offset: int = 0
+    ) -> tuple[Sequence[Mapping[str, object]], int]:
+        from sqlalchemy import func, select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        clauses = [models.SecurityAlert.workspace_id == self._runtime.workspace]
+        if unacknowledged_only:
+            clauses.append(models.SecurityAlert.acknowledged_at.is_(None))
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            total = (
+                await session.execute(select(func.count(models.SecurityAlert.id)).where(*clauses))
+            ).scalar_one()
+            rows = (
+                (
+                    await session.execute(
+                        select(models.SecurityAlert)
+                        .where(*clauses)
+                        .order_by(models.SecurityAlert.created_at.desc(), models.SecurityAlert.id)
+                        .limit(max(limit, 0))
+                        .offset(max(offset, 0))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [_alert_row(row) for row in rows], int(total)
+
+    async def acknowledge_alert(self, alert_id: str, *, by: str) -> Mapping[str, object] | None:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            row = (
+                (
+                    await session.execute(
+                        select(models.SecurityAlert).where(
+                            models.SecurityAlert.id == alert_id,
+                            models.SecurityAlert.workspace_id == self._runtime.workspace,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if row is None:
+                return None
+            row.acknowledged_at = utcnow()
+            row.acknowledged_by = by
+            return _alert_row(row)
 
 
 class _Maintenance:
@@ -3196,19 +4182,81 @@ class _Maintenance:
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
 
 
-def _key_summary(row: object) -> ApiKeySummary:
-    """One key's record, without anything that could be used as one."""
+def _key_summary(
+    row: object,
+    *,
+    role: str | None = None,
+    user_email: str | None = None,
+    user_name: str | None = None,
+) -> ApiKeySummary:
+    """One key's record, without anything that could be used as one.
+
+    Args:
+        role: Overrides the stored ``role`` column. :meth:`_Keys.verify` passes the *effective*
+            role — capped by the owner's current membership — while every other caller lets the
+            key's own stored role stand: the record a listing shows is what was granted, not
+            what one particular caller's membership currently permits.
+    """
     expires = getattr(row, "expires_at", None)
+    allowed_ips: object = getattr(row, "allowed_ips", None)
+    allowed_ips_tuple: tuple[str, ...] = (
+        tuple(str(entry) for entry in cast("list[object]", allowed_ips))
+        if isinstance(allowed_ips, list)
+        else ()
+    )
     return ApiKeySummary(
         id=str(getattr(row, "id", "")),
         name=str(getattr(row, "name", "")),
         prefix=str(getattr(row, "key_prefix", "")),
-        role=str(getattr(row, "role", "")),
+        role=role if role is not None else str(getattr(row, "role", "")),
         workspace=str(getattr(row, "workspace_id", "")),
         created_at=_isoformat(getattr(row, "created_at", None)),
         expires_at=_isoformat(expires) or None,
         revoked=getattr(row, "revoked_at", None) is not None,
+        user_id=getattr(row, "user_id", None),
+        user_email=user_email,
+        user_name=user_name,
+        allowed_ips=allowed_ips_tuple,
+        rate_limit=getattr(row, "rate_limit", None),
     )
+
+
+def _digest(secret: str) -> str:
+    """The SHA-256 of a presented secret, which is the only form of one the database holds."""
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _user_summary(user: object, membership: object, *, sessions: int | None = None) -> UserSummary:
+    """One person as a member of one workspace, read off the two rows that say so."""
+    return UserSummary(
+        id=str(getattr(user, "id", "")),
+        provider=str(getattr(user, "provider", "")),
+        email=str(getattr(user, "email", None) or ""),
+        name=str(getattr(user, "name", None) or ""),
+        role=str(getattr(membership, "role", "")),
+        workspace=str(getattr(membership, "workspace_id", "")),
+        disabled=getattr(membership, "disabled_at", None) is not None,
+        created_at=_isoformat(getattr(membership, "created_at", None)),
+        last_login_at=_isoformat(getattr(user, "last_login_at", None)),
+        sessions=sessions,
+    )
+
+
+def _alert_row(row: object) -> Mapping[str, object]:
+    """One alert row as a plain mapping, the shape :class:`Telemetry` rows already use."""
+    details: object = getattr(row, "details", None)
+    details_dict: dict[str, object] = (
+        cast("dict[str, object]", details) if isinstance(details, dict) else {}
+    )
+    return {
+        "id": getattr(row, "id", ""),
+        "kind": getattr(row, "kind", ""),
+        "subject": getattr(row, "subject", ""),
+        "details": details_dict,
+        "created_at": _isoformat(getattr(row, "created_at", None)),
+        "acknowledged_at": _isoformat(getattr(row, "acknowledged_at", None)) or None,
+        "acknowledged_by": getattr(row, "acknowledged_by", None),
+    }
 
 
 def _isoformat(value: object) -> str:

@@ -12,10 +12,12 @@ enforced in five places is a boundary enforced in whichever of them somebody rem
 
 from __future__ import annotations
 
+import threading
+import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import event, select, text
+from sqlalchemy import CompoundSelect, Delete, Insert, Select, Table, Update, event, select, text
 
 from manicule.core.errors import ManiculeError, UnknownEntityError
 from manicule.storage import models
@@ -24,8 +26,10 @@ from manicule.storage.engine import session_factory
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from sqlalchemy import Connection
+    from sqlalchemy import Connection, Engine
+    from sqlalchemy.engine.interfaces import ExecutionContext
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+    from sqlalchemy.pool import ConnectionPoolEntry
 
     from manicule.core.retrieval import Filter
 
@@ -54,35 +58,171 @@ class CrossWorkspaceCollisionError(ManiculeError):
     """
 
 
+NON_CORPUS_TABLES: frozenset[str] = frozenset(
+    {
+        models.QueryLog.__tablename__,
+        models.AuditLog.__tablename__,
+        models.SecurityAlert.__tablename__,
+        models.Conversation.__tablename__,
+        models.Message.__tablename__,
+        models.User.__tablename__,
+        models.WorkspaceMember.__tablename__,
+        models.AuthSession.__tablename__,
+        models.ApiKey.__tablename__,
+    }
+)
+"""Tables no query reads, whose writes therefore cannot change what a query returns.
+
+A record of who asked what, and of who is allowed to ask: the query log, the audit trail and
+its alerts, conversations and their turns, and the people, memberships, sessions and keys that
+identify a caller. Most of them are written *because* somebody searched, asked or signed in,
+which is exactly why a commit to one of them must not move the generation counter — the search
+that wrote it would invalidate its own cached ranking, and the next identical search would miss.
+
+**An exemption list, not a list of tables that count.** A table missing from here — including
+one added next year — counts, and the cost is a cold cache. A list of tables that count would
+fail the other way: the table nobody added would serve rankings computed over a corpus that no
+longer exists. The test suite holds three facts about this set that it depends on: no trigger
+fires on any of these tables, a foreign-key action that starts here lands only here, and the
+retrieval path reads none of them.
+"""
+
+_WROTE = "manicule.storage.scoped.wrote"
+"""The per-transaction mark, in the pooled connection's ``info``, that a statement counted."""
+
+_LANDING = "manicule.storage.scoped.landing"
+"""The mark that a counted commit has been announced and has not yet been seen to land."""
+
+
 class _CommitCounter:
-    """Counts committed transactions on an engine.
+    """Counts committed transactions on an engine that wrote anything a query could read.
 
     The invalidation signal behind the L1 query cache (``docs/retrieval.md`` §10.3), and it
     counts *commits* rather than calls to the write methods someone remembered to instrument.
     That is the same reasoning that puts FTS5 synchronization in triggers rather than in
     application code, and the same reasoning that puts the tenancy guards in this module: a
     per-method bump covers only the write paths its author enumerated, and the one nobody
-    enumerated is the one that serves a stale ranking. A transaction that committed on this
-    engine changed something; a read never reaches here, because a session closed without a
-    commit rolls back.
+    enumerated is the one that serves a stale ranking.
+
+    **Each statement is classified as it is sent, and the commit decides.** A transaction that
+    sent even one statement :func:`_cannot_change_a_ranking` cannot vouch for bumps the counter
+    when it commits; one that sent only reads and writes to :data:`NON_CORPUS_TABLES` does not.
+    The mark is set *before* the statement runs, so a statement that fails part-way has already
+    counted, and it is cleared on commit and on rollback, so a transaction that was rolled back
+    does not bump. A mark that outlives its transaction some other way can only make the next
+    commit on that connection bump when it need not have.
 
     Over-counting is the safe direction and is accepted. A commit that could not have changed a
-    result — a watermark, a connector's run metadata — still bumps the counter and costs at most
-    a cold cache. Under-counting would serve a ranking computed over a corpus that no longer
-    exists.
+    result — a watermark, a connector's run metadata, a raw ``text()`` insert into the query
+    log — still bumps the counter and costs at most a cold cache. Under-counting would serve a
+    ranking computed over a corpus that no longer exists.
+
+    **A counted commit moves the counter twice: when it is announced, and once it has landed.**
+    SQLAlchemy's ``commit`` event fires *before* the database commits, so a counter moved only
+    there leaves a window in which a concurrent search reads the new value and the old rows, and
+    caches a ranking of a corpus that is about to stop existing — under the key every later
+    search will use, for as long as the cache keeps it. The second move happens when the
+    connection is next seen after the commit returned: its next ``begin``, or its return to the
+    pool. A ranking computed inside the window is keyed to the value in between, and that value
+    is gone by the time anybody could be served it.
+
+    One per engine, shared by every handle on it (:meth:`on`), so a statement is classified once
+    however many workspaces' stores are open — and so two handles never race to consume the
+    same transaction's mark.
     """
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(self) -> None:
         self._value = 0
-        event.listen(engine.sync_engine, "commit", self._committed)
+
+    @classmethod
+    def on(cls, engine: AsyncEngine) -> _CommitCounter:
+        """The counter for ``engine``, listening from the first time anyone asks."""
+        target = engine.sync_engine
+        with _COUNTERS_LOCK:
+            counter = _COUNTERS.get(target)
+            if counter is None:
+                counter = cls()
+                event.listen(target, "before_cursor_execute", counter._executing, named=True)
+                event.listen(target, "commit", counter._committed)
+                event.listen(target, "rollback", counter._rolled_back)
+                event.listen(target, "begin", counter._began)
+                event.listen(target, "checkin", counter._checked_in)
+                _COUNTERS[target] = counter
+            return counter
+
+    @staticmethod
+    def _executing(conn: Connection, context: ExecutionContext | None, **_: object) -> None:
+        if not _cannot_change_a_ranking(context):
+            conn.info[_WROTE] = True
 
     def _committed(self, connection: Connection) -> None:
-        del connection  # the fact of the commit is the whole signal
-        self._value += 1
+        info = _info(connection)
+        if info is not None and info.pop(_WROTE, False):
+            self._value += 1
+            info[_LANDING] = True
+
+    def _landed(self, info: dict[Any, Any]) -> None:
+        """The commit announced on this connection has returned; move the counter again."""
+        if info.pop(_LANDING, False):
+            self._value += 1
+
+    def _began(self, connection: Connection) -> None:
+        info = _info(connection)
+        if info is not None:
+            self._landed(info)
+
+    def _checked_in(self, _dbapi_connection: object, record: ConnectionPoolEntry) -> None:
+        self._landed(record.info)
+
+    @staticmethod
+    def _rolled_back(connection: Connection) -> None:
+        info = _info(connection)
+        if info is not None:
+            info.pop(_WROTE, None)
 
     @property
     def value(self) -> int:
         return self._value
+
+
+def _info(connection: Connection) -> dict[Any, Any] | None:
+    """The pooled connection's ``info``, or ``None`` for one that has been invalidated.
+
+    An invalidated connection — a statement canceled under it, its driver gone — raises when
+    asked for ``info``, and these listeners run inside SQLAlchemy's own commit and rollback. A
+    listener that asked anyway would turn the ordinary unwinding of a canceled request into a
+    ``PendingRollbackError`` raised from inside the rollback. Skipping it can only leave a mark
+    behind, and a mark left behind costs one extra bump — the safe direction.
+    """
+    if connection.invalidated:
+        return None
+    return connection.info
+
+
+_COUNTERS: weakref.WeakKeyDictionary[Engine, _CommitCounter] = weakref.WeakKeyDictionary()
+_COUNTERS_LOCK = threading.Lock()
+
+
+def _cannot_change_a_ranking(context: ExecutionContext | None) -> bool:
+    """Whether a statement is one of the two kinds that provably cannot move a ranking.
+
+    Only a statement SQLAlchemy built can be vouched for, because only then is its shape known
+    rather than read out of a string: a ``SELECT`` or a set operation over them, which writes
+    nothing; or an ``INSERT``, ``UPDATE`` or ``DELETE`` whose target is one of
+    :data:`NON_CORPUS_TABLES`. Everything else counts — ``text()``, driver-level SQL, DDL,
+    savepoints — whatever table it names, because a string that looks like an insert into the
+    query log is not a proof that it is one, and a wrong guess here is the dangerous direction.
+    """
+    compiled = context.compiled if context is not None else None
+    statement = compiled.statement if compiled is not None else None
+    if isinstance(statement, Select | CompoundSelect):
+        return True
+    if isinstance(statement, Insert | Update | Delete):
+        target = statement.table
+        return (
+            isinstance(target, Table) and target.schema is None and target.name in NON_CORPUS_TABLES
+        )
+    return False
 
 
 class WorkspaceScoped:
@@ -108,7 +248,7 @@ class WorkspaceScoped:
         self._engine = engine
         self._workspace_id = workspace_id
         self._sessions = sessions or session_factory(engine)
-        self._generation = _CommitCounter(engine)
+        self._generation = _CommitCounter.on(engine)
         self._max_journal_records = max_journal_records
         self._max_journal_metadata_bytes = max_journal_metadata_bytes
         self._max_acquired_blob_backlog_bytes = max_acquired_blob_backlog_bytes
@@ -144,14 +284,16 @@ class WorkspaceScoped:
 
     @property
     def generation(self) -> int:
-        """Bumped by every committed transaction on this store's engine.
+        """Bumped by every committed transaction on this store's engine that could move a ranking.
 
         Satisfies :class:`~manicule.core.retrieval.SupportsGeneration`, which is what lets the
         retrieval layer cache a ranking and know when to stop trusting it. It counts commits on
         the *engine*, so a write through any other handle on the same database — another
         workspace's store, an ingest run, a repair verb, a collection being renamed — moves this
         one too. That is deliberate: this counter's job is to be impossible to bypass, not to be
-        minimal.
+        minimal. The one thing it leaves out is a commit that wrote only to
+        :data:`NON_CORPUS_TABLES` — a search's own query-log row, an answer's turn — because a
+        counter moved by the record of a search is a cache the next identical search misses.
 
         Here rather than on the document store for the same reason everything else in this class
         is: six protocols share one handle, and several of them write. A counter attached to one
@@ -296,6 +438,7 @@ class WorkspaceScoped:
 
 __all__ = [
     "DEFAULT_WORKSPACE",
+    "NON_CORPUS_TABLES",
     "CrossWorkspaceCollisionError",
     "WorkspaceScoped",
 ]

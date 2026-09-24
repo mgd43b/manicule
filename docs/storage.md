@@ -120,6 +120,31 @@ the only placement that covers every connection the pool will ever open. A test 
 web request produce `SQLITE_BUSY` immediately rather than after a wait. WAL permits many
 readers with one writer; manicule keeps a single write path and lets readers run concurrently.
 
+**Opening a connection is one step, and a canceled caller cannot split it.** Opening one is
+several awaits: `aiosqlite` starting a thread that creates the `sqlite3` handle, then every
+`connect` listener — the one above, and SQLAlchemy's own, which register SQL functions and, on
+an engine's first connection, inspect the database. A cancellation that landed in any of them
+stranded the connection. Canceled inside `aiosqlite`, the connection stopped its thread without
+closing the handle that thread had just opened; canceled inside a listener, SQLAlchemy dropped
+a pool entry it had not finished building, with the connection in it. Either way nothing held
+it, so neither the session nor the engine's disposal could close it, and it surfaced later as a
+`ResourceWarning` from the garbage collector. Callers are canceled as a matter of course — a
+reader who goes away, a request past its deadline, an answer that ends before its citation
+checks (`generation.md` §3.7) — so this was a leaked handle per canceled request, from any read.
+
+So `create_engine` builds the pool that SQLAlchemy would choose for a file database, with one
+difference: a new entry is built — the driver's connect and every `connect` listener — in a task
+and greenlet of its own. A caller canceled meanwhile waits for it to finish opening, closes it,
+and then raises the cancellation; to the pool this is a connection attempt that raised, so its
+accounting is untouched. The wait is the time the open was taking anyway. The other way a
+connection opens is an entry already in the pool reopening: a statement canceled mid-flight
+makes SQLAlchemy close its connection and return the entry empty, and the entry reconnects on
+its next checkout. A listener interrupted there is already SQLAlchemy's to close, because the
+entry holds the connection by then, but a handle `aiosqlite` never handed over is not; a
+`do_connect` listener opens the driver connection the same way for that path too. Once a
+connection is in the pool, cancellation is safe: SQLAlchemy invalidates and closes a
+connection whose statement was canceled.
+
 Blob filenames are content addresses, while compression is a property of their stored
 representation. Concurrent writers publish with an atomic no-clobber hard link and then read the
 winning representation before recording its descriptor. This remains coherent across processes:
@@ -241,13 +266,15 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **41 relational tables**. The 29 outside the durable
-re-embedding snapshot set are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`, `blobs`,
-`acquisition_markers`, `chunk_relations`, `chunks`, `collection_documents`, `collections`, `connectors`,
-`conversations`, `document_tags`, `document_versions`, `documents`, `glossary_aliases`,
-`glossary_entries`, `index_state`, `messages`, `plugins`, `query_logs`, `reconciliation_candidates`,
-`reconciliation_inventory_items`, `reconciliation_runs`, `source_dependencies`, `tags`,
-`vector_tombstones`, `workspace_members` and `workspaces`. Seven more make a re-embedding run
+The authoritative SQLAlchemy model has **44 relational tables**. The 32 outside the durable
+re-embedding snapshot set are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`,
+`auth_sessions`, `blobs`, `acquisition_markers`, `chunk_relations`, `chunks`,
+`collection_documents`, `collections`, `connectors`, `conversations`, `document_tags`,
+`document_versions`, `documents`, `glossary_aliases`, `glossary_entries`, `index_state`,
+`messages`, `plugins`, `query_logs`, `reconciliation_candidates`,
+`reconciliation_inventory_items`, `reconciliation_runs`, `security_alerts`,
+`source_dependencies`, `tags`, `users`, `vector_tombstones`, `workspace_members` and
+`workspaces`. Seven more make a re-embedding run
 durable without changing live reads until publication: `corpus_revision`,
 `reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
 `reembed_runs`, `reembed_shadow_generations` and `reembed_publication_receipts`.
@@ -258,8 +285,10 @@ resumable while publication remains one atomic corpus transition.
 Two content-addressed acquisition ledgers keep exact global backlog admission constant-time:
 `acquisition_blob_backlog` stores unfinished-record refcounts by hash, and
 `acquisition_backlog_capacity` stores their deduplicated byte total.
+Three more carry team mode ([#13](https://github.com/mgd43b/manicule/issues/13)): `users`,
+`auth_sessions` and `security_alerts` (§4.8).
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 41.
+included in the 44.
 
 ### 4.1 The pre-#187 additions
 
@@ -678,12 +707,12 @@ floats**, enforced at construction. A float's text form depends on how it was co
 setting arriving by two routes yields two different table names and a spurious refusal.
 Anything fractional is carried as a string.
 
-### 4.7 The other twelve, and what changed
+### 4.7 The other fourteen, and what changed
 
 | Table | Kept as-is | Changed, and why |
 |---|---|---|
 | `workspaces` | `id`, `name UNIQUE`, `mode`, `settings JSON` | `mode` gets a `CHECK` (`personal`/`team`) |
-| `workspace_members` | composite PK, `role` | **`api_key` column removed.** It held a raw, unhashed key — precisely what `api_keys.key_hash` exists to avoid. `api_keys` is the only key store. `role` gets a `CHECK` (`admin`/`member`/`viewer`) |
+| `workspace_members` | composite PK, `role` | **`api_key` column removed.** It held a raw, unhashed key — precisely what `api_keys.key_hash` exists to avoid. `api_keys` is the only key store. `role` gets a `CHECK` (`admin`/`member`/`viewer`). Team mode makes `user_id` a foreign key to `users` and adds `disabled_at`: a disabled membership is kept, not deleted, so the audit trail still names somebody and re-enabling restores the role (§4.8) |
 | `connectors` | `type`, `config JSON`, `sync_interval_seconds`, `last_synced_at`, `status`, `error_message`, `deleted_at` | `config` validated by the connector's Pydantic schema, not stored blind. `UNIQUE (workspace_id, name) WHERE deleted_at IS NULL`. `watermark JSON` added — `Connector.discover` takes a watermark (`contracts.md` §3) and it has to persist somewhere; `last_synced_at` is a timestamp, and a watermark is not always a timestamp. `metadata JSON` added, matching `documents` — last-run counters live here ([`ingest.md`](ingest.md) §13.1), overwritten per run rather than accumulated, which is the right retention policy for a diagnostic |
 | `tags` | `UNIQUE(workspace_id, name)`, `color` | `workspace_id NOT NULL` |
 | `document_tags` | composite PK, both cascades | `WITHOUT ROWID` |
@@ -694,12 +723,26 @@ Anything fractional is carried as a string.
 | `messages` | `role`, `content`, `sources JSON`, `confidence_score`, `response_time_ms` | `role` gets a `CHECK`. **`sources` embeds `Anchor`s**, so it inherits the ⚠️ lock from `contracts.md` §1 — a stored conversation's citations must keep resolving. Index `(conversation_id, created_at)` |
 | `query_logs` | everything | `workspace_id` keeps `ON DELETE CASCADE`. Query text is user content scoped to a workspace; retaining it past workspace deletion is a data-retention problem, not a feature. [#15](https://github.com/mgd43b/manicule/issues/15) exports what it needs rather than treating live rows as an archive |
 | `audit_logs` | everything, **including no foreign key** | Deliberate and now documented: `workspace_id` and `user_id` are plain `TEXT`. An audit log that cascades away when the thing it audits is deleted is not an audit log. Index `(workspace_id, created_at)` added alongside `(event_type, created_at)` |
-| `api_keys` | `key_hash UNIQUE`, `key_prefix`, `scopes`, `rate_limit`, `expires_at`, `last_used_at`, `revoked_at`, `allowed_ips` | `idx_api_keys_hash` **dropped** — `UNIQUE` already creates that index, so it was a second copy of the same B-tree maintained on every write |
+| `api_keys` | `key_hash UNIQUE`, `key_prefix`, `expires_at`, `last_used_at`, `revoked_at` | `idx_api_keys_hash` **dropped** — `UNIQUE` already creates that index, so it was a second copy of the same B-tree maintained on every write. **`scopes` removed** — nothing ever read it, and an unread column is coverage that cannot fail. **Added:** `user_id` (nullable FK `users`, `ON DELETE CASCADE`; `NULL` means minted on behalf of the installation by an administrator or the local operator), `allowed_ips JSON` (CIDR ranges the key may be presented from; empty means anywhere — checked in `_Keys.verify`, not in SQL, because SQLite has no CIDR containment operator), and `rate_limit` (requests per minute, `CHECK (rate_limit IS NULL OR rate_limit > 0)`, replacing `security.rate_limit.per_minute` for this key alone — enforced by `manicule.app.throttle`, `docs/surfaces.md` §9.10). An owned key's effective role is `min(key.role, owner's current WorkspaceMember.role)`, read with a `LEFT JOIN` in the same statement as every other `verify` predicate rather than a branch after it |
 | `plugins` | `name` PK, `type`, `version`, `config JSON`, `status` | **`permissions` column removed**, per `contracts.md` §5. And this table becomes the actual plugin registry rather than a JSON file beside the database, so plugin state is inside the same transactional and backup boundary as everything else |
 
 > **Prior art.** The `plugins` table is created by `001_initial.sql` and never read or
 > written; the real registry is `installed-plugins.json` on disk. It is in the backup file
 > list, so a restore can leave the registry and the database describing different worlds.
+
+### 4.8 People, sessions and security alerts
+
+Three tables for team mode, all added by one revision (`e41b9c07d2a5`) and all arriving empty:
+none can be derived from anything already stored.
+
+| Table | What it is | Why it is shaped this way |
+|---|---|---|
+| `users` | A person, as an identity provider vouched for them: `provider`, `subject`, the verified `email`, `name`, `last_login_at` | **Installation-wide.** One person in two workspaces is one row here and two in `workspace_members`, because a role is a relationship between a person and a workspace. `UNIQUE (provider, subject)` — identified by the provider's stable account id and never by address, which can change, be recycled or be unverified. `email` holds only an address the provider verified, cleared when a later sign-in stops reporting it so |
+| `auth_sessions` | A signed-in browser: `token_hash UNIQUE`, `user_id`, `workspace_id`, `expires_at`, `revoked_at` | **Server-side, so revocable one at a time.** A cookie that carried the identity could only be revoked by rotating the key that signs every cookie. Only the SHA-256 of the token is stored, as for `api_keys`, so a copy of the database is not a copy of anybody's session. Resolved in one statement joining the membership, so a disabled person or a changed role is what the next request sees ([`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session)) |
+| `security_alerts` | A pattern of use worth a person's attention: `kind` checked against `brute_force`, `key_abuse` and `export_volume`, `subject`, `details JSON`, `acknowledged_at`, `acknowledged_by` | **No foreign keys**, for `audit_logs`' reason: an alert about a key or an address must outlive the row it names. Written by `ApplicationService.record_security_alert` whether or not `security.audit.enabled` is set ([`surfaces.md`](surfaces.md) §9.11), indexed on `(workspace_id, created_at)` |
+
+Every read and write of a membership or a session carries the workspace as a predicate; a person
+is read without one, because a person is the same person everywhere.
 
 ---
 
@@ -2166,10 +2209,11 @@ nobody reads. It raises `InsecureTargetError`, which describes the *destination*
 the operation carrying the bytes, so a caller has one thing to catch for both.
 
 **What is genuinely not storage's to decide** stays with the security surface
-([#13](https://github.com/mgd43b/manicule/issues/13),
-[#19](https://github.com/mgd43b/manicule/issues/19)): encryption at rest and its key
+([#19](https://github.com/mgd43b/manicule/issues/19)): encryption at rest and its key
 management, whether retention is opt-out per connector, and the deployment-guide wording. The
-disclosure itself is discharged here.
+disclosure itself is discharged here. Team mode ([#13](https://github.com/mgd43b/manicule/issues/13))
+changed who may *reach* the data directory's contents through the surfaces, not how the
+directory is protected on disk.
 
 ---
 
@@ -2819,6 +2863,13 @@ preserves their candidate watermark and retained evidence. These migrations foll
 durable-acquisition and reconciliation chain, so an offline snapshot remains reconstructable
 before any shadow vector generation is planned or published.
 
+`e41b9c07d2a5` adds team mode's three tables (§4.8), bringing the modeled total to the 44 in §4,
+and rebuilds two: `workspace_members` gains its foreign key to `users` and `disabled_at`, and
+`api_keys` loses `scopes` and gains a real reference in `user_id`. Neither rebuild carries data
+it could not keep — no release ever wrote a membership, and every existing `api_keys.user_id` held
+the workspace's own name as a placeholder, so it becomes `NULL`, which is what a key minted at the
+command line now records.
+
 ---
 
 ## Appendix A: what this design decided that nothing else had
@@ -2838,6 +2889,8 @@ one.
 | `plugins` becomes the real registry; `permissions` column dropped | §4.7 |
 | `connectors.watermark` added | §4.7 |
 | `audit_logs` deliberately has no foreign keys; `query_logs` deliberately cascades | §4.7 |
+| People are installation-wide and keyed by provider account, never by address; memberships and sessions are per workspace | §4.8 |
+| A browser session is a revocable row holding a token digest, not a signed identity | §4.8 |
 | Column renames to match `docs/contracts.md` §2: `source_type`→`source`, `source_path`→`uri`, `file_type`→`media_type`, `source_version`→`version_token`, `parser_used`→`parser` | §4.2 |
 | FTS5 is external-content over `chunks` and trigger-maintained | §6.1 |
 | The vector row carries the chunk as `chunk_json`, because the protocol requires a self-sufficient store | §6.2 |
@@ -2878,8 +2931,7 @@ one.
   added by a migration when it earns one.
 - **Encryption at rest, and its key management.** §7.1 states what the data directory now
   contains and sets its permissions; encrypting it is a different problem with a key-handling
-  design behind it, and belongs to [#13](https://github.com/mgd43b/manicule/issues/13) /
-  [#19](https://github.com/mgd43b/manicule/issues/19).
+  design behind it, and belongs to [#19](https://github.com/mgd43b/manicule/issues/19).
 - **Any store other than SQLite.** Settled in `PLAN.md` §2 and not reopened here.
 - **The full `Filter` shape.** Open when this was written; settled since, in
   [`retrieval.md`](retrieval.md) §3 and built by

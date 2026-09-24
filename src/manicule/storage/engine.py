@@ -14,15 +14,19 @@ import threading
 import weakref
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, override
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
+from sqlalchemy.util import await_only, greenlet_spawn
 
 from manicule.core.errors import InsecureTargetError
 
 if TYPE_CHECKING:
-    from sqlalchemy.engine.interfaces import DBAPIConnection
+    from collections.abc import Callable
+
+    from sqlalchemy.engine.interfaces import DBAPIConnection, Dialect
     from sqlalchemy.ext.asyncio import AsyncSession
     from sqlalchemy.pool import ConnectionPoolEntry
 
@@ -294,7 +298,8 @@ def create_engine(data_dir: Path, *, echo: bool = False) -> AsyncEngine:
         echo: Log emitted SQL. For debugging only.
 
     Returns:
-        An engine whose every connection has been configured by :data:`PRAGMAS`.
+        An engine whose every connection has been configured by :data:`PRAGMAS`, and whose
+        pool opens each one as a step no cancellation can interrupt (:class:`_WholeOpeningPool`).
     """
     require_supported_sqlite()
     prepare_data_dir(data_dir)
@@ -302,9 +307,102 @@ def create_engine(data_dir: Path, *, echo: bool = False) -> AsyncEngine:
         f"sqlite+aiosqlite:///{database_path(data_dir)}",
         echo=echo,
         future=True,
+        poolclass=_WholeOpeningPool,
     )
     attach_pragmas(engine)
+    event.listen(engine.sync_engine, "do_connect", _open_driver_connection)
     return engine
+
+
+async def _to_the_end(work: asyncio.Future[Any]) -> asyncio.CancelledError | None:
+    """Wait for ``work`` to finish, through however many cancellations arrive meanwhile.
+
+    Returns the last of them, for the caller to raise once it has dealt with what the work
+    produced, or ``None`` if nobody asked. ``asyncio.wait`` rather than ``shield``: it neither
+    cancels the work nor raises its failure, so the outcome stays on the future to be read.
+    """
+    cancellation: asyncio.CancelledError | None = None
+    while not work.done():
+        try:
+            await asyncio.wait({work})
+        except asyncio.CancelledError as error:
+            cancellation = error
+    return cancellation
+
+
+async def _uninterrupted[T](step: Callable[[], T], discard: Callable[[T], object]) -> T:
+    """Run ``step`` to its end whatever happens to the caller, and discard it if they left.
+
+    ``step`` is SQLAlchemy code that awaits through its greenlet bridge, so it runs in a
+    greenlet and a task of its own, where the caller's cancellation cannot land. A caller
+    canceled meanwhile waits for it, hands what it produced to ``discard`` — also run to its end
+    — and only then raises the cancellation. That wait is time the step was taking anyway; not
+    waiting would leave what it produces with nobody to close it.
+
+    A failure of the step, or of the discard, is not reported to a canceled caller. The
+    cancellation is what that caller asked for, and it is what it gets.
+    """
+    made = asyncio.ensure_future(greenlet_spawn(step))
+    cancellation = await _to_the_end(made)
+    if cancellation is None:
+        return made.result()
+    if not made.cancelled() and made.exception() is None:
+        discarding = asyncio.ensure_future(greenlet_spawn(discard, made.result()))
+        await _to_the_end(discarding)
+        if not discarding.cancelled():
+            discarding.exception()
+    raise cancellation
+
+
+def _close_entry(entry: ConnectionPoolEntry) -> None:
+    entry.close()
+
+
+def _close_connection(connection: DBAPIConnection) -> None:
+    connection.close()
+
+
+class _WholeOpeningPool(AsyncAdaptedQueuePool):
+    """The pool SQLAlchemy chooses for a SQLite file, opening each new connection as one step.
+
+    **A cancellation that lands while a connection is being opened strands it.** Opening one is
+    several awaits: ``aiosqlite`` starting a thread that creates the ``sqlite3`` handle, then
+    every ``connect`` listener — SQLAlchemy's own, which register SQL functions and on the
+    first connection inspect the database, and :func:`_apply_pragmas`. Canceled inside
+    ``aiosqlite``, the connection stops its thread without closing the handle that thread has
+    just opened. Canceled inside a listener, the half-built pool entry is dropped with the
+    connection in it. Neither is held by anything, so neither the session nor the engine's
+    disposal can close it, and it surfaces later as a ``ResourceWarning`` from the garbage
+    collector — a leaked file handle per canceled caller, and callers are canceled routinely:
+    a reader who goes away, a request past its deadline, an answer that ends before its
+    citation checks.
+
+    So a new entry is built by :func:`_uninterrupted`: a caller canceled meanwhile waits for
+    the entry to finish opening, closes it, and then raises. The pool's own accounting is
+    untouched, because to the pool this is a connection attempt that raised.
+    """
+
+    @override
+    def _create_connection(self) -> ConnectionPoolEntry:
+        return await_only(_uninterrupted(super()._create_connection, _close_entry))
+
+
+def _open_driver_connection(
+    dialect: Dialect,
+    _record: ConnectionPoolEntry,
+    cargs: list[Any],
+    cparams: dict[str, Any],
+) -> DBAPIConnection:
+    """Open the driver connection exactly as SQLAlchemy would, as one uninterrupted step.
+
+    :class:`_WholeOpeningPool` covers a new entry. An entry already in the pool whose
+    connection was invalidated — which is what a statement canceled mid-flight leaves — opens
+    its replacement on its next checkout, outside that step. SQLAlchemy closes the replacement
+    itself if a listener is interrupted, because the entry already holds it by then; but it
+    cannot close a handle ``aiosqlite`` never handed over. This ``do_connect`` listener closes
+    that gap for every connection this engine opens, whichever path asked for it.
+    """
+    return await_only(_uninterrupted(lambda: dialect.connect(*cargs, **cparams), _close_connection))
 
 
 def _apply_pragmas(dbapi_connection: DBAPIConnection, _record: ConnectionPoolEntry) -> None:

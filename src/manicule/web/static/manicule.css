@@ -90,6 +90,7 @@ pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); bord
 .find { flex: 1 1 12rem; }
 .find input { width: 100%; }
 .who { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
+.who .signout { margin: 0; }
 
 .shell { display: flex; align-items: flex-start; gap: var(--gap); padding: var(--gap); }
 .side { flex: 0 0 12rem; position: sticky; top: 4rem; }
@@ -179,6 +180,7 @@ button:disabled { opacity: .6; cursor: progress; }
 .filters { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-bottom: var(--gap); }
 .actions { display: flex; gap: .4rem; flex-wrap: wrap; }
 .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-top: .5rem; }
+.providers { list-style: none; padding: 0; display: flex; flex-direction: column; gap: .5rem; }
 
 .secret {
   background: color-mix(in srgb, var(--warn) 18%, transparent);

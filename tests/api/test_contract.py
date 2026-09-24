@@ -68,10 +68,19 @@ OPERATIONS: frozenset[str] = frozenset(TOOL_NAMES) | {
     "reembed_start",
     "rebuild_run",
     "search_quality",
+    "security_alerts",
+    "security_alert_acknowledge",
     "shared_conversation",
+    # Both halves of a browser sign-in are one operation: the login route starts it and the
+    # callback completes it, and a refusal of either is a refusal of signing in.
+    "sign_in",
+    "sign_out",
     "tag_create",
     "tag_delete",
     "tag_list",
+    "user_list",
+    "user_sign_out",
+    "user_update",
     "workbench",
 }
 """Every ``op`` this surface may emit.
@@ -113,6 +122,7 @@ NOT_OPERATIONS: frozenset[str] = frozenset(
         "ui_documents",
         "ui_health",
         "ui_lifecycle",
+        "ui_login",
         "ui_plugins",
         "ui_reembed",
         "ui_script",
@@ -121,6 +131,7 @@ NOT_OPERATIONS: frozenset[str] = frozenset(
         "ui_shared",
         "ui_stylesheet",
         "ui_trash",
+        "ui_users",
         "ui_workspaces",
     }
 )

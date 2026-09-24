@@ -220,6 +220,17 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #1
   # somebody else wrote, escaping is the security property rather than a convenience.
   # BSD-3-Clause.
   "jinja2>=3.1",
+  # Signing the browser's session and sign-in cookies (#13). The cookie carries a random token
+  # the database holds a digest of; the signature is what lets a forged or expired cookie be
+  # refused before anything is looked up. BSD-3-Clause.
+  "itsdangerous>=2.2",
+  # The OAuth 2.0 client for signing in through Google and GitHub (#13): authorization URLs,
+  # PKCE and the code exchange, rather than a hand-rolled implementation of a protocol whose
+  # failure modes are all security failures. BSD-3-Clause.
+  "authlib>=1.3",
+  # The HTTP client authlib's async OAuth client runs on. Already present for the connectors;
+  # declared here as well so that `manicule[serve]` alone can complete a sign-in. BSD-3-Clause.
+  "httpx>=0.28",
 ]
 
 # What `uv tool install "manicule[all]"` installs, and the one extra a person who just wants
@@ -601,6 +612,18 @@ reportUnknownArgumentType = "none"
 [[tool.pyright.executionEnvironments]]
 root = "packages/manicule-mlx/src/manicule_mlx"
 reportMissingImports = "none"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+
+# The OAuth client (#13). authlib ships no type information, so the same four rules are relaxed
+# for the one directory that talks to it and for no other: `manicule.api.oauth` is a package
+# rather than a module precisely so this can be a directory. What it exports — `begin`,
+# `complete` and the `Profile` they produce — is fully typed, and everything that decides
+# whether a person is admitted lives in `manicule.app.people`, which stays fully checked.
+[[tool.pyright.executionEnvironments]]
+root = "src/manicule/api/oauth"
 reportMissingTypeStubs = "none"
 reportUnknownMemberType = "none"
 reportUnknownVariableType = "none"

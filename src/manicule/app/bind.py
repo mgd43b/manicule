@@ -49,7 +49,12 @@ Stdio transports never come here at all, and that is the point of
 :func:`stdio` — a bind decision that is not made cannot be made wrongly, so the MCP server's
 default mode has no address to get wrong.
 
-:func:`require_authoring_authentication` is the one rule here that is stricter than the three
+**None of that applies in team mode.** Everything above about an anonymous caller rests on
+there being one operator for that caller to be. ``mode = "team"`` says there is not, so
+:func:`require_team_authentication` refuses a socket without authentication on every address,
+loopback included, and refuses ``--no-authentication`` rather than letting it waive anything.
+
+:func:`require_authoring_authentication` is the other rule here that is stricter than the three
 above: a socket carrying ``document_create`` needs authentication even on loopback, because
 "reachable only from this machine" is a weaker statement about a write into a corpus than it is
 about a read out of one. ``allow_unauthenticated`` waives it, and that waiver is the whole
@@ -62,7 +67,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from manicule.config.settings import AuthMode
+from manicule.config.settings import AuthMode, Mode
 from manicule.core.errors import PolicyError
 
 if TYPE_CHECKING:
@@ -184,6 +189,52 @@ def require_authoring_authentication(
     raise PolicyError(msg)
 
 
+def require_team_authentication(settings: Settings, *, allow_unauthenticated: bool = False) -> None:
+    """Refuse to serve a team installation on a socket without authentication.
+
+    Called where a socket is made — :func:`resolve_bind` — and where an application is —
+    :func:`manicule.api.app.build_app` — for the reason each of those refusals is repeated in
+    the other: an ASGI application can be started by something other than ``manicule serve``.
+
+    **Stricter than every other rule in this module, and not waivable.** The anonymous caller
+    this module otherwise tolerates on loopback is the operator at this machine, holding the
+    authority the command line already gives them; ``--no-authentication`` extends that
+    arrangement to a network the operator owns. In ``team`` mode there is no such person —
+    several people share the installation — so an anonymous caller would be an administrator
+    who is nobody in particular, on loopback or anywhere else. The flag is refused rather than
+    ignored, because an operator who typed it believes it did something.
+
+    Args:
+        settings: Configuration. ``mode`` and ``security.auth.mode`` decide.
+        allow_unauthenticated: ``--no-authentication``, which team mode refuses outright.
+
+    Raises:
+        PolicyError: ``mode`` is ``team`` and either authentication is off or the command line
+            asked to serve without it.
+    """
+    if settings.mode is not Mode.TEAM:
+        return
+    problems: list[str] = []
+    if settings.security.auth.mode is AuthMode.NONE:
+        problems.append(
+            "security.auth.mode is 'none'. In team mode every caller must present a credential: "
+            "set security.auth.mode to 'api_key' or 'oauth'"
+        )
+    if allow_unauthenticated:
+        problems.append(
+            "--no-authentication was passed. It makes every anonymous caller an administrator, "
+            "which is a single-operator arrangement by definition and has no meaning when "
+            "several people share the installation; drop the flag"
+        )
+    if problems:
+        joined = "\n  - ".join(problems)
+        msg = (
+            f"refusing to serve workspace {settings.workspace!r} in team mode:\n  - {joined}\n"
+            f"Set mode to 'personal' if this installation is one person's."
+        )
+        raise PolicyError(msg)
+
+
 def stdio() -> None:
     """The transport that binds nothing.
 
@@ -225,8 +276,12 @@ def resolve_bind(
 
     Raises:
         PolicyError: The address is not loopback and something required to widen it is
-            missing. The message names which, and what to do instead.
+            missing, or the installation is in team mode without authentication — see
+            :func:`require_team_authentication`. The message names which, and what to do
+            instead.
     """
+    # First, and before the loopback answer below: team mode's refusal holds on every address.
+    require_team_authentication(settings, allow_unauthenticated=allow_unauthenticated)
     transport = settings.security.transport
     chosen = (host if host is not None else transport.bind_host).strip()
     chosen_port = port if port is not None else transport.port
@@ -273,6 +328,7 @@ __all__ = [
     "is_every_interface",
     "is_loopback",
     "require_authoring_authentication",
+    "require_team_authentication",
     "resolve_bind",
     "stdio",
 ]

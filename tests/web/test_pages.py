@@ -2,7 +2,7 @@
 
 Two kinds of assertion, matching ``tests/api/test_routes.py``:
 
-**Coverage.** Each of the twelve areas has a page that answers, checked from the mounted routes
+**Coverage.** Each of the areas has a page that answers, checked from the mounted routes
 rather than from a list in somebody's head. ``layout`` is the one area with no page of its own,
 and that is asserted as a property of the templates rather than waved away.
 
@@ -21,7 +21,9 @@ from pathlib import Path
 import pytest
 
 from manicule.api.security import Principal
+from manicule.app.caller import Caller, acting_as
 from manicule.app.service import ApplicationService
+from manicule.config.settings import Role
 from manicule.core.ann import AnnIndex, AnnIndexState, AnnLifecycle
 from manicule.core.errors import ManiculeError
 from manicule.web.areas import AREAS, NAVIGATION
@@ -61,14 +63,15 @@ PAGE_FOR_AREA: dict[str, str] = {
     "admin": "/ui/admin",
     "reembed": "/ui/reembed",
     "lifecycle": "/ui/lifecycle",
+    "users": "/ui/users",
     "auth": "/ui/auth",
 }
 
 
-def test_the_fourteen_areas_are_the_thirteen_pages_and_the_frame() -> None:
+def test_the_fifteen_areas_are_the_fourteen_pages_and_the_frame() -> None:
     """The area list and the pages cannot drift apart without this failing."""
     assert set(PAGE_FOR_AREA) | {"layout"} == set(AREAS)
-    assert len(AREAS) == 14
+    assert len(AREAS) == 15
 
 
 def test_the_admin_page_shows_whether_vector_search_is_still_exhaustive() -> None:
@@ -180,9 +183,18 @@ def test_the_layout_area_is_the_frame_every_other_page_extends() -> None:
         for path in TEMPLATE_DIR.glob("*.html")
         # `refused.html` and `notfound.html` are deliberately standalone: both render before
         # anything has decided whether the reader may see this workspace, and the frame's
-        # navigation is a description of what the installation holds.
+        # navigation is a description of what the installation holds. `signed_in.html` is the
+        # third, for its own reason: it is the one response that must end a sign-in's redirect
+        # chain, and it names only the person who just signed in.
         if path.name
-        not in {"layout.html", "bare.html", "macros.html", "refused.html", "notfound.html"}
+        not in {
+            "layout.html",
+            "bare.html",
+            "macros.html",
+            "refused.html",
+            "notfound.html",
+            "signed_in.html",
+        }
     )
     assert len(pages) >= 10, f"only {len(pages)} page templates found; the scan is looking wrong"
     for page in pages:
@@ -403,35 +415,95 @@ def test_a_second_page_of_a_listing_renders(path: str) -> None:
 
 
 def test_a_browser_that_presents_no_key_is_refused_as_a_page() -> None:
-    """With authentication configured, a navigation carries no credential and this says so.
+    """With API keys configured, a navigation carries no credential and this says so.
 
-    A browser cannot attach a header to a page load and this build has no session cookie, so
-    the honest answer is a refusal that explains itself — not a JSON envelope in a browser
-    window, and not a page that quietly renders as though the caller were the operator.
+    A browser cannot attach a header to a page load, and under ``api_key`` there is no session
+    cookie, so the honest answer is a refusal that explains itself — not a JSON envelope in a
+    browser window, and not a page that quietly renders as though the caller were the operator.
     """
     backend, _ = backend_with_a_document(security={"auth": {"mode": "api_key"}})
     with client_for(backend) as client:
         response = client.get("/ui/documents")
     assert response.status_code == UNAUTHORIZED
     assert "text/html" in response.headers["content-type"]
-    assert "session cookie" in response.text
+    assert "no session cookie" in response.text
+    assert 'href="/ui/login"' not in response.text, "offered a sign-in nobody can complete"
     assert "{" not in response.text.split("<body")[0], "a JSON body reached a browser"
+
+
+def test_where_people_sign_in_the_refusal_offers_the_sign_in_and_not_the_api_key_story() -> None:
+    """The sentence about there being no session cookie is true of ``api_key`` and false here.
+
+    The refusal page used to say it unconditionally; on an installation where people sign in it
+    would tell a person the one thing that is not so, beside no way forward.
+    """
+    backend, _ = backend_with_a_document(
+        security={
+            "auth": {
+                "mode": "oauth",
+                "session_secret": "k" * 40,
+                "providers": [
+                    {
+                        "type": "google",
+                        "client_id": "c",
+                        "client_secret": "s",
+                        "redirect_uri": "http://127.0.0.1:8765/auth/callback/google",
+                        "allowed_domains": ["example.org"],
+                    }
+                ],
+            }
+        }
+    )
+    with client_for(backend) as client:
+        response = client.get("/ui/documents")
+    assert response.status_code == UNAUTHORIZED
+    assert "text/html" in response.headers["content-type"]
+    assert 'href="/ui/login"' in response.text
+    assert "session cookie" not in response.text
 
 
 def test_a_viewer_may_not_read_the_administration_areas() -> None:
     """The pages take the floor the routes behind them take.
 
-    Query logs are what somebody asked, the audit trail names who did what, and the key list is
-    the installation's identities. A page that took less than its routes would be a way round
-    them.
+    Query logs are what somebody asked, the audit trail names who did what, and the member list
+    is the workspace's people. A page that took less than its routes would be a way round them.
+    The API keys page is not among them: its routes are viewer-floor, because which keys a caller
+    sees is the service's ownership rule rather than a role.
     """
     backend, _ = backend_with_a_document(security={"auth": {"mode": "api_key"}})
     secret = asyncio.run(ApplicationService(backend).api_key_create("reader", role="viewer")).secret
     with client_for(backend) as client:
         headers = {"X-API-Key": secret}
         assert client.get("/ui/documents", headers=headers).status_code == 200
-        for path in ("/ui/admin", "/ui/auth", "/ui/connectors", "/ui/plugins"):
+        for path in ("/ui/admin", "/ui/users", "/ui/connectors", "/ui/plugins"):
             assert client.get(path, headers=headers).status_code == FORBIDDEN, path
+
+
+def test_the_api_keys_page_shows_a_non_administrator_only_the_keys_they_own() -> None:
+    """A reader's page whose rows are the service's ownership rule, not the page's.
+
+    A person who minted a key sees it and nobody else's; a key with no owner, presented by a
+    caller short of admin, sees none at all — including itself, which only the operator who
+    minted it may list.
+    """
+    backend, _ = backend_with_a_document(security={"auth": {"mode": "api_key"}})
+    service = ApplicationService(backend)
+    ownerless = asyncio.run(service.api_key_create("shared-reader", role="viewer"))
+    with acting_as(Caller(role=Role.MEMBER, user_id="u-ada")):
+        own = asyncio.run(service.api_key_create("ada-laptop", role="viewer"))
+    backend.keys_.memberships["u-ada"] = "member"
+    with client_for(backend) as client:
+        as_ada = client.get("/ui/auth", headers={"X-API-Key": own.secret})
+        as_nobody = client.get("/ui/auth", headers={"X-API-Key": ownerless.secret})
+    # The listing only: the page's "this request" panel names the presenting key, as it should.
+    ada_listing = as_ada.text.split("<h2>Keys</h2>", 1)[1]
+    nobody_listing = as_nobody.text.split("<h2>Keys</h2>", 1)[1]
+    assert as_ada.status_code == 200
+    assert "ada-laptop" in ada_listing
+    assert "shared-reader" not in ada_listing
+    assert as_nobody.status_code == 200
+    assert "ada-laptop" not in nobody_listing
+    assert "shared-reader" not in nobody_listing
 
 
 def test_the_stylesheet_and_the_script_are_constants() -> None:

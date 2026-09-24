@@ -1,7 +1,7 @@
 {#
-  The frame for the one page that has no credential: a shared conversation.
+  The frame for the two pages that need no credential: a shared conversation, and signing in.
 
-  Deliberately not `layout.html`. An anonymous reader holds a bearer URL and nothing else, so
+  Deliberately not `layout.html`. An anonymous reader holds a bearer URL or nothing at all, so
   a navigation full of links to areas they cannot reach would be a list of what exists here —
   which is disclosure for no benefit. No search box, no workspace name, no role, no script.
 #}<!doctype html>
@@ -18,6 +18,6 @@
   <h1>{{ title }}</h1>
   {% block content %}{% endblock %}
 </main>
-<footer class="foot">Shared from a manicule installation.</footer>
+<footer class="foot">{% block foot %}Shared from a manicule installation.{% endblock %}</footer>
 </body>
 </html>

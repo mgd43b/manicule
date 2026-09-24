@@ -11,7 +11,7 @@ which is a manicule-internal concern rather than something a plugin author needs
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ __all__ = [
     "model_cache",
     "settings",
     "store",
+    "unclosed_connections",
     "vocabulary_cache",
 ]
 
@@ -250,3 +251,20 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     lines.extend(f"\n--- opened during {test}\n{stack}" for test, stack in leaked)
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
     raise pytest.UsageError("\n".join(lines))
+
+
+@pytest.fixture
+def unclosed_connections() -> Callable[[], list[str]]:
+    """Where each ``aiosqlite`` connection this test opened, and has not closed, was opened.
+
+    :func:`pytest_sessionfinish` names a leak, but it fails the session rather than the test
+    that caused it, and only once every test has run. A test whose whole point is that a path
+    leaves no connection behind asks this instead, at the moment every connection it opened
+    should be closed — once the engine is disposed — so the failure lands on that test.
+    """
+    before = set(_OPEN_CONNECTIONS)
+
+    def unclosed() -> list[str]:
+        return [stack for token, (_, stack) in _OPEN_CONNECTIONS.items() if token not in before]
+
+    return unclosed

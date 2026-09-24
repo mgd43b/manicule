@@ -51,7 +51,7 @@ from manicule.core.version import CORE_VERSION
 from manicule.generation.answers import EventKind
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     from pydantic import JsonValue
     from rich.console import Console
@@ -257,6 +257,21 @@ Both declarations are the same option, so two spellings of the help would be two
 WORKSPACE_HELP = "Run in this workspace instead of the configured one."
 """One sentence for ``--workspace``, for the same reason :data:`JSON_HELP` is one sentence."""
 
+WORKSPACES_HELP = (
+    "Search these workspaces together, comma-separated (a,b), merged into one ranking whose "
+    "hits each name their workspace. An administrator's search. Not --workspace/-w, which runs "
+    "the whole command in one other workspace: this searches several from this one, and "
+    "includes this one only if it is named."
+)
+"""Why ``--workspaces`` and ``--workspace`` are two options and not one.
+
+They differ by a letter and do different things, so the help says so where both are listed:
+``-w b search x`` is an ordinary search run *in* ``b``, and ``search x --workspaces a,b`` is one
+search *across* ``a`` and ``b``, merged. Folding one into the other would make the plural a way
+to change which workspace a command runs in, and the singular a way to widen a search.
+"""
+
+
 WORKSPACE_NAMED_TWICE = (
     "--workspace was given twice with different values, {before!r} before the command and "
     "{after!r} after it. Name one workspace: manicule cannot run an operation in both, and "
@@ -438,7 +453,9 @@ config_app = typer.Typer(
     help="Read and write configuration.", no_args_is_help=True, cls=CommandsShareTheRootOptions
 )
 auth_app = typer.Typer(
-    help="API keys for this workspace.", no_args_is_help=True, cls=CommandsShareTheRootOptions
+    help="API keys and members of this workspace.",
+    no_args_is_help=True,
+    cls=CommandsShareTheRootOptions,
 )
 collection_app = typer.Typer(
     help="Named sets of documents.", no_args_is_help=True, cls=CommandsShareTheRootOptions
@@ -727,6 +744,13 @@ PAYLOADS: dict[str, type[Payload]] = {
     "auth_create_key": r.ApiKeyIssued,
     "auth_list_keys": r.ApiKeyList,
     "auth_revoke_key": r.ApiKeyRevoked,
+    "auth_users": r.UserList,
+    "auth_set_role": r.UserUpdated,
+    "auth_disable_user": r.UserUpdated,
+    "auth_enable_user": r.UserUpdated,
+    "auth_sign_out": r.UserSignedOut,
+    "auth_alerts": r.SecurityAlertList,
+    "auth_ack_alert": r.SecurityAlertAcknowledged,
     "collection_create": r.CollectionSummary,
     "collection_list": r.CollectionList,
     "collection_rename": r.CollectionSummary,
@@ -936,8 +960,16 @@ def search(
         list[str] | None,
         typer.Option(help="Restrict to these collections, by name. Repeat to union them."),
     ] = None,
+    workspaces: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--workspaces",
+            help=WORKSPACES_HELP,
+        ),
+    ] = None,
 ) -> None:
     """Rank passages for a query, without asking a model anything."""
+    spanned = _workspace_list(workspaces)
     emit(
         "search",
         lambda service: service.search(
@@ -947,8 +979,21 @@ def search(
             sources=tuple(source or ()),
             media_types=tuple(media_type or ()),
             collections=tuple(collection or ()),
+            workspaces=spanned,
         ),
     )
+
+
+def _workspace_list(values: Sequence[str] | None) -> tuple[str, ...] | None:
+    """``--workspaces a,b --workspaces c`` as ``("a", "b", "c")``; ``None`` when not given.
+
+    Blank pieces are kept rather than dropped, so that ``a,,b`` reaches the service and is
+    refused there — one refusal for every surface, rather than a command line that quietly
+    searched fewer workspaces than it was given.
+    """
+    if not values:
+        return None
+    return tuple(piece for value in values for piece in value.split(","))
 
 
 # --- index ------------------------------------------------------------------------------------
@@ -1926,9 +1971,17 @@ def workspace_switch(
     create: Annotated[
         bool, typer.Option("--create", help="Accept a name that does not exist.")
     ] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option(
+            "--mode",
+            help="personal or team. Team mode serves several people, so every caller must "
+            "present a credential.",
+        ),
+    ] = None,
 ) -> None:
     """Record a different active workspace. It takes effect at the next start."""
-    submit(Command("workspace_switch", {"name": name, "create": create}))
+    submit(Command("workspace_switch", {"name": name, "create": create, "mode": mode}))
 
 
 # --- auth -------------------------------------------------------------------------------------
@@ -1939,9 +1992,32 @@ def auth_create_key(
     name: Annotated[str, typer.Argument(help="A label for the key.")],
     role: Annotated[str, typer.Option(help="admin, member or viewer.")] = "member",
     expires_days: Annotated[int | None, typer.Option(help="Days until it expires.")] = None,
+    allow_ip: Annotated[
+        list[str] | None,
+        typer.Option("--allow-ip", help="A CIDR range the key may be presented from. Repeatable."),
+    ] = None,
+    rate_limit: Annotated[
+        int | None,
+        typer.Option(help="Requests per minute for this key, replacing the installation default."),
+    ] = None,
 ) -> None:
     """Mint an API key for this workspace. The secret is shown once and never stored."""
-    submit(Command("auth_create_key", {"name": name, "role": role, "expires_days": expires_days}))
+    # Cast rather than annotated, on `collection_add`'s own reasoning: `list` is invariant, so
+    # `list[str]` is never a `list[JsonValue]` however it is spelled, and every list of strings
+    # is a list of JSON values.
+    allowed_ips = cast("list[JsonValue]", list(allow_ip or []))
+    submit(
+        Command(
+            "auth_create_key",
+            {
+                "name": name,
+                "role": role,
+                "expires_days": expires_days,
+                "allowed_ips": allowed_ips,
+                "rate_limit": rate_limit,
+            },
+        )
+    )
 
 
 @auth_app.command("list-keys")
@@ -1956,6 +2032,66 @@ def auth_revoke_key(
 ) -> None:
     """Revoke an API key. Immediate, and irreversible."""
     submit(Command("auth_revoke_key", {"name_or_id": name_or_id}))
+
+
+_USER = Annotated[
+    str,
+    typer.Argument(help="The member's user id, or an address that names exactly one member."),
+]
+
+
+@auth_app.command("users")
+def auth_users() -> None:
+    """List the members of this workspace: role, standing, and live sessions."""
+    emit("auth_users", lambda service: service.user_list())
+
+
+@auth_app.command("set-role")
+def auth_set_role(
+    user: _USER,
+    role: Annotated[str, typer.Argument(help="admin, member or viewer.")],
+) -> None:
+    """Change a member's role. The last enabled administrator cannot be demoted."""
+    submit(Command("auth_set_role", {"user": user, "role": role}))
+
+
+@auth_app.command("disable-user")
+def auth_disable_user(user: _USER) -> None:
+    """Disable a member, ending their sessions and revoking their API keys at once."""
+    submit(Command("auth_disable_user", {"user": user}))
+
+
+@auth_app.command("enable-user")
+def auth_enable_user(user: _USER) -> None:
+    """Enable a disabled member again, in the role they had. Their old credentials stay revoked."""
+    submit(Command("auth_enable_user", {"user": user}))
+
+
+@auth_app.command("sign-out")
+def auth_sign_out(user: _USER) -> None:
+    """End every browser session a member holds in this workspace. They may sign in again."""
+    submit(Command("auth_sign_out", {"user": user}))
+
+
+@auth_app.command("alerts")
+def auth_alerts(
+    all_: Annotated[
+        bool, typer.Option("--all", help="Include acknowledged alerts, not just open ones.")
+    ] = False,
+) -> None:
+    """List recorded security alerts: brute force, key abuse, export volume."""
+    emit(
+        "auth_alerts",
+        lambda service: service.security_alerts(unacknowledged_only=not all_),
+    )
+
+
+@auth_app.command("ack-alert")
+def auth_ack_alert(
+    alert_id: Annotated[str, typer.Argument(help="The alert's id.")],
+) -> None:
+    """Acknowledge one security alert."""
+    submit(Command("auth_ack_alert", {"alert_id": alert_id}))
 
 
 # --- plugin -----------------------------------------------------------------------------------

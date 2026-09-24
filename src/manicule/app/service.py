@@ -44,8 +44,22 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from manicule.app import results as r
+from manicule.app.alerts import AlertMonitor
 from manicule.app.bind import is_loopback
+from manicule.app.caller import RANK, current
+from manicule.app.people import (
+    LAST_ADMIN,
+    LOGIN_PATH,
+    REFUSALS,
+    Refusal,
+    admission,
+    applicable_providers,
+    provider_for,
+    serving_problems,
+)
+from manicule.app.ports import RetrievingAcross, SpansWorkspaces
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
+from manicule.app.throttle import RateLimiter
 from manicule.config.loader import load_settings
 from manicule.config.profiles import profile_config
 from manicule.config.settings import (
@@ -53,6 +67,7 @@ from manicule.config.settings import (
     AuthoringSettings,
     BrowserProvider,
     ConnectorSettings,
+    Mode,
     Role,
     Settings,
     config_file,
@@ -66,6 +81,7 @@ from manicule.core.errors import (
     ConfigError,
     ManiculeError,
     PolicyError,
+    SignInRefusedError,
     UnknownComponentError,
     UnknownEntityError,
 )
@@ -98,7 +114,11 @@ if TYPE_CHECKING:
 
     from pydantic import SecretStr
 
-    from manicule.app.ports import Backend, Conversing
+    from manicule.app.alerts import AlertEvent
+    from manicule.app.caller import Caller
+    from manicule.app.people import Profile
+    from manicule.app.ports import Backend, Conversing, DocumentSurface, OpenedWorkspace
+    from manicule.config.settings import OAuthProvider
     from manicule.connectors.browser import BrowserSessionProvider
     from manicule.connectors.config import ConfluenceConfig
     from manicule.connectors.enriched import EnrichedProfile
@@ -823,6 +843,19 @@ class ApplicationService:
         atomic rather than merely checked.
         """
 
+        self.rate_limiter = RateLimiter(backend.settings.security.rate_limit)
+        """The caller and failed-auth token buckets. One instance for this service's whole
+        life, so a network surface charges the same buckets on every request rather than
+        starting fresh each time — see :mod:`manicule.app.throttle`."""
+
+        self.alert_monitor = AlertMonitor(
+            backend.settings.security.alerts,
+            max_tracked=backend.settings.security.rate_limit.max_tracked,
+        )
+        """Sliding-window detection of the four patterns :mod:`manicule.app.alerts` names.
+        Bounded by the rate limiter's own ``max_tracked`` rather than a second setting: both
+        are answering "how many distinct callers does this process remember at once"."""
+
     def serving_on(self, host: str) -> None:
         """Record the address this process bound, for :meth:`doctor` to judge instead of the file.
 
@@ -1159,6 +1192,7 @@ class ApplicationService:
         sources: Sequence[str] = (),
         media_types: Sequence[str] = (),
         collections: Sequence[str] = (),
+        workspaces: Sequence[str] | None = None,
     ) -> r.SearchResult:
         """Rank passages without asking a model anything.
 
@@ -1166,7 +1200,23 @@ class ApplicationService:
         ``media_types`` the way :class:`~manicule.core.retrieval.Filter` says every field
         does — disjunction within a field, conjunction between them. So two collections union,
         and a collection together with a source keeps only what is in both.
+
+        ``workspaces`` names the workspaces to search together, which makes this an
+        administrator's search spanning them (:meth:`crosses_workspaces` says when it does). Left
+        out, empty, or naming only this workspace, it is exactly the ordinary search and runs
+        the ordinary path; see :meth:`_search_across` for the other one.
         """
+        spanned = self._spanned(workspaces)
+        if spanned is not None:
+            return await self._search_across(
+                query_text,
+                spanned,
+                limit=limit,
+                profile=profile,
+                sources=sources,
+                media_types=media_types,
+                collections=collections,
+            )
         started = time.monotonic()
         query = self._query(
             query_text,
@@ -1182,21 +1232,7 @@ class ApplicationService:
         documents = await self._require_scoped_chunks(candidate.chunk for candidate in candidates)
         await self._record_query(query, retrieved, started=started)
         hits = tuple(
-            r.SearchHit(
-                document_id=candidate.chunk.document_id,
-                chunk_id=candidate.chunk.id,
-                uri=documents[candidate.chunk.document_id].uri,
-                title=documents[candidate.chunk.document_id].title,
-                heading_path=candidate.chunk.heading_path,
-                kind=candidate.chunk.kind.value,
-                anchor=_json_object(candidate.chunk.anchor.model_dump(mode="json")),
-                provenance=source_reference(documents.get(candidate.chunk.document_id)),
-                score=candidate.score,
-                scores=dict(candidate.scores),
-                text=candidate.chunk.text,
-                token_count=candidate.chunk.token_count,
-            )
-            for candidate in candidates
+            _hit(candidate, documents, workspace=self.workspace) for candidate in candidates
         )
         confidence = retrieved.confidence
         expansions, conflicts = await self._glossary_payloads(retrieved.expansion)
@@ -1217,7 +1253,291 @@ class ApplicationService:
             truncated=retrieved.context.truncated,
             elapsed_ms=_millis(started),
             collections=tuple(collections),
+            workspaces=(self.workspace,),
         )
+
+    def crosses_workspaces(self, workspaces: Sequence[str] | None) -> bool:
+        """Whether a search naming ``workspaces`` would reach beyond this workspace.
+
+        The one definition of when a search is an administrator's, public so that a network
+        surface asking for the admin floor asks exactly this question rather than its own
+        reading of the argument: a floor that fired on ``workspaces=[<this one>]`` would refuse
+        a search this service runs as an ordinary one, and one that missed a spelling this
+        method normalizes would admit a search the service then has to refuse.
+
+        Raises:
+            ConfigError: A name is blank.
+        """
+        return self._spanned(workspaces) is not None
+
+    def _spanned(self, workspaces: Sequence[str] | None) -> tuple[str, ...] | None:
+        """The workspaces a search spans, or ``None`` when it is this workspace's ordinary one.
+
+        Names are stripped and de-duplicated in the order given. **This workspace is included
+        only when it is named** — a search of ``b`` and ``c`` from a process serving ``a``
+        searches ``b`` and ``c``. Adding the serving workspace implicitly would widen a request
+        past what it named, which is the one direction a scope must never move on its own; and
+        the payload's ``workspaces`` then says exactly what ran.
+
+        Raises:
+            ConfigError: A name is blank. Dropping it would search fewer workspaces than the
+                caller believes they named.
+        """
+        if workspaces is None:
+            return None
+        named: list[str] = []
+        for raw in workspaces:
+            name = raw.strip()
+            if not name:
+                msg = (
+                    "a workspace name in `workspaces` is blank. Name each workspace to search, "
+                    "or leave the argument out to search this one."
+                )
+                raise ConfigError(msg)
+            if name not in named:
+                named.append(name)
+        if not named or named == [self.workspace]:
+            return None
+        return tuple(named)
+
+    async def _search_across(
+        self,
+        query_text: str,
+        spanned: tuple[str, ...],
+        *,
+        limit: int,
+        profile: str | None,
+        sources: Sequence[str],
+        media_types: Sequence[str],
+        collections: Sequence[str],
+    ) -> r.SearchResult:
+        """An administrator's search spanning several workspaces: N scoped searches, merged.
+
+        ``docs/retrieval.md`` §3.2 is the rule and :meth:`Retriever.retrieve_across
+        <manicule.retrieval.retriever.Retriever.retrieve_across>` the merge. What this method
+        owns is the policy around it, in the order it is checked:
+
+        1. **The caller holds the admin role.** A search spanning workspaces is a deliberate
+           widening of the isolation boundary every other operation keeps (``PLAN.md`` §16),
+           so it is decided here, once, for every surface — the network surfaces also ask for
+           the admin floor, which puts the same refusal in their ordinary 403, but this is the
+           rule and theirs is the courtesy.
+        2. **The count is within ``rag.cross_workspace_limit``.** Each workspace is its own
+           scoped search, so this bounds the work one request can ask for.
+        3. **Every named workspace opens**: it exists here, has an index, and was embedded by
+           the model this process searches with. Anything else refuses the whole search.
+        4. **Every named collection exists in every named workspace.** A scope that fails is a
+           refusal, never a narrowing that quietly searches one workspace without it.
+        5. **Every hit's identity is checked in the workspace it came from**, exactly as an
+           ordinary hit is in this one, and a hit claimed by no workspace or by two is refused.
+
+        The search is recorded once, in this workspace's query log — where it was run, by the
+        caller who ran it — and never in the other workspaces' logs, whose operators did not
+        ask it. The row carries what an ordinary one does: the query text, which is the caller's
+        own, and the ids of the passages retrieved, which the hits already carry; no other
+        workspace's text. And it is audited as ``search.cross_workspace`` with the workspaces it
+        spanned and how many hits it returned, because reading across tenants is exactly the kind
+        of act an audit trail is for.
+
+        Raises:
+            PolicyError: The caller is not an administrator, or names more workspaces than
+                ``rag.cross_workspace_limit`` allows.
+            UnknownEntityError: A workspace or a collection named is not there.
+            VectorStoreStateError: A named workspace has no index yet.
+            FingerprintMismatchError: A named workspace was embedded by another model.
+            ConfigError: This installation cannot open other workspaces or merge across them.
+            CrossWorkspaceError: A workspace's store returned a passage that is not its own.
+        """
+        started = time.monotonic()
+        self._require_admin_to_span(spanned)
+        await self._require_standing_to_span(spanned)
+        bound = self.settings.rag.cross_workspace_limit
+        if len(spanned) > bound:
+            msg = (
+                f"this search names {len(spanned)} workspaces and rag.cross_workspace_limit "
+                f"allows {bound}. Each is its own scoped search, so the limit bounds the work "
+                f"one request can ask for; search fewer at once, or raise the limit."
+            )
+            raise PolicyError(msg)
+        backend = self._backend
+        if not isinstance(backend, SpansWorkspaces):
+            msg = (
+                "this installation's backend cannot open workspaces other than the one it "
+                "serves, so a search spanning workspaces cannot run here."
+            )
+            raise ConfigError(msg)
+        opened = list(await backend.open_workspaces(spanned))
+        collection_ids = await self._collections_across(opened, collections)
+        retriever = await backend.retriever()
+        if not isinstance(retriever, RetrievingAcross):
+            msg = (
+                "the configured retrieval can search only the workspace it serves, so a search "
+                "spanning workspaces cannot run here."
+            )
+            raise ConfigError(msg)
+        query = self._query(
+            query_text,
+            limit=limit,
+            profile=profile,
+            sources=sources,
+            media_types=media_types,
+            collection_ids=sorted(collection_ids),
+            workspaces=spanned,
+        )
+        retrieved = await retriever.retrieve_across(query, [workspace.leg for workspace in opened])
+        candidates = list(retrieved.candidates)[:limit]
+        attributed = await self._require_owned_across(opened, retrieved.origins, candidates)
+        await self._record_query(query, retrieved, started=started)
+        await self._audit(
+            "search.cross_workspace",
+            details={"workspaces": list(spanned), "hits": len(candidates)},
+        )
+        hits = tuple(
+            _hit(candidate, documents, workspace=workspace)
+            for candidate, (workspace, documents) in zip(candidates, attributed, strict=True)
+        )
+        confidence = retrieved.confidence
+        return r.SearchResult(
+            query=query_text,
+            profile=query.profile.value,
+            count=len(hits),
+            hits=hits,
+            confidence=confidence.score if confidence else None,
+            confidence_band=confidence.band.value if confidence else None,
+            confidence_reason=confidence.reason if confidence else "",
+            route=retrieved.trace.route.value,
+            cached=retrieved.trace.cached,
+            truncated=retrieved.context.truncated,
+            elapsed_ms=_millis(started),
+            collections=tuple(collections),
+            workspaces=spanned,
+        )
+
+    def _require_admin_to_span(self, spanned: Sequence[str]) -> None:
+        """Refuse a search spanning workspaces to anyone short of an administrator.
+
+        Raises:
+            PolicyError: The caller does not hold the admin role.
+        """
+        caller = current()
+        if caller.holds(Role.ADMIN):
+            return
+        held = caller.role.value if caller.role is not None else "none"
+        msg = (
+            f"a search spanning workspaces ({', '.join(repr(name) for name in spanned)}) needs "
+            f"the 'admin' role, and this caller holds {held!r}. It reads corpora beyond the one "
+            f"this caller was admitted to, which is an administrator's decision to make."
+        )
+        raise PolicyError(msg)
+
+    async def _require_standing_to_span(self, spanned: Sequence[str]) -> None:
+        """Refuse to reach a workspace the signed-in caller was never admitted to.
+
+        Being an administrator is a relationship with *this* workspace. A person who administers
+        it and has no membership of another has no standing there, so a search spanning both
+        would read a corpus nobody let them see. So a caller who is a person — signed in, or
+        presenting a key they minted — must hold an enabled membership of every other workspace
+        named.
+
+        Two callers carry no person and pass: the operator at this machine, who holds every
+        workspace on it already, and a key with no owner, which only that operator — or another
+        unowned key acting for them — can mint, and which is therefore their delegate.
+
+        Raises:
+            PolicyError: The caller is a person without an enabled membership of a named
+                workspace. The message names those workspaces — the caller named them — and
+                nothing about who does belong to them.
+        """
+        caller = current()
+        if caller.is_local or caller.user_id is None:
+            return
+        others = [name for name in spanned if name != self.workspace]
+        if not others:
+            return
+        users = await self._backend.users()
+        standing = await users.standing_in(caller.user_id, others)
+        missing = [name for name in others if name not in standing]
+        if missing:
+            msg = (
+                f"a search spanning workspaces reaches only workspaces the caller is a member "
+                f"of, and this caller has no enabled membership of "
+                f"{', '.join(repr(name) for name in missing)}. Administering this workspace "
+                f"is not standing in another; an administrator of that workspace can admit you."
+            )
+            raise PolicyError(msg)
+
+    async def _collections_across(
+        self, opened: Sequence[OpenedWorkspace], names: Sequence[str]
+    ) -> frozenset[str]:
+        """Resolve each collection name in every named workspace, refusing any that is missing.
+
+        The union of every workspace's ids goes into the filter, and each workspace's leg
+        resolves membership through its own store — which answers another workspace's id with
+        no members — so a leg ends up restricted to its own workspace's collection of that name.
+
+        Raises:
+            UnknownEntityError: A name is not a collection in one of the workspaces. Refused
+                rather than dropped for that workspace, because dropping it would search that
+                workspace unrestricted — the whole of it, ranked beside the scoped rest.
+        """
+        if not names:
+            return frozenset()
+        resolved: set[str] = set()
+        for workspace in opened:
+            for name in names:
+                found = await workspace.organization.find_collection(name)
+                if found is None:
+                    msg = (
+                        f"no collection {name!r} in workspace {workspace.name!r}. The search is "
+                        f"refused rather than run without it there: a restriction that silently "
+                        f"vanished in one workspace would return every document in it."
+                    )
+                    raise UnknownEntityError(msg)
+                resolved.add(found.id)
+        return frozenset(resolved)
+
+    async def _require_owned_across(
+        self,
+        opened: Sequence[OpenedWorkspace],
+        origins: Mapping[str, tuple[str, ...]],
+        candidates: Sequence[Candidate],
+    ) -> list[tuple[str, dict[str, Document]]]:
+        """Check each hit's identity in the workspace whose search returned it.
+
+        The ordinary check (:meth:`_require_scoped_chunks`), once per workspace, through that
+        workspace's scoped store and against its name — so a store that ignored its scope is
+        caught by arithmetic on the document it returned, exactly as it is on one workspace.
+
+        Returns:
+            Per candidate, positionally: the workspace it came from and that workspace's
+            resolved documents.
+
+        Raises:
+            CrossWorkspaceError: A hit was claimed by no workspace's search, by two, or by one
+                whose store cannot vouch for it. Nothing is returned, and the message quotes
+                nothing from the offending row.
+        """
+        handles = {workspace.name: workspace for workspace in opened}
+        grouped: dict[str, list[Chunk]] = {}
+        claims: list[str] = []
+        for candidate in candidates:
+            claimed = origins.get(candidate.chunk.id, ())
+            if len(claimed) != 1 or claimed[0] not in handles:
+                msg = (
+                    f"a passage in a search spanning {len(handles)} workspaces was not returned "
+                    f"by exactly one of their searches, and a passage belongs to exactly one "
+                    f"workspace. A store ignored its scope; nothing was returned."
+                )
+                raise CrossWorkspaceError(msg)
+            claims.append(claimed[0])
+            grouped.setdefault(claimed[0], []).append(candidate.chunk)
+        resolved = {
+            workspace: await self._require_scoped_in(
+                handles[workspace].documents, workspace, chunks
+            )
+            for workspace, chunks in grouped.items()
+        }
+        return [(workspace, resolved[workspace]) for workspace in claims]
 
     async def _glossary_payloads(
         self, expansion: QueryExpansion | None
@@ -2144,6 +2464,10 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         require_owns(self.workspace, document)
         stored: Sequence[Chunk] = await store.document_chunks(document_id) if chunks else ()
+        if chunks:
+            # The metadata-only path (`chunks=False`) hands back a title and a status, not the
+            # document's content, so it is not instrumented — see `_record_content_read`.
+            await self._record_content_read(document_id)
         return r.DocumentDetail(
             document=_summary(document, chunk_count=len(stored) if chunks else None),
             chunks=tuple(
@@ -2222,6 +2546,11 @@ class ApplicationService:
             else None
         )
         body = await self._retained_body(document) if content else _Body()
+        if content and body.text is not None:
+            # Not instrumented when `content=False`, or when it was asked for and the store had
+            # none to give — `body.text is None` there, on `unavailable_reason`'s own rule that
+            # "asked for and not held" is not a read of anything.
+            await self._record_content_read(document.id)
         return r.DocumentResolved(
             document=_summary(document),
             resolved_by=resolved_by,
@@ -3135,6 +3464,7 @@ class ApplicationService:
         checks: list[r.Check] = [
             self._configuration_check(),
             self._transport_check(),
+            self._sign_in_check(),
             self._plugin_check(),
         ]
         checks.append(await self._storage_check())
@@ -3155,6 +3485,7 @@ class ApplicationService:
         checks.append(await self._authoring_check())
         checks.append(await self._collection_membership_check())
         checks.append(await self._sessions_check())
+        checks.append(await self._security_alerts_check())
         checks.append(await self._document_identity_check())
         checks.append(await self._document_content_check())
         # After the two content checks and for the same reason they are adjacent: this one is
@@ -3230,7 +3561,23 @@ class ApplicationService:
             # the configuration says so.
             "unauthenticated_authoring_configured": self._serving_unauthenticated
             and self.settings.authoring.configured,
+            "installation_mode": self.settings.mode.value,
         }
+        if self.settings.mode is Mode.TEAM and mode is AuthMode.NONE:
+            # Before the loopback answer, because loopback does not help. Team mode means there
+            # is no operator-at-this-machine for an anonymous caller to be, so a socket without
+            # authentication is refused wherever it is bound — `--no-authentication` included.
+            return r.Check(
+                name="transport",
+                state="failing",
+                detail=(
+                    "mode is 'team' and security.auth.mode is 'none', so every server start is "
+                    "refused: in team mode every caller must present a credential, and an "
+                    "anonymous administrator is a single-operator arrangement."
+                ),
+                facts=facts,
+                remedy="manicule config set security.auth.mode api_key",
+            )
         if loopback:
             return r.Check(
                 name="transport",
@@ -3282,6 +3629,40 @@ class ApplicationService:
                 f"bound to {bound}, which is reachable from the network. "
                 f"Authentication is on ({mode.value})."
             ),
+            facts=facts,
+        )
+
+    def _sign_in_check(self) -> r.Check:
+        """Whether a served installation could complete a browser sign-in.
+
+        The same conditions ``build_app`` refuses to serve with, from the same function, so an
+        operator can learn them without starting a server that will not start. ``ok`` when
+        sign-in is not the configured mode: there is then nothing to be wrong.
+        """
+        mode = self.settings.security.auth.mode
+        applicable = [provider.type for provider in applicable_providers(self.settings)]
+        facts: dict[str, JsonValue] = {"auth_mode": mode.value, "providers": list(applicable)}
+        if mode is not AuthMode.OAUTH:
+            return r.Check(
+                name="sign_in",
+                state="ok",
+                detail=f"security.auth.mode is {mode.value!r}; no browser sign-in is offered",
+                facts=facts,
+            )
+        problems = serving_problems(self.settings)
+        facts["problems"] = list(problems)
+        if problems:
+            return r.Check(
+                name="sign_in",
+                state="failing",
+                detail="; ".join(problems),
+                facts=facts,
+                remedy="manicule config show",
+            )
+        return r.Check(
+            name="sign_in",
+            state="ok",
+            detail=f"sign-in through {', '.join(applicable)}",
             facts=facts,
         )
 
@@ -3966,6 +4347,41 @@ class ApplicationService:
             if isinstance(base_url, str):
                 held[base_url] = _text(row.get("account"))
         return held
+
+    async def _security_alerts_check(self) -> r.Check:
+        """Whether any recorded security alert is still waiting for a person to look at it.
+
+        ``degraded``, not ``failing``: an alert names a pattern worth attention, not evidence
+        that this installation is broken — the corpus and every check above this one can be
+        perfectly healthy while an address hammers authentication. The remedy names the exact
+        commands to review and clear it, on the rule every other remedy here follows.
+        """
+        try:
+            store = await self._backend.security_alerts()
+            _rows, total = await store.list_alerts(unacknowledged_only=True, limit=1, offset=0)
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            # `doctor` is run when storage is broken; one check that cannot read must report
+            # that, not take every other check's answer down with it.
+            return r.Check(
+                name="security_alerts",
+                state="unknown",
+                detail=f"security alerts could not be read: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
+        if total == 0:
+            return r.Check(
+                name="security_alerts",
+                state="ok",
+                detail="no unacknowledged security alerts",
+                facts={"unacknowledged": 0},
+            )
+        return r.Check(
+            name="security_alerts",
+            state="degraded",
+            detail=f"{total} unacknowledged security alert(s)",
+            facts={"unacknowledged": total},
+            remedy="manicule auth alerts; manicule auth ack-alert <id>",
+        )
 
     async def _document_identity_check(self) -> r.Check:
         """Documents keyed on where they sit while the file beside them declares a page id.
@@ -5288,6 +5704,10 @@ class ApplicationService:
             _validate_structural_chunker_config(document, parts)
 
         await asyncio.to_thread(_update_config, path, mutate)
+        # The key only, never the value: a value can be a credential even when the name is not
+        # one `secret_setting` recognizes, and the audit trail is exactly the durable, exported
+        # artifact `secret_setting` exists to keep secrets out of.
+        await self._audit("config.changed", details={"key": key})
         return r.ConfigChange(key=key, previous=previous, value=parsed, path=str(path))
 
     async def _current_value(self, parts: Sequence[str]) -> JsonValue:
@@ -5306,6 +5726,12 @@ class ApplicationService:
         Counts are reported for the active workspace only. This handle is scoped to one
         tenant, and counting another's documents through it would be the breach the scope
         exists to prevent — reported as a number rather than as text, but a read all the same.
+
+        **The active workspace's mode is the configuration's; every other one's is the mode it
+        was last opened for writing under.** Configuration is what decides how this process
+        behaves, so it is the true answer for the workspace being served. For the rest there is
+        no process to ask, and the record a writer left on the workspace's row is the only
+        answer there is.
         """
         maintenance = await self._backend.maintenance()
         store = await self._backend.documents()
@@ -5314,13 +5740,13 @@ class ApplicationService:
         if self.workspace not in known:
             rows = [*rows, (self.workspace, self.workspace, self.settings.mode.value)]
         summaries: list[r.WorkspaceSummary] = []
-        for identifier, name, mode in sorted(rows):
+        for identifier, name, recorded in sorted(rows):
             active = identifier == self.workspace
             summaries.append(
                 r.WorkspaceSummary(
                     id=identifier,
                     name=name,
-                    mode=mode,
+                    mode=self.settings.mode.value if active else recorded,
                     active=active,
                     documents=await store.count_documents() if active else None,
                 )
@@ -5329,21 +5755,36 @@ class ApplicationService:
             active=self.workspace, count=len(summaries), workspaces=tuple(summaries)
         )
 
-    async def workspace_switch(self, name: str, *, create: bool = False) -> r.WorkspaceSwitched:
-        """Record a different active workspace in the config file.
+    async def workspace_switch(
+        self, name: str, *, create: bool = False, mode: str | None = None
+    ) -> r.WorkspaceSwitched:
+        """Record a different active workspace in the config file, and optionally its mode.
 
         It takes effect on the next start, and deliberately not on this one: half a process
         holding handles scoped to the old workspace and half to the new one is exactly the
         state in which a cross-tenant read stops being impossible.
 
+        ``mode`` — ``personal`` or ``team`` — is written in the same edit as the workspace, so
+        the file never names one without the other. It is installation configuration rather
+        than a property stored on the workspace: the next writer to open the workspace records
+        it on the workspace's row, which is where ``workspace list`` reads it back from.
+
         Raises:
-            ConfigError: The name is empty.
+            ConfigError: The name is empty, or ``mode`` is not one manicule has.
             UnknownEntityError: No such workspace, and ``create`` was not asked for.
         """
         wanted = name.strip()
         if not wanted:
             msg = "a workspace name cannot be empty"
             raise ConfigError(msg)
+        chosen: Mode | None = None
+        if mode is not None:
+            try:
+                chosen = Mode(mode.strip().lower())
+            except ValueError as exc:
+                allowed = ", ".join(item.value for item in Mode)
+                msg = f"no such mode {mode!r}. Available: {allowed}"
+                raise ConfigError(msg) from exc
         maintenance = await self._backend.maintenance()
         known = {row[0] for row in await maintenance.workspaces()}
         if wanted not in known and not create:
@@ -5351,8 +5792,36 @@ class ApplicationService:
             msg = f"no workspace named {wanted!r}. Known: {listed}. Pass create to make it."
             raise UnknownEntityError(msg)
         previous = self.workspace
-        change = await self.config_set("workspace", wanted, as_text=True)
-        return r.WorkspaceSwitched(previous=previous, active=wanted, path=change.path)
+        if chosen is None:
+            change = await self.config_set("workspace", wanted, as_text=True)
+            await self._audit(
+                "workspace.switched", details={"previous": previous, "active": wanted}
+            )
+            return r.WorkspaceSwitched(previous=previous, active=wanted, path=change.path)
+        path = config_file()
+
+        def mutate(document: dict[str, Any]) -> None:
+            document["workspace"] = wanted
+            document["mode"] = chosen.value
+
+        await asyncio.to_thread(_update_config, path, mutate)
+        await self._audit(
+            "workspace.switched",
+            details={"previous": previous, "active": wanted, "mode": chosen.value},
+        )
+        detail = ""
+        if chosen is Mode.TEAM and self.settings.security.auth.mode is AuthMode.NONE:
+            # Recorded anyway, because the edit is valid configuration: team mode with
+            # authentication off is refused where a socket is made, not in the file. Saying so
+            # now spares the operator finding out from the next `manicule serve`.
+            detail = (
+                "team mode with security.auth.mode = 'none' cannot be served: every caller must "
+                "present a credential. Set security.auth.mode to 'api_key' or 'oauth' before "
+                "the next start."
+            )
+        return r.WorkspaceSwitched(
+            previous=previous, active=wanted, path=str(path), mode=chosen.value, detail=detail
+        )
 
     # --- plugins --------------------------------------------------------------------------
 
@@ -5462,6 +5931,7 @@ class ApplicationService:
                 ),
             )
         change = await self._set_plugin_lists(name, enabled=True)
+        await self._audit("plugin.added", details={"name": name})
         return r.PluginChanged(
             name=name, enabled=True, installed=True, path=change, detail="enabled at next start"
         )
@@ -5479,6 +5949,7 @@ class ApplicationService:
             msg = f"no plugin named {name!r} is installed. Installed: {known}"
             raise UnknownEntityError(msg)
         change = await self._set_plugin_lists(name, enabled=False)
+        await self._audit("plugin.removed", details={"name": name})
         return r.PluginChanged(
             name=name,
             enabled=False,
@@ -5495,47 +5966,107 @@ class ApplicationService:
     # --- api keys -------------------------------------------------------------------------
 
     async def api_key_create(
-        self, name: str, *, role: str = "member", expires_days: int | None = None
+        self,
+        name: str,
+        *,
+        role: str = "member",
+        expires_days: int | None = None,
+        allowed_ips: Sequence[str] = (),
+        rate_limit: int | None = None,
     ) -> r.ApiKeyIssued:
         """Mint an API key for this workspace.
 
+        **Ownership and the role cap, decided from** :func:`~manicule.app.caller.current`.
+        **A person's key is theirs**, whatever their role: ``user_id`` is the minter, so their
+        membership can demote or revoke it — a disabled administrator's keys go with them, and a
+        key they mint reaches no workspace they were not admitted to. An administrator may mint
+        any role; anyone else only at or below their own, so a member cannot hand out an admin
+        key. **Only the operator at this machine mints an unowned key** (``user_id`` ``None``,
+        the convention :class:`~manicule.storage.models.ApiKey` records for it), and so does a
+        key that operator minted, acting as their delegate — which is what makes "an unowned key
+        speaks for the operator" true rather than assumed. A non-admin caller with no
+        ``user_id`` at all — a member or viewer key that is itself unowned — cannot mint
+        anything: there would be
+        nobody for the new key to belong to, and minting an unowned key from a non-admin
+        authority would let it outlive the very membership that justified it.
+
         Raises:
-            ConfigError: The name is empty, or the role is not one manicule has.
+            ConfigError: The name is empty, the role is not one manicule has, an entry in
+                ``allowed_ips`` is not an address or a CIDR range, or ``rate_limit`` is not a
+                positive number of requests per minute.
+            PolicyError: The caller may not mint a key at all, or not one with this role.
         """
         label = name.strip()
         if not label:
             msg = "an API key needs a name, so that it can be revoked without guessing"
             raise ConfigError(msg)
-        try:
-            chosen = Role(role)
-        except ValueError as exc:
-            allowed = ", ".join(item.value for item in Role)
-            msg = f"no such role {role!r}. Available: {allowed}"
-            raise ConfigError(msg) from exc
+        chosen = _role(role)
+        if rate_limit is not None and rate_limit < 1:
+            msg = f"rate_limit must be at least 1 request per minute, got {rate_limit}"
+            raise ConfigError(msg)
+        cidrs = _validated_cidrs(allowed_ips)
+        owner = _key_owner_for(current(), chosen)
         keys = await self._backend.keys()
-        summary, secret = await keys.issue(label, role=chosen.value, expires_days=expires_days)
+        summary, secret = await keys.issue(
+            label,
+            role=chosen.value,
+            expires_days=expires_days,
+            user_id=owner,
+            allowed_ips=cidrs,
+            rate_limit=rate_limit,
+        )
         # The record, never the secret. An audit trail that quoted the credential it was
         # recording the creation of would be a copy of every key ever minted.
         await self._audit(
             "api_key.created",
-            details={"id": summary.id, "name": summary.name, "role": summary.role},
+            details={
+                "id": summary.id,
+                "name": summary.name,
+                "role": summary.role,
+                "owner": summary.user_id,
+                "allowed_ips": list(summary.allowed_ips),
+                "rate_limit": summary.rate_limit,
+            },
         )
         return r.ApiKeyIssued(key=summary, secret=secret)
 
     async def api_key_list(self) -> r.ApiKeyList:
-        """Every key in this workspace. Never a secret — only digests are stored."""
-        keys = await self._backend.keys()
-        listed = tuple(await keys.list_keys())
+        """Keys in this workspace: every one for an admin or the local operator, else only the
+        caller's own.
+
+        Never a secret — only digests are stored.
+        """
+        caller = current()
+        if caller.is_local or caller.holds(Role.ADMIN):
+            keys = await self._backend.keys()
+            listed = tuple(await keys.list_keys())
+        elif caller.user_id:
+            keys = await self._backend.keys()
+            listed = tuple(await keys.list_keys(owner=caller.user_id))
+        else:
+            # A non-admin caller with no user_id — an unowned key's own holder — owns nothing.
+            listed = ()
         return r.ApiKeyList(count=len(listed), keys=listed)
 
     async def api_key_revoke(self, name_or_id: str) -> r.ApiKeyRevoked:
-        """Revoke a key.
+        """Revoke a key: any key in this workspace for an admin or the local operator, else only
+        one the caller owns.
 
         Raises:
-            UnknownEntityError: No key by that name or id **in this workspace**.
+            UnknownEntityError: No key by that name or id **in this workspace**, or it exists
+                but belongs to somebody else — reported identically, so a non-admin caller
+                cannot use this to discover what keys other people hold.
         """
+        caller = current()
         keys = await self._backend.keys()
-        summary = await keys.revoke(name_or_id)
+        if caller.is_local or caller.holds(Role.ADMIN):
+            summary = await keys.revoke(name_or_id)
+        elif caller.user_id:
+            summary = await keys.revoke(name_or_id, restrict_to_owner=caller.user_id)
+        else:
+            # A non-admin caller with no user_id owns nothing, ever.
+            msg = f"no API key named {name_or_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
         await self._audit("api_key.revoked", details={"id": summary.id, "name": summary.name})
         return r.ApiKeyRevoked(id=summary.id, name=summary.name, revoked=True)
 
@@ -6054,7 +6585,13 @@ class ApplicationService:
             NameInUseError: A collection of that name already exists here.
         """
         store = await self._backend.organization()
-        return _collection(await store.create_collection(name, description=description, rule=rule))
+        created = _collection(
+            await store.create_collection(name, description=description, rule=rule)
+        )
+        await self._audit(
+            "collection.created", details={"collection_id": created.id, "name": created.name}
+        )
+        return created
 
     async def collection_list(self) -> r.CollectionList:
         """Every collection in this workspace."""
@@ -6072,6 +6609,7 @@ class ApplicationService:
         """
         store = await self._backend.organization()
         await store.delete_collection(collection_id)
+        await self._audit("collection.deleted", details={"collection_id": collection_id})
         return r.CollectionDeleted(collection_id=collection_id, deleted=True)
 
     async def collection_add(
@@ -6476,6 +7014,53 @@ class ApplicationService:
             ),
         )
 
+    async def security_alerts(
+        self, *, unacknowledged_only: bool = False, limit: int = 50, offset: int = 0
+    ) -> r.SecurityAlertList:
+        """A page of recorded security alerts, newest first.
+
+        Recorded independently of ``security.audit.enabled`` — see
+        :meth:`record_security_alert` — so this list is not empty just because auditing is off.
+        """
+        store = await self._backend.security_alerts()
+        rows, total = await store.list_alerts(
+            unacknowledged_only=unacknowledged_only, limit=limit, offset=offset
+        )
+        return r.SecurityAlertList(
+            total=total,
+            count=len(rows),
+            limit=limit,
+            offset=offset,
+            unacknowledged_only=unacknowledged_only,
+            alerts=tuple(
+                r.SecurityAlert(
+                    id=_text(row.get("id")),
+                    kind=_text(row.get("kind")),
+                    subject=_text(row.get("subject")),
+                    details=_json_object(row.get("details")),
+                    created_at=_text(row.get("created_at")),
+                    acknowledged_at=_text_or_none(row.get("acknowledged_at")),
+                    acknowledged_by=_text_or_none(row.get("acknowledged_by")),
+                )
+                for row in rows
+            ),
+        )
+
+    async def security_alert_acknowledge(self, alert_id: str) -> r.SecurityAlertAcknowledged:
+        """Mark one alert acknowledged, recording who did it.
+
+        Raises:
+            UnknownEntityError: No such alert in this workspace.
+        """
+        store = await self._backend.security_alerts()
+        actor = current().actor
+        row = await store.acknowledge_alert(alert_id, by=actor)
+        if row is None:
+            msg = f"no security alert {alert_id!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        await self._audit("security.alert_acknowledged", details={"id": alert_id})
+        return r.SecurityAlertAcknowledged(id=alert_id, acknowledged=True, acknowledged_by=actor)
+
     async def search_quality(self) -> r.SearchQuality:
         """What the evaluation harness has recorded, rendered by the harness itself.
 
@@ -6576,7 +7161,7 @@ class ApplicationService:
 
     # --- identity -------------------------------------------------------------------------
 
-    async def authenticate(self, secret: str) -> r.Identity:
+    async def authenticate(self, secret: str, *, address: str = "") -> r.Identity:
         """Turn a presented API key into an identity, or say plainly that it is not one.
 
         The whole decision lives here rather than in the surface that received the header, so
@@ -6587,6 +7172,11 @@ class ApplicationService:
         When ``security.auth.mode`` is ``none`` this reports an unauthenticated identity
         rather than inventing one — and it is the bind policy, not this method, that stops an
         unauthenticated installation being reachable from anywhere but loopback.
+
+        Args:
+            address: The presenting client's address, passed to
+                :meth:`~manicule.app.ports.Keys.verify` so a key with a non-empty
+                ``allowed_ips`` is refused from anywhere else.
         """
         mode = self.settings.security.auth.mode
         if mode is AuthMode.NONE:
@@ -6598,7 +7188,7 @@ class ApplicationService:
                 authenticated=False, mode=mode.value, role="", workspace=self.workspace
             )
         keys = await self._backend.keys()
-        summary = await keys.verify(secret)
+        summary = await keys.verify(secret, address=address)
         if summary is None:
             return r.Identity(
                 authenticated=False, mode=mode.value, role="", workspace=self.workspace
@@ -6610,7 +7200,21 @@ class ApplicationService:
             key_id=summary.id,
             key_name=summary.name,
             workspace=summary.workspace,
+            via="key",
+            user_id=summary.user_id or "",
+            user_email=summary.user_email or "",
+            user_name=summary.user_name or "",
+            rate_limit=summary.rate_limit,
         )
+
+    async def record_failed_authentication(self, *, credential_kind: str) -> None:
+        """Audit a presented credential that did not authenticate.
+
+        Never the credential's value — only which *kind* it was (``bearer`` or ``x-api-key``)
+        — and the address is whatever :func:`~manicule.app.caller.current` reports, which the
+        surface has already set with :func:`~manicule.app.caller.acting_as` before calling this.
+        """
+        await self._audit("auth.failed", details={"credential_kind": credential_kind})
 
     async def auth_providers(self) -> r.AuthProviders:
         """Which identity providers are configured, by name and type only.
@@ -6629,11 +7233,312 @@ class ApplicationService:
                     f"offered. Authenticate with an API key, or configure OAuth."
                 ),
             )
+        # Only the providers that apply to *this* workspace. One configured for another
+        # workspace is refused at its login path here, so listing it would advertise a sign-in
+        # this process will not perform.
+        applicable = applicable_providers(self.settings)
         return r.AuthProviders(
             mode=auth.mode.value,
-            count=len(auth.providers),
-            providers=tuple(provider.type for provider in auth.providers),
+            count=len(applicable),
+            providers=tuple(provider.type for provider in applicable),
+            login_paths=tuple(LOGIN_PATH.format(provider=provider.type) for provider in applicable),
         )
+
+    # --- people and sessions --------------------------------------------------------------
+
+    def sign_in_provider(self, provider_type: str) -> OAuthProvider:
+        """The configured provider a browser may sign in through here, by type.
+
+        Not an operation — it returns configuration, and the surface that asks is the one about
+        to speak the provider's protocol. It is on the service so that *which* provider applies
+        to this workspace is decided in one place: a login route that consulted the provider
+        list itself would be a second opinion about it.
+
+        Raises:
+            UnknownEntityError: No provider of that type applies to this workspace, or sign-in
+                is not the configured mode. One refusal for both, because the difference is not
+                the caller's business.
+        """
+        provider = provider_for(self.settings, provider_type)
+        if provider is None:
+            msg = f"there is no sign-in through {provider_type!r} for workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        return provider
+
+    async def sign_in(self, provider_type: str, profile: Profile) -> r.SignedIn:
+        """Admit a person an identity provider has vouched for, and start their session.
+
+        **Admission is decided on every sign-in, not only the first.** The provider's allowlist
+        is consulted as it stands now, so removing an address stops that person here the next
+        time; a disabled membership is refused whatever the allowlist says; and only then is the
+        person recorded, made a member if they were not one — in the provider's role, that once
+        — and given a session.
+
+        The refusal says which of three categories applied and no more: see
+        :class:`~manicule.core.errors.SignInRefusedError`.
+
+        **What the audit trail keeps of a refusal is the provider and the category — never the
+        address.** A refused address belongs to somebody who is not a member and never agreed to
+        be recorded by this installation, and a trail is kept indefinitely and read by every
+        administrator; the client address the row already carries says where the attempt came
+        from. A successful sign-in names the person by id, which is what every other row that
+        person causes will name them by.
+
+        Raises:
+            UnknownEntityError: No provider of that type applies here.
+            SignInRefusedError: The person is not admitted, their address is unverified where
+                one is required, or their membership is disabled.
+        """
+        provider = self.sign_in_provider(provider_type)
+        if profile.provider != provider.type:
+            msg = (
+                f"a {profile.provider!r} identity was presented to the {provider.type!r} "
+                f"sign-in; nothing was recorded"
+            )
+            raise ConfigError(msg)
+        refusal = admission(provider, profile)
+        users = await self._backend.users()
+        if refusal is None:
+            existing = await users.member_by_subject(profile.provider, profile.subject)
+            if existing is not None and existing.disabled:
+                refusal = Refusal.DISABLED
+        if refusal is not None:
+            await self._audit(
+                "auth.login_refused",
+                details={"provider": provider.type, "reason": refusal.value},
+            )
+            raise SignInRefusedError(REFUSALS[refusal], reason=refusal.value)
+        member = await users.admit(profile, role=provider.role.value)
+        self._require_member_here(member)
+        session_id, expires_at, token = await users.begin_session(
+            member.id, max_age_s=self.settings.security.auth.session_max_age_s
+        )
+        await self._audit(
+            "auth.login",
+            details={"user_id": member.id, "provider": provider.type, "session_id": session_id},
+            actor=member.id,
+        )
+        return r.SignedIn(user=member, session_id=session_id, expires_at=expires_at, token=token)
+
+    async def authenticate_session(self, token: str) -> r.Identity:
+        """Turn a browser's session token into an identity, or say plainly that it is not one.
+
+        The session counterpart of :meth:`authenticate`, and deliberately the same shape: every
+        way a session can be unusable — unknown, revoked, expired, another workspace's, a
+        disabled person's — is one ``None`` from the store and one unauthenticated identity
+        here. The role is the membership's as it stands now, read in the same statement, so a
+        demotion takes effect on the demoted person's very next request.
+
+        Only when ``security.auth.mode`` is ``oauth``. Under any other mode there is no
+        sign-in, so a session cookie — left over from before a configuration change — is not a
+        credential this installation accepts.
+        """
+        mode = self.settings.security.auth.mode
+        unauthenticated = r.Identity(
+            authenticated=False, mode=mode.value, role="", workspace=self.workspace
+        )
+        if mode is not AuthMode.OAUTH or not token:
+            return unauthenticated
+        users = await self._backend.users()
+        member = await users.resolve_session(token)
+        # The store's predicate is what refuses another workspace's session. This is the check
+        # on the way out, against the row in hand, and it fails closed: a member from anywhere
+        # else is an unauthenticated caller, not an error the caller could learn from.
+        if member is None or member.workspace != self.workspace or member.disabled:
+            return unauthenticated
+        return r.Identity(
+            authenticated=True,
+            mode=mode.value,
+            role=member.role,
+            workspace=member.workspace,
+            via="session",
+            user_id=member.id,
+            user_email=member.email,
+            user_name=member.name,
+        )
+
+    async def sign_out(self, token: str) -> r.SignedOut:
+        """End one browser session on the server.
+
+        Revoked rather than merely forgotten by the browser: a copy of the cookie taken before
+        the sign-out stops working at the same moment the original does. Succeeds whether or
+        not the token named a live session, because signing out twice is not an error.
+        """
+        ended = False
+        if token:
+            users = await self._backend.users()
+            ended = await users.end_session(token)
+        if ended:
+            await self._audit("auth.logout", details={})
+        return r.SignedOut(ended=ended)
+
+    async def user_list(self) -> r.UserList:
+        """Every member of this workspace, with how many browsers each is signed in with."""
+        users = await self._backend.users()
+        members = tuple(await users.list_members())
+        for member in members:
+            self._require_member_here(member)
+        return r.UserList(
+            count=len(members),
+            admins=sum(1 for member in members if member.role == "admin" and not member.disabled),
+            users=members,
+        )
+
+    async def user_update(
+        self, user: str, *, role: str | None = None, disabled: bool | None = None
+    ) -> r.UserUpdated:
+        """Change one member's role, their standing, or both, as one change.
+
+        Three rules, all here so that every surface has all three:
+
+        * **A workspace that has an enabled administrator keeps one.** A change that would take
+          the last one away is refused, with what to do instead. The command line gets the same
+          refusal: the operator at a terminal can always promote somebody first, so the rule
+          costs them an ordering rather than an ability.
+        * **Nobody disables themselves.** A disable ends every session the person holds, the
+          one making the request included, and revokes every key they minted — a click on one's
+          own row that no longer has anybody present to undo it. Demoting oneself is allowed,
+          because handing administration to somebody else is legitimate and the first rule
+          already stops it from leaving nobody in charge.
+        * **Disabling takes the person's credentials with it**, sessions and keys together, in
+          the store's one transaction.
+
+        Raises:
+            ConfigError: Neither a role nor a standing was given, or the role is not one
+                manicule has.
+            UnknownEntityError: No member matches ``user`` in this workspace.
+            AmbiguousHandleError: An address matched more than one member.
+            PolicyError: The change would leave no enabled administrator, or a person tried
+                to disable themselves.
+        """
+        if role is None and disabled is None:
+            msg = "nothing to change: give a role, a standing (disabled or enabled), or both"
+            raise ConfigError(msg)
+        wanted = _role(role) if role is not None else None
+        users = await self._backend.users()
+        member = await self._member(user)
+        caller = current()
+        if disabled and caller.user_id == member.id:
+            msg = (
+                "you cannot disable your own membership: it would end the session making this "
+                "request and revoke every key you minted, with nobody signed in to undo it. Ask "
+                "another administrator, or run `manicule auth disable-user` at the command line."
+            )
+            raise PolicyError(msg)
+        was_admin = member.role == Role.ADMIN.value and not member.disabled
+        new_role = wanted.value if wanted is not None else member.role
+        new_disabled = disabled if disabled is not None else member.disabled
+        stays_admin = new_role == Role.ADMIN.value and not new_disabled
+        if was_admin and not stays_admin and await users.count_admins() <= 1:
+            raise PolicyError(LAST_ADMIN.format(who=member.id, workspace=self.workspace))
+        change = await users.update_member(
+            member.id, role=wanted.value if wanted is not None else None, disabled=disabled
+        )
+        self._require_member_here(change.member)
+        if change.member.role != change.previous_role:
+            await self._audit(
+                "user.role_changed",
+                details={
+                    "user_id": change.member.id,
+                    "from": change.previous_role,
+                    "to": change.member.role,
+                },
+            )
+        if change.member.disabled and not change.previously_disabled:
+            await self._audit(
+                "user.disabled",
+                details={
+                    "user_id": change.member.id,
+                    "sessions_revoked": change.sessions_revoked,
+                    "keys_revoked": change.keys_revoked,
+                },
+            )
+        elif change.previously_disabled and not change.member.disabled:
+            await self._audit("user.enabled", details={"user_id": change.member.id})
+        return r.UserUpdated(
+            user=change.member,
+            previous_role=change.previous_role,
+            previously_disabled=change.previously_disabled,
+            sessions_revoked=change.sessions_revoked,
+            keys_revoked=change.keys_revoked,
+        )
+
+    async def user_set_role(self, user: str, role: str) -> r.UserUpdated:
+        """Change one member's role. See :meth:`user_update` for the rules it is held to."""
+        return await self.user_update(user, role=role)
+
+    async def user_disable(self, user: str) -> r.UserUpdated:
+        """Disable one member, ending their sessions and revoking their keys at once."""
+        return await self.user_update(user, disabled=True)
+
+    async def user_enable(self, user: str) -> r.UserUpdated:
+        """Enable a disabled member again, in the role they had.
+
+        Their sessions and keys stay revoked: re-enabling a person restores their membership,
+        not credentials they may have lost control of. They sign in again and mint new keys.
+        """
+        return await self.user_update(user, disabled=False)
+
+    async def user_sign_out(self, user: str) -> r.UserSignedOut:
+        """End every browser session one member holds in this workspace.
+
+        For a lost laptop or a shared machine: the person stays a member and may sign in again.
+        Their API keys are untouched — a key is revoked by name, on its own.
+        """
+        users = await self._backend.users()
+        member = await self._member(user)
+        revoked = await users.end_sessions(member.id)
+        await self._audit(
+            "user.signed_out", details={"user_id": member.id, "sessions_revoked": revoked}
+        )
+        refreshed = member.model_copy(update={"sessions": 0})
+        return r.UserSignedOut(user=refreshed, sessions_revoked=revoked)
+
+    async def _member(self, user: str) -> r.UserSummary:
+        """The one member of this workspace that ``user`` names, by id or by address.
+
+        Raises:
+            UnknownEntityError: Nothing matched, among this workspace's members.
+            AmbiguousHandleError: An address matched more than one member — two accounts at
+                two providers can report the same one — and each candidate's id is listed.
+        """
+        wanted = user.strip()
+        users = await self._backend.users()
+        found = list(await users.find_members(wanted))
+        for member in found:
+            self._require_member_here(member)
+        exact = [member for member in found if member.id == wanted]
+        if exact:
+            return exact[0]
+        if not found:
+            msg = f"no member {wanted!r} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
+        if len(found) > 1:
+            candidates = ", ".join(f"{member.id} ({member.provider})" for member in found)
+            msg = (
+                f"{wanted!r} is the address of {len(found)} members of workspace "
+                f"{self.workspace!r}: {candidates}. Name one by its id."
+            )
+            raise AmbiguousHandleError(msg)
+        return found[0]
+
+    def _require_member_here(self, member: r.UserSummary) -> None:
+        """Refuse a membership of another workspace on its way out of the service.
+
+        The people store scopes every statement by workspace, and that is where isolation is
+        enforced. This reads the row in hand, so a store that lost its predicate is refused
+        loudly rather than answering a question about somebody else's workspace.
+
+        Raises:
+            CrossWorkspaceError: It is another workspace's.
+        """
+        if member.workspace != self.workspace:
+            msg = (
+                f"the people store returned a membership of another workspace to workspace "
+                f"{self.workspace!r}. This is a store that ignored its scope; nothing was "
+                f"returned."
+            )
+            raise CrossWorkspaceError(msg)
 
     # --- helpers --------------------------------------------------------------------------
 
@@ -6646,24 +7551,97 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         require_owns(self.workspace, document)
 
-    async def _audit(self, event_type: str, *, details: Mapping[str, object]) -> None:
+    async def _audit(
+        self, event_type: str, *, details: Mapping[str, object], actor: str | None = None
+    ) -> None:
         """Record one security-relevant event, when auditing is switched on.
 
         Gated here rather than in the writer, so that "auditing is off" is a decision made
         once against configuration instead of a condition every call site repeats — and the
         admin surface reports the same switch alongside the entries, so an empty trail is
         never mistaken for a quiet one.
+
+        **Who and from where come from** :func:`~manicule.app.caller.current`, the caller the
+        surface that authenticated this request said it was acting for with
+        :func:`~manicule.app.caller.acting_as`. Every row carries them: a trail whose rows name
+        nobody exists without answering the one question an audit trail is for. ``actor``
+        overrides the who for the one event whose subject is not yet the caller: a sign-in,
+        where the request arrived anonymous and the row is about the person it admitted.
         """
         audit = self.settings.security.audit
         if not audit.enabled:
             return
         if audit.events and event_type not in audit.events:
             return
+        caller = current()
         telemetry = await self._backend.telemetry()
         # Deliberately **not** wrapped the way `_record_query` is. An audit entry that cannot
         # be written must fail the operation it was auditing: a trail with holes in it is worse
         # than none, because the holes are invisible and the operation reported success.
-        await telemetry.record_audit(event_type, details=details)
+        await telemetry.record_audit(
+            event_type,
+            details=details,
+            actor=actor or caller.actor,
+            ip_address=caller.address or None,
+        )
+
+    async def record_security_alert(self, event: AlertEvent | None) -> None:
+        """Persist, log and audit one alert :attr:`alert_monitor` decided to fire.
+
+        Recorded even when auditing is off — the ``security_alerts`` row and the warning log
+        are the alert; ``security.alert`` in the audit trail is a second, optional view of the
+        same fact and follows ``audit.enabled`` like everything else :meth:`_audit` writes.
+
+        Args:
+            event: ``None`` when nothing crossed a threshold, which every ``record_*`` method on
+                :class:`~manicule.app.alerts.AlertMonitor` returns far more often than not — a
+                caller passes whatever came back without checking first, on the same rule
+                :meth:`_audit` follows for "is auditing on".
+        """
+        if event is None:
+            return
+        store = await self._backend.security_alerts()
+        alert_id = await store.record_alert(event.kind, event.subject, details=event.details)
+        # WARNING, not ERROR: nothing has failed. A pattern worth a person's attention is not
+        # a defect in this installation, and neither the subject nor the details carry document
+        # text or a credential — see `AlertEvent`.
+        _log.warning(
+            "security alert %s: kind=%s subject=%s details=%s",
+            alert_id,
+            event.kind,
+            event.subject,
+            event.details,
+        )
+        await self._audit(
+            "security.alert",
+            details={"id": alert_id, "kind": event.kind, "subject": event.subject, **event.details},
+        )
+
+    async def _record_content_read(self, document_id: str) -> None:
+        """Instrument one read of a document's actual content: :meth:`document_get` with
+        ``chunks=True`` and :meth:`document_resolve` with ``content=True`` — the two places
+        manicule hands a caller a document's stored text or bytes, rather than a title, a
+        status, or a ranked passage.
+
+        **Search hits are deliberately not instrumented.** Search returns short passages
+        ranked for relevance, which is the corpus's core function rather than an export;
+        counting every hit here would flag ordinary use as a security event, and would fire in
+        proportion to how often somebody searches rather than to how much of the corpus they
+        have actually read.
+
+        **The local operator is not monitored for export volume.** They already hold every
+        authority the command line gives them, including ``manicule export``, so flagging their
+        own reads is noise with no security value — there is no boundary here for an alert to
+        be evidence of crossing. The audit trail still records the read regardless of who made
+        it: ``document.accessed`` is gated by ``security.audit.enabled`` like every other event,
+        never by who the caller is.
+        """
+        await self._audit("document.accessed", details={"document_id": document_id})
+        caller = current()
+        if caller.is_local:
+            return
+        event = self.alert_monitor.record_document_read(caller.actor, document_id)
+        await self.record_security_alert(event)
 
     async def _record_query(
         self, query: Query, retrieved: RetrievalResult, *, started: float
@@ -6706,11 +7684,14 @@ class ApplicationService:
         sources: Sequence[str] = (),
         media_types: Sequence[str] = (),
         collection_ids: Sequence[str] = (),
+        workspaces: Sequence[str] = (),
     ) -> Query:
-        """Build a query already carrying this workspace.
+        """Build a query already carrying this workspace — or the ones an administrator named.
 
         The filter has no default workspace and cannot be built without one, so there is no
-        path from here to an unscoped search.
+        path from here to an unscoped search. ``workspaces`` is set only by
+        :meth:`_search_across`, after the caller's authority and the configured bound have both
+        been checked; empty, the query carries this workspace and nothing else.
 
         ``collection_ids`` are ids, already resolved from whatever the caller named by
         :meth:`_collection_scope`. Resolution happens before this rather than inside it
@@ -6734,7 +7715,7 @@ class ApplicationService:
             limit=limit,
             profile=chosen,
             filter=Filter(
-                workspace_ids=frozenset({self.workspace}),
+                workspace_ids=frozenset(workspaces or (self.workspace,)),
                 sources=frozenset(sources),
                 media_types=frozenset(media_types),
                 collection_ids=frozenset(collection_ids),
@@ -6799,19 +7780,32 @@ class ApplicationService:
         Raises:
             CrossWorkspaceError: A chunk points at a document this workspace does not own.
         """
+        return await self._require_scoped_in(
+            await self._backend.documents(), self.workspace, chunks
+        )
+
+    @staticmethod
+    async def _require_scoped_in(
+        store: DocumentSurface, workspace: str, chunks: Iterable[Chunk]
+    ) -> dict[str, Document]:
+        """:meth:`_require_scoped_chunks` for ``workspace``, through ``store`` — its own handle.
+
+        Raises:
+            CrossWorkspaceError: A chunk points at a document ``workspace`` does not own.
+        """
         wanted = list(dict.fromkeys(chunk.document_id for chunk in chunks))
         if not wanted:
             return {}
-        found = await self._scoped_documents(wanted)
+        found = await _documents_in(store, workspace, wanted)
         missing = [document_id_ for document_id_ in wanted if document_id_ not in found]
         if missing:
             msg = (
                 f"retrieval returned {len(missing)} chunk(s) whose document workspace "
-                f"{self.workspace!r} cannot see. Nothing was returned: a search that quietly "
-                f"drops the rows it should not have had is a search that leaked the ranking."
+                f"{workspace!r} cannot see. Nothing was returned: a search that quietly drops "
+                f"the rows it should not have had is a search that leaked the ranking."
             )
             raise CrossWorkspaceError(msg)
-        require_owned(self.workspace, found.values())
+        require_owned(workspace, found.values())
         return found
 
     async def _scoped_documents(self, document_ids: Iterable[str]) -> dict[str, Document]:
@@ -6827,18 +7821,7 @@ class ApplicationService:
         glossary entry whose document is missing is a race and must be dropped. Deciding here
         would force one of them to un-decide it.
         """
-        asked = frozenset(document_ids)
-        if not asked:
-            return {}
-        store = await self._backend.documents()
-        page = await store.list_documents(
-            Filter(workspace_ids=frozenset({self.workspace}), document_ids=asked),
-            limit=len(asked),
-        )
-        # Restricted to what was asked for. A store that returns more than the filter allowed
-        # is a defect its own conformance suite owns; here the question is only which of the
-        # requested documents came back.
-        return {document.id: document for document in page if document.id in asked}
+        return await _documents_in(await self._backend.documents(), self.workspace, document_ids)
 
     def _answer_payload(
         self,
@@ -7586,6 +8569,47 @@ def _hub_offline_env() -> str:
     return OFFLINE_ENV
 
 
+def _hit(candidate: Candidate, documents: Mapping[str, Document], *, workspace: str) -> r.SearchHit:
+    """One ranked passage as a search reports it, attributed to the workspace it came from."""
+    document = documents[candidate.chunk.document_id]
+    return r.SearchHit(
+        document_id=candidate.chunk.document_id,
+        chunk_id=candidate.chunk.id,
+        uri=document.uri,
+        title=document.title,
+        heading_path=candidate.chunk.heading_path,
+        kind=candidate.chunk.kind.value,
+        anchor=_json_object(candidate.chunk.anchor.model_dump(mode="json")),
+        provenance=source_reference(document),
+        workspace=workspace,
+        score=candidate.score,
+        scores=dict(candidate.scores),
+        text=candidate.chunk.text,
+        token_count=candidate.chunk.token_count,
+    )
+
+
+async def _documents_in(
+    store: DocumentSurface, workspace: str, document_ids: Iterable[str]
+) -> dict[str, Document]:
+    """The documents of ``document_ids`` that ``workspace``'s store can see, keyed by id.
+
+    One query rather than one per document, and it returns what was found and says nothing
+    about what was not — see :meth:`ApplicationService._scoped_documents` for why each caller
+    decides that for itself.
+    """
+    asked = frozenset(document_ids)
+    if not asked:
+        return {}
+    page = await store.list_documents(
+        Filter(workspace_ids=frozenset({workspace}), document_ids=asked), limit=len(asked)
+    )
+    # Restricted to what was asked for. A store that returns more than the filter allowed is a
+    # defect its own conformance suite owns; here the question is only which of the requested
+    # documents came back.
+    return {document.id: document for document in page if document.id in asked}
+
+
 def _millis(started: float) -> int:
     return max(int((time.monotonic() - started) * 1000), 0)
 
@@ -8080,6 +9104,20 @@ def _read_toml(path: Path) -> dict[str, Any]:
         return tomllib.load(handle)
 
 
+def _role(value: str) -> Role:
+    """A role by name, or a refusal listing the ones that exist.
+
+    Raises:
+        ConfigError: ``value`` is not a role manicule has.
+    """
+    try:
+        return Role(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in Role)
+        msg = f"no such role {value!r}. Available: {allowed}"
+        raise ConfigError(msg) from exc
+
+
 def _update_config(path: Path, mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
     """Read the config file, change it, validate the **whole** tree, then write it.
 
@@ -8171,6 +9209,54 @@ def _config_key_parts(key: str) -> list[str]:
     if len(raw) >= component_field_parts and raw[:2] == ["plugins", "config"]:
         return [*raw[:2], f"{raw[2]}.{raw[3]}", *raw[4:]]
     return raw
+
+
+def _validated_cidrs(allowed_ips: Sequence[str]) -> tuple[str, ...]:
+    """Every entry as a network, on :class:`~manicule.config.settings.TransportSettings`'s own
+    rule for ``trusted_proxies``: ``ip_network(..., strict=False)``, so a bare host address means
+    that single host.
+
+    Raises:
+        ConfigError: An entry is not an address or a CIDR range, naming it.
+    """
+    from ipaddress import ip_network  # noqa: PLC0415
+
+    for entry in allowed_ips:
+        try:
+            ip_network(entry, strict=False)
+        except ValueError as exc:
+            msg = f"{entry!r} is not an address or a CIDR range for allowed_ips ({exc})"
+            raise ConfigError(msg) from exc
+    return tuple(allowed_ips)
+
+
+def _key_owner_for(caller: Caller, requested_role: Role) -> str | None:
+    """Who a newly minted key belongs to, and the role cap that comes with not being an admin.
+
+    See :meth:`ApplicationService.api_key_create` for the reasoning; this is only the rule.
+
+    Raises:
+        PolicyError: The caller may not mint a key at all, or not one with ``requested_role``.
+    """
+    if caller.is_local:
+        return None
+    if caller.holds(Role.ADMIN):
+        # A signed-in administrator's key is theirs; an unowned admin key — the operator's
+        # delegate — mints unowned keys, and nothing else can.
+        return caller.user_id
+    if not caller.user_id:
+        msg = (
+            "minting an API key requires being signed in, an administrator, or the local "
+            "operator — this caller is none of those"
+        )
+        raise PolicyError(msg)
+    if caller.role is not None and RANK[requested_role] > RANK[caller.role]:
+        msg = (
+            f"cannot mint a key with role {requested_role.value!r}: that is more authority "
+            f"than this caller holds ({caller.role.value!r})"
+        )
+        raise PolicyError(msg)
+    return caller.user_id
 
 
 def _validate_structural_chunker_config(

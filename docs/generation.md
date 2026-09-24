@@ -383,6 +383,22 @@ once-per-chunk cost, not a per-query one.
 **Started concurrently with the generation call**, since it needs no model output. On a warm
 cache it has finished before the request reaches the provider.
 
+**Closed with the answer, whichever finishes first.** Each document's checks run as a task of
+their own. When the answer ends before they do — a one-sentence reply that cites nothing, a
+reader who went away — closing the run cancels those tasks, waits for them until the close
+deadline and no longer, and records every slot still without a verdict as a drop. The deadline
+holds whatever the tasks do. A canceled check can outlast its cancellation: the engine finishes
+opening a connection before it raises one, because a connection abandoned half-open is one
+nothing can close (`storage.md` §3.1), and a parser may catch the cancellation or block in its
+own cleanup. The close does not wait for either past its deadline.
+
+A check still running at the deadline keeps running, canceled, with nothing waiting on it. It
+changes nothing about the answer: every slot already has its verdict, and the first verdict
+wins. It is not abandoned either. The verifier holds it until it finishes, a connection it was
+opening is closed by the engine before its cancellation is raised, and the runtime waits for
+every such check before it disposes of the engine or closes the parsers the check reads with,
+so none of them is left reading from something already gone.
+
 **Bounded, and the bound is a failure rather than a bypass.** `citation_verify_timeout_s`
 defaults to 5.0, measured from the start of the answer, which is generous because the work
 began before the first token. A marker whose verification has not completed when the marker
@@ -1125,6 +1141,14 @@ batch:
 | — | The model's answer | It has already left. Redacting the reply protects nothing and would rewrite the answer, which §3.4 refuses |
 | — | The system prompt and slot labels | manicule's own text, not user content |
 
+**Text sent to an embedder is not on this path, and that is a boundary rather than a gap.** A
+redacted chunk embeds as a vector of the redaction, so the index would stop finding the very
+passages a question names. Every embedding backend manicule ships runs on this machine or on an
+endpoint the operator configured, and an embedding endpoint that leaves the machine is governed
+by the startup refusal instead: with `cloud_allowed = false`, `Settings.policy_problems()`
+refuses any selected endpoint — embedding included — that is not on this machine. A hosted
+embedder added later is covered by that refusal and not by `auto_redact`.
+
 **Redacting the query is the correction the prior art most needs** — a user pasting a
 customer's email into the chat box currently ships it to the provider verbatim and stores it in
 plaintext — and it has a cost worth naming: retrieval already ran on the *unredacted* query, so
@@ -1626,9 +1650,9 @@ and cannot read the runbook. That is a weaker guarantee than checking it themsel
 honestly labeled as an attestation rather than dressed up as a link they could follow.
 
 Sharing is an explicit act whose confirmation states exactly what becomes public, in those
-terms. And because a document *title* can itself be sensitive, team mode can disable sharing
-entirely — one switch, in `security`, rather than a per-field disclosure policy nobody will
-configure correctly.
+terms. And because a document *title* can itself be sensitive, an operator can disable sharing
+entirely — `security.sharing.enabled`, one switch independent of `mode`, rather than a
+per-field disclosure policy nobody will configure correctly.
 
 ### 11.4 Revocation and expiry are not optional
 
