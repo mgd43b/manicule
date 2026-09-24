@@ -2987,13 +2987,18 @@ class _Users:
         from manicule.app.people import LAST_ADMIN  # noqa: PLC0415
         from manicule.app.ports import MemberChange  # noqa: PLC0415
         from manicule.storage import models  # noqa: PLC0415
-        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.engine import session_factory, writer_admission  # noqa: PLC0415
         from manicule.storage.types import utcnow  # noqa: PLC0415
 
         workspace = self._runtime.workspace
         now = utcnow()
-        sessions = session_factory(self._runtime.require_engine())
-        async with sessions.begin() as session:
+        engine = self._runtime.require_engine()
+        sessions = session_factory(engine)
+        # In the engine's one writer queue, for the whole transaction. The last-administrator
+        # count below is read before the change is written, and SQLite takes no lock for a
+        # read: without the queue two demotions each count two administrators, both write, and
+        # the workspace is left with none.
+        async with writer_admission(engine), sessions.begin() as session:
             row = (
                 await session.execute(
                     select(models.User, models.WorkspaceMember)

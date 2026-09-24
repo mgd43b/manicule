@@ -48,10 +48,23 @@ async def test_the_local_operator_mints_any_role_unowned(service: ApplicationSer
     assert issued.key.user_id is None
 
 
-async def test_an_admin_mints_any_role_unowned(service: ApplicationService) -> None:
-    with acting_as(ADMIN):
+async def test_a_signed_in_admin_s_key_is_theirs(service: ApplicationService) -> None:
+    """An administrator may mint any role, and the key still belongs to them.
+
+    Unowned, it would outlive their membership — a disabled administrator keeping every key
+    they minted — and would pass the cross-workspace standing check as the operator's delegate,
+    reaching workspaces they were never admitted to.
+    """
+    with acting_as(Caller(role=Role.ADMIN, user_id="u-admin")):
         issued = await service.api_key_create("for-a-teammate", role="admin")
     assert issued.key.role == "admin"
+    assert issued.key.user_id == "u-admin"
+
+
+async def test_an_unowned_admin_key_mints_unowned_keys(service: ApplicationService) -> None:
+    """The operator's delegate delegates in turn: there is no person to own what it mints."""
+    with acting_as(ADMIN):
+        issued = await service.api_key_create("ci", role="viewer")
     assert issued.key.user_id is None
 
 

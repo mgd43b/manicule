@@ -1440,8 +1440,8 @@ class ApplicationService:
         named.
 
         Two callers carry no person and pass: the operator at this machine, who holds every
-        workspace on it already, and a key with no owner, which only that operator can mint and
-        which is therefore their delegate.
+        workspace on it already, and a key with no owner, which only that operator — or another
+        unowned key acting for them — can mint, and which is therefore their delegate.
 
         Raises:
             PolicyError: The caller is a person without an enabled membership of a named
@@ -4356,8 +4356,18 @@ class ApplicationService:
         perfectly healthy while an address hammers authentication. The remedy names the exact
         commands to review and clear it, on the rule every other remedy here follows.
         """
-        store = await self._backend.security_alerts()
-        _rows, total = await store.list_alerts(unacknowledged_only=True, limit=1, offset=0)
+        try:
+            store = await self._backend.security_alerts()
+            _rows, total = await store.list_alerts(unacknowledged_only=True, limit=1, offset=0)
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            # `doctor` is run when storage is broken; one check that cannot read must report
+            # that, not take every other check's answer down with it.
+            return r.Check(
+                name="security_alerts",
+                state="unknown",
+                detail=f"security alerts could not be read: {type(exc).__name__}: {exc}",
+                facts={"error_type": type(exc).__name__},
+            )
         if total == 0:
             return r.Check(
                 name="security_alerts",
@@ -5967,16 +5977,16 @@ class ApplicationService:
         """Mint an API key for this workspace.
 
         **Ownership and the role cap, decided from** :func:`~manicule.app.caller.current`.
-        The local operator and an administrator may mint any role, and the key they mint is
-        *unowned* — ``user_id`` is ``None``, on the same convention
-        :class:`~manicule.storage.models.ApiKey` already uses for a key the local operator
-        mints: it is provisioned on behalf of the installation rather than tied to whoever is
-        holding admin authority at the moment they minted it, which matters once a signed-in
-        administrator is a caller this process can have. A caller with a role below admin may
-        mint a key only at or below that role, and only for themselves — ``user_id`` is their
-        own — so a member cannot hand out an admin key and a key always has an owner whose
-        membership can later demote or revoke it. A non-admin caller with no ``user_id`` at all
-        — a member or viewer key that is itself unowned — cannot mint anything: there would be
+        **A person's key is theirs**, whatever their role: ``user_id`` is the minter, so their
+        membership can demote or revoke it — a disabled administrator's keys go with them, and a
+        key they mint reaches no workspace they were not admitted to. An administrator may mint
+        any role; anyone else only at or below their own, so a member cannot hand out an admin
+        key. **Only the operator at this machine mints an unowned key** (``user_id`` ``None``,
+        the convention :class:`~manicule.storage.models.ApiKey` records for it), and so does a
+        key that operator minted, acting as their delegate — which is what makes "an unowned key
+        speaks for the operator" true rather than assumed. A non-admin caller with no
+        ``user_id`` at all — a member or viewer key that is itself unowned — cannot mint
+        anything: there would be
         nobody for the new key to belong to, and minting an unowned key from a non-admin
         authority would let it outlive the very membership that justified it.
 
@@ -9228,8 +9238,12 @@ def _key_owner_for(caller: Caller, requested_role: Role) -> str | None:
     Raises:
         PolicyError: The caller may not mint a key at all, or not one with ``requested_role``.
     """
-    if caller.is_local or caller.holds(Role.ADMIN):
+    if caller.is_local:
         return None
+    if caller.holds(Role.ADMIN):
+        # A signed-in administrator's key is theirs; an unowned admin key — the operator's
+        # delegate — mints unowned keys, and nothing else can.
+        return caller.user_id
     if not caller.user_id:
         msg = (
             "minting an API key requires being signed in, an administrator, or the local "

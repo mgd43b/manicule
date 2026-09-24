@@ -470,8 +470,10 @@ class RateLimitSettings(Section):
     failed_auth_per_minute: int = Field(
         default=10,
         ge=1,
-        description="Failed authentications per minute one address may make before every "
-        "request from it is refused until the bucket refills.",
+        description="Failed authentications per minute one address may make. Past it, "
+        "requests from that address presenting a credential that does not work are refused "
+        "with 429 until the bucket refills; a working credential from the same address never "
+        "is.",
     )
     max_tracked: int = Field(
         default=10_000,

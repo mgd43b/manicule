@@ -74,7 +74,7 @@ class TokenBucket:
         self.tokens = capacity
         self.updated_at = now
 
-    def _refill(self, now: float) -> None:
+    def refill(self, now: float) -> None:
         elapsed = now - self.updated_at
         if elapsed <= 0:
             # A clock that went backwards, or two calls in the same instant. Neither refills
@@ -86,7 +86,7 @@ class TokenBucket:
 
     def take(self, now: float, *, cost: float = 1.0) -> bool:
         """Consume ``cost`` tokens if there are enough, and report whether it did."""
-        self._refill(now)
+        self.refill(now)
         if self.tokens < cost:
             return False
         self.tokens -= cost
@@ -94,12 +94,12 @@ class TokenBucket:
 
     def available(self, now: float, *, cost: float = 1.0) -> bool:
         """Whether ``cost`` tokens could be taken right now, without taking them."""
-        self._refill(now)
+        self.refill(now)
         return self.tokens >= cost
 
     def retry_after(self, now: float, *, cost: float = 1.0) -> float:
         """Seconds until ``cost`` tokens would be available. ``0`` if they already are."""
-        self._refill(now)
+        self.refill(now)
         deficit = cost - self.tokens
         if deficit <= 0:
             return 0.0
@@ -141,12 +141,19 @@ class KeyedLimiter:
     def _bucket(
         self, key: str, *, per_minute: int | None, burst: int | None, now: float
     ) -> TokenBucket:
+        capacity = float(burst if burst is not None else self._burst)
+        refill = (per_minute if per_minute is not None else self._per_minute) / 60.0
         existing = self._buckets.get(key)
         if existing is not None:
             self._buckets.move_to_end(key)
+            if existing.capacity != capacity or existing.refill_per_second != refill:
+                # Refilled at the old rate up to now, then held to the new terms from now on,
+                # with no more in hand than the new capacity allows.
+                existing.refill(now)
+                existing.capacity = capacity
+                existing.refill_per_second = refill
+                existing.tokens = min(existing.tokens, capacity)
             return existing
-        capacity = float(burst if burst is not None else self._burst)
-        refill = (per_minute if per_minute is not None else self._per_minute) / 60.0
         bucket = TokenBucket(capacity=capacity, refill_per_second=refill, now=now)
         self._buckets[key] = bucket
         if len(self._buckets) > self._max_tracked:

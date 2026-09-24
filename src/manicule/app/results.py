@@ -2491,7 +2491,8 @@ class Stats(Payload):
 class Check(Payload):
     """One diagnostic.
 
-    ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``plugins``,
+    ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``sign_in``,
+    ``plugins``,
     ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
     ``authoring``, ``collection-membership``, ``sessions``, ``security_alerts``,
     ``document-identity``, ``document-content``, ``extractable-text``, ``wiki-provenance``,

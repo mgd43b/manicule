@@ -883,7 +883,8 @@ release whether or not anything changed.
 
 Checks, in the order `doctor` emits them: `configuration`, `transport`, `sign_in`, `plugins`,
 `storage`, `permissions`, `index`, `vector_integrity`, `vector_backend`, `glossary`,
-`connectors`, `authoring`, `collection-membership`, `sessions`, `document-identity`,
+`connectors`, `authoring`, `collection-membership`, `sessions`, `security_alerts`,
+`document-identity`,
 `document-content`, `extractable-text`, `wiki-provenance`, `grammars`, `vocabularies`, `models`,
 and
 `component:<kind>:<name>` for anything already constructed.
@@ -1449,11 +1450,13 @@ viewer's until it is given workspaces other than its own, when it is an administ
 **The key routes are the deliberate exception the other way.** `GET`/`POST /api/v1/auth/keys` and
 `DELETE /api/v1/auth/keys/{nameOrId}` ask only for a viewer floor, because *who may mint, see or
 revoke what key* is not a role question the route can answer on its own: it is decided by
-`ApplicationService.api_key_create/list/revoke` against `manicule.app.caller.current()`. The
-local operator and an administrator may mint any role, and the key they mint is unowned
-(`user_id` null) — provisioned for the installation rather than tied to one person. Any other
-caller must have a `user_id` (a key with none may not mint at all), may request a role no higher
-than their own, and the new key is owned by them. Listing and revoking follow the same split: an
+`ApplicationService.api_key_create/list/revoke` against `manicule.app.caller.current()`. **A
+person's key is theirs**, whatever their role: an administrator may mint any role and anyone else
+no higher than their own, and either way the key is owned by its minter, so their membership
+demotes or revokes it — a disabled administrator's keys go with them, and a key they mint
+reaches no workspace they were never admitted to. **Only the operator at this machine mints an
+unowned key** (`user_id` null), and so does an unowned admin key, acting as that operator's
+delegate; a caller short of admin with no `user_id` may not mint at all. Listing and revoking follow the same split: an
 admin or the local operator sees and may revoke every key in the workspace; anyone else sees and
 may revoke only keys they own, and revoking somebody else's key by id fails exactly as an
 unknown id would — the same non-disclosure `Keys.verify` already practices for a bad secret.

@@ -90,18 +90,34 @@ def test_the_lru_bound_holds() -> None:
 
 
 def test_eviction_takes_the_least_recently_touched_key() -> None:
-    """Touching a key keeps it warm, so eviction is LRU rather than insertion order."""
+    """Touching a key keeps it warm, so eviction is LRU rather than insertion order.
+
+    The clock does not move, so nothing refills: a surviving "a" has spent its burst and is
+    refused, where an "a" that had been evicted and recreated would arrive full.
+    """
     clock = FakeClock()
-    limiter = KeyedLimiter(per_minute=60, burst=10, max_tracked=2, clock=clock)
+    limiter = KeyedLimiter(per_minute=60, burst=2, max_tracked=2, clock=clock)
     limiter.take("a")
     limiter.take("b")
-    limiter.take("a")  # "a" is now more recently touched than "b"
+    limiter.take("a")  # "a" is now more recently touched than "b", and has spent its burst
     limiter.take("c")  # forces an eviction: "b" goes, not "a"
     assert limiter.tracked == 2
-    # "a" still has its original bucket state (partially spent, not reset by eviction+recreate).
-    fresh = KeyedLimiter(per_minute=60, burst=10, max_tracked=2, clock=clock)
-    fresh.take("a")
-    assert fresh.tracked == 1
+    assert limiter.take("a").allowed is False, "'a' was evicted and recreated rather than kept"
+
+
+def test_a_changed_limit_applies_to_a_bucket_that_already_exists() -> None:
+    """A key's terms take effect on its next request, not whenever its bucket is evicted.
+
+    A busy key is never the least recently touched, so a limit applied only at creation would
+    never apply to the one key most likely to need it.
+    """
+    clock = FakeClock()
+    limiter = KeyedLimiter(per_minute=600, burst=100, max_tracked=10, clock=clock)
+    for _ in range(5):
+        assert limiter.take("key:k").allowed
+    # Ninety-five tokens in hand, clamped to the new capacity of one: one more, then refused.
+    assert limiter.take("key:k", per_minute=1, burst=1).allowed is True
+    assert limiter.take("key:k", per_minute=1, burst=1).allowed is False
 
 
 # --- RateLimiter -------------------------------------------------------------------------------

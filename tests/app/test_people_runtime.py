@@ -331,3 +331,52 @@ async def test_a_first_sign_in_that_loses_the_race_to_create_the_person_still_su
     async with sessions() as session:
         people = (await session.execute(select(models.User.id))).scalars().all()
     assert people == [member.id]
+
+
+async def test_two_administrators_demoted_at_once_cannot_leave_the_workspace_with_none(
+    runtime: Runtime,
+) -> None:
+    """The last-administrator check and the change it guards are one step, however they race.
+
+    Two demotions started together each count two administrators if the count is read before
+    either writes — and then both succeed. Writes queue in the engine's one writer admission, so
+    the second counts after the first has committed and is refused.
+    """
+    import asyncio  # noqa: PLC0415 - only this test races
+    import contextlib  # noqa: PLC0415
+
+    users = await runtime.users()
+    ada, _ = await _signed_in(users, role="admin", subject="ada")
+    bob, _ = await _signed_in(users, role="admin", subject="bob")
+
+    # Hold each demotion at its count until both have counted — the interleaving that loses an
+    # administrator when nothing orders the two, forced rather than left to timing. With the
+    # writes queued, the second never reaches its count while the first is open, so the barrier
+    # is released by a timeout instead of by both arriving.
+    counted = 0
+    both = asyncio.Event()
+    original = type(users)._enabled_admins  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]
+
+    async def count_then_wait(self: object, session: object) -> int:
+        nonlocal counted
+        result = int(await original(self, session))  # pyright: ignore[reportUnknownArgumentType]
+        counted += 1
+        if counted == 2:
+            both.set()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(both.wait(), timeout=0.5)
+        return result
+
+    type(users)._enabled_admins = count_then_wait  # pyright: ignore[reportAttributeAccessIssue]
+    try:
+        outcomes = await asyncio.gather(
+            users.update_member(ada, role="member"),
+            users.update_member(bob, role="member"),
+            return_exceptions=True,
+        )
+    finally:
+        type(users)._enabled_admins = original  # pyright: ignore[reportAttributeAccessIssue]
+
+    refused = [outcome for outcome in outcomes if isinstance(outcome, PolicyError)]
+    assert len(refused) == 1, outcomes
+    assert await users.count_admins() == 1

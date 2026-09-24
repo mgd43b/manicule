@@ -327,7 +327,7 @@ def render_search(out: Console, payload: r.SearchResult) -> None:
         out.print(f"[dim]{escape(hit.uri)} · {escape(_anchor_summary(hit.anchor))}[/dim]\n")
     summary = [f"{payload.count} hit(s)", f"profile {payload.profile}"]
     if spanning:
-        summary.append(f"across {', '.join(payload.workspaces)}")
+        summary.append(f"across {escape(', '.join(payload.workspaces))}")
     if payload.confidence is not None:
         summary.append(f"confidence {payload.confidence:.2f} ({payload.confidence_band})")
     if payload.explicit_definition:

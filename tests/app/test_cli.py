@@ -444,8 +444,10 @@ def test_the_help_tells_workspaces_apart_from_workspace() -> None:
     """One letter apart and two different things, so the help says which is which."""
     result = run(["search", "--help"])
 
+    # Rich colors the option names wherever the terminal allows it — CI does — and styles
+    # each dash separately, so the text is compared with its escape sequences taken out.
     assert result.exit_code == 0
-    assert "--workspaces" in result.output
+    assert "--workspaces" in _ANSI.sub("", result.output)
     assert "--workspace" in cli.WORKSPACES_HELP
     assert "runs the whole command in one other workspace" in " ".join(cli.WORKSPACES_HELP.split())
 

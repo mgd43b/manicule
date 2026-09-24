@@ -670,7 +670,9 @@ def _refuse_rate_limit(
         from manicule.web.security import is_page_request, rate_limited_page  # noqa: PLC0415
 
         if is_page_request(request):
-            return rate_limited_page(request, message, retry_after_s=retry_after_s)
+            return _dress_response(
+                rate_limited_page(request, message, retry_after_s=retry_after_s), settings
+            )
     response = refusal(
         _op_of(request), service.workspace, RateLimitedError(message, retry_after_s=retry_after_s)
     )
