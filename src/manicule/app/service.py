@@ -6610,6 +6610,7 @@ class ApplicationService:
             key_id=summary.id,
             key_name=summary.name,
             workspace=summary.workspace,
+            via="key",
         )
 
     async def auth_providers(self) -> r.AuthProviders:

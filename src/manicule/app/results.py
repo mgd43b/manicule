@@ -1914,6 +1914,16 @@ class Identity(Payload):
     key_id: str = ""
     key_name: str = ""
     workspace: str = ""
+    via: str = Field(
+        default="",
+        description="How the caller authenticated: ``key``, ``session``, or empty for nobody.",
+    )
+    user_id: str = Field(
+        default="",
+        description="The signed-in person, or the person who minted the key presented.",
+    )
+    user_email: str = ""
+    user_name: str = ""
 
 
 class AuthProviders(Payload):

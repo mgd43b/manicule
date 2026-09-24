@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Annotated
 from fastapi import Depends, Request, WebSocket
 
 from manicule.api.proxy import FORWARDED_FOR
-from manicule.app.caller import RANK
+from manicule.app.caller import RANK, Caller
 from manicule.app.results import Identity
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import ManiculeError
@@ -118,8 +118,27 @@ class Principal:
 
     @property
     def actor(self) -> str:
-        """Who to record in the audit trail. The key's id, or the local operator."""
-        return self.identity.key_id or ("local" if not self.identity.authenticated else "")
+        """Who to record in the audit trail. See :attr:`manicule.app.caller.Caller.actor`."""
+        return self.caller.actor
+
+    @property
+    def caller(self) -> Caller:
+        """This principal as the service sees it, for :func:`manicule.app.caller.acting_as`.
+
+        The unauthenticated caller of an installation with ``auth.mode = none`` is the local
+        operator, for the reason :attr:`role` gives; every other caller carries the role this
+        request resolved to, so the service can never hold a network caller to less than the
+        surface did.
+        """
+        identity = self.identity
+        if not identity.authenticated and identity.mode == AuthMode.NONE.value:
+            return Caller(address=self.address)
+        return Caller(
+            role=self.role,
+            key_id=identity.key_id or None,
+            user_id=identity.user_id or None,
+            address=self.address,
+        )
 
 
 def token_of(request: Request | WebSocket) -> str:

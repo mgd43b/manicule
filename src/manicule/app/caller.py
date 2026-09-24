@@ -40,6 +40,9 @@ if TYPE_CHECKING:
 LOCAL_ACTOR = "local"
 """What the audit trail records for the operator at this machine."""
 
+ANONYMOUS_ACTOR = "anonymous"
+"""What it records for a network caller that presented no usable credential."""
+
 
 @dataclass(frozen=True, slots=True)
 class Caller:
@@ -64,11 +67,13 @@ class Caller:
 
     @property
     def actor(self) -> str:
-        """Who the audit trail records: the person, else the key, else the local operator.
+        """Who the audit trail records: the person, else the key, else nobody in particular.
 
         The person first, because a key a person minted is that person acting.
         """
-        return self.user_id or self.key_id or LOCAL_ACTOR
+        if self.is_local:
+            return LOCAL_ACTOR
+        return self.user_id or self.key_id or ANONYMOUS_ACTOR
 
     def holds(self, floor: Role) -> bool:
         """Whether this caller's authority reaches ``floor``."""
