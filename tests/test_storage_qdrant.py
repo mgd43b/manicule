@@ -48,6 +48,7 @@ from manicule.core.lifecycle import HealthState
 from manicule.core.protocols import (
     AdoptingVectorStore,
     AnnIndexMaintenance,
+    MultiWorkspaceVectorStore,
     PublicationAwareVectorStore,
     PublicationBoundVectorStore,
     ResettableVectorStore,
@@ -767,6 +768,127 @@ async def test_deleting_from_a_store_that_holds_nothing_is_not_an_error(
     await store.delete_chunks(["no-such-row"])
 
     assert await store.count() == 0
+
+
+# --- opening another workspace ---------------------------------------------------------------
+
+
+@pytest.mark.contract
+def test_the_store_claims_the_capability_a_cross_workspace_search_needs(
+    store: QdrantVectorStore,
+) -> None:
+    """Without it, a search spanning workspaces has no way to reach a second collection.
+
+    The embedded backend's workspaces are directories the runtime opens itself; here there is
+    one client and a flat namespace, so only the store can hand out a view on another
+    workspace's collection. The signature is checked too, because ``isinstance`` would accept
+    an ``open_workspace`` that took its arguments in another order.
+    """
+    assert isinstance(store, MultiWorkspaceVectorStore)
+    assert_protocol_signatures(store, MultiWorkspaceVectorStore)
+
+
+async def test_an_opened_workspace_searches_that_workspace_s_collection_and_no_other(
+    make_store: Callable[[], QdrantVectorStore],
+) -> None:
+    """The handle is the other workspace's, not this one's with a new label.
+
+    Both workspaces hold a row at the same point in space, so a handle that searched the wrong
+    collection would still return a perfect match — just the wrong one.
+    """
+    serving, other = make_store(), make_store()
+    for held in (serving, other):
+        await prepared(held)
+        await held.upsert([chunk(f"row-of-{held.workspace_id}")], [spread(4, 0)])
+
+    opened = await serving.open_workspace(other.workspace_id, fingerprint(4))
+
+    found = await opened.search(spread(4, 0), 5)
+    assert [candidate.chunk.id for candidate in found] == [f"row-of-{other.workspace_id}"]
+    assert opened.workspace_id == other.workspace_id
+
+
+async def test_opening_a_workspace_that_holds_nothing_is_refused_and_creates_nothing(
+    store: QdrantVectorStore, client: AsyncQdrantClient
+) -> None:
+    """A cross-workspace search is a read. It must not be the act that creates an index.
+
+    ``ensure_ready`` records a model and creates a collection the first time a workspace is
+    prepared; a search that did that to a workspace it was only asked to read would leave a
+    record naming this process's model behind in a workspace nobody indexed.
+    """
+    await prepared(store)
+    before = {collection.name for collection in (await client.get_collections()).collections}
+
+    with pytest.raises(VectorStoreStateError, match="holds no vectors"):
+        await store.open_workspace("never-indexed", fingerprint(4))
+
+    after = {collection.name for collection in (await client.get_collections()).collections}
+    assert after == before
+    reader = QdrantVectorStore(
+        client, workspace_id="never-indexed", collection_prefix=TEST_COLLECTION_PREFIX
+    )
+    assert await reader.fingerprint() is None, "refusing to open it still recorded a model"
+
+
+async def test_opening_a_workspace_embedded_by_another_model_is_refused(
+    make_store: Callable[[], QdrantVectorStore],
+) -> None:
+    """Two models of one size pass every dimension check and are still two spaces.
+
+    A merged ranking compares cosines across workspaces, and a cosine from one model means
+    nothing on another's scale.
+    """
+    serving, other = make_store(), make_store()
+    await serving.ensure_ready(fingerprint(4, model_id="searching/model"))
+    await other.ensure_ready(fingerprint(4, model_id="another/model"))
+
+    with pytest.raises(FingerprintMismatchError):
+        await serving.open_workspace(other.workspace_id, fingerprint(4, model_id="searching/model"))
+
+
+async def test_opening_a_workspace_whose_collection_is_gone_is_refused(
+    make_store: Callable[[], QdrantVectorStore], client: AsyncQdrantClient
+) -> None:
+    """A record with no collection behind it is an index nobody can search, not an empty one.
+
+    Marking the handle prepared anyway would turn every search of it into a server error from
+    the middle of a merge, or — on a client that answers a missing collection with nothing — a
+    workspace silently contributing no passages to a ranking that says it covered it.
+    """
+    serving, other = make_store(), make_store()
+    for held in (serving, other):
+        await prepared(held)
+    await client.delete_collection(other.storage_name(fingerprint(4)))
+
+    with pytest.raises(VectorStoreStateError, match="does not exist"):
+        await serving.open_workspace(other.workspace_id, fingerprint(4))
+
+
+async def test_tearing_down_an_opened_workspace_leaves_the_shared_client_open(
+    client: AsyncQdrantClient,
+) -> None:
+    """The opened handle borrows the client; the serving store still needs it afterwards."""
+    serving = QdrantVectorStore(
+        client,
+        workspace_id=WORKSPACE,
+        collection_prefix=TEST_COLLECTION_PREFIX,
+        owns_client=True,
+    )
+    other = QdrantVectorStore(
+        client, workspace_id="other", collection_prefix=TEST_COLLECTION_PREFIX
+    )
+    for held in (serving, other):
+        await prepared(held)
+        await held.upsert([chunk(f"row-of-{held.workspace_id}")], [spread(4, 0)])
+
+    opened = await serving.open_workspace("other", fingerprint(4))
+    await opened.teardown()
+
+    assert [candidate.chunk.id for candidate in await serving.search(spread(4, 0), 5)] == [
+        f"row-of-{WORKSPACE}"
+    ]
+    await serving.teardown()
 
 
 # --- resetting -----------------------------------------------------------------------------

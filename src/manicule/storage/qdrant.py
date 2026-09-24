@@ -688,6 +688,55 @@ class QdrantVectorStore:
         """The fingerprint this store was built with, or ``None`` if it holds nothing yet."""
         return await self._recorded_fingerprint()
 
+    async def open_workspace(
+        self, workspace_id: str, fingerprint: EmbedFingerprint
+    ) -> QdrantVectorStore:
+        """A read handle on another workspace's collection, over this store's client.
+
+        Satisfies :class:`~manicule.core.protocols.MultiWorkspaceVectorStore`, which is what a
+        cross-workspace search asks of a backend that is not a directory. The handle shares the
+        client and does not own it, so tearing it down never closes the sockets the serving
+        workspace is still using.
+
+        **Nothing here writes**, and that is the difference from :meth:`ensure_ready`: a
+        workspace with no record is refused rather than given one, and the collection's shape is
+        read as it is rather than brought to this installation's configuration. The handle is
+        marked prepared only once the recorded fingerprint has matched and the collection it
+        names exists, so a search through it is a search of exactly the space the check passed.
+
+        Raises:
+            VectorStoreStateError: The workspace has recorded no vectors here, or its record
+                names a collection that does not exist.
+            FingerprintMismatchError: Its recorded model is not ``fingerprint``'s.
+        """
+        sibling = QdrantVectorStore(
+            self._client,
+            workspace_id=workspace_id,
+            collection_prefix=self._prefix,
+            shape=self._shape,
+            owns_client=False,
+        )
+        recorded = await sibling._recorded_fingerprint()
+        if recorded is None:
+            msg = (
+                f"workspace {workspace_id!r} holds no vectors on this Qdrant server under the "
+                f"prefix {self._prefix!r}, so there is nothing of it to search. Index a document "
+                f"into it first, or leave it out of the search."
+            )
+            raise VectorStoreStateError(msg)
+        recorded.require_match(fingerprint)
+        if not await sibling._collection_exists(fingerprint):
+            msg = (
+                f"workspace {workspace_id!r} records vectors from {fingerprint.describe()}, and "
+                f"the collection {sibling.storage_name(fingerprint)!r} that would hold them does "
+                f"not exist. The record and the server disagree; reset that workspace's index "
+                f"rather than searching half of it."
+            )
+            raise VectorStoreStateError(msg)
+        sibling._fingerprint = fingerprint
+        sibling._middleware = self._middleware
+        return sibling
+
     async def upsert(
         self,
         chunks: Sequence[Chunk],
