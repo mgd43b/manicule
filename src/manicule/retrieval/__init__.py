@@ -46,6 +46,7 @@ from manicule.retrieval.rerank import CrossEncoderReranker, PairScorer
 from manicule.retrieval.retriever import RetrievalResult, Retriever, build_retriever
 from manicule.retrieval.router import QueryRouter, Routing, UtilityKind
 from manicule.retrieval.runner import PipelineRun, PipelineRunner
+from manicule.retrieval.spanning import WorkspaceLeg, merge_on_similarity
 from manicule.retrieval.tokens import ContextTokenCounter, ContextTokenDriftError
 from manicule.retrieval.trace import Regime, RetrievalTrace, Route, Shortfall, StageSpan
 from manicule.retrieval.utility import UtilityAnswer, handlers_for
@@ -85,11 +86,13 @@ __all__ = [
     "SupportsLiveChunkCount",
     "UtilityAnswer",
     "UtilityKind",
+    "WorkspaceLeg",
     "band_for",
     "build_retriever",
     "cache_key",
     "derive_over_fetch",
     "handlers_for",
+    "merge_on_similarity",
     "rehydrate",
     "resolve",
     "retrieval_depth",

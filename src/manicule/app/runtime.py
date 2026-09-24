@@ -38,10 +38,12 @@ from manicule.container.container import Container, build_container
 from manicule.core.content import RawDocument
 from manicule.core.errors import (
     ConfigError,
+    FingerprintMismatchError,
     ManiculeError,
     PolicyError,
     UnknownEntityError,
     VectorMigrationError,
+    VectorStoreStateError,
 )
 from manicule.core.lifecycle import HealthReport, HealthState
 from manicule.ingest.capacity import CapacityRefusedError
@@ -60,6 +62,7 @@ if TYPE_CHECKING:
         Ingesting,
         Keys,
         Maintenance,
+        OpenedWorkspace,
         Organizing,
         ResetOutcome,
         RetainedBytes,
@@ -69,11 +72,16 @@ if TYPE_CHECKING:
     from manicule.config.settings import Settings
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.ann import AnnIndexBuild, AnnIndexState
-    from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
+    from manicule.core.embedding import (
+        EmbedFingerprint,
+        VectorChecksumBackfill,
+        VectorChecksumCoverage,
+    )
     from manicule.core.fingerprints import GlossaryFingerprint
     from manicule.core.protocols import (
         AdoptingVectorStore,
         Connector,
+        DocStore,
         Embedder,
         Generator,
         InspectableVectorStore,
@@ -104,7 +112,7 @@ if TYPE_CHECKING:
     )
     from manicule.storage.source_lifecycle import ResetPreparation
     from manicule.storage.vector_migration import VectorMigration
-    from manicule.storage.vectors import LanceVectorStore
+    from manicule.storage.vectors import LanceVectorStore, PublishedLanceVectorStore
 
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
@@ -238,6 +246,7 @@ class Runtime:
         self._derived_mutation_lock = asyncio.Lock()
         self._health: _Observation | None = None
         self._health_lock = asyncio.Lock()
+        self._workspaces = _Workspaces(self)
 
     # --- lifecycle --------------------------------------------------------------------------
 
@@ -321,26 +330,18 @@ class Runtime:
         try:
             close_error: Exception | None = None
             try:
-                await self._container.aclose()
-            except Exception as error:  # noqa: BLE001 - teardown must still close vector handles
+                # First, while the engine they read their publication pointers through is open.
+                await self._workspaces.aclose()
+            except Exception as error:  # noqa: BLE001 - teardown must still close the rest
                 close_error = error
             try:
-                vectors = self._slots.get("vectors")
-                if vectors is not None and vectors.value is not None:
-                    from manicule.core.protocols import (  # noqa: PLC0415
-                        PublicationBoundVectorStore,
-                    )
-
-                    if isinstance(vectors.value, PublicationBoundVectorStore):
-                        await vectors.value.teardown()
-            except Exception as vector_error:
+                await self._close_components()
+            except Exception as error:
                 if close_error is None:
                     raise
-                close_error.add_note(
-                    f"closing the published vector handle also failed: {vector_error}"
-                )
+                close_error.add_note(f"closing this workspace's components also failed: {error}")
             if close_error is not None:
-                raise close_error  # noqa: TRY301 - preserve the container's original exception
+                raise close_error  # noqa: TRY301 - preserve the first exception
         except Exception as during_teardown:
             if pending is None:
                 raise
@@ -358,6 +359,27 @@ class Runtime:
                 if self._lock is not None:
                     self._lock.release()
                     self._lock = None
+
+    async def _close_components(self) -> None:
+        """Close the container, then the published vector handle it does not own."""
+        close_error: Exception | None = None
+        try:
+            await self._container.aclose()
+        except Exception as error:  # noqa: BLE001 - teardown must still close vector handles
+            close_error = error
+        try:
+            vectors = self._slots.get("vectors")
+            if vectors is not None and vectors.value is not None:
+                from manicule.core.protocols import PublicationBoundVectorStore  # noqa: PLC0415
+
+                if isinstance(vectors.value, PublicationBoundVectorStore):
+                    await vectors.value.teardown()
+        except Exception as vector_error:
+            if close_error is None:
+                raise
+            close_error.add_note(f"closing the published vector handle also failed: {vector_error}")
+        if close_error is not None:
+            raise close_error
 
     # --- what the service is given ----------------------------------------------------------
 
@@ -546,6 +568,14 @@ class Runtime:
         """API keys for this workspace."""
         return await self._once("keys", self._build_keys)
 
+    async def open_workspaces(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
+        """Read handles on each named workspace of this data directory, for a spanning search.
+
+        Satisfies :class:`~manicule.app.ports.SpansWorkspaces`; the registry behind it is
+        :class:`_Workspaces`, whose docstring says what is shared and what is opened.
+        """
+        return await self._workspaces.open(names)
+
     async def component_checks(self) -> Sequence[Check]:
         """Health of what is already constructed. Constructs nothing.
 
@@ -726,45 +756,60 @@ class Runtime:
         under it. Neither question imports LanceDB to ask it: ``manicule.storage.config`` is a
         pydantic module, and the protocol lives in core.
         """
+        await self.documents()
+        store = await self._container.aget(keys.VECTOR_STORE)
+        if self.publishes_lance(store):
+            return await self.published_vectors(self.workspace)
+        return store
+
+    def publishes_lance(self, store: object) -> bool:
+        """Whether vectors are the embedded backend's, and so opened as a published directory."""
         from manicule.core.protocols import PublicationAwareVectorStore  # noqa: PLC0415
         from manicule.storage.config import VECTOR_STORE_NAME  # noqa: PLC0415
 
-        await self.documents()
-        store = await self._container.aget(keys.VECTOR_STORE)
-        if self._settings.storage.vector_db == VECTOR_STORE_NAME and isinstance(
+        return self._settings.storage.vector_db == VECTOR_STORE_NAME and isinstance(
             store, PublicationAwareVectorStore
-        ):
-            from sqlalchemy import select  # noqa: PLC0415
+        )
 
-            from manicule.storage import models  # noqa: PLC0415
-            from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
+    async def published_vectors(self, workspace: str) -> PublishedLanceVectorStore:
+        """The handle that follows ``workspace``'s publication pointer in the embedded backend.
 
-            async with self.require_engine().connect() as connection:
-                row = (
-                    await connection.execute(
-                        select(
-                            models.IndexState.vector_namespace,
-                            models.Workspace.derived_reset_epoch,
-                        )
-                        .select_from(models.Workspace)
-                        .outerjoin(
-                            models.IndexState,
-                            models.IndexState.workspace_id == models.Workspace.id,
-                        )
-                        .where(models.Workspace.id == self.workspace)
+        Parametrized by workspace because two callers need it: this workspace's vectors, and —
+        for a search spanning several — another workspace's on the same data directory, which
+        lives in its own directory under the same root and is bound to its own index identity
+        and reset epoch in exactly the same way.
+        """
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import VECTORS_DIRNAME  # noqa: PLC0415
+        from manicule.storage.vector_paths import workspace_vector_directory  # noqa: PLC0415
+        from manicule.storage.vectors import PublishedLanceVectorStore  # noqa: PLC0415
+
+        async with self.require_engine().connect() as connection:
+            row = (
+                await connection.execute(
+                    select(
+                        models.IndexState.vector_namespace,
+                        models.Workspace.derived_reset_epoch,
                     )
-                ).one()
-            identity_namespace = row.vector_namespace
-            return PublishedLanceVectorStore(
-                await self.vector_directory(),
-                self.require_engine(),
-                workspace_id=self.workspace,
-                identity_namespace=(
-                    None if identity_namespace is None else str(identity_namespace)
-                ),
-                expected_reset_epoch=int(row.derived_reset_epoch),
-            )
-        return store
+                    .select_from(models.Workspace)
+                    .outerjoin(
+                        models.IndexState,
+                        models.IndexState.workspace_id == models.Workspace.id,
+                    )
+                    .where(models.Workspace.id == workspace)
+                )
+            ).one()
+        identity_namespace = row.vector_namespace
+        root = self._settings.data_dir / VECTORS_DIRNAME
+        return PublishedLanceVectorStore(
+            root if identity_namespace == "legacy" else workspace_vector_directory(root, workspace),
+            self.require_engine(),
+            workspace_id=workspace,
+            identity_namespace=None if identity_namespace is None else str(identity_namespace),
+            expected_reset_epoch=int(row.derived_reset_epoch),
+        )
 
     async def _build_prepared_vectors(self) -> VectorStore:
         store = await self.vectors()
@@ -2210,6 +2255,282 @@ class _Keys:
                 raise UnknownEntityError(msg)
             row.revoked_at = utcnow()
             return _key_summary(row)
+
+
+@dataclass(slots=True)
+class _OpenedVectors:
+    """One other workspace's vector handle, and the index state it was opened against."""
+
+    state: tuple[str, str | None, int]
+    """``(embedding fingerprint, vector namespace, reset epoch)`` when this handle was opened.
+
+    Compared on every search rather than trusted: another process may reset that workspace or
+    re-embed it under another model, and a handle bound to the old identity would either refuse
+    with a message about rebuilding the runtime or — worse — search a space nobody checked.
+    """
+
+    vectors: VectorStore
+
+
+class _Workspaces:
+    """The workspace registry: read handles on the other workspaces of this data directory.
+
+    What an administrator's cross-workspace search needs (``docs/retrieval.md`` §3.2), and the
+    storage half of it only — the fan-out and the merge are retrieval's. Three things are true of
+    every handle it hands out, and each is why it is built this way rather than as a second
+    :class:`Runtime` per workspace.
+
+    **The engine is shared.** Every workspace's rows are in the one SQLite file, so each
+    workspace's document store is the ordinary scoped store over this runtime's engine — one
+    connection pool, one opinion about the schema, and a commit counter that already sees every
+    workspace's writes (``manicule.storage.scoped``).
+
+    **The embedder is shared, and that is what the fingerprint check licenses.** A cross-workspace
+    merge compares cosines, which are comparable only when one model produced every vector. So a
+    workspace is opened only if the embedding fingerprint its index recorded matches the one this
+    process searches with, and then the query is embedded once, by this process's model, for every
+    workspace. A second runtime per workspace would load a second copy of the same model to embed
+    the same query into the same space — gigabytes, for nothing — and would make it possible to
+    search a workspace in a space the others are not in.
+
+    **Nothing here writes.** A workspace that has recorded no index is refused rather than
+    prepared, and one whose vectors came from another model is refused rather than searched: a
+    cross-workspace search is a read of corpora the caller is not ingesting into. The serving
+    workspace is the one exception to "opened here" — it is this runtime's own documents and
+    prepared vectors, not a second handle on them.
+
+    Handles are cached for the life of the runtime and closed with it. The document store never
+    goes stale — it carries a workspace, not an index — and a vector handle is reopened whenever
+    the index state it was opened against has moved.
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+        self._stores: dict[str, SqliteDocStore] = {}
+        self._vectors: dict[str, _OpenedVectors] = {}
+        self._lock = asyncio.Lock()
+
+    async def open(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
+        """Open each named workspace, in order, or refuse the whole request.
+
+        All or nothing, and checked before anything is searched: a workspace that is unknown,
+        unindexed or in another model's space refuses the search that named it, because a
+        merged ranking with one workspace silently missing is a partial answer reported as a
+        whole one.
+        """
+        from manicule.app.ports import OpenedWorkspace as Opened  # noqa: PLC0415
+        from manicule.retrieval.spanning import WorkspaceLeg  # noqa: PLC0415
+
+        runtime = self._runtime
+        await runtime.documents()
+        async with self._lock:
+            # Names first, then the model, then every workspace's index, and only then a single
+            # handle: an unknown name is refused without loading an embedder to refuse it, and
+            # an unsearchable workspace is refused before any other workspace has been opened.
+            states = await self._states(names)
+            embedder = await runtime.embedder()
+            for name in names:
+                self._require_searchable(name, states[name], embedder.fingerprint)
+            opened: list[OpenedWorkspace] = []
+            for name in names:
+                state = states[name]
+                if name == runtime.workspace:
+                    documents: DocumentSurface = await runtime.documents()
+                    organization: Organizing = await runtime.organization()
+                    docstore = cast("DocStore", documents)
+                    vectors = await runtime.prepared_vectors()
+                else:
+                    store = self._store(name)
+                    documents, organization, docstore = store, store, store
+                    vectors = await self._vectors_for(name, state, embedder.fingerprint)
+                opened.append(
+                    Opened(
+                        name=name,
+                        documents=documents,
+                        organization=organization,
+                        leg=WorkspaceLeg(workspace=name, docstore=docstore, vectors=vectors),
+                    )
+                )
+            return opened
+
+    async def aclose(self) -> None:
+        """Release every vector handle this registry opened. The engine is the runtime's."""
+        opened = list(self._vectors.values())
+        self._vectors.clear()
+        failures: list[Exception] = []
+        for handle in opened:
+            teardown = getattr(handle.vectors, "teardown", None)
+            if teardown is None:
+                continue
+            try:
+                await teardown()
+            except Exception as error:  # noqa: BLE001 - collected, then reported together
+                failures.append(error)
+        if failures:
+            msg = "errors while closing other workspaces' vector handles"
+            raise ExceptionGroup(msg, failures)
+
+    async def _states(self, names: Sequence[str]) -> dict[str, tuple[str | None, str | None, int]]:
+        """Each named workspace's recorded embedding, vector namespace and reset epoch.
+
+        One statement for every workspace this data directory holds, so an unknown name can be
+        refused with the list of known ones in the same breath.
+
+        Raises:
+            UnknownEntityError: A name is not a workspace here.
+        """
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        async with self._runtime.require_engine().connect() as connection:
+            rows = (
+                await connection.execute(
+                    select(
+                        models.Workspace.id,
+                        models.IndexState.embed_fingerprint,
+                        models.IndexState.vector_namespace,
+                        models.Workspace.derived_reset_epoch,
+                    )
+                    .select_from(models.Workspace)
+                    .outerjoin(
+                        models.IndexState,
+                        models.IndexState.workspace_id == models.Workspace.id,
+                    )
+                )
+            ).all()
+        known = {
+            str(row.id): (
+                None if row.embed_fingerprint is None else str(row.embed_fingerprint),
+                None if row.vector_namespace is None else str(row.vector_namespace),
+                int(row.derived_reset_epoch),
+            )
+            for row in rows
+        }
+        unknown = [name for name in names if name not in known]
+        if unknown:
+            named = ", ".join(repr(name) for name in unknown)
+            msg = (
+                f"no workspace {named} on this data directory. Workspaces here: "
+                f"{', '.join(sorted(known)) or 'none'}. Nothing was searched: a search that "
+                f"quietly skipped a workspace it was asked for would report a partial answer as "
+                f"a whole one."
+            )
+            raise UnknownEntityError(msg)
+        return {name: known[name] for name in names}
+
+    @staticmethod
+    def _require_searchable(
+        name: str, state: tuple[str | None, str | None, int], searching: EmbedFingerprint
+    ) -> None:
+        """Refuse a workspace with no index, or one embedded by a different model.
+
+        Raises:
+            VectorStoreStateError: It has recorded no index.
+            FingerprintMismatchError: It records a different embedding model.
+        """
+        from manicule.core.embedding import EmbedFingerprint as Fingerprint  # noqa: PLC0415
+
+        recorded, _namespace, _epoch = state
+        if recorded is None:
+            msg = (
+                f"workspace {name!r} has no index yet — nothing in it has been embedded — so "
+                f"there is nothing of it to search. Index into it first (`manicule -w {name} "
+                f"index <path>`), or leave it out of the search."
+            )
+            raise VectorStoreStateError(msg)
+        built = Fingerprint.model_validate_json(recorded)
+        if not built.matches(searching):
+            msg = (
+                f"workspace {name!r} was embedded with {built.describe()}, and this process "
+                f"searches with {searching.describe()}. Cosines from two models are not one "
+                f"scale, so the two cannot be merged into one ranking; the search is refused "
+                f"rather than run without {name!r}. Re-embed one of them onto the other's model, "
+                f"or search them separately."
+            )
+            raise FingerprintMismatchError(msg)
+
+    def _store(self, name: str) -> SqliteDocStore:
+        """``name``'s scoped document store, over this runtime's engine. Built once."""
+        from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+        store = self._stores.get(name)
+        if store is None:
+            settings = self._runtime.settings
+            store = SqliteDocStore(
+                self._runtime.require_engine(),
+                workspace_id=name,
+                data_dir=settings.data_dir,
+                max_journal_records=settings.ingest.max_journal_records,
+                max_journal_metadata_bytes=settings.ingest.max_journal_metadata_bytes,
+                max_acquired_blob_backlog_bytes=settings.ingest.max_acquired_blob_backlog_bytes,
+                min_disk_headroom_bytes=settings.ingest.min_disk_headroom_bytes,
+            )
+            self._stores[name] = store
+        return store
+
+    async def _vectors_for(
+        self,
+        name: str,
+        state: tuple[str | None, str | None, int],
+        searching: EmbedFingerprint,
+    ) -> VectorStore:
+        """``name``'s vectors, opened for reading in ``searching``'s space.
+
+        The embedded backend opens the workspace's own directory, bound to its index identity
+        and reset epoch as this runtime's own handle is. Any other backend is asked to open it,
+        through :class:`~manicule.core.protocols.MultiWorkspaceVectorStore`, because only the
+        store knows how its workspaces are laid out — and a backend that cannot is refused by
+        name rather than guessed at.
+
+        Raises:
+            ConfigError: The configured vector store cannot open another workspace.
+            VectorStoreStateError: The workspace's vectors are not there to open.
+            FingerprintMismatchError: The vectors on disk are another model's.
+        """
+        from manicule.core.protocols import MultiWorkspaceVectorStore  # noqa: PLC0415
+
+        key = (searching.canonical(), state[1], state[2])
+        cached = self._vectors.get(name)
+        if cached is not None and cached.state == key:
+            return cached.vectors
+        if cached is not None:
+            del self._vectors[name]
+            teardown = getattr(cached.vectors, "teardown", None)
+            if teardown is not None:
+                await teardown()
+
+        configured = await self._runtime.container.aget(keys.VECTOR_STORE)
+        vectors: VectorStore
+        if self._runtime.publishes_lance(configured):
+            published = await self._runtime.published_vectors(name)
+            physical = await published.physical_fingerprint()
+            if physical is None:
+                await published.teardown()
+                msg = (
+                    f"workspace {name!r} records an index, and its vector directory holds none. "
+                    f"The record and the disk disagree; reset that workspace's index rather than "
+                    f"searching half of it."
+                )
+                raise VectorStoreStateError(msg)
+            try:
+                physical.require_match(searching)
+                await published.ensure_ready(searching)
+            except BaseException:
+                await published.teardown()
+                raise
+            vectors = published
+        elif isinstance(configured, MultiWorkspaceVectorStore):
+            vectors = await configured.open_workspace(name, searching)
+        else:
+            msg = (
+                f"the configured vector store ({type(configured).__name__}) cannot open another "
+                f"workspace's vectors, so a search spanning workspaces cannot run on it. Search "
+                f"each workspace on its own."
+            )
+            raise ConfigError(msg)
+        self._vectors[name] = _OpenedVectors(state=key, vectors=vectors)
+        return vectors
 
 
 class _Telemetry:

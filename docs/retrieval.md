@@ -290,16 +290,44 @@ consequences worth stating:
   computed over the whole `chunks_fts` index while relevance is being judged per workspace;
   merging on it would rank the workspaces against each other rather than the chunks.
 
-N is bounded by configuration and the feature is gated on team mode.
+N is bounded by configuration — `rag.cross_workspace_limit`, 8 by default and at most 64 — and
+the feature is an administrator's: the application service refuses a search naming any
+workspace but the serving one to a caller short of the admin role (`PLAN.md` §16), and the
+network surfaces ask for the same floor so the refusal is their ordinary 403.
 
-**What #6 built, and what waits for team mode.** The rule above is a rule about *merging*, and
-merging needs N store handles. Obtaining them is a workspace registry — team-mode plumbing in
-the storage layer, not a retrieval question — and it does not exist. What ships with the
-pipeline is the property that makes waiting safe rather than risky: `SqliteDocStore` refuses a
-filter naming a workspace it does not serve, with a message pointing at the fan-out, so a
-cross-workspace query today is an error naming its own remedy rather than a query that quietly
-answers about one workspace. The merge itself lands in the same change as the registry, and the
-rule it must follow is settled above.
+**What exists, and how it keeps the rule.** #6 settled the merge and left the store's refusal
+holding the line until something could hand out N store handles; #13 built that and the merge
+together.
+
+- **The registry** is `manicule.app.runtime._Workspaces`, behind
+  `Runtime.open_workspaces`. It opens the other workspaces of the serving process's data
+  directory for reading, sharing the one engine and the one embedder rather than building a
+  runtime per workspace: a workspace opens only if the embedding fingerprint its index recorded
+  matches the one this process searches with, which is what makes the shared model's cosines
+  one scale — and a workspace that is unknown, has no index, or was embedded by another model
+  refuses the whole search rather than being left out of it. On the embedded backend it opens
+  the workspace's own directory; any other backend is asked through
+  `MultiWorkspaceVectorStore`, which opens and never prepares.
+- **The fan-out and the merge** are `Retriever.retrieve_across` and
+  `manicule.retrieval.spanning`. Each workspace runs the pipeline's own dense stage, bound to
+  that workspace's handles, with its own over-fetch and its own hydrating join; the legs merge
+  on cosine; the pipeline's reranker, when it has one, scores the merged pool once; and only
+  then is the list re-trimmed to the pipeline's depth — trimming before the legs had filtered
+  would be the top-`k` trap (§4.2) in its cross-workspace form. Lexical, fusion, routing and
+  glossary expansion do not run: BM25 and RRF are ruled out above, a utility answer is one
+  workspace's fact, and a definition is one workspace's too.
+- **Attribution is kept, and checked.** Every merged candidate records which workspaces
+  returned it, every hit names its workspace, and the application service checks each hit's
+  identity in the workspace whose search returned it — the §4.2 join inside each leg and the
+  surface's arithmetic after it, per workspace, exactly as on one. A hit claimed by no
+  workspace or by two is refused.
+- **Confidence** is the ordinary function over the merged passages with the one leg that ran,
+  so its agreement component is suppressed with a reason rather than scored zero.
+
+`SqliteDocStore` still refuses a filter naming a workspace it does not serve, and the
+single-workspace `Retriever.retrieve` now refuses a query naming more than one, so `ask` and
+`research` — which reach retrieval only through it — cannot span workspaces at all.
+Cross-workspace is a search, and only a search.
 
 ### 3.3 The split, settled as a rule rather than as a constant
 
@@ -385,29 +413,33 @@ traded against a worse one. It is a storage change and it becomes a storage tick
 trace shows the condition occurring, not before. Nothing about correctness depends on it: the
 post-filter plan is always correct, only slower.
 
-### 3.4 What this costs in already-merged code
+### 3.4 What this cost in already-merged code
 
-The shape above is not what shipped, so closing the question has a bill, and it is a small one.
-Filed as [#36](https://github.com/mgd43b/manicule/issues/36) rather than done here, because this
-document owns no code and two implementation tickets are in flight, and **paid there** — the
-list below is what that ticket did, kept as the record of why each item was necessary:
+The shape above was not what had shipped, so closing the question had a bill, and it was a
+small one. It was filed as [#36](https://github.com/mgd43b/manicule/issues/36) rather than paid
+here, because this document owns no code, and #36 paid it. The list is kept as the record of
+what each item changed and why it was necessary:
 
-- `Filter()` no longer constructs. `predicate_for` uses `default = Filter()` as a comparison
-  sentinel and `filter.is_empty` as a short-circuit; both need replacing with a comparison
-  against declared field defaults.
-- `PUSHED_DOWN_FILTER_FIELDS` gains `langs`, and needs a companion set naming `workspace_ids` as
-  **deliberately not pushed down**. This is the delicate one: the current code raises on any
-  field it cannot honor, and that refusal is doing real work. It must keep raising for
-  everything except the one field whose enforcement moved somewhere stronger, and the exemption
-  has to be a named constant with the reason attached, not an omission.
-- `SqliteDocStore._require_same_workspace` compares a scalar; it becomes a subset check, and the
-  fan-out in §3.2 means it will only ever see its own workspace.
-- The exemption above is the one place a security field is knowingly dropped by a store, so it
-  gets a structural guard rather than a comment: `manicule.testing` grows
-  `assert_pipeline_enforces_scope(pipeline, docstore, query)`, which runs a pipeline against a
-  fixture holding soft-deleted, `pending` and foreign-workspace chunks and asserts that **no
-  stage's output** contains one. A dense stage that skipped the join fails it. The same check is
-  available as an opt-in runtime assertion in the pipeline runner, off by default.
+- **`Filter()` no longer constructs.** `predicate_for` had used `default = Filter()` as a
+  comparison sentinel and `filter.is_empty` as a short-circuit; both were replaced by
+  `Filter.restricting_fields`, which compares each field against its own declared default.
+- **`PUSHED_DOWN_FILTER_FIELDS` gained `langs`, and `EXEMPT_FILTER_FIELDS` names
+  `workspace_ids` as deliberately not pushed down.** Both live in
+  `manicule.storage.vector_schema`, shared by the two backends. This was the delicate one: the
+  store raises on any field it cannot honor, and that refusal does real work, so it still
+  raises for everything except the one field whose enforcement moved somewhere stronger — and
+  the exemption is a named constant with its reason attached rather than an omission.
+- **The document store's workspace check became a subset check.** It is
+  `WorkspaceScoped._require_honorable` in `manicule.storage.scoped` now, and with the fan-out
+  of §3.2 a store only ever sees its own workspace; one handed a filter reaching past it is
+  refused.
+- **The exemption got a structural guard rather than a comment**, because it is the one place
+  a store knowingly drops a security field.
+  `manicule.testing.assert_pipeline_enforces_scope(pipeline, docstore, query)` runs a pipeline
+  against a fixture holding soft-deleted, `pending` and foreign-workspace chunks and fails if
+  **any stage's output** contains one, so a dense stage that skipped the join fails it. The
+  same check is the opt-in runtime assertion `rag.assert_scope` in the pipeline runner, off by
+  default — and it holds every leg of a cross-workspace search too.
 
 ---
 
@@ -1300,6 +1332,11 @@ content-caching version invites:
 shortened list would be correct but misleading — the ranking was computed over a candidate set
 that no longer exists, and the replacement for the dropped candidate was never considered.
 
+A cross-workspace ranking (§3.2) is cached the same way, with one addition: the entry records
+which workspace returned each id, because a chunk id cannot say which workspace minted it, and a
+hit re-hydrates each id through **that workspace's** store and join. An id whose workspace the
+search did not open is one no store can vouch for, and makes the entry stale like any other drop.
+
 ### 10.2 The key
 
 A hash over the canonical form of, in order:
@@ -1323,7 +1360,11 @@ Notes on four of those:
   like a corpus with nothing more in it — the §4.4 failure arriving through the cache.
 
 - **The whole `Filter`, not just the workspace.** Two filters produce two different rankings; a
-  key that omits one is a cache that answers a different question.
+  key that omits one is a cache that answers a different question. The workspace *set* is part
+  of it, and that is what keeps an administrator's cross-workspace ranking (§3.2) and one
+  workspace's ranking of the same words apart — served to each other, the first would show a
+  single-workspace caller other tenants' passages, and the second would report a search that
+  says it spanned several and looked at one.
 - **The pipeline declaration and the reranker id.** Comparing two pipelines is #15's entire
   method, and a cache that cannot tell them apart would serve pipeline A's ranking as pipeline
   B's result. #15 also runs with the cache **disabled**, which is a configuration flag rather
@@ -2001,7 +2042,7 @@ Calls made in the absence of a stated position.
 | Stages run sequentially; concurrency deliberately declined for measurement clarity | §2.2 |
 | Stage names unique within a pipeline; the container refuses duplicates | §2.2 |
 | `Filter` settled: `workspace_ids` required/non-empty, `sources` and `langs` set-valued, `extra` removed | §3.1 |
-| Cross-workspace search is N scoped queries merged on cosine, never one unscoped query, never RRF | §3.2 |
+| Cross-workspace search is N scoped queries merged on cosine, never one unscoped query, never RRF; an administrator's, bounded by `rag.cross_workspace_limit`, and search-only | §3.2 |
 | The pre-filter/post-filter split is a rule with recorded inputs, not a constant | §3.3 |
 | "No join-requiring field set" and "resolved to the empty set" are opposite instructions, not one case | §3.3 |
 | The hydrating join lives *inside* the dense stage, so scope is a per-stage invariant | §2.4, §4.2 |
@@ -2061,7 +2102,7 @@ out here because a reader of the other documents will not have seen it coming.
 
 | Ticket | What | Why not here |
 |---|---|---|
-| [#36](https://github.com/mgd43b/manicule/issues/36) | **Reshape `Filter` to the settled form** (§3.1, §3.4), and add `assert_pipeline_enforces_scope` | It changes `manicule.core.retrieval` and both stores — merged code owned by #1 and #2 — while two implementation tickets are in flight. It is also worth landing as its own reviewable change, because it moves a security boundary |
+| [#36](https://github.com/mgd43b/manicule/issues/36) | **Reshape `Filter` to the settled form** (§3.1, §3.4), and add `assert_pipeline_enforces_scope` — landed | It changed `manicule.core.retrieval` and both stores — merged code owned by #1 and #2 — while two implementation tickets were in flight, and it was worth landing as its own reviewable change, because it moved a security boundary |
 
 ## Appendix E: what #6 changed in this document
 
@@ -2070,7 +2111,7 @@ did, each fixed above rather than noted:
 
 | Where | What building it showed |
 |---|---|
-| §3.2 | The cross-workspace **merge rule** is a retrieval decision and is settled; the **fan-out** needs a workspace registry that is team-mode storage plumbing. The store's refusal is what holds the line meanwhile, and it names its own remedy |
+| §3.2 | The cross-workspace **merge rule** is a retrieval decision and is settled; the **fan-out** needed a workspace registry, which is storage plumbing rather than a retrieval question. #6 shipped the rule and the store's refusal; #13 shipped the registry and the merge together, and the refusal still stands for any single store handed a filter reaching past its workspace |
 | §3.3 | Resolution has to stop one row past `prefilter_id_limit`, and the count it records is then a lower bound. A figure recorded as exact when it is not would skew the distribution the threshold is to be set from |
 | §4.1, §11.1 | The lexical trace records the query text the leg was **given**, not the escaped match string. Escaping belongs to the store; reproducing it in the stage would import a database driver into a package that needs none and hardcode one store's query language into a swappable leg |
 | §7.3, §12.1 | The token budgets were inherited, unreachable by a factor of three to five, and `precise` failed its own startup cross-check against the model this project ships with. They are now derived from what each profile can hold |

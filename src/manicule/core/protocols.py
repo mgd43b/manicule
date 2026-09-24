@@ -611,6 +611,40 @@ class ResettableVectorStore(Protocol):
 
 
 @runtime_checkable
+class MultiWorkspaceVectorStore(Protocol):
+    """Optionally opens a read handle on another workspace's vectors, held by the same backend.
+
+    What an administrator's cross-workspace search needs from a backend that is not a directory
+    (``docs/retrieval.md`` §3.2): one scoped handle per workspace, fanned out and merged. The
+    embedded backend does not implement this and is not degraded by it — each workspace is its
+    own directory, and the application runtime opens that directory itself, exactly as it opens
+    the serving workspace's. A networked backend holds one client for every workspace, so the
+    handle for a second workspace is a second view over the same connection rather than a second
+    connection, and only the store knows how to make one.
+
+    **It opens; it never prepares.** :meth:`VectorStore.ensure_ready` is a write the first time a
+    workspace is prepared — it creates a collection and records which model filled it — and a
+    search that spans workspaces is a read of corpora the caller is not ingesting into. So a
+    workspace that holds nothing is refused rather than created, and one whose recorded model is
+    not ``fingerprint`` is refused rather than searched: two workspaces' cosines are comparable
+    only when one model produced both, which is the whole reason the merge rule may use them.
+    """
+
+    async def open_workspace(self, workspace_id: str, fingerprint: EmbedFingerprint) -> VectorStore:
+        """A read handle on ``workspace_id``'s vectors, ready to search in ``fingerprint``'s space.
+
+        The handle shares this store's connection and does not own it: tearing it down leaves
+        the connection to whoever opened it.
+
+        Raises:
+            VectorStoreStateError: The workspace holds no vectors in this backend.
+            FingerprintMismatchError: Its vectors came from a different model, including a
+                different model of the same size.
+        """
+        ...
+
+
+@runtime_checkable
 class InspectableVectorStore(VectorStore, Protocol):
     """Optionally streams every row it holds, in the shape ``vector_schema`` names.
 
@@ -1473,6 +1507,7 @@ __all__ = [
     "Generator",
     "InspectableVectorStore",
     "Middleware",
+    "MultiWorkspaceVectorStore",
     "Parser",
     "PublicationAwareVectorStore",
     "PublicationBoundVectorStore",

@@ -102,7 +102,9 @@ Search and question-answering over a self-hosted document index.
 
 Every response is the same envelope: `ok`, `op`, `workspace`, and then `data` or `error`. Read
 `ok` first — a failure is a result with a shape, not a bare status code. Everything is scoped
-to one workspace and nothing crosses between them.
+to one workspace and nothing crosses between them, with one exception an administrator asks for
+by name: `GET /api/v1/search?workspaces=…` searches several workspaces and merges them into one
+ranking, and every hit names the workspace it came from.
 """
 
 ROUTE_GROUPS = (

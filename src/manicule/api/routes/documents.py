@@ -25,14 +25,18 @@ exactly what this has.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Query, Response
 
 from manicule.api.context import Service
 from manicule.api.envelopes import respond
 from manicule.api.models import DocumentBody
-from manicule.api.security import MemberPrincipal, ViewerPrincipal
+from manicule.api.security import MemberPrincipal, ViewerPrincipal, require
+from manicule.config.settings import Role
+
+if TYPE_CHECKING:
+    from manicule.app.results import Payload
 
 router = APIRouter(prefix="/api/v1", tags=["documents"])
 
@@ -224,20 +228,40 @@ async def search(
     profile: Annotated[str | None, Query()] = None,
     sources: Annotated[list[str] | None, Query()] = None,
     media_types: Annotated[list[str] | None, Query()] = None,
+    workspaces: Annotated[
+        list[str] | None,
+        Query(
+            description="Search these workspaces together, merged into one ranking whose hits "
+            "each name their workspace. An administrator's search: naming any workspace but "
+            "this one needs the admin role."
+        ),
+    ] = None,
 ) -> Response:
-    """The cheap half of ``ask``: ranked passages, each with the score every stage gave it."""
-    del caller
-    return await respond(
-        "search",
-        service,
-        lambda: service.search(
+    """The cheap half of ``ask``: ranked passages, each with the score every stage gave it.
+
+    **Naming other workspaces raises the floor to admin**, here as well as in the service. The
+    service's check is the rule, and it holds on every surface; this one refuses with the
+    route's own ``ForbiddenError`` before a single workspace is opened, whatever identity the
+    service has been told it is acting for. It asks the service's own question —
+    :meth:`~manicule.app.service.ApplicationService.crosses_workspaces` — so the two cannot
+    disagree about which requests span workspaces, and it asks it inside the dispatched call, so
+    a refusal is the ordinary envelope at the ordinary 403.
+    """
+    spanned = tuple(workspaces) if workspaces else None
+
+    async def searched() -> Payload:
+        if service.crosses_workspaces(spanned):
+            require(caller, Role.ADMIN)
+        return await service.search(
             q,
             limit=limit,
             profile=profile,
             sources=tuple(sources or ()),
             media_types=tuple(media_types or ()),
-        ),
-    )
+            workspaces=spanned,
+        )
+
+    return await respond("search", service, searched)
 
 
 __all__ = ["router"]

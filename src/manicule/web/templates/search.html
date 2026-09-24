@@ -15,6 +15,17 @@
     <option value="balanced"{% if profile == 'balanced' %} selected{% endif %}>balanced</option>
     <option value="precise"{% if profile == 'precise' %} selected{% endif %}>precise</option>
   </select>
+  {# Offered only when the page handed over a list, which it does only for an administrator:
+     searching several workspaces is theirs alone, and the decision is the handler's rather than
+     this template's. Nothing selected is an ordinary search of this workspace. #}
+  {% if workspace_choices %}
+  <label for="sworkspaces">Workspaces</label>
+  <select id="sworkspaces" name="workspaces" multiple size="{{ [workspace_choices | length, 4] | min }}">
+    {% for name in workspace_choices %}
+    <option value="{{ name }}"{% if name in selected_workspaces %} selected{% endif %}>{{ name }}</option>
+    {% endfor %}
+  </select>
+  {% endif %}
   <button type="submit">Search</button>
 </form>
 
@@ -24,8 +35,12 @@
 {{ m.empty('Type a query above to rank passages. Nothing is sent to a model — this is retrieval only.') }}
 {% elif panels.search.ok %}
 {% set found = panels.search.data %}
+{# Spanning whenever the search ran over anything but this workspace alone — including a search
+   of one *other* workspace, whose passages the document pages here cannot open. #}
+{% set spanning = (found.workspaces | list) != [workspace] %}
 <p class="muted">
   {{ found.count }} passages · profile {{ found.profile }} · route {{ found.route or 'default' }}
+  {% if spanning %} · across {{ found.workspaces | join(', ') }}{% endif %}
   {# Scores and confidence are formatted to the same widths the command line uses. A raw float
      renders as 0.5232638788223267, which reads as precision this number does not have and
      disagrees with `manicule search` about the same value. #}
@@ -67,7 +82,10 @@
   {% for hit in found.hits %}
   <li>
     <p class="meta">
-      <a href="/ui/documents/{{ hit.document_id }}">{{ hit.title or hit.uri }}</a>
+      {# A document page is this workspace's, so a passage from another one is named rather than
+         linked: the link would open a page that cannot find it. #}
+      {% if spanning %}<span class="pill" title="Workspace">{{ hit.workspace }}</span>{% endif %}
+      {% if not spanning or hit.workspace == workspace %}<a href="/ui/documents/{{ hit.document_id }}">{{ hit.title or hit.uri }}</a>{% else %}{{ hit.title or hit.uri }}{% endif %}
       {{ m.trail(hit.heading_path) }}
       <span class="score">{{ "%.4f" | format(hit.score) }}</span>
     </p>

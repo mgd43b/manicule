@@ -38,6 +38,7 @@ from tests.app.fakes import (
     FakeMaintenance,
     make_chunk,
     make_document,
+    spanning_backend,
 )
 from tests.conftest import CLEARED_TERMINAL_VARIABLES
 
@@ -385,6 +386,65 @@ def test_an_empty_stdin_is_a_refusal_rather_than_an_empty_query(
     result = run(["--json", "search"], stdin="")
     assert result.exit_code == 1
     assert json.loads(result.stdout)["error"]["type"] == "ConfigError"
+
+
+# --- searching several workspaces --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spelling", [["--workspaces", "alpha,beta"], ["--workspaces", "alpha", "--workspaces", "beta"]]
+)
+def test_workspaces_reach_the_service_in_either_spelling(
+    monkeypatch: pytest.MonkeyPatch, spelling: list[str]
+) -> None:
+    """Comma-separated or repeated, the search spans exactly the workspaces named, in order."""
+    backend = spanning_backend()
+    _bind(monkeypatch, ApplicationService(backend))
+
+    result = run(["--json", "search", "runbook", *spelling])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert body["data"]["workspaces"] == ["alpha", "beta"]
+    assert [hit["workspace"] for hit in body["data"]["hits"]] == ["beta", "alpha"]
+    assert backend.opened == [["alpha", "beta"]]
+
+
+def test_a_blank_piece_of_workspaces_is_refused_rather_than_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``a,,b`` is not ``a,b``: the service refuses it, the same way on every surface."""
+    backend = spanning_backend()
+    _bind(monkeypatch, ApplicationService(backend))
+
+    result = run(["--json", "search", "runbook", "--workspaces", "alpha,,beta"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"]["type"] == "ConfigError"
+    assert backend.opened == []
+
+
+def test_a_spanning_search_names_each_hit_s_workspace_at_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A merged ranking a reader cannot place line by line is one they cannot act on."""
+    _bind(monkeypatch, ApplicationService(spanning_backend()))
+
+    result = run(["search", "runbook", "--workspaces", "alpha,beta"])
+
+    assert result.exit_code == 0, result.output
+    assert "1. beta Beta runbook" in result.output
+    assert "across alpha, beta" in result.output
+
+
+def test_the_help_tells_workspaces_apart_from_workspace() -> None:
+    """One letter apart and two different things, so the help says which is which."""
+    result = run(["search", "--help"])
+
+    assert result.exit_code == 0
+    assert "--workspaces" in result.output
+    assert "--workspace" in cli.WORKSPACES_HELP
+    assert "runs the whole command in one other workspace" in " ".join(cli.WORKSPACES_HELP.split())
 
 
 # --- guarded commands ---------------------------------------------------------------------------

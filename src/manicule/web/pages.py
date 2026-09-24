@@ -35,7 +35,7 @@ policy decision in a template.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Query
 
@@ -45,9 +45,14 @@ from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from manicule.api.context import Service
+from manicule.api.security import Principal, require
+from manicule.config.settings import Role
 from manicule.web.areas import AREAS, NAVIGATION
 from manicule.web.rendering import SCRIPT, STYLESHEET, PanelCall, panel, panels, render
 from manicule.web.security import Guest, Operator, Reader
+
+if TYPE_CHECKING:
+    from manicule.app.results import Payload
 
 router = APIRouter(prefix="/ui", tags=["web"])
 
@@ -268,6 +273,7 @@ async def search(
     q: Annotated[str, Query()] = "",
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
     profile: Annotated[str | None, Query()] = None,
+    workspaces: Annotated[list[str] | None, Query()] = None,
 ) -> HTMLResponse:
     """The cheap half of ``ask``: ranked passages, each with the score every stage gave it.
 
@@ -278,7 +284,21 @@ async def search(
     with a traceback frame naming this file's path on the server — into a browser window, which
     is both a dead end for the reader and an unnecessary disclosure. Blank renders the form with
     nothing under it instead, which is the state the page is *for* before a query is typed.
+
+    **Searching several workspaces is an administrator's**, and this page takes the floor the
+    route behind it takes: ``GET /api/v1/search`` asks for an admin when it is given other
+    workspaces, and so does this, inside the operation so the refusal is the page the operation's
+    failure renders. The workspace picker is offered only to a reader who holds that role —
+    decided here rather than in the template, which renders whatever list it is handed — and
+    the service refuses anyone else however the request was made.
     """
+    spanned = tuple(workspaces) if workspaces else None
+    extra = {
+        "query": q if q.strip() else "",
+        "profile": profile or "",
+        "workspace_choices": await _workspace_choices(service, caller),
+        "selected_workspaces": spanned or (),
+    }
     if not q.strip():
         return render(
             "search.html",
@@ -287,21 +307,43 @@ async def search(
             service=service,
             caller=caller,
             panels={},
-            extra={"query": "", "profile": profile or ""},
+            extra=extra,
         )
+
+    async def searched() -> Payload:
+        if service.crosses_workspaces(spanned):
+            require(caller, Role.ADMIN)
+        return await service.search(q, limit=limit, profile=profile, workspaces=spanned)
+
     return render(
         "search.html",
         area="documents",
         title="Search",
         service=service,
         caller=caller,
-        panels={
-            "search": await panel(
-                "search", service, lambda: service.search(q, limit=limit, profile=profile)
-            )
-        },
+        panels={"search": await panel("search", service, searched)},
         primary="search",
-        extra={"query": q, "profile": profile or ""},
+        extra=extra,
+    )
+
+
+async def _workspace_choices(service: Service, caller: Principal) -> tuple[str, ...]:
+    """The workspaces an administrator may search together, and nothing for anyone else.
+
+    Empty rather than refused for a reader below admin: the ordinary search is theirs, and a
+    picker that is not offered is the honest rendering of a choice they do not have. A listing
+    that fails leaves the picker out rather than failing the page — the search is still a search.
+    """
+    if not caller.caller.holds(Role.ADMIN):
+        return ()
+    listed = await panel("workspace_list", service, service.workspace_list)
+    if not listed.ok:
+        return ()
+    rows = listed.data.get("workspaces")
+    if not isinstance(rows, list):
+        return ()
+    return tuple(
+        str(row["id"]) for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)
     )
 
 

@@ -162,8 +162,25 @@ class PipelineRunner:
         """The declaration this runner executes. Part of every run's identity."""
         return tuple(stage.name for stage in self._stages)
 
-    async def run(self, query: Query) -> PipelineRun:
+    @property
+    def asserts_scope(self) -> bool:
+        """Whether this runner holds every run to the scope assertion.
+
+        Read by a cross-workspace search, which runs one leg per workspace through a runner of
+        its own and has to hold each of them to the same setting this one was configured with —
+        a runtime check that applied to one workspace's searches and not to a search spanning
+        several would be off exactly where the boundary is widest.
+        """
+        return self._assert_scope
+
+    async def run(self, query: Query, *, seed: Sequence[Candidate] = ()) -> PipelineRun:
         """Fold the query through every stage, recording each one.
+
+        ``seed`` is what the first stage is handed, and it is empty for every ordinary run —
+        the first stages of a pipeline produce candidates from the query alone. A
+        cross-workspace search passes the ranking its legs merged, so that the reranker scores
+        that pool through the runner and is timed, counted and recorded exactly as it is in a
+        single workspace's pipeline rather than by a second, hand-written span.
 
         Raises:
             AssertionError: ``assert_scope`` is on and a stage emitted a chunk outside the
@@ -177,14 +194,16 @@ class PipelineRunner:
         # its own, so a pipeline can still be run and measured without a retriever around it.
         ambient = tracing.current_frame()
         if ambient is not None:
-            return await self._fold(query, ambient)
+            return await self._fold(query, ambient, seed)
         with tracing.installed() as frame:
-            return await self._fold(query, frame)
+            return await self._fold(query, frame, seed)
 
-    async def _fold(self, query: Query, frame: tracing.TraceFrame) -> PipelineRun:
+    async def _fold(
+        self, query: Query, frame: tracing.TraceFrame, seed: Sequence[Candidate]
+    ) -> PipelineRun:
         started = time.perf_counter()
         first = len(frame.spans)
-        candidates: list[Candidate] = []
+        candidates: list[Candidate] = list(seed)
         outputs: list[tuple[str, list[Candidate]]] = []
 
         for stage in self._stages:

@@ -45,6 +45,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from manicule.app import results as r
 from manicule.app.bind import is_loopback
+from manicule.app.caller import current
+from manicule.app.ports import RetrievingAcross, SpansWorkspaces
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
 from manicule.config.loader import load_settings
 from manicule.config.profiles import profile_config
@@ -98,7 +100,7 @@ if TYPE_CHECKING:
 
     from pydantic import SecretStr
 
-    from manicule.app.ports import Backend, Conversing
+    from manicule.app.ports import Backend, Conversing, DocumentSurface, OpenedWorkspace
     from manicule.connectors.browser import BrowserSessionProvider
     from manicule.connectors.config import ConfluenceConfig
     from manicule.connectors.enriched import EnrichedProfile
@@ -1159,6 +1161,7 @@ class ApplicationService:
         sources: Sequence[str] = (),
         media_types: Sequence[str] = (),
         collections: Sequence[str] = (),
+        workspaces: Sequence[str] | None = None,
     ) -> r.SearchResult:
         """Rank passages without asking a model anything.
 
@@ -1166,7 +1169,23 @@ class ApplicationService:
         ``media_types`` the way :class:`~manicule.core.retrieval.Filter` says every field
         does — disjunction within a field, conjunction between them. So two collections union,
         and a collection together with a source keeps only what is in both.
+
+        ``workspaces`` names the workspaces to search together, which makes this an
+        administrator's search spanning them (:meth:`crosses_workspaces` says when it does). Left
+        out, empty, or naming only this workspace, it is exactly the ordinary search and runs
+        the ordinary path; see :meth:`_search_across` for the other one.
         """
+        spanned = self._spanned(workspaces)
+        if spanned is not None:
+            return await self._search_across(
+                query_text,
+                spanned,
+                limit=limit,
+                profile=profile,
+                sources=sources,
+                media_types=media_types,
+                collections=collections,
+            )
         started = time.monotonic()
         query = self._query(
             query_text,
@@ -1182,21 +1201,7 @@ class ApplicationService:
         documents = await self._require_scoped_chunks(candidate.chunk for candidate in candidates)
         await self._record_query(query, retrieved, started=started)
         hits = tuple(
-            r.SearchHit(
-                document_id=candidate.chunk.document_id,
-                chunk_id=candidate.chunk.id,
-                uri=documents[candidate.chunk.document_id].uri,
-                title=documents[candidate.chunk.document_id].title,
-                heading_path=candidate.chunk.heading_path,
-                kind=candidate.chunk.kind.value,
-                anchor=_json_object(candidate.chunk.anchor.model_dump(mode="json")),
-                provenance=source_reference(documents.get(candidate.chunk.document_id)),
-                score=candidate.score,
-                scores=dict(candidate.scores),
-                text=candidate.chunk.text,
-                token_count=candidate.chunk.token_count,
-            )
-            for candidate in candidates
+            _hit(candidate, documents, workspace=self.workspace) for candidate in candidates
         )
         confidence = retrieved.confidence
         expansions, conflicts = await self._glossary_payloads(retrieved.expansion)
@@ -1217,7 +1222,254 @@ class ApplicationService:
             truncated=retrieved.context.truncated,
             elapsed_ms=_millis(started),
             collections=tuple(collections),
+            workspaces=(self.workspace,),
         )
+
+    def crosses_workspaces(self, workspaces: Sequence[str] | None) -> bool:
+        """Whether a search naming ``workspaces`` would reach beyond this workspace.
+
+        The one definition of when a search is an administrator's, public so that a network
+        surface asking for the admin floor asks exactly this question rather than its own
+        reading of the argument: a floor that fired on ``workspaces=[<this one>]`` would refuse
+        a search this service runs as an ordinary one, and one that missed a spelling this
+        method normalizes would admit a search the service then has to refuse.
+
+        Raises:
+            ConfigError: A name is blank.
+        """
+        return self._spanned(workspaces) is not None
+
+    def _spanned(self, workspaces: Sequence[str] | None) -> tuple[str, ...] | None:
+        """The workspaces a search spans, or ``None`` when it is this workspace's ordinary one.
+
+        Names are stripped and de-duplicated in the order given. **This workspace is included
+        only when it is named** — a search of ``b`` and ``c`` from a process serving ``a``
+        searches ``b`` and ``c``. Adding the serving workspace implicitly would widen a request
+        past what it named, which is the one direction a scope must never move on its own; and
+        the payload's ``workspaces`` then says exactly what ran.
+
+        Raises:
+            ConfigError: A name is blank. Dropping it would search fewer workspaces than the
+                caller believes they named.
+        """
+        if workspaces is None:
+            return None
+        named: list[str] = []
+        for raw in workspaces:
+            name = raw.strip()
+            if not name:
+                msg = (
+                    "a workspace name in `workspaces` is blank. Name each workspace to search, "
+                    "or leave the argument out to search this one."
+                )
+                raise ConfigError(msg)
+            if name not in named:
+                named.append(name)
+        if not named or named == [self.workspace]:
+            return None
+        return tuple(named)
+
+    async def _search_across(
+        self,
+        query_text: str,
+        spanned: tuple[str, ...],
+        *,
+        limit: int,
+        profile: str | None,
+        sources: Sequence[str],
+        media_types: Sequence[str],
+        collections: Sequence[str],
+    ) -> r.SearchResult:
+        """An administrator's search spanning several workspaces: N scoped searches, merged.
+
+        ``docs/retrieval.md`` §3.2 is the rule and :meth:`Retriever.retrieve_across
+        <manicule.retrieval.retriever.Retriever.retrieve_across>` the merge. What this method
+        owns is the policy around it, in the order it is checked:
+
+        1. **The caller holds the admin role.** A search spanning workspaces is a deliberate
+           widening of the isolation boundary every other operation keeps (``PLAN.md`` §16),
+           so it is decided here, once, for every surface — the network surfaces also ask for
+           the admin floor, which puts the same refusal in their ordinary 403, but this is the
+           rule and theirs is the courtesy.
+        2. **The count is within ``rag.cross_workspace_limit``.** Each workspace is its own
+           scoped search, so this bounds the work one request can ask for.
+        3. **Every named workspace opens**: it exists here, has an index, and was embedded by
+           the model this process searches with. Anything else refuses the whole search.
+        4. **Every named collection exists in every named workspace.** A scope that fails is a
+           refusal, never a narrowing that quietly searches one workspace without it.
+        5. **Every hit's identity is checked in the workspace it came from**, exactly as an
+           ordinary hit is in this one, and a hit claimed by no workspace or by two is refused.
+
+        The search is recorded once, in this workspace's query log — where it was run, by the
+        caller who ran it — and never in the other workspaces' logs, whose operators did not
+        ask it. The row carries what an ordinary one does: the query text, which is the caller's
+        own, and the ids of the passages retrieved, which the hits already carry; no other
+        workspace's text. And it is audited as ``search.cross_workspace`` with the workspaces it
+        spanned and how many hits it returned, because reading across tenants is exactly the kind
+        of act an audit trail is for.
+
+        Raises:
+            PolicyError: The caller is not an administrator, or names more workspaces than
+                ``rag.cross_workspace_limit`` allows.
+            UnknownEntityError: A workspace or a collection named is not there.
+            VectorStoreStateError: A named workspace has no index yet.
+            FingerprintMismatchError: A named workspace was embedded by another model.
+            ConfigError: This installation cannot open other workspaces or merge across them.
+            CrossWorkspaceError: A workspace's store returned a passage that is not its own.
+        """
+        started = time.monotonic()
+        self._require_admin_to_span(spanned)
+        bound = self.settings.rag.cross_workspace_limit
+        if len(spanned) > bound:
+            msg = (
+                f"this search names {len(spanned)} workspaces and rag.cross_workspace_limit "
+                f"allows {bound}. Each is its own scoped search, so the limit bounds the work "
+                f"one request can ask for; search fewer at once, or raise the limit."
+            )
+            raise PolicyError(msg)
+        backend = self._backend
+        if not isinstance(backend, SpansWorkspaces):
+            msg = (
+                "this installation's backend cannot open workspaces other than the one it "
+                "serves, so a search spanning workspaces cannot run here."
+            )
+            raise ConfigError(msg)
+        opened = list(await backend.open_workspaces(spanned))
+        collection_ids = await self._collections_across(opened, collections)
+        retriever = await backend.retriever()
+        if not isinstance(retriever, RetrievingAcross):
+            msg = (
+                "the configured retrieval can search only the workspace it serves, so a search "
+                "spanning workspaces cannot run here."
+            )
+            raise ConfigError(msg)
+        query = self._query(
+            query_text,
+            limit=limit,
+            profile=profile,
+            sources=sources,
+            media_types=media_types,
+            collection_ids=sorted(collection_ids),
+            workspaces=spanned,
+        )
+        retrieved = await retriever.retrieve_across(query, [workspace.leg for workspace in opened])
+        candidates = list(retrieved.candidates)[:limit]
+        attributed = await self._require_owned_across(opened, retrieved.origins, candidates)
+        await self._record_query(query, retrieved, started=started)
+        await self._audit(
+            "search.cross_workspace",
+            details={"workspaces": list(spanned), "hits": len(candidates)},
+        )
+        hits = tuple(
+            _hit(candidate, documents, workspace=workspace)
+            for candidate, (workspace, documents) in zip(candidates, attributed, strict=True)
+        )
+        confidence = retrieved.confidence
+        return r.SearchResult(
+            query=query_text,
+            profile=query.profile.value,
+            count=len(hits),
+            hits=hits,
+            confidence=confidence.score if confidence else None,
+            confidence_band=confidence.band.value if confidence else None,
+            confidence_reason=confidence.reason if confidence else "",
+            route=retrieved.trace.route.value,
+            cached=retrieved.trace.cached,
+            truncated=retrieved.context.truncated,
+            elapsed_ms=_millis(started),
+            collections=tuple(collections),
+            workspaces=spanned,
+        )
+
+    def _require_admin_to_span(self, spanned: Sequence[str]) -> None:
+        """Refuse a search spanning workspaces to anyone short of an administrator.
+
+        Raises:
+            PolicyError: The caller does not hold the admin role.
+        """
+        caller = current()
+        if caller.holds(Role.ADMIN):
+            return
+        held = caller.role.value if caller.role is not None else "none"
+        msg = (
+            f"a search spanning workspaces ({', '.join(repr(name) for name in spanned)}) needs "
+            f"the 'admin' role, and this caller holds {held!r}. It reads corpora beyond the one "
+            f"this caller was admitted to, which is an administrator's decision to make."
+        )
+        raise PolicyError(msg)
+
+    async def _collections_across(
+        self, opened: Sequence[OpenedWorkspace], names: Sequence[str]
+    ) -> frozenset[str]:
+        """Resolve each collection name in every named workspace, refusing any that is missing.
+
+        The union of every workspace's ids goes into the filter, and each workspace's leg
+        resolves membership through its own store — which answers another workspace's id with
+        no members — so a leg ends up restricted to its own workspace's collection of that name.
+
+        Raises:
+            UnknownEntityError: A name is not a collection in one of the workspaces. Refused
+                rather than dropped for that workspace, because dropping it would search that
+                workspace unrestricted — the whole of it, ranked beside the scoped rest.
+        """
+        if not names:
+            return frozenset()
+        resolved: set[str] = set()
+        for workspace in opened:
+            for name in names:
+                found = await workspace.organization.find_collection(name)
+                if found is None:
+                    msg = (
+                        f"no collection {name!r} in workspace {workspace.name!r}. The search is "
+                        f"refused rather than run without it there: a restriction that silently "
+                        f"vanished in one workspace would return every document in it."
+                    )
+                    raise UnknownEntityError(msg)
+                resolved.add(found.id)
+        return frozenset(resolved)
+
+    async def _require_owned_across(
+        self,
+        opened: Sequence[OpenedWorkspace],
+        origins: Mapping[str, tuple[str, ...]],
+        candidates: Sequence[Candidate],
+    ) -> list[tuple[str, dict[str, Document]]]:
+        """Check each hit's identity in the workspace whose search returned it.
+
+        The ordinary check (:meth:`_require_scoped_chunks`), once per workspace, through that
+        workspace's scoped store and against its name — so a store that ignored its scope is
+        caught by arithmetic on the document it returned, exactly as it is on one workspace.
+
+        Returns:
+            Per candidate, positionally: the workspace it came from and that workspace's
+            resolved documents.
+
+        Raises:
+            CrossWorkspaceError: A hit was claimed by no workspace's search, by two, or by one
+                whose store cannot vouch for it. Nothing is returned, and the message quotes
+                nothing from the offending row.
+        """
+        handles = {workspace.name: workspace for workspace in opened}
+        grouped: dict[str, list[Chunk]] = {}
+        claims: list[str] = []
+        for candidate in candidates:
+            claimed = origins.get(candidate.chunk.id, ())
+            if len(claimed) != 1 or claimed[0] not in handles:
+                msg = (
+                    f"a passage in a search spanning {len(handles)} workspaces was not returned "
+                    f"by exactly one of their searches, and a passage belongs to exactly one "
+                    f"workspace. A store ignored its scope; nothing was returned."
+                )
+                raise CrossWorkspaceError(msg)
+            claims.append(claimed[0])
+            grouped.setdefault(claimed[0], []).append(candidate.chunk)
+        resolved = {
+            workspace: await self._require_scoped_in(
+                handles[workspace].documents, workspace, chunks
+            )
+            for workspace, chunks in grouped.items()
+        }
+        return [(workspace, resolved[workspace]) for workspace in claims]
 
     async def _glossary_payloads(
         self, expansion: QueryExpansion | None
@@ -6707,11 +6959,14 @@ class ApplicationService:
         sources: Sequence[str] = (),
         media_types: Sequence[str] = (),
         collection_ids: Sequence[str] = (),
+        workspaces: Sequence[str] = (),
     ) -> Query:
-        """Build a query already carrying this workspace.
+        """Build a query already carrying this workspace — or the ones an administrator named.
 
         The filter has no default workspace and cannot be built without one, so there is no
-        path from here to an unscoped search.
+        path from here to an unscoped search. ``workspaces`` is set only by
+        :meth:`_search_across`, after the caller's authority and the configured bound have both
+        been checked; empty, the query carries this workspace and nothing else.
 
         ``collection_ids`` are ids, already resolved from whatever the caller named by
         :meth:`_collection_scope`. Resolution happens before this rather than inside it
@@ -6735,7 +6990,7 @@ class ApplicationService:
             limit=limit,
             profile=chosen,
             filter=Filter(
-                workspace_ids=frozenset({self.workspace}),
+                workspace_ids=frozenset(workspaces or (self.workspace,)),
                 sources=frozenset(sources),
                 media_types=frozenset(media_types),
                 collection_ids=frozenset(collection_ids),
@@ -6800,19 +7055,32 @@ class ApplicationService:
         Raises:
             CrossWorkspaceError: A chunk points at a document this workspace does not own.
         """
+        return await self._require_scoped_in(
+            await self._backend.documents(), self.workspace, chunks
+        )
+
+    @staticmethod
+    async def _require_scoped_in(
+        store: DocumentSurface, workspace: str, chunks: Iterable[Chunk]
+    ) -> dict[str, Document]:
+        """:meth:`_require_scoped_chunks` for ``workspace``, through ``store`` — its own handle.
+
+        Raises:
+            CrossWorkspaceError: A chunk points at a document ``workspace`` does not own.
+        """
         wanted = list(dict.fromkeys(chunk.document_id for chunk in chunks))
         if not wanted:
             return {}
-        found = await self._scoped_documents(wanted)
+        found = await _documents_in(store, workspace, wanted)
         missing = [document_id_ for document_id_ in wanted if document_id_ not in found]
         if missing:
             msg = (
                 f"retrieval returned {len(missing)} chunk(s) whose document workspace "
-                f"{self.workspace!r} cannot see. Nothing was returned: a search that quietly "
-                f"drops the rows it should not have had is a search that leaked the ranking."
+                f"{workspace!r} cannot see. Nothing was returned: a search that quietly drops "
+                f"the rows it should not have had is a search that leaked the ranking."
             )
             raise CrossWorkspaceError(msg)
-        require_owned(self.workspace, found.values())
+        require_owned(workspace, found.values())
         return found
 
     async def _scoped_documents(self, document_ids: Iterable[str]) -> dict[str, Document]:
@@ -6828,18 +7096,7 @@ class ApplicationService:
         glossary entry whose document is missing is a race and must be dropped. Deciding here
         would force one of them to un-decide it.
         """
-        asked = frozenset(document_ids)
-        if not asked:
-            return {}
-        store = await self._backend.documents()
-        page = await store.list_documents(
-            Filter(workspace_ids=frozenset({self.workspace}), document_ids=asked),
-            limit=len(asked),
-        )
-        # Restricted to what was asked for. A store that returns more than the filter allowed
-        # is a defect its own conformance suite owns; here the question is only which of the
-        # requested documents came back.
-        return {document.id: document for document in page if document.id in asked}
+        return await _documents_in(await self._backend.documents(), self.workspace, document_ids)
 
     def _answer_payload(
         self,
@@ -7585,6 +7842,47 @@ def _hub_offline_env() -> str:
     except ImportError:
         return ""
     return OFFLINE_ENV
+
+
+def _hit(candidate: Candidate, documents: Mapping[str, Document], *, workspace: str) -> r.SearchHit:
+    """One ranked passage as a search reports it, attributed to the workspace it came from."""
+    document = documents[candidate.chunk.document_id]
+    return r.SearchHit(
+        document_id=candidate.chunk.document_id,
+        chunk_id=candidate.chunk.id,
+        uri=document.uri,
+        title=document.title,
+        heading_path=candidate.chunk.heading_path,
+        kind=candidate.chunk.kind.value,
+        anchor=_json_object(candidate.chunk.anchor.model_dump(mode="json")),
+        provenance=source_reference(document),
+        workspace=workspace,
+        score=candidate.score,
+        scores=dict(candidate.scores),
+        text=candidate.chunk.text,
+        token_count=candidate.chunk.token_count,
+    )
+
+
+async def _documents_in(
+    store: DocumentSurface, workspace: str, document_ids: Iterable[str]
+) -> dict[str, Document]:
+    """The documents of ``document_ids`` that ``workspace``'s store can see, keyed by id.
+
+    One query rather than one per document, and it returns what was found and says nothing
+    about what was not — see :meth:`ApplicationService._scoped_documents` for why each caller
+    decides that for itself.
+    """
+    asked = frozenset(document_ids)
+    if not asked:
+        return {}
+    page = await store.list_documents(
+        Filter(workspace_ids=frozenset({workspace}), document_ids=asked), limit=len(asked)
+    )
+    # Restricted to what was asked for. A store that returns more than the filter allowed is a
+    # defect its own conformance suite owns; here the question is only which of the requested
+    # documents came back.
+    return {document.id: document for document in page if document.id in asked}
 
 
 def _millis(started: float) -> int:
