@@ -1514,8 +1514,8 @@ class SqliteDocStore(
             )
         # **The session closes before the hydration, and that is hold-and-wait rather than
         # tidiness.** `get_chunks` opens a session of its own, so calling it inside this one
-        # meant a single search held two of the engine's connections at once. The engine is
-        # built with no pool arguments, which on `sqlite+aiosqlite` over a file gives an
+        # meant a single search held two of the engine's connections at once. The engine's pool
+        # is sized by SQLAlchemy's defaults for `sqlite+aiosqlite` over a file, an
         # `AsyncAdaptedQueuePool` of 5 plus 10 overflow — fifteen for the whole process. Eight
         # concurrent searches therefore each held one connection and queued for a second that
         # only another holder could release, and every one of them blocked until the pool's

@@ -622,10 +622,10 @@ class VerificationRun:
 
         The wait is bounded for the same reason the provider close is: this runs in a caller's
         ``finally``, and a parser doing long blocking work inside its own cleanup must not be
-        able to stall request teardown indefinitely. The one read it does not cut short is a
-        blob lookup already under way: ``BlobStore.get`` finishes it before raising the
-        cancellation, because a lookup canceled while the pool is opening its connection
-        strands that connection (``docs/storage.md`` §3.1).
+        able to stall request teardown indefinitely. The one step it does not cut short is a
+        connection the engine is still opening for a blob read: the engine finishes opening it,
+        and closes it, before raising the cancellation, because a connection canceled half-open
+        is stranded where nothing can close it (``docs/storage.md`` §3.1).
         """
         for task in self._tasks:
             task.cancel()
