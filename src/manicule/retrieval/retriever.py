@@ -720,8 +720,8 @@ class Retriever:
 
         The serving workspace's generation counter, on a cross-workspace search too. It counts
         commits on the *engine* every workspace's store shares (``manicule.storage.scoped``), so a
-        write to any workspace on this data directory moves it — which is what a cached ranking
-        spanning several of them needs, and why no second counter per workspace is kept.
+        corpus write to any workspace on this data directory moves it — which is what a cached
+        ranking spanning several of them needs, and why no second counter per workspace is kept.
         """
         if not self._cache.enabled:
             return None
