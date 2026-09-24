@@ -36,7 +36,7 @@ from manicule.core.retrieval import Candidate
 from manicule.retrieval.hydration import visible_documents
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from manicule.core.protocols import DocStore
     from manicule.core.retrieval import Filter, PipelineIdentity, Query
@@ -67,6 +67,16 @@ class CachedRanking:
     exhausted_budget: bool = False
     """Whether a leg of the populating run stopped at its own caps. Caps confidence."""
 
+    origins: tuple[tuple[str, ...], ...] = ()
+    """Per candidate, the workspaces whose leg returned it — on a cross-workspace ranking only.
+
+    Empty on every single-workspace entry, whose candidates all came from the workspace the
+    retriever serves. A cross-workspace hit has to re-hydrate each chunk through the store of
+    the workspace it came from (``manicule.retrieval.spanning.rehydrate_across``), and a chunk
+    id does not say which workspace that is: the id is a digest, and a digest does not run
+    backwards.
+    """
+
     stored_at: float = field(default_factory=time.monotonic)
 
 
@@ -86,7 +96,11 @@ def cache_key(
       and serving a cached ten-result ranking to a request for fifty returns a short list that
       looks like a corpus with nothing more in it.
     * **The whole filter**, not just the workspace. Two filters produce two rankings, and a key
-      that omits one is a cache that answers a different question.
+      that omits one is a cache that answers a different question. The workspace *set* is part
+      of it, which is what keeps an administrator's cross-workspace ranking and one workspace's
+      ranking of the same words apart: served to each other, the first would put other tenants'
+      passages in front of a single-workspace caller and the second would report a workspace-
+      spanning search that never looked past one.
     * **The pipeline identity**, because comparing two pipelines is the evaluation harness's
       entire method and a cache that cannot tell them apart would serve one's ranking as the
       other's.
@@ -192,14 +206,22 @@ class L1QueryCache:
         *,
         incomparable: Sequence[str] = (),
         exhausted_budget: bool = False,
+        origins: Mapping[str, tuple[str, ...]] | None = None,
     ) -> CachedRanking:
-        """Reduce a ranking to the decision it represents."""
+        """Reduce a ranking to the decision it represents.
+
+        ``origins`` maps a chunk id to the workspaces that returned it, for a cross-workspace
+        ranking; ``None`` for a single-workspace one.
+        """
         return CachedRanking(
             chunk_ids=tuple(candidate.chunk.id for candidate in candidates),
             scores=tuple(tuple(sorted(candidate.scores.items())) for candidate in candidates),
             identity=identity,
             incomparable=tuple(incomparable),
             exhausted_budget=exhausted_budget,
+            origins=()
+            if origins is None
+            else tuple(origins.get(candidate.chunk.id, ()) for candidate in candidates),
         )
 
 

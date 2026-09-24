@@ -85,6 +85,7 @@ class DenseStage:
         profiles: Profiles,
         config: DenseConfig | None = None,
         name: str = "dense",
+        workspace: str | None = None,
     ) -> None:
         self.name = name
         self._embedder = embedder
@@ -92,11 +93,21 @@ class DenseStage:
         self._docstore = docstore
         self._profiles = profiles
         self._config = config or DenseConfig()
+        self._workspace = workspace
         self._fraction_cache: dict[tuple[int, str], float] = {}
 
     def describe(self) -> Metadata:
-        """The settings this leg ran under, for the record."""
-        return dict(self._config.model_dump(mode="json"))
+        """The settings this leg ran under, for the record.
+
+        A leg bound to one workspace of a cross-workspace search also names that workspace,
+        because every leg of one is called ``dense`` — its score key has to be the same in each,
+        or the merge would have no one scale to read — and a trace of four spans all called
+        ``dense`` is otherwise a trace nobody can attribute.
+        """
+        described = dict(self._config.model_dump(mode="json"))
+        if self._workspace is not None:
+            described["workspace"] = self._workspace
+        return described
 
     def with_vectors(self, vectors: VectorStore) -> DenseStage:
         """Return this configured leg bound to the vector handle retrieval must use.
@@ -113,6 +124,29 @@ class DenseStage:
             profiles=self._profiles,
             config=self._config,
             name=self.name,
+            workspace=self._workspace,
+        )
+
+    def for_workspace(
+        self, workspace: str, *, vectors: VectorStore, docstore: DocStore
+    ) -> DenseStage:
+        """Return this configured leg bound to another workspace's two stores.
+
+        What a cross-workspace search runs once per workspace (``docs/retrieval.md`` §3.2). The
+        embedder, the profiles and the over-fetch configuration are this leg's, so every
+        workspace is searched by one model under one set of rules — which is what makes their
+        cosines one scale. The hydrating join is this leg's too, run against ``docstore``: the
+        bound leg is as scoped as the one it was made from, and could not be made less so by a
+        caller that forgot something, because there is nothing to pass.
+        """
+        return DenseStage(
+            embedder=self._embedder,
+            vectors=vectors,
+            docstore=docstore,
+            profiles=self._profiles,
+            config=self._config,
+            name=self.name,
+            workspace=workspace,
         )
 
     async def run(self, query: Query, candidates: list[Candidate]) -> list[Candidate]:
