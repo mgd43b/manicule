@@ -453,7 +453,9 @@ config_app = typer.Typer(
     help="Read and write configuration.", no_args_is_help=True, cls=CommandsShareTheRootOptions
 )
 auth_app = typer.Typer(
-    help="API keys for this workspace.", no_args_is_help=True, cls=CommandsShareTheRootOptions
+    help="API keys and members of this workspace.",
+    no_args_is_help=True,
+    cls=CommandsShareTheRootOptions,
 )
 collection_app = typer.Typer(
     help="Named sets of documents.", no_args_is_help=True, cls=CommandsShareTheRootOptions
@@ -742,6 +744,11 @@ PAYLOADS: dict[str, type[Payload]] = {
     "auth_create_key": r.ApiKeyIssued,
     "auth_list_keys": r.ApiKeyList,
     "auth_revoke_key": r.ApiKeyRevoked,
+    "auth_users": r.UserList,
+    "auth_set_role": r.UserUpdated,
+    "auth_disable_user": r.UserUpdated,
+    "auth_enable_user": r.UserUpdated,
+    "auth_sign_out": r.UserSignedOut,
     "collection_create": r.CollectionSummary,
     "collection_list": r.CollectionList,
     "collection_rename": r.CollectionSummary,
@@ -1962,9 +1969,17 @@ def workspace_switch(
     create: Annotated[
         bool, typer.Option("--create", help="Accept a name that does not exist.")
     ] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option(
+            "--mode",
+            help="personal or team. Team mode serves several people, so every caller must "
+            "present a credential.",
+        ),
+    ] = None,
 ) -> None:
     """Record a different active workspace. It takes effect at the next start."""
-    submit(Command("workspace_switch", {"name": name, "create": create}))
+    submit(Command("workspace_switch", {"name": name, "create": create, "mode": mode}))
 
 
 # --- auth -------------------------------------------------------------------------------------
@@ -1992,6 +2007,45 @@ def auth_revoke_key(
 ) -> None:
     """Revoke an API key. Immediate, and irreversible."""
     submit(Command("auth_revoke_key", {"name_or_id": name_or_id}))
+
+
+_USER = Annotated[
+    str,
+    typer.Argument(help="The member's user id, or an address that names exactly one member."),
+]
+
+
+@auth_app.command("users")
+def auth_users() -> None:
+    """List the members of this workspace: role, standing, and live sessions."""
+    emit("auth_users", lambda service: service.user_list())
+
+
+@auth_app.command("set-role")
+def auth_set_role(
+    user: _USER,
+    role: Annotated[str, typer.Argument(help="admin, member or viewer.")],
+) -> None:
+    """Change a member's role. The last enabled administrator cannot be demoted."""
+    submit(Command("auth_set_role", {"user": user, "role": role}))
+
+
+@auth_app.command("disable-user")
+def auth_disable_user(user: _USER) -> None:
+    """Disable a member, ending their sessions and revoking their API keys at once."""
+    submit(Command("auth_disable_user", {"user": user}))
+
+
+@auth_app.command("enable-user")
+def auth_enable_user(user: _USER) -> None:
+    """Enable a disabled member again, in the role they had. Their old credentials stay revoked."""
+    submit(Command("auth_enable_user", {"user": user}))
+
+
+@auth_app.command("sign-out")
+def auth_sign_out(user: _USER) -> None:
+    """End every browser session a member holds in this workspace. They may sign in again."""
+    submit(Command("auth_sign_out", {"user": user}))
 
 
 # --- plugin -----------------------------------------------------------------------------------

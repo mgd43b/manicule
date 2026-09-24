@@ -43,7 +43,9 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   so manicule reports the command that would install one and runs nothing. `docs/surfaces.md` §8
 - [x] `list-keys` → `auth list-keys`
 - [x] `list` → `document list`, `connector list`, `workspace list`, `plugin list`
-- [ ] `login` — OAuth. #13
+- [ ] ~~`login`~~ — a command-line sign-in. The command line runs as the operator at this
+  machine and needs no credential; people sign in from a browser, through Google or GitHub, at
+  `/ui/login`. `docs/surfaces.md` §9.2.1
 - [ ] ~~`publish`~~ — publishing a plugin. That is a package index's job
 - [x] `remove <name>` → `plugin remove`
 - [x] `reset` → `reset-index`
@@ -79,7 +81,9 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 - [x] start — option `-p, --port <port>`
 - [x] upgrade — option `--skip-backup`
 - [x] upgrade — option `--version <version>`
-- [ ] workspace — option `--mode <mode>` — personal or team. #13 owns team mode
+- [x] workspace — option `--mode <mode>` → `workspace switch NAME --mode personal|team`, written
+  beside the workspace in one edit. A team installation refuses to serve without authentication,
+  `--no-authentication` included
 
 ### Added, because the commands above could not do their job without them
 
@@ -254,8 +258,8 @@ name — an absence with no test is an absence that comes back.
 - [x] `GET    /api/v1/tags`
 - [x] `GET    /api/v1/workbench`
 - [x] `GET    /api/v1/workspaces`
-- [ ] ~~`GET    /auth/callback/:provider`~~ — OAuth. #13
-- [ ] ~~`GET    /auth/login/:provider`~~ — OAuth. #13
+- [x] `GET    /auth/callback/:provider` — Google and GitHub, with PKCE; answers with a page
+- [x] `GET    /auth/login/:provider`
 - [x] `GET    /auth/providers`
 - [x] `PATCH  /api/v1/collections/:id` — the description. Renaming is its own route: it can
   fail with a 409 and describing cannot, and one route returning either status depending on
@@ -282,11 +286,10 @@ name — an absence with no test is an absence that comes back.
 - [ ] ~~`POST   /api/v1/documents/upload`~~ — accepting bytes over HTTP is an ingest path with no filesystem permission check and no path the operator chose. `manicule index <path>` is the ingest this build offers
 - [ ] ~~`POST   /api/v1/plugins/install`~~ — installing a plugin fetches and executes code with this process's full authority. `POST /api/v1/plugins/:name` enables one that is already installed
 - [x] `POST   /api/v1/tags`
-- [ ] ~~`POST   /auth/logout`~~ — there is no session cookie in this build — a key is presented on every request — so there is nothing to log out of. `GET /auth/session` reports who a request is
+- [x] `POST   /auth/logout` — revokes the browser's session on the server, not only its cookie
 - [x] `POST   /auth/session` — as `GET /auth/session`, which *reports* an identity rather than
-  creating one. There is no session cookie in this build: a key is presented on every request,
-  and a signed cookie would be a second credential type with its own expiry, revocation and
-  CSRF story
+  creating one. A browser session is created only by signing in through a provider, and a
+  program presents a key on every request instead; `docs/surfaces.md` §9.2.1
 
 ## File types — 18
 

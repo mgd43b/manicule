@@ -20,7 +20,7 @@
   {% endif %}
 </div>
 {# A refusal is where a reader is most likely to be stuck, and the frame's navigation is a list
-   of eleven areas rather than the way back to the one they came from. #}
+   of every area rather than the way back to the one they came from. #}
 <p class="muted">
   {%- for name, path, label in navigation %}{% if name == area %}<a href="{{ path }}">Back to {{ label }}</a>{% endif %}{% endfor -%}
 </p>

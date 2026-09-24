@@ -11,6 +11,7 @@ import ast
 import asyncio
 import json
 import re
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -28,6 +29,7 @@ from manicule.app.results import Envelope, succeeded
 from manicule.app.service import ApplicationService
 from manicule.cli import render
 from manicule.cli.shell import SHELLS, completion_script
+from manicule.config.settings import Settings
 from manicule.core.errors import ConfigError
 from manicule.core.version import CORE_VERSION
 from manicule.mcp.server import TOOL_NAMES
@@ -36,6 +38,7 @@ from tests.app.fakes import (
     FakeBackend,
     FakeIngestion,
     FakeMaintenance,
+    FakeUsers,
     make_chunk,
     make_document,
     spanning_backend,
@@ -1160,8 +1163,13 @@ def test_a_fingerprint_is_never_truncated(
 CLI_ONLY_OPS: frozenset[str] = frozenset(
     {
         "auth_create_key",
+        "auth_disable_user",
+        "auth_enable_user",
         "auth_list_keys",
         "auth_revoke_key",
+        "auth_set_role",
+        "auth_sign_out",
+        "auth_users",
         "backup",
         "completion",
         "document_reembed",
@@ -2614,7 +2622,11 @@ def test_connector_sidecar_reports_which_profiles_ran(
 
 MINIMAL: dict[str, list[str]] = {
     "auth_create_key": ["auth", "create-key", "ci"],
+    "auth_disable_user": ["auth", "disable-user", "user-1"],
+    "auth_enable_user": ["auth", "enable-user", "user-1"],
     "auth_revoke_key": ["auth", "revoke-key", "ci"],
+    "auth_set_role": ["auth", "set-role", "user-1", "viewer"],
+    "auth_sign_out": ["auth", "sign-out", "user-1"],
     "collection_add": ["collection", "add", "col-1", "doc-1"],
     "collection_create": ["collection", "create", "runbooks"],
     "collection_delete": ["collection", "delete", "col-1"],
@@ -2829,3 +2841,86 @@ def test_a_migrate_command_with_no_arguments_plans_rather_than_copies() -> None:
     assert Arguments("vector_migrate", {}).flag("dry_run", default=True) is True
     assert Command("vector_migrate").writes() is False
     assert Command("vector_migrate", {"dry_run": False}).writes() is True
+
+
+# --- people ---------------------------------------------------------------------------------------
+#
+# The rules are the service's and ``tests/app/test_people.py`` asserts them; what is asserted here
+# is the adapter — each command reaches its operation with the arguments it was given, its result
+# renders, and a refusal is the service's refusal, exit status and all. The last is the decision
+# worth pinning: the command line runs as the local operator and gets the last-administrator
+# refusal anyway, because the operator can always promote somebody first.
+
+
+@pytest.fixture
+def people(monkeypatch: pytest.MonkeyPatch) -> FakeUsers:
+    """A workspace with one administrator and one member, and the command line bound to it."""
+    backend = FakeBackend()
+    backend.users_ = FakeUsers(workspace=backend.workspace)
+    backend.users_.add_member("root", role="admin", email="root@example.org")
+    backend.users_.add_member("bob", role="member", email="bob@example.org")
+    _bind(monkeypatch, ApplicationService(backend))
+    return backend.users_
+
+
+def test_the_members_are_listed_with_their_roles_and_standing(people: FakeUsers) -> None:
+    del people
+    result = run(["auth", "users"])
+    assert result.exit_code == 0, result.output
+    rendered = _unwrapped(result.output)
+    assert "bob@example.org" in rendered
+    assert "admin" in rendered
+    assert "1 enabled administrator(s)" in rendered
+
+
+def test_a_role_is_changed_by_address(people: FakeUsers) -> None:
+    result = run(["auth", "set-role", "bob@example.org", "viewer"])
+    assert result.exit_code == 0, result.output
+    assert "member → viewer" in _unwrapped(result.output)
+    assert people.memberships[("default", "bob")]["role"] == "viewer"
+
+
+def test_the_command_line_gets_the_last_administrator_refusal_too(people: FakeUsers) -> None:
+    """No override: the operator can promote somebody first, so there is nothing to override."""
+    result = run(["auth", "set-role", "root", "member"])
+    assert result.exit_code == 1
+    assert "last enabled administrator" in _unwrapped(result.output)
+    assert people.memberships[("default", "root")]["role"] == "admin"
+
+
+def test_disabling_says_what_it_took_with_it(people: FakeUsers) -> None:
+    result = run(["auth", "disable-user", "bob"])
+    assert result.exit_code == 0, result.output
+    rendered = _unwrapped(result.output)
+    assert "disabled" in rendered
+    assert people.memberships[("default", "bob")]["disabled"] is True
+
+    enabled = run(["auth", "enable-user", "bob"])
+    assert enabled.exit_code == 0, enabled.output
+    assert "enabled" in _unwrapped(enabled.output)
+
+
+def test_signing_a_member_out_everywhere_reports_how_many_sessions_ended(
+    people: FakeUsers,
+) -> None:
+    del people
+    result = run(["auth", "sign-out", "bob"])
+    assert result.exit_code == 0, result.output
+    assert "ended 0 session(s)" in _unwrapped(result.output)
+
+
+def test_switching_workspace_records_the_mode_beside_it(
+    monkeypatch: pytest.MonkeyPatch, manicule_environment: Path
+) -> None:
+    config = manicule_environment / "config.toml"
+    monkeypatch.setenv("MANICULE_CONFIG_FILE", str(config))
+    _bind(monkeypatch, ApplicationService(FakeBackend(settings=Settings())))
+
+    result = run(["workspace", "switch", "team-a", "--create", "--mode", "team"])
+
+    assert result.exit_code == 0, result.output
+    rendered = _unwrapped(result.output)
+    assert "mode: team" in rendered
+    assert "cannot be served" in rendered
+    written = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert (written["workspace"], written["mode"]) == ("team-a", "team")

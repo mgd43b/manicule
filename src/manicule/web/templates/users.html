@@ -1,0 +1,74 @@
+{#
+  The people who are members of this workspace, and the three things an administrator does to
+  a membership: change its role, disable or enable it, and end its sessions everywhere.
+
+  Every control calls the JSON API through the page's script — `PATCH /api/v1/auth/users/{id}`
+  and `POST /api/v1/auth/users/{id}/sign-out` — exactly as the key buttons on the auth page do.
+  None of the rules is here: the last administrator staying one, nobody disabling themselves,
+  and a disable taking the person's sessions and keys with it are the service's, and a refusal
+  arrives in the status line in the words the API used.
+
+  Members are identified by id in every request, because an address can be shared by two
+  accounts at two providers. The row you are signed in as is marked, and nothing more: whether
+  you may change it is the service's question, not the template's.
+#}{% extends layout %}
+{% import "macros.html" as m %}
+{% block content %}
+
+<section class="panel">
+  <h2>Members</h2>
+  {% if panels.providers.ok and panels.providers.data.mode != 'oauth' %}
+  <p class="muted">
+    People become members by signing in, and this installation's authentication mode is
+    <code>{{ panels.providers.data.mode }}</code>, so nobody signs in here. Programs authenticate
+    with API keys, on the API keys page.
+  </p>
+  {% endif %}
+  <p class="muted" data-user-status role="status" aria-live="polite"></p>
+
+  {% if panels.users.ok %}
+    {% if panels.users.data.users %}
+    <p>{{ panels.users.data.count }} member(s), {{ panels.users.data.admins }} enabled administrator(s).</p>
+    <table>
+      <thead><tr><th>Person</th><th>Provider</th><th>Role</th><th>Standing</th><th>Sessions</th><th>Last sign-in</th><th></th></tr></thead>
+      <tbody>
+        {% for user in panels.users.data.users %}
+        <tr>
+          <td>
+            {{ user.name or user.email or user.id }}{% if user.id == me %} <span class="pill">you</span>{% endif %}
+            {% if user.email and user.name %}<br><span class="muted">{{ user.email }}</span>{% endif %}
+            <br><code>{{ user.id }}</code>
+          </td>
+          <td>{{ user.provider }}</td>
+          <td>
+            <label class="offscreen" for="role-{{ user.id }}">Role</label>
+            <select id="role-{{ user.id }}" data-user-role="{{ user.id }}">
+              {% for choice in ('viewer', 'member', 'admin') %}
+              <option value="{{ choice }}"{% if choice == user.role %} selected{% endif %}>{{ choice }}</option>
+              {% endfor %}
+            </select>
+          </td>
+          <td>{{ 'disabled' if user.disabled else 'enabled' }}</td>
+          <td>{{ user.sessions if user.sessions is not none else '—' }}</td>
+          <td>{{ user.last_login_at or 'never' }}</td>
+          <td class="actions">
+            {% if user.disabled %}
+            <button type="button" class="ghost" data-user-enable="{{ user.id }}">Enable</button>
+            {% else %}
+            <button type="button" class="ghost danger" data-user-disable="{{ user.id }}">Disable</button>
+            <button type="button" class="ghost" data-user-sign-out="{{ user.id }}">Sign out everywhere</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted">
+      Disabling a member ends every session they hold here and revokes every API key they
+      minted, at once; enabling them again restores the membership and not those credentials.
+      A workspace that has an enabled administrator always keeps one.
+    </p>
+    {% else %}{{ m.empty('Nobody has signed in to this workspace yet.') }}{% endif %}
+  {% else %}{{ m.failed(panels.users) }}{% endif %}
+</section>
+{% endblock %}

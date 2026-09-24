@@ -67,6 +67,8 @@ IMPLEMENTATION_MODULES = (
     "requests",
     "apscheduler",
     "authlib",
+    # signing the browser's cookies (#13) — the HTTP surface's, never core's
+    "itsdangerous",
 )
 """What core must not pull in. Every entry is a library this project will eventually use."""
 

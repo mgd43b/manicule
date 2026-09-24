@@ -151,6 +151,22 @@ class KeyBody(Body):
     expires_days: int | None = Field(default=None, ge=1, le=3650)
 
 
+class UserPatch(Body):
+    """A change to one member: a role, a standing, or both.
+
+    Both optional, and a body with neither is the service's to refuse rather than this model's:
+    "nothing to change" is a rule about the operation, and a rule written here would be one the
+    command line does not have.
+    """
+
+    role: str | None = Field(default=None, description="``admin``, ``member`` or ``viewer``.")
+    disabled: bool | None = Field(
+        default=None,
+        description="``true`` disables the membership — ending the person's sessions and "
+        "revoking their keys — and ``false`` enables it again.",
+    )
+
+
 class SyncBody(Body):
     """A request to run one configured connector."""
 
@@ -170,4 +186,5 @@ __all__ = [
     "ShareBody",
     "SyncBody",
     "TagBody",
+    "UserPatch",
 ]

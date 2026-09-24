@@ -42,8 +42,11 @@ OAuth 2.0 3LO · Bearer" row that nothing implemented. 3LO is the multi-user arr
 registered Atlassian app, a client secret, a redirect URI and a token exchange, so that each
 person's own grant fetches what they may see — and manicule's index is deliberately not
 permission-aware (§9). Building the credential without the index that would justify it would
-buy nothing, so the row is gone rather than half-built. Per-user visibility is
-[#13](https://github.com/mgd43b/manicule/issues/13).
+buy nothing, so the row is gone rather than half-built. Team mode does not change that: people
+sign in to a workspace, and every member can search all of it — a role decides what a person may
+*do*, not which pages they may read. Content only some people may see belongs in a separate
+workspace, synced by an account that sees only that
+([`surfaces.md` §9.2.1](../surfaces.md#921-signing-in-and-the-browser-session)).
 
 ### 1.1 Browser sessions, for an instance behind an identity provider
 
@@ -1336,7 +1339,8 @@ Concretely, and in the terms someone deciding this needs:
 
 - **Confluence's space and page restrictions do not travel with the content.** A page
   restricted to three people, indexed by an account that is one of them, is retrievable by
-  every manicule user — text, attachments and the answers generated from them.
+  every member of the workspace it was indexed into — text, attachments and the answers
+  generated from them. Roles in team mode decide what a member may do, not what they may read.
 - **The sync account is the blast radius.** Point the connector at an account with access to
   exactly what the index is meant to hold; an admin token indexes everything an admin can see.
   A 403 during a sync is therefore not necessarily a fault — it is the boundary working — and

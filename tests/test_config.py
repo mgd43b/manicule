@@ -632,9 +632,21 @@ def test_binding_beyond_loopback_without_authentication_is_not_a_configuration_p
     assert not any("bind_host" in problem for problem in settings.policy_problems())
 
 
-def test_oauth_without_a_provider_is_refused() -> None:
+def test_oauth_without_a_provider_is_a_serving_problem_rather_than_a_policy_problem() -> None:
+    """``policy_problems`` is consulted by every command, and this stops none of them.
+
+    An installation set to ``oauth`` with no provider cannot sign anybody in — which is a fact
+    about a served browser surface, not about ``manicule index``. It used to be listed here, and
+    ``build_container`` raises on anything listed, so an operator part-way through configuring
+    sign-in could not index, search or run ``doctor`` until they had finished. It is reported by
+    :func:`~manicule.app.people.serving_problems` instead, which ``build_app`` refuses on and
+    ``doctor`` reports — the same place the rule about an unauthenticated wide bind moved to.
+    """
+    from manicule.app.people import serving_problems  # noqa: PLC0415
+
     settings = Settings(security={"auth": {"mode": "oauth"}})  # pyright: ignore[reportArgumentType]
-    assert any("oauth" in problem for problem in settings.policy_problems())
+    assert not any("oauth" in problem.lower() for problem in settings.policy_problems())
+    assert any("no OAuth provider applies" in problem for problem in serving_problems(settings))
 
 
 def test_auditing_to_a_webhook_with_no_webhook_is_refused() -> None:
@@ -675,13 +687,14 @@ def test_every_problem_is_reported_at_once() -> None:
     settings = Settings(
         llm={"provider": "openai"},  # pyright: ignore[reportArgumentType]
         security={  # pyright: ignore[reportArgumentType]
-            # A wide `bind_host` used to be the third problem here, and is no longer a problem
-            # this method reports at all: it governs binding, and `policy_problems` is consulted
-            # by every command including those that never bind. `auth.mode = oauth` with no
-            # provider is a genuine one in its place — the point of this test is the plural.
-            "auth": {"mode": "oauth"},
+            # Neither a wide `bind_host` nor `auth.mode = oauth` with no provider is a problem
+            # this method reports any more: both govern what a *served* process may do, and
+            # `policy_problems` is consulted by every command including those that serve nothing.
             "data_policy": {"cloud_allowed": False},
         },
+        # A network vector store with nowhere to be is a genuine one in their place — the point
+        # of this test is the plural.
+        storage={"vector_db": "qdrant"},  # pyright: ignore[reportArgumentType]
     )
     assert len(settings.policy_problems()) >= 3
 

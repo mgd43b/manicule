@@ -617,6 +617,18 @@ reportUnknownMemberType = "none"
 reportUnknownVariableType = "none"
 reportUnknownArgumentType = "none"
 
+# The OAuth client (#13). authlib ships no type information, so the same four rules are relaxed
+# for the one directory that talks to it and for no other: `manicule.api.oauth` is a package
+# rather than a module precisely so this can be a directory. What it exports — `begin`,
+# `complete` and the `Profile` they produce — is fully typed, and everything that decides
+# whether a person is admitted lives in `manicule.app.people`, which stays fully checked.
+[[tool.pyright.executionEnvironments]]
+root = "src/manicule/api/oauth"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests", "packages"]

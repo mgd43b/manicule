@@ -197,17 +197,19 @@ class UnknownEntityError(ManiculeError):
 
 
 class AmbiguousHandleError(ManiculeError):
-    """A handle that is not an identity matched more than one document.
+    """A handle that is not an identity matched more than one thing.
 
-    Raised only for lookups by URI, and it exists because a URI is display data a source is
-    free to change rather than a key — two connectors may mirror one page, and a source may
-    reissue a path it once gave something else. Answering with the first row would make the
-    result depend on storage order, and the caller would never learn there had been a choice.
+    Raised for two lookups, and for the same reason in each. A document's URI is display data a
+    source is free to change rather than a key — two connectors may mirror one page, and a
+    source may reissue a path it once gave something else. A member's email address is display
+    data too — two accounts at two providers can report the same one. Answering with the first
+    row would make the result depend on storage order, and the caller would never learn there
+    had been a choice.
 
-    Distinct from :class:`UnknownEntityError` because the remedy is the opposite one: the
-    document is there, and what is missing is a handle that identifies which. Every candidate
-    is named in the message — they are all inside the caller's own workspace, so listing them
-    discloses nothing the caller could not already list.
+    Distinct from :class:`UnknownEntityError` because the remedy is the opposite one: the thing
+    is there, and what is missing is a handle that identifies which. Every candidate is named
+    in the message — they are all inside the caller's own workspace, so listing them discloses
+    nothing the caller could not already list.
     """
 
 
@@ -267,6 +269,23 @@ class InstanceLockedError(ManiculeError):
     instance that started anyway would requeue the first one's in-flight documents out from
     under it.
     """
+
+
+class SignInRefusedError(ManiculeError):
+    """An identity provider vouched for somebody this workspace does not admit.
+
+    The message says which of three things happened — the address was not verified, the person
+    is not admitted, or their membership is disabled — and never which allowlist entry or rule
+    was consulted. A refusal that said "your domain is not listed" would tell a stranger what
+    to register next; one that says "not admitted" tells them to ask somebody.
+
+    ``reason`` carries the same category as a stable word, for the audit trail and for a
+    surface that renders the refusal, so neither has to parse the sentence.
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class ContextOverflowError(ManiculeError):
@@ -406,6 +425,7 @@ __all__ = [
     "ProviderTimeoutError",
     "ReconciliationRefusedError",
     "RedactionError",
+    "SignInRefusedError",
     "StorageBusyError",
     "TokenStateError",
     "UnknownComponentError",

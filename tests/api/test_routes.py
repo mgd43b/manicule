@@ -151,6 +151,7 @@ def test_the_mcp_endpoint_is_mounted() -> None:
         "/api/v1/admin/connectors",
         "/auth/session",
         "/auth/providers",
+        "/api/v1/auth/users",
     ],
 )
 def test_every_read_route_answers(path: str) -> None:

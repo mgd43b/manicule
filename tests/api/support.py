@@ -50,6 +50,7 @@ def backend_with_a_document(**overrides: Any) -> tuple[FakeBackend, Document]:
     backend.store.workspace_id = settings.workspace
     backend.organization_.workspace_id = settings.workspace
     backend.keys_.workspace = settings.workspace
+    backend.users_.workspace = settings.workspace
     document = make_document(settings.workspace)
     backend.store.add(document, make_chunk(document))
     backend.organization_.documents[document.id] = document

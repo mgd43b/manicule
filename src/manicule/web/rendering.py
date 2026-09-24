@@ -299,6 +299,13 @@ def render(
         "role": caller.role.value,
         "auth_mode": caller.identity.mode,
         "authenticated": caller.identity.authenticated,
+        # A signed-in person, for the frame to name and to offer a sign-out to. Empty for a key
+        # and for the operator at a loopback socket, neither of whom has a session to end.
+        "person": (
+            caller.identity.user_name or caller.identity.user_email or caller.identity.user_id
+            if caller.identity.via == "session"
+            else ""
+        ),
         "stylesheet": STYLESHEET_PATH,
         "script": SCRIPT_PATH,
         "layout": layout,

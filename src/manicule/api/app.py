@@ -14,6 +14,12 @@ but an ASGI application can be started by something other than ``manicule start`
 production server, a container entry point, somebody's own uvicorn invocation. So the refusal
 is repeated where the *application* is made, and it is the same one, stated the same way.
 
+Two more applications are not built, for the same reason. **A team installation with no
+authentication** — :func:`~manicule.app.bind.require_team_authentication`, which
+``--no-authentication`` cannot waive — and **a browser sign-in that could never complete**:
+under ``security.auth.mode = 'oauth'``, a missing signing key or a provider that cannot be
+reached back is a server that sends people to a provider and fails them when they return.
+
 **CORS is explicit or absent.** With no ``security.transport.allowed_origins`` the middleware
 is not installed at all, which means same-origin only. There is no wildcard: configuration
 refuses ``*`` outright, because a cross-origin wildcard over a document index means every page
@@ -76,7 +82,12 @@ from manicule.api.routes import health as health_routes
 from manicule.api.security import require, resolve
 from manicule.api.widget import router as widget_router
 from manicule.app import frontdoor
-from manicule.app.bind import is_loopback, require_authoring_authentication
+from manicule.app.bind import (
+    is_loopback,
+    require_authoring_authentication,
+    require_team_authentication,
+)
+from manicule.app.people import serving_problems
 from manicule.app.request_logging_http import RequestLoggingMiddleware
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import PolicyError
@@ -271,6 +282,10 @@ def build_app(
     # into a corpus reachable by every process on the machine is not made safe by the port
     # being local.
     require_authoring_authentication(settings, allow_unauthenticated=allow_unauthenticated)
+    # Team mode's refusal, repeated here from `resolve_bind` for that function's own reason:
+    # an application can be served by something that never resolved a bind.
+    require_team_authentication(settings, allow_unauthenticated=allow_unauthenticated)
+    _require_a_sign_in_that_can_complete(service)
 
     # Built before the application, because the application needs its lifespan. FastMCP's ASGI
     # app owns a session manager that has to be started and stopped, and a mount does not run a
@@ -313,6 +328,11 @@ def build_app(
     app.state.service = service
     app.state.proxy_policy = ProxyPolicy.of(settings)
     app.state.route_groups = ROUTE_GROUPS
+    # How a sign-in reaches an identity provider. `None` is the network; a suite replaces it
+    # with a transport that plays the provider, so no test of the sign-in routes leaves this
+    # machine. It is state rather than a parameter because nothing but a test has a reason to
+    # set it, and a parameter would be one more argument every caller of this function passes.
+    app.state.oauth_transport = None
 
     origins = settings.security.transport.allowed_origins
     if origins:
@@ -322,9 +342,11 @@ def build_app(
             CORSMiddleware,
             allow_origins=list(origins),
             allow_credentials=False,
-            # Credentials are never cookies here — a key is presented on every request — so
-            # `allow_credentials` stays off. With it on, a browser would attach cookies to
-            # cross-origin calls, which is the ingredient a CSRF needs.
+            # Off, and it stays off under OAuth too. The one cookie that is a credential — a
+            # signed-in browser's session — is for this origin's own pages and nothing else:
+            # it is `SameSite=Strict`, and a cross-origin caller such as the widget presents a
+            # key in a header instead. With this on, a browser would attach that cookie to a
+            # listed origin's calls, which is the ingredient a cross-site request forgery needs.
             allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type", "X-API-Key"],
             max_age=600,
@@ -521,6 +543,25 @@ def _op_of(request: Request) -> str:
     route = request.scope.get("route")
     name = getattr(route, "name", "")
     return name or "request"
+
+
+def _require_a_sign_in_that_can_complete(service: ApplicationService) -> None:
+    """Refuse to build an application whose browser sign-in could never succeed.
+
+    Under ``security.auth.mode = 'oauth'`` a missing signing key, a provider for another
+    workspace, a ``redirect_uri`` that is not this installation's callback — each of those is
+    a server that starts, sends a person to a provider, and fails when they come back. Refused
+    here, where an application is made, rather than in ``policy_problems``: none of them stops a
+    command that serves nothing. ``doctor``'s ``sign_in`` check reports the same list.
+
+    Raises:
+        PolicyError: Anything :func:`~manicule.app.people.serving_problems` reports.
+    """
+    problems = serving_problems(service.settings)
+    if problems:
+        joined = "\n  - ".join(problems)
+        msg = f"refusing to serve browser sign-in as configured:\n  - {joined}"
+        raise PolicyError(msg)
 
 
 def _require_auth_for_wide_bind(

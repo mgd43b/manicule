@@ -1935,6 +1935,12 @@ class Settings(BaseSettings):
         :func:`~manicule.api.app._require_auth_for_wide_bind` before an application does. Both
         refuse, both take ``--no-authentication`` to waive, and ``doctor``'s ``transport`` check
         reports the same condition as a finding for anybody who wants to know without serving.
+
+        ``security.auth.mode = 'oauth'`` with no provider left for the same reason: it stops a
+        browser from signing in, not ``manicule index`` from running.
+        :func:`~manicule.app.people.serving_problems` holds it with the rest of what a sign-in
+        needs, ``build_app`` refuses to serve with any of it, and ``doctor``'s ``sign_in`` check
+        reports it.
         """
         problems: list[str] = []
 
@@ -1980,9 +1986,6 @@ class Settings(BaseSettings):
         problems.extend(self._source_restriction_problems())
         problems.extend(self._vector_store_problems())
         problems.extend(self._dispatch_problems())
-
-        if self.security.auth.mode is AuthMode.OAUTH and not self.security.auth.providers:
-            problems.append("security.auth.mode is 'oauth' but no OAuth providers are configured")
 
         if self.security.audit.destination is AuditDestination.WEBHOOK and not self.events.webhooks:
             problems.append("security.audit.destination is 'webhook' but events.webhooks is empty")

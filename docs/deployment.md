@@ -86,6 +86,11 @@ an account with access to exactly what the index is meant to hold. An admin toke
 everything an admin can see, into a directory that is a verbatim copy, on a machine whose file
 permissions are now the only access control left.
 
+**Team mode does not change this.** Every member of a workspace can search all of it; a role
+decides what a person may *do* — read, write, administer — and not which documents they may see
+([`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session)). Content some
+members must not read belongs in a workspace they are not members of.
+
 ---
 
 ## 2. Filesystem permissions
@@ -269,14 +274,17 @@ mutating tool is absent from it rather than refused on it, for the reason
 gives. Over stdio, where one client talks to one process down a pipe, the whole surface is
 offered.
 
-The browser surface is for the loopback, single-operator installation. A browser cannot attach a
-header to a page load and this build has no session cookie, so with `security.auth.mode` set to
-anything but `none` a page load carries no credential and is refused — with a page saying so.
-That is deliberate rather than a gap; [`web.md` §5](web.md#5-what-a-browser-cannot-present-said-plainly)
-explains it, and an interactive login belongs to
-[#13](https://github.com/mgd43b/manicule/issues/13). The practical consequence for a deployment
-is that publishing a port gets you the API and the widget, and the pages will refuse — which is
-the safe direction for the surface that renders the corpus.
+What the browser surface does on a published port depends on how the installation
+authenticates. A browser cannot attach a header to a page load, so with `security.auth.mode =
+api_key` a page load carries no credential and is refused — with a page saying so — and
+publishing a port gets you the API and the widget while the pages refuse, which is the safe
+direction for the surface that renders the corpus. With `security.auth.mode = oauth` people sign
+in through Google or GitHub at `/ui/login` and the pages work for them; that needs
+`security.auth.session_secret`, a provider whose `redirect_uri` is this deployment's own
+`https://<host>/auth/callback/<type>`, and an allowlist, and `manicule serve` refuses to start
+without them. [`web.md` §5](web.md#5-what-a-browser-can-present-said-plainly) says what a
+browser can present in each mode, and
+[`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session) is the sign-in.
 
 **Publish to host loopback, with authentication on.**
 

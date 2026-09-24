@@ -306,7 +306,7 @@ server and the built command tree.
 | `config_get` | ✓ | `config get` / `config show` | configuration, redacted |
 | `config_set` | ✓ | `config set` | the key, before and after |
 | `workspace_list` | ✓ | `workspace list` | workspaces, active marked |
-| `workspace_switch` | ✓ | `workspace switch` | previous and current |
+| `workspace_switch` | ✓ | `workspace switch [--mode personal\|team]` | previous and current, and the mode recorded beside it |
 | `plugin_list` | ✓ | `plugin list` | installed plugins and components |
 | `plugin_add` | ✓ | `plugin add` | what was enabled |
 | `plugin_remove` | ✓ | `plugin remove` | what was disabled |
@@ -333,6 +333,7 @@ server and the built command tree.
 | `start` / `stop` | — | `start` / `stop` | the address, and whether it is loopback |
 | `completion` | — | `completion` | a shell script |
 | `auth_create_key` / `auth_list_keys` / `auth_revoke_key` | — | `auth …` | API keys |
+| `auth_users` / `auth_set_role` / `auth_disable_user` / `auth_enable_user` / `auth_sign_out` | — | `auth users`, `auth set-role`, `auth disable-user`, `auth enable-user`, `auth sign-out` | members of this workspace, and what a change took with it |
 
 ### 4.0.1 Shared lifecycle status
 
@@ -387,8 +388,9 @@ incremental walk, and is not the same claim as `false`. Absent `enumeration_offs
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
 `connector_sidecar`, `collection_orphans`, `document_reindex_stale`, `document_reembed`, the
-five mutating or corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs are
-command-line only. Each of them either destroys data, mints a credential, writes into the
+five mutating or corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs — keys
+and people alike — have no tool; the `auth` verbs are on the HTTP surface for an administrator
+too (§9.2). Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
 assistant can call unattended should not be able to do any of that. The forty-five tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
@@ -879,10 +881,11 @@ the shape of this payload and moves only when the shape does, which is what a co
 behavior actually wants — `manicule_version` and the envelope's `version` both move with every
 release whether or not anything changed.
 
-Checks, in the order `doctor` emits them: `configuration`, `transport`, `plugins`, `storage`,
-`permissions`, `index`, `vector_integrity`, `vector_backend`, `glossary`, `connectors`,
-`authoring`, `collection-membership`, `sessions`, `document-identity`, `document-content`,
-`extractable-text`, `wiki-provenance`, `grammars`, `vocabularies`, `models`, and
+Checks, in the order `doctor` emits them: `configuration`, `transport`, `sign_in`, `plugins`,
+`storage`, `permissions`, `index`, `vector_integrity`, `vector_backend`, `glossary`,
+`connectors`, `authoring`, `collection-membership`, `sessions`, `document-identity`,
+`document-content`, `extractable-text`, `wiki-provenance`, `grammars`, `vocabularies`, `models`,
+and
 `component:<kind>:<name>` for anything already constructed.
 
 `extractable-text` is `degraded` when more than 5% of a source's documents ended
@@ -939,7 +942,14 @@ It is never `failing`. Nothing stored is damaged and nothing is lost, which is t
 `transport` reports the bind: `ok` for loopback, `degraded` for a non-loopback bind with
 authentication on, and `failing` for one without it — including when `--no-authentication` made
 that deliberate, where the wording says so and the remedy becomes "configure authentication"
-rather than "bind loopback".
+rather than "bind loopback". In team mode with no authentication it is `failing` on any address,
+loopback included, because every server start will be refused (§6); `facts.installation_mode`
+says which mode was read.
+
+`sign_in` is `ok` when `security.auth.mode` is not `oauth` — there is no browser sign-in to get
+wrong — and otherwise lists every condition `build_app` would refuse to serve with (§9.2.1): a
+signing key, a provider that applies to this workspace, a `redirect_uri` that is this
+installation's callback, and an allowlist that admits somebody.
 
 **It judges the address this process actually took**, not the one configuration holds. `--host`
 is a command-line option, so a server started with `--host 0.0.0.0` leaves
@@ -1125,6 +1135,23 @@ A rule about what may *listen* belongs where something listens. It is enforced a
 above and nowhere else, and `doctor`'s `transport` check reports the same condition as a finding
 for anybody who wants to know without serving.
 
+#### Team mode takes the way out away
+
+Everything above about an anonymous caller rests on there being one operator for that caller to
+be. `mode = "team"` says there is not — several people share the installation — so **a team
+installation with `security.auth.mode = none` is refused wherever a socket is made, loopback
+included**, and `--no-authentication` is refused rather than allowed to waive it: an anonymous
+administrator is a single-operator arrangement by definition. The refusal is
+`manicule.app.bind.require_team_authentication`, called from `resolve_bind` and from `build_app`
+for the reason each of the other refusals is repeated in both, and `doctor`'s `transport` check
+reports it as failing without serving. It is not a `policy_problems` entry, for the same reason
+the wide-bind rule is not: `manicule index` in a team installation opens no socket.
+
+`workspace switch NAME --mode team` writes the mode beside the workspace in one edit of the
+configuration file. The mode is installation configuration; what a workspace row records is the
+mode a **writer** last opened it under, which is where `workspace list` reads the mode of every
+workspace but the one being served.
+
 ### 6.1 MCP over a socket carries the read-only tools and one named write
 
 The endpoint is `/mcp` on the same port, and a client is configured with the trailing slash:
@@ -1213,6 +1240,12 @@ see; what they share is the process — one `Runtime`, one pipeline, one session
 schedule — which is right, because each of those is a fact about the process rather than about a
 caller. `tests/api/test_both_surfaces.py` drives two clients at once over a real socket and
 proves each is answered with what it asked for.
+
+For the same reason **a browser's session cookie is not a credential here** (§9.2.1): a caller
+presents its key on every call. An assistant running in a browser tab would otherwise inherit
+whoever happens to be signed in there, which is ambient authority of exactly the kind this mount
+has none of. `tests/api/test_signin.py` asserts the cookie that reads the API is refused on the
+mount in the same breath.
 
 **Every other write operation is reachable where a person is present**: at the command line, over
 stdio, and over the control socket of `docs/deployment.md` §6.1. Widening that set is its own
@@ -1366,13 +1399,13 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | tags | `GET`/`POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`, `POST`/`DELETE /api/v1/documents/{docId}/tags/{tagId}` |
 | admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
 | plugins | `GET /api/v1/plugins`, `GET /api/v1/plugins/search`, `POST`/`DELETE /api/v1/plugins/{name}` |
-| auth | `GET /auth/providers`, `GET /auth/session`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}` |
+| auth | `GET /auth/providers`, `GET /auth/session`, `GET /auth/login/{provider}`, `GET /auth/callback/{provider}`, `POST /auth/logout`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}`, `GET /api/v1/auth/users`, `PATCH /api/v1/auth/users/{user}`, `POST /api/v1/auth/users/{user}/sign-out` |
 | workbench | `GET /api/v1/workbench?document_id=…` |
 | websocket chat | `WS /api/v1/chat/ws` |
 | mcp | `POST /mcp/` — the read-only tool surface of §6.1, plus `document_create`. Authentication decides who may call that write, not whether it is carried |
 
 Plus the embeddable widget: `GET /widget/widget.js` and a static page at `GET /widget`, and the
-browser surface at `/ui` — twelve areas of server-rendered HTML over the same service, mounted on
+browser surface at `/ui` — fifteen areas of server-rendered HTML over the same service, mounted on
 the same application. It is not a twelfth route group: it publishes no operation of its own, and
 [`web.md`](web.md) is its document.
 
@@ -1395,6 +1428,15 @@ the page sends. On the websocket, where a browser cannot set headers, it travels
 `Sec-WebSocket-Protocol` header as `manicule.api-key.<key>` and the server echoes the
 subprotocol back.
 
+With `oauth`, keys work exactly as above, and **a person at a browser signs in** through Google
+or GitHub instead — §9.2.1. A request presenting no header credential is then resolved from the
+browser's session cookie, if it carries one. A header always wins over a cookie, valid or not,
+and the cookie is **never** honored beneath the MCP mount, which is stateless by design (§6.1):
+an assistant running in a browser tab must not inherit whoever is signed in there.
+`manicule.api.security.identify` is the one place that decision is made, for HTTP routes, pages
+and the websocket alike. `GET /auth/session` reports `via` — `key` or `session` — and, for a
+signed-in person, their user id, address and name.
+
 Roles are a floor: `viewer` reads, `member` writes, `admin` administers. A route asks for the
 least it needs — and one asks for more when an argument asks for more: `GET /api/v1/search` is a
 viewer's until it is given workspaces other than its own, when it is an administrator's (§7).
@@ -1411,7 +1453,135 @@ operator — which is tolerable because that configuration is refused twice on a
 loopback (§6), and reachable off loopback only by a person typing `--no-authentication`. On
 that bind the "operator" is anything that can route to the port — able to read the index and to
 author into the configured source. That is the exposure the flag buys, named at startup and
-reported by `manicule doctor` for as long as it holds.
+reported by `manicule doctor` for as long as it holds. In team mode it is not available at all
+(§6, "Team mode takes the way out away").
+
+#### 9.2.1 Signing in, and the browser session
+
+The one description of how a person signs in; [`web.md` §5](web.md#5-what-a-browser-can-present-said-plainly)
+points here rather than repeating it.
+
+**Configuration.** The shape, as it would sit in the configuration file:
+
+```toml
+mode = "team"
+
+[security.auth]
+mode = "oauth"
+session_secret = "…"          # at least 32 characters; see below
+
+[[security.auth.providers]]
+type = "google"
+client_id = "…apps.googleusercontent.com"
+client_secret = "…"
+redirect_uri = "https://manicule.example.org/auth/callback/google"
+allowed_domains = ["example.org"]
+role = "member"
+```
+
+`session_secret` and every `client_secret` are credentials, and `manicule config set` refuses to
+write one. Set them in the environment instead —
+`MANICULE_SECURITY__AUTH__SESSION_SECRET`, and `MANICULE_SECURITY__AUTH__PROVIDERS` as a JSON list
+of the provider tables above — or keep them in a configuration file only the account running
+manicule can read.
+
+`redirect_uri` is required and never derived from the request, because a `Host` header would
+then choose where the provider sends the authorization code. It must be the callback registered
+with the provider, and `https` unless it names a loopback host or
+`security.transport.enforce_https` is off.
+
+**The flow.** `GET /auth/login/{google|github}` generates a random `state` and a PKCE verifier,
+puts both in the `manicule_signin` cookie, and redirects to the provider with the `state`, the
+S256 challenge and the configured `redirect_uri`. The provider sends the browser back to
+`GET /auth/callback/{provider}`, which requires the cookie, compares `state` in constant time,
+deletes the cookie whatever happens next, exchanges the code with the verifier (authlib, over
+`httpx`), and asks the provider who signed in — Google's OpenID userinfo (`sub`,
+`email_verified`), or GitHub's numeric account `id` and the address `/user/emails` marks
+primary, verified only if GitHub says so. The service then decides. Every outcome is an HTML
+page: a refusal at the status the API would have used, or a short page that moves the browser
+on. Neither carries a code, a token or a provider's error text.
+
+**Admission**, decided by `ApplicationService.sign_in` on **every** sign-in rather than
+remembered from the first — so removing an address stops that person at their next one:
+
+- the provider must apply to this workspace: `workspace` unset, or naming the one being served;
+- `allow_any_user = true` admits every account the provider authenticates; otherwise the address
+  must be **verified** and either match an `allowed_emails` entry exactly, or have its part after
+  the `@` equal an `allowed_domains` entry exactly — `team.example.org` is not `example.org`;
+- a disabled membership is refused whatever the allowlist says.
+
+A refusal says *not admitted*, *address not verified* or *disabled*, and never which allowlist
+entry was consulted. The audit trail records `auth.login_refused` with the provider and that
+category, and **not the address**: it belongs to somebody who is not a member. A first sign-in
+creates the person (installation-wide, keyed by provider and account id — never by address) and
+their membership in the provider's `role`; after that, the role is whatever an administrator
+made it, and a sign-in never overwrites it.
+
+**The two cookies.** Both are `itsdangerous` timed signatures keyed by
+`security.auth.session_secret` (at least 32 characters), each with its own salt, so a forged or
+over-age cookie is refused for the cost of a hash — before anything is looked up.
+
+| | `manicule_session` | `manicule_signin` |
+|---|---|---|
+| Carries | a random 256-bit token; the database keeps only its SHA-256 | one sign-in's `state`, PKCE verifier and provider |
+| `HttpOnly` | yes — page script cannot read it | yes |
+| `SameSite` | `Strict` — attached to no request another site caused | `Lax` — the provider's return is a cross-site top-level `GET`, which `Strict` would withhold |
+| `Path` | `/` | `/auth/callback` |
+| `Max-Age` | `security.auth.session_max_age_s`, not extended by use | ten minutes |
+| `Secure` | when `security.transport.enforce_https` | the same |
+
+**Why the callback answers with a page.** The session cookie is `Strict`, and the callback is
+the end of a redirect chain that began on the provider's site. A browser withholds a `Strict`
+cookie from any further redirect in that chain, so redirecting from the callback would deliver
+the person to the dashboard signed out. A page ends the chain; its
+`<meta http-equiv="refresh">` — and an ordinary link, for a browser that ignores it — starts a
+navigation on this origin, which carries the cookie. There is no script on it: the browser
+surface's policy forbids inline script.
+
+**Sessions are rows, so they are revocable one at a time.** The cookie names a row in
+`auth_sessions`; nothing about the person is in it. A session is usable only while its row is
+this workspace's, unrevoked and unexpired and its person's membership is enabled — all one
+statement, with no branch that distinguishes an unknown token from a revoked one. The role is
+read from the membership in that same statement, so a demotion takes effect on the next request.
+A session minted for one workspace authenticates in no other. It ends when:
+
+- the person signs out — `POST /auth/logout` revokes the row, so a copy of the cookie stops
+  working at the same moment, and clears the cookie; a form post is sent on to `/ui/login`;
+- an administrator signs them out everywhere, or disables them — a disable also revokes every
+  key they minted, in the same transaction;
+- it expires, or `session_secret` changes — which signs every browser out at once, deliberately.
+
+**Cross-site requests.** Two defenses, each holding without the other: `SameSite=Strict` keeps a
+browser from attaching the cookie to a request another site caused, and §9.6.1's refusal of an
+unsafe method from another origin runs before routing on every route — `POST /auth/logout`
+included. CORS never allows credentials, so a listed origin such as the widget's presents a key
+instead.
+
+**What a role is, and is not.** Team mode does not make the index permission-aware. Every member
+of a workspace can read the whole workspace; roles decide what a person may *do* — `viewer`
+reads, `member` writes, `admin` administers people, keys and the installation — not which
+documents they may see. A corpus some people must not read belongs in another workspace.
+
+**The first administrator.** Either give one provider `role = "admin"` with an allowlist that
+names only that person, sign in, and then narrow the provider back to `member`; or let people
+sign in as members and promote one from the command line, which runs as the operator at the
+machine: `manicule auth set-role <user-id-or-address> admin`. A workspace that has an enabled
+administrator always keeps one — the last one cannot be demoted or disabled, on any surface,
+the command line included, because promoting somebody first is always possible. Nobody can
+disable themselves.
+
+**Refused at serve time, reported by `doctor`.** Under `oauth`, `build_app` refuses to serve —
+and `doctor`'s `sign_in` check reports as failing — a missing or short `session_secret`, no
+provider that applies to the served workspace, two applicable providers of one type, a
+`redirect_uri` that does not end with `/auth/callback/<type>` or is plain `http` on a
+non-loopback host while `enforce_https` is on, and a provider that admits nobody. None of these
+is a `policy_problems` entry: none of them stops a command that serves nothing.
+
+**People over HTTP**, all admin: `GET /api/v1/auth/users` lists members with their role,
+standing and live session count; `PATCH /api/v1/auth/users/{user}` takes `role` and/or
+`disabled`; `POST /api/v1/auth/users/{user}/sign-out` ends every session the member holds.
+`{user}` is a user id, or an address that names exactly one member of this workspace — two
+accounts at two providers can share one, and then the id is required.
 
 ### 9.3 Whose address a request has
 
@@ -1437,8 +1607,9 @@ deliberately cross-origin.
 - **CORS is explicit or absent.** With no `security.transport.allowed_origins` the middleware
   is not installed, which means same-origin. Configuration refuses `*` outright: a wildcard
   over a document index means any page a user visits can read it.
-- **Credentials are never permitted cross-origin.** A key is presented per request; there is no
-  cookie to attach, and `allow-credentials` is the ingredient a CSRF needs.
+- **Credentials are never permitted cross-origin.** A key is presented per request, and the one
+  cookie that is a credential — a signed-in browser's session — is `SameSite=Strict` and for this
+  origin's own pages. `allow-credentials` stays off, because it is the ingredient a CSRF needs.
 - **Framing is refused unless somebody named the frames.** Every response carries
   `frame-ancestors`, naming `security.transport.widget_allowed_domains` and `'none'` when that
   is empty.
@@ -1505,7 +1676,7 @@ before routing.
 
 The threat needs a browser holding *ambient* authority, which is the posture manicule ships as:
 loopback with `security.auth.mode = none`, where there is no credential and the caller is whoever
-can reach the port. CORS hides the **response** to a cross-origin request and does not stop a
+can reach the port. A signed-in browser's session cookie is the other case (§9.2.1). CORS hides the **response** to a cross-origin request and does not stop a
 "simple" one being sent, so a form `POST` from a page the operator merely visited would take
 effect. `Sec-Fetch-Site` is the primary signal because page script cannot set it; `Origin`
 compared against `Host` is the fallback. A request with neither header — every non-browser
