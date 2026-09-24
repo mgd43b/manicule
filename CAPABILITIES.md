@@ -310,6 +310,11 @@ name — an absence with no test is an absence that comes back.
 - Every request over this surface, over the MCP mount, and the websocket handshake, is now
   metered by `security.rate_limit` — a 429 with a `Retry-After` header, not a new route.
   `docs/surfaces.md` §9.10.
+- `GET /api/v1/auth/keys`, `POST /api/v1/auth/keys` and `DELETE /api/v1/auth/keys/:nameOrId` —
+  minting, listing and revoking API keys, which the endpoints above assume exist and never
+  create. Viewer-floor routes, because who may see, mint and revoke which key is the service's
+  ownership rule rather than a role: an administrator manages every key, anyone else only the
+  keys they minted, at no more than their own role. `docs/surfaces.md` §9.2.
 - `GET /api/v1/auth/users`, `PATCH /api/v1/auth/users/:user` and
   `POST /api/v1/auth/users/:user/sign-out` — the people-admin surface `mode = "team"` needs and
   a single-operator build has no one to apply it to: list members with role, standing and live

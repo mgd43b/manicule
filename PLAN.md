@@ -451,6 +451,11 @@ the sections above.
 auth 5 · tags 5 · health 4 · plugins 4 · chat 3 · workbench 1, plus a websocket channel.
 The workbench is a single read-only endpoint behind a `document:read` scope.
 
+That count is the audited system's, taken when this plan was written, and it is kept as the
+record of what was audited. manicule's own surface is counted where it is enforced: the route
+groups and every deliberate absence in `tests/api/test_routes.py`, and the routes themselves in
+[`docs/surfaces.md`](docs/surfaces.md) §9 and `CAPABILITIES.md`.
+
 
 ---
 
