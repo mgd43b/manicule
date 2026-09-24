@@ -2,8 +2,14 @@
   A refusal, as a page rather than as a JSON envelope.
 
   Standalone: somebody who may not read this page may not be shown a navigation listing what
-  exists here either. The message is the one `manicule.api.security.require` produced, so a
-  person and a program are told the same thing about what this installation wants.
+  exists here either. The message is the one `manicule.api.security.require` produced — or, for
+  a sign-in, the one the service or the sign-in route did — so a person and a program are told
+  the same thing about what this installation wants.
+
+  The hint underneath is chosen by `manicule.web.security` from how this installation
+  authenticates, because the sentence that is true of an installation that uses API keys is not
+  true of one where people sign in. `sign_in` is the one link offered, and only where signing in
+  is what would help.
 #}<!doctype html>
 <html lang="en">
 <head>
@@ -18,14 +24,10 @@
   <h1>{{ status }} · {{ title }}</h1>
   <div class="panel bad">
     <p class="message">{{ message }}</p>
-    <p class="hint">
-      A browser cannot attach a header to a page load, and this build has no session cookie —
-      a key is presented on every request instead. On an installation with authentication
-      switched on, use the HTTP API or the command line; the browser surface is for the
-      loopback, single-operator installation manicule ships as.
-    </p>
+    {% if hint %}<p class="hint">{{ hint }}</p>{% endif %}
     <p class="muted">{{ path }}</p>
   </div>
+  {% if sign_in %}<p><a href="{{ sign_in }}">Sign in</a></p>{% endif %}
 </main>
 </body>
 </html>

@@ -61,14 +61,15 @@ PAGE_FOR_AREA: dict[str, str] = {
     "admin": "/ui/admin",
     "reembed": "/ui/reembed",
     "lifecycle": "/ui/lifecycle",
+    "users": "/ui/users",
     "auth": "/ui/auth",
 }
 
 
-def test_the_fourteen_areas_are_the_thirteen_pages_and_the_frame() -> None:
+def test_the_fifteen_areas_are_the_fourteen_pages_and_the_frame() -> None:
     """The area list and the pages cannot drift apart without this failing."""
     assert set(PAGE_FOR_AREA) | {"layout"} == set(AREAS)
-    assert len(AREAS) == 14
+    assert len(AREAS) == 15
 
 
 def test_the_admin_page_shows_whether_vector_search_is_still_exhaustive() -> None:
@@ -180,9 +181,18 @@ def test_the_layout_area_is_the_frame_every_other_page_extends() -> None:
         for path in TEMPLATE_DIR.glob("*.html")
         # `refused.html` and `notfound.html` are deliberately standalone: both render before
         # anything has decided whether the reader may see this workspace, and the frame's
-        # navigation is a description of what the installation holds.
+        # navigation is a description of what the installation holds. `signed_in.html` is the
+        # third, for its own reason: it is the one response that must end a sign-in's redirect
+        # chain, and it names only the person who just signed in.
         if path.name
-        not in {"layout.html", "bare.html", "macros.html", "refused.html", "notfound.html"}
+        not in {
+            "layout.html",
+            "bare.html",
+            "macros.html",
+            "refused.html",
+            "notfound.html",
+            "signed_in.html",
+        }
     )
     assert len(pages) >= 10, f"only {len(pages)} page templates found; the scan is looking wrong"
     for page in pages:
@@ -403,19 +413,51 @@ def test_a_second_page_of_a_listing_renders(path: str) -> None:
 
 
 def test_a_browser_that_presents_no_key_is_refused_as_a_page() -> None:
-    """With authentication configured, a navigation carries no credential and this says so.
+    """With API keys configured, a navigation carries no credential and this says so.
 
-    A browser cannot attach a header to a page load and this build has no session cookie, so
-    the honest answer is a refusal that explains itself — not a JSON envelope in a browser
-    window, and not a page that quietly renders as though the caller were the operator.
+    A browser cannot attach a header to a page load, and under ``api_key`` there is no session
+    cookie, so the honest answer is a refusal that explains itself — not a JSON envelope in a
+    browser window, and not a page that quietly renders as though the caller were the operator.
     """
     backend, _ = backend_with_a_document(security={"auth": {"mode": "api_key"}})
     with client_for(backend) as client:
         response = client.get("/ui/documents")
     assert response.status_code == UNAUTHORIZED
     assert "text/html" in response.headers["content-type"]
-    assert "session cookie" in response.text
+    assert "no session cookie" in response.text
+    assert 'href="/ui/login"' not in response.text, "offered a sign-in nobody can complete"
     assert "{" not in response.text.split("<body")[0], "a JSON body reached a browser"
+
+
+def test_where_people_sign_in_the_refusal_offers_the_sign_in_and_not_the_api_key_story() -> None:
+    """The sentence about there being no session cookie is true of ``api_key`` and false here.
+
+    The refusal page used to say it unconditionally; on an installation where people sign in it
+    would tell a person the one thing that is not so, beside no way forward.
+    """
+    backend, _ = backend_with_a_document(
+        security={
+            "auth": {
+                "mode": "oauth",
+                "session_secret": "k" * 40,
+                "providers": [
+                    {
+                        "type": "google",
+                        "client_id": "c",
+                        "client_secret": "s",
+                        "redirect_uri": "http://127.0.0.1:8765/auth/callback/google",
+                        "allowed_domains": ["example.org"],
+                    }
+                ],
+            }
+        }
+    )
+    with client_for(backend) as client:
+        response = client.get("/ui/documents")
+    assert response.status_code == UNAUTHORIZED
+    assert "text/html" in response.headers["content-type"]
+    assert 'href="/ui/login"' in response.text
+    assert "session cookie" not in response.text
 
 
 def test_a_viewer_may_not_read_the_administration_areas() -> None:
@@ -430,7 +472,7 @@ def test_a_viewer_may_not_read_the_administration_areas() -> None:
     with client_for(backend) as client:
         headers = {"X-API-Key": secret}
         assert client.get("/ui/documents", headers=headers).status_code == 200
-        for path in ("/ui/admin", "/ui/auth", "/ui/connectors", "/ui/plugins"):
+        for path in ("/ui/admin", "/ui/auth", "/ui/users", "/ui/connectors", "/ui/plugins"):
             assert client.get(path, headers=headers).status_code == FORBIDDEN, path
 
 

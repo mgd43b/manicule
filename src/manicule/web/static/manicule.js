@@ -768,6 +768,38 @@
     act("[data-revoke]", keyStatus, "Revoking…", "Revoked.", function (element) {
       return json("DELETE", "/api/v1/auth/keys/" + encodeURIComponent(element.getAttribute("data-revoke")))
     });
+
+    /* People. Every control names the member by id, never by address, and every rule — the last
+     * administrator, nobody disabling themselves — is the server's: a refusal arrives in the
+     * status line in its words, and the select is put back by the reload that follows. */
+    var userStatus = document.querySelector("[data-user-status]");
+    document.querySelectorAll("[data-user-role]").forEach(function (select) {
+      var chosen = select.value;
+      select.addEventListener("change", function () {
+        runAction(select, userStatus, "Changing role…", function () {
+          return json("PATCH", "/api/v1/auth/users/" + encodeURIComponent(select.getAttribute("data-user-role")),
+                      { role: select.value });
+        }, function (result, node) {
+          chosen = select.value;
+          reloadAfterChange(result, node, "Role changed.");
+        }).then(function () {
+          /* Settled: a success moved `chosen` before this ran, so a difference is a refusal,
+           * and the select goes back to the role the member still has. */
+          if (select.value !== chosen) { select.value = chosen; }
+        });
+      });
+    });
+    act("[data-user-disable]", userStatus, "Disabling…", "Disabled.", function (element) {
+      return json("PATCH", "/api/v1/auth/users/" + encodeURIComponent(element.getAttribute("data-user-disable")),
+                  { disabled: true });
+    });
+    act("[data-user-enable]", userStatus, "Enabling…", "Enabled.", function (element) {
+      return json("PATCH", "/api/v1/auth/users/" + encodeURIComponent(element.getAttribute("data-user-enable")),
+                  { disabled: false });
+    });
+    act("[data-user-sign-out]", userStatus, "Signing out…", "Signed out everywhere.", function (element) {
+      return json("POST", "/api/v1/auth/users/" + encodeURIComponent(element.getAttribute("data-user-sign-out")) + "/sign-out");
+    });
   }
 
   startTheme();

@@ -11,6 +11,10 @@ on this surface one of those is a hole. So the handshake resolves a principal an
 before ``accept``, and the refusal is a close code rather than a JSON body, because a client
 that never completed a handshake has nowhere to read a body from.
 
+**A signed-in browser needs no subprotocol.** Under ``security.auth.mode = 'oauth'`` the
+handshake carries the session cookie like any other same-origin request, and it is resolved by
+:func:`~manicule.api.security.identify` — the function every HTTP route's principal comes from.
+
 **The credential is never a query parameter.** A browser cannot set headers on a ``WebSocket``,
 and the usual workaround puts the key in the URL — where it lands in the access log, the
 browser history and any ``Referer`` the page sends. manicule reads it from the subprotocol
@@ -36,7 +40,7 @@ from manicule.api.context import policy_of, service_of
 from manicule.api.models import AskBody
 from manicule.api.origins import HANDSHAKE_REFUSAL, ORIGIN, handshake_permitted
 from manicule.api.proxy import FORWARDED_FOR
-from manicule.api.security import Principal, require, websocket_token
+from manicule.api.security import Principal, identify, require, websocket_token
 from manicule.api.streaming import answer_frames
 from manicule.app.dispatch import error_info
 from manicule.app.results import failed
@@ -88,10 +92,13 @@ async def chat_socket(websocket: WebSocket) -> None:
         )
         return
 
-    token, subprotocol = websocket_token(websocket)
+    # The same decision every HTTP route gets, header first and a signed-in browser's session
+    # cookie after it — reached here, after the origin check above, because a cookie is exactly
+    # the ambient credential a cross-origin handshake would otherwise be spending.
+    _, subprotocol = websocket_token(websocket)
     client = websocket.client
     principal = Principal(
-        identity=await service.authenticate(token),
+        identity=await identify(service, websocket),
         address=policy.client_address(
             peer=client.host if client is not None else None,
             forwarded_for=websocket.headers.get(FORWARDED_FOR),

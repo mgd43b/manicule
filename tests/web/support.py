@@ -220,7 +220,9 @@ def pages_of(document_id: str) -> tuple[str, ...]:
         "/ui/settings",
         "/ui/workspaces",
         "/ui/admin",
+        "/ui/users",
         "/ui/auth",
+        "/ui/login",
         f"/ui/shared/{SHARE_TOKEN}",
     )
 

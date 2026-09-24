@@ -19,6 +19,17 @@ non-loopback bind with no auth is refused twice: by
 :func:`~manicule.app.bind.resolve_bind` before a socket exists, and by
 :func:`~manicule.api.app.build_app` before an application exists.
 
+**A browser that signed in presents a session cookie instead of a header.** Under
+``security.auth.mode = 'oauth'`` a request carrying no header credential is resolved from the
+``manicule_session`` cookie, if it has one — its signature first, then
+:meth:`~manicule.app.service.ApplicationService.authenticate_session`. A header always wins: a
+request presenting a key is that key, valid or not, whatever cookie the browser also sent. And
+the cookie is **not** honored beneath the MCP mount, which is stateless by design
+(``docs/surfaces.md`` §6.1) — a protocol client presents its key on every call, and an assistant
+running in a browser tab must not inherit whatever the person in that tab is signed in as.
+:mod:`manicule.api.cookies` says why each cookie attribute is what it is, and how a cookie
+cannot be spent by another site.
+
 ``manicule serve --no-authentication`` satisfies both refusals, and it is the one case where
 the assumption above does not hold: the anonymous administrator below is then anything that can
 route to the port. **Nothing here bounds that, and the honest thing is to say so rather than to
@@ -42,8 +53,10 @@ from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Depends, Request, WebSocket
 
+from manicule.api.cookies import SESSION_COOKIE, session_token
 from manicule.api.proxy import FORWARDED_FOR
 from manicule.app.caller import RANK, Caller
+from manicule.app.frontdoor import MCP
 from manicule.app.results import Identity
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import ManiculeError
@@ -167,6 +180,37 @@ def websocket_token(websocket: WebSocket) -> tuple[str, str | None]:
     return "", None
 
 
+def beneath_mcp(path: str) -> bool:
+    """Whether ``path`` is the MCP mount or anything under it."""
+    return path == MCP or path.startswith(f"{MCP}/")
+
+
+async def identify(service: ApplicationService, request: Request | WebSocket) -> Identity:
+    """Who this request is, from a header credential or — for a browser — a session cookie.
+
+    The order is the rule. A header credential is always the answer when one is presented, so
+    a program's key is never overridden by a browser's ambient cookie. Only with no header,
+    under ``oauth``, and outside the MCP mount is the cookie consulted, and its signature is
+    checked before the service is asked anything: a forged or expired cookie is refused for the
+    cost of a hash.
+    """
+    if isinstance(request, WebSocket):
+        header, _ = websocket_token(request)
+    else:
+        header = token_of(request)
+    settings = service.settings
+    if (
+        not header
+        and settings.security.auth.mode is AuthMode.OAUTH
+        and SESSION_COOKIE in request.cookies
+        and not beneath_mcp(request.url.path)
+    ):
+        return await service.authenticate_session(
+            session_token(settings, request.cookies.get(SESSION_COOKIE))
+        )
+    return await service.authenticate(header)
+
+
 async def resolve(
     service: ApplicationService, policy: ProxyPolicy, request: Request | WebSocket
 ) -> Principal:
@@ -175,11 +219,11 @@ async def resolve(
     A missing or unusable key produces an *unauthenticated* principal rather than an error,
     so that the anonymous routes — health, a shared conversation link, the provider list —
     are reachable through the same resolution as everything else. :func:`require` is what
-    refuses.
+    refuses. :func:`identify` is what decides which credential a request is presenting.
     """
     client = request.client
     return Principal(
-        identity=await service.authenticate(token_of(request)),
+        identity=await identify(service, request),
         address=policy.client_address(
             peer=client.host if client is not None else None,
             # Through the constant, not a literal. The header manicule reads is a decision
@@ -197,15 +241,23 @@ def require(principal: Principal, floor: Role) -> Principal:
         UnauthenticatedError: Authentication is configured and no usable key was presented.
         ForbiddenError: A valid key without the authority this route needs.
     """
-    if principal.identity.mode != AuthMode.NONE.value and not principal.identity.authenticated:
+    identity = principal.identity
+    if identity.mode != AuthMode.NONE.value and not identity.authenticated:
         msg = (
             "this installation requires authentication. Present an API key as "
-            "'Authorization: Bearer <key>' or 'X-API-Key: <key>'."
+            "'Authorization: Bearer <key>' or 'X-API-Key: <key>'"
         )
-        raise UnauthenticatedError(msg)
+        if identity.mode == AuthMode.OAUTH.value:
+            # The login routes rather than the browser surface's page, because those exist
+            # whether or not the browser surface is served; `/auth/providers` lists them.
+            msg += ", or sign in from a browser — GET /auth/providers lists where"
+        raise UnauthenticatedError(f"{msg}.")
     if RANK[principal.role] < RANK[floor]:
+        credential = {"key": "this key has", "session": "you have"}.get(
+            identity.via, "this caller has"
+        )
         msg = (
-            f"this operation needs the {floor.value!r} role or higher; this key has "
+            f"this operation needs the {floor.value!r} role or higher; {credential} "
             f"{principal.role.value!r}."
         )
         raise ForbiddenError(msg)
@@ -262,6 +314,8 @@ __all__ = [
     "UnauthenticatedError",
     "ViewerPrincipal",
     "anonymous",
+    "beneath_mcp",
+    "identify",
     "require",
     "resolve",
     "token_of",

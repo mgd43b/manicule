@@ -1,4 +1,4 @@
-"""Twelve areas, each a page that runs operations and renders their envelopes.
+"""The areas, each a page that runs operations and renders their envelopes.
 
 Every handler here has the same three lines: admit the reader, run one or more operations
 through :func:`~manicule.web.rendering.panel`, render. There is no fourth line, and a page that
@@ -575,14 +575,13 @@ async def settings(service: Service, caller: Operator) -> HTMLResponse:
 # --- auth -------------------------------------------------------------------------------------
 
 
-@router.get("/auth", name="ui_auth", summary="This person's API keys, and how they authenticate.")
+@router.get("/auth", name="ui_auth", summary="This workspace's API keys, and how it authenticates.")
 async def auth(service: Service, caller: Operator) -> HTMLResponse:
-    """One person managing their own keys. There is no user administration here.
+    """The keys programs authenticate with, and what this installation demands of a caller.
 
-    manicule is single-user until it is feature complete; roles, invitations and identity
-    providers belong to team mode ([#13](https://github.com/mgd43b/manicule/issues/13)). What
-    this page is for is the two things a single operator needs: the keys that exist, and what
-    this installation currently demands of a caller.
+    Keys only. People — who is a member, in what role, and whether they are enabled — are the
+    people page's (:func:`users`), because a key and a membership are revoked, owned and
+    reasoned about differently, and one page carrying both would blur which control does what.
 
     Records, never secrets. Only digests are stored, so there is no secret to render — a key's
     one copy is in the response that minted it.
@@ -600,11 +599,67 @@ async def auth(service: Service, caller: Operator) -> HTMLResponse:
                 "providers": ("auth_providers", service.auth_providers),
             },
         ),
-        extra={"key_id": caller.identity.key_id, "key_name": caller.identity.key_name},
+        extra={
+            "key_id": caller.identity.key_id,
+            "key_name": caller.identity.key_name,
+            "credential": {"key": "an API key", "session": "a signed-in browser"}.get(
+                caller.identity.via, ""
+            ),
+        },
     )
 
 
-# --- the one page with no credential ------------------------------------------------------------
+# --- people ---------------------------------------------------------------------------------
+
+
+@router.get("/users", name="ui_users", summary="The people who are members of this workspace.")
+async def users(service: Service, caller: Operator) -> HTMLResponse:
+    """Members, their roles and standing, and the controls an administrator uses on them.
+
+    Admin-only, like the API route it reads. Every control on it calls the JSON API; the rules
+    those calls are held to are the service's, and a refusal is shown in the service's words.
+    """
+    return render(
+        "users.html",
+        area="users",
+        title="People",
+        service=service,
+        caller=caller,
+        panels=await panels(
+            service,
+            {
+                "users": ("user_list", service.user_list),
+                "providers": ("auth_providers", service.auth_providers),
+            },
+        ),
+        extra={"me": caller.identity.user_id},
+    )
+
+
+# --- the two pages with no credential -------------------------------------------------------------
+
+
+@router.get(
+    "/login", name="ui_login", summary="Sign in, or learn how this installation authenticates."
+)
+async def login(service: Service, caller: Guest) -> HTMLResponse:
+    """Links to every provider that applies to this workspace, and nothing to type.
+
+    Anonymous, because it is how a person without a credential gets one. Where nobody signs in —
+    ``security.auth.mode`` of ``none`` or ``api_key`` — it says how this installation does
+    authenticate instead, rather than offering a sign-in that the login routes would refuse.
+    """
+    return render(
+        "login.html",
+        area="",
+        title="Sign in",
+        service=service,
+        caller=caller,
+        panels={
+            "providers": await panel("auth_providers", service, service.auth_providers),
+        },
+        layout="bare.html",
+    )
 
 
 @router.get(

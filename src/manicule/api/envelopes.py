@@ -47,6 +47,9 @@ STATUS_BY_ERROR: dict[str, int] = {
     "UnauthenticatedError": UNAUTHORIZED,
     "ForbiddenError": FORBIDDEN,
     "PolicyError": FORBIDDEN,
+    # A person the provider vouched for and this workspace does not admit. Not 401: they did
+    # authenticate, with the provider, and presenting the same identity again will not help.
+    "SignInRefusedError": FORBIDDEN,
     "UnknownEntityError": NOT_FOUND,
     "UnknownComponentError": NOT_FOUND,
     "UnknownConversationError": NOT_FOUND,
