@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import CompoundSelect, Delete, Insert, Select, Table, Update, event, select, text
 
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from sqlalchemy import Connection, Engine
     from sqlalchemy.engine.interfaces import ExecutionContext
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+    from sqlalchemy.pool import ConnectionPoolEntry
 
     from manicule.core.retrieval import Filter
 
@@ -89,6 +90,9 @@ retrieval path reads none of them.
 _WROTE = "manicule.storage.scoped.wrote"
 """The per-transaction mark, in the pooled connection's ``info``, that a statement counted."""
 
+_LANDING = "manicule.storage.scoped.landing"
+"""The mark that a counted commit has been announced and has not yet been seen to land."""
+
 
 class _CommitCounter:
     """Counts committed transactions on an engine that wrote anything a query could read.
@@ -113,6 +117,15 @@ class _CommitCounter:
     log — still bumps the counter and costs at most a cold cache. Under-counting would serve a
     ranking computed over a corpus that no longer exists.
 
+    **A counted commit moves the counter twice: when it is announced, and once it has landed.**
+    SQLAlchemy's ``commit`` event fires *before* the database commits, so a counter moved only
+    there leaves a window in which a concurrent search reads the new value and the old rows, and
+    caches a ranking of a corpus that is about to stop existing — under the key every later
+    search will use, for as long as the cache keeps it. The second move happens when the
+    connection is next seen after the commit returned: its next ``begin``, or its return to the
+    pool. A ranking computed inside the window is keyed to the value in between, and that value
+    is gone by the time anybody could be served it.
+
     One per engine, shared by every handle on it (:meth:`on`), so a statement is classified once
     however many workspaces' stores are open — and so two handles never race to consume the
     same transaction's mark.
@@ -132,6 +145,8 @@ class _CommitCounter:
                 event.listen(target, "before_cursor_execute", counter._executing, named=True)
                 event.listen(target, "commit", counter._committed)
                 event.listen(target, "rollback", counter._rolled_back)
+                event.listen(target, "begin", counter._began)
+                event.listen(target, "checkin", counter._checked_in)
                 _COUNTERS[target] = counter
             return counter
 
@@ -143,6 +158,18 @@ class _CommitCounter:
     def _committed(self, connection: Connection) -> None:
         if connection.info.pop(_WROTE, False):
             self._value += 1
+            connection.info[_LANDING] = True
+
+    def _landed(self, info: dict[Any, Any]) -> None:
+        """The commit announced on this connection has returned; move the counter again."""
+        if info.pop(_LANDING, False):
+            self._value += 1
+
+    def _began(self, connection: Connection) -> None:
+        self._landed(connection.info)
+
+    def _checked_in(self, _dbapi_connection: object, record: ConnectionPoolEntry) -> None:
+        self._landed(record.info)
 
     @staticmethod
     def _rolled_back(connection: Connection) -> None:

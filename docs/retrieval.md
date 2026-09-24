@@ -1452,6 +1452,15 @@ under-counting serves a ranking computed over a corpus that no longer exists.
 What this cannot see is a write made on the raw driver connection, beneath SQLAlchemy — which no
 SQLAlchemy event can see, and which nothing in this project does.
 
+**A counted commit moves the counter twice: when it is announced, and once it has landed.**
+SQLAlchemy's `commit` event fires *before* the database commits. A counter moved only there
+leaves a window in which a concurrent search reads the new value and the old rows, and caches a
+ranking of a corpus that is about to stop existing — under the key every later search will use,
+for as long as the entry lives. So the counter moves again when the connection is next seen
+after the commit returned: its next `begin`, or its return to the pool. A ranking computed
+inside the window is keyed to the value in between, which is gone before anybody could be
+served it.
+
 **A second engine for telemetry was the alternative, and it is worse.** Writing the query log,
 the audit trail and conversations through an engine the counter does not listen to would put two
 connection pools and two writer queues on one SQLite file, racing for its single writer rather

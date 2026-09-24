@@ -203,6 +203,39 @@ async def test_a_rolled_back_write_neither_counts_nor_lingers(
     assert store.generation == settled
 
 
+async def test_a_ranking_computed_while_a_commit_is_landing_is_keyed_to_a_value_that_goes(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """The counter moves again once the commit has returned, not only when it is announced.
+
+    SQLAlchemy's ``commit`` event fires before the database commits. A search that read the
+    counter in that window would read the new value and the old rows, and cache a ranking of a
+    corpus about to stop existing under the key every later search uses. Observed here from a
+    listener that runs inside the window: whatever it saw, the settled value is past it.
+    """
+    from sqlalchemy import event  # noqa: PLC0415 - only this test listens
+
+    chunks = await _live(store)
+    seen_inside: list[int] = []
+
+    def inside_the_window(_connection: object) -> None:
+        seen_inside.append(store.generation)
+
+    event.listen(engine.sync_engine, "commit", inside_the_window)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                update(models.Chunk).where(models.Chunk.id == chunks[0].id).values(text="moved")
+            )
+    finally:
+        event.remove(engine.sync_engine, "commit", inside_the_window)
+
+    assert seen_inside, "the listener never ran, so this proves nothing"
+    assert store.generation > seen_inside[-1], (
+        "a ranking keyed to the value seen while the commit was landing would outlive it"
+    )
+
+
 async def test_changing_a_collection_s_membership_moves_the_counter(store: SqliteDocStore) -> None:
     """Membership decides what a collection-scoped query may return.
 
