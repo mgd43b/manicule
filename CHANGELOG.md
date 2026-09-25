@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.10](https://github.com/mgd43b/manicule/compare/v0.2.9...v0.2.10) (2026-09-25)
+
+
+### Bug Fixes
+
+* **deps:** take the runtime-group bump, following authlib 1.8 onto httpx2 ([#409](https://github.com/mgd43b/manicule/issues/409)) ([7e2c2e3](https://github.com/mgd43b/manicule/commit/7e2c2e38682389f1cb7d8a0971ec5727473e0f6b))
+* **ingest:** stop parser library versions refusing every write into an existing index ([#411](https://github.com/mgd43b/manicule/issues/411)) ([12ac923](https://github.com/mgd43b/manicule/commit/12ac9237fc870e7c76a754ea0d6547920cfd5a83))
+
 ## [0.2.9](https://github.com/mgd43b/manicule/compare/v0.2.8...v0.2.9) (2026-09-24)
 
 
