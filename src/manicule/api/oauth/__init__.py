@@ -18,8 +18,15 @@ intercepted it. ``state`` binds the callback to the browser that started the sig
 compared in constant time by the route that receives it.
 
 **The network is injectable.** Every request goes through the ``transport`` the caller passes,
-which is ``None`` — the real network — in a served process and an ``httpx.MockTransport``
+which is ``None`` — the real network — in a served process and an ``httpx2.MockTransport``
 standing in for the provider under test, so no test of this module can reach the internet.
+
+**httpx2, not httpx, because that is what authlib runs on.** From 1.8 authlib's client is an
+``httpx2.AsyncClient`` whenever ``httpx2`` is importable, falling back to ``httpx`` only without
+it, and ``manicule[serve]`` declares ``httpx2``. The transport handed in and the errors caught
+below have to belong to the same library as the client: an ``httpx`` transport fails an
+assertion inside ``httpx2`` on its first response, and ``except httpx.HTTPError`` lets an
+unreachable provider through as a 500 rather than a refusal naming the step.
 
 It is a package rather than a module for one reason: authlib ships no type information, and the
 type checker's relaxation for an untyped dependency is scoped by directory, exactly as it is for
@@ -33,7 +40,7 @@ import secrets
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
-import httpx
+import httpx2
 from authlib.common.errors import AuthlibBaseError
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 
@@ -50,7 +57,7 @@ if TYPE_CHECKING:
 class _Client(Protocol):
     """The part of authlib's ``AsyncOAuth2Client`` this module uses, stated.
 
-    The library declares none of it — its client inherits from ``httpx.AsyncClient`` through a
+    The library declares none of it — its client inherits from ``httpx2.AsyncClient`` through a
     path the type checker cannot follow — so the one construction site casts to this, and every
     call below is checked against a signature somebody wrote down rather than against nothing.
     """
@@ -78,7 +85,7 @@ class _Client(Protocol):
         headers: dict[str, str],
     ) -> object: ...
 
-    async def get(self, url: str) -> httpx.Response: ...
+    async def get(self, url: str) -> httpx2.Response: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +161,7 @@ async def complete(
     transaction: SignInTransaction,
     code: str,
     *,
-    transport: httpx.AsyncBaseTransport | None = None,
+    transport: httpx2.AsyncBaseTransport | None = None,
 ) -> Profile:
     """Exchange ``code`` for a token, and ask the provider who it belongs to.
 
@@ -185,12 +192,12 @@ async def complete(
         error = str(getattr(exc, "error", "") or "an error")
         msg = f"the {provider.type} sign-in failed while {step}: the provider answered {error}"
         raise SignInFailedError(msg) from exc
-    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+    except (httpx2.HTTPError, ValueError, KeyError, TypeError) as exc:
         msg = f"the {provider.type} sign-in failed while {step}: {type(exc).__name__}"
         raise SignInFailedError(msg) from exc
 
 
-def _client(provider: OAuthProvider, *, transport: httpx.AsyncBaseTransport | None) -> _Client:
+def _client(provider: OAuthProvider, *, transport: httpx2.AsyncBaseTransport | None) -> _Client:
     """One OAuth client for one sign-in, closed when that sign-in is.
 
     ``client_secret_post`` at the token endpoint because both providers accept it and GitHub

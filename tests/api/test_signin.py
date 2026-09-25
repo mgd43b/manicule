@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
-import httpx
+import httpx2
 import pytest
 from itsdangerous import TimestampSigner
 
@@ -193,11 +193,11 @@ def test_a_failed_code_exchange_is_refused_and_the_page_carries_no_code() -> Non
 def test_a_provider_that_cannot_be_reached_is_a_refusal_rather_than_an_error() -> None:
     """A dropped connection is a page for the person, naming the step, not a 500."""
 
-    def unreachable(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("no route to host", request=request)
+    def unreachable(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("no route to host", request=request)
 
     with client_with(
-        oauth_backend(), FakeIdentityProvider(), transport=httpx.MockTransport(unreachable)
+        oauth_backend(), FakeIdentityProvider(), transport=httpx2.MockTransport(unreachable)
     ) as client:
         refused = sign_in(client)
     assert refused.status_code == BAD_REQUEST

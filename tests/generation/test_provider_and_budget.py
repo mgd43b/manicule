@@ -7,6 +7,7 @@ import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any, cast, override
 
+import httpx
 import litellm
 import pytest
 from litellm.types.utils import (  # pyright: ignore[reportMissingTypeStubs] - the library ships none
@@ -231,7 +232,7 @@ def test_importing_the_provider_library_does_not_fetch_a_model_table(
     error_table()
 
     assert os.environ[LOCAL_COST_MAP_ENV] == "True"
-    fetched, table = _resolve_model_cost_map(monkeypatch)
+    fetched, table = _resolve_model_cost_map()
     assert fetched == []
     assert table
 
@@ -250,36 +251,43 @@ def test_an_operator_who_wants_the_live_model_table_keeps_it(
     error_table()
 
     assert os.environ[LOCAL_COST_MAP_ENV] == "False"
-    fetched, _ = _resolve_model_cost_map(monkeypatch)
+    fetched, _ = _resolve_model_cost_map()
     assert fetched == [_COST_MAP_URL]
 
 
 _COST_MAP_URL = "https://manicule-tests.invalid/model_prices.json"
 
 
-def _resolve_model_cost_map(
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[list[str], dict[str, Any]]:
+class _RefusingFetcher:
+    """The HTTP client the resolver fetches with, recording each URL and reaching none of them."""
+
+    def __init__(self) -> None:
+        self.attempted: list[str] = []
+
+    def get(self, url: str, *, timeout: float | None = None) -> httpx.Response:
+        del timeout
+        self.attempted.append(url)
+        msg = "this test does not fetch a model table"
+        raise httpx.ConnectError(msg)
+
+
+def _resolve_model_cost_map() -> tuple[list[str], dict[str, Any]]:
     """Run the library's own cost-map resolver, recording any remote fetch it attempts.
 
-    The recorder raises rather than returning a table, so a fetch that does happen is visible
-    as an attempt *and* leaves the resolver on its documented fallback — this must never turn
-    into a test that reaches raw.githubusercontent.com for real.
+    The recorder is handed to the resolver as the client it fetches with — its own parameter,
+    rather than a patch over a method that has already been renamed once — and it refuses the
+    way an unreachable network does. So a fetch that does happen is visible as an attempt *and*
+    leaves the resolver on its documented fallback; this must never turn into a test that
+    reaches raw.githubusercontent.com for real. One attempt, because a refused fetch is
+    otherwise retried on a background thread that would outlive the test.
     """
     from litellm.litellm_core_utils import get_model_cost_map as resolver  # noqa: PLC0415
 
-    attempted: list[str] = []
-
-    def watch(url: str) -> dict[str, Any]:
-        attempted.append(url)
-        msg = "this test does not fetch a model table"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(resolver.GetModelCostMap, "fetch_remote_model_cost_map", watch)
+    fetcher = _RefusingFetcher()
     # The library ships no type information for this function, so its `dict` is an Unknown
     # that would spread into the caller. Declared here, where it is one line.
-    resolve = cast("Callable[[str], dict[str, Any]]", resolver.get_model_cost_map)  # pyright: ignore[reportUnknownMemberType]
-    return attempted, resolve(_COST_MAP_URL)
+    resolve = cast("Callable[..., dict[str, Any]]", resolver.get_model_cost_map)  # pyright: ignore[reportUnknownMemberType]
+    return fetcher.attempted, resolve(_COST_MAP_URL, client=fetcher, max_attempts=1)
 
 
 def test_the_mapping_table_is_ordered_most_specific_first() -> None:
