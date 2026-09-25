@@ -84,8 +84,9 @@ def test_no_parser_records_a_version_for_a_library_it_does_not_use() -> None:
         "python-pptx": ("pptx",),
         "pypdfium2": ("pdf",),
         "ruamel-yaml": ("structured",),
-        "selectolax": ("html", "email", "confluence"),
+        "selectolax": ("html", "email", "confluence", "msg"),
         "tree-sitter": ("sourcecode",),
+        "tree-sitter-language-pack": ("sourcecode",),
     }
 
     for distribution, parsers in imported_by.items():
@@ -278,3 +279,20 @@ def test_a_parser_that_started_describing_its_table_rows_moved_its_fingerprint(
         f"lineage claims to be current"
     )
     assert "version" in current.changed_fields(stale)
+
+
+def test_msg_carries_the_mail_parser_it_is_a_shim_over() -> None:
+    """``msg`` reconstitutes an RFC 5322 message and hands it to ``MailParser``.
+
+    So a change to what ``email`` extracts is a change to what ``msg`` extracts, and has to
+    re-parse ``.msg`` documents too. It named ``olefile`` alone before: ``selectolax`` reached
+    it only through the ``html_text`` suffix the corpus-wide chunk fingerprint used to carry,
+    and none of ``email``'s four rules bumps reached a ``.msg`` document at all.
+    """
+    msg = parse_fingerprint("msg")
+    email = parse_fingerprint("email")
+    assert msg is not None
+    assert email is not None
+
+    assert msg.version.endswith(f"+email/{email.version}")
+    assert email.libraries.items() <= msg.libraries.items()

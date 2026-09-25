@@ -44,7 +44,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, override
 
 from manicule.core.protocols import Middleware
-from manicule.parsers.config import DIAGRAM_LANGUAGES, DIAGRAM_MIDDLEWARE_NAME, DiagramConfig
+from manicule.parsers.config import (
+    DIAGRAM_LANGUAGES,
+    DIAGRAM_MIDDLEWARE_NAME,
+    DiagramConfig,
+    diagram_grammar_identity,
+)
 
 if TYPE_CHECKING:
     from xml.etree.ElementTree import Element
@@ -690,9 +695,13 @@ class DiagramMiddleware(Middleware):
 
     name = DIAGRAM_MIDDLEWARE_NAME
     mutates_embedded_text = True
+    version: str
+    """The grammar libraries this reads with, recorded beside its name in the chunk fingerprint.
+    See :func:`~manicule.parsers.config.diagram_grammar_identity`."""
 
     def __init__(self, config: DiagramConfig) -> None:
         self._config = config
+        self.version = diagram_grammar_identity(config)
 
     @override
     async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:

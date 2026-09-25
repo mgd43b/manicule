@@ -1674,8 +1674,8 @@ They are not interchangeable, and the price of each is the reason:
 | Lineage | Moves when | Repaired by | Costs |
 |---|---|---|---|
 | `documents.parse_fp` | a parser's rules or one of its libraries changes | `document reindex --stale` | a parse from retained bytes, then an embed of whatever moved |
-| `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | `rebuild plan` then `rebuild execute` (§10.4); the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything, from retained bytes |
-| `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
+| `index_state.chunk_fingerprint` | the chunker's version, its budget or overlap, its tokenizer, or a middleware declaring `mutates_embedded_text` changes — not a parser library, which `documents.parse_fp` covers | `rebuild plan` then `rebuild execute` (§10.4); the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything, from retained bytes |
+| `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `manicule reembed start` on LanceDB; `manicule reset-index --yes` and a sync elsewhere | an embedding pass, no parsing |
 | `documents.glossary_fp` | any detection or normalization rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
 | `documents.relation_fp` | a relation extractor is configured, unconfigured, or its rules change | `document reindex --stale-relations` | a pass over stored chunks; **no GPU at all** |
 
@@ -1980,10 +1980,12 @@ per connector — is what the plan identity names and what publication rechecks,
 between planning and publication invalidates the plan rather than publishing an older proof
 against a newer corpus.
 
-**Migrating a corpus to a release-locked grammar version.** `ChunkFingerprint` records a grammar
-version per language (`parsing.md` §8.1), so changing the installed `tree-sitter-language-pack`
-moves the chunk identity of every language it touches and `check_before_run` refuses the next
-ingest outright. The repair is this path, and it reads no source:
+**Migrating a corpus to a new chunk identity.** A change to the chunk budget, the overlap, the
+tokenizer that measures them, the chunker's own version, or a middleware declaring
+`mutates_embedded_text` moves `ChunkFingerprint`, and `check_before_run` refuses the next ingest
+outright. `manicule doctor` reports the same state as a failing `index` check, naming each field
+that moved with both of its values, so an upgrade that causes it is visible before the first
+ingest fails. The repair is this path, and it reads no source:
 
 ```sh
 manicule connector snapshot CONNECTOR --json   # copy data.snapshot_id
@@ -1991,6 +1993,12 @@ manicule rebuild plan SNAPSHOT_ID
 manicule rebuild execute SNAPSHOT_ID
 manicule rebuild status GENERATION_ID
 ```
+
+A release of a library a *parser* reads with — the tree-sitter grammar pack, `selectolax` — is
+not one of these. Each is recorded in the parse lineage of the parsers that use it
+(`parsing.md` §3.0), so a release re-parses the documents those parsers produced on the next sync
+and leaves the rest alone. Both used to sit in `ChunkFingerprint`, where a release refused every
+ingest into every index; 0.2.9's grammar-pack bump did that to indexes holding no code at all.
 
 `rebuild plan` is a dry run. Read three things in its output before running anything. The
 **source inventory coverage** line says how much of the live corpus the replacement will
@@ -2044,7 +2052,7 @@ surviving a composed publication, a live worker's lease fenced by a promotion th
 mid-build, a promotion racing the publication, and an idempotent republish. What it does not cover is scale: the chain walk, the
 coverage aggregate and the deduplicated evidence reads are each one bounded query per bound run
 rather than per document, but no rehearsal has yet been run against a corpus large enough for
-the constant factors to matter, and a real grammar migration on a production corpus should be
+the constant factors to matter, and a real migration to a new chunk identity on a production corpus should be
 rehearsed against a copy of that corpus before it is run against the original.
 
 ### 10.5 Source and derived lifecycle boundaries

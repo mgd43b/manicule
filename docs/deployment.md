@@ -256,6 +256,12 @@ knowing:
 - **`doctor` does not look there.** Its permissions check is about `<data_dir>`. The snapshot
   directory is created and verified `0700` by `backup` itself, but if you move one somewhere
   else, §1 applies to it from then on.
+- **Run `manicule doctor` once the new version is up.** Its `index` check fails when the
+  upgrade moved something the index's fingerprints record — an embedder, the chunk budget, a
+  middleware that rewrites embedding input — and names each field that moved with both of its
+  values. Every ingest into that index is refused until it is re-derived, while search keeps
+  answering from what it holds, so this is the moment to find out rather than the first write
+  that fails.
 
 ---
 

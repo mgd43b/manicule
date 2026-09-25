@@ -81,7 +81,7 @@ def declarations(
     supplied = versions or {}
     return tuple(
         sorted(
-            f"{hook.name}@{supplied.get(hook.name, '')}"
+            f"{hook.name}@{_version_of(hook, supplied)}"
             for hook in middleware
             if hook.mutates_embedded_text
         )
@@ -112,7 +112,20 @@ def chain(
     other one is a definition served from rules that no longer exist.
     """
     supplied = versions or {}
-    return tuple(sorted(f"{hook.name}@{supplied.get(hook.name, '')}" for hook in middleware))
+    return tuple(sorted(f"{hook.name}@{_version_of(hook, supplied)}" for hook in middleware))
+
+
+def _version_of(hook: Middleware, supplied: Mapping[str, str]) -> str:
+    """The version recorded beside ``hook``'s name: supplied, else its own, else empty.
+
+    Read with ``getattr`` because ``version`` is optional rather than a protocol member — see
+    :class:`~manicule.core.protocols.Middleware` — and a hook without one is recorded as
+    ``name@``, exactly what every middleware recorded before the attribute existed.
+    """
+    if hook.name in supplied:
+        return supplied[hook.name]
+    own: object = getattr(hook, "version", "")
+    return own if isinstance(own, str) else ""
 
 
 class MiddlewareRunner:

@@ -20,6 +20,8 @@ from pydantic import TypeAdapter
 from sqlalchemy import text
 
 from manicule.app.service import _reembed_run_report  # pyright: ignore[reportPrivateUsage]
+from manicule.chunking.chunker import CHUNKER_VERSION
+from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.retrieval import Filter
 from manicule.ingest.reembed import (
@@ -805,6 +807,113 @@ async def test_parse_lineage_arrives_empty_and_leaves_the_rest_alone(data_dir: P
         assert await _row_counts(engine) == counts
     finally:
         await engine.dispose()
+
+
+_V029_TOKENIZER = "local:sha256:" + "0" * 64
+
+
+def _v029_chunk_identity() -> dict[str, object]:
+    """A chunk fingerprint's fields as 0.2.9 recorded them, in the model's field order.
+
+    Both retired parts are present, with the values a real 0.2.9 install recorded: a grammar map
+    at the pack release it shipped, and the converter suffix on ``version``.
+    """
+    return {
+        "chunker": "structural",
+        "version": "3;html_text=web-blocks/1+selectolax/0.4.11",
+        "max_tokens": 512,
+        "overlap_tokens": 64,
+        "tokenizer_id": _V029_TOKENIZER,
+        "grammars": {"bash": "1.20.0", "mermaid": "1.20.0", "python": "1.20.0"},
+        "embed_text_middleware": [],
+    }
+
+
+async def test_parser_libraries_leave_the_stored_chunk_identity(data_dir: Path) -> None:
+    """``f2b7c4e9a1d3`` rewrites what 0.2.9 stored into what the chunker computes today.
+
+    Without the rewrite every document's ``chunk_fp`` would differ from the running chunker's by
+    the two retired parts alone, and everything selecting on that column would report the whole
+    corpus as built by some other chunker. Asserted against a fingerprint built from the model
+    rather than against a literal, because the claim is agreement with the code, and a literal
+    would agree with whatever the migration happened to write.
+
+    The seeded document's ``chunk_fp`` carries neither retired part and must come through
+    byte-for-byte: a rewrite that re-serialized everything would pass every other assertion.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, revision="e41b9c07d2a5")
+        stored = _v029_chunk_identity()
+        canonical = json.dumps(stored, sort_keys=True, separators=(",", ":"))
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO workspaces (id, name, mode, settings, created_at) "
+                    "VALUES ('w', 'w', 'personal', '{}', '2026-01-01T00:00:00+00:00')"
+                )
+            )
+            for identifier, chunk_fp in (("d1", _SEEDED_CHUNK_FP), ("d2", canonical)):
+                await connection.execute(
+                    text(
+                        "INSERT INTO documents (id, workspace_id, source, source_id, uri, title, "
+                        "media_type, content_hash, status, chunk_fp, metadata, created_at, "
+                        "updated_at) VALUES (:id, 'w', 'fs', :id, :uri, '', 'text/markdown', "
+                        ":id, 'indexed', :chunk_fp, '{}', '2026-01-01T00:00:00+00:00', "
+                        "'2026-01-01T00:00:00+00:00')"
+                    ),
+                    {"id": identifier, "uri": f"file:///{identifier}.md", "chunk_fp": chunk_fp},
+                )
+            await connection.execute(
+                text(
+                    "INSERT INTO index_state (workspace_id, chunk_fingerprint, created_at, "
+                    "updated_at) VALUES ('w', :chunk_fingerprint, "
+                    "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+                ),
+                {"chunk_fingerprint": json.dumps(stored, separators=(",", ":"))},
+            )
+
+        await upgrade(engine)
+
+        current = ChunkFingerprint(
+            chunker="structural",
+            version=CHUNKER_VERSION,
+            max_tokens=512,
+            overlap_tokens=64,
+            tokenizer_id=_V029_TOKENIZER,
+        )
+        async with engine.connect() as connection:
+            rewritten = await connection.scalar(
+                text("SELECT chunk_fp FROM documents WHERE id = 'd2'")
+            )
+            recorded = await connection.scalar(
+                text("SELECT chunk_fingerprint FROM index_state WHERE workspace_id = 'w'")
+            )
+        assert rewritten == current.canonical()
+        assert isinstance(recorded, str)
+        assert "grammars" not in json.loads(recorded)
+        assert ChunkFingerprint.model_validate_json(recorded).matches(current)
+        assert await _document_values(engine, "chunk_fp") == {"chunk_fp": _SEEDED_CHUNK_FP}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "not json",
+        "[1, 2]",
+        '{"chunker":"structural","version":"3;other=1"}',
+        '{"chunker":"structural","max_tokens":512}',
+    ],
+)
+def test_the_rewrite_leaves_alone_what_carries_neither_retired_part(stored: str) -> None:
+    migration = importlib.import_module(
+        "manicule.storage.migrations.versions."
+        "20260924_f2b7c4e9a1d3_parser_libraries_leave_chunk_identity"
+    )
+
+    assert migration.retire(stored, canonical=True) is None
 
 
 async def test_container_ownership_adopts_the_members_already_indexed(data_dir: Path) -> None:

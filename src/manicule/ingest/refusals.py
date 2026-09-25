@@ -238,7 +238,11 @@ async def _refuse_chunk_mismatch(
                 "re-embedding stored embed_text cannot change structural boundaries. Run "
                 "`manicule rebuild plan SNAPSHOT_ID` for an aggregate cost/capacity estimate, "
                 "then `manicule rebuild execute SNAPSHOT_ID` to publish one resumable atomic "
-                "workspace generation without reacquiring source data."
+                "workspace generation without reacquiring source data — but only from a plan "
+                "reporting no uncovered documents, since a snapshot that does not account for "
+                "every live document cannot rebuild the ones it leaves out. Otherwise "
+                "`manicule reset-index --yes` and a connector sync re-read every source, with "
+                "search empty until the sync finishes."
             )
         )
         exc.add_note(note)

@@ -100,10 +100,6 @@ class SourceCodeParser:
         """The declared set, validated and canonically ordered."""
         return self._languages
 
-    def grammar_versions(self) -> dict[str, str]:
-        """Grammar version per declared language, for ``ChunkFingerprint.grammars``."""
-        return grammars.grammar_versions(self._languages)
-
     async def parse(self, raw: RawDocument) -> AsyncIterator[ParsedBlock]:
         """Yield code blocks in source order, each anchored to its own lines.
 

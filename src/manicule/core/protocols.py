@@ -1429,6 +1429,16 @@ class Middleware(Protocol):
 
     Inherit from this to pick up the pass-through defaults and override only the hooks you
     care about.
+
+    **A hook may also carry a ``version`` string**, and it is recorded beside its name as
+    ``name@version`` — in the chunk fingerprint for a hook declaring
+    :attr:`mutates_embedded_text`, and in the glossary and relation lineage for every hook. Set
+    it when something that moves independently of the hook's own code decides what it writes:
+    the diagram middleware names the tree-sitter runtime and grammar pack it reads diagrams with,
+    because nothing else records them for the chunks it rewrites. It is read if present rather
+    than declared here, because a protocol member would make every middleware already written
+    against this protocol structurally stop satisfying it; absent, it records ``name@``, which
+    is what every middleware recorded before the attribute existed.
     """
 
     name: str

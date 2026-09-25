@@ -271,12 +271,13 @@ gets the same mechanical treatment `Embedder.fingerprint` gets for dimensionalit
 
 ```
 ChunkFingerprint  chunker, version, max_tokens, overlap_tokens,
-                  tokenizer_id, grammars: {language: version}
+                  tokenizer_id, embed_text_middleware
 ```
 
 Recorded at first ingest alongside the embedder fingerprint, in the same index-identity row
 ([`storage.md`](storage.md) §6.3). **Ingest refuses to start when the stored fingerprint
-differs from the running one**, and names the differing field and the re-index command. This
+differs from the running one**, and names each differing field with the value each side
+holds for it, and the re-index command. This
 is the same guard, in the same place, for the same reason — and it is the strictly larger
 invalidation of the two, since a chunk-size change means re-chunk *and* re-embed where a
 dimensionality change means only re-embed.
@@ -289,20 +290,23 @@ Two of the fields are less obvious than they look:
   identity of a stand-in counter, including its safety factor, for the reasons in §1.2 — and
   `ChunkFingerprint.provisional` is read off it, so the refusal and the identity cannot
   disagree.
-- **`grammars` is a per-language map, not one pack version.** A tree-sitter grammar upgrade
-  changes parse trees, which changes code chunk boundaries (§8.3). Recording it per language
-  means a Python grammar bump invalidates Python documents and nothing else — `changed_fields()`
-  names exactly what moved.
 
-**What is deliberately *not* here: parser versions.** `grammars` looks like the precedent for
-folding `pypdfium2` and `selectolax` in beside it, and it is not one. A parser version decides
-`text`, which is upstream of chunking; `ChunkFingerprint` is compared once for a whole corpus,
-where a parser version has no honest corpus-wide value — recorded only for parsers that ran,
-the map would grow the first time a PDF was ingested and refuse the corpus it had just joined;
-recorded for every installed parser, a `pypdfium2` bump would refuse a corpus of Markdown no
-PDF library has touched. `grammars` escapes this only because the declared language set is
-configuration, fixed before the run. So parser versions get their own fingerprint, per
-document, in §3.0.
+**What is deliberately *not* here: parser versions.** A parser version decides `text`, which is
+upstream of chunking; `ChunkFingerprint` is compared once for a whole corpus, where a parser
+version has no honest corpus-wide value — recorded only for parsers that ran, the map would grow
+the first time a PDF was ingested and refuse the corpus it had just joined; recorded for every
+installed parser, a `pypdfium2` bump would refuse a corpus of Markdown no PDF library has
+touched. So parser versions get their own fingerprint, per document, in §3.0.
+
+Two of them used to be here anyway, and the second half of that argument is what they ran into.
+A `grammars` map recorded the tree-sitter grammar pack's release per declared language, on the
+reasoning that the declared set is configuration and cannot grow mid-run; and `version` carried
+a `;html_text=web-blocks/1+selectolax/…` suffix for the converter an HTML-only mail body is
+reduced through. 0.2.9 moved the grammar pack from 1.17.0 to 1.20.0 and every ingest into every
+existing index was refused — indexes of nothing but Markdown included — until each was rebuilt,
+with a refusal whose two summaries were identical because the chunk fingerprint's own
+description omitted the field that had moved. Both now live in the parse lineage of the parsers
+that use them (§3.0, §8.3), and a refusal prints each differing value rather than two summaries.
 
 ### 1.8 How to evaluate and migrate another policy
 
@@ -699,8 +703,9 @@ Three properties of what is recorded:
   keys and a bump that appears to change nothing. `docx` and `pptx` name `lxml`, which neither
   wrapper mentions and both parse OOXML *with*; `email` names `selectolax`, because an
   HTML-only body's line numbers address the converted text; `sourcecode` names the tree-sitter
-  runtime and not the grammar pack, which `ChunkFingerprint.grammars` already records per
-  language. An empty map is a real answer — `adf`, `archive` and `plaintext` are built on the
+  runtime *and* the grammar pack, which between them decide the tree its blocks are cut from;
+  `msg` folds in `email`'s rules and libraries, being a shim that hands the mail parser a
+  reconstituted message. An empty map is a real answer — `adf`, `archive` and `plaintext` are built on the
   standard library and cannot be moved by a dependency bump.
 - **Nothing is invented.** A distribution that is not installed raises rather than defaulting;
   a parser manicule does not ship records no fingerprint at all, because its version is not
@@ -1349,9 +1354,11 @@ That is the second time this entry has been bumped for a change it did not make,
 is recorded beside it.
 
 `html_text_version` is **not** bumped with them. `web-blocks/1` names the rule email applies to
-those blocks — join them with a blank line — and that rule is unchanged; it lives in
-`ChunkFingerprint.version`, where a bump refuses ingest against the entire corpus rather than
-re-parsing the documents that moved.
+those blocks — join them with a blank line — and that rule is unchanged; it lived in
+`ChunkFingerprint.version` then, where a bump refused ingest against the entire corpus rather
+than re-parsing the documents that moved. It has since left the chunk fingerprint (§1.7): it is
+block metadata, and a change to the join rule is a change to what `email` extracts, which moves
+`email`'s rules.
 
 **What it costs is the shape §4.5 prices**, with one number worth having: text moves only in
 documents that contain a break, and on the fixture corpus that was 1 block of 323, across 21
@@ -1834,9 +1841,8 @@ guardrail. So it is closed in three moves:
    machines end up with two chunkings of the same file. The document is stored, visible,
    and re-indexable the moment the grammar arrives.
 
-The declared set, the pack version, and the resolved grammar versions all feed
-`ChunkFingerprint.grammars` (§8.3), so "which grammars built this corpus"
-is recorded rather than inferred from a cache directory.
+The pack version is recorded in the code parser's per-document parse lineage (§8.3), so
+"which grammars parsed this document" is recorded rather than inferred from a cache directory.
 
 **Licenses are settled, not an open audit.** The pack's stated policy is that every included
 grammar is permissively licensed — MIT, Apache-2.0, BSD, ISC or similar — and that copyleft
@@ -2020,28 +2026,32 @@ set is a configuration error and not a document that mysteriously will not parse
 `refresh` method embeds with `src/auth/token.py > TokenStore > refresh` in front of it,
 which is what makes a query for "token refresh" find the method rather than the README.
 
-### 8.3 Grammar versions are part of the fingerprint
+### 8.3 Grammar versions are part of the parse lineage
 
 A grammar upgrade changes parse trees. Changed trees mean changed split points (§4.2), which
 mean changed chunk boundaries, which mean stored embeddings that no longer correspond to the
-chunks that would be produced today.
+chunks that would be produced today — for code documents, and only for them.
 
-The grammar version is therefore in `ChunkFingerprint.grammars`, per language (§1.7). Because it can only affect
-code documents, a mismatch on this field alone permits a **partial** re-parse — re-chunk and
-re-embed the code documents, leave everything else — rather than the full re-index a
-`max_tokens` change demands.
+So the pack release is one of the code parser's `libraries` in its `ParseFingerprint` (§3.0),
+beside the tree-sitter runtime, and it is compared **per document** in `documents.parse_fp`. A
+pack release makes every code document's lineage differ from the installed parser's; the next
+sync re-parses them as a `LINEAGE` change, `manicule document reindex --stale` selects exactly that
+set without waiting for one, and every other document is untouched. The pack is recorded as one
+release rather than per language because it ships as one bundle: every grammar moves together,
+and the release describes them exactly.
 
-The global fingerprint on its own cannot express that, since it is one value for the whole
-index. What makes it actionable is that each document also records the fingerprints it was
-last built with ([`storage.md`](storage.md) §6.4), so partial invalidation is a query over
-`documents` rather than a policy someone has to remember:
+**It used to be corpus-wide, and that was the mistake this section once described as a
+feature.** The first design put a `grammars: {language: version}` map in `ChunkFingerprint` and
+argued that per-language keys made a *partial* re-parse possible. They could not: the chunk
+fingerprint is compared once per run, and a mismatch refuses the run before any document is
+selected, so the partial repair was unreachable and the whole corpus had to be rebuilt. 0.2.9's
+pack bump did exactly that to every existing index, including ones with no code in them at all.
 
-```sql
-SELECT id FROM documents WHERE chunk_fp <> :current AND media_type IN (:code_types)
-```
-
-The global refusal still stands — one vector table cannot hold two embedding spaces — but
-once a new fingerprint is adopted the repair is targeted instead of total.
+**One consumer really is corpus-wide.** The diagram middleware (§8.4) rewrites the embedding
+input of every dot and mermaid chunk it is configured for, in Markdown as much as in code, and
+it reads them through the same grammars. It names the runtime and the pack in its own
+`name@version` declaration, which the chunk fingerprint folds in, so an installation running it
+re-chunks on a pack release and one that does not is not asked to.
 
 ### 8.4 Diagrams — the same grammars, a different destination
 
@@ -2102,9 +2112,9 @@ Three consequences follow from that row, and only the first is the one being ask
   describes neither grammar and inventing definitions for them would be `LineAnchor.symbol`
   claiming structure the notation does not have. `.puml` is *not* in this list, because
   `plantuml` is not declared — see below.
-- **`ChunkFingerprint.grammars` grows two entries** (§8.3). Adding a language is therefore an
-  index-affecting change on the terms §8.3 already sets, and the partial re-parse it permits is
-  the mechanism that makes adopting it affordable.
+- **No corpus-wide identity moves.** The code parser's lineage records the grammar pack, not the
+  declared set (§8.3), so declaring two more languages changes which documents route to it and
+  nothing an existing index was built with.
 
 The Markdown case is why this is worth more than the Confluence macro that prompted it: a fenced
 ` ```mermaid ` block already carries `lang="mermaid"` out of `manicule.parsers.markdown`, so a

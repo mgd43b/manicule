@@ -16,6 +16,7 @@ from manicule.chunking import (
     TokenCounter,
 )
 from manicule.chunking.breadcrumb import render
+from manicule.chunking.chunker import CHUNKER_VERSION
 from manicule.chunking.sentences import sentences
 from manicule.chunking.tokens import tiktoken_tokenizer_id
 from manicule.core.anchors import CellAnchor, LineAnchor, PageAnchor
@@ -237,21 +238,25 @@ def test_the_fingerprint_records_everything_that_moves_a_boundary() -> None:
     produces different boundaries, and a model swap that keeps the dimension but changes the
     vocabulary would otherwise pass the embedder check and quietly re-chunk everything.
     """
-    chunker = make_chunker(grammars={"python": "0.23.0"}, version_components={"html_text": "2"})
-    fingerprint = chunker.fingerprint
+    fingerprint = make_chunker().fingerprint
     assert fingerprint.max_tokens == MAX_TOKENS
     assert fingerprint.overlap_tokens == OVERLAP_TOKENS
     assert fingerprint.tokenizer_id == TOKENIZER_ID
-    assert fingerprint.grammars == {"python": "0.23.0"}
-    assert "html_text=2" in fingerprint.version
+    assert fingerprint.version == CHUNKER_VERSION
 
 
-def test_a_grammar_bump_changes_only_the_grammar_field() -> None:
-    """Recorded per language so a Python grammar upgrade invalidates Python documents and
-    leaves the rest of the corpus alone."""
-    before = make_chunker(grammars={"python": "0.23.0", "rust": "0.21.0"}).fingerprint
-    after = make_chunker(grammars={"python": "0.24.0", "rust": "0.21.0"}).fingerprint
-    assert before.changed_fields(after) == frozenset({"grammars"})
+def test_the_fingerprint_carries_nothing_a_parser_read_with() -> None:
+    """Grammar and HTML-converter versions are per-document parse lineage, not chunk identity.
+
+    Both used to be passed in here — ``grammars`` and ``version_components`` — and folded into
+    a value compared once for the whole corpus, so a release of either library refused every
+    ingest into every index, whether or not it held a document those libraries had read.
+    """
+    with pytest.raises(TypeError):
+        make_chunker(grammars={"python": "1.20.0"})
+    with pytest.raises(TypeError):
+        make_chunker(version_components={"html_text": "web-blocks/1+selectolax/0.4.11"})
+    assert ";" not in make_chunker().fingerprint.version
 
 
 # --- structure -----------------------------------------------------------------------------

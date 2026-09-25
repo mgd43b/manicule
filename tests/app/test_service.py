@@ -3602,6 +3602,53 @@ async def test_doctor_identifies_stale_empty_index_identity_with_reset_remedy(
     assert check.remedy == "manicule reset-index --yes"
 
 
+async def test_doctor_fails_a_populated_index_the_installation_can_no_longer_write(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The state an upgrade leaves behind when it moves anything a fingerprint records.
+
+    ``doctor`` computed this comparison and acted on it only for an empty index. After 0.2.9
+    moved the grammar pack it reported "index ok" over an index that refused every ingest, and
+    the first sign anything was wrong was a memory that would not index. A populated index is
+    the case that matters, and it is failing rather than degraded: search still answers, from a
+    corpus that has stopped changing.
+    """
+    from manicule.core.embedding import IndexFingerprints  # noqa: PLC0415
+    from manicule.core.fingerprints import ChunkFingerprint  # noqa: PLC0415
+    from tests.fakes import HashEmbedder  # noqa: PLC0415
+
+    embedding = HashEmbedder(model_id="fake/configured").fingerprint
+    recorded = ChunkFingerprint(
+        chunker="structural",
+        version="3",
+        max_tokens=512,
+        overlap_tokens=64,
+        tokenizer_id=embedding.tokenizer_id,
+    )
+    installed = recorded.model_copy(update={"max_tokens": 384})
+    assert await backend.store.count_documents() > 0, "the point is an index holding documents"
+
+    async def fingerprints() -> IndexFingerprints:
+        return IndexFingerprints(embed=embedding, chunk=recorded, vector_table="chunks__live")
+
+    async def configured_fingerprints() -> tuple[str, str]:
+        return embedding.canonical(), installed.canonical()
+
+    monkeypatch.setattr(backend.store, "index_fingerprints", fingerprints)
+    monkeypatch.setattr(
+        backend.ingestion_, "configured_index_fingerprints", configured_fingerprints
+    )
+
+    check = _check(await ApplicationService(backend).doctor(), "index")
+
+    assert check.state == "failing"
+    assert check.facts["writable"] is False
+    assert check.facts["chunking_differences"] == ["max_tokens: 512 -> 384"]
+    assert "embedding_differences" not in check.facts
+    assert "max_tokens: 512 -> 384" in check.detail
+    assert "every ingest into this index is refused" in check.detail
+
+
 async def test_doctor_detects_orphaned_physical_fingerprint_without_sql_identity(
     backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -6,7 +6,8 @@ successfully, and return answers drawn from a space the query does not live in.
 
 from __future__ import annotations
 
-from typing import cast
+import json
+from typing import ClassVar, cast, override
 
 import pytest
 
@@ -15,6 +16,7 @@ from manicule.core.errors import FingerprintMismatchError
 from manicule.core.fingerprints import (
     PROVISIONAL_TOKENIZER_PREFIX,
     ChunkFingerprint,
+    Fingerprint,
     ParseFingerprint,
 )
 
@@ -256,15 +258,91 @@ def test_the_canonical_form_is_byte_stable() -> None:
     assert "max_sequence_length" not in one.canonical()
 
 
-def test_a_grammar_upgrade_names_only_what_changed() -> None:
-    """Selective invalidation: one language moved, so one language's documents are stale."""
-    before = chunks(grammars={"python": "0.21.0", "rust": "0.21.0"})
-    after = chunks(grammars={"python": "0.22.0", "rust": "0.21.0"})
+def test_a_refusal_names_each_differing_value_even_when_the_summaries_agree() -> None:
+    """What 0.2.9 printed for every write into an existing index.
 
-    assert before.changed_fields(after) == {"grammars"}
-    assert before.grammars["rust"] == after.grammars["rust"]
-    with pytest.raises(FingerprintMismatchError, match="grammars"):
-        before.require_match(after)
+    "the index was built with X, but X was offered", with both halves byte-identical, because
+    :meth:`~manicule.core.fingerprints.Fingerprint.describe` is a summary and the chunk
+    fingerprint's left out the field that had moved. A refusal has to name what differs from
+    the values the comparison itself used, so it can never read as a contradiction again —
+    whatever a subclass's summary happens to omit.
+    """
+
+    class Terse(Fingerprint):
+        IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = ("name", "libraries")
+
+        name: str
+        libraries: dict[str, str]
+
+        @override
+        def describe(self) -> str:
+            return self.name
+
+    built = Terse(name="parser", libraries={"grammar-pack": "1.17.0", "runtime": "0.25.0"})
+    offered = Terse(name="parser", libraries={"grammar-pack": "1.20.0", "runtime": "0.25.0"})
+    assert built.describe() == offered.describe()
+
+    with pytest.raises(FingerprintMismatchError) as refused:
+        built.require_match(offered)
+
+    message = str(refused.value)
+    assert 'libraries[\'grammar-pack\']: "1.17.0" -> "1.20.0"' in message
+    assert "runtime" not in message, "a key that did not move is noise in a refusal"
+
+
+def test_a_refusal_names_a_scalar_difference_with_both_values() -> None:
+    with pytest.raises(FingerprintMismatchError) as refused:
+        chunks(max_tokens=512).require_match(chunks(max_tokens=384))
+
+    assert "What differs, index -> offered: max_tokens: 512 -> 384." in str(refused.value)
+
+
+def test_a_key_present_on_one_side_only_is_named_as_absent() -> None:
+    before = parses(libraries={"pypdfium2": "5.12.1"})
+    after = parses(libraries={"pypdfium2": "5.12.1", "tree-sitter-language-pack": "1.20.0"})
+
+    assert before.differences(after) == (
+        "libraries['tree-sitter-language-pack']: absent -> \"1.20.0\"",
+    )
+
+
+def test_a_long_mapping_difference_is_counted_rather_than_listed() -> None:
+    """A pack bump moved every one of 26 grammar keys at once; a refusal is not a diff tool."""
+    before = parses(libraries={f"lib{index:02}": "1" for index in range(10)})
+    after = parses(libraries={f"lib{index:02}": "2" for index in range(10)})
+
+    moved = before.differences(after)
+
+    assert len(moved) == 7
+    assert moved[0] == 'libraries[\'lib00\']: "1" -> "2"'
+    assert moved[-1] == "libraries: and 4 more key(s)"
+
+
+def test_the_grammar_pack_is_not_part_of_the_chunk_identity() -> None:
+    """The incident, at the level of the value.
+
+    0.2.9 moved the grammar pack from 1.17.0 to 1.20.0, the chunk fingerprint carried the pack
+    per declared language, and a chunk fingerprint is compared once per run for the whole
+    corpus — so every ingest into every existing index was refused, including indexes holding
+    nothing but Markdown. The pack is the code parser's library now, compared per document.
+    """
+    assert "grammars" not in ChunkFingerprint.IDENTITY_FIELDS
+    assert "grammars" not in ChunkFingerprint.model_fields
+
+
+def test_a_fingerprint_stored_with_a_grammar_map_still_reads_and_matches() -> None:
+    """Rows, backups and rebuild targets written by 0.2.9 carry the field.
+
+    ``extra="forbid"`` must not make them unreadable, and the retired field must not make them
+    compare unequal to what the chunker produces today.
+    """
+    current = chunks()
+    stored = json.loads(current.model_dump_json()) | {"grammars": {"python": "1.17.0"}}
+
+    assert ChunkFingerprint.model_validate(stored).matches(current)
+    assert ChunkFingerprint.model_validate_json(json.dumps(stored)).canonical() == (
+        current.canonical()
+    )
 
 
 def test_chunk_budgets_and_tokenizers_are_identity() -> None:

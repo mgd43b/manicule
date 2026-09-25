@@ -1432,9 +1432,11 @@ class _Ingestion:
                     f"middleware {name!r} metadata did not declare its fingerprint behavior"
                 )
             middleware.append(declaration)
-        chain = tuple(sorted(f"{item.name}@" for item in middleware))
+        chain = tuple(sorted(f"{item.name}@{item.version}" for item in middleware))
         embedded = tuple(
-            sorted(f"{item.name}@" for item in middleware if item.mutates_embedded_text)
+            sorted(
+                f"{item.name}@{item.version}" for item in middleware if item.mutates_embedded_text
+            )
         )
         chunk = chunk.with_middleware(embedded)
         settings = self._runtime.settings

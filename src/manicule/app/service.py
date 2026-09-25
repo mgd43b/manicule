@@ -85,6 +85,7 @@ from manicule.core.errors import (
     UnknownComponentError,
     UnknownEntityError,
 )
+from manicule.core.fingerprints import identity_differences
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id as document_id_of
 from manicule.core.organization import directory_prefix
@@ -128,6 +129,7 @@ if TYPE_CHECKING:
     from manicule.core.ann import AnnIndexState
     from manicule.core.content import Chunk, Document
     from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
+    from manicule.core.fingerprints import Fingerprint
     from manicule.core.organization import Collection, CollectionRule, Tag
     from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Confidence
@@ -441,6 +443,75 @@ def _lifecycle_outcome_report(outcome: LifecycleOutcome) -> r.LifecycleReport:
             snapshot_promoted=True if outcome.snapshot_items else None,
             can_continue_offline=outcome.snapshot_items > 0,
         ),
+    )
+
+
+def _unwritable_index_check(
+    *,
+    documents: int,
+    vector_table: str | None,
+    embedding: tuple[Fingerprint | None, str] | None,
+    chunking: tuple[Fingerprint | None, str] | None,
+) -> r.Check:
+    """A populated index this installation can no longer write to, said before ingest says it.
+
+    ``doctor`` computed exactly this comparison and acted on it only for an *empty* index, so a
+    populated one whose recorded identity no longer matched the installed configuration was
+    reported ``ok`` — while every ingest into it was refused before reading a document. That is
+    the state an upgrade leaves behind when it moves anything the fingerprints record, and it
+    went unseen until a write failed: 0.2.9 moved the grammar pack, and ``doctor`` said "index
+    ok" over an index that had stopped accepting documents.
+
+    **Failing, not degraded.** Search still serves what the index holds, and that is the trap:
+    every answer is from before the upgrade and nothing says so. A connector sync, a
+    ``document_create`` and an ``index`` all refuse, so the part of the system that keeps the
+    corpus current has stopped.
+
+    The differences are spelled by
+    :func:`~manicule.core.fingerprints.identity_differences`, which is what the ingest refusal
+    prints, so this check and the refusal an operator meets next name the same fields and the
+    same values.
+    """
+    facts: dict[str, JsonValue] = {
+        "documents": documents,
+        "vector_table": vector_table,
+        "writable": False,
+    }
+    halves: list[str] = []
+    for label, pair in (("embedding", embedding), ("chunking", chunking)):
+        if pair is None:
+            continue
+        recorded, installed = pair
+        moved = identity_differences(
+            recorded.identity() if recorded is not None else {},
+            cast("dict[str, JsonValue]", json.loads(installed)),
+        )
+        halves.append(f"{label} {'; '.join(moved)}")
+        facts[f"{label}_differences"] = list(moved)
+    repair = (
+        "Both differ, and re-embedding does not re-chunk: `manicule reset-index --yes` and a "
+        "connector sync re-derive chunks and vectors together, and search is empty until the "
+        "sync finishes."
+        if embedding is not None and chunking is not None
+        else "Re-embed into the installed model's space: `manicule reembed start` on the built-in "
+        "LanceDB store; on any other store, `manicule reset-index --yes` and a connector sync."
+        if embedding is not None
+        else "Re-derive it under the installed configuration: `manicule reset-index --yes` and a "
+        "connector sync re-read every source, and search is empty until the sync finishes; "
+        "`manicule rebuild plan` and `rebuild execute` publish a replacement from retained "
+        "snapshots without interrupting search, but only from a plan that covers every live "
+        "document."
+    )
+    return r.Check(
+        name="index",
+        state="failing",
+        detail=(
+            f"{documents} document(s) are indexed under an identity this installation no longer "
+            f"produces, so every ingest into this index is refused before it reads a document: "
+            f"search still answers from what the index holds, and nothing new reaches it. What "
+            f"differs, index -> installed: {' | '.join(halves)}. {repair}"
+        ),
+        facts=facts,
     )
 
 
@@ -5080,6 +5151,13 @@ class ApplicationService:
                     "stale_empty_identity": True,
                 },
                 remedy="manicule reset-index --yes",
+            )
+        if embed_mismatch or chunk_mismatch:
+            return _unwritable_index_check(
+                documents=documents,
+                vector_table=fingerprints.vector_table or None,
+                embedding=(fingerprints.embed, configured_embed) if embed_mismatch else None,
+                chunking=(fingerprints.chunk, configured_chunk) if chunk_mismatch else None,
             )
         return r.Check(
             name="index",
