@@ -92,6 +92,7 @@ __all__ = [
     "StructuredConfig",
     "WebConfig",
     "WordConfig",
+    "diagram_grammar_identity",
     "html_text_version",
 ]
 
@@ -423,6 +424,35 @@ class DiagramConfig(BaseModel):
     relationships *and* the diagram's title, its groupings and its unconnected nodes; a bound that
     counted only edges would let the other three grow past it. Called ``max_relations`` it read as
     a promise the code does not keep — adding a title would have silently cost an edge."""
+
+
+def diagram_grammar_identity(config: DiagramConfig) -> str:
+    """The libraries that read this configuration's diagrams, for the middleware's version.
+
+    A dot or mermaid reading comes out of a tree-sitter parse, so the runtime and the grammar
+    pack decide the embedding input this middleware writes — for Markdown chunks as much as
+    for code, since a fenced mermaid block reaches it from any parser that keeps ``lang``. The chunk
+    fingerprint used to record the pack as ``grammars`` for every corpus, which covered this
+    by accident and refused every corpus on a pack bump; it records neither now, so this is the
+    one place these readings are versioned. It belongs in the declaration because the
+    middleware's reach is corpus-wide in exactly the way the chunk fingerprint describes: it
+    rewrites every diagram chunk it is configured for.
+
+    Defined here rather than beside the middleware because both halves of the comparison need
+    it: the constructed middleware for ingest, and its metadata factory for a rebuild plan, which
+    must name the same ``name@version`` without importing the readers.
+
+    Empty when every configured notation is read without a grammar — ``mxfile`` alone — because
+    then no grammar decides anything and a pack bump must not move this installation's
+    fingerprint.
+    """
+    if not (config.languages - GRAMMARLESS_DIAGRAM_LANGUAGES) & DIAGRAM_LANGUAGES:
+        return ""
+    from importlib.metadata import version  # noqa: PLC0415 - metadata, not the extension
+
+    from manicule.parsers.grammars import PACK_DISTRIBUTION  # noqa: PLC0415 - a parsing extra
+
+    return f"tree-sitter/{version('tree-sitter')}+{PACK_DISTRIBUTION}/{version(PACK_DISTRIBUTION)}"
 
 
 class DrawioConfig(BaseModel):

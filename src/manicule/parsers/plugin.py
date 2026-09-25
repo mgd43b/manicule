@@ -382,8 +382,14 @@ def _diagram_metadata(context: MetadataContext) -> MiddlewareMetadata:
     fingerprint it feeds is compared at startup — and constructing this middleware to ask would
     import the readers on every run, including the runs with no diagram in the corpus.
     """
-    del context
-    return MiddlewareMetadata(name=DIAGRAM_MIDDLEWARE_NAME, mutates_embedded_text=True)
+    config = context.config
+    if not isinstance(config, parser_config.DiagramConfig):
+        raise ConfigError("diagram middleware metadata received invalid component configuration")
+    return MiddlewareMetadata(
+        name=DIAGRAM_MIDDLEWARE_NAME,
+        mutates_embedded_text=True,
+        version=parser_config.diagram_grammar_identity(config),
+    )
 
 
 def _factory_for(registration: _Registration) -> Factory[Parser]:

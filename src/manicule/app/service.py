@@ -489,7 +489,11 @@ def _unwritable_index_check(
         halves.append(f"{label} {'; '.join(moved)}")
         facts[f"{label}_differences"] = list(moved)
     repair = (
-        "Re-embed into the installed model's space: `manicule reembed start` on the built-in "
+        "Both differ, and re-embedding does not re-chunk: `manicule reset-index --yes` and a "
+        "connector sync re-derive chunks and vectors together, and search is empty until the "
+        "sync finishes."
+        if embedding is not None and chunking is not None
+        else "Re-embed into the installed model's space: `manicule reembed start` on the built-in "
         "LanceDB store; on any other store, `manicule reset-index --yes` and a connector sync."
         if embedding is not None
         else "Re-derive it under the installed configuration: `manicule reset-index --yes` and a "

@@ -143,6 +143,9 @@ class MiddlewareMetadata:
 
     name: str
     mutates_embedded_text: bool = False
+    version: str = ""
+    """What the constructed middleware records beside its name, so a plan names the same
+    ``name@version`` that ingest will — the two are compared before a rebuild executes."""
 
 
 @dataclass(frozen=True, slots=True)

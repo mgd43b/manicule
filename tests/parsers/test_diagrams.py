@@ -13,6 +13,7 @@ from collections.abc import Iterator
 import pytest
 
 from manicule.config.settings import Settings
+from manicule.container import keys
 from manicule.container.container import Container
 from manicule.core.content import Chunk
 from manicule.parsers import grammars
@@ -30,6 +31,7 @@ from manicule.parsers.diagrams import (
 )
 from manicule.parsers.plugin import PLUGIN
 from manicule.plugins import ComponentRegistry
+from manicule.plugins.registry import MiddlewareMetadata
 from manicule.testing import assert_middleware_contract
 from tests.fakes import make_chunks, make_document
 
@@ -529,3 +531,43 @@ def test_a_middleware_reading_only_grammarless_notations_names_no_grammar() -> N
     grammarless = DiagramMiddleware(DiagramConfig(languages=GRAMMARLESS_DIAGRAM_LANGUAGES))
 
     assert grammarless.version == ""
+
+
+@pytest.mark.parametrize(
+    "languages", [DIAGRAM_LANGUAGES, GRAMMARLESS_DIAGRAM_LANGUAGES], ids=["grammar", "mxfile"]
+)
+async def test_a_rebuild_plan_declares_the_same_version_ingest_records(
+    languages: frozenset[str],
+) -> None:
+    """The metadata a plan reads and the middleware ingest runs must name one ``name@version``.
+
+    ``_rebuild_target`` builds the chunk fingerprint from metadata without constructing the
+    middleware, and a rebuild refuses to execute when that disagrees with the executable stack.
+    Metadata that said ``diagrams@`` while ingest said ``diagrams@tree-sitter/…`` would make
+    every rebuild of an installation running this middleware fail before it started.
+    """
+    registry = ComponentRegistry().bind("parsing")
+    PLUGIN.register(registry)
+    settings = Settings()
+    configured = settings.model_copy(
+        update={
+            "plugins": settings.plugins.model_copy(
+                update={
+                    "middleware": (DIAGRAM_MIDDLEWARE_NAME,),
+                    "config": {
+                        f"middleware.{DIAGRAM_MIDDLEWARE_NAME}": {"languages": sorted(languages)}
+                    },
+                }
+            )
+        }
+    )
+    container = Container(configured, registry)
+
+    declared = container.metadata(keys.MIDDLEWARE.named(DIAGRAM_MIDDLEWARE_NAME))
+    chain = await container.middleware()
+
+    assert isinstance(declared, MiddlewareMetadata)
+    executed = chain[0]
+    assert isinstance(executed, DiagramMiddleware)
+    assert declared.version == executed.version
+    assert bool(declared.version) is (languages == DIAGRAM_LANGUAGES)

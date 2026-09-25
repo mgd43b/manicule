@@ -1674,8 +1674,8 @@ They are not interchangeable, and the price of each is the reason:
 | Lineage | Moves when | Repaired by | Costs |
 |---|---|---|---|
 | `documents.parse_fp` | a parser's rules or one of its libraries changes | `document reindex --stale` | a parse from retained bytes, then an embed of whatever moved |
-| `index_state.chunk_fingerprint` | the chunker, its budget, its tokenizer or a grammar changes | `rebuild plan` then `rebuild execute` (§10.4); the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything, from retained bytes |
-| `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `ingest.reindex.re_embed` | an embedding pass, no parsing |
+| `index_state.chunk_fingerprint` | the chunker's version, its budget or overlap, its tokenizer, or a middleware declaring `mutates_embedded_text` changes — not a parser library, which `documents.parse_fp` covers | `rebuild plan` then `rebuild execute` (§10.4); the corpus-wide refusal is what stops mixing | a re-chunk and a re-embed of everything, from retained bytes |
+| `index_state.embed_fingerprint` | the model, its dimension or its normalization changes | `manicule reembed start` on LanceDB; `manicule reset-index --yes` and a sync elsewhere | an embedding pass, no parsing |
 | `documents.glossary_fp` | any detection or normalization rule changes, or a dependency of one does | `document reindex --stale-glossary` | a pass over stored text; **no GPU at all** |
 | `documents.relation_fp` | a relation extractor is configured, unconfigured, or its rules change | `document reindex --stale-relations` | a pass over stored chunks; **no GPU at all** |
 
@@ -2052,7 +2052,7 @@ surviving a composed publication, a live worker's lease fenced by a promotion th
 mid-build, a promotion racing the publication, and an idempotent republish. What it does not cover is scale: the chain walk, the
 coverage aggregate and the deduplicated evidence reads are each one bounded query per bound run
 rather than per document, but no rehearsal has yet been run against a corpus large enough for
-the constant factors to matter, and a real grammar migration on a production corpus should be
+the constant factors to matter, and a real migration to a new chunk identity on a production corpus should be
 rehearsed against a copy of that corpus before it is run against the original.
 
 ### 10.5 Source and derived lifecycle boundaries
