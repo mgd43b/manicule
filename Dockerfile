@@ -43,7 +43,7 @@
 # manicule importable so that what is fetched is decided by manicule's own code rather than by
 # a list copied into this file and left to drift.
 
-FROM ghcr.io/astral-sh/uv:0.12.17 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.19 AS uv
 FROM python:3.14-slim-bookworm AS deps
 
 COPY --from=uv /uv /usr/local/bin/uv
