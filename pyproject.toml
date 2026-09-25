@@ -227,10 +227,17 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #1
   # The OAuth 2.0 client for signing in through Google and GitHub (#13): authorization URLs,
   # PKCE and the code exchange, rather than a hand-rolled implementation of a protocol whose
   # failure modes are all security failures. BSD-3-Clause.
-  "authlib>=1.3",
-  # The HTTP client authlib's async OAuth client runs on. Already present for the connectors;
-  # declared here as well so that `manicule[serve]` alone can complete a sign-in. BSD-3-Clause.
-  "httpx>=0.28",
+  #
+  # 1.8 is a floor the code depends on rather than the oldest release that installs: it is the
+  # release whose client moved from `httpx` to `httpx2`, and `manicule.api.oauth` hands that
+  # client an `httpx2` transport and catches `httpx2` errors. Under 1.7 the client is an
+  # `httpx.AsyncClient`, and the two libraries' transports and exceptions do not mix.
+  "authlib>=1.8",
+  # The HTTP client authlib's async OAuth client runs on from 1.8, which imports it when it is
+  # present and falls back to `httpx`, with a deprecation warning, when it is not. The MCP SDK
+  # already depends on it; declared here as well so that the sign-in does not rest on a
+  # transitive dependency of somebody else's. BSD-3-Clause.
+  "httpx2>=2.10",
 ]
 
 # What `uv tool install "manicule[all]"` installs, and the one extra a person who just wants
@@ -396,8 +403,8 @@ dev = [
   # and falls back to `httpx` at run time with a deprecation warning — and `filterwarnings =
   # ["error"]` turns that warning into a collection failure, while the fallback leaves every
   # `client.get(...)` typed as Unknown under pyright's strict mode. Both symptoms are the same
-  # missing package. Test-only: nothing manicule ships imports it, and `httpx` stays the
-  # client the connectors use.
+  # missing package. `manicule[serve]` now declares it too, for the OAuth client, but the test
+  # client is a reason of its own; `httpx` stays the client the connectors use.
   "httpx2>=2.10",
 ]
 
@@ -640,7 +647,18 @@ markers = [
   "slow: starts real subprocesses; the only way to test what a process boundary buys",
   "browser: needs a downloaded browser binary; skipped when one is not installed",
 ]
-filterwarnings = ["error"]
+# **One exception, named down to the class.** litellm 1.102 declares `ChatCompletionReasoningItem`
+# with a `ReadOnly` item and puts it on `Delta` and `Message`, and pydantic warns the first time
+# either model is built that it will not enforce `ReadOnly` on a plain dict. The build is lazy and
+# happens inside litellm — on the first streamed chunk, or the first `Delta` a test constructs — so
+# no manicule code path owns it, and none could build it early under a filter pytest resets for
+# every test. The warning is about a guarantee nothing here relies on: manicule reads the text of a
+# delta and never touches a reasoning item. Matched on the class name so that the same warning
+# about any other TypedDict still fails. Remove it when litellm stops declaring the field that way.
+filterwarnings = [
+  "error",
+  "ignore:Item 'summary' on TypedDict class 'ChatCompletionReasoningItem' is using the `ReadOnly` qualifier:UserWarning",
+]
 
 # **Line coverage on `sys.monitoring`, not branch coverage on the C tracer.** Measured on the
 # ubuntu runner, four arms of the same suite in one CI run, 3186 tests and 41 skips in every

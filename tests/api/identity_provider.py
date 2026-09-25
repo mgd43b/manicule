@@ -1,7 +1,7 @@
 """A fake Google and a fake GitHub, and an installation that signs people in through them.
 
-The sign-in routes reach a provider through an ``httpx`` transport the application holds, so
-these suites replace it with :class:`FakeIdentityProvider` — an ``httpx.MockTransport`` that
+The sign-in routes reach a provider through an ``httpx2`` transport the application holds, so
+these suites replace it with :class:`FakeIdentityProvider` — an ``httpx2.MockTransport`` that
 answers the token, userinfo, user and emails endpoints the way the real ones do. No request
 leaves this machine, and every request the routes make is recorded so a test can assert what
 was *sent*: the PKCE verifier, the registered ``redirect_uri``, the client's credentials.
@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlsplit
 
-import httpx
+import httpx2
 from fastapi.testclient import TestClient
 
 from manicule.api.oauth import GITHUB, GITHUB_EMAILS, GITHUB_USER, GOOGLE, GOOGLE_USERINFO
@@ -124,25 +124,25 @@ class FakeIdentityProvider:
     exchanges: list[dict[str, str]] = field(default_factory=list[dict[str, str]])
     requests: list[str] = field(default_factory=list[str])
 
-    def handle(self, request: httpx.Request) -> httpx.Response:
+    def handle(self, request: httpx2.Request) -> httpx2.Response:
         url = str(request.url)
         self.requests.append(f"{request.method} {url}")
         if request.method == "POST" and url in {GOOGLE.token, GITHUB.token}:
             form = {key: values[0] for key, values in parse_qs(request.content.decode()).items()}
             self.exchanges.append(form)
-            return httpx.Response(self.token_status, json=self.token_body)
+            return httpx2.Response(self.token_status, json=self.token_body)
         if request.headers.get("authorization") != f"Bearer {ACCESS_TOKEN}":
-            return httpx.Response(401, json={"message": "Bad credentials"})
+            return httpx2.Response(401, json={"message": "Bad credentials"})
         if url == GOOGLE_USERINFO:
-            return httpx.Response(200, json=self.userinfo)
+            return httpx2.Response(200, json=self.userinfo)
         if url == GITHUB_USER:
-            return httpx.Response(200, json=self.github_user)
+            return httpx2.Response(200, json=self.github_user)
         if url == GITHUB_EMAILS:
-            return httpx.Response(200, content=json.dumps(self.github_emails))
-        return httpx.Response(404)
+            return httpx2.Response(200, content=json.dumps(self.github_emails))
+        return httpx2.Response(404)
 
-    def transport(self) -> httpx.MockTransport:
-        return httpx.MockTransport(self.handle)
+    def transport(self) -> httpx2.MockTransport:
+        return httpx2.MockTransport(self.handle)
 
 
 def client_with(
@@ -150,7 +150,7 @@ def client_with(
     provider: FakeIdentityProvider,
     *,
     base_url: str = "http://testserver",
-    transport: httpx.AsyncBaseTransport | None = None,
+    transport: httpx2.AsyncBaseTransport | None = None,
 ) -> TestClient:
     """The production application, reaching ``provider`` instead of the network.
 
