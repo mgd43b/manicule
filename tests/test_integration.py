@@ -7,6 +7,7 @@ Nothing is stubbed, and no private attribute is touched.
 
 from __future__ import annotations
 
+import importlib.metadata
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ from manicule.core.errors import ConfigError, PolicyError, UnknownComponentError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import content_hash, document_id
 from manicule.core.protocols import Chunker, Parser
+from manicule.ingest.refusals import check_before_run
+from manicule.parsers.versions import parse_fingerprint
 from manicule.plugins import (
     BuildContext,
     ComponentKey,
@@ -29,6 +32,7 @@ from manicule.plugins import (
 )
 from manicule.testing import assert_parser_contract, closing
 from tests.fakes import HashEmbedder, make_raw
+from tests.ingest.fakes import MemoryIngestStore
 
 EMBEDDER_NAME = "local"
 """The stand-in embedder these tests select.
@@ -241,6 +245,74 @@ async def test_structural_policy_matches_executable_and_metadata_identity(
 
     assert (declared.max_tokens, declared.overlap_tokens) == expected
     assert executable.fingerprint.canonical() == declared.canonical()
+
+
+async def test_a_parser_library_release_does_not_move_the_corpus_chunk_identity(
+    manicule_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 0.2.9 incident, end to end through the real plugin.
+
+    0.2.9 took ``tree-sitter-language-pack`` from 1.17.0 to 1.20.0. The structural chunker's
+    fingerprint carried that release for every declared language, it is compared once per run
+    for the whole corpus, and so every ingest into every index built before the upgrade was
+    refused — indexes of nothing but Markdown included — until each was rebuilt. The HTML
+    converter's ``selectolax`` version sat in the same value and would have done the same.
+
+    Both are the parsers' libraries now. So the identity an index records is the same under
+    either release and the upgrade is admitted, while the code parser's per-document lineage
+    moves — which is what selects the documents the new grammars would actually parse
+    differently, and nothing else.
+    """
+    del manicule_environment
+    real_version = importlib.metadata.version
+    moved = {"tree-sitter-language-pack", "selectolax"}
+
+    async def released_as(release: str) -> tuple[ChunkFingerprint, ChunkFingerprint]:
+        def version(distribution: str) -> str:
+            return release if distribution in moved else real_version(distribution)
+
+        monkeypatch.setattr(importlib.metadata, "version", version)
+        parse_fingerprint.cache_clear()
+        found = discover()
+        found.registry.bind("synthetic").add(
+            keys.EMBEDDER.named(EMBEDDER_NAME),
+            lambda _: _WideSyntheticEmbedder(),
+            metadata_factory=lambda _: _WideSyntheticEmbedder().fingerprint,
+        )
+        container = build_container(
+            Settings(embedding={"provider": EMBEDDER_NAME}),  # pyright: ignore[reportArgumentType]
+            discovery=found,
+        )
+        declared = container.metadata(keys.CHUNKER)
+        assert isinstance(declared, ChunkFingerprint)
+        async with container:
+            executable = await container.aget(keys.CHUNKER)
+        return declared, executable.fingerprint
+
+    try:
+        built_under, _ = await released_as("1.17.0")
+        code_then = parse_fingerprint("sourcecode")
+        markdown_then = parse_fingerprint("markdown")
+        declared, executable = await released_as("1.20.0")
+        code_now = parse_fingerprint("sourcecode")
+        markdown_now = parse_fingerprint("markdown")
+    finally:
+        # The table is cached for the life of the process, and it has just been filled with
+        # versions nothing installed.
+        parse_fingerprint.cache_clear()
+
+    assert declared.canonical() == built_under.canonical() == executable.canonical()
+    store = MemoryIngestStore()
+    embedding = _WideSyntheticEmbedder().fingerprint
+    await check_before_run(embed=embedding, chunk=built_under, store=store)
+    await check_before_run(embed=embedding, chunk=declared, store=store)
+
+    assert code_then is not None
+    assert code_now is not None
+    assert markdown_then is not None
+    assert markdown_now is not None
+    assert code_then.changed_fields(code_now) == {"libraries"}
+    assert markdown_then.matches(markdown_now)
 
 
 @pytest.mark.parametrize(

@@ -44,7 +44,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, override
 
 from manicule.core.protocols import Middleware
-from manicule.parsers.config import DIAGRAM_LANGUAGES, DIAGRAM_MIDDLEWARE_NAME, DiagramConfig
+from manicule.parsers.config import (
+    DIAGRAM_LANGUAGES,
+    DIAGRAM_MIDDLEWARE_NAME,
+    GRAMMARLESS_DIAGRAM_LANGUAGES,
+    DiagramConfig,
+)
 
 if TYPE_CHECKING:
     from xml.etree.ElementTree import Element
@@ -679,6 +684,31 @@ def _statements(block: Node) -> Iterator[Node]:
 # --- the middleware --------------------------------------------------------------------------
 
 
+def _grammar_identity(config: DiagramConfig) -> str:
+    """The libraries that read this configuration's diagrams, for the middleware's version.
+
+    A dot or mermaid reading comes out of a tree-sitter parse, so the runtime and the grammar
+    pack decide the embedding input this middleware writes — for Markdown chunks as much as
+    for code, since a fenced mermaid block reaches it from any parser that keeps ``lang``. The chunk
+    fingerprint used to record the pack as ``grammars`` for every corpus, which covered this
+    by accident and refused every corpus on a pack bump; it records neither now, so this is the
+    one place these readings are versioned. It belongs in the declaration because the
+    middleware's reach is corpus-wide in exactly the way the chunk fingerprint describes: it
+    rewrites every diagram chunk it is configured for.
+
+    Empty when every configured notation is read without a grammar — ``mxfile`` alone — because
+    then no grammar decides anything and a pack bump must not move this installation's
+    fingerprint.
+    """
+    if not (config.languages - GRAMMARLESS_DIAGRAM_LANGUAGES) & DIAGRAM_LANGUAGES:
+        return ""
+    from importlib.metadata import version  # noqa: PLC0415 - metadata, not the extension
+
+    from manicule.parsers.grammars import PACK_DISTRIBUTION  # noqa: PLC0415 - a parsing extra
+
+    return f"tree-sitter/{version('tree-sitter')}+{PACK_DISTRIBUTION}/{version(PACK_DISTRIBUTION)}"
+
+
 class DiagramMiddleware(Middleware):
     """Replaces a diagram chunk's embedding input with the relationships it draws.
 
@@ -690,9 +720,13 @@ class DiagramMiddleware(Middleware):
 
     name = DIAGRAM_MIDDLEWARE_NAME
     mutates_embedded_text = True
+    version: str
+    """The grammar libraries this reads with, recorded beside its name in the chunk fingerprint.
+    See :func:`_grammar_identity`."""
 
     def __init__(self, config: DiagramConfig) -> None:
         self._config = config
+        self.version = _grammar_identity(config)
 
     @override
     async def after_chunk(self, document: Document, chunks: list[Chunk]) -> list[Chunk]:

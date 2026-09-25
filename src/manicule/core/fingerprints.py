@@ -14,7 +14,7 @@ They share these semantics deliberately:
 Comparison is on a canonical serialization, byte for byte
     Not on one field. A guard that compared only a dimension, or only a version number,
     passes exactly the cases that matter — two different models at the same dimension, two
-    different grammars at the same chunk size.
+    different tokenizers under the same chunk budget.
 
 Identity is a declared subset of the fields
     Some fields describe the producer without affecting its output. Those are recorded for
@@ -24,6 +24,14 @@ Identity is a declared subset of the fields
 A mismatch raises, always
     Never a warning. There is nothing downstream that can detect mixed output, so the only
     place it can be caught is here.
+
+A refusal names the values, not only the fields
+    :meth:`Fingerprint.describe` is a summary written for people, and a summary leaves things
+    out. A refusal that printed only the two summaries could say "the index was built with X,
+    but X was offered" with both halves byte-identical — which is what 0.2.9 printed for every
+    write into an existing index, because ``ChunkFingerprint.describe`` did not mention the
+    field that had moved. So :meth:`Fingerprint.require_match` prints each differing identity
+    field with both of its values, read off the same serialization the comparison used.
 
 Where they differ is scope, and it follows from what each one produces.
 :class:`ChunkFingerprint` and ``EmbedFingerprint`` describe one process applied to a whole
@@ -50,11 +58,11 @@ incomparable, and repairable one document at a time from chunks that are already
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar, Final, Self, override
+from typing import ClassVar, Final, Self, cast, override
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from manicule.core.errors import FingerprintMismatchError
 
@@ -112,14 +120,20 @@ class Fingerprint(BaseModel):
         return type(self) is type(other) and self.canonical() == other.canonical()
 
     def changed_fields(self, other: Self) -> frozenset[str]:
-        """Which identity fields differ.
-
-        What makes selective invalidation possible: a grammar upgrade that changes one
-        language should invalidate the documents in that language, not the corpus.
-        """
+        """Which identity fields differ."""
         mine = self.identity()
         theirs = other.identity()
         return frozenset(name for name in (*mine, *theirs) if mine.get(name) != theirs.get(name))
+
+    def differences(self, other: Self) -> tuple[str, ...]:
+        """Each differing identity field with both of its values, this one's first.
+
+        Read off :meth:`identity` — the values the comparison itself used — rather than off
+        :meth:`describe`, which is a summary and is allowed to leave a field out. A mapping
+        field is broken down to the keys that moved, because "the grammar map differs" names
+        the field and leaves somebody to diff two dozen entries by eye to find out how.
+        """
+        return identity_differences(self.identity(), other.identity())
 
     def require_match(self, other: Self) -> None:
         """Raise unless ``other`` is interchangeable with this one.
@@ -128,15 +142,20 @@ class Fingerprint(BaseModel):
             other: The fingerprint offered by whatever is about to read or write.
 
         Raises:
-            FingerprintMismatchError: When they differ, naming the fields that differ.
+            FingerprintMismatchError: When they differ, naming the fields that differ and the
+                value each side holds for them.
         """
         if self.matches(other):
             return
         changed = ", ".join(sorted(self.changed_fields(other))) or "type"
+        differences = self.differences(other) or (
+            f"type: {type(self).__name__} -> {type(other).__name__}",
+        )
         msg = (
             f"{type(self).__name__} mismatch on {changed}: the index was built with "
-            f"{self.describe()}, but {other.describe()} was offered. Re-run against the "
-            f"index this produced, or rebuild the index."
+            f"{self.describe()}, but {other.describe()} was offered. What differs, index -> "
+            f"offered: {'; '.join(differences)}. Re-run against the index this produced, or "
+            f"rebuild the index."
         )
         raise FingerprintMismatchError(msg)
 
@@ -145,12 +164,100 @@ class Fingerprint(BaseModel):
         return self.canonical()
 
 
+_ABSENT: Final = object()
+"""Stands in for a field one side of a comparison does not have, which only a comparison
+between two kinds of fingerprint produces."""
+
+_MAPPING_KEYS_SHOWN: Final = 6
+"""How many moved keys of one mapping field a refusal lists before counting the rest."""
+
+
+def identity_differences(
+    index: Mapping[str, JsonValue], offered: Mapping[str, JsonValue]
+) -> tuple[str, ...]:
+    """Each identity field that differs between two identities, with both values, index first.
+
+    The one spelling of a fingerprint difference. :meth:`Fingerprint.require_match` prints it
+    in a refusal and ``doctor`` prints it in the ``index`` check, which compares the recorded
+    identity against the installed one before any ingest has been tried — so the two say the
+    same thing about the same mismatch, and an operator who reads one has read the other.
+
+    Args:
+        index: :meth:`Fingerprint.identity` of what the index recorded, or the parsed JSON of
+            its :meth:`Fingerprint.canonical` form, which is the same mapping.
+        offered: The same, for what is installed now.
+    """
+    changed = sorted(
+        name
+        for name in {*index, *offered}
+        if index.get(name, _ABSENT) != offered.get(name, _ABSENT)
+    )
+    return tuple(
+        line
+        for name in changed
+        for line in _field_differences(name, index.get(name, _ABSENT), offered.get(name, _ABSENT))
+    )
+
+
+def _field_differences(name: str, mine: object, theirs: object) -> tuple[str, ...]:
+    """``name`` as it differs between two identities, one line per moved value."""
+    if isinstance(mine, dict) and isinstance(theirs, dict):
+        index = cast("dict[str, JsonValue]", mine)
+        offered = cast("dict[str, JsonValue]", theirs)
+        moved = [
+            f"{name}[{key!r}]: {_shown(index.get(key, _ABSENT))} -> "
+            f"{_shown(offered.get(key, _ABSENT))}"
+            for key in sorted({*index, *offered})
+            if index.get(key, _ABSENT) != offered.get(key, _ABSENT)
+        ]
+        if len(moved) > _MAPPING_KEYS_SHOWN:
+            hidden = len(moved) - _MAPPING_KEYS_SHOWN
+            moved = [*moved[:_MAPPING_KEYS_SHOWN], f"{name}: and {hidden} more key(s)"]
+        return tuple(moved)
+    # Cast back to what the parameter declares: the `isinstance` above leaves `mine` narrowed
+    # to `object | dict[Unknown, Unknown]` on this path, and a mapping here is a scalar-vs-
+    # mapping difference that serializes exactly as well as any other value.
+    return (f"{name}: {_shown(cast('object', mine))} -> {_shown(theirs)}",)
+
+
+def _shown(value: object) -> str:
+    """One identity value as the canonical serialization spells it, or ``absent``."""
+    if value is _ABSENT:
+        return "absent"
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 class ChunkFingerprint(Fingerprint):
     """The identity of the process that decided where chunks begin and end.
 
     Persisted per corpus and recorded per document, so a change can be traced to the
-    documents it affects. Re-chunking is cheaper than re-embedding but not free, and
-    invalidating everything because one grammar moved is the expensive mistake.
+    documents it affects. It is compared once per run and a mismatch refuses the run, so
+    **everything in it has to be something whose change reaches every document** — the
+    budget, the tokenizer that measures it, the chunker's own rules, a middleware that
+    rewrites every chunk's embedding input.
+
+    **What is deliberately not in it: the libraries a parser reads with.** It used to carry
+    two. ``grammars`` recorded the tree-sitter grammar pack's release per declared language,
+    and ``version`` carried a ``;html_text=web-blocks/1+selectolax/…`` suffix for the
+    converter an HTML-only email body is reduced through. Each of them decides what *one
+    parser* extracts, and each was compared here, for the whole corpus. 0.2.9 moved the
+    grammar pack from 1.17.0 to 1.20.0, and from that release every ingest into every existing
+    index was refused — including an index holding nothing but Markdown, which no grammar had
+    ever read — until the operator rebuilt all of it. The refusal also printed two identical
+    summaries, because :meth:`describe` did not mention the field that had moved.
+
+    Both now live where :class:`ParseFingerprint` puts every other parser library: in the
+    ``libraries`` of the parsers that use them, compared per document, so a bump re-parses
+    the documents those parsers produced and nothing else. That is the partial invalidation
+    ``grammars`` was introduced to allow and could never deliver, since a mismatch on a
+    corpus-wide value stops the run before any document is selected. A middleware that reads
+    diagrams with the same grammars is the one consumer that really does touch every chunk it
+    applies to, and it names the pack in its own declaration — see
+    :attr:`embed_text_middleware`.
+
+    A stored fingerprint written before the move still parses: :meth:`_retire_grammars`
+    drops the old field on the way in, and migration ``f2b7c4e9a1d3`` rewrites the stored
+    rows so that string comparisons against them keep agreeing.
     """
 
     IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = (
@@ -159,7 +266,6 @@ class ChunkFingerprint(Fingerprint):
         "max_tokens",
         "overlap_tokens",
         "tokenizer_id",
-        "grammars",
         "embed_text_middleware",
     )
 
@@ -188,12 +294,6 @@ class ChunkFingerprint(Fingerprint):
         f"``{PROVISIONAL_TOKENIZER_PREFIX}``, so that no part of it can vary behind an "
         "identifier that stays still.",
     )
-    grammars: dict[str, str] = Field(
-        default_factory=dict,
-        description="Version by language for structure-aware chunking, e.g. "
-        "``{'python': '0.21.0'}``. Recorded per language so that upgrading one grammar "
-        "invalidates the documents in that language and leaves the rest alone.",
-    )
     embed_text_middleware: tuple[str, ...] = Field(
         default=(),
         description="Sorted ``name@version`` for every middleware declaring "
@@ -204,6 +304,21 @@ class ChunkFingerprint(Fingerprint):
         "neither otherwise knows middleware exists. Adding, removing or upgrading one is "
         "then exactly as loud as changing the chunk budget, which is what it is.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _retire_grammars(cls, data: object) -> object:
+        """Accept a fingerprint stored before ``grammars`` left this identity, without it.
+
+        A backup manifest, a rebuild generation's target and any row written by 0.2.9 or
+        earlier carry the field, and ``extra="forbid"`` would otherwise refuse to read them
+        at all. Dropping it is exact rather than lenient: it is not identity any more, so the
+        fingerprint these rows describe is the one that remains.
+        """
+        if not isinstance(data, dict):
+            return data
+        stored = cast("dict[str, object]", data)
+        return {name: value for name, value in stored.items() if name != "grammars"}
 
     @property
     def provisional(self) -> bool:
@@ -257,10 +372,8 @@ class ParseFingerprint(Fingerprint):
     leaves old anchors resolving into text produced differently — a plausible, wrong
     location, which is the defect this project exists not to reproduce.
 
-    **Why this is its own fingerprint rather than a field on** :class:`ChunkFingerprint`.
-    :attr:`ChunkFingerprint.grammars` is the precedent for folding a library version into the
-    chunker's identity, and it does not carry here, for a reason that is structural rather
-    than aesthetic:
+    **Why this is its own fingerprint rather than a field on** :class:`ChunkFingerprint`,
+    for a reason that is structural rather than aesthetic:
 
     - A parser version determines ``text``, which is *upstream* of chunking.
       :class:`ChunkFingerprint` is "the identity of the process that decided where chunks
@@ -270,11 +383,16 @@ class ParseFingerprint(Fingerprint):
       still be honest. Recorded only for the parsers that actually ran, the map would grow
       the first time a PDF was ingested and refuse the corpus it had just been part of;
       recorded for every installed parser instead, a ``pypdfium2`` bump would refuse a corpus
-      of Markdown that no PDF library has ever touched. ``grammars`` escapes this only
-      because the declared language set is configuration, fixed before the run, and read
-      without importing anything.
+      of Markdown that no PDF library has ever touched.
     - One document has exactly one parser. There is no corpus-wide parse identity to compare,
       so the comparison belongs where the fact does: ``documents.parse_fp``, per document.
+
+    The tree-sitter grammar pack was once held to be the exception — ``ChunkFingerprint``
+    carried a ``grammars`` map, on the argument that the declared language set is
+    configuration and so cannot grow mid-run. That argument answers the first half of the
+    second bullet and not the second half, and the second half is what happened: a pack bump
+    refused a corpus of Markdown that no grammar had ever read. The pack is now one of the
+    code parser's ``libraries``, like every other parser library.
 
     So the cost is a third column and a third comparison, and what it buys is invalidation
     that names the documents a bump actually touched.
@@ -552,4 +670,5 @@ __all__ = [
     "ParseFingerprint",
     "RelationFingerprint",
     "RelationRules",
+    "identity_differences",
 ]

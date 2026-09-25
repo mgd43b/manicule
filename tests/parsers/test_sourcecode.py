@@ -41,6 +41,7 @@ from manicule.core.errors import ParseError
 from manicule.core.protocols import aclose, parsing, read_blocks
 from manicule.parsers import grammars
 from manicule.parsers.sourcecode import SourceCodeConfig, SourceCodeParser
+from manicule.parsers.versions import parse_fingerprint
 from manicule.testing import assert_round_trip
 from tests.parsers.support import check_corpus, check_fixture, document_for, raw_from, raw_of
 
@@ -609,27 +610,31 @@ async def test_a_file_past_the_size_cap_parses_without_special_handling(corpus: 
     assert found[-1].symbol == "stage_109"
 
 
-# --- what the chunk fingerprint records ------------------------------------------------------
+# --- what the lineage records -----------------------------------------------------------------
 
 
-def test_the_parser_reports_a_grammar_version_for_every_declared_language() -> None:
-    """``ChunkFingerprint.grammars`` is per language so a grammar bump invalidates the
-    documents in that language and leaves the rest of the corpus alone."""
-    built = parser(languages=("python", "rust"))
+def test_the_code_parser_records_the_grammar_pack_it_parsed_with() -> None:
+    """Per document, in ``parse_fp`` — so a pack release re-parses the code and nothing else.
 
-    assert built.grammar_versions() == {
-        "python": grammars.pack_version(),
-        "rust": grammars.pack_version(),
-    }
+    It used to be ``ChunkFingerprint.grammars``, one value for the whole corpus, and 0.2.9's
+    move from 1.17.0 to 1.20.0 refused every ingest into every existing index, Markdown-only
+    ones included, until each was rebuilt.
+    """
+    lineage = parse_fingerprint("sourcecode")
+    markdown = parse_fingerprint("markdown")
+
+    assert lineage is not None
+    assert markdown is not None
+    assert lineage.libraries[grammars.PACK_DISTRIBUTION] == grammars.pack_version()
+    assert grammars.PACK_DISTRIBUTION not in markdown.libraries
 
 
 def test_the_declared_language_set_is_the_same_value_however_it_was_written() -> None:
-    """It feeds the chunk fingerprint, so a reordered configuration file must not read as a
-    different chunking process."""
+    """It decides what routes to the parser, so a reordered configuration file must not read
+    as a different parser."""
     written_one_way = parser(languages=("rust", "python"))
     written_another = parser(languages=("python", "rust"))
 
-    assert written_one_way.grammar_versions() == written_another.grammar_versions()
     assert written_one_way.languages == written_another.languages
 
 

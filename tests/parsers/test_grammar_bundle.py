@@ -480,7 +480,7 @@ def test_the_bundle_records_the_release_it_was_built_from(
 ) -> None:
     """Which grammars built a corpus must be knowable, not inferred from a directory listing.
 
-    ``ChunkFingerprint.grammars`` records the pack release, and an offline install has no
+    The code parser's parse lineage records the pack release, and an offline install has no
     manifest to consult and no download to infer it from — so the bundle carries it. The
     per-language digest is recorded for the same reason: a bundle is copied between machines by
     hand, and "the same bundle" has to mean the same bytes.

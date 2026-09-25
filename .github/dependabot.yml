@@ -147,11 +147,12 @@ updates:
           - "numpy"
 
       # --- index-affecting: where chunks begin and end ----------------------------------
-      # `ChunkFingerprint` records grammar versions per language, so a
-      # `tree-sitter-language-pack` bump invalidates the code documents in the languages it
-      # moved and leaves the rest alone. That selectivity is the whole reason the field is a
-      # mapping, and it is why this is a cheaper event than an embedding bump — but it is
-      # still a re-chunk and therefore a re-embed of what it touches.
+      # `tree-sitter` and `tree-sitter-language-pack` were here, on the claim that
+      # `ChunkFingerprint` recorded grammar versions per language and a bump invalidated only
+      # the code documents it moved. It did not: that fingerprint is compared once per run for
+      # the whole corpus, and the 1.17.0 -> 1.20.0 pack bump refused every ingest into every
+      # existing index, Markdown-only ones included. Both are the code parser's libraries now
+      # and live in `index-affecting-extraction` below, which is what a bump of them costs.
       #
       # `tiktoken` backs the *provisional* token counter, which records its encoding and its
       # installed version — `provisional:x1.5:tiktoken/cl100k_base@0.13.0` — so a bump moves
@@ -169,16 +170,19 @@ updates:
       index-affecting-chunking:
         patterns:
           - "tiktoken"
-          - "tree-sitter"
-          - "tree-sitter-*"
 
       # --- index-affecting: what a document was reduced to -------------------------------
       # These decide the text that ends up in the corpus. `ParseFingerprint` records every
       # one of them, per document, in `documents.parse_fp` — so a bump here no longer passes
       # unnoticed: change detection stops treating the affected documents as unchanged and
-      # re-parses them, and `reindex --re-parse` selects exactly that set without waiting for
-      # a sync. What a bump costs is therefore a re-parse of the documents that library
-      # produced, and nothing else.
+      # re-parses them, and `manicule document reindex --stale` selects exactly that set
+      # without waiting for a sync. What a bump costs is therefore a re-parse of the documents
+      # that library produced, and nothing else.
+      #
+      # `tree-sitter` and its grammar pack decide the code parser's blocks. One installation
+      # pays more for them: one running the diagram middleware, which reads dot and mermaid
+      # through the same grammars and names both in its chunk-fingerprint declaration, so a
+      # bump there re-chunks every diagram chunk it rewrites — Markdown included.
       #
       # `tests/parsers/test_versions.py` asserts that every distribution reaching a parse
       # fingerprint is matched by a pattern in this group. A library that decides stored text
@@ -203,6 +207,8 @@ updates:
           - "olefile"
           - "markdown-it-py"
           - "ruamel*"
+          - "tree-sitter"
+          - "tree-sitter-*"
 
       # --- routine ----------------------------------------------------------------------
       # Development tooling. A bump here can fail the build; it cannot change a stored byte.

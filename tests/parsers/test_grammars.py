@@ -31,6 +31,7 @@ from manicule.app.service import LANGUAGES_NAMED, ApplicationService
 from manicule.config.settings import Settings
 from manicule.core.errors import ConfigError, ParseError
 from manicule.parsers import grammars
+from manicule.parsers.versions import parse_fingerprint
 
 UNREACHABLE_MANIFEST = "http://127.0.0.1:9/manicule-tests-must-not-download.json"
 """Discard port on the loopback interface. A fetch attempted through this refuses at once
@@ -111,8 +112,8 @@ def test_declaring_no_languages_at_all_is_refused() -> None:
 def test_the_declared_set_is_a_value_rather_than_an_order() -> None:
     """Two configurations naming the same languages describe the same corpus.
 
-    The set feeds ``ChunkFingerprint.grammars``; if the order it was written in survived, a
-    reordered configuration file would read as a different chunking process.
+    The set decides what routes to the code parser; if the order it was written in survived,
+    a reordered configuration file would read as a different configuration.
     """
     assert grammars.validate_languages(["rust", "python", "rust"]) == ("python", "rust")
 
@@ -426,17 +427,18 @@ def test_prefetch_does_nothing_when_every_declared_grammar_is_already_cached() -
     assert grammars.prefetch(available) == ()
 
 
-def test_grammar_versions_describe_the_declared_set_and_not_the_cache(empty_cache: Path) -> None:
-    """``ChunkFingerprint.grammars`` must not depend on what a machine happens to hold.
+def test_the_recorded_grammar_version_does_not_depend_on_the_cache(empty_cache: Path) -> None:
+    """The code parser's lineage must not depend on what a machine happens to hold.
 
-    If the map shrank when a grammar was absent, the fingerprint would differ between a
-    freshly installed machine and a warmed one, and the corpus each built would be declared
-    incompatible with the other for no reason at all.
+    If it moved when a grammar was absent, a freshly installed machine and a warmed one would
+    record different lineage for the same parse, and each would re-parse the other's documents
+    for no reason at all.
     """
     del empty_cache
-    versions = grammars.grammar_versions(["python", "rust"])
+    lineage = parse_fingerprint("sourcecode")
 
-    assert versions == {"python": grammars.pack_version(), "rust": grammars.pack_version()}
+    assert lineage is not None
+    assert lineage.libraries[grammars.PACK_DISTRIBUTION] == grammars.pack_version()
 
 
 def test_a_grammar_version_is_not_a_hash_of_a_platform_specific_binary() -> None:
@@ -450,7 +452,6 @@ def test_a_grammar_version_is_not_a_hash_of_a_platform_specific_binary() -> None
     version = grammars.pack_version()
 
     assert version == metadata("tree-sitter-language-pack")["Version"]
-    assert set(grammars.grammar_versions(grammars.DECLARED_LANGUAGES).values()) == {version}
 
 
 def test_the_manifest_override_is_removed_again_when_it_is_not_asked_for(

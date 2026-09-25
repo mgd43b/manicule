@@ -261,54 +261,34 @@ def _build_chunker(context: BuildContext) -> StructuralChunker:
     counter = (
         TokenCounter.bound_to(embedder) if embedder is not None else TokenCounter.provisionally()
     )
+    _validate_declared_languages(context.settings)
     return StructuralChunker(
         counter,
         embedder=embedder,
         max_tokens=policy.max_tokens,
         overlap_tokens=policy.overlap_tokens,
-        grammars=_grammar_versions(context.settings),
-        version_components=_pinned_versions(),
     )
 
 
-def _grammar_versions(settings: Settings) -> dict[str, str]:
-    """Grammar version by language, for ``ChunkFingerprint.grammars``.
+def _validate_declared_languages(settings: Settings) -> None:
+    """Refuse a declared code-language set the grammar pack does not recognize, at startup.
 
-    Read from **configuration**, not from the cache and not from a constructed parser.
+    Done when the chunker is built because the chunker is built for every ingest, while the
+    code parser is built only when a code document arrives: a corpus that happens to contain no
+    code would otherwise carry a typo — ``c_sharp`` for ``csharp`` — until the first source
+    file turned it into a refusal. The check used to happen as a side effect of recording
+    grammar versions in the chunk fingerprint. The versions have moved to the code parser's own
+    per-document lineage; the startup check is kept on purpose rather than lost with them.
 
-    Not the cache, because a map that shrank when a grammar was missing would make the
-    fingerprint depend on cache state — a freshly installed machine and a warmed one would
-    declare their corpora incompatible for no reason at all, and an air-gapped install with no
-    route to the grammar mirror could not build a chunker at all. Recording a grammar version
-    must never require the network, and here it does not: the language set is configuration and
-    the version is distribution metadata.
-
-    Not a constructed parser, because building the code parser would also configure the
-    grammar pack's process-global registry — pointing it at a cache directory and a manifest
-    mirror — as a side effect of asking a question about configuration.
-
-    The declared set is validated here rather than trusted. That does import the grammar pack,
-    to check the keys against the names it ships; validating late instead would let a typo
-    become a fingerprint recording a language that does not exist, on a corpus that happens to
-    contain no code and so never builds the parser that would have caught it.
+    It imports the grammar pack, to check the keys against the names it ships, and it does not
+    construct the code parser — which would also configure the pack's process-global registry
+    as a side effect of asking a question about configuration.
     """
     from manicule.parsers.config import SourceCodeConfig  # noqa: PLC0415 - see module docstring
-    from manicule.parsers.grammars import grammar_versions  # noqa: PLC0415
+    from manicule.parsers.grammars import validate_languages  # noqa: PLC0415
 
     declared = settings.component_config("parser", SOURCE_CODE_NAME)
-    config = SourceCodeConfig.model_validate(dict(declared))
-    return dict(grammar_versions(config.languages))
-
-
-def _pinned_versions() -> dict[str, str]:
-    """Other pinned transformations whose output an anchor addresses.
-
-    The HTML-to-text conversion is the one that matters: an email with an HTML-only body has
-    line numbers into the *converted* text, so a converter upgrade would shift every anchor
-    in every HTML email — round-tripping today and pointing at the wrong paragraph after a
-    dependency bump, with no test failing in between.
-    """
-    return {"html_text": parser_config.html_text_version()}
+    validate_languages(SourceCodeConfig.model_validate(dict(declared)).languages)
 
 
 def _chunker_metadata(context: MetadataContext) -> ChunkFingerprint:
@@ -326,15 +306,12 @@ def _chunker_metadata(context: MetadataContext) -> ChunkFingerprint:
     policy = context.config
     if not isinstance(policy, parser_config.StructuralChunkerConfig):
         raise ConfigError("structural chunker metadata received invalid component configuration")
-    components = _pinned_versions()
-    suffix = "".join(f";{name}={value}" for name, value in sorted(components.items()))
     return ChunkFingerprint(
         chunker=FINGERPRINT_NAME,
-        version=f"{CHUNKER_VERSION}{suffix}",
+        version=CHUNKER_VERSION,
         max_tokens=policy.max_tokens,
         overlap_tokens=policy.overlap_tokens,
         tokenizer_id=embedding.tokenizer_id,
-        grammars=_grammar_versions(context.settings),
     )
 
 

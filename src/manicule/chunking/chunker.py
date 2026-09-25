@@ -20,7 +20,7 @@ Two numbers are expensive to change once a corpus is indexed, and both are in
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Final, cast
 
@@ -203,6 +203,11 @@ class _Overlap:
 class StructuralChunker:
     """Groups blocks into retrievable chunks, respecting the structure the parser found.
 
+    Its fingerprint carries this chunker's own identity and nothing a parser read with. Grammar
+    and HTML-converter versions used to be passed in here and folded into it, which made a
+    library bump refuse every document in the corpus; they are recorded per document, in each
+    parser's :class:`~manicule.core.fingerprints.ParseFingerprint`, instead.
+
     Args:
         counter: How tokens are counted. Comes from the bound embedder, so the budget is
             measured with the tokenizer that enforces it.
@@ -211,13 +216,6 @@ class StructuralChunker:
             read — the check has to happen before ingest, not after, because past the limit
             the input is dropped without an error and the chunk is indexed as its opening
             tokens while still claiming all of its text.
-        grammars: Grammar version by language, for
-            :attr:`~manicule.core.fingerprints.ChunkFingerprint.grammars`. Per language, so a
-            Python grammar bump invalidates Python documents and leaves the rest alone.
-        version_components: Other pinned versions that move chunk boundaries or anchors — the
-            HTML-to-text conversion that email line numbers address, for instance. Folded
-            into the fingerprint's ``version``, because a converter upgrade that shifts every
-            anchor in every HTML email must not pass unnoticed.
     """
 
     def __init__(
@@ -229,8 +227,6 @@ class StructuralChunker:
         overlap_tokens: int = OVERLAP_TOKENS,
         min_tokens: int = MIN_TOKENS,
         breadcrumb_tokens: int = BREADCRUMB_TOKENS,
-        grammars: Mapping[str, str] | None = None,
-        version_components: Mapping[str, str] | None = None,
     ) -> None:
         if breadcrumb_tokens >= max_tokens:
             msg = (
@@ -246,15 +242,12 @@ class StructuralChunker:
         self._breadcrumb_tokens = breadcrumb_tokens
         self._text_budget = max_tokens - breadcrumb_tokens
         self._probe_chars = max(1, max_tokens * PROBE_CHARS_PER_TOKEN)
-        components = dict(version_components or {})
-        suffix = "".join(f";{name}={value}" for name, value in sorted(components.items()))
         self.fingerprint = ChunkFingerprint(
             chunker=CHUNKER_NAME,
-            version=f"{CHUNKER_VERSION}{suffix}",
+            version=CHUNKER_VERSION,
             max_tokens=max_tokens,
             overlap_tokens=overlap_tokens,
             tokenizer_id=counter.tokenizer_id,
-            grammars=dict(grammars or {}),
         )
 
     @property

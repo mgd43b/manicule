@@ -230,9 +230,9 @@ def html_text_version() -> str:
     own rule — take the blocks the web parser yields and join them with a blank line — and the
     second is the engine underneath it, whose text extraction is the other half of the answer.
     The installed version is read rather than written down so that an upgrade cannot pass
-    unnoticed; the price is that a ``selectolax`` release makes the chunk fingerprint differ
-    and ingest say so, which is the explicit, priced operation ``docs/parsing.md`` §1.7 asks
-    for instead of silent drift.
+    unnoticed. It is recorded on each block the conversion produces; what re-parses the mail a
+    ``selectolax`` release moved is the ``email`` and ``msg`` parse lineage, which names the
+    same library (:data:`~manicule.parsers.versions.PARSERS`).
 
     A function rather than a constant: this module is imported during plugin discovery, and an
     install without the parsing extras would otherwise fail there — during discovery, before
@@ -273,7 +273,7 @@ class SourceCodeConfig(BaseModel):
     """Configuration for :class:`~manicule.parsers.sourcecode.SourceCodeParser`.
 
     Set under ``plugins.config."parser.sourcecode"``. The declared language set decides what
-    routes to the parser at all and what the corpus fingerprint records, and the two grammar
+    routes to the parser at all, and the two grammar
     overrides are what a container image and an air-gapped site respectively need in order to
     pre-seed.
     """

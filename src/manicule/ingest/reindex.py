@@ -16,8 +16,8 @@ since publications existed can only change its vectors by publishing new ones.
 
 Only the last can fail for reasons outside the machine, and it is the only one that is not
 reproducible. Everything above it is a pure function of what is already stored. That is the
-whole return on retaining original bytes, and it is why ``--re-parse`` is a first-class verb
-rather than a flag on sync.
+whole return on retaining original bytes, and it is why ``document reindex --stale`` is a
+first-class verb rather than a flag on sync.
 
 **Rung 0 is cheaper than rung 1 and that is why it is a separate verb rather than a wider
 sweep.** Re-detecting a glossary reads chunk text and writes rows: it runs no parser, opens no
@@ -26,9 +26,9 @@ Folding it into the re-parse sweep would work and would charge a corpus-sized pa
 re-embed for a change to a regular expression, which is the thing an operator most needs to be
 able to avoid.
 
-**Selection is a query, never a scan**, because ``documents.chunk_fp`` and
-``documents.embed_fp`` record per-document lineage: a tree-sitter grammar upgrade invalidates
-code documents and nothing else, and saying so is one ``WHERE`` clause.
+**Selection is a query, never a scan**, because ``documents.parse_fp``, ``chunk_fp`` and
+``embed_fp`` record per-document lineage: a tree-sitter grammar upgrade moves the code parser's
+``parse_fp`` and nothing else, and selecting what it touched is one ``WHERE`` clause.
 
 **A document with no retained bytes cannot be re-parsed**, and that is reported per document
 rather than failing the run. Those are the only documents for which a re-crawl is the sole

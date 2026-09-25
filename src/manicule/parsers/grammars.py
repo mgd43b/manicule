@@ -110,7 +110,6 @@ __all__ = [
     "bundle_status",
     "cache_directory",
     "configure_pack",
-    "grammar_versions",
     "is_available",
     "language_for_media_type",
     "library_layout",
@@ -173,7 +172,14 @@ runs the command all say the same thing, and a rename cannot leave two of the th
 
 
 def pack_version() -> str:
-    """The installed grammar pack release. See :func:`grammar_versions`.
+    """The installed grammar pack release.
+
+    Every grammar ships in one platform bundle per pack release, so the release describes all
+    of them exactly: ``Language.abi_version`` is the tree-sitter ABI and moves for reasons
+    unrelated to a grammar's content, and ``Language.semantic_version`` is ``None`` for every
+    grammar the pack carries. That is why the code parser's lineage records the pack as a
+    distribution — :data:`~manicule.parsers.versions.PARSERS` — rather than a version per
+    language.
 
     Read from the distribution's metadata rather than from ``pack.__version__``, which is the
     same string — the suite asserts that rather than assuming it. Reading the metadata answers
@@ -797,43 +803,6 @@ def _fetch_failure(languages: Sequence[str], detail: str, bundle_dir: Path | Non
         f"mirror if this host has a route to one, or narrow the declared language set. "
         f"docs/parsing.md §8.1 covers building a bundle for a host with neither."
     )
-
-
-def grammar_versions(languages: Sequence[str]) -> dict[str, str]:
-    """Grammar version per declared language, for ``ChunkFingerprint.grammars``.
-
-    A grammar upgrade changes parse trees, changed trees change split points, and changed
-    split points mean stored embeddings that no longer correspond to the chunks that would
-    be produced today. Recording this per language is what lets a grammar bump invalidate
-    the documents in that language instead of the corpus.
-
-    The value is the **pack release**, for every declared language, and that is the honest
-    answer rather than a placeholder. Two alternatives were rejected:
-
-    - *A per-grammar version number.* The pack does not carry one. ``Language.abi_version``
-      is the tree-sitter ABI (14 for every grammar in this release, and it moves for reasons
-      unrelated to a grammar's content) and ``Language.semantic_version`` is ``None`` for
-      every grammar here — verified, not assumed.
-    - *A hash of the grammar's shared library.* It would be genuinely per-language, and it
-      would also differ between macOS and Linux for identical grammar source, so moving a
-      corpus between machines would invalidate it for no reason. ``fingerprints.py`` is
-      explicit that fields describing the producer without affecting its output stay out of
-      identity; a platform-dependent hash is worse than that, since it *looks* like output.
-
-    Grammars ship as one platform bundle per pack release, so every grammar moves together
-    and the release version describes all of them exactly. Keeping the map per language
-    means a pack that later versions grammars individually needs no schema change.
-
-    Args:
-        languages: The declared set.
-
-    Returns:
-        ``{language: version}`` over the declared set, independent of what is cached. It has
-        to be independent: a map that shrank when a grammar was missing would make the
-        fingerprint depend on cache state, which is the hazard this module exists to close.
-    """
-    version = pack_version()
-    return dict.fromkeys(validate_languages(languages), version)
 
 
 _PARSERS: dict[str, Parser] = {}

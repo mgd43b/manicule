@@ -20,10 +20,12 @@ approximately right.
 For an HTML-only body the line numbers address the *converted* text rather than the source
 bytes, so a converter upgrade shifts every anchor in every HTML email — round-tripping today,
 pointing at the wrong paragraph after a dependency bump, with no test failing in between. The
-version therefore belongs in
-:attr:`ChunkFingerprint.version <manicule.core.fingerprints.ChunkFingerprint.version>`, by way
-of ``StructuralChunker(version_components=...)``, where a change to it refuses to run against
-a corpus built with the old one.
+converter is therefore part of this parser's lineage — ``selectolax`` among its libraries in
+:data:`~manicule.parsers.versions.PARSERS`, and the join rule among its ``rules`` — so a change
+to either re-parses the mail it affects. It used to be a suffix on the corpus-wide
+:attr:`ChunkFingerprint.version <manicule.core.fingerprints.ChunkFingerprint.version>`, where a
+``selectolax`` release refused every ingest into every index, mail or not. The version is still
+stamped on each block as ``html_to_text_version``, for anyone reading one.
 
 **Quoted reply chains are kept.** Trimming them is a retrieval optimization with a real
 downside — the quoted text is frequently the only statement of the thing being replied to —

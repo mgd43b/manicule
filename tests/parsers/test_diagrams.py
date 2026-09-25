@@ -507,3 +507,25 @@ async def test_the_registered_middleware_builds_through_the_container() -> None:
     assert chain[0].mutates_embedded_text, (
         "the fingerprint would not know this middleware rewrites every vector"
     )
+
+
+def test_the_middleware_names_the_grammar_libraries_it_reads_with() -> None:
+    """A dot or mermaid reading comes out of a tree-sitter parse, so the runtime and the pack
+    decide the embedding input it writes — for Markdown chunks as much as for code.
+
+    The chunk fingerprint used to carry the pack as ``grammars`` for every corpus. That covered
+    this middleware by accident and refused every corpus on a pack bump; the declaration is now
+    the one place these readings are versioned, and it moves only for an installation that runs
+    this middleware.
+    """
+    declared = middleware().version
+
+    assert f"{grammars.PACK_DISTRIBUTION}/{grammars.pack_version()}" in declared
+    assert declared.startswith("tree-sitter/")
+
+
+def test_a_middleware_reading_only_grammarless_notations_names_no_grammar() -> None:
+    """``mxfile`` is decoded XML; no grammar decides it, so no pack bump may move it."""
+    grammarless = DiagramMiddleware(DiagramConfig(languages=GRAMMARLESS_DIAGRAM_LANGUAGES))
+
+    assert grammarless.version == ""

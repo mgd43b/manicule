@@ -7,9 +7,12 @@ file go red — a guard nobody has seen fire is a guard nobody knows works.
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from manicule.core.errors import MiddlewareViolationError
+from manicule.core.protocols import Middleware
 from manicule.ingest.middleware import MiddlewareRunner, text_digest
 from tests.fakes import make_chunks, make_document, make_raw
 from tests.ingest import fakes
@@ -113,6 +116,32 @@ async def test_only_declaring_middleware_reaches_the_chunk_fingerprint() -> None
     assert runner.declarations({"declared": "2.1"}) == ("declared@2.1",)
 
 
+async def test_a_middleware_states_its_own_version_when_nothing_is_supplied() -> None:
+    """What decides a hook's output beyond its own code is recorded beside its name.
+
+    The diagram middleware reads with a grammar pack, and nothing else records that pack for the
+    chunks it rewrites now that the chunk fingerprint no longer carries grammar versions. A
+    version supplied by the caller still wins, as it did before the attribute existed.
+    """
+    versioned = _VersionedRewriter()
+
+    assert MiddlewareRunner([versioned]).declarations() == ("versioned@pack/1.20.0",)
+    assert MiddlewareRunner([versioned]).chain() == ("versioned@pack/1.20.0",)
+    assert MiddlewareRunner([versioned]).declarations({"versioned": "9"}) == ("versioned@9",)
+
+
+async def test_a_middleware_written_without_the_version_attribute_still_records_its_name() -> None:
+    """Third-party middleware written against the protocol structurally predates ``version``."""
+
+    class Structural:
+        name = "structural"
+        mutates_embedded_text = True
+
+    runner = MiddlewareRunner([cast("Middleware", Structural())])
+
+    assert runner.declarations() == ("structural@",)
+
+
 async def test_the_declaration_set_does_not_depend_on_configuration_order() -> None:
     """Reordering middleware changes not one vector, so it must not read as a re-index."""
     first = MiddlewareRunner([fakes.DeclaredRewriter(), _SecondRewriter()])
@@ -131,6 +160,11 @@ async def test_a_middleware_with_no_known_version_is_still_recorded() -> None:
 def test_the_text_digest_cannot_be_fooled_by_moving_a_boundary() -> None:
     """``["ab", "c"]`` and ``["a", "bc"]`` must not hash alike, or the check is decoration."""
     assert text_digest(["ab", "c"]) != text_digest(["a", "bc"])
+
+
+class _VersionedRewriter(fakes.DeclaredRewriter):
+    name = "versioned"
+    version = "pack/1.20.0"
 
 
 class _SecondRewriter(fakes.DeclaredRewriter):

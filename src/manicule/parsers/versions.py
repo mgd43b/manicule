@@ -1,12 +1,16 @@
 """What each parser was built out of, so a bump can name the documents it changed.
 
-``ChunkFingerprint.grammars`` records a tree-sitter version per language and calls the result
-selective invalidation. Nine other libraries decide what a document is reduced to —
-``pypdfium2``, ``selectolax``, ``lxml``, ``python-docx``, ``python-pptx``,
-``python-calamine``, ``nbformat``, ``markdown-it-py``, ``ruamel.yaml`` — and until this module
-existed none of them was recorded anywhere. A bump changed the text the same bytes produce,
-change detection keys on those bytes and so never re-read what was stored, and the corpus
-quietly held two generations of extracted text.
+Libraries decide what a document is reduced to — ``pypdfium2``, ``selectolax``, ``lxml``,
+``python-docx``, ``python-pptx``, ``python-calamine``, ``nbformat``, ``markdown-it-py``,
+``ruamel.yaml``, the tree-sitter runtime and its grammar pack — and until this module existed
+none of them was recorded per document. A bump changed the text the same bytes produce, change
+detection keys on those bytes and so never re-read what was stored, and the corpus quietly
+held two generations of extracted text.
+
+Two of them were recorded somewhere, and it was the wrong scope in the other direction: the
+grammar pack and the HTML converter sat in the corpus-wide chunk fingerprint, where a bump
+refused every ingest into every index whether or not it held a single document those libraries
+had read. They are in this table now, beside the rest.
 
 This is the table that closes it, and three properties of it are load-bearing.
 
@@ -86,6 +90,40 @@ class ParserVersions:
     """
 
 
+# `email`'s rules, one bump at a time.
+#
+# 1 -> 2: an HTML-only mail body's line numbers address the text
+# `mail._html_to_text` builds from the web parser's blocks, and the web parser now
+# recovers CDATA sections instead of deleting them — so a recovered body becomes a block
+# and every line after it moves. Bumped even though this parser's own rules are
+# unchanged, because what it extracts changed and `parse_fp` is what re-parses it.
+#
+# 2 -> 3: the same reasoning, one change along. A `<br>` in an HTML-only body now puts a
+# newline *inside* a block, and `_html_to_text` hands the result to `lines_of` — so the
+# break becomes a line of the canonical text and every `LineAnchor` after it moves by one.
+# This parser's own rules are again unchanged; what it extracts is not.
+#
+# **Deliberately not moved to 4 when `html` did**, which breaks the run of two above and is
+# therefore the entry most at risk of being tidied into symmetry later. Both bumps above
+# moved the *text* an HTML-only body's `LineAnchor`s address. #109 did not: it added `rows`
+# to what the web parser says *about* a table block, and `_html_to_text` joins the blocks'
+# `text` and never reads their metadata — a body carrying a 300-row table parses to
+# byte-identical blocks and byte-identical anchors across it, run rather than inferred.
+# `test_an_html_body_is_built_from_block_text_alone` in `tests/parsers/test_mail.py` is what
+# keeps that true; a bump here would be symmetry rather than a fact, and it would re-parse
+# and re-embed every email in the corpus to produce identical text.
+#
+# 3 -> 4: the definition-list rendering, and this one *does* move the text — which is why
+# the paragraph above is worth having rather than a rule of thumb that email never follows
+# html. `<dt>NOW</dt><dd>Network Operations Workspace</dd>` reaches `_html_to_text` through
+# the web parser's blocks and now joins as `NOW` above `: Network Operations Workspace`
+# instead of two `- ` lines, so an HTML-only body holding a `<dl>` produces different
+# characters and every `LineAnchor` after that list addresses a different line. Confirmed by
+# parsing a message, not by reading the call graph.
+_EMAIL: Final = ParserVersions(rules="4", distributions=("selectolax",))
+"""The ``email`` entry of :data:`PARSERS`, named because ``msg`` is built from it."""
+
+
 PARSERS: Final[dict[str, ParserVersions]] = {
     # 1 -> 2: table blocks carry `rows`, so an oversized table is split at its row boundaries
     # with the header repeated into every part instead of wherever the token budget landed. The
@@ -105,7 +143,16 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # and belongs here. What it does *not* decide is how those bytes become a message — that is
     # `rules`, and the two move independently: a fix to the synthesized-header path moves
     # `rules` while the reader stays put.
-    "msg": ParserVersions(rules="1", distributions=("olefile",)),
+    # A shim over `email` (see `parsers.msg`): the MAPI properties are reconstituted into an
+    # RFC 5322 message and `MailParser` does everything after that, so what `email` extracts is
+    # what this extracts. Its rules and libraries are therefore folded in from `_EMAIL` rather
+    # than copied, and a bump there reaches `.msg` documents without anybody having to remember
+    # this entry. Before this entry did so it named `olefile` alone: `selectolax` was covered
+    # for it only by the `html_text` suffix the corpus-wide chunk fingerprint used to carry,
+    # and a change to `email`'s rules — four of them so far — reached no `.msg` document at all.
+    "msg": ParserVersions(
+        rules=f"1+email/{_EMAIL.rules}", distributions=("olefile", *_EMAIL.distributions)
+    ),
     # Started at 1 rather than inheriting `html`'s 2. A version is a statement about one
     # parser's own output, and these are different parsers: the documents this reads were
     # previously read by `html`, and what re-parses them is `Change.ROUTING` noticing that the
@@ -145,35 +192,8 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # 4 of 4 after; the detector rule was correct throughout and had no input.
     "confluence": ParserVersions(rules="5", distributions=("selectolax",)),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
-    # 1 -> 2: an HTML-only mail body's line numbers address the text
-    # `mail._html_to_text` builds from the web parser's blocks, and the web parser now
-    # recovers CDATA sections instead of deleting them — so a recovered body becomes a block
-    # and every line after it moves. Bumped even though this parser's own rules are
-    # unchanged, because what it extracts changed and `parse_fp` is what re-parses it.
-    #
-    # 2 -> 3: the same reasoning, one change along. A `<br>` in an HTML-only body now puts a
-    # newline *inside* a block, and `_html_to_text` hands the result to `lines_of` — so the
-    # break becomes a line of the canonical text and every `LineAnchor` after it moves by one.
-    # This parser's own rules are again unchanged; what it extracts is not.
-    #
-    # **Deliberately not moved to 4 when `html` did**, which breaks the run of two above and is
-    # therefore the entry most at risk of being tidied into symmetry later. Both bumps above
-    # moved the *text* an HTML-only body's `LineAnchor`s address. #109 did not: it added `rows`
-    # to what the web parser says *about* a table block, and `_html_to_text` joins the blocks'
-    # `text` and never reads their metadata — a body carrying a 300-row table parses to
-    # byte-identical blocks and byte-identical anchors across it, run rather than inferred.
-    # `test_an_html_body_is_built_from_block_text_alone` in `tests/parsers/test_mail.py` is what
-    # keeps that true; a bump here would be symmetry rather than a fact, and it would re-parse
-    # and re-embed every email in the corpus to produce identical text.
-    #
-    # 3 -> 4: the definition-list rendering, and this one *does* move the text — which is why
-    # the paragraph above is worth having rather than a rule of thumb that email never follows
-    # html. `<dt>NOW</dt><dd>Network Operations Workspace</dd>` reaches `_html_to_text` through
-    # the web parser's blocks and now joins as `NOW` above `: Network Operations Workspace`
-    # instead of two `- ` lines, so an HTML-only body holding a `<dl>` produces different
-    # characters and every `LineAnchor` after that list addresses a different line. Confirmed by
-    # parsing a message, not by reading the call graph.
-    "email": ParserVersions(rules="4", distributions=("selectolax",)),
+    # Its rules history is on `_EMAIL`, above, because `msg` is built from it.
+    "email": _EMAIL,
     # 1 -> 2: CDATA sections are recovered as text rather than deleted by the HTML parser's
     # bogus-comment reparse. Every document containing one produces different text now, and
     # the bump is what re-parses them from retained bytes instead of leaving a corpus that is
@@ -184,9 +204,11 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # every one with a break in a heading, a table cell or a list item gains the space that was
     # missing between the fragments either side of it. `html_text_version` is deliberately not
     # bumped with it: `web-blocks/1` names the *rule* email applies to these blocks — join them
-    # with a blank line — and that rule is unchanged. It sits in `ChunkFingerprint.version`,
-    # where a bump refuses ingest against the whole corpus; a change to what one parser extracts
-    # is what `parse_fp` is for, which is the division the 1 -> 2 pair above already drew.
+    # with a blank line — and that rule is unchanged. It sat in `ChunkFingerprint.version` then,
+    # where a bump refused ingest against the whole corpus; a change to what one parser extracts
+    # is what `parse_fp` is for, which is the division the 1 -> 2 pair above already drew. It
+    # has since left the chunk fingerprint altogether: a change to that join rule is a change to
+    # what `email` extracts, and moves `email`'s rules like any other.
     #
     # 3 -> 4: table blocks carry `rows`, by the same edit and for the same reason as
     # `confluence`'s 3 -> 4 above — `_table_text` became `_table_rows` and the join moved to the
@@ -236,7 +258,9 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     "pdf": ParserVersions(rules="1", distributions=("pypdfium2",)),
     "plaintext": ParserVersions(rules="1"),
     "pptx": ParserVersions(rules="1", distributions=("python-pptx", "lxml")),
-    "sourcecode": ParserVersions(rules="1", distributions=("tree-sitter",)),
+    "sourcecode": ParserVersions(
+        rules="1", distributions=("tree-sitter", "tree-sitter-language-pack")
+    ),
     "spreadsheet": ParserVersions(rules="1", distributions=("python-calamine",)),
     "structured": ParserVersions(rules="1", distributions=("ruamel-yaml",)),
 }
@@ -258,12 +282,16 @@ places:
     converter upgrade therefore shifts every anchor in every HTML email — round-tripping
     today, pointing at the wrong paragraph after a bump.
 
-``sourcecode`` names ``tree-sitter`` and not the grammar pack
-    The pack release is already recorded, per language, in
-    :attr:`~manicule.core.fingerprints.ChunkFingerprint.grammars`, and recording it twice
-    would make one bump look like two independent events. The tree-sitter runtime underneath
-    it is recorded here because nothing else records it, and it is what turns a grammar into
-    a parse tree.
+``sourcecode`` names ``tree-sitter`` and the grammar pack
+    The runtime turns a grammar into a parse tree and the pack supplies the grammar, and the
+    block boundaries this parser emits are node boundaries of that tree — so either moving
+    moves them. The pack was recorded instead as ``ChunkFingerprint.grammars``, per language,
+    for the whole corpus, and that made its bump refuse every ingest into an index that held no
+    code at all. Recorded here it re-parses the code documents, which is what it changes.
+
+``msg`` folds in ``email``
+    It is a shim that hands a reconstituted message to the mail parser, so ``email``'s rules
+    and libraries are its own and are read off the ``email`` entry rather than restated.
 
 ``spreadsheet`` names only ``python-calamine``
     CSV goes through the standard library's ``csv`` module, which moves with the interpreter
