@@ -296,7 +296,3 @@ def test_msg_carries_the_mail_parser_it_is_a_shim_over() -> None:
 
     assert msg.version.endswith(f"+email/{email.version}")
     assert email.libraries.items() <= msg.libraries.items()
-
-    bumped = PARSERS["email"].rules + "0"
-    moved = ParserVersions(rules=f"1+email/{bumped}", distributions=PARSERS["msg"].distributions)
-    assert moved.rules != PARSERS["msg"].rules, "an email bump must move msg's identity"

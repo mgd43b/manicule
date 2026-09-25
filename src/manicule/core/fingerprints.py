@@ -318,6 +318,8 @@ class ChunkFingerprint(Fingerprint):
         if not isinstance(data, dict):
             return data
         stored = cast("dict[str, object]", data)
+        if "grammars" not in stored:
+            return stored
         return {name: value for name, value in stored.items() if name != "grammars"}
 
     @property
