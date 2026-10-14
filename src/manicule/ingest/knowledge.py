@@ -65,7 +65,7 @@ _READ_BEYOND_BLOCK = 4096
 
 _TOP_KEY = re.compile(r"""^["']?([A-Za-z_][A-Za-z0-9_-]*)["']?\s*:""")
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
-_CODE_FENCE = re.compile(r"^ {0,3}(```|~~~)")
+_CODE_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def _top_level_keys(inner: Sequence[str]) -> set[str]:
@@ -153,10 +153,19 @@ def _require_body(body: Sequence[str]) -> None:
     fence = ""
     for index, line in enumerate(body):
         marker = _CODE_FENCE.match(line)
-        if marker:
-            fence = "" if fence == marker[1] else (fence or marker[1])
+        if marker and not fence:
+            fence = marker[1]
             continue
         if fence:
+            # CommonMark closes a fence only with the same character, at least as long as the
+            # opening one, and nothing after it. A shorter fence inside a longer one is text.
+            if (
+                marker
+                and marker[1][0] == fence[0]
+                and len(marker[1]) >= len(fence)
+                and not marker[2].strip()
+            ):
+                fence = ""
             continue
         found = _HEADING.match(line)
         if found:
@@ -180,13 +189,20 @@ def _require_body(body: Sequence[str]) -> None:
 def _has_content(
     body: Sequence[str], headings: Sequence[tuple[int, str, int]], section: str
 ) -> bool:
-    """Whether a level-2 heading called ``section`` has any text before the next heading."""
+    """Whether a level-2 heading called ``section`` has text under it.
+
+    The section runs to the next heading **of the same or a higher level**, so a procedure
+    organized under ``### Steps`` subheadings counts as having its text. A subheading line is not
+    itself text: ``## Answer`` followed by an empty ``### Steps`` is still empty.
+    """
+    heading_lines = {index for _, _, index in headings}
     for position, (level, title, index) in enumerate(headings):
         if level != 2 or title.lower() != section.lower():  # noqa: PLR2004 - section headings are level 2
             continue
-        end = headings[position + 1][2] if position + 1 < len(headings) else len(body)
-        if any(line.strip() for line in body[index + 1 : end]):
-            return True
+        end = next((h[2] for h in headings[position + 1 :] if h[0] <= level), len(body))
+        for number in range(index + 1, end):
+            if number not in heading_lines and body[number].strip():
+                return True
     return False
 
 

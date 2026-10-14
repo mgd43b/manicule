@@ -337,10 +337,13 @@ class KnowledgeRecord(BaseModel):
 def _derived_status(evidence: object) -> str:
     """``single_source`` or ``corroborated``, from how many places the evidence points at."""
     items = cast("list[object]", evidence) if isinstance(evidence, list) else []
+    # Only string locators are counted. A list or mapping here is unhashable, and the model's own
+    # validation is what refuses it, with a sentence; counting it would raise first.
     places = {
-        cast("Mapping[str, object]", item).get("locator")
+        locator
         for item in items
         if isinstance(item, Mapping)
+        and isinstance(locator := cast("Mapping[str, object]", item).get("locator"), str)
     }
     # The same count `KnowledgeRecord.independent_sources` makes, over input that has not been
     # validated yet; the model's own check then holds a declared status to it.

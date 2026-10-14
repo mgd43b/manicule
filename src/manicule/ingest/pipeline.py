@@ -104,7 +104,7 @@ from manicule.core.errors import (
     StorageBusyError,
 )
 from manicule.core.ids import content_hash, document_id
-from manicule.core.knowledge import KNOWLEDGE_KEY
+from manicule.core.knowledge import KNOWLEDGE_KEY, Knowledge
 from manicule.core.protocols import BatchedDiscoveryConnector, EnumerationProgressConnector
 from manicule.core.provenance import Provenance
 from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, SourceId
@@ -1001,23 +1001,28 @@ def _with_knowledge(raw: RawDocument, existing: Document | None) -> RawDocument:
     it; the key is written only when there is something to overwrite, so a document that never
     had a record never gets one.
     """
-    if raw.media_type not in MARKDOWN_MEDIA_TYPES:
-        return raw
+    declared = _declared_knowledge(raw) if raw.media_type in MARKDOWN_MEDIA_TYPES else None
+    if declared is not None:
+        return raw.model_copy(
+            update={"metadata": {**raw.metadata, KNOWLEDGE_KEY: declared.as_metadata_value()}}
+        )
+    # Reached for a non-Markdown revision as well: a memory replaced by a PDF under the same
+    # identity must lose its evidence too, or the new document is cited with the old one's sources.
+    if existing is not None and KNOWLEDGE_KEY in existing.metadata:
+        return raw.model_copy(update={"metadata": {**raw.metadata, KNOWLEDGE_KEY: None}})
+    return raw
+
+
+def _declared_knowledge(raw: RawDocument) -> Knowledge | None:
+    """The record a Markdown document's front matter declares, or ``None``."""
     head = raw.content[:_FRONT_MATTER_PROBE]
     try:
         text = head if isinstance(head, str) else head.decode(raw.encoding, errors="ignore")
     except LookupError:
         # An encoding name Python does not know. The parser will refuse the document for the
         # same reason and say so; this stage has nothing to add.
-        return raw
-    declared = read_knowledge(text)
-    if declared is not None:
-        return raw.model_copy(
-            update={"metadata": {**raw.metadata, KNOWLEDGE_KEY: declared.as_metadata_value()}}
-        )
-    if existing is not None and KNOWLEDGE_KEY in existing.metadata:
-        return raw.model_copy(update={"metadata": {**raw.metadata, KNOWLEDGE_KEY: None}})
-    return raw
+        return None
+    return read_knowledge(text)
 
 
 class IngestPipeline:

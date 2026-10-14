@@ -487,3 +487,37 @@ def test_a_relationship_to_itself_is_caught_across_hyphens_and_underscores() -> 
 
     with pytest.raises(KnowledgeError, match="its own target"):
         check(text, slug=SLUG)
+
+
+@pytest.mark.parametrize("locator", ["[]", "{}", "[a]", "{a: b}", "3"])
+def test_a_locator_that_is_not_a_string_is_refused_not_raised(locator: str) -> None:
+    """Status is derived before validation, so an unhashable locator must not reach a set."""
+    text = memory(evidence=EVIDENCE.replace(LOCATOR, locator))
+
+    assert "locator" in _refusal(text)
+
+
+def test_a_shorter_fence_inside_a_longer_one_does_not_close_it() -> None:
+    body = (
+        "# Title\n\n## Problem\n\nText.\n\n````\n```\n## Answer\nnot a heading\n```\n````\n\n"
+        "## Applicability\n\nHere.\n"
+    )
+
+    with pytest.raises(KnowledgeError, match="`## Answer`"):
+        check(memory(body=body), slug=SLUG)
+
+
+def test_a_section_organized_under_subheadings_has_its_text() -> None:
+    body = BODY.replace("Run the failover runbook;", "### Steps\n\nRun the failover runbook;")
+
+    check(memory(body=body), slug=SLUG)
+
+
+def test_a_section_with_only_an_empty_subheading_is_still_empty() -> None:
+    body = BODY.replace(
+        "Run the failover runbook; the second gateway does not take over by itself.\n",
+        "### Steps\n",
+    )
+
+    with pytest.raises(KnowledgeError, match="`## Answer`"):
+        check(memory(body=body), slug=SLUG)

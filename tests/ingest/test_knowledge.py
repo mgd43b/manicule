@@ -142,3 +142,26 @@ async def test_a_re_parse_rederives_the_record_from_the_retained_bytes() -> None
     await re_parse([damaged], pipeline=pipeline, blobs=blobs)
 
     assert (await stored(store)).knowledge == before
+
+
+async def test_a_memory_replaced_by_non_markdown_loses_its_evidence() -> None:
+    """The early return for other media types used to skip the removal."""
+    store = fakes.MemoryIngestStore()
+    pipeline, _, _ = build(store=store)
+    connector = a_connector(memory())
+    await pipeline.run(connector)
+    assert (await stored(store)).knowledge is not None
+
+    connector.documents[ID] = "plain text now\n"
+    connector.media_types[ID] = MEDIA_TYPE
+    await pipeline.run(connector)
+
+    assert (await stored(store)).knowledge is None
+
+
+async def test_a_non_markdown_document_that_never_had_a_record_gains_no_key() -> None:
+    pipeline, store, _ = build()
+
+    await pipeline.run(a_connector("plain\n", media_type=MEDIA_TYPE))
+
+    assert KNOWLEDGE_KEY not in (await stored(store)).metadata
