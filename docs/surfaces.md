@@ -777,7 +777,7 @@ replayed conversation claim it had cited a version that did not exist yet.
 On every search hit, every answer citation and every document summary — and `null` on all three
 unless the document is a **structured memory**: Markdown whose front matter declares a
 `knowledge_type` ([`memory-authoring.md`](memory-authoring.md) §6). It is a different thing from
-`provenance` and a document is never both: `provenance` says a document is a *copy of* something
+`provenance`, and the two are independent: `provenance` says a document is a *copy of* something
 published elsewhere, and `knowledge` says it is a *claim* that cites where it was said.
 
 `knowledge_type`, `evidence_status`, `evidence`, `oldest_said_at`, `newest_said_at`,

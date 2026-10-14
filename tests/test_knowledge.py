@@ -437,3 +437,19 @@ def test_the_clock_is_not_an_input_to_what_is_a_record() -> None:
     future = (datetime.now(UTC) + timedelta(days=400)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     assert _record_of(memory(evidence=EVIDENCE.replace("2026-03-02T14:05:00Z", future)))
+
+
+@pytest.mark.parametrize(
+    ("was", "becomes", "says"),
+    [
+        ("kind: slack", 'kind: "slack\\n"', "one lowercase token"),
+        ("target: reference_vpn_cert_rotation", 'target: "a\\n"', "not a slug"),
+    ],
+)
+def test_a_trailing_newline_is_not_a_token(was: str, becomes: str, says: str) -> None:
+    """``$`` matches before a final newline, so an anchored ``match`` accepted ``"slack\\n"``."""
+    front = "relationships:\n  - relation: relates_to\n    target: reference_vpn_cert_rotation\n"
+    text = memory(front=front, evidence=EVIDENCE)
+    assert was in text + EVIDENCE or was.startswith("target")
+
+    assert says in _refusal(text.replace(was, becomes))

@@ -496,7 +496,7 @@ class Document(_Content):
         Read through :attr:`metadata` for the reason :attr:`provenance` is, and **a different
         thing from it**: provenance says this document is a copy of something published
         elsewhere, while this says the document is a claim *about* the world that cites the
-        places it was said. A memory never has the first, and putting its citations there would
+        places it was said. The two are independent, and putting a memory's citations there would
         assert that the memory *is* the Slack message.
 
         ``None`` is the ordinary answer: nothing but a document whose front matter declares a

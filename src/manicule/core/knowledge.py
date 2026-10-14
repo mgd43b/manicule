@@ -59,7 +59,7 @@ from pydantic import (
 
 from manicule.core.provenance import require_aware, require_citable_uri, require_printable
 
-KNOWLEDGE_KEY: Final = "knowledge"
+KNOWLEDGE_KEY: Final = "structured_memory"
 """The ``documents.metadata`` key the record is stored under.
 
 One name, exported: two spellings of it are two records, and a hit would show whichever one it
@@ -211,7 +211,7 @@ class EvidenceSource(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> Self:
-        if not _KIND.match(self.kind):
+        if not _KIND.fullmatch(self.kind):
             msg = (
                 f"kind {self.kind!r} must be one lowercase token of letters, digits, '_' or '-' "
                 f"(for example {', '.join(KIND_EXAMPLES)})"
@@ -244,7 +244,7 @@ class Relationship(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> Self:
-        if not _SLUG.match(self.target):
+        if not _SLUG.fullmatch(self.target):
             msg = (
                 f"target {self.target!r} is not a slug: letters, digits, '_' and '-' only, "
                 f"without a path or a '.md' suffix"

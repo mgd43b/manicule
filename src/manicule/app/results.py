@@ -520,7 +520,7 @@ class KnowledgeReference(Payload):
 
     **Not a second ``provenance``.** ``provenance`` says a document *is a copy of* something
     published elsewhere; this says a document is a claim *about* the world and cites where it
-    was said. A memory never has the first, and reporting its evidence there would assert that
+    was said. The two are independent, and reporting a memory's evidence there would assert that
     the memory is the Slack message.
     """
 
@@ -583,7 +583,7 @@ class Anchored(Payload):
     knowledge: KnowledgeReference | None = Field(
         default=None,
         description="What the document claims and what it rests on, when it is a structured "
-        "memory. A different thing from ``provenance``, and a document is never both: that is "
+        "memory. A different thing from ``provenance``, and independent of it: that is "
         "a copy of something published elsewhere, this is a claim that cites where it was said.",
     )
 

@@ -132,7 +132,11 @@ def check(text: str, *, slug: str) -> None:
         raise KnowledgeError(msg)
     parsed = read(text)
     if parsed is None or parsed.record is None:
-        raise KnowledgeError(parsed.unavailable_reason if parsed else "the record is unreadable")
+        raise KnowledgeError(
+            parsed.unavailable_reason
+            if parsed
+            else f"the front matter is over {MAX_FRONT_MATTER_CHARS} characters, so it was not read"
+        )
     if any(link.target == slug for link in parsed.record.relationships):
         msg = f"relationships names this memory ({slug!r}) as its own target"
         raise KnowledgeError(msg)

@@ -115,7 +115,8 @@ def test_a_stored_citation_replays_without_live_knowledge() -> None:
         verification=Verification.RESOLVED,
     )
 
-    replayed = service_module._citation(stored)
+    # The replay function is the thing under test, so the private name is the point.
+    replayed = service_module._citation(stored)  # pyright: ignore[reportPrivateUsage]
 
     assert replayed.knowledge is None
     assert replayed.provenance is None
