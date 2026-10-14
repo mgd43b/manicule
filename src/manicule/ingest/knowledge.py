@@ -30,6 +30,8 @@ from manicule.core.knowledge import (
     Knowledge,
     KnowledgeError,
     KnowledgeRecord,
+    bounded_reason,
+    normalize_slug,
 )
 from manicule.parsers.front_matter import (
     MAX_FRONT_MATTER_CHARS,
@@ -61,7 +63,7 @@ none.
 _READ_BEYOND_BLOCK = 4096
 """How far past the largest readable block the scan goes looking for its closing fence."""
 
-_TOP_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:")
+_TOP_KEY = re.compile(r"""^["']?([A-Za-z_][A-Za-z0-9_-]*)["']?\s*:""")
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
 _CODE_FENCE = re.compile(r"^ {0,3}(```|~~~)")
 
@@ -93,7 +95,7 @@ def read(text: str) -> Knowledge | None:
         declared = read_front_matter(lines)
         record = KnowledgeRecord.from_declared({k: declared[k] for k in FIELDS if k in declared})
     except (FrontMatterError, KnowledgeError) as exc:
-        return Knowledge(unavailable_reason=str(exc))
+        return Knowledge(unavailable_reason=bounded_reason(str(exc)))
     return Knowledge(record=record)
 
 
@@ -137,7 +139,9 @@ def check(text: str, *, slug: str) -> None:
             if parsed
             else f"the front matter is over {MAX_FRONT_MATTER_CHARS} characters, so it was not read"
         )
-    if any(link.target == slug for link in parsed.record.relationships):
+    if any(
+        normalize_slug(link.target) == normalize_slug(slug) for link in parsed.record.relationships
+    ):
         msg = f"relationships names this memory ({slug!r}) as its own target"
         raise KnowledgeError(msg)
     _require_body(lines[front_matter_end(lines) :])

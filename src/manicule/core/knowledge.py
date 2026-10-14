@@ -337,15 +337,48 @@ class KnowledgeRecord(BaseModel):
 def _derived_status(evidence: object) -> str:
     """``single_source`` or ``corroborated``, from how many places the evidence points at."""
     items = cast("list[object]", evidence) if isinstance(evidence, list) else []
-    places: set[object] = set()
-    for item in items:
-        if isinstance(item, Mapping):
-            places.add(cast("Mapping[str, object]", item).get("locator"))
+    places = {
+        cast("Mapping[str, object]", item).get("locator")
+        for item in items
+        if isinstance(item, Mapping)
+    }
+    # The same count `KnowledgeRecord.independent_sources` makes, over input that has not been
+    # validated yet; the model's own check then holds a declared status to it.
     return (
         EvidenceStatus.CORROBORATED.value
         if len(places) >= CORROBORATION
         else EvidenceStatus.SINGLE_SOURCE.value
     )
+
+
+MAX_ECHO_CHARS: Final = 64
+"""Longest author-supplied value a refusal repeats back.
+
+Only a short plain string: the value could be a multi-megabyte scalar or a YAML alias expanding
+to a structure whose ``repr`` is exponential, and a refusal must cost what the input cost to
+parse and no more.
+"""
+
+MAX_ERRORS_REPORTED: Final = 8
+MAX_REASON_CHARS: Final = 1000
+
+
+def bounded_reason(reason: str, *, more: int = 0) -> str:
+    """``reason`` held to :data:`MAX_REASON_CHARS`, saying so when anything was left out.
+
+    A stored reason travels with every hit, citation and listing that returns the memory, so it
+    is a diagnostic and not a transcript. Truncating a *diagnostic* is safe where truncating
+    evidence is not: the author still has the file, and the first errors are the ones to fix.
+    """
+    suffix = f" (and {more - MAX_ERRORS_REPORTED} more)" if more > MAX_ERRORS_REPORTED else ""
+    if len(reason) > MAX_REASON_CHARS:
+        reason = reason[: MAX_REASON_CHARS - 1] + "…"
+    return reason + suffix
+
+
+def normalize_slug(slug: str) -> str:
+    """A slug as memories link to each other: case folded, hyphen and underscore one separator."""
+    return re.sub(r"[-_]+", "-", slug.strip().lower())
 
 
 def _describe(error: ValidationError) -> str:
@@ -362,9 +395,11 @@ def _describe(error: ValidationError) -> str:
         elif detail["type"] == "enum":
             # The list of what is accepted does not say which of the author's words was not, and
             # an enum value is a short token the author chose — never a quote or a locator.
-            message = f"{message} (got {detail['input']!r})"
+            echoed = detail["input"]
+            if isinstance(echoed, str) and len(echoed) <= MAX_ECHO_CHARS:
+                message = f"{message} (got {echoed!r})"
         lines.append(f"{path}: {message}" if path else message)
-    return "; ".join(lines)
+    return bounded_reason("; ".join(lines[:MAX_ERRORS_REPORTED]), more=len(lines))
 
 
 def _allowed_beside(location: tuple[int | str, ...]) -> tuple[str, ...]:
@@ -425,8 +460,11 @@ __all__ = [
     "KIND_EXAMPLES",
     "KNOWLEDGE_KEY",
     "MARKER",
+    "MAX_ECHO_CHARS",
+    "MAX_ERRORS_REPORTED",
     "MAX_EVIDENCE",
     "MAX_QUOTE_CHARS",
+    "MAX_REASON_CHARS",
     "MAX_RELATIONSHIPS",
     "EvidenceSource",
     "EvidenceStatus",
@@ -436,4 +474,6 @@ __all__ = [
     "KnowledgeType",
     "RelationKind",
     "Relationship",
+    "bounded_reason",
+    "normalize_slug",
 ]

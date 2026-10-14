@@ -450,6 +450,40 @@ def test_a_trailing_newline_is_not_a_token(was: str, becomes: str, says: str) ->
     """``$`` matches before a final newline, so an anchored ``match`` accepted ``"slack\\n"``."""
     front = "relationships:\n  - relation: relates_to\n    target: reference_vpn_cert_rotation\n"
     text = memory(front=front, evidence=EVIDENCE)
-    assert was in text + EVIDENCE or was.startswith("target")
+    assert was in text, "the sample no longer contains what this case breaks"
 
     assert says in _refusal(text.replace(was, becomes))
+
+
+def test_a_hostile_enum_value_is_not_echoed_back_whole() -> None:
+    """A refusal repeats a short word the author chose, never an arbitrarily large value."""
+    huge = "x" * 5000
+
+    reason = _refusal(memory(knowledge_type=f'"{huge}"'))
+
+    assert huge not in reason
+    assert len(reason) <= 1100
+
+
+def test_a_refusal_is_bounded_however_many_things_are_wrong() -> None:
+    many = "evidence:\n" + "".join(
+        "  - kind: BAD\n    locator: nope\n    said_at: 1\n    quote: ' '\n" for _ in range(30)
+    )
+
+    reason = _refusal(memory(evidence=many))
+
+    assert len(reason) <= 1100
+
+
+def test_a_quoted_marker_key_is_still_a_memory() -> None:
+    text = memory().replace("knowledge_type:", '"knowledge_type":')
+
+    assert _record_of(text)
+
+
+def test_a_relationship_to_itself_is_caught_across_hyphens_and_underscores() -> None:
+    target = SLUG.replace("_", "-")
+    text = memory(front=f"relationships:\n  - relation: relates_to\n    target: {target}\n")
+
+    with pytest.raises(KnowledgeError, match="its own target"):
+        check(text, slug=SLUG)
