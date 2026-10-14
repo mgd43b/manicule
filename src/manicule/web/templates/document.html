@@ -56,6 +56,17 @@
 </section>
 {% endif %}
 
+{# A structured memory's claim and what it rests on. Separate from the Source panel above for the
+   reason that panel gives: a document is a copy of something published elsewhere, or it is a
+   claim that cites where it was said, and showing both in one place would let one be read as the
+   other. #}
+{% if doc.knowledge %}
+<section class="panel">
+  <h2>Memory</h2>
+  {{ m.knowledge(doc.knowledge) }}
+</section>
+{% endif %}
+
 <section class="panel">
   <h2>Blocks</h2>
   {% if panels.workbench.data.blocks %}

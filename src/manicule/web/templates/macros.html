@@ -53,3 +53,40 @@
 {% macro empty(message) %}
 <p class="muted empty">{{ message }}</p>
 {% endmacro %}
+
+{% macro knowledge(record) %}
+{# What a structured memory rests on. Nothing for a document that is not one.
+
+   Every value is rendered as text, **including the locator**. It is restricted to http and https
+   before it is stored, so a link would be safe — but an address that is never an `href` has no
+   sink to get wrong, and the same is true of the quote, which is somebody else's message.
+
+   The word is "attested", not "verified": these are the sources the memory's author recorded,
+   and nothing here was opened or checked. `verified` is what an answer citation's quotation is
+   when it resolves against the text it cites, and the two must not be readable as one. #}
+{% if record %}
+<div class="knowledge">
+  {% if record.unavailable_reason %}
+  <p class="muted">This memory declares a record that could not be used. {{ record.unavailable_reason }}</p>
+  {% else %}
+  <p class="meta">
+    <span class="pill" title="Knowledge type">{{ record.knowledge_type }}</span>
+    <span class="pill" title="Evidence status">{{ record.evidence_status }}</span>
+    <span class="muted">{{ record.evidence | length }} source(s) attested · newest said {{ (record.newest_said_at or '')[:10] }}</span>
+  </p>
+  <ul class="evidence">
+    {% for source in record.evidence %}
+    <li>
+      <b>{{ source.kind }}</b>{% if source.author %} · {{ source.author }}{% endif %} · <time>{{ source.said_at }}</time>
+      <blockquote>{{ source.quote }}</blockquote>
+      <code>{{ source.locator }}</code>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if record.relationships %}
+  <p class="muted">{% for link in record.relationships %}{{ link.relation }} <code>{{ link.target }}</code>{% if not loop.last %} · {% endif %}{% endfor %}</p>
+  {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+{% endmacro %}

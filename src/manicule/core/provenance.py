@@ -136,7 +136,9 @@ well-formed, so ``text/html;charset`` and ``text/html;;`` are refused as before.
 """
 
 
-def _require_printable(value: str, *, field: str) -> None:
+def require_printable(
+    value: str, *, field: str, limit: int = MAX_FIELD_CHARS, allow: str = ""
+) -> None:
     """Refuse ``value`` if it is over-long or holds a control character.
 
     **A check, and only a check.** An earlier version returned ``value.strip()``, which every
@@ -154,6 +156,11 @@ def _require_printable(value: str, *, field: str) -> None:
     ``NUL`` is refused by the same check and for a different reason: it terminates a C string,
     and it travels through JSON, SQLite and an FTS5 index that all handle it differently.
 
+    ``limit`` and ``allow`` exist for text that is genuinely longer or multi-line — a quoted
+    message — and both default to the strict single-line rule every other field is held to.
+    ``allow`` names the control characters a field may contain **and only those**: a quote may
+    hold a newline and a tab, and still not an escape sequence.
+
     Raises:
         ValueError: Naming the field and the offending code point, because "invalid title" does
             not tell whoever declared the value which character to remove. **The message names
@@ -164,11 +171,11 @@ def _require_printable(value: str, *, field: str) -> None:
             that costs more time than no diagnostic. The value's *origin* is the caller's to
             name; this function knows the field and the character and says those.
     """
-    if len(value) > MAX_FIELD_CHARS:
-        msg = f"{field} is {len(value)} characters, over the {MAX_FIELD_CHARS}-character limit"
+    if len(value) > limit:
+        msg = f"{field} is {len(value)} characters, over the {limit}-character limit"
         raise ValueError(msg)
     for character in value:
-        if unicodedata.category(character) == "Cc":
+        if unicodedata.category(character) == "Cc" and character not in allow:
             msg = (
                 f"{field} contains the control character U+{ord(character):04X}, which cannot "
                 f"appear in a citation"
@@ -176,7 +183,7 @@ def _require_printable(value: str, *, field: str) -> None:
             raise ValueError(msg)
 
 
-def _aware(value: datetime | None, *, field: str) -> datetime | None:
+def require_aware(value: datetime | None, *, field: str) -> datetime | None:
     """``value``, refused if it is naive.
 
     A naive timestamp is not a moment: read as UTC it is wrong by the mirror host's offset, and
@@ -192,6 +199,37 @@ def _aware(value: datetime | None, *, field: str) -> datetime | None:
         msg = f"{field} must carry a UTC offset; {value.isoformat()} does not say which zone"
         raise ValueError(msg)
     return value
+
+
+def require_citable_uri(value: str, *, field: str, hint: str = "") -> None:
+    """Refuse ``value`` unless it is an address a reader could open.
+
+    One rule, two callers: a document's own canonical address and the address a memory's
+    evidence points at. Both are rendered as a link and printed to a terminal, so both are held
+    to :data:`CITABLE_SCHEMES` and to naming a host — a second copy of the allowlist is the
+    place a ``javascript:`` address would eventually get through.
+
+    ``hint`` is appended to the scheme refusal and is the caller's to word: what a local path
+    means differs between a document's own address and an address a memory cites, and this
+    function knows neither.
+
+    Raises:
+        ValueError: Naming ``field`` and what was wrong with it.
+    """
+    require_printable(value, field=field)
+    parsed = urlsplit(value)
+    scheme = parsed.scheme.lower()
+    if scheme not in CITABLE_SCHEMES:
+        msg = (
+            f"{field} {value!r} uses the {scheme or 'absent'!r} scheme; "
+            f"a citable address is one of {sorted(CITABLE_SCHEMES)}."
+        )
+        if hint:
+            msg = f"{msg} {hint}"
+        raise ValueError(msg)
+    if not parsed.hostname:
+        msg = f"{field} {value!r} names no host, so it addresses nothing a reader could open"
+        raise ValueError(msg)
 
 
 class SourceMetadata(BaseModel):
@@ -265,11 +303,11 @@ class SourceMetadata(BaseModel):
         it came from — a manifest author reading "invalid" learns nothing, and this is the
         error they will actually see.
         """
-        _require_printable(self.title, field="title")
-        _require_printable(self.source_id, field="source_id")
-        _require_printable(self.version, field="version")
-        _aware(self.created_at, field="created_at")
-        _aware(self.modified_at, field="modified_at")
+        require_printable(self.title, field="title")
+        require_printable(self.source_id, field="source_id")
+        require_printable(self.version, field="version")
+        require_aware(self.created_at, field="created_at")
+        require_aware(self.modified_at, field="modified_at")
         self._validate_canonical_uri()
         self._validate_content_type()
         self._validate_section_path()
@@ -278,22 +316,12 @@ class SourceMetadata(BaseModel):
     def _validate_canonical_uri(self) -> None:
         if not self.canonical_uri:
             return
-        _require_printable(self.canonical_uri, field="canonical_uri")
-        parsed = urlsplit(self.canonical_uri)
-        scheme = parsed.scheme.lower()
-        if scheme not in CITABLE_SCHEMES:
-            msg = (
-                f"canonical_uri {self.canonical_uri!r} uses the {scheme or 'absent'!r} scheme; "
-                f"a citable address is one of {sorted(CITABLE_SCHEMES)}. A local path is not a "
-                f"canonical address — manicule records the snapshot's location itself."
-            )
-            raise ValueError(msg)
-        if not parsed.hostname:
-            msg = (
-                f"canonical_uri {self.canonical_uri!r} names no host, so it addresses nothing a "
-                f"reader could open"
-            )
-            raise ValueError(msg)
+        require_citable_uri(
+            self.canonical_uri,
+            field="canonical_uri",
+            hint="A local path is not a canonical address — manicule records the snapshot's "
+            "location itself.",
+        )
 
     def _validate_content_type(self) -> None:
         if self.content_type and not _MEDIA_TYPE.match(self.content_type):
@@ -311,7 +339,7 @@ class SourceMetadata(BaseModel):
             )
             raise ValueError(msg)
         for index, element in enumerate(self.section_path):
-            _require_printable(element, field=f"section_path[{index}]")
+            require_printable(element, field=f"section_path[{index}]")
             if not element.strip():
                 msg = f"section_path[{index}] is empty; a hierarchy has no anonymous levels"
                 raise ValueError(msg)
@@ -379,8 +407,8 @@ class LocalSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def _validated(self) -> Self:
-        _require_printable(self.path, field="snapshot path")
-        _aware(self.retrieved_at, field="retrieved_at")
+        require_printable(self.path, field="snapshot path")
+        require_aware(self.retrieved_at, field="retrieved_at")
         return self
 
 
@@ -475,4 +503,7 @@ __all__ = [
     "LocalSnapshot",
     "Provenance",
     "SourceMetadata",
+    "require_aware",
+    "require_citable_uri",
+    "require_printable",
 ]

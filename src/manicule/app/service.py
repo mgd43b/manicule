@@ -103,7 +103,9 @@ from manicule.core.rebuild import (
 from manicule.core.retrieval import Candidate, Context, Filter, Query, RetrievalProfile
 from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
 from manicule.core.version import CORE_VERSION
+from manicule.ingest.knowledge import check as check_knowledge
 from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
+from manicule.parsers.front_matter import FRONT_MATTER_FENCE, front_matter_end
 from manicule.research.config import ResearchLimits
 
 # Two names, no engine: `storage.config` imports nothing heavier than pydantic, so the service
@@ -1217,6 +1219,7 @@ class ApplicationService:
                     quote=citation.quote,
                     verification=citation.verification.value,
                     provenance=source_reference(documents.get(citation.document_id)),
+                    knowledge=knowledge_reference(documents.get(citation.document_id)),
                 )
                 for citation in envelope.citations
             ),
@@ -2841,7 +2844,7 @@ class ApplicationService:
         # to the same rule. Operator-supplied rather than caller-supplied, which makes this
         # unlikely rather than impossible — and "unlikely" is not what a path check is for.
         _require_segment(collection, "collection name")
-        content = _authored_markdown(body)
+        content = _authored_markdown(body, slug=slug)
 
         store = await self._backend.organization()
         found = await store.find_collection(collection)
@@ -7927,6 +7930,7 @@ class ApplicationService:
                     quote=citation.quote,
                     verification=citation.verification.value,
                     provenance=source_reference(documents.get(citation.document_id)),
+                    knowledge=knowledge_reference(documents.get(citation.document_id)),
                 )
                 for citation in envelope.citations
             ),
@@ -8281,6 +8285,50 @@ def source_reference(document: Document | None) -> r.SourceReference | None:
     )
 
 
+def knowledge_reference(document: Document | None) -> r.KnowledgeReference | None:
+    """A structured memory's claim and evidence, in the shape every surface reports.
+
+    ``None`` for a document that is not one, which is nearly every document: nothing but a
+    ``knowledge_type`` in the front matter makes one, so an ordinary corpus reports ``null``
+    here exactly as it did before the field existed.
+
+    Built here, once, beside :func:`source_reference`, because the same four callers need it and
+    a second copy of this mapping is the field nobody remembers when the record gains one.
+
+    **A refused record is reported, not hidden.** ``unavailable_reason`` is what separates a
+    memory whose evidence was malformed from one nobody tried to cite, and every field beside it
+    is empty by default so the refusal cannot be mistaken for a record.
+    """
+    if document is None:
+        return None
+    stored = document.knowledge
+    if stored is None:
+        return None
+    record = stored.record
+    if record is None:
+        return r.KnowledgeReference(unavailable_reason=stored.unavailable_reason)
+    return r.KnowledgeReference(
+        knowledge_type=record.knowledge_type.value,
+        evidence_status=record.evidence_status.value,
+        evidence=tuple(
+            r.EvidenceReference(
+                kind=source.kind,
+                locator=source.locator,
+                said_at=source.said_at.isoformat(),
+                quote=source.quote,
+                author=source.author,
+            )
+            for source in record.evidence
+        ),
+        oldest_said_at=record.oldest_said_at.isoformat(),
+        newest_said_at=record.newest_said_at.isoformat(),
+        relationships=tuple(
+            r.RelationshipReference(relation=link.relation.value, target=link.target)
+            for link in record.relationships
+        ),
+    )
+
+
 def _citation(citation: Citation) -> r.AnswerCitation:
     """One stored citation, in the shape every surface reports citations in.
 
@@ -8338,6 +8386,7 @@ def _summary(document: Document, *, chunk_count: int | None = None) -> r.Documen
         content_hash=document.content_hash,
         chunk_count=chunk_count,
         provenance=source_reference(document),
+        knowledge=knowledge_reference(document),
     )
 
 
@@ -8659,6 +8708,7 @@ def _hit(candidate: Candidate, documents: Mapping[str, Document], *, workspace: 
         kind=candidate.chunk.kind.value,
         anchor=_json_object(candidate.chunk.anchor.model_dump(mode="json")),
         provenance=source_reference(document),
+        knowledge=knowledge_reference(document),
         workspace=workspace,
         score=candidate.score,
         scores=dict(candidate.scores),
@@ -8801,16 +8851,22 @@ def _require_segment(value: str, what: str) -> None:
         raise ValueError(msg)
 
 
-def _authored_markdown(body: str) -> str:
+def _authored_markdown(body: str, *, slug: str) -> str:
     """The body as it will be written, refusing what would not parse as intended.
 
-    Two refusals, and neither authors anything. An empty document is a file with no content to
-    retrieve, which is a mistake in every case and an expensive one where it overwrites a fact
-    that had content. An **unterminated front-matter fence** is the sharper one: CommonMark
-    reads ``name: something`` followed by ``---`` as a setext heading, so a document whose fence
-    never closes acquires a top-level heading nobody wrote and hangs every heading path in the
-    file beneath it. The parser's ``front_matter`` setting skips a *closed* fence; it has no way
-    to rescue an open one, and the damage is silent.
+    Three refusals, and none of them authors anything. An empty document is a file with no
+    content to retrieve, which is a mistake in every case and an expensive one where it
+    overwrites a fact that had content. An **unterminated front-matter fence** is the sharper
+    one: CommonMark reads ``name: something`` followed by ``---`` as a setext heading, so a
+    document whose fence never closes acquires a top-level heading nobody wrote and hangs every
+    heading path in the file beneath it. The parser's ``front_matter`` setting skips a *closed*
+    fence; it has no way to rescue an open one, and the damage is silent.
+
+    The third is a **structured memory that would not be read as one**
+    (:func:`manicule.ingest.knowledge.check`): a document declaring ``knowledge_type`` whose
+    evidence is malformed, or whose body lacks the title and sections a reader finds it by. It is
+    the same kind of refusal as the other two — validating that what arrives works, never
+    supplying what is missing — and it is silent on every document that does not declare one.
 
     A trailing newline is added when the body has none, which is the one edit made to what a
     caller sent. It is a property of the file rather than of the content — every tool that
@@ -8820,11 +8876,6 @@ def _authored_markdown(body: str) -> str:
     if not body.strip():
         msg = "the document body is empty; there would be nothing to index or to cite"
         raise ValueError(msg)
-    from manicule.parsers.markdown import (  # noqa: PLC0415 - keeps markdown-it off this path
-        FRONT_MATTER_FENCE,
-        front_matter_end,
-    )
-
     lines = body.splitlines()
     if lines and lines[0].strip() == FRONT_MATTER_FENCE and front_matter_end(lines) == 0:
         msg = (
@@ -8833,6 +8884,7 @@ def _authored_markdown(body: str) -> str:
             "does not have — so every heading path below it would be wrong. Close the fence."
         )
         raise ValueError(msg)
+    check_knowledge(body, slug=slug)
     return body if body.endswith("\n") else body + "\n"
 
 

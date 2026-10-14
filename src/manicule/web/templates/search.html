@@ -90,6 +90,7 @@
       <span class="score">{{ "%.4f" | format(hit.score) }}</span>
     </p>
     <pre>{{ hit.text }}</pre>
+    {{ m.knowledge(hit.knowledge) }}
     {% if hit.scores %}<p class="muted">{% for stage, value in hit.scores | items %}{{ stage }} {{ "%.4f" | format(value) }} {% endfor %}</p>{% endif %}
   </li>
   {% endfor %}

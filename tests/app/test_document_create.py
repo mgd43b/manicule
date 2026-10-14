@@ -50,6 +50,7 @@ from manicule.mcp.server import build_server
 from manicule.plugins.registry import ComponentRegistry
 from tests.api.live import mounted
 from tests.app.fakes import FakeBackend, FakeIngestion, FakeStore, make_chunk, make_document
+from tests.knowledge_samples import EVIDENCE, SECOND_SOURCE, SLUG, memory
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1033,3 +1034,56 @@ async def test_a_remedy_naming_a_collection_with_a_space_is_still_one_command(
     assert check.state == "failing"
     assert check.remedy == (f"manicule collection create 'Team A' --uri-prefix '{root / 'Team A'}'")
     assert shlex.split(check.remedy)[-1] == str(root / "Team A")
+
+
+# --- a structured memory at the door -----------------------------------------------------------
+
+
+async def test_a_structured_memory_is_written_exactly_as_sent(root: Path) -> None:
+    """Validated and never authored: the file holds the caller's bytes and nothing else."""
+    service = await service_for(settings_for(root))
+    body = memory(evidence=EVIDENCE + SECOND_SOURCE)
+
+    created = await service.document_create(collection=COLLECTION, slug=SLUG, body=body)
+
+    assert (root / COLLECTION / f"{SLUG}.md").read_text(encoding="utf-8") == body
+    assert created.indexed is True
+
+
+@pytest.mark.parametrize(
+    ("body", "says"),
+    [
+        (memory(knowledge_type="recipe"), "knowledge_type: Input should be"),
+        (memory(front="sources:\n  - x\n"), "sources, which nothing reads"),
+        (memory(knowledge_type=None), "no knowledge_type"),
+        (memory(body="# Title\n\nNo sections here.\n"), "the body is missing"),
+        (memory(evidence=EVIDENCE.replace("2026-03-02T14:05:00Z", "2026-03-02")), "full timestamp"),
+    ],
+)
+async def test_a_memory_that_would_not_be_read_as_one_is_refused_and_writes_nothing(
+    root: Path, body: str, says: str
+) -> None:
+    """Refused where the author is still holding the text, and before anything reaches the disk."""
+    service = await service_for(settings_for(root))
+
+    with pytest.raises(ValueError, match=says):
+        await service.document_create(collection=COLLECTION, slug=SLUG, body=body)
+
+    assert written_under(root) == []
+
+
+async def test_the_refusal_is_an_envelope_an_assistant_can_act_on(root: Path) -> None:
+    """``ok: false`` with the sentence that says what to change — not a transport error.
+
+    The whole point of refusing at the door is that the caller can fix it and call again, which
+    needs the reason to arrive as the ordinary error envelope every other refusal comes as.
+    """
+    service = await service_for(settings_for(root))
+
+    envelope = await _from_tool(
+        service, {"collection": COLLECTION, "slug": SLUG, "body": memory(knowledge_type="recipe")}
+    )
+
+    assert envelope["ok"] is False
+    assert "knowledge_type" in envelope["error"]["message"]
+    assert written_under(root) == []

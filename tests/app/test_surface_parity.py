@@ -938,6 +938,112 @@ def test_a_document_with_no_source_metadata_reports_null_rather_than_an_empty_bl
     assert hit["title"] == "Retry policy", "the fixture must still have produced a real hit"
 
 
+# --- a structured memory's evidence, through every surface ------------------------------------
+
+
+KNOWLEDGE_PAIRS = tuple((*pair[:4], (*pair[4][:-1], "knowledge")) for pair in SOURCE_PAIRS)
+"""The same two operations as :data:`SOURCE_PAIRS`, reading the other field of the same payloads.
+
+Derived rather than restated, so the two lists cannot drift: a surface that reports a hit's
+provenance and not its knowledge — or the reverse — is a divergence this file exists to catch.
+"""
+
+
+def _service_ranking_a_memory(text: str | None = None) -> ApplicationService:
+    """A service whose single ranked document is a structured memory, read as ingest reads it."""
+    from manicule.core.retrieval import Candidate  # noqa: PLC0415 - only this helper ranks one
+    from manicule.ingest.knowledge import read  # noqa: PLC0415
+    from tests.knowledge_samples import (  # noqa: PLC0415 - only these tests build a memory
+        EVIDENCE,
+        SECOND_SOURCE,
+        memory,
+    )
+
+    made = FakeBackend()
+    document = make_document(
+        WORKSPACE,
+        source_id="reference_vpn_gateway_failover.md",
+        title="VPN gateway failover is manual",
+        knowledge=read(text or memory(evidence=EVIDENCE + SECOND_SOURCE)),
+    )
+    chunk = make_chunk(document)
+    made.store.add(document, chunk)
+    made.retriever_.candidates = [Candidate(chunk=chunk, score=0.5)]
+    return ApplicationService(made)
+
+
+@pytest.mark.parametrize(("tool", "arguments", "argv", "request_", "keys"), KNOWLEDGE_PAIRS)
+def test_a_memorys_evidence_serializes_identically_on_every_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tool: str,
+    arguments: dict[str, Any],
+    argv: list[str],
+    request_: HttpCall,
+    keys: tuple[str | int, ...],
+) -> None:
+    """One record, four ways out, and the same bytes each time.
+
+    The timestamps are the hazard, as they are for source metadata: ``said_at`` is a ``datetime``
+    on the record and a string on the payload, so exactly one place converts it, and a second
+    converter anywhere would give one surface an offset and another a ``Z``. The two sources are
+    in different offsets for that reason.
+    """
+    service = _service_ranking_a_memory()
+    produced = [_tool(service, tool, arguments), _cli(monkeypatch, service, argv)]
+    if request_ is not None:
+        method, path, kwargs = request_
+        produced.append(_http(service, method, path, **kwargs))
+
+    blocks = [_at(envelope["data"], keys) for envelope in produced]
+    assert blocks[0] is not None, f"{tool} reported no knowledge, so this compares copies of null"
+    assert blocks[0]["knowledge_type"] == "constraint"
+    assert blocks[0]["evidence_status"] == "corroborated"
+    assert [source["kind"] for source in blocks[0]["evidence"]] == ["slack", "jira"]
+    assert blocks[0]["evidence"][0]["said_at"] == "2026-03-02T14:05:00+00:00"
+    assert blocks[0]["evidence"][1]["said_at"] == "2026-04-01T09:00:00+02:00"
+    assert blocks[0]["oldest_said_at"] == "2026-03-02T14:05:00+00:00"
+    assert blocks[0]["newest_said_at"] == "2026-04-01T09:00:00+02:00"
+    assert blocks[0]["unavailable_reason"] == ""
+    for other in blocks[1:]:
+        assert other == blocks[0]
+
+
+def test_evidence_is_never_reported_as_provenance() -> None:
+    """A memory is a claim that cites where it was said, not a copy of something published.
+
+    Reporting its sources as ``provenance`` would assert the memory *is* the Slack message, which
+    is the conflation :mod:`manicule.core.provenance` was written to prevent.
+    """
+    hit = _tool(_service_ranking_a_memory(), "search", {"query": "retry"})["data"]["hits"][0]
+
+    assert hit["provenance"] is None
+    assert hit["knowledge"] is not None
+
+
+def test_a_refused_record_is_reported_rather_than_hidden() -> None:
+    """A memory whose evidence was malformed must not look like one nobody cited."""
+    from tests.knowledge_samples import memory  # noqa: PLC0415
+
+    service = _service_ranking_a_memory(memory(knowledge_type="recipe"))
+
+    hit = _tool(service, "search", {"query": "retry"})["data"]["hits"][0]
+
+    assert hit["knowledge"]["evidence"] == []
+    assert hit["knowledge"]["knowledge_type"] == ""
+    assert "knowledge_type" in hit["knowledge"]["unavailable_reason"]
+
+
+def test_a_document_that_is_not_a_memory_reports_null_knowledge() -> None:
+    """Absent, not blank: the ordinary document is overwhelmingly most of any corpus."""
+    plain = _service_ranking_one_document(with_record=False)
+    hit = _tool(plain, "search", {"query": "retry"})["data"]["hits"][0]
+    summary = _tool(plain, "document_list", {})["data"]["documents"][0]
+
+    assert hit["knowledge"] is None
+    assert summary["knowledge"] is None
+
+
 def _at(payload: Any, keys: tuple[str | int, ...]) -> Any:
     """One nested value out of a payload, or ``None`` if the path does not resolve."""
     value: Any = payload

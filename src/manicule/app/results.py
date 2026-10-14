@@ -479,6 +479,85 @@ class SourceReference(Payload):
     )
 
 
+class EvidenceReference(Payload):
+    """One place a memory's claim was said, as a hit reports it.
+
+    **Attested, never verified.** Manicule cannot open a permalink; every field here is what the
+    memory's author recorded, and ``quote`` is the words they said the source used. It is *not*
+    the document-level ``Verification`` an answer citation carries, which means a quotation
+    resolved against the text it cites. Two meanings of one word on one payload is how a reader
+    comes to treat a Slack message as checked.
+    """
+
+    kind: str = Field(description="What sort of place: slack, jira, confluence, email, ...")
+    locator: str = Field(description="Where a reader goes to see it. An http or https address.")
+    said_at: str = Field(
+        description="When the **source** said it. Never when the memory was written or indexed."
+    )
+    quote: str = Field(description="What the source said, as the author recorded it.")
+    author: str = Field(default="", description="Who said it, as the source names them.")
+
+
+class RelationshipReference(Payload):
+    """A typed pointer from one memory to another, by slug.
+
+    Reported as declared. The target is not looked up: whether it exists, and what it says now,
+    is a second read that a consumer asks for by searching the slug.
+    """
+
+    relation: str = Field(
+        description="supersedes, superseded_by, contradicts, depends_on or relates_to."
+    )
+    target: str = Field(description="The other memory's slug.")
+
+
+class KnowledgeReference(Payload):
+    """What a structured memory claims to be and what it rests on.
+
+    Present only for a document whose front matter declares a ``knowledge_type``; ``None``
+    everywhere else, which is the honest answer for an ordinary document and not an empty
+    object that reads as one that was looked for and found blank.
+
+    **Not a second ``provenance``.** ``provenance`` says a document *is a copy of* something
+    published elsewhere; this says a document is a claim *about* the world and cites where it
+    was said. A memory never has the first, and reporting its evidence there would assert that
+    the memory is the Slack message.
+    """
+
+    knowledge_type: str = Field(
+        default="",
+        description="procedure, constraint, fact, decision, known_issue or ownership — what "
+        "sort of knowledge this is, and so how to act on it.",
+    )
+    evidence_status: str = Field(
+        default="",
+        description="single_source, corroborated, disputed or superseded: how well the sources "
+        "support it, as the author found them. A statement about the sources; nothing here "
+        "was checked by this installation.",
+    )
+    evidence: tuple[EvidenceReference, ...] = Field(
+        default=(), description="Every source cited, in the order the memory lists them."
+    )
+    oldest_said_at: str | None = Field(
+        default=None, description="When the earliest source said it."
+    )
+    newest_said_at: str | None = Field(
+        default=None,
+        description="When the latest source said it — the age to weigh the memory by. It dates "
+        "the **evidence**: a memory written last week from a message sent three years ago is "
+        "three years old, and ``indexed_at`` would say last week.",
+    )
+    relationships: tuple[RelationshipReference, ...] = Field(
+        default=(), description="How this memory stands to others, as declared."
+    )
+    unavailable_reason: str = Field(
+        default="",
+        description="Why there is no usable record, when the document declared one and it was "
+        "refused. Reported rather than swallowed: a memory whose evidence was refused looks, "
+        "in every hit, like one nobody cited.",
+    )
+
+
 class Anchored(Payload):
     """A location in a document, as a citation or a search hit reports it."""
 
@@ -500,6 +579,12 @@ class Anchored(Payload):
         "and ``uri`` above are already the canonical ones where a record exists — this is the "
         "structured form, for a consumer that needs the version it cited or the snapshot it "
         "was read from rather than a line to display.",
+    )
+    knowledge: KnowledgeReference | None = Field(
+        default=None,
+        description="What the document claims and what it rests on, when it is a structured "
+        "memory. A different thing from ``provenance``, and a document is never both: that is "
+        "a copy of something published elsewhere, this is a claim that cites where it was said.",
     )
 
 
@@ -867,6 +952,12 @@ class DocumentSummary(Payload):
         description="The document's authoritative source metadata, when it has any. On the "
         "summary as well as on a citation, because ``document list`` is where an operator looks "
         "to find out whether a manifest was honored — and a refused one says so here.",
+    )
+    knowledge: KnowledgeReference | None = Field(
+        default=None,
+        description="What the document claims and what it rests on, when it is a structured "
+        "memory. On the summary for the reason ``provenance`` is: a record that was declared "
+        "and refused says so here, where somebody listing documents will look.",
     )
 
 
@@ -3068,6 +3159,7 @@ __all__ = [
     "DocumentTags",
     "Envelope",
     "ErrorInfo",
+    "EvidenceReference",
     "ExportReport",
     "FeedbackRecorded",
     "GlossaryConflict",
@@ -3079,6 +3171,7 @@ __all__ = [
     "IngestOutcome",
     "IngestReport",
     "InitReport",
+    "KnowledgeReference",
     "Payload",
     "PluginChanged",
     "PluginHealth",
@@ -3091,6 +3184,7 @@ __all__ = [
     "ReembedPlanReport",
     "ReembedRunReport",
     "ReembedSweepReport",
+    "RelationshipReference",
     "ResearchReportPayload",
     "ResearchSubQuestion",
     "ResetReport",

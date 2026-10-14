@@ -542,6 +542,22 @@ so with the path — the content is not lost, and a later sync indexes it.
 [`docs/memory-authoring.md`](docs/memory-authoring.md) is the whole of the reasoning, including
 why this is a narrower authority than indexing a directory.
 
+### Knowledge that cites where it was said
+
+Operational knowledge — how an environment really behaves — mostly lives in chat, tickets and wikis,
+and without the place and the time it is folklore. A memory whose front matter declares a
+`knowledge_type` is a **structured memory**: a title, a problem, an answer and where it applies in
+the body, and in front matter its type, its `evidence` and how the memory relates to others. Each
+source carries a `kind`, an http(s) `locator`, when the *source* said it (`said_at`), and the
+`quote` — required, because a permalink is a pointer and pointers die.
+
+Nothing connects to any chat product; a caller reads a message however it reads it and records the
+claim. Sources are **attested, never verified** — manicule cannot open a permalink and says so in
+the vocabulary — and every search hit and citation reports them with the age of the newest. A
+malformed memory is refused at `document_create` naming the field to fix, before anything is
+written. The format, and what is deliberately not built, is
+[`docs/memory-authoring.md`](docs/memory-authoring.md) §6.
+
 ### `[[wikilinks]]` become a graph
 
 Install [`manicule-plugin-wikilinks`](packages/manicule-plugin-wikilinks) beside it and
