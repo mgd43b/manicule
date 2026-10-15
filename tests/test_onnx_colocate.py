@@ -355,3 +355,51 @@ def test_a_nested_file_that_resolves_away_is_what_triggers_staging(tmp_path: Pat
 
     assert staged != graph
     assert _run(staged) == 3.0
+
+
+def test_a_directory_another_process_just_completed_is_not_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two cold starts see the same damaged directory; the second must not remove the first's.
+
+    The first completeness check says incomplete, then the other process publishes, then the
+    check made just before discarding says complete — and the directory is left exactly as it is.
+    """
+    from manicule.embedding.runtimes import colocate  # noqa: PLC0415
+
+    graph = _snapshot(tmp_path, sharded=True)
+    staging = tmp_path / "staging"
+    staged = colocated(graph, staging)
+    marker = staged.parent / "marker"
+    marker.write_text("published by the other process")
+    answers = iter([False, True])
+
+    def completeness(*args: object) -> bool:
+        del args
+        return next(answers)
+
+    monkeypatch.setattr(colocate, "_complete", completeness)
+
+    assert colocated(graph, staging) == staged
+    assert marker.is_file(), "the directory the other process published was removed"
+
+
+def test_an_error_while_measuring_does_not_hide_the_error_being_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manicule.core.errors import ConfigError  # noqa: PLC0415
+    from manicule.embedding.runtimes import onnx_backend  # noqa: PLC0415
+
+    def cannot_stage(graph: Path, staging: Path, *, identity: str = "") -> Path:
+        raise OSError(28, "No space left on device")
+
+    def cannot_measure(self: Path, pattern: str) -> list[Path]:
+        raise PermissionError(13, "Permission denied")
+
+    graph = _snapshot(tmp_path, sharded=True)
+    monkeypatch.setattr(onnx_backend, "colocated", cannot_stage)
+    monkeypatch.setattr("pathlib.Path.rglob", cannot_measure)
+    embedder = _embedder_staging_into(tmp_path / "staging")
+
+    with pytest.raises(ConfigError, match=r"No space left on device.*could not be measured"):
+        embedder._openable(graph)  # pyright: ignore[reportPrivateUsage]

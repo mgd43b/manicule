@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 
 
@@ -71,7 +72,8 @@ def colocated(graph: Path, staging: Path, *, identity: str = "") -> Path:
         return staged
     # Present and missing a file: something removed part of it, or an earlier version staged
     # fewer. Reusing it would hand onnxruntime a graph with no weights beside it.
-    shutil.rmtree(target, ignore_errors=True)
+    if target.exists() and not _discard(target, graph.parent, files):
+        return staged
 
     staging.mkdir(parents=True, exist_ok=True)
     # Built beside the target and renamed into place, so a process that stops halfway leaves a
@@ -91,6 +93,28 @@ def colocated(graph: Path, staging: Path, *, identity: str = "") -> Path:
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return staged
+
+
+def _discard(target: Path, root: Path, files: list[Path]) -> bool:
+    """Move an incomplete staged directory out of the way; ``False`` if it has just been completed.
+
+    **Renamed, never deleted in place.** Two cold starts can both see the same damaged directory.
+    One rebuilds and publishes it; deleting by name from the other would then remove the directory
+    the first is about to open. The completeness check is repeated immediately before the move,
+    and the move is to a unique name that is deleted afterwards, so a directory another process
+    published in the meantime is left alone. The window that remains is the few instructions
+    between that check and the rename, on a directory that was already damaged.
+    """
+    if _complete(target, root, files):
+        return False
+    aside = target.with_name(f".{target.name}.stale.{uuid.uuid4().hex}")
+    try:
+        target.rename(aside)
+    except OSError:
+        # Gone already, or replaced by a process that finished first. Either way it is not ours.
+        return True
+    shutil.rmtree(aside, ignore_errors=True)
+    return True
 
 
 def _files(root: Path) -> list[Path]:

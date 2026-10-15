@@ -52,6 +52,20 @@ measures nothing, and the fast path on Apple hardware already exists — it is c
 """
 
 
+def _staging_size(graph: Path) -> str:
+    """How much room copying the graph's directory would need, for an error message.
+
+    An estimate made while already reporting a failure, so it must not be able to fail: a
+    permission error here would replace the message that names the directory with one that does
+    not.
+    """
+    try:
+        size = sum(path.stat().st_size for path in graph.parent.rglob("*") if path.is_file())
+    except OSError:
+        return "an unknown amount (the files could not be measured)"
+    return f"about {size / 1e9:.1f} GB"
+
+
 class OnnxEmbedder(PooledEmbedder):
     """Embeds with onnxruntime, pooling in manicule's numpy."""
 
@@ -113,12 +127,12 @@ class OnnxEmbedder(PooledEmbedder):
         try:
             return colocated(graph, staging, identity=identity)
         except OSError as exc:
-            size = sum(path.stat().st_size for path in graph.parent.rglob("*") if path.is_file())
+            size = _staging_size(graph)
             msg = (
                 f"the ONNX graph {graph} keeps its weights in a different directory from the "
                 f"graph, which onnxruntime refuses to open, and they could not be placed "
                 f"together under {staging}: {exc}. That needs a writable directory with room "
-                f"for about {size / 1e9:.1f} GB when it cannot hard-link; point the cache "
+                f"for {size} when it cannot hard-link; point the cache "
                 f"directory somewhere that has both."
             )
             raise ConfigError(msg) from exc
