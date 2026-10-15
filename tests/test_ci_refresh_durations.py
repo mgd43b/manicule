@@ -160,3 +160,12 @@ def test_the_token_is_visible_to_the_three_steps_that_use_it_and_to_nothing_else
         if "secrets.DURATIONS_REFRESH_TOKEN" in line and not line.lstrip().startswith("#")
     ]
     assert len(mentions) == len(TOKEN_STEPS), "the secret is referenced outside its three steps"
+
+
+def test_an_unchanged_measurement_closes_a_proposal_that_is_still_open() -> None:
+    """Auto-merge stays requested on an open PR, which would later merge an older file."""
+    delivery = _step("open or update")["run"]
+    unchanged = delivery[: delivery.index("exit 0")]
+
+    assert "gh pr close" in unchanged
+    assert unchanged.index("branch=") < unchanged.index("git diff --quiet")

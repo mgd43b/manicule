@@ -209,12 +209,18 @@ jobs:
           set -euo pipefail
           auth=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)
           echo "::add-mask::${auth}"
+          branch=chore/refresh-test-durations
           if git diff --quiet -- .test_durations; then
             echo "The measurement is identical to the committed file; nothing to propose."
+            # An earlier proposal may still be open with auto-merge requested. Left alone it
+            # would merge a file that is now older than `main`'s, so it is closed.
+            for number in $(gh pr list --head "${branch}" --state open --json number --jq '.[].number'); do
+              gh pr close "${number}" --delete-branch \
+                --comment "The latest measurement matches main, so this proposal is obsolete."
+            done
             exit 0
           fi
 
-          branch=chore/refresh-test-durations
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -C "${branch}"
