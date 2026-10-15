@@ -111,10 +111,18 @@ whole namespace before each test, so a switch living inside it is deleted before
 ### `.test_durations`, and when it needs regenerating
 
 **You do not normally have to.** `.github/workflows/refresh-test-durations.yml` re-measures it on
-a runner on the first of every month and commits the result to `main` (and can be started by hand
-from the Actions tab). It runs the full suite serially with CI's own environment, refuses a result
-that is empty or has lost a tenth of its entries, and commits nothing if the suite failed. What
-follows is for refreshing it yourself sooner — after adding a corpus, say.
+a runner on the first of every month (and can be started by hand from the Actions tab). It runs the
+full suite serially with CI's own environment, refuses a result that is empty or has lost a tenth
+of its entries, and commits nothing if the suite failed. It delivers the result as **one pull
+request** on `chore/refresh-test-durations`, with auto-merge requested where the repository allows
+it, because `main` requires a pull request and three checks.
+
+It needs a **`DURATIONS_REFRESH_TOKEN` secret**: a personal access token (fine-grained, this
+repository only, `Contents` and `Pull requests` read-write) or a GitHub App token. `github.token`
+cannot stand in, because a pull request opened with it starts no workflows, so the three required
+checks would never run. The workflow checks the secret before it spends half an hour measuring. The
+measured file is also kept as the `test-durations` artifact for 30 days, so a failure to deliver it
+costs nothing. What follows is for refreshing it yourself sooner — after adding a corpus, say.
 
 CI runs the Python 3.14 suite in three shards, balanced on the committed
 `.test_durations`. **You do not need it to run the tests** — `uv run pytest` ignores it

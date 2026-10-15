@@ -45,15 +45,35 @@ def test_it_drops_the_entries_of_tests_that_no_longer_exist() -> None:
     assert "--clean-durations" in _step("measure")["run"]
 
 
-def test_the_refusal_guard_sits_between_the_measurement_and_the_commit() -> None:
+def test_the_token_is_checked_before_the_half_hour_measurement() -> None:
+    """A missing secret found afterwards loses the measurement, which is what the first run did."""
+    names = [str(step.get("name", "")) for step in _steps()]
+
+    assert names.index(_step("check the token")["name"]) == 0
+    assert names.index(_step("check the token")["name"]) < names.index(_step("measure")["name"])
+    assert "DURATIONS_REFRESH_TOKEN" in _step("check the token")["run"]
+
+
+def test_the_measurement_is_kept_before_anything_can_refuse_or_fail_to_deliver_it() -> None:
+    names = [str(step.get("name", "")) for step in _steps()]
+
+    keep = names.index(_step("keep the measurement")["name"])
+
+    assert names.index(_step("measure")["name"]) < keep
+    assert keep < names.index(_step("refuse")["name"])
+    assert keep < names.index(_step("open or update")["name"])
+    assert _step("keep the measurement")["with"]["path"] == ".test_durations"
+
+
+def test_the_refusal_guard_sits_between_the_measurement_and_the_delivery() -> None:
     names = [str(step.get("name", "")) for step in _steps()]
 
     measure = names.index(_step("measure")["name"])
     guard = names.index(_step("refuse")["name"])
-    commit = names.index(_step("commit")["name"])
+    deliver = names.index(_step("open or update")["name"])
 
-    assert measure < guard < commit
-    assert "if" not in _step("commit"), "a conditional could skip past a failed guard"
+    assert measure < guard < deliver
+    assert "if" not in _step("open or update"), "a conditional could skip past a failed guard"
 
 
 def test_it_runs_monthly_and_on_demand_and_nothing_else() -> None:
@@ -63,15 +83,37 @@ def test_it_runs_monthly_and_on_demand_and_nothing_else() -> None:
     assert set(triggers) == {"schedule", "workflow_dispatch"}
 
 
-def test_it_writes_only_where_it_must() -> None:
+def test_it_holds_no_write_permission_of_its_own() -> None:
+    """Everything that writes does so with the secret's token, so the job's own token only reads."""
     workflow = _workflow()
 
     assert workflow["permissions"] == {}
-    assert workflow["jobs"]["refresh"]["permissions"] == {"contents": "write"}
+    assert workflow["jobs"]["refresh"]["permissions"] == {"contents": "read"}
 
 
-def test_it_measures_main_and_pushes_to_main() -> None:
+def test_it_measures_main_and_proposes_on_a_branch_never_to_main() -> None:
+    """``main`` refused the push once; the proposal goes to a branch and a pull request."""
     checkout = next(step for step in _steps() if "actions/checkout" in str(step.get("uses", "")))
+    delivery = _step("open or update")["run"]
 
     assert checkout["with"]["ref"] == "main"
-    assert 'git push origin "HEAD:main"' in _step("commit")["run"]
+    assert "HEAD:main" not in delivery
+    assert 'git push --force origin "${branch}"' in delivery
+    assert "gh pr create" in delivery
+
+
+def test_the_token_comes_from_the_secret_and_not_from_github_token() -> None:
+    """``github.token`` starts no workflows, so the pull request's checks would never run."""
+    job = _workflow()["jobs"]["refresh"]
+    checkout = next(step for step in _steps() if "actions/checkout" in str(step.get("uses", "")))
+    expression = "${{ secrets.DURATIONS_REFRESH_TOKEN }}"  # a workflow expression, not a credential
+
+    assert job["env"]["GH_TOKEN"] == expression
+    assert checkout["with"]["token"] == expression
+    executable = [
+        line
+        for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    forbidden = ("${{ github.token }}", "secrets.GITHUB_TOKEN")
+    assert not any(form in line for line in executable for form in forbidden)
