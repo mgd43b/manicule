@@ -882,6 +882,17 @@ passes and nobody should meet it by accident.
   failure the switch exists to prevent, occurring inside it. It is now
   `REQUIRE_EMBEDDING_MODELS`, read at import time, and a test asserts both. Found by reading a
   green CI log, not by a test.
+- **A hub cache can lay a model out so onnxruntime will not open it.** `bge-m3`'s graph names
+  its 2.3 GB of weights by a path beside itself, and onnxruntime resolves symlinks and then
+  requires that sidecar to live in the graph's own directory ("External data path escapes model
+  directory"). `huggingface-hub` 1.x kept a repository's blobs together, so the check passed
+  unseen; 2.x keeps one shared store sharded by hash prefix, so the two files resolve into
+  different directories and the model cannot be opened — with nothing in manicule changed. The
+  backend therefore stages the graph and its sibling files into one directory under the cache
+  (`<cache_dir>/onnx/`), by hard link where the filesystem allows and by a one-time copy where
+  it does not, and leaves a layout that already works alone
+  (`embedding/runtimes/colocate.py`). The container smoke test found it on a dependency bump,
+  because it is the only job that opens the real model from a real cache.
 
 ---
 

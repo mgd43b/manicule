@@ -31,11 +31,17 @@ from manicule.embedding.artifacts import onnx_weights, resolve_artifact
 from manicule.embedding.base import PooledEmbedder
 from manicule.embedding.cards import ModelCard
 from manicule.embedding.pooling import TOKEN_STATE_RANK
+from manicule.embedding.runtimes.colocate import colocated
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import onnxruntime as ort
 
 BACKEND = "onnx"
+
+STAGING_SUBDIR: Final = "onnx"
+"""Under the cache directory: where a graph is co-located with its weights when it has to be."""
 
 PROVIDERS: Final[tuple[str, ...]] = ("CPUExecutionProvider",)
 """CPU, deliberately, including on Apple Silicon.
@@ -44,6 +50,20 @@ CoreML would be faster here and is not used, because this backend's second job i
 fixed point the MLX backend is measured against. A reference that varies by accelerator
 measures nothing, and the fast path on Apple hardware already exists — it is called MLX.
 """
+
+
+def _staging_size(graph: Path) -> str:
+    """How much room copying the graph's directory would need, for an error message.
+
+    An estimate made while already reporting a failure, so it must not be able to fail: a
+    permission error here would replace the message that names the directory with one that does
+    not.
+    """
+    try:
+        size = sum(path.stat().st_size for path in graph.parent.rglob("*") if path.is_file())
+    except OSError:
+        return "an unknown amount (the files could not be measured)"
+    return f"about {size / 1e9:.1f} GB"
 
 
 class OnnxEmbedder(PooledEmbedder):
@@ -57,6 +77,7 @@ class OnnxEmbedder(PooledEmbedder):
         weights_revision: str = "",
         batch_size: int = 32,
         cache_entries: int = 10_000,
+        staging_dir: Path | None = None,
     ) -> None:
         artifact = resolve_artifact(
             BACKEND, card.source_ref, card.revision, override=weights, revision=weights_revision
@@ -70,6 +91,7 @@ class OnnxEmbedder(PooledEmbedder):
             cache_entries=cache_entries,
         )
         self._artifact = artifact
+        self._staging_dir = staging_dir
         self._session: ort.InferenceSession | None = None
         self._inputs: frozenset[str] = frozenset()
 
@@ -86,8 +108,34 @@ class OnnxEmbedder(PooledEmbedder):
                 f"construction. Vectors would be attributed to weights that did not make them."
             )
             raise ConfigError(msg)
-        self._session = ort.InferenceSession(str(graph), providers=list(PROVIDERS))
+        self._session = ort.InferenceSession(
+            str(self._openable(graph, weights.identity)), providers=list(PROVIDERS)
+        )
         self._inputs = frozenset(item.name for item in self._session.get_inputs())
+
+    def _openable(self, graph: Path, identity: str = "") -> Path:
+        """``graph``, or the same graph with its weights beside it where onnxruntime can see them.
+
+        See :mod:`~manicule.embedding.runtimes.colocate` for why a snapshot's own symlinks are not
+        always enough.
+        """
+        staging = self._staging_dir
+        if staging is None:
+            from manicule.config.settings import default_cache_dir  # noqa: PLC0415
+
+            staging = default_cache_dir() / STAGING_SUBDIR
+        try:
+            return colocated(graph, staging, identity=identity)
+        except OSError as exc:
+            size = _staging_size(graph)
+            msg = (
+                f"the ONNX graph {graph} keeps its weights in a different directory from the "
+                f"graph, which onnxruntime refuses to open, and they could not be placed "
+                f"together under {staging}: {exc}. That needs a writable directory with room "
+                f"for {size} when it cannot hard-link; point the cache "
+                f"directory somewhere that has both."
+            )
+            raise ConfigError(msg) from exc
 
     @override
     def _unload(self) -> None:

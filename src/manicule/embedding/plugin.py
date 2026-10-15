@@ -79,7 +79,10 @@ def read_embedder_card(context: BuildContext) -> tuple[ModelCard, EmbedderConfig
 
 def _build_onnx(context: BuildContext) -> Embedder:
     # Deferred: this is where onnxruntime is loaded.
-    from manicule.embedding.runtimes.onnx_backend import OnnxEmbedder  # noqa: PLC0415
+    from manicule.embedding.runtimes.onnx_backend import (  # noqa: PLC0415
+        STAGING_SUBDIR,
+        OnnxEmbedder,
+    )
 
     card, config = read_embedder_card(context)
     embedding = context.settings.embedding
@@ -89,6 +92,7 @@ def _build_onnx(context: BuildContext) -> Embedder:
         weights_revision=config.weights_revision,
         batch_size=embedding.batch_size,
         cache_entries=embedding.cache_entries,
+        staging_dir=context.cache_dir / STAGING_SUBDIR,
     )
 
 
