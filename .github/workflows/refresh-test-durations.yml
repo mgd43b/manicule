@@ -18,19 +18,32 @@ name: Refresh test durations
 # test that is skipped for want of an extra locally is recorded as free, then placed as free in
 # CI, where it runs.
 #
-# **It commits to `main` directly, the way relock.yml does, and for a smaller reason to worry.**
-# A stale or odd durations file can only cost *balance*; it cannot drop a test, and
-# `tests/test_ci_test_sharding.py` holds the shard count to the matrix. A monthly pull request
-# would carry a one-megabyte JSON diff nobody can review, and a pull request opened with
-# `github.token` starts no checks, so each would need a human to approve its runs before it could
-# merge — a chore that exists to remove a chore. A push authenticated the same way starts no
-# workflows either, which is what makes this safe to run unattended: no CI run, no Release run,
-# and no loop.
+# **It opens a pull request, because `main` will not take anything else.** The first run of this
+# workflow measured for 33 minutes and was then refused: `main` requires a pull request and three
+# status checks, and the bot has no bypass. It had been written to push directly, on the strength
+# of relock.yml doing so — and nothing here had shown that push to be accepted.
+#
+# **The pull request is opened with a token from a secret, not `github.token`.** Anything pushed
+# or opened with `github.token` starts no workflows, so the three required checks would never run
+# and the pull request could never merge without a human nudging it. A personal access token acts
+# as a person for that purpose: CI runs on the branch like any other, and auto-merge (below) can
+# finish the job. **A personal access token, not a GitHub App token**: an App's installation token
+# expires after an hour, so a stored one would pass today and fail every month after, and minting
+# one per run would need the App's private key stored and the token's expiry reasoned about from
+# the start of the measurement to its delivery. Setting it up is one-time and is described in
+# CONTRIBUTING.md. The workflow checks the token **before** it spends half an hour measuring,
+# because a missing secret found afterwards loses the measurement.
+#
+# **One branch, one pull request.** The work goes to a fixed branch, force-pushed, and a pull
+# request is opened only if none is open, so a month nobody merged in does not stack a second one
+# on top of the first.
 #
 # **It commits nothing unless the run passed and the result looks like a measurement.** A failed
 # suite is a failed job, not a durations file; and a result that has lost more than a tenth of the
 # entries it replaces is a partial collection, which would be committed as though the missing
-# tests had no cost. Either way the job fails loudly and the committed file stays as it was.
+# tests had no cost. Either way the job fails loudly and the committed file stays as it was. The
+# measured file is also uploaded as an artifact whatever happens afterwards, so a failure to
+# deliver it does not cost the run.
 on:
   schedule:
     # The first of the month, early, when nothing is likely to be merging.
@@ -54,13 +67,50 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
-      # To push the refreshed file. Nothing else here writes.
-      contents: write
+      # Reads only. Everything that writes does so with the secret's token, which is the point.
+      contents: read
+    # No job-level `env` for the token, deliberately. The measurement below runs every test in the
+    # repository and every dependency's code for half an hour, and anything in the job's
+    # environment or in git's stored credentials is readable by all of it. The token is given to
+    # the three steps that talk to GitHub and to nothing else.
     steps:
+      - name: check the token before measuring
+        env:
+          GH_TOKEN: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::the DURATIONS_REFRESH_TOKEN secret is not set. The refreshed file is delivered as a pull request that has to start CI, and github.token cannot do that. See CONTRIBUTING.md, and set it before running this: the measurement takes about half an hour."
+            exit 1
+          fi
+          # Only that it can see the repository. `permissions.push` here is the holder's *role*,
+          # not the token's scope, so it is not asked; whether the token can write is asked of
+          # the server by the dry-run push below, which cannot be answered by anything else.
+          gh api "repos/${GITHUB_REPOSITORY}" --jq .full_name >/dev/null
+
       # `ref: main`, for the reason relock.yml gives: the measurement belongs on the current tip.
+      # Credentials are not persisted into `.git/config`, where the measurement would be able to
+      # read them; the two steps that push authenticate their own command instead.
       - uses: actions/checkout@v7
         with:
           ref: main
+          persist-credentials: false
+
+      - name: check the token can push
+        env:
+          GH_TOKEN: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
+        # `--dry-run` still asks the server to advertise the branch for writing, which a token
+        # without write scope is refused. `--force` because the delivery force-pushes: without it a
+        # branch left over from an unmerged proposal is a non-fast-forward the check would refuse
+        # and the job would stop before measuring anything. Asked now, in seconds, because the alternative is
+        # finding out after the half-hour measurement — which is how the first run was lost. The
+        # credential is passed to this one command and masked, rather than stored.
+        run: |
+          set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)
+          echo "::add-mask::${auth}"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push --dry-run --force origin HEAD:refs/heads/chore/refresh-test-durations
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -102,6 +152,7 @@ jobs:
         run: cp .test_durations "${RUNNER_TEMP}/durations.before.json"
 
       - name: measure
+        id: measure
         env:
           REQUIRE_GRAMMAR_BUNDLE: "1"
           REQUIRE_VOCABULARY_BUNDLE: "1"
@@ -111,6 +162,21 @@ jobs:
         # drops the entries of tests that no longer exist; without it they stay for ever, and the
         # file only grows.
         run: uv run --python 3.14 pytest --store-durations --clean-durations --cov --durations=10
+
+      # Kept whatever happens next. The measurement is the expensive part, and a rejected push or a
+      # refused guard should not make it unrecoverable.
+      - name: keep the measurement
+        if: ${{ !cancelled() && steps.measure.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-durations
+          path: .test_durations
+          # The file is a dotfile, and the action leaves those out by default. Without this it
+          # uploads nothing, reports success, and the safety net holds nothing — and with the
+          # default `if-no-files-found: warn` it would not even say so.
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
 
       - name: refuse a result that is not a measurement
         run: |
@@ -136,26 +202,49 @@ jobs:
           print(f"{len(before)} entries before, {len(after)} after")
           PY
 
-      - name: commit the refreshed file
+      - name: open or update the pull request
+        env:
+          GH_TOKEN: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
         run: |
           set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)
+          echo "::add-mask::${auth}"
+          branch=chore/refresh-test-durations
           if git diff --quiet -- .test_durations; then
-            echo "The measurement is identical to the committed file; nothing to commit."
+            echo "The measurement is identical to the committed file; nothing to propose."
+            # An earlier proposal may still be open with auto-merge requested. Left alone it
+            # would merge a file that is now older than `main`'s, so it is closed.
+            for number in $(gh pr list --head "${branch}" --state open --json number --jq '.[].number'); do
+              gh pr close "${number}" --delete-branch \
+                --comment "The latest measurement matches main, so this proposal is obsolete."
+            done
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "${branch}"
           git add .test_durations
           git commit \
             -m 'chore: refresh test shard durations' \
             -m 'Re-measured serially on a runner with the environment ci.yml uses, so the three test shards stay balanced as tests are added.' \
             -m 'See .github/workflows/refresh-test-durations.yml for why this commit exists.'
 
-          # The measurement took twenty minutes, so `main` has very likely moved. Only one file is
-          # touched and nothing else writes it, so replaying the commit onto the new tip is safe.
-          git pull --rebase origin main
-          if ! git push origin "HEAD:main"; then
-            echo "::error::could not push the refreshed durations; main moved while this job ran. Nothing is half-done, and the next run measures again."
-            exit 1
+          # Force, because the branch is this workflow's alone and a month-old proposal that was
+          # never merged is exactly what a fresh measurement should replace.
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push --force origin "${branch}"
+
+          open=$(gh pr list --head "${branch}" --state open --json number --jq 'length')
+          if [ "${open}" = "0" ]; then
+            gh pr create --base main --head "${branch}" \
+              --title 'chore: refresh test shard durations' \
+              --body 'Re-measured `.test_durations` serially on a runner with the same environment as ci.yml, so the three test shards stay balanced. Generated by `.github/workflows/refresh-test-durations.yml`; a stale file can only cost shard balance, never a test.'
+          else
+            echo "A pull request for ${branch} is already open; the force-push updated it."
           fi
+
+          # Best effort: auto-merge is a repository setting this workflow cannot turn on, and a
+          # pull request that waits for a human is still a correct outcome.
+          gh pr merge "${branch}" --auto --squash \
+            || echo "::warning::could not enable auto-merge on ${branch}; merge it once its checks pass."
