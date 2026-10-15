@@ -271,7 +271,7 @@ def test_a_staged_directory_missing_its_weights_is_rebuilt_not_reused(tmp_path: 
 
 
 def test_load_opens_the_staged_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """``_load`` is the wiring; reverting it to ``str(graph)`` fails here, not in the helper tests."""
+    """``_load`` is the wiring: reverting it to ``str(graph)`` fails here, not elsewhere."""
     from types import SimpleNamespace  # noqa: PLC0415
 
     from manicule.embedding.runtimes import onnx_backend  # noqa: PLC0415
