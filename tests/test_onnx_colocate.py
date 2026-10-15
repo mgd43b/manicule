@@ -20,7 +20,7 @@ nothing to do with the fix.
 from __future__ import annotations
 
 import struct
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
@@ -256,3 +256,41 @@ def test_an_unwritable_cache_is_reported_as_configuration_that_names_the_directo
 
     with pytest.raises(ConfigError, match=r"could not be placed together under .*staging"):
         embedder._openable(graph)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_staged_directory_missing_its_weights_is_rebuilt_not_reused(tmp_path: Path) -> None:
+    graph = _snapshot(tmp_path, sharded=True)
+    staging = tmp_path / "staging"
+    first = colocated(graph, staging)
+    (first.parent / SIDECAR).unlink()
+
+    second = colocated(graph, staging)
+
+    assert second == first
+    assert _run(second) == 3.0
+
+
+def test_load_opens_the_staged_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_load`` is the wiring; reverting it to ``str(graph)`` fails here, not in the helper tests."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from manicule.embedding.runtimes import onnx_backend  # noqa: PLC0415
+
+    graph = _snapshot(tmp_path, sharded=True)
+    weights = SimpleNamespace(describe=lambda: "weights")
+
+    def resolved(artifact: object) -> tuple[SimpleNamespace, Path]:
+        del artifact
+        return weights, graph
+
+    monkeypatch.setattr(onnx_backend, "onnx_weights", resolved)
+    embedder = _embedder_staging_into(tmp_path / "staging")
+    embedder.fingerprint = SimpleNamespace(weights_ref="weights")  # pyright: ignore[reportAttributeAccessIssue]
+    embedder._artifact = object()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+
+    embedder._load()  # pyright: ignore[reportPrivateUsage]
+
+    session: Any = embedder._session  # pyright: ignore[reportPrivateUsage]
+    assert session is not None
+    (out,) = session.run(["Y"], {"X": np.array([2.0], dtype=np.float32)})
+    assert float(out[0]) == 3.0

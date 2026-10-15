@@ -111,11 +111,13 @@ class OnnxEmbedder(PooledEmbedder):
         try:
             return colocated(graph, staging)
         except OSError as exc:
+            size = sum(path.stat().st_size for path in graph.parent.iterdir() if path.is_file())
             msg = (
                 f"the ONNX graph {graph} keeps its weights in a different directory from the "
                 f"graph, which onnxruntime refuses to open, and they could not be placed "
-                f"together under {staging}: {exc}. Make that directory writable, or point the "
-                f"cache directory somewhere that is."
+                f"together under {staging}: {exc}. That needs a writable directory with room "
+                f"for about {size / 1e9:.1f} GB when it cannot hard-link; point the cache "
+                f"directory somewhere that has both."
             )
             raise ConfigError(msg) from exc
 

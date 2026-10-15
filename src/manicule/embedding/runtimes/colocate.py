@@ -62,8 +62,11 @@ def colocated(graph: Path, staging: Path) -> Path:
     key = hashlib.sha256(identity.encode()).hexdigest()[:32]
     target = staging / key
     staged = target / graph.name
-    if staged.is_file():
+    if _complete(target, siblings):
         return staged
+    # Present and missing a file: something removed part of it, or an earlier version staged
+    # fewer. Reusing it would hand onnxruntime a graph with no weights beside it.
+    shutil.rmtree(target, ignore_errors=True)
 
     staging.mkdir(parents=True, exist_ok=True)
     # Built beside the target and renamed into place, so a process that stops halfway leaves a
@@ -76,11 +79,16 @@ def colocated(graph: Path, staging: Path) -> Path:
             work.rename(target)
         except OSError:
             # Another process finished the same directory first, which is as good as ours.
-            if not staged.is_file():
+            if not _complete(target, siblings):
                 raise
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return staged
+
+
+def _complete(target: Path, siblings: list[Path]) -> bool:
+    """Whether ``target`` holds every file that was beside the graph."""
+    return all((target / path.name).is_file() for path in siblings)
 
 
 def _link_or_copy(source: Path, destination: Path) -> None:
