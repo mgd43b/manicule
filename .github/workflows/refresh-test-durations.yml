@@ -66,10 +66,14 @@ jobs:
     permissions:
       # Reads only. Everything that writes does so with the secret's token, which is the point.
       contents: read
-    env:
-      GH_TOKEN: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
+    # No job-level `env` for the token, deliberately. The measurement below runs every test in the
+    # repository and every dependency's code for half an hour, and anything in the job's
+    # environment or in git's stored credentials is readable by all of it. The token is given to
+    # the three steps that talk to GitHub and to nothing else.
     steps:
       - name: check the token before measuring
+        env:
+          GH_TOKEN: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN}" ]; then
@@ -82,17 +86,26 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}" --jq .full_name >/dev/null
 
       # `ref: main`, for the reason relock.yml gives: the measurement belongs on the current tip.
-      # The token is given to checkout so the push below is made with it.
+      # Credentials are not persisted into `.git/config`, where the measurement would be able to
+      # read them; the two steps that push authenticate their own command instead.
       - uses: actions/checkout@v7
         with:
           ref: main
-          token: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
+          persist-credentials: false
 
       - name: check the token can push
+        env:
+          GH_TOKEN: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
         # `--dry-run` still asks the server to advertise the branch for writing, which a token
         # without write scope is refused. Asked now, in seconds, because the alternative is
-        # finding out after the half-hour measurement — which is how the first run was lost.
-        run: git push --dry-run origin HEAD:refs/heads/chore/refresh-test-durations
+        # finding out after the half-hour measurement — which is how the first run was lost. The
+        # credential is passed to this one command and masked, rather than stored.
+        run: |
+          set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)
+          echo "::add-mask::${auth}"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push --dry-run origin HEAD:refs/heads/chore/refresh-test-durations
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -185,8 +198,12 @@ jobs:
           PY
 
       - name: open or update the pull request
+        env:
+          GH_TOKEN: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
         run: |
           set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)
+          echo "::add-mask::${auth}"
           if git diff --quiet -- .test_durations; then
             echo "The measurement is identical to the committed file; nothing to propose."
             exit 0
@@ -204,7 +221,8 @@ jobs:
 
           # Force, because the branch is this workflow's alone and a month-old proposal that was
           # never merged is exactly what a fresh measurement should replace.
-          git push --force origin "${branch}"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push --force origin "${branch}"
 
           open=$(gh pr list --head "${branch}" --state open --json number --jq 'length')
           if [ "${open}" = "0" ]; then

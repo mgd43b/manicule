@@ -63,7 +63,7 @@ def test_the_token_is_proved_able_to_write_before_the_half_hour_measurement() ->
     push_check = names.index(_step("check the token can push")["name"])
 
     assert names.index(_step("measure")["name"]) > push_check
-    assert "git push --dry-run" in _step("check the token can push")["run"]
+    assert "push --dry-run" in _step("check the token can push")["run"]
     assert "chore/refresh-test-durations" in _step("check the token can push")["run"]
 
 
@@ -116,18 +116,18 @@ def test_it_measures_main_and_proposes_on_a_branch_never_to_main() -> None:
 
     assert checkout["with"]["ref"] == "main"
     assert "HEAD:main" not in delivery
-    assert 'git push --force origin "${branch}"' in delivery
+    assert 'push --force origin "${branch}"' in delivery
     assert "gh pr create" in delivery
+
+
+EXPRESSION = "${{ secrets.DURATIONS_REFRESH_TOKEN }}"  # a workflow expression, not a credential
+TOKEN_STEPS = ("check the token before", "check the token can push", "open or update")
 
 
 def test_the_token_comes_from_the_secret_and_not_from_github_token() -> None:
     """``github.token`` starts no workflows, so the pull request's checks would never run."""
-    job = _workflow()["jobs"]["refresh"]
-    checkout = next(step for step in _steps() if "actions/checkout" in str(step.get("uses", "")))
-    expression = "${{ secrets.DURATIONS_REFRESH_TOKEN }}"  # a workflow expression, not a credential
-
-    assert job["env"]["GH_TOKEN"] == expression
-    assert checkout["with"]["token"] == expression
+    for prefix in TOKEN_STEPS:
+        assert _step(prefix)["env"]["GH_TOKEN"] == EXPRESSION
     executable = [
         line
         for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
@@ -135,3 +135,26 @@ def test_the_token_comes_from_the_secret_and_not_from_github_token() -> None:
     ]
     forbidden = ("${{ github.token }}", "secrets.GITHUB_TOKEN")
     assert not any(form in line for line in executable for form in forbidden)
+
+
+def test_the_token_is_visible_to_the_three_steps_that_use_it_and_to_nothing_else() -> None:
+    """The measurement runs every test and every dependency for half an hour.
+
+    Anything in the job's environment or in git's stored credentials is readable by all of it, so
+    the token is not in the job's ``env``, is not persisted by checkout, and appears only in the
+    steps that talk to GitHub.
+    """
+    job = _workflow()["jobs"]["refresh"]
+    checkout = next(step for step in _steps() if "actions/checkout" in str(step.get("uses", "")))
+    holders = [step["name"] for step in _steps() if "GH_TOKEN" in (step.get("env") or {})]
+
+    assert "env" not in job
+    assert checkout["with"]["persist-credentials"] is False
+    assert "token" not in checkout["with"]
+    assert holders == [_step(prefix)["name"] for prefix in TOKEN_STEPS]
+    mentions = [
+        line
+        for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
+        if "secrets.DURATIONS_REFRESH_TOKEN" in line and not line.lstrip().startswith("#")
+    ]
+    assert len(mentions) == len(TOKEN_STEPS), "the secret is referenced outside its three steps"
