@@ -75,7 +75,12 @@ def test_the_measurement_is_kept_before_anything_can_refuse_or_fail_to_deliver_i
     assert names.index(_step("measure")["name"]) < keep
     assert keep < names.index(_step("refuse")["name"])
     assert keep < names.index(_step("open or update")["name"])
-    assert _step("keep the measurement")["with"]["path"] == ".test_durations"
+    kept = _step("keep the measurement")["with"]
+    assert kept["path"] == ".test_durations"
+    # A dotfile is skipped by default, and a missing file only warns by default: together they
+    # make this step succeed having kept nothing.
+    assert kept["include-hidden-files"] is True
+    assert kept["if-no-files-found"] == "error"
 
 
 def test_the_refusal_guard_sits_between_the_measurement_and_the_delivery() -> None:

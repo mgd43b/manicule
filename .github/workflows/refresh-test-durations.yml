@@ -153,6 +153,11 @@ jobs:
         with:
           name: test-durations
           path: .test_durations
+          # The file is a dotfile, and the action leaves those out by default. Without this it
+          # uploads nothing, reports success, and the safety net holds nothing — and with the
+          # default `if-no-files-found: warn` it would not even say so.
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 30
 
       - name: refuse a result that is not a measurement
