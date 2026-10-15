@@ -118,11 +118,12 @@ request** on `chore/refresh-test-durations`, with auto-merge requested where the
 it, because `main` requires a pull request and three checks.
 
 It needs a **`DURATIONS_REFRESH_TOKEN` secret**: a personal access token (fine-grained, this
-repository only, `Contents` and `Pull requests` read-write) or a GitHub App token. `github.token`
-cannot stand in, because a pull request opened with it starts no workflows, so the three required
-checks would never run. The workflow checks the secret before it spends half an hour measuring. The
-measured file is also kept as the `test-durations` artifact for 30 days, so a failure to deliver it
-costs nothing. What follows is for refreshing it yourself sooner — after adding a corpus, say.
+repository only, `Contents` and `Pull requests` read-write). It must be a personal access token:
+a GitHub App's installation token expires after an hour, so a stored one would fail every run
+after the first. `github.token` cannot stand in, because a pull request opened with it starts no
+workflows, so the three required checks would never run. The workflow checks the secret before it
+spends half an hour measuring. The measured file is also kept as the `test-durations` artifact for
+30 days, so a failure to deliver it costs nothing. What follows is for refreshing it yourself sooner — after adding a corpus, say.
 
 CI runs the Python 3.14 suite in three shards, balanced on the committed
 `.test_durations`. **You do not need it to run the tests** — `uv run pytest` ignores it

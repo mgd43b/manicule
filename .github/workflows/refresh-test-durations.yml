@@ -25,9 +25,12 @@ name: Refresh test durations
 #
 # **The pull request is opened with a token from a secret, not `github.token`.** Anything pushed
 # or opened with `github.token` starts no workflows, so the three required checks would never run
-# and the pull request could never merge without a human nudging it. A personal access token or
-# GitHub App token acts as a person for that purpose: CI runs on the branch like any other, and
-# auto-merge (below) can finish the job. Setting it up is one-time and is described in
+# and the pull request could never merge without a human nudging it. A personal access token acts
+# as a person for that purpose: CI runs on the branch like any other, and auto-merge (below) can
+# finish the job. **A personal access token, not a GitHub App token**: an App's installation token
+# expires after an hour, so a stored one would pass today and fail every month after, and minting
+# one per run would need the App's private key stored and the token's expiry reasoned about from
+# the start of the measurement to its delivery. Setting it up is one-time and is described in
 # CONTRIBUTING.md. The workflow checks the token **before** it spends half an hour measuring,
 # because a missing secret found afterwards loses the measurement.
 #
@@ -97,7 +100,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
         # `--dry-run` still asks the server to advertise the branch for writing, which a token
-        # without write scope is refused. Asked now, in seconds, because the alternative is
+        # without write scope is refused. `--force` because the delivery force-pushes: without it a
+        # branch left over from an unmerged proposal is a non-fast-forward the check would refuse
+        # and the job would stop before measuring anything. Asked now, in seconds, because the alternative is
         # finding out after the half-hour measurement — which is how the first run was lost. The
         # credential is passed to this one command and masked, rather than stored.
         run: |
@@ -105,7 +110,7 @@ jobs:
           auth=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)
           echo "::add-mask::${auth}"
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
-            push --dry-run origin HEAD:refs/heads/chore/refresh-test-durations
+            push --dry-run --force origin HEAD:refs/heads/chore/refresh-test-durations
 
       - uses: astral-sh/setup-uv@v7
         with:

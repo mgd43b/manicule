@@ -63,7 +63,9 @@ def test_the_token_is_proved_able_to_write_before_the_half_hour_measurement() ->
     push_check = names.index(_step("check the token can push")["name"])
 
     assert names.index(_step("measure")["name"]) > push_check
-    assert "push --dry-run" in _step("check the token can push")["run"]
+    assert "push --dry-run --force" in _step("check the token can push")["run"], (
+        "the delivery force-pushes, so the check must too or a leftover branch fails it"
+    )
     assert "chore/refresh-test-durations" in _step("check the token can push")["run"]
 
 
