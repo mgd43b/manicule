@@ -16,6 +16,7 @@ from typing import Final, Self
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from manicule.core.anchors import Anchor
+from manicule.core.knowledge import Knowledge
 from manicule.core.provenance import Provenance
 
 Metadata = dict[str, JsonValue]
@@ -487,6 +488,22 @@ class Document(_Content):
         twice.
         """
         return Provenance.from_metadata(self.metadata)
+
+    @property
+    def knowledge(self) -> Knowledge | None:
+        """What this document claims to be as a structured memory, or ``None`` if it is not one.
+
+        Read through :attr:`metadata` for the reason :attr:`provenance` is, and **a different
+        thing from it**: provenance says this document is a copy of something published
+        elsewhere, while this says the document is a claim *about* the world that cites the
+        places it was said. The two are independent, and putting a memory's citations there would
+        assert that the memory *is* the Slack message.
+
+        ``None`` is the ordinary answer: nothing but a document whose front matter declares a
+        ``knowledge_type`` is ever read as one. A stored record that no longer validates also
+        answers ``None``, for the reason :meth:`Provenance.from_metadata` gives.
+        """
+        return Knowledge.from_metadata(self.metadata)
 
     @property
     def revision(self) -> DocumentRevision:

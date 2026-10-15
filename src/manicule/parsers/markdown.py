@@ -46,6 +46,11 @@ from manicule.parsers.base import (
 )
 from manicule.parsers.config import MARKDOWN_MEDIA_TYPES, MarkdownConfig
 
+# Defined in `front_matter` and re-exported, because the rule moved without its name changing:
+# authoring, the knowledge reader and this parser all ask where a block ends, and the answer
+# lives in the module that imports no Markdown library.
+from manicule.parsers.front_matter import FRONT_MATTER_FENCE, front_matter_end
+
 __all__ = [
     "FRONT_MATTER_FENCE",
     "MARKDOWN_MEDIA_TYPES",
@@ -70,15 +75,6 @@ thematic break, a closing tag — and produces no block rather than an empty one
 _TEXT_CHILDREN = frozenset({"text", "code_inline"})
 """Inline token types that carry literal characters. Emphasis and link markers do not, so a
 heading's rendered title is built from these alone."""
-
-FRONT_MATTER_FENCE = "---"
-"""What opens and closes a front-matter block.
-
-Public because one other place has to recognize the same fence: authoring refuses a body
-that opens one and never closes it, since the parser can skip a closed fence and has no way
-to rescue an open one. A second spelling of ``---`` would be a second answer to "is this
-front matter", and the two would agree until one of them was changed.
-"""
 
 _JSX_TAG = re.compile(r"^</?(?P<name>[A-Z][A-Za-z0-9_.]*)(?:\s[^<>]*?)?/?>$")
 """A JSX component tag alone on a line. Capitalized initial letter is what distinguishes a
@@ -232,22 +228,6 @@ def _component_lines(lines: Sequence[str], start: int) -> Iterator[tuple[int, st
         match = _JSX_TAG.match(stripped)
         if match is not None:
             yield index, match["name"]
-
-
-def front_matter_end(lines: Sequence[str]) -> int:
-    """How many leading lines are front matter. Zero when there is none.
-
-    **Zero is also the answer for a fence that never closes**, which is the case the parser
-    cannot do anything about and authoring therefore refuses at the door: an unterminated
-    block is read as content, and CommonMark turns its last line into a setext heading the
-    document does not have. Two callers, one rule.
-    """
-    if not lines or lines[0].strip() != FRONT_MATTER_FENCE:
-        return 0
-    for index in range(1, len(lines)):
-        if lines[index].strip() == FRONT_MATTER_FENCE:
-            return index + 1
-    return 0
 
 
 def _trim(lines: Sequence[str], first: int, last: int) -> int:

@@ -115,6 +115,10 @@ def render_answer(
                 escape(citation.verification),
             )
         out.print(table)
+        for citation in payload.citations:
+            if citation.knowledge is not None:
+                out.print(f"[dim]\\[{citation.slot}][/dim]")
+                _render_knowledge(out, citation.knowledge)
     elif payload.ungrounded:
         out.print("[yellow]no citation survived verification[/yellow]")
     elif payload.corpus_consulted:
@@ -324,7 +328,9 @@ def render_search(out: Console, payload: r.SearchResult) -> None:
             f"[dim] {escape(heading)}  score {hit.score:.4f}[/dim]"
         )
         out.print(Text(_clip(hit.text), style="none"))
-        out.print(f"[dim]{escape(hit.uri)} · {escape(_anchor_summary(hit.anchor))}[/dim]\n")
+        out.print(f"[dim]{escape(hit.uri)} · {escape(_anchor_summary(hit.anchor))}[/dim]")
+        _render_knowledge(out, hit.knowledge)
+        out.print()
     summary = [f"{payload.count} hit(s)", f"profile {payload.profile}"]
     if spanning:
         summary.append(f"across {escape(', '.join(payload.workspaces))}")
@@ -1896,6 +1902,44 @@ def _anchor_summary(anchor: Mapping[str, object]) -> str:
 def _clip(text: str, limit: int = 400) -> str:
     stripped = " ".join(text.split())
     return stripped if len(stripped) <= limit else stripped[: limit - 1] + "…"
+
+
+def _render_knowledge(out: Console, knowledge: r.KnowledgeReference | None) -> None:
+    """What a structured memory claims to rest on, under the passage that matched.
+
+    Nothing for a document that is not one. **The word is "attested", not "verified"**: the
+    sources here are what the memory's author recorded, and ``verified`` is already the column
+    an answer's citation table uses for a quotation that resolved against the text it cites.
+
+    Every value printed is one the payload validated — printable, no escape sequences, an
+    http(s) address — and the quote goes through :class:`~rich.text.Text` rather than markup, so
+    a bracket in somebody's message is a bracket.
+    """
+    if knowledge is None:
+        return
+    if knowledge.unavailable_reason:
+        out.print(
+            Text.assemble(
+                ("memory record refused: ", "yellow"), (_clip(knowledge.unavailable_reason), "")
+            )
+        )
+        return
+    newest = (knowledge.newest_said_at or "")[:10]
+    out.print(
+        f"[dim]{escape(knowledge.knowledge_type)} · {escape(knowledge.evidence_status)} · "
+        f"{len(knowledge.evidence)} source(s) attested, newest said {escape(newest)}[/dim]"
+    )
+    for source in knowledge.evidence:
+        who = f"{source.author}, " if source.author else ""
+        out.print(
+            Text(
+                f"  {source.kind}: {who}{source.said_at[:10]} “{_clip(source.quote, 160)}” "
+                f"{source.locator}",
+                style="dim",
+            )
+        )
+    for link in knowledge.relationships:
+        out.print(Text(f"  {link.relation} {link.target}", style="dim"))
 
 
 __all__ = [

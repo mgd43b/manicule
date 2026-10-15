@@ -49,6 +49,7 @@ from manicule.core.errors import NameInUseError, PolicyError, UnknownEntityError
 from manicule.core.generation import FinishReason, Token
 from manicule.core.glossary import QueryExpansion
 from manicule.core.ids import chunk_id, content_hash, document_id
+from manicule.core.knowledge import KNOWLEDGE_KEY, Knowledge
 from manicule.core.organization import Collection as DocumentCollection
 from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
 from manicule.core.protocols import Generator
@@ -117,6 +118,7 @@ def make_document(
     title: str = "Notes",
     status: DocumentStatus = DocumentStatus.INDEXED,
     provenance: Provenance | None = None,
+    knowledge: Knowledge | None = None,
     indexed_at: datetime | None = None,
     status_detail: str | None = None,
 ) -> Document:
@@ -125,10 +127,16 @@ def make_document(
     Derived rather than written down, so a test cannot be made to pass by editing a literal
     id until it matches. The identity under test *is* this function's second line.
 
-    ``provenance`` goes into ``metadata`` under the reserved key rather than onto a field of its
-    own, because that is where the real pipeline puts it and where every reader looks — a fixture
-    that supplied it any other way would be exercising a path production does not have.
+    ``provenance`` and ``knowledge`` go into ``metadata`` under their reserved keys rather than
+    onto fields of their own, because that is where the real pipeline puts them and where every
+    reader looks — a fixture that supplied either any other way would be exercising a path
+    production does not have.
     """
+    metadata: dict[str, Any] = {}
+    if provenance:
+        metadata[PROVENANCE_KEY] = provenance.as_metadata_value()
+    if knowledge:
+        metadata[KNOWLEDGE_KEY] = knowledge.as_metadata_value()
     return Document(
         id=document_id(workspace, source, source_id),
         source=source,
@@ -139,7 +147,7 @@ def make_document(
         media_type="text/markdown",
         status=status,
         status_detail=status_detail,
-        metadata={PROVENANCE_KEY: provenance.as_metadata_value()} if provenance else {},
+        metadata=metadata,
         indexed_at=indexed_at,
     )
 

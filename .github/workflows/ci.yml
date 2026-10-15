@@ -39,6 +39,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.14"
 
       # **Before the sync, and that ordering is the whole point.** `uv sync` and `uv run` repair
       # a stale `uv.lock` in place and say nothing, so a lockfile that disagreed with
@@ -75,6 +76,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.14"
       - run: uv sync --all-groups --all-extras
       - name: pyright (strict)
         run: uv run pyright
@@ -271,6 +273,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.14"
       - run: uv sync --all-groups --all-extras
       # The service container is up before the step runs, but "up" is the container, not the
       # server inside it. Polling the endpoint the tests will use turns a slow start into a
@@ -342,6 +345,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.14"
       - run: uv sync --all-groups --all-extras
       # The service container being up is the container, not the server inside it. Polling the
       # endpoint the tests will use turns a slow start into a wait rather than into a
@@ -387,6 +391,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.14"
       - run: uv sync --all-groups --all-extras
       - name: alembic check (models match migrations)
         # `check` compares the models against a live database, so one has to exist at head
@@ -420,6 +425,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.14"
       - run: uv sync --all-groups --all-extras
       # Weights are fetched here rather than by the tests. A test that downloads on first run
       # is a test that fails when the network does, and one that downloads several hundred
@@ -568,6 +574,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.14"
       # The grammar pack is staged on the runner and handed to the build, rather than
       # downloaded inside the image. #22 made the *image* need no network; the build still did,
       # on every run, from a third-party GitHub release — so a dropped transfer there blocked

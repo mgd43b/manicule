@@ -104,6 +104,7 @@ from manicule.core.errors import (
     StorageBusyError,
 )
 from manicule.core.ids import content_hash, document_id
+from manicule.core.knowledge import KNOWLEDGE_KEY, Knowledge
 from manicule.core.protocols import BatchedDiscoveryConnector, EnumerationProgressConnector
 from manicule.core.provenance import Provenance
 from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, SourceId
@@ -112,6 +113,7 @@ from manicule.ingest.containers import retire_subtree
 from manicule.ingest.embedding import DEFAULT_TARGET_BATCH_TOKENS, EmbeddingWork, embed_or_reuse
 from manicule.ingest.glossary import detect_entries
 from manicule.ingest.glossary_lineage import glossary_fingerprint
+from manicule.ingest.knowledge import read as read_knowledge
 from manicule.ingest.ports import (
     AcquisitionStore,
     BatchedAcquisitionStore,
@@ -131,7 +133,9 @@ from manicule.parsers.chain import (
     container_result,
     run_chain,
 )
+from manicule.parsers.config import MARKDOWN_MEDIA_TYPES
 from manicule.parsers.expansion import ExpandedMember, MemberFailure
+from manicule.parsers.front_matter import MAX_FRONT_MATTER_CHARS
 from manicule.parsers.versions import parse_fingerprint
 
 if TYPE_CHECKING:
@@ -973,6 +977,52 @@ stage downstream has room for it, so the number trades queries against exactly t
 Sixty-four, and the ordering is unchanged: ``after_sequence`` still advances per record, so a
 page is the same sequence of records the one-at-a-time walk produced, read in fewer queries.
 """
+
+
+_FRONT_MATTER_PROBE = MAX_FRONT_MATTER_CHARS * 4 + 4096
+"""How much of a document's start is read to find its front matter, in bytes.
+
+Four bytes a character is UTF-8's worst case, so a block at the character limit still fits; the
+rest of the document is not decoded at all, which keeps this off the cost of a large file.
+"""
+
+
+def _with_knowledge(raw: RawDocument, existing: Document | None) -> RawDocument:
+    """``raw``, carrying the structured-memory record its front matter declares, if any.
+
+    **Only Markdown, and only a document that declares ``knowledge_type``.** Everything else is
+    returned untouched, so a corpus with no structured memories pays one media-type comparison
+    per document and acquires no metadata key.
+
+    **A record that is no longer declared is removed.** The stored metadata is merged *under*
+    what a connector just fetched, so a revision that dropped its evidence would otherwise keep
+    the previous revision's — a memory citing sources its current text no longer cites, which
+    is the one failure here that reads as more trustworthy than the truth. ``None`` overwrites
+    it; the key is written only when there is something to overwrite, so a document that never
+    had a record never gets one.
+    """
+    declared = _declared_knowledge(raw) if raw.media_type in MARKDOWN_MEDIA_TYPES else None
+    if declared is not None:
+        return raw.model_copy(
+            update={"metadata": {**raw.metadata, KNOWLEDGE_KEY: declared.as_metadata_value()}}
+        )
+    # Reached for a non-Markdown revision as well: a memory replaced by a PDF under the same
+    # identity must lose its evidence too, or the new document is cited with the old one's sources.
+    if existing is not None and KNOWLEDGE_KEY in existing.metadata:
+        return raw.model_copy(update={"metadata": {**raw.metadata, KNOWLEDGE_KEY: None}})
+    return raw
+
+
+def _declared_knowledge(raw: RawDocument) -> Knowledge | None:
+    """The record a Markdown document's front matter declares, or ``None``."""
+    head = raw.content[:_FRONT_MATTER_PROBE]
+    try:
+        text = head if isinstance(head, str) else head.decode(raw.encoding, errors="ignore")
+    except LookupError:
+        # An encoding name Python does not know. The parser will refuse the document for the
+        # same reason and say so; this stage has nothing to add.
+        return None
+    return read_knowledge(text)
 
 
 class IngestPipeline:
@@ -3602,7 +3652,7 @@ class IngestPipeline:
                 container_depth=container_depth,
             )
             return skipped, ()
-        raw = transformed
+        raw = _with_knowledge(transformed, existing)
 
         await self._advance(existing, DocumentStatus.PARSING)
 

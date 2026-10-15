@@ -23,7 +23,7 @@ Corpus shape, which the design assumes:
 ```markdown
 ---
 name: project_metallb_cluster_vlan_vip     # equals the filename stem
-description: One line. This is what retrieval ranks on.
+description: One line, for a person scanning a directory listing.
 metadata:
   node_type: memory
   type: project | feedback | reference | user | hardware
@@ -31,6 +31,14 @@ metadata:
 
 Prose. Links to related facts as [[project_home_apiserver_vip]].
 ```
+
+**Front matter is not indexed, and this page used to say it was.** The Markdown parser blanks a
+closed front-matter block before it parses anything
+(`parsers/markdown.py::MarkdownParser._mask`), so `name`, `description` and `type` are not ranked
+text, not chunk text and not stored metadata: a search matches the body and nothing else. The
+earlier comment on `description` — "this is what retrieval ranks on" — described behavior nothing
+implemented. It matters for any field that has to be *found by its words*: it belongs in the body.
+§6 is built around that.
 
 ## 2. Non-goal: manicule is not a note database
 
@@ -420,8 +428,171 @@ corpus — is re-selected on every repair, for ever.
 out of the core parser is correct on its own, and it exercises the public extension path on a real
 component rather than only on the example.
 
-## 6. Testing
+## 6. Structured memories
 
+### 6.1 Why
+
+A memory about how an environment actually works — *failover to the second gateway is manual
+since the certificate rotation* — is a claim somebody made, in a place, at a time. Without the place
+and the time it is folklore: it cannot be checked, cannot be dated, and nothing distinguishes it
+from what somebody wished were true. Chat, tickets and wikis are where such claims are made, and in
+a large organization they are most of what is known about how things really behave.
+
+This is **source-agnostic on purpose**. Nothing here connects to Slack or any other product; a
+caller reads a message however it reads it and records the claim with a citation. The format has a
+`kind` (`slack`, `jira`, `confluence`, `email`, `meeting`, `incident`, `web` are examples, not an
+allowlist) because an enumeration of products is a list somebody edits every time a team adopts a
+tool.
+
+### 6.2 The format
+
+The file stays the record (§2). A structured memory is Markdown whose front matter declares
+`knowledge_type`, and whose body has a title and three sections:
+
+```markdown
+---
+name: reference_vpn_gateway_failover
+description: Gateway failover is manual.
+metadata:
+  node_type: memory
+  type: reference
+knowledge_type: constraint
+evidence_status: corroborated        # optional; derived from the evidence when omitted
+evidence:
+  - kind: slack
+    locator: https://example.slack.com/archives/C0123/p1700000000000100
+    author: Jane Doe                 # optional
+    said_at: 2026-03-02T14:05:00Z
+    quote: "failover is manual since the cert rotation: nothing flips on its own"
+  - kind: jira
+    locator: https://jira.example.com/browse/OPS-12
+    said_at: 2026-04-01T09:00:00+02:00
+    quote: |
+      Confirmed: automatic failover was removed.
+relationships:                       # optional
+  - relation: relates_to
+    target: reference_vpn_cert_rotation
+---
+
+# VPN gateway failover is manual
+
+## Problem
+The primary gateway fails and nothing flips to the second one.
+
+## Answer
+Run the failover runbook; the second gateway does not take over by itself.
+
+## Applicability
+Production only, since March 2026. The staging pair still fails over on its own.
+```
+
+| Field | Where | What |
+|---|---|---|
+| title | body `# …` | what the memory is about |
+| problem | body `## Problem` | the situation or question that sends someone looking |
+| answer | body `## Answer` | the knowledge |
+| applicability | body `## Applicability` | where and when it holds, and where it does not |
+| knowledge type | `knowledge_type` | `procedure`, `constraint`, `fact`, `decision`, `known_issue` or `ownership` |
+| evidence | `evidence[]` | `kind`, `locator`, `said_at`, `quote`, optional `author` |
+| evidence status | `evidence_status` | `single_source`, `corroborated`, `disputed` or `superseded` |
+| source dates | `evidence[].said_at` | when each *source* said it; oldest and newest are reported |
+| relationships | `relationships[]` | `relation` (`supersedes`, `superseded_by`, `contradicts`, `depends_on`, `relates_to`) and a `target` slug |
+
+**The prose is in the body and the typed fields are in front matter, because front matter is not
+indexed** (§1). A reader finds a memory by the words of its problem and its answer, and a heading
+is what lets a hit say *which* section matched. What a reader sees at a glance, dates and weighs — the type,
+the sources, how well they hold up — is what a typed record is for.
+
+### 6.3 Evidence is attested, never verified
+
+Manicule cannot open a Slack permalink, and nothing here claims it did. Every field is what the
+author recorded. `evidence_status` is a statement about the *sources*, and the word "verified" is
+absent from its vocabulary on purpose: an answer citation's `verification` already means a
+quotation that resolved against the text it cites, and a second use of the word for something that
+is not that would let one be read as the other.
+
+**The quote is required.** A permalink is a pointer, and pointers die — a retention policy deletes
+the message, a channel is archived, a workspace is migrated. The excerpt is what survives, so a
+source with no quote is a citation that expires. The cost is stated rather than hidden: authoring
+a quote **copies text out of wherever it was said into a corpus every member can search**. That is
+a decision the person authoring makes by choosing what to record, and it is the reason the quote
+is bounded (2,000 characters; refused rather than truncated, because a truncated quotation is a
+different quotation) and why it should be the sentence that supports the claim and not the thread
+around it.
+
+**Three timestamps, never folded together.** `said_at` is when the source said it and must be a
+full timestamp with a UTC offset: a bare date is a claim about *when* the author never made, and a
+number is worse. When the memory was written down is in the file's history; when manicule read it is
+`indexed_at`. `newest_said_at` is the only age reported, because it dates the **evidence** — a memory
+written last week from a message sent three years ago is three years old.
+
+### 6.4 Evidence status
+
+Derived when omitted, because whether two sources are the same message is arithmetic and an author
+asked to state a fact the evidence already shows has one more way to be wrong: one distinct
+`locator` is `single_source`, two or more is `corroborated`. The same message cited twice is one
+source said once.
+
+`disputed` and `superseded` cannot be derived from the evidence, so they are declared. A declared
+status that contradicts the evidence is refused: `corroborated` with one place, `single_source`
+with two, or `superseded` with no `superseded_by` relationship saying by what.
+
+### 6.5 Relationships
+
+Typed pointers to other memories, by slug. **They are recorded as declared and not resolved**: the
+target is not looked up, and the inverse is not derived, so the author of a replacement writes
+`supersedes` on the new memory and `superseded_by` (with `evidence_status: superseded`) on the old
+one. They are *not* `chunk_relations` edges, so nothing ranks or filters by them yet — a superseded
+memory is flagged on its own hit and is not demoted below the one that replaced it. Turning them
+into edges, with the lineage a derived relation needs (§5.5), is the next piece of work and not
+something this section claims.
+
+### 6.6 Where it is read, and where it is refused
+
+**One key makes a document a structured memory: `knowledge_type` in the front matter, at column
+0.** A document without it is ordinary Markdown whatever else its front matter says — `status:` and
+`source:` mean something in half the documentation sites in the world, and reading them here would
+put a refusal on pages nobody authored as memories. Only Markdown is read, from any connector.
+
+At **ingest** the reader never raises. A file arrives by a sync or a `git pull`, and a document that
+declares a record it cannot have is still a document: it is stored with the *reason*
+(`unavailable_reason`), and every surface reports that instead of nothing, because a memory whose
+evidence was refused otherwise reads as one nobody cited. A revision that drops its evidence loses
+the stored record rather than keeping the old one.
+
+At the **authoring door** (`document_create`) the same rules raise, before anything reaches the
+disk, naming the field and what would fix it. The door also checks what ingest cannot — the body
+has a title and the three sections with text under each, sections inside a code fence do not count —
+and catches the failures that would otherwise be silent: evidence under a name nothing reads
+(`sources`, `citations`), evidence with no `knowledge_type`, a memory relating to itself. The
+commonest failure is a quote containing `: ` left unquoted, which is not valid YAML; the refusal
+says so.
+
+The record is **derived** from the file and nothing in the database is the only copy, so a re-parse
+repairs a damaged one. It is read again, and validated again, every time it is loaded, because the
+file it came from is input from whoever could write it.
+
+### 6.7 What is not built
+
+- **Nothing reads the evidence into an answer.** `ask` cites a memory and the citation carries its
+  evidence, but the generator is shown the passage, not the sources, so an answer does not yet say
+  "this was last confirmed fourteen months ago".
+- **No retention handling.** When the source is deleted the quote survives and nothing notices;
+  when a source is withdrawn nothing demotes the memory.
+- **No access control on evidence.** The corpus is as readable as the collection it is in; see §6.3
+  for what authoring a quote means.
+- **Relationships are not edges** (§6.5).
+
+## 7. Testing
+
+- `tests/test_knowledge.py` — the record and the reader: what is accepted, every refusal and the
+  sentence that fixes it, the door's body and key checks, and that reading never raises.
+- `tests/ingest/test_knowledge.py` — the pipeline's part: which documents are read, that a
+  refusal costs the document nothing, that a dropped record is removed, and re-derivation.
+- `tests/app/test_surface_parity.py` — `knowledge` serializes identically on every surface, and a
+  memory reports `provenance: null`.
+- `tests/web/test_knowledge_escaping.py` — the evidence reaches HTML inert, with the control.
+- `tests/app/test_cli_knowledge.py` — what the terminal prints, and that "verified" is not it.
 - `tests/app/test_document_create.py` — surface parity across the three envelope adapters, identity
   stability under a retitle, the overwrite refusal naming the existing document, partial failure
   leaving the file and reporting `ok: false`, and containment for every shape of unsafe slug.
@@ -438,7 +609,7 @@ component rather than only on the example.
   underscore variants reaching the same target. Against a real store, so `relate`'s idempotence and
   the lexical index's tokenization are the product's rather than a fake's.
 
-## 7. Out of scope
+## 8. Out of scope
 
 - Deployment to k8s, the HTTPS/PKI surface, and the commit-and-push sidecar.
 - Migrating the corpus off qmd. It keeps running over the same files throughout.

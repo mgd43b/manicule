@@ -772,6 +772,40 @@ citation records **what was shown**, its title and URI frozen as they were at an
 block reports **what is true now**. Attaching a live one to a historical record would let a
 replayed conversation claim it had cited a version that did not exist yet.
 
+### `knowledge` → `KnowledgeReference`
+
+On every search hit, every answer citation and every document summary — and `null` on all three
+unless the document is a **structured memory**: Markdown whose front matter declares a
+`knowledge_type` ([`memory-authoring.md`](memory-authoring.md) §6). It is a different thing from
+`provenance`, and the two are independent: `provenance` says a document is a *copy of* something
+published elsewhere, and `knowledge` says it is a *claim* that cites where it was said.
+
+`knowledge_type`, `evidence_status`, `evidence`, `oldest_said_at`, `newest_said_at`,
+`relationships` and `unavailable_reason`. Each `evidence` entry is `kind`, `locator`, `said_at`,
+`quote` and `author`.
+
+Four things about it are contract rather than implementation detail:
+
+- **Attested, never verified.** Every field is what the memory's author recorded; manicule cannot
+  open a permalink and nothing here says it did. `evidence_status` is a statement about the
+  *sources* (`single_source`, `corroborated`, `disputed`, `superseded`), and the word "verified"
+  is deliberately absent from the vocabulary, because an answer citation's `verification` already
+  means a quotation that resolved against the text it cites. Two meanings of one word on one
+  payload is how a reader comes to treat a chat message as checked.
+- **`said_at` is when the *source* said it**, and `newest_said_at` is the age to weigh the memory
+  by. It is never when the memory was written or indexed: a memory written last week from a
+  message sent three years ago is three years old, and `indexed_at` would say last week.
+- **`null`, not an empty object**, for a document that is not a memory, for the reason
+  `provenance` gives. A memory whose record was declared and **refused** is *not* `null`: it
+  reports `unavailable_reason` with every other field empty, because a memory whose evidence was
+  malformed otherwise reads as one nobody cited.
+- **Relationships are reported as declared.** The target is a slug and is not looked up, so a
+  `superseded_by` pointing at a memory that does not exist reads the same as one that does.
+
+`conversation_messages` replays stored citations with `knowledge: null`, for the reason
+`provenance` does: a stored citation records what was shown, and this block reports what is true
+now.
+
 ### `index_path` / `connector_sync` / `import` → `IngestReport`
 
 `connector`, `discovered`, `ingested`, `skipped`, `failed`, `expanded`, `collected`,

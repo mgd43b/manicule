@@ -992,6 +992,19 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         Front matter is yours and is written exactly as sent; nothing here invents `name`,
         `description` or a type. Follow whatever convention the collection already uses.
 
+        **Knowledge that rests on a source** — something said in chat, a ticket, a page — is
+        recorded as a structured memory, so it can be dated and weighed later. Add to the front
+        matter `knowledge_type` (procedure, constraint, fact, decision, known_issue or
+        ownership) and `evidence`: a list of sources, each with `kind` (slack, jira, ...),
+        `locator` (an http(s) permalink), `said_at` (a full timestamp with a UTC offset, when the
+        *source* said it), `quote` (its words, verbatim) and optionally `author`. Optional:
+        `evidence_status` (single_source, corroborated, disputed or superseded; derived from the
+        evidence when omitted) and `relationships` (each `relation` — supersedes, superseded_by,
+        contradicts, depends_on or relates_to — and the other memory's `target` slug). The body
+        is `# Title`, then `## Problem`, `## Answer` and `## Applicability`. Wrap any value
+        containing `: ` in quotes. Sources are recorded as given and are never checked; a
+        malformed memory is refused naming the field, and nothing is written.
+
         This returns only once the document is published, so a search immediately afterwards
         finds it. If indexing fails the **file is kept** and the result says so with
         `ok: false` and the path — the content is not lost and a later sync will index it.
