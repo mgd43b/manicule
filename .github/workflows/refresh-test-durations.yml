@@ -107,8 +107,10 @@ jobs:
           REQUIRE_VOCABULARY_BUNDLE: "1"
           TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
         # Serial and unsplit: `--store-durations` rewrites `.test_durations` from what it ran, so
-        # running a shard would replace the whole file with a third of it.
-        run: uv run --python 3.14 pytest --store-durations --cov --durations=10
+        # running a shard would replace the whole file with a third of it. `--clean-durations`
+        # drops the entries of tests that no longer exist; without it they stay for ever, and the
+        # file only grows.
+        run: uv run --python 3.14 pytest --store-durations --clean-durations --cov --durations=10
 
       - name: refuse a result that is not a measurement
         run: |
