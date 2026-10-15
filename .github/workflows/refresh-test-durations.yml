@@ -76,13 +76,10 @@ jobs:
             echo "::error::the DURATIONS_REFRESH_TOKEN secret is not set. The refreshed file is delivered as a pull request that has to start CI, and github.token cannot do that. See CONTRIBUTING.md, and set it before running this: the measurement takes about half an hour."
             exit 1
           fi
-          # `permissions.push` is what the API reports for the token's holder, which is the
-          # question that matters: can it push a branch. Asked here so the answer arrives in
-          # seconds rather than after the measurement.
-          if [ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.permissions.push')" != "true" ]; then
-            echo "::error::the DURATIONS_REFRESH_TOKEN token cannot push to ${GITHUB_REPOSITORY}."
-            exit 1
-          fi
+          # Only that it can see the repository. `permissions.push` here is the holder's *role*,
+          # not the token's scope, so it is not asked; whether the token can write is asked of
+          # the server by the dry-run push below, which cannot be answered by anything else.
+          gh api "repos/${GITHUB_REPOSITORY}" --jq .full_name >/dev/null
 
       # `ref: main`, for the reason relock.yml gives: the measurement belongs on the current tip.
       # The token is given to checkout so the push below is made with it.
@@ -90,6 +87,12 @@ jobs:
         with:
           ref: main
           token: ${{ secrets.DURATIONS_REFRESH_TOKEN }}
+
+      - name: check the token can push
+        # `--dry-run` still asks the server to advertise the branch for writing, which a token
+        # without write scope is refused. Asked now, in seconds, because the alternative is
+        # finding out after the half-hour measurement — which is how the first run was lost.
+        run: git push --dry-run origin HEAD:refs/heads/chore/refresh-test-durations
 
       - uses: astral-sh/setup-uv@v7
         with:

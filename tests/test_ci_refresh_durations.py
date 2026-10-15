@@ -49,9 +49,22 @@ def test_the_token_is_checked_before_the_half_hour_measurement() -> None:
     """A missing secret found afterwards loses the measurement, which is what the first run did."""
     names = [str(step.get("name", "")) for step in _steps()]
 
-    assert names.index(_step("check the token")["name"]) == 0
-    assert names.index(_step("check the token")["name"]) < names.index(_step("measure")["name"])
-    assert "DURATIONS_REFRESH_TOKEN" in _step("check the token")["run"]
+    assert names.index(_step("check the token before")["name"]) == 0
+    assert names.index(_step("check the token before")["name"]) < names.index(
+        _step("measure")["name"]
+    )
+    assert "DURATIONS_REFRESH_TOKEN" in _step("check the token before")["run"]
+
+
+def test_the_token_is_proved_able_to_write_before_the_half_hour_measurement() -> None:
+    """A role check cannot see a token's scope; only the server refusing a push can."""
+    names = [str(step.get("name", "")) for step in _steps()]
+
+    push_check = names.index(_step("check the token can push")["name"])
+
+    assert names.index(_step("measure")["name"]) > push_check
+    assert "git push --dry-run" in _step("check the token can push")["run"]
+    assert "chore/refresh-test-durations" in _step("check the token can push")["run"]
 
 
 def test_the_measurement_is_kept_before_anything_can_refuse_or_fail_to_deliver_it() -> None:
