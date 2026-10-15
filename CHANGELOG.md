@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.11](https://github.com/mgd43b/manicule/compare/v0.2.10...v0.2.11) (2026-10-15)
+
+
+### Features
+
+* structured memories that cite where they were said ([#428](https://github.com/mgd43b/manicule/issues/428)) ([2aa19b5](https://github.com/mgd43b/manicule/commit/2aa19b5ccec68b363640300a68152d68bca87039))
+
+
+### Bug Fixes
+
+* open an ONNX model whose weights a hub cache keeps in another directory ([#433](https://github.com/mgd43b/manicule/issues/433)) ([291cd71](https://github.com/mgd43b/manicule/commit/291cd71baaa848199f6e284053181ad808d3717d))
+
 ## [0.2.10](https://github.com/mgd43b/manicule/compare/v0.2.9...v0.2.10) (2026-09-25)
 
 
