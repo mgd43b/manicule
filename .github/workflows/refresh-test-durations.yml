@@ -1,0 +1,161 @@
+name: Refresh test durations
+
+# **The shards stay balanced because a runner re-measures them, not because somebody remembers.**
+#
+# ci.yml splits the Python 3.14 suite across three jobs using the committed `.test_durations`, and
+# that file goes stale as tests are added: a test it has never heard of is given the *average*
+# duration, so the new, heavy ones are placed as though they were cheap. On 2026-10-15 shard 1
+# took 12.4 minutes against 7.2 and 6.6 for the others, and every release waits for the slowest
+# shard, so the imbalance was paid in full on each one. CONTRIBUTING.md says to regenerate the file
+# "when the shards have visibly drifted", which depends on somebody looking at three job timings
+# and acting. Nobody did for a month.
+#
+# **It measures on a runner, serially, with the same environment CI uses.** A laptop's numbers
+# balance the shards well enough in principle — relative cost is what matters — but a laptop is
+# also the machine doing other work, and the full serial run is about twenty minutes during which
+# every figure it records is contended. The environment below is ci-shard-benchmark.yml's: the same
+# `uv sync --all-groups --all-extras`, the same grammar and vocabulary pre-seeding, coverage on. A
+# test that is skipped for want of an extra locally is recorded as free, then placed as free in
+# CI, where it runs.
+#
+# **It commits to `main` directly, the way relock.yml does, and for a smaller reason to worry.**
+# A stale or odd durations file can only cost *balance*; it cannot drop a test, and
+# `tests/test_ci_test_sharding.py` holds the shard count to the matrix. A monthly pull request
+# would carry a one-megabyte JSON diff nobody can review, and a pull request opened with
+# `github.token` starts no checks, so each would need a human to approve its runs before it could
+# merge — a chore that exists to remove a chore. A push authenticated the same way starts no
+# workflows either, which is what makes this safe to run unattended: no CI run, no Release run,
+# and no loop.
+#
+# **It commits nothing unless the run passed and the result looks like a measurement.** A failed
+# suite is a failed job, not a durations file; and a result that has lost more than a tenth of the
+# entries it replaces is a partial collection, which would be committed as though the missing
+# tests had no cost. Either way the job fails loudly and the committed file stays as it was.
+on:
+  schedule:
+    # The first of the month, early, when nothing is likely to be merging.
+    - cron: "17 4 1 * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # Never canceled: a canceled run is twenty minutes spent for nothing, and two runs would commit
+  # two measurements of the same tree.
+  group: refresh-test-durations
+  cancel-in-progress: false
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  refresh:
+    name: re-measure .test_durations
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      # To push the refreshed file. Nothing else here writes.
+      contents: write
+    steps:
+      # `ref: main`, for the reason relock.yml gives: the measurement belongs on the current tip.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          # Pinned, as everywhere else: the interpreter that measures is the one that tests.
+          python-version: "3.14"
+
+      - run: uv sync --all-groups --all-extras --python 3.14
+
+      - name: cache tree-sitter grammars
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: grammars-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: pre-seed grammars
+        run: >-
+          uv run --python 3.14 python -c
+          "from manicule.parsers import grammars;
+          print('fetched:', grammars.prefetch(grammars.DECLARED_LANGUAGES));
+          missing = grammars.missing_grammars(grammars.DECLARED_LANGUAGES);
+          assert not missing, f'grammars still missing after pre-seed: {missing}'"
+      - name: cache tiktoken vocabularies
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/tiktoken
+          key: vocabularies-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: pre-seed tiktoken vocabularies
+        env:
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
+        run: >-
+          uv run --python 3.14 python -c
+          "from manicule import vocabularies;
+          wanted = vocabularies.required_encodings();
+          print('seeded:', vocabularies.prefetch(wanted));
+          missing = vocabularies.missing_vocabularies(wanted);
+          assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
+
+      - name: keep the file being replaced
+        run: cp .test_durations "${RUNNER_TEMP}/durations.before.json"
+
+      - name: measure
+        env:
+          REQUIRE_GRAMMAR_BUNDLE: "1"
+          REQUIRE_VOCABULARY_BUNDLE: "1"
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
+        # Serial and unsplit: `--store-durations` rewrites `.test_durations` from what it ran, so
+        # running a shard would replace the whole file with a third of it. `--clean-durations`
+        # drops the entries of tests that no longer exist; without it they stay for ever, and the
+        # file only grows.
+        run: uv run --python 3.14 pytest --store-durations --clean-durations --cov --durations=10
+
+      - name: refuse a result that is not a measurement
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+
+          def refuse(message):
+              print("::error::" + message)
+              sys.exit(1)
+
+
+          before = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "durations.before.json")))
+          after = json.load(open(".test_durations"))
+          if not isinstance(after, dict) or not after:
+              refuse(".test_durations is empty or not an object after the run")
+          if len(after) < 0.9 * len(before):
+              refuse(
+                  f"the refreshed file has {len(after)} entries against {len(before)} before. "
+                  "Tests have not vanished in a month; the collection was partial, and "
+                  "committing it would record every missing test as free."
+              )
+          print(f"{len(before)} entries before, {len(after)} after")
+          PY
+
+      - name: commit the refreshed file
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- .test_durations; then
+            echo "The measurement is identical to the committed file; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .test_durations
+          git commit \
+            -m 'chore: refresh test shard durations' \
+            -m 'Re-measured serially on a runner with the environment ci.yml uses, so the three test shards stay balanced as tests are added.' \
+            -m 'See .github/workflows/refresh-test-durations.yml for why this commit exists.'
+
+          # The measurement took twenty minutes, so `main` has very likely moved. Only one file is
+          # touched and nothing else writes it, so replaying the commit onto the new tip is safe.
+          git pull --rebase origin main
+          if ! git push origin "HEAD:main"; then
+            echo "::error::could not push the refreshed durations; main moved while this job ran. Nothing is half-done, and the next run measures again."
+            exit 1
+          fi

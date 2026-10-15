@@ -110,6 +110,12 @@ whole namespace before each test, so a switch living inside it is deleted before
 
 ### `.test_durations`, and when it needs regenerating
 
+**You do not normally have to.** `.github/workflows/refresh-test-durations.yml` re-measures it on
+a runner on the first of every month and commits the result to `main` (and can be started by hand
+from the Actions tab). It runs the full suite serially with CI's own environment, refuses a result
+that is empty or has lost a tenth of its entries, and commits nothing if the suite failed. What
+follows is for refreshing it yourself sooner — after adding a corpus, say.
+
 CI runs the Python 3.14 suite in three shards, balanced on the committed
 `.test_durations`. **You do not need it to run the tests** — `uv run pytest` ignores it
 entirely, and it is read only when `--splits` is passed.
