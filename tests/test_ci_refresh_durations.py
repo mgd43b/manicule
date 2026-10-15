@@ -169,3 +169,19 @@ def test_an_unchanged_measurement_closes_a_proposal_that_is_still_open() -> None
 
     assert "gh pr close" in unchanged
     assert unchanged.index("branch=") < unchanged.index("git diff --quiet")
+
+
+def test_only_proposals_from_this_repository_are_looked_up_or_closed() -> None:
+    """``gh pr list --head`` matches the branch name alone, so a fork's PR could pass for ours."""
+    delivery = "\n".join(
+        line
+        for line in _step("open or update")["run"].splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+    assert delivery.count("gh pr list") == 1, "every lookup goes through the one filtered helper"
+    assert "select(.isCrossRepository == false)" in delivery
+    assert "--base main" in delivery
+    assert delivery.count("our_proposals") >= 3, (
+        "defined once, used by the close loop and the check"
+    )
