@@ -36,33 +36,38 @@ import tempfile
 from pathlib import Path
 
 
-def colocated(graph: Path, staging: Path) -> Path:
-    """``graph``, or a path to the same graph with its sibling files beside it.
+def colocated(graph: Path, staging: Path, *, identity: str = "") -> Path:
+    """``graph``, or a path to the same graph with every file that belongs to it beside it.
 
     Args:
         graph: The ``.onnx`` file, as the hub cache lays it out — usually a symlink.
         staging: A writable directory to build the co-located copy under.
+        identity: What the artifact is, as the caller verified it
+            (:attr:`~manicule.embedding.artifacts.WeightsRef.identity`). **Part of the name of the
+            staged directory**, because a resolved filename is a content hash only in a hub cache:
+            a local export may call its graph and its sidecar the same thing as a different
+            export does, and keying on names alone would hand the second one the first one's
+            weights and attribute the vectors to the wrong artifact.
 
     Returns:
-        ``graph`` itself when the files beside it already resolve into one directory; otherwise
-        the graph inside a directory under ``staging`` that holds every regular file that was
-        beside it. The directory is named by what the files *are* (their resolved blob names,
-        which are content hashes), so the same weights always land in the same place and a
-        different revision lands somewhere else.
+        ``graph`` itself when every file under its directory already resolves inside that
+        directory; otherwise the graph inside a directory under ``staging`` that holds all of
+        them, **at the same relative paths** — an external-data location may name a
+        subdirectory (``data/weights.bin``), and flattening it would leave the graph pointing
+        at nothing.
 
     Raises:
         OSError: ``staging`` cannot be written to.
     """
-    siblings = sorted(path for path in graph.parent.iterdir() if path.is_file())
+    files = _files(graph.parent)
     home = graph.resolve().parent
-    if all(path.resolve().parent == home for path in siblings):
+    if all(path.resolve().is_relative_to(home) for path in files):
         return graph
 
-    identity = "\n".join(f"{path.name}={path.resolve().name}" for path in siblings)
-    key = hashlib.sha256(identity.encode()).hexdigest()[:32]
+    key = _key(graph.parent, files, identity)
     target = staging / key
     staged = target / graph.name
-    if _complete(target, siblings):
+    if _complete(target, graph.parent, files):
         return staged
     # Present and missing a file: something removed part of it, or an earlier version staged
     # fewer. Reusing it would hand onnxruntime a graph with no weights beside it.
@@ -73,22 +78,42 @@ def colocated(graph: Path, staging: Path) -> Path:
     # dot-directory nobody reads rather than a half-copied one that a later start trusts.
     work = Path(tempfile.mkdtemp(prefix=f".{key}.", dir=staging))
     try:
-        for path in siblings:
-            _link_or_copy(path.resolve(), work / path.name)
+        for path in files:
+            destination = work / path.relative_to(graph.parent)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _link_or_copy(path.resolve(), destination)
         try:
             work.rename(target)
         except OSError:
             # Another process finished the same directory first, which is as good as ours.
-            if not _complete(target, siblings):
+            if not _complete(target, graph.parent, files):
                 raise
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return staged
 
 
-def _complete(target: Path, siblings: list[Path]) -> bool:
-    """Whether ``target`` holds every file that was beside the graph."""
-    return all((target / path.name).is_file() for path in siblings)
+def _files(root: Path) -> list[Path]:
+    """Every regular file under ``root``, nested ones included, in a stable order."""
+    return sorted(path for path in root.rglob("*") if path.is_file())
+
+
+def _key(root: Path, files: list[Path], identity: str) -> str:
+    """A name for one set of files: the caller's identity, and each file's path, size and target.
+
+    The size and resolved name are the cheap discriminators available without reading 2.3 GB;
+    in a hub cache the name is the content hash already, and ``identity`` carries the rest.
+    """
+    parts = [identity] + [
+        f"{path.relative_to(root)}={path.resolve().name}:{path.resolve().stat().st_size}"
+        for path in files
+    ]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
+
+
+def _complete(target: Path, root: Path, files: list[Path]) -> bool:
+    """Whether ``target`` holds every file that was under the graph's directory."""
+    return all((target / path.relative_to(root)).is_file() for path in files)
 
 
 def _link_or_copy(source: Path, destination: Path) -> None:

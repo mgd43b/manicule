@@ -20,15 +20,13 @@ nothing to do with the fix.
 from __future__ import annotations
 
 import struct
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
 from manicule.embedding.runtimes.colocate import colocated
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 ort = pytest.importorskip("onnxruntime")
 
@@ -277,7 +275,7 @@ def test_load_opens_the_staged_graph(tmp_path: Path, monkeypatch: pytest.MonkeyP
     from manicule.embedding.runtimes import onnx_backend  # noqa: PLC0415
 
     graph = _snapshot(tmp_path, sharded=True)
-    weights = SimpleNamespace(describe=lambda: "weights")
+    weights = SimpleNamespace(describe=lambda: "weights", identity="test-identity")
 
     def resolved(artifact: object) -> tuple[SimpleNamespace, Path]:
         del artifact
@@ -294,3 +292,66 @@ def test_load_opens_the_staged_graph(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert session is not None
     (out,) = session.run(["Y"], {"X": np.array([2.0], dtype=np.float32)})
     assert float(out[0]) == 3.0
+
+
+def _local_export(root: Path, *, weight: float, sidecar: str = SIDECAR) -> Path:
+    """A local export: graph and weights as real files together, plus one link that resolves away.
+
+    The link is what triggers staging — it is how a ``weights`` directory with one symlinked file
+    in it looks — and every real file keeps the name a different export would give it.
+    """
+    here = root / "onnx"
+    (here / Path(sidecar).parent).mkdir(parents=True)
+    (here / "model.onnx").write_bytes(_model(sidecar))
+    (here / sidecar).write_bytes(struct.pack("<f", weight))
+    elsewhere = root.parent / "shared-config.json"
+    elsewhere.write_text("{}")
+    (here / "config.json").symlink_to(elsewhere)
+    return here / "model.onnx"
+
+
+def test_two_local_exports_with_the_same_file_names_do_not_share_staged_weights(
+    tmp_path: Path,
+) -> None:
+    """Names are content hashes only in a hub cache; here they are whatever the exporter chose.
+
+    Both exports call their weights ``model.onnx_data`` and both are four bytes, so nothing about
+    the files separates them but what they are — which is the artifact identity the caller
+    verified. Without it in the key the second export is served the first one's weights and its
+    vectors are attributed to the wrong artifact.
+    """
+    first = _local_export(tmp_path / "a", weight=1.0)
+    second = _local_export(tmp_path / "b", weight=5.0)
+    staging = tmp_path / "staging"
+
+    one = colocated(first, staging, identity="export-a")
+    two = colocated(second, staging, identity="export-b")
+
+    assert one.parent != two.parent
+    assert _run(one) == 3.0
+    assert _run(two) == 7.0
+
+
+def test_weights_in_a_subdirectory_keep_their_relative_path(tmp_path: Path) -> None:
+    """An external-data location may name a subdirectory; flattening it would orphan the graph."""
+    graph = _local_export(tmp_path / "a", weight=1.0, sidecar="data/weights.bin")
+
+    staged = colocated(graph, tmp_path / "staging", identity="nested")
+
+    assert (staged.parent / "data" / "weights.bin").is_file()
+    assert _run(staged) == 3.0
+
+
+def test_a_nested_file_that_resolves_away_is_what_triggers_staging(tmp_path: Path) -> None:
+    """Layout detection looks below the graph's directory too, not only beside it."""
+    graph = _local_export(tmp_path / "a", weight=1.0, sidecar="data/weights.bin")
+    (graph.parent / "config.json").unlink()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(struct.pack("<f", 1.0))
+    (graph.parent / "data" / "weights.bin").unlink()
+    (graph.parent / "data" / "weights.bin").symlink_to(outside)
+
+    staged = colocated(graph, tmp_path / "staging", identity="nested-link")
+
+    assert staged != graph
+    assert _run(staged) == 3.0

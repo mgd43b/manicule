@@ -94,10 +94,12 @@ class OnnxEmbedder(PooledEmbedder):
                 f"construction. Vectors would be attributed to weights that did not make them."
             )
             raise ConfigError(msg)
-        self._session = ort.InferenceSession(str(self._openable(graph)), providers=list(PROVIDERS))
+        self._session = ort.InferenceSession(
+            str(self._openable(graph, weights.identity)), providers=list(PROVIDERS)
+        )
         self._inputs = frozenset(item.name for item in self._session.get_inputs())
 
-    def _openable(self, graph: Path) -> Path:
+    def _openable(self, graph: Path, identity: str = "") -> Path:
         """``graph``, or the same graph with its weights beside it where onnxruntime can see them.
 
         See :mod:`~manicule.embedding.runtimes.colocate` for why a snapshot's own symlinks are not
@@ -109,9 +111,9 @@ class OnnxEmbedder(PooledEmbedder):
 
             staging = default_cache_dir() / STAGING_SUBDIR
         try:
-            return colocated(graph, staging)
+            return colocated(graph, staging, identity=identity)
         except OSError as exc:
-            size = sum(path.stat().st_size for path in graph.parent.iterdir() if path.is_file())
+            size = sum(path.stat().st_size for path in graph.parent.rglob("*") if path.is_file())
             msg = (
                 f"the ONNX graph {graph} keeps its weights in a different directory from the "
                 f"graph, which onnxruntime refuses to open, and they could not be placed "
