@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
@@ -753,16 +754,30 @@ async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
     #
     # The ratios carry the meaning; the absolute scale only has to survive a loaded CI runner.
     # Validation outlasts one whole lease, and the heartbeat renews at LEASE_DURATION/3, so a
-    # correct implementation renews twice during the read and a broken one loses the lease.
+    # correct implementation renews at least twice during the read and a broken one loses the
+    # lease.
     #
-    # The scale was 60 ms with a 120 ms read. That is not survivable on CI's two-core runners:
-    # a heartbeat *due* in 20 ms is not necessarily *scheduled* within the 60 ms before the
-    # lease expires, and a tenth of a second of scheduler jitter is ordinary there. Ten times
-    # slower keeps every ratio, buys 400 ms of slack per renewal, and costs about a second.
-    lease = timedelta(milliseconds=600)
-    read_seconds = 2 * lease.total_seconds()
+    # **The slack per renewal is `lease - lease/3`, and that is the number that flakes.** The
+    # scale was 60 ms, then 600 ms, which left 400 ms: enough on a quiet runner, and not on the
+    # two-core one where this shard runs `-n auto --cov` beside tests that take 55 and 120
+    # seconds. It failed there once (run 39810189119, shard 3, a pull request that changed no
+    # code) with the heartbeat's renewal reporting the lease already gone. The cause was not
+    # reproduced — sixteen cores at three times oversubscription never lost it — so this widens
+    # the slack rather than claiming to have found a stall. Three seconds leaves two.
+    #
+    # **The read ends on what it is waiting for, not on a clock.** It used to sleep for twice the
+    # lease. That is the cost of a test like this, and it was paid whether or not the renewals
+    # happened. The read now waits until the heartbeat has renewed twice *and* a full lease and a
+    # quarter have passed, which is the assertion: it outlasted the lease and the heartbeat kept
+    # it. The long timeout is only so that a heartbeat that never renews fails the test by losing
+    # the lease rather than hanging the suite.
+    lease = timedelta(seconds=3)
+    outlast = lease.total_seconds() * 1.25
+    renewals_required = 2
 
     reads: list[Path] = []
+    renewed = threading.Event()
+    renewals = 0
     # Reaching a private static method is the point: it is the seam where the blocking read
     # happens, and a public wrapper would not be one.
     original_read_blob = BlobStore._read_blob  # pyright: ignore[reportPrivateUsage]
@@ -771,7 +786,11 @@ async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
 
     def slow_read_blob(path: Path, compression: str) -> bytes:
         reads.append(path)
-        time.sleep(read_seconds)
+        started = time.monotonic()
+        renewed.wait(timeout=lease.total_seconds() * 4)
+        remaining = outlast - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(remaining)
         return original_read_blob(path, compression)
 
     async def transient_heartbeat_busy(
@@ -782,18 +801,24 @@ async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
         now: datetime,
         expires_at: datetime,
     ) -> bool:
-        nonlocal busy_injected
+        nonlocal busy_injected, renewals
         task = asyncio.current_task()
-        if task is not None and task.get_name().endswith("-lease-heartbeat") and not busy_injected:
+        is_heartbeat = task is not None and task.get_name().endswith("-lease-heartbeat")
+        if is_heartbeat and not busy_injected:
             busy_injected = True
             raise StorageBusyError
-        return await original_renew(
+        result = await original_renew(
             run_id,
             owner,
             generation,
             now=now,
             expires_at=expires_at,
         )
+        if is_heartbeat and result:
+            renewals += 1
+            if renewals >= renewals_required:
+                renewed.set()
+        return result
 
     monkeypatch.setattr(legacy_snapshots, "LEASE_DURATION", lease)
     monkeypatch.setattr(BlobStore, "_read_blob", staticmethod(slow_read_blob))
@@ -809,6 +834,10 @@ async def test_slow_validation_is_kept_alive_by_an_independent_lease_heartbeat(
         "again; re-point the patch at it rather than deleting this assertion."
     )
     assert busy_injected, "the heartbeat contention fault was never exercised"
+    assert renewals >= renewals_required, (
+        f"the heartbeat renewed {renewals} times during a read that outlasted the lease; "
+        f"{renewals_required} are what LEASE_DURATION/3 promises"
+    )
     assert (migrated.retained, migrated.promoted, migrated.deferred) == (1, 1, 0)
     assert await store.verify_snapshot_manifest((await _legacy_run(store, "wiki")).id)
 
