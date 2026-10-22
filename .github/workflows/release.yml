@@ -158,7 +158,7 @@ jobs:
       # and one re-run of an earlier attempt got through. Another attempt after a pause is the
       # cheap answer; whether one is always enough is not known.
       #
-      # The first phase is not repeated by the retry: a release pull request already labelled
+      # The first phase is not repeated by the retry: a release pull request already labeled
       # `autorelease: tagged` is not released twice. That is why `release_created` above reads
       # both steps. This one is deliberately not `continue-on-error`.
       - name: wait before retrying release-please
