@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.12](https://github.com/mgd43b/manicule/compare/v0.2.11...v0.2.12) (2026-10-22)
+
+
+### Miscellaneous Chores
+
+* request release 0.2.12 ([#449](https://github.com/mgd43b/manicule/issues/449)) ([8dd3d32](https://github.com/mgd43b/manicule/commit/8dd3d32d188443c4dd205751422452953a7c3a1a))
+
 ## [0.2.11](https://github.com/mgd43b/manicule/compare/v0.2.10...v0.2.11) (2026-10-15)
 
 
