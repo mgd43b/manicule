@@ -119,8 +119,7 @@ updates:
       #
       # A range rather than named versions, unlike the entries above: `litellm` ships a
       # release most days, so naming them would be a new line every week. The effect is that
-      # `litellm` stays on the 1.103.x patch line, which this still offers. Security updates
-      # are not affected by `ignore`.
+      # `litellm` stays on the 1.103.x patch line, which this still offers.
       #
       # Drop this entry once a `litellm` release allows `huggingface-hub` 2.x, or when moving
       # hub back to 1.x is a decision someone has actually made.
