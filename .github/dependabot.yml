@@ -59,10 +59,15 @@ updates:
     # lands rather than joining a batch. That is the intended behavior and the reason no
     # group below sets `applies-to`.
     #
-    # `commit-message` is deliberately unset on both blocks. Its default is to follow the
-    # patterns already in the repository, which produces "Bump x from 1 to 2" — imperative,
-    # which is what CONTRIBUTING.md asks for. A `prefix` would replace that with a
-    # conventional-commit form this repository does not otherwise use.
+    # `commit-message` is set on this block so that a runtime bump counts as a release. The
+    # default it replaces followed the repository's history and produced `build(deps): bump x`,
+    # and release-please hides `build`: with only those on `main` since v0.2.11 it logged "No
+    # user facing commits found" and opened no release pull request, so the wheels and the image
+    # that carry these libraries stayed on the old ones until somebody wrote a `fix` by hand.
+    # `fix(deps)` is a patch release, and the runtime group is what ships. `prefix-development`
+    # keeps the dev-tooling group at `build(deps-dev)`, because ruff does not reach a user.
+    # Security updates take the same prefix, which is right: an advisory in a shipped library is
+    # the case where a release should follow. The docker block below is left alone on purpose.
     #
     # Every dependency in this project is declared with a bare `>=` floor, which reads as
     # "the oldest version we have tested" rather than as a resolution. The default strategy
@@ -71,6 +76,10 @@ updates:
     # `increase-if-necessary` leaves a floor alone whenever the new release already satisfies
     # it, so the ordinary bump moves uv.lock and touches nothing else.
     versioning-strategy: "increase-if-necessary"
+    commit-message:
+      prefix: "fix"
+      prefix-development: "build"
+      include: "scope"
     ignore:
       # The three workspace members. They resolve through `[tool.uv.sources]`, never from an
       # index, and none of them is published. Without this, a package registered on PyPI
