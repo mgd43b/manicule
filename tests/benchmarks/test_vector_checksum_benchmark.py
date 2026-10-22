@@ -24,11 +24,13 @@ from tests.benchmarks.vector_checksum import RefusingEmbedder, measure, render
 
 ROWS = 256
 DIMENSION = 64
+# Enough for the fastest run of an in-memory loop to be the one that measured the work.
+REPEATS = 5
 
 
 async def test_every_phase_is_measured_separately_and_none_of_them_embeds() -> None:
     """The three numbers the design argument needs, kept apart."""
-    measurements = await measure(rows=ROWS, dimension=DIMENSION)
+    measurements = await measure(rows=ROWS, dimension=DIMENSION, repeats=REPEATS)
 
     assert [measurement.phase for measurement in measurements] == ["hash", "verify", "scan"]
     assert all(measurement.rows == ROWS for measurement in measurements)
@@ -52,7 +54,7 @@ async def test_the_storage_scan_is_the_slower_of_the_two_and_that_is_the_point()
     """
     measurements = {
         measurement.phase: measurement
-        for measurement in await measure(rows=ROWS, dimension=DIMENSION)
+        for measurement in await measure(rows=ROWS, dimension=DIMENSION, repeats=REPEATS)
     }
 
     assert measurements["scan"].seconds >= measurements["verify"].seconds
@@ -66,7 +68,7 @@ async def test_the_refusing_embedder_would_actually_fail_if_something_called_it(
 
 async def test_the_rendering_lines_up_and_fits_a_terminal() -> None:
     """It is pasted into pull requests, so it has to survive being pasted."""
-    rendered = render(await measure(rows=ROWS, dimension=DIMENSION)).splitlines()
+    rendered = render(await measure(rows=ROWS, dimension=DIMENSION, repeats=REPEATS)).splitlines()
 
     assert len({len(line) for line in rendered}) == 1, (
         "every row ends in the same column, which is what makes three phases comparable by eye"

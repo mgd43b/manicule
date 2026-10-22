@@ -11,6 +11,13 @@ another:
 ``verify``
     Recomputing a recorded checksum and comparing it. The read-path cost per row.
 
+``hash`` and ``verify`` are the best of ``repeats`` runs, one by default so the published
+numbers do not take five times as long. They are in-memory loops, and a stall — a scheduler, a
+collector, a neighbor on a shared runner — can only make a run slower, never faster, so the
+fastest run is the one that measured the work. The suite asks for several, because at its size
+a single sample let ``verify`` read 45 ms against a scan of 15 ms, which is a stalled timer
+rather than a cheaper scan.
+
 ``scan``
     The same verification through :meth:`LanceVectorStore.checksum_coverage`, which also pays
     LanceDB's scan and deserialization. Subtracting ``verify`` from it is what separates "the
@@ -57,7 +64,7 @@ from manicule.core.embedding import (
 from manicule.storage.vectors import LanceVectorStore
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from manicule.core.embedding import Vector
 
@@ -161,27 +168,42 @@ def _measurement(
     )
 
 
-async def measure(*, rows: int, dimension: int, page_size: int = 512) -> list[Measurement]:
+def _fastest(work: Callable[[], None], repeats: int) -> float:
+    """The shortest of ``repeats`` runs of ``work``; a stall only ever adds time."""
+    fastest = float("inf")
+    for _ in range(repeats):
+        started = time.perf_counter()
+        work()
+        fastest = min(fastest, time.perf_counter() - started)
+    return fastest
+
+
+async def measure(
+    *, rows: int, dimension: int, page_size: int = 512, repeats: int = 1
+) -> list[Measurement]:
     """Time the three phases over ``rows`` synthetic vectors of ``dimension``.
 
     Setup — generating vectors and writing them through LanceDB — is outside every timer. What
-    is being priced is the check, not the fixture.
+    is being priced is the check, not the fixture. ``hash`` and ``verify`` report the fastest of
+    ``repeats`` runs; ``scan`` is one run, because it needs a store and a stall in it only makes
+    the claim that it is the slower phase easier to meet.
     """
     embedder = RefusingEmbedder(dimension)
     vectors = _vectors(rows, dimension)
     checksums = [vector_checksum(vector) for vector in vectors]
 
-    started = time.perf_counter()
-    for vector in vectors:
-        vector_checksum(vector)
-    hashing = time.perf_counter() - started
+    def hash_all() -> None:
+        for vector in vectors:
+            vector_checksum(vector)
 
-    started = time.perf_counter()
-    for vector, checksum in zip(vectors, checksums, strict=True):
-        verify_stored_checksum(
-            vector, recorded=checksum, version=VECTOR_CHECKSUM_VERSION, required=True
-        )
-    verifying = time.perf_counter() - started
+    def verify_all() -> None:
+        for vector, checksum in zip(vectors, checksums, strict=True):
+            verify_stored_checksum(
+                vector, recorded=checksum, version=VECTOR_CHECKSUM_VERSION, required=True
+            )
+
+    hashing = _fastest(hash_all, repeats)
+    verifying = _fastest(verify_all, repeats)
 
     with tempfile.TemporaryDirectory() as temporary:
         store = LanceVectorStore(Path(temporary) / "vectors")
