@@ -133,11 +133,41 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+      # Either attempt can be the one that created the release, and the second one cannot say
+      # so: see the retry below. So `release_created` is true if *any* attempt reported it, and
+      # `tag_name` is whichever attempt had one. Taking the later step's output alone would
+      # turn a release that was created into one that never happened, and `build` and
+      # `publish-container` run only on `release_created == 'true'`.
+      release_created: ${{ steps.release.outputs.release_created == 'true' || steps.release_retry.outputs.release_created == 'true' }}
+      tag_name: ${{ steps.release.outputs.tag_name || steps.release_retry.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: release
+        # Not fatal on its own: the step below runs it once more. If that fails too, the job
+        # fails there, so a real problem is still red.
+        continue-on-error: true
+        with:
+          token: ${{ github.token }}
+
+      # **One retry, because the failure is GitHub's and it comes after the release is made.**
+      # release-please works in two phases: it creates the release for a merged release pull
+      # request, then reads the merge commits on `main` to build the next one. The second phase
+      # fails intermittently with "Something went wrong while executing your query", a GraphQL
+      # error from GitHub's side. It hit three runs on 2026-10-22, including the one for v0.2.12,
+      # where the release and the publishes had already happened and the job went red anyway,
+      # and one re-run of an earlier attempt got through. Another attempt after a pause is the
+      # cheap answer; whether one is always enough is not known.
+      #
+      # The first phase is not repeated by the retry: a release pull request already labelled
+      # `autorelease: tagged` is not released twice. That is why `release_created` above reads
+      # both steps. This one is deliberately not `continue-on-error`.
+      - name: wait before retrying release-please
+        if: ${{ steps.release.outcome == 'failure' }}
+        run: sleep 30
+
+      - uses: googleapis/release-please-action@v5
+        id: release_retry
+        if: ${{ steps.release.outcome == 'failure' }}
         with:
           token: ${{ github.token }}
 
@@ -158,19 +188,19 @@ jobs:
       # the changed constraints require, so this moves the two version lines and leaves every
       # resolved dependency alone. A release pull request must not quietly bump third-party pins.
       - uses: actions/checkout@v7
-        if: ${{ steps.release.outputs.pr }}
+        if: ${{ steps.release.outputs.pr || steps.release_retry.outputs.pr }}
         with:
-          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          ref: ${{ fromJSON(steps.release.outputs.pr || steps.release_retry.outputs.pr).headBranchName }}
 
       - uses: astral-sh/setup-uv@v7
-        if: ${{ steps.release.outputs.pr }}
+        if: ${{ steps.release.outputs.pr || steps.release_retry.outputs.pr }}
         with:
           # Pinned for the same reason the build job pins it: the interpreter that resolves a
           # release's lockfile is a decision, not whatever ubuntu-latest moved to this month.
           python-version: "3.14"
 
       - name: re-lock the release pull request
-        if: ${{ steps.release.outputs.pr }}
+        if: ${{ steps.release.outputs.pr || steps.release_retry.outputs.pr }}
         env:
           # The whole `pr` output, handed to the shell unparsed. `fromJSON` cannot be used
           # here the way the two steps above use it: a step's `env` block is evaluated
@@ -179,7 +209,7 @@ jobs:
           # `build(deps)` bump, and every release merge, neither of which is a user-facing
           # commit — `fromJSON('')` raised a template error and failed the job, even
           # though the step it was attached to was correctly skipped.
-          PR: ${{ steps.release.outputs.pr }}
+          PR: ${{ steps.release.outputs.pr || steps.release_retry.outputs.pr }}
         run: |
           set -euo pipefail
           # `headBranchName` is the release branch release-please just wrote. Pushing anywhere
