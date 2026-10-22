@@ -67,7 +67,10 @@ updates:
     # `fix(deps)` is a patch release, and the runtime group is what ships. `prefix-development`
     # keeps the dev-tooling group at `build(deps-dev)`, because ruff does not reach a user.
     # Security updates take the same prefix, which is right: an advisory in a shipped library is
-    # the case where a release should follow. The docker block below is left alone on purpose.
+    # the case where a release should follow. The docker block below is left alone on purpose:
+    # its `base-images` group mixes the shipped Python base with the build-only `uv` stage, so a
+    # `fix` prefix there would release for both. A Python base-image bump therefore still needs a
+    # `Release-As` footer or a `fix` of its own to reach a release.
     #
     # Every dependency in this project is declared with a bare `>=` floor, which reads as
     # "the oldest version we have tested" rather than as a resolution. The default strategy
