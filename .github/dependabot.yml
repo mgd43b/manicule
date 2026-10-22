@@ -97,6 +97,20 @@ updates:
       - dependency-name: "tokenizers"
         versions: ["0.23.1"]
 
+      # `sentence-transformers` 6.x, because it pins `huggingface-hub<2.0.0` and this repository
+      # is already on hub 2.x. Taking 6.1.0 in the runtime group did not stay in that group: the
+      # lockfile moved `huggingface-hub` from 2.2.0 back to 1.33.0, a major-version downgrade of
+      # a package the `index-affecting-embedding` group exists to review on its own, delivered
+      # inside a pull request that was about the reranker. `sentence-transformers` is not
+      # index-affecting itself, so the bump is not what is being refused; the downgrade it drags
+      # in is. `6.x` rather than `6.1.0`, because every 6.x carries the same pin.
+      #
+      # Drop this entry once a `sentence-transformers` release allows `huggingface-hub` 2.x, or
+      # when moving hub back to 1.x is a decision someone has actually made. It expires on its
+      # own at 7.x either way.
+      - dependency-name: "sentence-transformers"
+        versions: ["6.x"]
+
     # Group order is meaningful: a dependency joins the first group it matches. The
     # `index-affecting-*` groups are therefore first, and `runtime` — the only group with a
     # wildcard — repeats their patterns under `exclude-patterns` as well. That duplication is
