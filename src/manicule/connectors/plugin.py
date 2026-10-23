@@ -19,12 +19,15 @@ from manicule.connectors.config import (
     CONNECTOR_NAME,
     FILESYSTEM_CONNECTOR_NAME,
     GIT_SITE_CONNECTOR_NAME,
+    GMAIL_CONNECTOR_NAME,
     SNAPSHOT_CONNECTOR_NAME,
     ConfluenceConfig,
     ConfluenceSnapshotConfig,
     FilesystemConfig,
     GitSiteConfig,
+    GmailConfig,
     resolve_credentials,
+    resolve_gmail_credentials,
 )
 from manicule.container import keys
 from manicule.core.errors import ConfigError
@@ -40,6 +43,7 @@ __all__ = [
     "build_confluence_snapshot",
     "build_filesystem",
     "build_git_site",
+    "build_gmail",
 ]
 
 
@@ -227,6 +231,50 @@ def build_git_site(context: BuildContext) -> Connector:
     return GitSiteConnector(settings, name=_source_name(context, GIT_SITE_CONNECTOR_NAME))
 
 
+def build_gmail(context: BuildContext) -> Connector:
+    """Resolve and check the Gmail credential, then refuse: the connector itself is not built yet.
+
+    What this build has of Gmail is its configuration and its credential, and this factory
+    exercises both so that a misconfigured source is named at startup: the settings validate
+    against :class:`~manicule.connectors.config.GmailConfig` before this runs, the client secret
+    and refresh token are resolved from the environment, and a credential is constructed from
+    them. What it cannot do is return a connector, because the object that discovers and
+    fetches messages does not exist yet — handing back anything else would be a connector the
+    scheduler could try to sync and that read nothing.
+
+    **No network here.** The container calls factories synchronously from inside its event loop,
+    so a refresh and a ``users.getProfile`` would block every other request. They are
+    ``RefreshTokenCredential.confirm_mailbox``, which ``doctor`` calls and which belongs in the
+    connector's setup: the container awaits that before ``Container.connector`` hands the
+    connector to anyone, so the mailbox is checked before a caller can use it.
+
+    Raises:
+        ConfigError: The context carries configuration of some other type, the client secret or
+            refresh token is absent (naming the setting and the environment variable), or —
+            always, once those pass — the connector that would use them is not available.
+    """
+    from manicule.connectors.credentials import gmail_credential  # noqa: PLC0415 - see above
+
+    settings = context.config
+    if not isinstance(settings, GmailConfig):
+        msg = (
+            f"connector {GMAIL_CONNECTOR_NAME!r} was built with {type(settings).__name__} where "
+            f"it declares GmailConfig. Configuration reaching a factory is validated against "
+            f"the model the component registered; a factory called outside the container has "
+            f"to supply that model itself."
+        )
+        raise ConfigError(msg)
+    name = _source_name(context, GMAIL_CONNECTOR_NAME)
+    resolved = resolve_gmail_credentials(settings, instance=context.instance)
+    gmail_credential(resolved, instance=name)
+    msg = (
+        f"the Gmail source {name!r} is configured correctly and its credential resolved, but "
+        f"this build cannot read a mailbox: the Gmail connector's discovery and fetching are "
+        f"not implemented yet. Disable the source until they are."
+    )
+    raise ConfigError(msg)
+
+
 class ConnectorsPlugin:
     """The plugin object the ``connectors`` entry point resolves to."""
 
@@ -234,7 +282,7 @@ class ConnectorsPlugin:
         name="connectors",
         version="0.1.0",
         core_version=">=0.1,<0.3",
-        summary="Sources manicule ingests from: local files, pinned Git sites, and Confluence.",
+        summary="Sources manicule ingests from: files, pinned Git sites, Confluence and Gmail.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:
@@ -261,6 +309,13 @@ class ConnectorsPlugin:
             build_git_site,
             config_model=GitSiteConfig,
             summary="Pages from one pinned local Git commit, cited by their public site routes.",
+        )
+        registry.add(
+            keys.CONNECTOR.named(GMAIL_CONNECTOR_NAME),
+            build_gmail,
+            config_model=GmailConfig,
+            summary="A Google Workspace mailbox, read-only. Configuration and credential only: "
+            "reading mail is not implemented yet.",
         )
 
 

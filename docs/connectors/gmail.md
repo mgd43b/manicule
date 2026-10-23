@@ -3,14 +3,23 @@
 Design for the Gmail connector. Ticket [#457](https://github.com/mgd43b/manicule/issues/457),
 epic [#464](https://github.com/mgd43b/manicule/issues/464).
 
-> **Status: design, with the REST client built.** The calls, pacing and error typing of §5 and
-> §6 are implemented in `manicule/connectors/gmail_client.py`, against the synthetic Gmail in
-> `tests/connectors/fake_gmail.py` ([#459](https://github.com/mgd43b/manicule/issues/459)).
-> Everything else below is a decision for
-> [#458](https://github.com/mgd43b/manicule/issues/458) and
-> [#460](https://github.com/mgd43b/manicule/issues/460)–[#463](https://github.com/mgd43b/manicule/issues/463)
-> to implement, not a description of code that exists. When a section ships, its ticket
-> replaces this banner's claim for that section with the module that implements it (§12).
+> **Status: partly implemented; the connector that reads mail does not exist yet.** Two tickets
+> have shipped. [#458](https://github.com/mgd43b/manicule/issues/458) is the configuration
+> (`GmailConfig`, `manicule/connectors/config.py`), the refresh-token credential and the mailbox
+> check (`manicule/connectors/credentials.py`), the pipeline's pinned-identity check
+> (`manicule/ingest/pipeline.py`) and the `gmail-credential` `doctor` check
+> (`manicule/app/service.py`). [#459](https://github.com/mgd43b/manicule/issues/459) is the REST
+> client, whose calls, pacing and error typing (§5, §6) are in `manicule/connectors/gmail_client.py`,
+> tested against the synthetic Gmail in `tests/connectors/fake_gmail.py`. A `type = "gmail"` source
+> validates and resolves its credential, and then the factory refuses to build it, because the
+> connector is [#460](https://github.com/mgd43b/manicule/issues/460). Everything else on this page
+> — discovery, fetching and reconciliation
+> ([#460](https://github.com/mgd43b/manicule/issues/460),
+> [#466](https://github.com/mgd43b/manicule/issues/466)), `connector login`
+> ([#461](https://github.com/mgd43b/manicule/issues/461)) and the serving refusal
+> ([#462](https://github.com/mgd43b/manicule/issues/462)) — is still design: a decision for
+> those tickets to implement, not a description of code that exists. §12 says which module
+> implements which part; when a ticket ships, it replaces its sections' "will" with the module.
 
 A mailbox is the most sensitive source manicule has been pointed at, and the obvious
 implementation gets three things wrong quietly: it re-downloads the whole mailbox to find what
@@ -77,16 +86,31 @@ wins, the named environment variable fills it otherwise, and printing the config
 shows it. A credential in a configuration file is a credential in version control eventually,
 so the documented path is the environment variable.
 
-**It is resolved and checked in the factory, before the connector exists.** A missing client
-secret or refresh token is a `ConfigError` naming the setting and the environment variable.
-`doctor` reports whether a refresh succeeds, so a revoked grant is visible before a sync rather
-than at its first request ([#458](https://github.com/mgd43b/manicule/issues/458)).
+**It is resolved in the factory, before the connector exists** (implemented,
+`resolve_gmail_credentials`). A missing client secret or refresh token is a `ConfigError`
+naming the setting and the environment variable, never a value. The factory is synchronous, so
+it does no network I/O: it validates, resolves the secrets and constructs the credential
+object, and that is all. Today it then always refuses with a `ConfigError`, because the
+connector that would use the credential is [#460](https://github.com/mgd43b/manicule/issues/460)
+and handing back anything else would be a source the scheduler could try to sync that reads
+nothing. Disable a Gmail source until that lands.
 
-**Access tokens are minted from it and cached until shortly before `expires_in`.** A 401 on an
-API call refreshes once and retries once; a second 401 is a typed credential error. Google
-answering the refresh with `invalid_grant` — the grant was revoked, the account's password
-changed under a policy that revokes tokens, or the token aged out — is the same typed error,
-and its renewal text names `manicule connector login <name>`.
+**Whether a refresh succeeds is checked by `doctor` today** (the `gmail-credential` check,
+[`surfaces.md`](../surfaces.md)), so a revoked grant is visible before a sync rather than at its
+first request. [#460](https://github.com/mgd43b/manicule/issues/460) adds the same check to the
+connector's setup and to the start of each run, where it can refuse to begin.
+
+**Access tokens are minted from it and cached until shortly before `expires_in`** (implemented,
+`RefreshTokenCredential`: the cache expires 60 seconds early). The REST client
+([#459](https://github.com/mgd43b/manicule/issues/459)) asks it for `access_token()`, asks again
+with `refresh=True` after a 401 and retries once, and raises the credential's `rejected()` on a
+second 401, which is a `TokenRejectedError`; `send(attempt)` does the same refresh-and-resend for
+a caller that has no retry of its own. Google answering the
+refresh with `invalid_grant` — the grant was revoked, the account's password changed under a
+policy that revokes tokens, or the token aged out — raises `GrantRevokedError`, and its renewal
+text names `manicule connector login <name>`. The token endpoint is a constant in the module,
+not a setting: a setting for it would let one line of configuration send the client secret and
+the refresh token to any host.
 
 **Signing in again replaces the token, and the old one is not reliably dead.** Google keeps at
 most 100 refresh tokens per account per client and invalidates the oldest *without warning*
@@ -106,12 +130,16 @@ For a Workspace administrator, once per organization:
 4. If the domain restricts access to Google data for unconfigured third-party apps, mark the
    client **Trusted** under Security → Access and data control → API controls.
 
-Then, as the account whose mail is indexed:
+Then, as the account whose mail is indexed. Only `manicule doctor` exists today:
+`manicule connector login` for Gmail is [#461](https://github.com/mgd43b/manicule/issues/461),
+and syncing is [#460](https://github.com/mgd43b/manicule/issues/460). Until `login` lands, a
+refresh token has to be obtained by other means and supplied through the environment variable
+below.
 
 ```console
-$ manicule connector login mail          # opens a browser; writes the refresh token where told
-$ manicule doctor                        # the credential check should pass
-$ manicule connector sync mail
+$ manicule connector login mail          # planned (#461): opens a browser; writes the refresh token where told
+$ manicule doctor                        # the gmail-credential check should pass (implemented)
+$ manicule connector sync mail           # planned (#460): the factory refuses until then
 ```
 
 ```toml
@@ -120,12 +148,21 @@ type = "gmail"
 enabled = true
 
 [connectors.mail.options]
-account = "someone@example.org"   # the mailbox this instance indexes, and no other (§1.4)
-client_id = "1234567890-example.apps.googleusercontent.com"
-client_secret_env = "GMAIL_CLIENT_SECRET"
-refresh_token_env = "GMAIL_REFRESH_TOKEN"
-exclude_labels = []          # SPAM, TRASH and DRAFT are always excluded (§3)
+account = "someone@example.org"   # required: the primary address of the one mailbox this
+                                  # instance indexes (§1.4); stored lowercase
+client_id = "1234567890-example.apps.googleusercontent.com"   # required; not a secret
+client_secret_env = "GMAIL_CLIENT_SECRET"    # the default; client_secret = "..." wins if set
+refresh_token_env = "GMAIL_REFRESH_TOKEN"    # the default; refresh_token = "..." wins if set
+exclude_labels = []          # label names; SPAM, TRASH and DRAFT are always excluded and
+                             # listing one is refused (§3)
+quota_units_per_minute = 5400     # the default; accepted range 60 to 6000 (§6)
+max_retry_after_seconds = 120     # the default; longest Retry-After honored
+max_retries = 5                   # the default; attempts after the first
+request_timeout_seconds = 30      # the default
 ```
+
+Any other key is refused at startup, which is how the settings that are deliberately absent
+(a `query`, an `include_spam_trash`, a `user`, a token endpoint) stay absent.
 
 ### 1.4 One instance, one mailbox, pinned
 
@@ -139,20 +176,39 @@ unfinished inventory, while the old mailbox's mail stayed indexed beside it.
 
 So the mailbox is configuration, not a side effect of the credential:
 
-- **`account` is required**, and it is the address the instance indexes.
-- **It is checked against `users.getProfile`'s `emailAddress`** in the factory, in `doctor`'s
-  credential check and at the start of every run. A token for any other mailbox is a typed
-  credential error, and the run does not begin. The error says the token belongs to a different
-  mailbox without printing either address, since run-level errors are aggregate (§10). Ordinary
-  renewal cannot switch mailboxes, because the check fails before anything is read.
-- **`account` is part of the scope fingerprint** as well, so stored state from one mailbox is
-  never resumed for another even if the check were bypassed.
+- **`account` is required**, and it is the address the instance indexes. It is stored
+  lowercase, because Google compares addresses without regard to case and two spellings of one
+  address must not be two scopes. A malformed value is refused without echoing it.
+- **It is checked against `users.getProfile`'s `emailAddress`.** Implemented:
+  `RefreshTokenCredential.confirm_mailbox`, which does one refresh and one `getProfile` call and
+  raises `MailboxMismatchError` for a token that belongs to another mailbox, without printing
+  either address, since run-level errors are aggregate (§10). Today it runs in `doctor`'s
+  `gmail-credential` check. [#460](https://github.com/mgd43b/manicule/issues/460) adds it to the
+  connector's setup and to the start of each run, so that a mismatch stops the run before
+  anything is read; the factory itself cannot call it, because it is synchronous and does no
+  network I/O (§1.2). `getProfile` reports the *primary* address, so configure the primary
+  address: an alias of the account is refused as a mismatch rather than followed.
+- **`account` is part of the scope fingerprint** as well (`GmailConfig.scope_fingerprint`, which
+  also hashes the source scope, the resolved label ids and the representation version), so
+  stored state from one mailbox is never resumed for another even if the check were bypassed.
+  The fingerprint alone does not protect the first mailbox's mail, though: a different account
+  makes the stored watermark invisible rather than wrong, and the run would begin a complete
+  walk of someone else's mailbox beside the first person's. That is what the next bullet is for.
+- **Editing `account` on an instance that has synced is refused.** This is implemented in the
+  pipeline, not in the fingerprint. A connector may expose a `pinned_identity` — for Gmail, a
+  digest of the account, never the address — and before a run reads a watermark or enumerates
+  anything, the pipeline compares it with the one it recorded for that source and raises
+  `PinnedIdentityError` if they differ and the source has *synced*. "Synced" means the source
+  still holds documents, or has a run that began and did not settle; an instance that has never
+  synced may change its account freely, and deleting its documents releases the pin. The
+  fingerprint cannot do this job because it cannot tell an edit to the account (which must not
+  keep the source) from an edit to the scope (which does).
 - **Indexing a different mailbox is a different instance**, under a new connector name and
   therefore a new source identity. The old instance's documents do not leave by themselves —
   reconciliation is not wired (§7) — so they are deleted explicitly before or after the switch.
-  Editing `account` on an existing instance is refused with the same instruction rather than
-  treated as a scope change, because a scope change keeps the source and re-walks it, leaving
-  removal to reconciliation — and what would be left behind here is someone else's mail.
+  The refusal above says so, rather than treating the edit as a scope change: a scope change
+  keeps the source and re-walks it, leaving removal to reconciliation, and what would be left
+  behind here is someone else's mail.
 
 ---
 
@@ -188,8 +244,18 @@ unsent and rewritten continuously while being edited, so an indexed draft is a s
 minutes and a sent message is indexed separately once it is sent.
 
 **`exclude_labels` takes label names**, resolved to label ids once per run through
-`users.labels.list`. An unknown name is a configuration error, not an empty exclusion — a typo
-that silently excluded nothing would index precisely the mail the operator meant to keep out.
+`users.labels.list` (the listing is the REST client's, [#459](https://github.com/mgd43b/manicule/issues/459);
+the rules below are implemented in `manicule/connectors/config.py`):
+
+- An unknown name is a `ConfigError`, not an empty exclusion — a typo that silently excluded
+  nothing would index precisely the mail the operator meant to keep out. Matching is exact, so a
+  nested label is written with its slashes (`Parent/Child`). The error names only the name the
+  operator configured and never lists the labels the mailbox has, since label names come from
+  the mail and run-level errors carry none (§10). The resolution is `resolve_label_ids`, a pure
+  function over whatever `labels.list` returned.
+- **Listing SPAM, TRASH or DRAFT is refused at startup.** They are always excluded, so a setting
+  that named one would do nothing while reading like a rule in force.
+- Duplicate names are dropped, and an empty name is refused.
 
 **Why there is no `query` setting.** Gmail's search syntax is the obvious way to narrow a
 mailbox, and it cannot be used here without breaking the one rule scope has to keep: discovery,
@@ -592,18 +658,21 @@ differ, it is here — check these first when one is available:
 
 ---
 
-## 12. Where this will live
+## 12. Where this lives
 
-| Concern | Planned module | Ticket |
-|---|---|---|
-| `GmailConfig`, credential resolution | `manicule/connectors/config.py` | [#458](https://github.com/mgd43b/manicule/issues/458) |
-| Token refresh and caching | `manicule/connectors/credentials.py` | [#458](https://github.com/mgd43b/manicule/issues/458) |
-| REST calls, pacing, error typing | `manicule/connectors/gmail_client.py` (built) | [#459](https://github.com/mgd43b/manicule/issues/459) |
-| `discover`, `fetch`, `reconcile`, watermarks | `manicule/connectors/gmail.py` | [#460](https://github.com/mgd43b/manicule/issues/460) |
-| Registration, marked sensitive | `manicule/connectors/plugin.py` | [#460](https://github.com/mgd43b/manicule/issues/460) |
-| `connector login` for Gmail | `manicule/connectors/` and the CLI | [#461](https://github.com/mgd43b/manicule/issues/461) |
-| Refusing to serve a sensitive source unauthenticated | `manicule/app/bind.py` | [#462](https://github.com/mgd43b/manicule/issues/462) |
-| The synthetic Gmail | `tests/connectors/fake_gmail.py` (built) | [#459](https://github.com/mgd43b/manicule/issues/459) |
+| Concern | Module | Ticket | Status |
+|---|---|---|---|
+| `GmailConfig`, credential resolution, label-name resolution, scope fingerprint, pinned identity | `manicule/connectors/config.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
+| Token refresh and caching, 401 retry, mailbox check, credential errors | `manicule/connectors/credentials.py`, `manicule/connectors/errors.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
+| Holding a synced source to its pinned identity | `manicule/ingest/pipeline.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
+| The `gmail-credential` `doctor` check | `manicule/app/service.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
+| Registration (configuration and credential only; the factory always refuses) | `manicule/connectors/plugin.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented; completed, and marked sensitive, by [#460](https://github.com/mgd43b/manicule/issues/460) |
+| REST calls, pacing, error typing | `manicule/connectors/gmail_client.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
+| `discover`, `fetch`, `reconcile`, watermarks | `manicule/connectors/gmail.py` | [#460](https://github.com/mgd43b/manicule/issues/460) | Planned |
+| `connector login` for Gmail | `manicule/connectors/` and the CLI | [#461](https://github.com/mgd43b/manicule/issues/461) | Planned |
+| Refusing to serve a sensitive source unauthenticated | `manicule/app/bind.py` | [#462](https://github.com/mgd43b/manicule/issues/462) | Planned |
+| Reconciliation after a full walk | `manicule/connectors/gmail.py` and the pipeline | [#466](https://github.com/mgd43b/manicule/issues/466) | Planned |
+| The synthetic Gmail | `tests/connectors/fake_gmail.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
 
 No Google client library is added. The six REST calls (`getProfile`, `labels.list`,
 `messages.list`, `messages.get` in `raw` and `minimal`, and `history.list`) go through the HTTP

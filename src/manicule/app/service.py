@@ -123,7 +123,7 @@ if TYPE_CHECKING:
     from manicule.app.ports import Backend, Conversing, DocumentSurface, OpenedWorkspace
     from manicule.config.settings import OAuthProvider
     from manicule.connectors.browser import BrowserSessionProvider
-    from manicule.connectors.config import ConfluenceConfig
+    from manicule.connectors.config import ConfluenceConfig, GmailConfig
     from manicule.connectors.enriched import EnrichedProfile
     from manicule.connectors.filesystem import FilesystemConnector
     from manicule.connectors.sessions import SessionStore
@@ -3559,6 +3559,7 @@ class ApplicationService:
         checks.append(await self._authoring_check())
         checks.append(await self._collection_membership_check())
         checks.append(await self._sessions_check())
+        checks.append(await self._gmail_credential_check())
         checks.append(await self._security_alerts_check())
         checks.append(await self._document_identity_check())
         checks.append(await self._document_content_check())
@@ -4264,6 +4265,120 @@ class ApplicationService:
             # that wants to offer the action should not have to find it inside one. The
             # permissions check sets both and this is the other check with a command to give.
             remedy=f"manicule document list --source {first}",
+        )
+
+    async def _gmail_credential_check(self) -> r.Check:
+        """Whether every Gmail source has a credential that works for the mailbox it names.
+
+        **Asks Google, which is why it is its own check.** A revoked grant is invisible in
+        configuration: the variables are set and the file validates. The only way to know is to
+        spend one refresh, and a mailbox pinned to the wrong account shows only at the first
+        ``users.getProfile``. So for each enabled Gmail source this resolves the credential,
+        refreshes it and compares the mailbox it reads with the configured ``account`` — the same
+        :meth:`~manicule.connectors.credentials.RefreshTokenCredential.confirm_mailbox` the
+        connector runs before it is handed out (``docs/connectors/gmail.md`` §1.2, §1.4), so what
+        this reports is what the next sync would meet.
+
+        **Named ``gmail-credential`` and not ``sessions`` or ``connectors``** because it answers a
+        different question from each. ``sessions`` is what the server holds in memory; this is
+        what a secret store holds. ``connectors`` is whether a source has run; this runs nothing.
+        Monitors select on a name, and one that meant two things would watch the wrong one.
+
+        **States.** ``failing`` when the next sync would stop on a credential: a secret that is
+        absent, a grant that is revoked, an OAuth client Google rejects, or a token that belongs to
+        another mailbox. ``degraded`` when Google could not be asked, which says nothing about the
+        credential. Neither the detail nor the facts carries an address, a token or a secret —
+        they carry source names and fixed outcome words, because ``doctor`` output is read by more
+        people than the mailbox is.
+        """
+        from manicule.connectors.config import GMAIL_CONNECTOR_NAME  # noqa: PLC0415
+
+        # Options over the type's global defaults, as the container merges them: a `client_id`
+        # set under `plugins.config."connector.gmail"` is in force for the connector, so a check
+        # reading only the instance's own options would skip a source the factory would build.
+        defaults = self.settings.component_config("connector", GMAIL_CONNECTOR_NAME)
+        sources = sorted(
+            (name, {**defaults, **configured.options})
+            for name, configured in self.settings.connectors.items()
+            if configured.type == GMAIL_CONNECTOR_NAME and configured.enabled
+        )
+        # Concurrently: each source can wait out Google's timeout twice, and a deployment with
+        # several would otherwise hold `doctor` for the sum of them.
+        found = await asyncio.gather(
+            *(_observed_gmail_outcome(name, options) for name, options in sources)
+        )
+        outcomes = {name: word for (name, _), (word, _) in zip(sources, found, strict=True)}
+        age = max((seen for _, seen in found), default=0.0)
+        fresh = age == 0.0
+
+        # The same two facts the `component:*` checks carry (`runtime.py`): a result reused from
+        # a moment ago says how old it is, instead of presenting an old green as a new one.
+        facts = cast(
+            "dict[str, JsonValue]",
+            {
+                "sources": dict(sorted(outcomes.items())),
+                "observed_seconds_ago": round(age, 3),
+                "freshly_measured": fresh,
+            },
+        )
+        stale = "" if fresh else f" (observed {age:.0f}s ago)"
+        if not outcomes:
+            return r.Check(
+                name="gmail-credential",
+                state="ok",
+                detail="no enabled source reads a Gmail mailbox",
+                facts=facts,
+            )
+        broken = {name: why for name, why in sorted(outcomes.items()) if why != "ok"}
+        if not broken:
+            return r.Check(
+                name="gmail-credential",
+                state="ok",
+                detail=(
+                    f"{_listed(outcomes)} refresh(es) a Gmail access token and read the "
+                    f"configured mailbox{stale}"
+                ),
+                facts=facts,
+            )
+        first, why = next(iter(broken.items()))
+        sentences = {
+            "invalid_options": "has options that do not validate",
+            "dependency_missing": "cannot run because the HTTP client is not installed",
+            "missing_secret": (
+                "has no client secret or refresh token in its configuration or environment"
+            ),
+            "different_mailbox": "holds a credential for a different mailbox than its account",
+            "grant_revoked": "has a refresh token Google no longer honors",
+            "credential_rejected": "was refused by Google (the OAuth client or the grant)",
+            "unreachable": "could not be checked because Google did not answer",
+        }
+        problems = "; ".join(f"{name!r} {sentences[reason]}" for name, reason in broken.items())
+        only_unreachable = all(reason == "unreachable" for reason in broken.values())
+        if why == "dependency_missing":
+            remedy = "pip install 'manicule[connectors]'"
+        elif why == "invalid_options":
+            remedy = (
+                "fix the source's options: account and client_id are required, and a key "
+                "the connector does not define is refused (docs/connectors/gmail.md §1.3)"
+            )
+        elif why == "missing_secret":
+            remedy = (
+                "set client_secret and refresh_token, or the variables named in the source's "
+                "options (docs/connectors/gmail.md §1.3)"
+            )
+        elif why == "unreachable":
+            remedy = "check the machine can reach Google, then run `manicule doctor` again"
+        else:
+            remedy = (
+                f"mint a new Gmail refresh token for {first!r} as the account it is configured "
+                f"for and supply it as its refresh_token (docs/connectors/gmail.md §1.3)"
+            )
+        return r.Check(
+            name="gmail-credential",
+            state="degraded" if only_unreachable else "failing",
+            detail=f"{problems}. Nothing was read from any mailbox.{stale}",
+            facts=facts,
+            remedy=remedy,
         )
 
     async def _sessions_check(self) -> r.Check:
@@ -8744,6 +8859,115 @@ def _millis(started: float) -> int:
 
 def _severity(state: r.CheckState) -> int:
     return {"ok": 0, "degraded": 1, "failing": 2, "unknown": 1}.get(state, 1)
+
+
+GMAIL_PROBE_TTL_SECONDS = 30.0
+"""How long a Gmail source's probe result is reused.
+
+``doctor`` is asked for repeatedly by anything that renders it — the web dashboard, a health
+poll — and each probe is a token exchange and a ``users.getProfile`` against Google's quota. A
+fresh process (the command line) has nothing cached, so ``manicule doctor`` always measures.
+"""
+
+_gmail_clock: Callable[[], float] = time.monotonic
+_gmail_observations: dict[tuple[str, str], tuple[float, str]] = {}
+"""``(source, digest of its options)`` to ``(when, outcome)``. Digested so a secret set in the
+options is not kept as a dictionary key, and keyed by options so editing a source is a miss."""
+
+GMAIL_PROBE_DEADLINE_SECONDS = 15.0
+"""How long ``doctor`` waits for one Gmail source's probe before calling it unreachable.
+
+The credential's own timeout is the *sync* request timeout, and it applies to each of the two
+requests a probe makes; a diagnostic's latency should not be set by a setting meant for a
+large download. Sources are probed concurrently, so this bounds the whole sweep.
+"""
+
+
+def _resolve_gmail_source(name: str, options: Mapping[str, Any]) -> GmailConfig | str:
+    """The source's settings with its secrets resolved, or the fixed word for what is wrong.
+
+    Done on every call, ahead of any reuse of an earlier probe: a secret removed from the
+    environment a moment ago must not be reported as a working credential for the rest of the
+    reuse window. Nothing here asks Google.
+    """
+    from manicule.connectors.config import (  # noqa: PLC0415 - no HTTP stack at import
+        GmailConfig,
+        resolve_gmail_credentials,
+    )
+
+    try:
+        config = GmailConfig.model_validate(options)
+    except ValidationError:
+        return "invalid_options"
+    try:
+        return resolve_gmail_credentials(config, instance=name)
+    except ConfigError:
+        return "missing_secret"
+
+
+async def _observed_gmail_outcome(name: str, options: Mapping[str, Any]) -> tuple[str, float]:
+    """A source's outcome and how many seconds old it is (``0.0`` when measured just now).
+
+    A probe is reused only for the same source with the same settings **and the same resolved
+    secrets**, so replacing a token is a new measurement rather than a stale answer about the old
+    one, and a problem found locally is reported as it stands, never remembered.
+    """
+    resolved = _resolve_gmail_source(name, options)
+    if isinstance(resolved, str):
+        return resolved, 0.0
+    material = json.dumps(
+        [
+            resolved.model_dump(mode="json"),
+            resolved.client_secret.get_secret_value() if resolved.client_secret else "",
+            resolved.refresh_token.get_secret_value() if resolved.refresh_token else "",
+        ],
+        sort_keys=True,
+    )
+    key = (name, hashlib.blake2b(material.encode(), digest_size=16).hexdigest())
+    now = _gmail_clock()
+    held = _gmail_observations.get(key)
+    if held is not None and now - held[0] < GMAIL_PROBE_TTL_SECONDS:
+        return held[1], now - held[0]
+    word = await _probe_gmail_source(name, resolved)
+    if word == "dependency_missing":
+        _gmail_observations.pop(key, None)
+    else:
+        _gmail_observations[key] = (_gmail_clock(), word)
+    return word, 0.0
+
+
+async def _probe_gmail_source(name: str, resolved: GmailConfig) -> str:
+    """One refresh and one ``getProfile`` for a source, as a word from a closed set.
+
+    Every outcome is a fixed word, because the outcome reaches ``doctor``'s ``facts`` and nothing
+    a mailbox, Google or a secret supplied may reach those. The word never carries a value.
+    """
+    from manicule.connectors.credentials import gmail_credential  # noqa: PLC0415
+    from manicule.connectors.errors import (  # noqa: PLC0415
+        ConnectorError,
+        CredentialError,
+        GrantRevokedError,
+        MailboxMismatchError,
+    )
+
+    credential = gmail_credential(resolved, instance=name)
+    try:
+        async with asyncio.timeout(GMAIL_PROBE_DEADLINE_SECONDS):
+            await credential.confirm_mailbox(resolved.account)
+    except TimeoutError:
+        return "unreachable"
+    except ConfigError:
+        return "dependency_missing"
+    except ConnectorError as error:
+        # Most specific first: each of these is a CredentialError, and anything that is not one
+        # is Google failing to answer, which says nothing about the credential.
+        named = (
+            (MailboxMismatchError, "different_mailbox"),
+            (GrantRevokedError, "grant_revoked"),
+            (CredentialError, "credential_rejected"),
+        )
+        return next((word for kind, word in named if isinstance(error, kind)), "unreachable")
+    return "ok"
 
 
 def _listed(names: Iterable[str]) -> str:

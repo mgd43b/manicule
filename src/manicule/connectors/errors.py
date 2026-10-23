@@ -31,15 +31,20 @@ __all__ = [
     "CrawlerThrottleError",
     "CrawlerTimeoutError",
     "CrawlerTransportError",
+    "CredentialError",
     "CursorExpiredError",
+    "GrantRevokedError",
+    "MailboxMismatchError",
     "NotFoundError",
     "PermissionDeniedError",
+    "PinnedIdentityError",
     "ProviderRefusedError",
     "RateLimitedError",
     "RemoteError",
     "RequestTimeoutError",
     "SessionExpiredError",
     "SessionMissingError",
+    "TokenRejectedError",
     "UntrustedLinkError",
 ]
 
@@ -266,4 +271,58 @@ class SessionMissingError(ConfigError):
     nothing at all. :class:`~manicule.app.served.Scheduler` matches on this type, records it as
     its own state, and says which of the two it was. Matching on the message text would be a
     guard that breaks when somebody improves the wording.
+    """
+
+
+class CredentialError(ConnectorError):
+    """A credential that mints its own access tokens could not authenticate a request.
+
+    The family :class:`~manicule.connectors.credentials.RefreshTokenCredential` fails with, as
+    :class:`SessionExpiredError` is the family a browser session fails with. It is
+    a :class:`ConnectorError` rather than a :class:`~manicule.core.errors.ConfigError` because
+    what it reports is the source's answer — a grant Google no longer honors, a token it
+    rejected, a mailbox that is not the configured one — and not a setting that can be read off
+    the page. Every subclass carries what a person does about it in its message, because
+    a run that stops on one needs a person, and the person is reading a log line.
+
+    **No message carries a secret, an access token, or a mailbox address.** Run-level errors are
+    aggregate (``docs/connectors/gmail.md`` §10): they are read by whoever reads a log or a
+    status surface, which is a wider audience than whoever may read the mail.
+    """
+
+
+class GrantRevokedError(CredentialError):
+    """Google answered the refresh with ``invalid_grant``: the refresh token is no longer good.
+
+    The grant was revoked, the account's password changed under a policy that revokes tokens, or
+    the token aged out. No amount of retrying changes it, so the run stops and the message names
+    ``manicule connector login <name>``, which mints a replacement.
+    """
+
+
+class TokenRejectedError(CredentialError):
+    """A request was rejected with 401 after a freshly minted access token was tried.
+
+    One refresh and one resend is the whole policy: the first 401 is an access token that expired
+    or was revoked early, and the second is something a retry cannot fix.
+    """
+
+
+class MailboxMismatchError(CredentialError):
+    """The credential belongs to a different mailbox than the instance is configured for.
+
+    A token can read only the mailbox that granted it, and tokens are replaced routinely; the
+    configured ``account`` is what keeps a replacement from silently switching which mailbox an
+    instance indexes (``docs/connectors/gmail.md`` §1.4). The message says so without printing
+    either address.
+    """
+
+
+class PinnedIdentityError(ConfigError):
+    """An instance that has synced was pointed at a different identity than it synced.
+
+    A :class:`~manicule.core.errors.ConfigError`, because the fix is in configuration: indexing
+    a different mailbox is a different instance, under a new name and therefore a new source
+    identity. Distinct from a scope change, which keeps the source and re-walks it — what would
+    be left behind here is another person's mail. No message carries either identity.
     """

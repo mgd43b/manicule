@@ -62,6 +62,7 @@ from manicule.connectors.errors import (
     BodyUnavailableError,
     CursorExpiredError,
     NotFoundError,
+    PinnedIdentityError,
     RemoteError,
     RequestTimeoutError,
     SessionExpiredError,
@@ -966,6 +967,16 @@ class _Sync:
 
 
 JOURNAL_PAGE: Final = 64
+
+PINNED_IDENTITY_KEY: Final = "pinned_identity"
+"""The connector-metadata key holding the identity a source was last synced as."""
+
+WATERMARK_IDENTITY_KEY: Final = "watermark_identity"
+"""The connector-metadata key holding the identity the stored watermark was committed under.
+
+The non-durable path reads a watermark without a scope fingerprint, so nothing else ties a
+cursor to the account it came from. See :meth:`IngestPipeline._trusted_watermark`.
+"""
 """How many acquisition records a journal reader takes per query.
 
 The three readers walked the journal with ``limit=1``, so a durable run issued one SQL query
@@ -1384,6 +1395,70 @@ class IngestPipeline:
                 retain_source_bytes=retain_source_bytes,
             )
 
+    async def _trusted_watermark(self, connector: Connector) -> Watermark | None:
+        """The stored watermark, unless it was committed under another identity.
+
+        The non-durable path reads the cursor without a scope fingerprint, so the pin alone does
+        not keep it from the wrong account: after the documents are deleted to release the pin, the
+        old account's cursor is still stored and would be handed to the new account's discovery,
+        which an incremental connector would honor by skipping everything before it. A connector
+        that declares an identity therefore has its cursor trusted only if the run that committed
+        it recorded the same identity. Nothing is deleted: the next committed run overwrites it.
+        """
+        watermark = await self._store.get_watermark(connector.name)
+        identity = declared_identity(connector)
+        if watermark is None or not identity:
+            return watermark
+        recorded = (await self._store.connector_metadata(connector.name)).get(
+            WATERMARK_IDENTITY_KEY
+        )
+        return watermark if recorded == identity else None
+
+    async def _hold_pinned_identity(self, connector: Connector) -> None:
+        """Refuse to sync a source that has synced as one identity under another.
+
+        **For a connector whose identity is not its location.** A mailbox is chosen by the
+        credential, and credentials are replaced routinely, so a connector can declare
+        ``pinned_identity`` — a digest, never the identity itself — and this holds the instance to
+        it. The scope fingerprint cannot: it includes the identity, so a different one makes the
+        stored watermark invisible rather than wrong, and the run would quietly begin a complete
+        walk of someone else's data beside the first person's. Nor can the fingerprint tell an
+        edit to the identity from an edit to the scope, and only one of those keeps the source.
+
+        **"Synced" is state that would be left behind**: documents the source still holds, or a
+        run that began and did not settle. A never-synced instance changes identity freely, and
+        deleting the documents is what releases a pin, which is the instruction the error gives.
+        A connector without the attribute is unaffected.
+
+        Raises:
+            PinnedIdentityError: The identity differs from the one recorded and the source has
+                synced. Raised before the watermark is read or anything is enumerated.
+        """
+        declared = declared_identity(connector)
+        if not declared:
+            return
+        recorded = (await self._store.connector_metadata(connector.name)).get(PINNED_IDENTITY_KEY)
+        if recorded == declared:
+            return
+        if isinstance(recorded, str) and recorded:
+            holds_documents = await self._store.count_documents(source=connector.name) > 0
+            unsettled = (
+                self._acquisitions is not None
+                and await self._acquisitions.latest_unsettled_acquisition_run(connector.name)
+                is not None
+            )
+            if holds_documents or unsettled:
+                msg = (
+                    f"connector {connector.name!r} has synced as a different identity than the "
+                    f"one it is now configured with. Indexing another account is a different "
+                    f"instance: give it a new name, and delete the documents this instance "
+                    f"indexed. This one is refused rather than treated as a change of scope, "
+                    f"because a change of scope keeps the source and would leave the first "
+                    f"account's data indexed beside the second's."
+                )
+                raise PinnedIdentityError(msg)
+        await self._store.record_connector_metadata(connector.name, {PINNED_IDENTITY_KEY: declared})
+
     async def _run_guarded(  # noqa: PLR0912, PLR0915 - orchestrates durable recovery stages
         self,
         connector: Connector,
@@ -1443,6 +1518,7 @@ class IngestPipeline:
         if not acquire_only and not self._derivation_enabled:
             msg = "this runtime was assembled for source acquisition only"
             raise RuntimeError(msg)
+        await self._hold_pinned_identity(connector)
         retain = self._retain_source_bytes if retain_source_bytes is None else retain_source_bytes
         if acquire_only and (not retain or self._acquisitions is None):
             msg = "acquire-only requires durable source-byte retention"
@@ -1477,7 +1553,7 @@ class IngestPipeline:
                 connector.name, scope_fingerprint
             )
         else:
-            watermark = await self._store.get_watermark(connector.name)
+            watermark = await self._trusted_watermark(connector)
         try:
             acquisition = await self._start_acquisition(connector, watermark, acquisitions)
         except CapacityRefusedError as error:
@@ -3258,6 +3334,13 @@ class IngestPipeline:
         )
         if reached is not None:
             await self._store.set_watermark(run.connector.name, reached)
+            identity = declared_identity(run.connector)
+            if identity:
+                # After the watermark, so an interruption between the two leaves a cursor with
+                # no matching identity, which is read as foreign and costs a complete walk.
+                await self._store.record_connector_metadata(
+                    run.connector.name, {WATERMARK_IDENTITY_KEY: identity}
+                )
             return True
         return False
 
@@ -4998,16 +5081,35 @@ def _expanded(outcome: DocumentOutcome) -> bool:
     return outcome.enumerated
 
 
+def declared_identity(connector: Connector) -> str:
+    """The digest of the identity a connector was configured with, or ``""`` for one with none."""
+    declared = getattr(connector, "pinned_identity", None)
+    return declared if isinstance(declared, str) else ""
+
+
 def snapshot_scope(connector: Connector) -> tuple[str, str]:
-    """Read a connector's non-secret scope identity, with a safe whole-instance default."""
+    """Read a connector's non-secret scope identity, with a safe whole-instance default.
+
+    **A declared identity is part of the fingerprint whoever computes it.** A durable cursor is
+    reused only under the fingerprint it was committed with, so folding the identity in here —
+    including when the connector supplies its own fingerprint — means no connector that
+    declares one can have its cursor read back under another account's, whatever its own
+    fingerprint chose to include. A connector without an identity is unchanged.
+    """
     declared = getattr(connector, "source_scope", None)
     source_scope = (
         declared if isinstance(declared, str) and declared else f"instance:{connector.name}"
     )
     declared_fingerprint = getattr(connector, "scope_fingerprint", None)
     if isinstance(declared_fingerprint, str) and declared_fingerprint:
-        return source_scope, declared_fingerprint
-    fingerprint = hashlib.blake2b(source_scope.encode(), digest_size=20).hexdigest()
+        fingerprint = declared_fingerprint
+    else:
+        fingerprint = hashlib.blake2b(source_scope.encode(), digest_size=20).hexdigest()
+    identity = declared_identity(connector)
+    if identity:
+        fingerprint = hashlib.blake2b(
+            f"{fingerprint}|identity={identity}".encode(), digest_size=20
+        ).hexdigest()
     return source_scope, fingerprint
 
 
