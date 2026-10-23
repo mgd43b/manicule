@@ -635,3 +635,44 @@ async def test_discarding_rejects_an_omitted_or_mismatched_scope(store: SqliteDo
 
     assert mismatched.refused
     assert PROPOSED_DELETION_KEY in await store.connector_metadata(_CONNECTOR)
+
+
+async def test_a_pass_held_off_keeps_its_inventory_and_applies_it_without_asking_again(
+    store: SqliteDocStore,
+) -> None:
+    """A backup holding the data defers the delete, not the enumeration.
+
+    The completed inventory stays resumable, so the next attempt applies it without contacting
+    the source — which the connector here would refuse, having been told it will not be asked.
+    """
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    await _documents(store, 4)
+    source = _BatchedInventory()
+    state = {"reason": "a backup is running"}
+
+    @asynccontextmanager
+    async def window():  # noqa: ANN202
+        yield state["reason"]
+
+    declined = await reconcile(
+        source, store, scope=_SCOPE, now=_NOW, window=window, max_delete_fraction=0.5
+    )
+    assert declined.blocked == "a backup is running"
+    for number in range(4):
+        assert await store.find_document(_CONNECTOR, f"page-{number}") is not None
+    assert await store.latest_completed_reconciliation_inventory(_CONNECTOR, _SCOPE) is not None
+
+    state["reason"] = ""
+    applied = await reconcile(
+        _MustNotEnumerate(),
+        store,
+        scope=_SCOPE,
+        now=_NOW,
+        window=window,
+        max_delete_fraction=0.5,
+    )
+
+    assert applied.blocked == ""
+    assert applied.applied_count == 1
+    assert await store.find_document(_CONNECTOR, "page-3") is None

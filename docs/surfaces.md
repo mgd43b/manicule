@@ -932,7 +932,7 @@ the URL it was asking for.
 | `confirmed` | `ok: true` | The proposal's reviewed set was soft-deleted, without enumerating again; documents republished or seen since are skipped, so `deleted` can be below `missing`. |
 | `discarded` | `ok: true` | Nothing was deleted, the proposal was cleared and the interval restarted. |
 | `proposed` | `ok: false`, HTTP 409, `ReconciliationRefusedError` | The diff exceeded `ingest.reconcile_max_delete_fraction`. Nothing was deleted; `proposal_pending` is true. |
-| `blocked` | `ok: false`, HTTP 503, `ReconciliationBlockedError` | The pass did not start because something else held the data. Nothing was enumerated or deleted. |
+| `blocked` | `ok: false`, HTTP 503, `ReconciliationBlockedError` | A backup held the data when the pass reached the step that deletes (or when a confirmation would have applied). Nothing was deleted; a completed inventory is kept, so the next attempt applies it without asking the source again. |
 | `failed` | `ok: false`, HTTP 503 | The source could not be enumerated completely, so nothing was deleted. `error_type` names the class. |
 | `none_pending` | `ok: false`, HTTP 404, `UnknownEntityError` | `--confirm` or `--discard` found no proposal for the connector's current scope. |
 

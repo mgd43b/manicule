@@ -1441,7 +1441,12 @@ class _Ingestion:
     ) -> Reconciliation:
         """Enumerate one connector's source and soft-delete what left it.
 
-        The whole pass, enumeration included, runs under the derived-mutation guard. A sync
+        The whole pass, enumeration included, runs under the derived-mutation guard, and only
+        the step that soft-deletes takes the backup window (``Runtime.maintenance_window``): a
+        backup waits for that step, not for an enumeration that can take minutes, and a pass
+        that finds a backup running declines with ``blocked`` set and deletes nothing.
+
+        The derived-mutation guard is also what stops a sync of the same connector. A sync
         holds it across its own network walk, so this adds no new kind of wait, and holding it
         is what keeps a sync of the same connector from publishing documents between the
         inventory and the diff — the race the inventory's own newer-evidence rule would
@@ -1461,6 +1466,7 @@ class _Ingestion:
                 store,
                 max_delete_fraction=max_delete_fraction,
                 dry_run=dry_run,
+                window=self._runtime.maintenance_window,
             )
 
     async def resolve_proposal(self, connector: str, *, confirm: bool) -> Reconciliation:
@@ -1471,6 +1477,7 @@ class _Ingestion:
         different source (``docs/ingest.md`` §11.1).
         """
         from manicule.ingest.reconcile import (  # noqa: PLC0415
+            Reconciliation,
             confirm_proposed_deletion,
             connector_scope,
             discard_proposed_deletion,
@@ -1480,10 +1487,14 @@ class _Ingestion:
         store = cast("IngestStore", await self._runtime.documents())
         scope = connector_scope(built)
         async with self._runtime.derived_mutation_guard():
-            if confirm:
+            if not confirm:
+                return await discard_proposed_deletion(connector, store, scope=scope)
+            # Only the apply takes the window: it removes documents, where discarding keeps them.
+            async with self._runtime.maintenance_window() as blocked:
+                if blocked:
+                    return Reconciliation(connector=connector, blocked=blocked)
                 confirmed = await confirm_proposed_deletion(connector, store, scope=scope)
-                return _confirmed(connector, confirmed)
-            return await discard_proposed_deletion(connector, store, scope=scope)
+            return _confirmed(connector, confirmed)
 
     async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
         """Read the active or newest promoted manifest from durable local identity."""

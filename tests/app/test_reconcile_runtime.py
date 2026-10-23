@@ -26,6 +26,7 @@ from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.core.errors import PolicyError
 from manicule.plugins.registry import discover
+from manicule.storage.backup_lock import backup_lock
 from tests.app.test_scheduler import Clock
 from tests.fakes import HashEmbedder
 from tests.ingest.fakes import BlockChunker
@@ -281,3 +282,81 @@ async def test_the_scheduler_reconciles_a_due_source_end_to_end(
     assert scheduler.reconciling["docs"].deleted == 1
     summary = (await service.connector_list()).connectors[0]
     assert summary.last_reconciled_at is not None
+
+
+async def test_a_pass_declines_while_a_backup_holds_the_data_and_runs_after(
+    service: ApplicationService, source_root: Path, manicule_environment: Path
+) -> None:
+    """The issue's 'not during a backup', against the real lock a real backup takes."""
+    await service.connector_sync("docs")
+    remove(source_root, 3)
+
+    async with backup_lock(manicule_environment / "data", wait_s=5):
+        held = await run_op(
+            "connector_reconcile", "default", lambda: service.connector_reconcile("docs")
+        )
+        preview = await service.connector_reconcile("docs", dry_run=True)
+
+    assert held.ok is False
+    assert held.error is not None
+    assert held.error.type == "ReconciliationBlockedError"
+    assert await live(service) == 10, "a backup was copying; nothing was removed"
+    assert preview.outcome == "previewed", "a preview removes nothing and never has to wait"
+    after = await service.connector_reconcile("docs")
+    assert (after.outcome, after.deleted) == ("applied", 1)
+
+
+async def test_confirming_waits_for_a_backup_but_discarding_does_not(
+    service: ApplicationService, source_root: Path, manicule_environment: Path
+) -> None:
+    await service.connector_sync("docs")
+    remove(source_root, 0, 1, 2, 3, 4)
+    await service.connector_reconcile("docs")
+
+    async with backup_lock(manicule_environment / "data", wait_s=5):
+        confirm = await service.connector_reconcile_resolve("docs", confirm=True)
+    assert confirm.outcome == "blocked"
+    assert await live(service) == 10
+
+    confirmed = await service.connector_reconcile_resolve("docs", confirm=True)
+    assert (confirmed.outcome, confirmed.deleted) == ("confirmed", 5)
+
+
+async def test_discarding_does_not_wait_for_a_backup(
+    service: ApplicationService, source_root: Path, manicule_environment: Path
+) -> None:
+    await service.connector_sync("docs")
+    remove(source_root, 0, 1, 2, 3, 4)
+    await service.connector_reconcile("docs")
+
+    async with backup_lock(manicule_environment / "data", wait_s=5):
+        discarded = await service.connector_reconcile_resolve("docs", confirm=False)
+
+    assert discarded.outcome == "discarded"
+
+
+async def test_a_backup_waits_for_a_pass_in_its_removal_step_and_not_for_its_enumeration(
+    service: ApplicationService, source_root: Path, manicule_environment: Path
+) -> None:
+    """The window is held around the delete, so a slow source never starves a backup."""
+    from manicule.storage.backup_lock import MaintenanceBusyError  # noqa: PLC0415
+
+    await service.connector_sync("docs")
+    connector = await (await service._backend.ingestion()).connector("docs")  # pyright: ignore[reportPrivateUsage]
+    real = connector.reconcile
+    during_enumeration: list[bool] = []
+
+    async def enumerating() -> AsyncIterator[str]:
+        try:
+            async with backup_lock(manicule_environment / "data", wait_s=0.1):
+                during_enumeration.append(True)
+        except MaintenanceBusyError:
+            during_enumeration.append(False)
+        async for source_id in real():
+            yield source_id
+
+    object.__setattr__(connector, "reconcile", enumerating)
+
+    await service.connector_reconcile("docs")
+
+    assert during_enumeration == [True], "a backup could take the lock mid-enumeration"

@@ -1,10 +1,12 @@
 """The lock that keeps a hot backup from overlapping an operation that removes data.
 
 A backup copies a data directory that a server may be writing, and ``docs/storage.md`` §9.1
-makes it correct by ordering alone **only if nothing removes data while it copies**. Two
-passes remove data: the vector sweep (which also purges soft-deleted documents) and blob
-garbage collection. This module is what keeps those two, and any other pass that deletes
-something a snapshot is about to read, out of a backup's way — and a backup out of theirs.
+makes it correct by ordering alone **only if nothing removes data while it copies**. Three
+passes remove data: the vector sweep (which also purges soft-deleted documents), blob garbage
+collection, and the step of a reconciliation that soft-deletes documents that left their source
+(``manicule.app.runtime._Ingestion.reconcile``). This module is what keeps those, and any other
+pass that deletes something a snapshot is about to read, out of a backup's way — and a backup
+out of theirs.
 
 **Cross-process, because the two halves live in different processes.** ``backup`` is a
 read-only operation (:data:`~manicule.app.dispatch.READ_ONLY_OPS`), so the command line runs
@@ -148,7 +150,8 @@ class MaintenanceHold:
             os.close(handle)
             self._blocked_by = (
                 "a backup is running and holds the backup lock; this pass removes data a "
-                "backup is copying, so it declines and will run at its next interval"
+                "backup is copying, so it declines; a scheduled pass looks again at its next "
+                "interval, and a command can be run again once the backup has finished"
             )
             return self._blocked_by
         except OSError as exc:

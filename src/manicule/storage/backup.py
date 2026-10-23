@@ -130,9 +130,9 @@ async def create_backup(
 
     The order is load-bearing and is argued in the module docstring. The backup lock
     (:func:`manicule.storage.backup_lock.backup_lock`) is taken here, exclusively, for the whole
-    snapshot: the vector sweep and the blob GC are the only two operations that remove data, and
-    they are the only two a hot backup has to exclude, so a caller has nothing to arrange. A
-    pass already running is waited for, up to ``lock_wait_s``.
+    snapshot: the vector sweep, the blob GC and a reconciliation's soft-delete step are the
+    operations that remove data, and they are the ones a hot backup has to exclude, so a caller
+    has nothing to arrange. A pass already running is waited for, up to ``lock_wait_s``.
 
     Args:
         engine: The live engine, used to read counts and the migration revision.

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast, overload
@@ -44,9 +45,11 @@ from manicule.ingest.containers import retire_derived
 from manicule.ingest.ports import ReconciliationStore
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+    from contextlib import AbstractAsyncContextManager
 
     from manicule.core.protocols import Connector
+    from manicule.core.reconciliation import CompletedInventory
     from manicule.core.sources import SourceId
     from manicule.ingest.ports import IngestStore
 
@@ -168,6 +171,24 @@ def _moment(recorded: object) -> datetime | None:
     return None
 
 
+type RemovalWindow = Callable[[], AbstractAsyncContextManager[str]]
+"""What a caller supplies to keep a pass off data something else is copying.
+
+Entered only around the step that removes documents. It yields ``""`` when the body may proceed
+and a sentence naming what is in the way when it may not (``Runtime.maintenance_window`` is the
+production one). Enumeration, the diff and recording a proposal remove nothing, so a backup
+need not wait for them — and an enumeration can take minutes."""
+
+
+@asynccontextmanager
+async def _held(window: RemovalWindow | None) -> AsyncGenerator[str]:
+    if window is None:
+        yield ""
+        return
+    async with window() as blocked:
+        yield blocked
+
+
 def last_attempt(metadata: Mapping[str, object]) -> datetime | None:
     """When reconciliation last concluded for this connector, by a clean pass or an operator.
 
@@ -205,6 +226,7 @@ async def reconcile(
     now: datetime | None = None,
     scope: str | None = None,
     dry_run: bool = False,
+    window: RemovalWindow | None = None,
 ) -> Reconciliation:
     """Diff what the source still has against what is indexed, and soft-delete the difference.
 
@@ -216,6 +238,9 @@ async def reconcile(
         store: Holds what is indexed for this connector.
         max_delete_fraction: The ceiling from guard 2.
         now: For deterministic tests; defaults to the current time.
+        window: Entered around the step that soft-deletes. When it reports something in the way,
+            nothing is deleted and ``blocked`` says why; a durable inventory that completed is
+            kept, so the next attempt applies it without contacting the source again.
 
     Returns:
         What happened, including the refusal or the error when there was one. Never raises for
@@ -230,88 +255,16 @@ async def reconcile(
             now=now,
             scope=scope or connector_scope(connector),
             dry_run=dry_run,
+            window=window,
         )
 
-    seen: set[SourceId] = set()
-    try:
-        async for source_id in connector.reconcile():
-            seen.add(source_id)
-    except Exception as exc:  # noqa: BLE001 - a partial enumeration is data, not a crash
-        # Guard 1. What was seen is a prefix, and a prefix diffed against the stored set marks
-        # everything not yet enumerated as deleted. Discarded rather than salvaged.
-        return Reconciliation(
-            connector=connector.name,
-            seen=len(seen),
-            error=f"{type(exc).__name__}: {exc}",
-            error_type=type(exc).__name__,
-        )
-
-    known: list[SourceId] = []
-    stream = store.known_source_ids(connector.name)
-    try:
-        async for source_id in stream:
-            known.append(source_id)
-    finally:
-        closer = getattr(stream, "aclose", None)
-        if closer is not None:
-            await closer()
-
-    missing = tuple(sorted(set(known) - seen))
-    if dry_run:
-        return Reconciliation(
-            connector=connector.name,
-            seen=len(seen),
-            live_count=len(known),
-            missing_count=len(missing),
-            dry_run=True,
-        )
-    if not missing:
-        await _record_clean(store, connector.name, now)
-        return Reconciliation(connector=connector.name, seen=len(seen), live_count=len(known))
-
-    # Guard 2. Against the live count, not against what the source reported: a source that
-    # returned almost nothing is exactly the case the ceiling exists for.
-    if known and len(missing) / len(known) > max_delete_fraction:
-        refusal = (
-            f"reconciling {connector.name!r} would soft-delete {len(missing)} of "
-            f"{len(known)} live document(s), above the {max_delete_fraction:.0%} ceiling. A "
-            f"bulk deletion this large is rare and worth confirming; a bug that looks like one "
-            f"is not rare at all. The proposal is recorded — confirm it, or fix the source and "
-            f"reconcile again."
-        )
-        await store.record_connector_metadata(
-            connector.name,
-            {PROPOSED_DELETION_KEY: {"source_ids": list(missing), "live": len(known)}},
-        )
-        return Reconciliation(
-            connector=connector.name,
-            seen=len(seen),
-            refused=refusal,
-            proposed=missing,
-            live_count=len(known),
-            missing_count=len(missing),
-        )
-
-    # Guard 3. Soft only. Chunks, vectors and FTS rows all stay and become invisible at the
-    # join, so restoring is clearing a timestamp — no re-embed, no re-parse, no re-fetch.
-    for source_id in missing:
-        document = await store.find_document(connector.name, source_id)
-        if document is not None:
-            await store.soft_delete_document(document.id)
-            # And whatever was expanded out of it. A member's source id was never in this
-            # connector's inventory, so the diff above cannot name it and a later pass never
-            # will — the query that finds candidates excludes derived documents on purpose.
-            # Leaving them behind is leaving documents that are searchable, citable, and
-            # unreachable by the only thing that would have removed them.
-            await retire_derived(store, document)
-    await _record_clean(store, connector.name, now)
-    return Reconciliation(
-        connector=connector.name,
-        seen=len(seen),
-        deleted=missing,
-        live_count=len(known),
-        missing_count=len(missing),
-        applied_count=len(missing),
+    return await _reconcile_in_memory(
+        connector,
+        store,
+        max_delete_fraction=max_delete_fraction,
+        now=now,
+        dry_run=dry_run,
+        window=window,
     )
 
 
@@ -462,6 +415,157 @@ def connector_scope(connector: Connector) -> str:
     return f"whole-connector:{connector.name}"
 
 
+async def _reconcile_in_memory(
+    connector: Connector,
+    store: IngestStore,
+    *,
+    max_delete_fraction: float,
+    now: datetime | None,
+    dry_run: bool,
+    window: RemovalWindow | None,
+) -> Reconciliation:
+    """The pass for a store with no durable journal: the whole inventory in a set."""
+    seen: set[SourceId] = set()
+    try:
+        async for source_id in connector.reconcile():
+            seen.add(source_id)
+    except Exception as exc:  # noqa: BLE001 - a partial enumeration is data, not a crash
+        # Guard 1. What was seen is a prefix, and a prefix diffed against the stored set marks
+        # everything not yet enumerated as deleted. Discarded rather than salvaged.
+        return Reconciliation(
+            connector=connector.name,
+            seen=len(seen),
+            error=f"{type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+        )
+
+    known: list[SourceId] = []
+    stream = store.known_source_ids(connector.name)
+    try:
+        async for source_id in stream:
+            known.append(source_id)
+    finally:
+        closer = getattr(stream, "aclose", None)
+        if closer is not None:
+            await closer()
+
+    missing = tuple(sorted(set(known) - seen))
+    if dry_run:
+        return Reconciliation(
+            connector=connector.name,
+            seen=len(seen),
+            live_count=len(known),
+            missing_count=len(missing),
+            dry_run=True,
+        )
+    if not missing:
+        await _record_clean(store, connector.name, now)
+        return Reconciliation(connector=connector.name, seen=len(seen), live_count=len(known))
+
+    # Guard 2. Against the live count, not against what the source reported: a source that
+    # returned almost nothing is exactly the case the ceiling exists for.
+    if known and len(missing) / len(known) > max_delete_fraction:
+        refusal = (
+            f"reconciling {connector.name!r} would soft-delete {len(missing)} of "
+            f"{len(known)} live document(s), above the {max_delete_fraction:.0%} ceiling. A "
+            f"bulk deletion this large is rare and worth confirming; a bug that looks like one "
+            f"is not rare at all. The proposal is recorded — confirm it, or fix the source and "
+            f"reconcile again."
+        )
+        await store.record_connector_metadata(
+            connector.name,
+            {PROPOSED_DELETION_KEY: {"source_ids": list(missing), "live": len(known)}},
+        )
+        return Reconciliation(
+            connector=connector.name,
+            seen=len(seen),
+            refused=refusal,
+            proposed=missing,
+            live_count=len(known),
+            missing_count=len(missing),
+        )
+
+    # Guard 3. Soft only. Chunks, vectors and FTS rows all stay and become invisible at the
+    # join, so restoring is clearing a timestamp — no re-embed, no re-parse, no re-fetch.
+    async with _held(window) as blocked:
+        if blocked:
+            return Reconciliation(
+                connector=connector.name,
+                seen=len(seen),
+                live_count=len(known),
+                missing_count=len(missing),
+                blocked=blocked,
+            )
+        for source_id in missing:
+            document = await store.find_document(connector.name, source_id)
+            if document is not None:
+                await store.soft_delete_document(document.id)
+                # And whatever was expanded out of it. A member's source id was never in this
+                # connector's inventory, so the diff above cannot name it and a later pass never
+                # will — the query that finds candidates excludes derived documents on purpose.
+                # Leaving them behind is leaving documents that are searchable, citable, and
+                # unreachable by the only thing that would have removed them.
+                await retire_derived(store, document)
+    await _record_clean(store, connector.name, now)
+    return Reconciliation(
+        connector=connector.name,
+        seen=len(seen),
+        deleted=missing,
+        live_count=len(known),
+        missing_count=len(missing),
+        applied_count=len(missing),
+    )
+
+
+async def _journal_inventory(
+    connector: Connector, store: ReconciliationStore, *, scope: str, moment: datetime
+) -> CompletedInventory | Reconciliation:
+    """Enumerate the source into the journal, or say why it could not be completed.
+
+    Only a completed inventory is returned. A source-side failure comes back as a
+    :class:`Reconciliation` carrying the error class, with the partial rows cancelled; a
+    cancellation of this task cancels them too and propagates.
+    """
+    run_id = uuid4().hex
+    await store.begin_reconciliation_inventory(run_id, connector.name, scope)
+    seen = 0
+    try:
+        if isinstance(connector, BatchedReconciliationConnector):
+            async for source_page in connector.reconcile_batches():
+                if not source_page:
+                    continue
+                seen += await store.append_reconciliation_inventory_page(
+                    run_id, connector.name, scope, source_page
+                )
+        else:
+            page: list[SourceId] = []
+            async for source_id in connector.reconcile():
+                page.append(source_id)
+                if len(page) == _INVENTORY_PAGE_SIZE:
+                    seen += await store.append_reconciliation_inventory_page(
+                        run_id, connector.name, scope, page
+                    )
+                    page.clear()
+            if page:
+                seen += await store.append_reconciliation_inventory_page(
+                    run_id, connector.name, scope, page
+                )
+        return await store.complete_reconciliation_inventory(
+            run_id, connector.name, scope, now=moment
+        )
+    except asyncio.CancelledError:
+        await asyncio.shield(store.cancel_reconciliation_inventory(run_id, connector.name, scope))
+        raise
+    except Exception as exc:  # noqa: BLE001 - incomplete inventory is durable diagnostic state
+        await store.cancel_reconciliation_inventory(run_id, connector.name, scope)
+        return Reconciliation(
+            connector=connector.name,
+            seen=seen,
+            error=f"{type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+        )
+
+
 async def _reconcile_durable(
     connector: Connector,
     store: ReconciliationStore,
@@ -470,58 +574,33 @@ async def _reconcile_durable(
     now: datetime | None,
     scope: str,
     dry_run: bool,
+    window: RemovalWindow | None,
 ) -> Reconciliation:
     """Journal a full pass, or resume a completed one after a process crash."""
     moment = now or datetime.now(UTC)
     completed = await store.latest_completed_reconciliation_inventory(connector.name, scope)
     if completed is None:
-        run_id = uuid4().hex
-        await store.begin_reconciliation_inventory(run_id, connector.name, scope)
-        seen = 0
-        try:
-            if isinstance(connector, BatchedReconciliationConnector):
-                async for source_page in connector.reconcile_batches():
-                    if not source_page:
-                        continue
-                    seen += await store.append_reconciliation_inventory_page(
-                        run_id, connector.name, scope, source_page
-                    )
-            else:
-                page: list[SourceId] = []
-                async for source_id in connector.reconcile():
-                    page.append(source_id)
-                    if len(page) == _INVENTORY_PAGE_SIZE:
-                        seen += await store.append_reconciliation_inventory_page(
-                            run_id, connector.name, scope, page
-                        )
-                        page.clear()
-                if page:
-                    seen += await store.append_reconciliation_inventory_page(
-                        run_id, connector.name, scope, page
-                    )
-            completed = await store.complete_reconciliation_inventory(
-                run_id, connector.name, scope, now=moment
-            )
-        except asyncio.CancelledError:
-            await asyncio.shield(
-                store.cancel_reconciliation_inventory(run_id, connector.name, scope)
-            )
-            raise
-        except Exception as exc:  # noqa: BLE001 - incomplete inventory is durable diagnostic state
-            await store.cancel_reconciliation_inventory(run_id, connector.name, scope)
-            return Reconciliation(
-                connector=connector.name,
-                seen=seen,
-                error=f"{type(exc).__name__}: {exc}",
-                error_type=type(exc).__name__,
-            )
+        journaled = await _journal_inventory(connector, store, scope=scope, moment=moment)
+        if isinstance(journaled, Reconciliation):
+            return journaled
+        completed = journaled
 
-    assessed = await store.assess_reconciliation_inventory(
-        completed,
-        max_delete_fraction=max_delete_fraction,
-        dry_run=dry_run,
-        now=moment,
-    )
+    if dry_run:
+        assessed = await store.assess_reconciliation_inventory(
+            completed, max_delete_fraction=max_delete_fraction, dry_run=True, now=moment
+        )
+    else:
+        async with _held(window) as blocked:
+            if blocked:
+                # The inventory stays completed: the next attempt applies it without asking the
+                # source again, and the storage layer's newer-evidence rule keeps anything
+                # synced in the meantime out of the diff.
+                return Reconciliation(
+                    connector=connector.name, seen=completed.seen_count, blocked=blocked
+                )
+            assessed = await store.assess_reconciliation_inventory(
+                completed, max_delete_fraction=max_delete_fraction, dry_run=False, now=moment
+            )
     return Reconciliation(
         connector=assessed.connector,
         seen=assessed.seen_count,

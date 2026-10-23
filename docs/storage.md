@@ -2469,7 +2469,8 @@ sweeps the vector store only grows.
 **So the procedure is:**
 
 1. Take the backup lock (`create_backup` does; `backup.lock`, §2). It blocks the vector sweep
-   and the blob GC — the only two passes that remove data — and anything else that takes
+   and the blob GC, and the step of a reconciliation that soft-deletes (and a confirmed
+   proposal's apply) — the passes that remove data — and anything else that takes
    `Runtime.maintenance_window()`, and nothing else. Ingest and queries continue. If a pass is
    running the backup waits for it (60 seconds by default) and then refuses, saying a maintenance
    pass holds the lock; the wait never blocks the event loop.

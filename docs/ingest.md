@@ -1158,12 +1158,15 @@ installation for the length of it, to fix a problem no two unrelated pages have.
 dropped when the last holder leaves, so a sweep does not accumulate one lock per row it has
 finished with.
 
-**A reconciliation pass takes the derived-mutation guard and no lock of its own.** That guard is
+**A reconciliation pass takes the derived-mutation guard and, to delete, the backup window.** That guard is
 the runtime's process-wide barrier, the one every sync, sweep, reset, rebuild and re-embed also
 takes, and the runtime's reconcile operation (`_Ingestion.reconcile`) holds it for the whole pass,
 source enumeration included. `pipeline.run` holds the same guard for its whole walk, so a pass and a sync of the same
 connector cannot interleave in one process: the pass does not begin between a sync's publications,
-and the sync does not publish between the pass's inventory and its diff. It is not a row in the
+and the sync does not publish between the pass's inventory and its diff. The one other thing a
+pass takes is the backup window (`Runtime.maintenance_window`, §11.2), and only around the step
+that soft-deletes: a backup waits for that step and never for the enumeration, and a pass that
+finds a backup running declines with `blocked` and deletes nothing. It is not a row in the
 table because it is not per document and excludes nothing across processes, which is the
 data-directory flock's job and one a served process already holds. For the documents themselves a
 pass relies on the revision rule rather than a lock: the apply is conditioned on the revision each
@@ -2413,7 +2416,7 @@ reports no interval. `doctor` has two checks, placed right after `connectors`:
 degrades while a refused deletion waits and names the command that answers it. Both name connectors
 and counts. Everything a pass returns is counts (`ConnectorReconciled`): never a source id, title
 or URI. An unsuccessful outcome is `ok: false` with its counts retained: a proposal is HTTP `409`
-(`ReconciliationRefusedError`), a pass held off by something else holding the data is `503`
+(`ReconciliationRefusedError`), a pass held off by a backup holding the data is `503`
 (`ReconciliationBlockedError`), a failed enumeration is `503` with the failure's class name only,
 and answering a proposal that is not there is `404`.
 
@@ -2502,8 +2505,8 @@ owns when that sweep runs:
 
 - **The sweep is scheduled, not triggered by deletion** — otherwise a large reconciliation
   produces a sweep storm during a sync.
-- **It does not run during a backup.** The backup lock blocks exactly two things — this sweep
-  and the blob GC — because they are the only two that remove data (`storage.md` §9.1). The
+- **It does not run during a backup.** The backup lock blocks the passes that remove data — this
+  sweep, the blob GC, and a reconciliation's soft-delete step (§11) (`storage.md` §9.1). The
   lock is an `flock` on `<data_dir>/backup.lock`, because the backup is a command-line process
   and the sweep is the server's: the sweep holds it shared for the whole pass, a backup holds it
   exclusively, and whichever arrives second waits (the backup, for up to a minute) or declines

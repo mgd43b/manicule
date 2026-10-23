@@ -300,3 +300,60 @@ def test_standing_survives_a_malformed_record() -> None:
     assert state.last_clean_at is None
     assert state.proposal_pending is True
     assert (state.proposal_missing, state.proposal_live) == (0, 0)
+
+
+def _window(reason: str):  # noqa: ANN202 - a test double for the production context manager
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    entered: list[str] = []
+
+    @asynccontextmanager
+    async def window():  # noqa: ANN202
+        entered.append("entered")
+        yield reason
+
+    return window, entered
+
+
+async def test_a_pass_declines_and_deletes_nothing_while_something_holds_the_data() -> None:
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", [f"doc-{n}" for n in range(20)])
+    connector = fakes.DictConnector({f"doc-{n}": "text" for n in range(20)})
+    connector.hidden = {"doc-7"}
+    held, entered = _window("a backup is running")
+
+    result = await reconcile(connector, store, window=held)
+
+    assert result.blocked == "a backup is running"
+    assert not result.clean
+    assert (result.deleted, result.missing_count) == ((), 1)
+    assert store.deleted_at == {}
+    assert LAST_RECONCILE_KEY not in store.connector_meta.get("memory", {})
+    assert entered == ["entered"]
+
+
+async def test_a_pass_proceeds_when_the_window_is_open() -> None:
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", [f"doc-{n}" for n in range(20)])
+    connector = fakes.DictConnector({f"doc-{n}": "text" for n in range(20)})
+    connector.hidden = {"doc-7"}
+    held, _ = _window("")
+
+    result = await reconcile(connector, store, window=held)
+
+    assert result.deleted == ("doc-7",)
+
+
+async def test_a_dry_run_and_a_clean_pass_do_not_need_the_window() -> None:
+    """Neither removes anything, so a backup never has to wait for either."""
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", [f"doc-{n}" for n in range(20)])
+    connector = fakes.DictConnector({f"doc-{n}": "text" for n in range(20)})
+    held, entered = _window("a backup is running")
+
+    preview = await reconcile(connector, store, dry_run=True, window=held)
+    nothing_missing = await reconcile(connector, store, window=held)
+
+    assert preview.dry_run
+    assert nothing_missing.clean
+    assert entered == []
