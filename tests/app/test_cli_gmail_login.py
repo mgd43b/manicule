@@ -10,6 +10,7 @@ or a standard output that is not a terminal — and on no other stream, log or r
 from __future__ import annotations
 
 import logging
+import re
 import stat
 import sys
 from typing import TYPE_CHECKING, Any
@@ -78,6 +79,19 @@ def google(monkeypatch: pytest.MonkeyPatch) -> FakeGoogleSignIn:
     return fake
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(output: str) -> str:
+    """A refusal as the sentence it is: without color, box drawing or the width it was wrapped to.
+
+    Rich colors and boxes an error when it believes it is writing to a terminal (CI does), which
+    splits a substring that runs across a line.
+    """
+    stripped = "".join(c for c in _ANSI.sub("", output) if c not in "│╭╮╰╯─")
+    return " ".join(stripped.split())
+
+
 def login(*argv: str) -> Any:
     # A bounded wait, so a sign-in that never arrives fails the test instead of hanging it.
     return CliRunner().invoke(cli.app, ["connector", "login", *argv, "--timeout", "20"])
@@ -96,8 +110,8 @@ def test_a_token_file_is_created_private_and_the_result_never_shows_the_token(
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert REFRESH_TOKEN not in result.output
     assert REFRESH_TOKEN not in result.stderr
-    assert str(target) in result.output.replace("\n", "")
-    assert ACCOUNT in result.output
+    assert str(target) in _plain(result.output).replace(" ", "")
+    assert ACCOUNT in _plain(result.output)
 
 
 def test_json_with_a_token_file_prints_an_envelope_without_the_token(
@@ -144,7 +158,7 @@ def test_a_terminal_never_receives_the_token(
 
     assert result.exit_code != 0
     assert google.authorizations == []  # refused before anybody was sent to a browser
-    assert "--token-file" in result.output.replace("\n", " ")
+    assert "--token-file" in _plain(result.output)
     assert REFRESH_TOKEN not in result.output
 
 
@@ -167,7 +181,7 @@ def test_json_without_a_file_is_refused_rather_than_mixed_with_the_token(
 
     assert result.exit_code != 0
     assert REFRESH_TOKEN not in result.output
-    assert "--token-file" in result.output.replace("\n", " ")
+    assert "--token-file" in _plain(result.output)
 
 
 def test_an_existing_file_is_refused_and_untouched(
@@ -196,7 +210,7 @@ def test_the_confluence_options_are_refused_for_a_gmail_source(
     result = login("mail", *flag)
 
     assert result.exit_code != 0
-    assert "Gmail" in result.output
+    assert "Gmail" in _plain(result.output)
     assert google.authorizations == []
 
 
@@ -206,14 +220,14 @@ def test_the_gmail_options_are_refused_for_a_confluence_source(
     result = login("wiki", "--token-file", str(tmp_path / "token"))
 
     assert result.exit_code != 0
-    assert "not a Gmail source" in result.output.replace("\n", " ")
+    assert "not a Gmail source" in _plain(result.output)
 
 
 def test_overwriting_needs_a_file_to_overwrite(google: FakeGoogleSignIn) -> None:
     result = login("mail", "--overwrite-token-file")
 
     assert result.exit_code != 0
-    assert "--token-file" in result.output.replace("\n", " ")
+    assert "--token-file" in _plain(result.output)
 
 
 def test_a_gmail_source_is_routed_by_the_real_configuration_and_needs_no_server(
@@ -244,7 +258,7 @@ def test_a_gmail_source_is_routed_by_the_real_configuration_and_needs_no_server(
     result = login("mail", "--token-file", str(tmp_path / "token"))
 
     assert result.exit_code != 0
-    text = result.output.replace("\n", " ")
+    text = _plain(result.output)
     assert "GMAIL_CLIENT_SECRET" in text
     assert "no manicule server" not in text
     assert not (tmp_path / "token").exists()
@@ -271,7 +285,7 @@ def test_a_configuration_problem_is_reported_as_itself_not_as_a_non_gmail_source
     result = login("mail", "--token-file", str(tmp_path / "token"))
 
     assert result.exit_code != 0
-    text = result.output.replace("\n", " ")
+    text = _plain(result.output)
     assert reports in text
     assert "not a Gmail source" not in text
     assert not (tmp_path / "token").exists()
