@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.13](https://github.com/mgd43b/manicule/compare/v0.2.12...v0.2.13) (2026-10-23)
+
+
+### Features
+
+* add the Gmail configuration model and OAuth refresh-token credential ([#468](https://github.com/mgd43b/manicule/issues/468)) ([08030b1](https://github.com/mgd43b/manicule/commit/08030b1a3ba7a6a3d73aa04b4349c4088630ed53))
+* **connectors:** add the Gmail connector with history-based discovery, raw fetch and complete reconciliation ([#473](https://github.com/mgd43b/manicule/issues/473)) ([6e9e7b2](https://github.com/mgd43b/manicule/commit/6e9e7b2e4eed33f0c3cd7989bce90a5ff4ad46a8))
+* **connectors:** add the Gmail REST client and a synthetic Gmail ([#467](https://github.com/mgd43b/manicule/issues/467)) ([6918f4b](https://github.com/mgd43b/manicule/commit/6918f4b1d2372efdf08223c5e2020c4283abb272))
+* **connectors:** mint a Gmail refresh token with connector login ([#472](https://github.com/mgd43b/manicule/issues/472)) ([1476d80](https://github.com/mgd43b/manicule/commit/1476d80110fe1c21ace5ef8265985ed615ea0581))
+* refuse to serve a sensitive source with authentication off ([#471](https://github.com/mgd43b/manicule/issues/471)) ([4268a60](https://github.com/mgd43b/manicule/commit/4268a6089ccbba2ffbd0fc50ccdc7706f6acbd51))
+* **retrieval:** collapse what a mail thread repeats, measured on synthetic threads ([#474](https://github.com/mgd43b/manicule/issues/474)) ([f62c8ee](https://github.com/mgd43b/manicule/commit/f62c8eee95a7cd683bc3e7a649ec8f9830eb5828))
+* run reconciliation so documents that left their source stop being searchable ([#470](https://github.com/mgd43b/manicule/issues/470)) ([044c2d4](https://github.com/mgd43b/manicule/commit/044c2d4c8f596e724c7520282487453637ceff94))
+
+
+### Bug Fixes
+
+* **connectors:** split a Gmail listing page larger than one durable batch ([#475](https://github.com/mgd43b/manicule/issues/475)) ([50d41c5](https://github.com/mgd43b/manicule/commit/50d41c570754323d6c3a3f9cc7aa9ea3df684cde))
+* **deps:** bump certifi from 2026.7.22 to 2026.10.19 ([#455](https://github.com/mgd43b/manicule/issues/455)) ([9bce2ce](https://github.com/mgd43b/manicule/commit/9bce2ced4d877596218ca3192598a3423dd9f4a8))
+* **deps:** bump opentelemetry-api from 1.44.0 to 1.45.1 ([#454](https://github.com/mgd43b/manicule/issues/454)) ([74a0658](https://github.com/mgd43b/manicule/commit/74a065814f32c17e8279551a3f9499f42756948e))
+
 ## [0.2.12](https://github.com/mgd43b/manicule/compare/v0.2.11...v0.2.12) (2026-10-22)
 
 
