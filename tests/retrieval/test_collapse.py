@@ -120,6 +120,8 @@ async def test_one_quotation_removes_a_later_quotation_of_the_same_text(
         pytest.param(ORIGINAL.replace("four", "five"), id="a changed figure"),
         pytest.param(ORIGINAL.replace("thirty second", "thirty second jittered"), id="inserted"),
         pytest.param(quoted(ORIGINAL.replace("four", "five")), id="quoted, then corrected"),
+        pytest.param(ORIGINAL.replace("thirty second ", ""), id="removed"),
+        pytest.param(ORIGINAL.replace("four attempts", "six or seven tries"), id="rephrased"),
     ],
 )
 async def test_a_correction_is_never_dropped_as_a_copy_of_what_it_corrects(
@@ -149,6 +151,24 @@ async def test_unshown_text_at_a_chunk_s_ends_is_a_seam_not_new_text(
     )
 
     assert kept == [shown]
+
+
+async def test_a_seam_between_passages_shown_apart_is_not_mistaken_for_a_correction(
+    store: SqliteDocStore,
+) -> None:
+    """The join of two shown passages is unshown, but no chunk above holds both sides of it."""
+    first = await message(store, "m1", {"gmail_thread_id": "t1"})
+    second = await message(store, "m2", {"gmail_thread_id": "t1"})
+    third = await message(store, "m3", {"gmail_thread_id": "t1"})
+    ranked = [
+        candidate(first, ORIGINAL, 0.9),
+        candidate(second, REPLY, 0.8),
+        candidate(third, quoted(f"{REPLY} {ORIGINAL}"), 0.7),
+    ]
+
+    kept = await CollapseStage(docstore=store).run(a_query(), ranked)
+
+    assert kept == ranked[:2]
 
 
 async def test_a_candidate_that_adds_enough_new_text_is_kept(store: SqliteDocStore) -> None:

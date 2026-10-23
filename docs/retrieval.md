@@ -783,11 +783,19 @@ in other words fell off the page. [`connectors/gmail.md`](connectors/gmail.md) �
 numbers and the program that produced them.
 
 The `collapse` stage runs after fusion and removes the repeats. Walking the fused list best
-first, a candidate is dropped when its document names a conversation and at least `containment`
+first, a candidate is dropped when its document names a conversation, at least `containment`
 (0.8) of its word trigrams already appear in candidates kept above it from the same
-conversation. Coverage is counted against everything kept above, not against one candidate,
-because chunk boundaries fall in different places in different replies and no single earlier
-chunk holds exactly what a later one quotes.
+conversation, and nothing new sits in its middle. Coverage is counted against everything kept
+above, not against one candidate, because chunk boundaries fall in different places in different
+replies and no single earlier chunk holds exactly what a later one quotes.
+
+- **A correction is never a copy.** One changed or inserted word inside a sentence leaves most of
+  its trigrams in place — fourteen of seventeen for a retry budget changed from four to five —
+  and would clear 0.8 alone. But it puts three consecutive never-shown trigrams in the middle of
+  the text, and that keeps it. Unshown text at either end is where the chunk began or ended, and
+  fewer than three in a row inside it is a seam between two passages shown in different chunks
+  above; neither keeps it. A single deleted word leaves only two unshown trigrams and is not
+  told apart from a seam.
 
 - **Within one conversation only.** The conversation is a document metadata field,
   `thread_key` — `gmail_thread_id` by default, which the Gmail connector records — taken

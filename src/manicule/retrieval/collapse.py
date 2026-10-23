@@ -8,11 +8,10 @@ the measurement.
 
 **The rule.** Walk the ranking best first. A candidate whose document names a conversation is
 dropped when at least ``containment`` of its word trigrams already appear in candidates kept
-above it from the same conversation, and nothing new sits in its middle: what was not shown lies
-only where its chunk began or ended or at a seam between two passages shown apart, never inside a
-sentence, where a corrected figure would be. Nothing is reordered and nothing is rescored, so what
-survives keeps the rank fusion gave it; the stage only removes what would show a person text
-they have already been shown.
+above it from the same conversation — unless what differs is a few words changed inside text
+shown above, which is a correction rather than a copy. Nothing is reordered and nothing is
+rescored, so what survives keeps the rank fusion gave it; the stage only removes what would
+show a person text they have already been shown.
 
 **Whichever copy ranked first is the one kept, so the original can be the one dropped.** When a
 reply quoting a message outranks it, the message's own chunk is a repeat of what was shown and
@@ -66,6 +65,62 @@ def shingles(text: str) -> frozenset[tuple[str, ...]]:
     return frozenset(trigrams(text))
 
 
+EDIT = 3
+"""The most words a correction changes, inserts or removes in one place, for it to be told
+from new text: past that, what differs is a passage of its own, and ``containment`` decides."""
+
+
+class _Shown:
+    """The text kept above, in one conversation: its trigrams, and where each stood."""
+
+    def __init__(self) -> None:
+        self.trigrams: set[tuple[str, ...]] = set()
+        self._at: list[dict[tuple[str, ...], list[int]]] = []
+
+    def add(self, ordered: list[tuple[str, ...]]) -> None:
+        self.trigrams.update(ordered)
+        positions: dict[tuple[str, ...], list[int]] = {}
+        for index, trigram in enumerate(ordered):
+            positions.setdefault(trigram, []).append(index)
+        self._at.append(positions)
+
+    def edits(self, ordered: list[tuple[str, ...]]) -> bool:
+        """Whether ``ordered`` is shown text with a few words changed in the middle.
+
+        A correction leaves the words either side of it in place, so its signature is a short
+        run of unshown trigrams whose neighbors — the shown trigram just before and just after —
+        stand in one chunk above, at most :data:`EDIT` words apart, with at most :data:`EDIT`
+        words between them here. A seam between two passages shown in different chunks, and a
+        passage no chunk above showed, have no such neighbors, so neither is mistaken for one.
+        """
+        covered = [trigram in self.trigrams for trigram in ordered]
+        index = 0
+        while index < len(ordered):
+            if covered[index]:
+                index += 1
+                continue
+            start = index
+            while index < len(ordered) and not covered[index]:
+                index += 1
+            if start == 0 or index == len(ordered):
+                continue  # unshown text at an end is where this chunk began or ended
+            # The neighbors end and begin ``run - 2`` words apart here: none for a removed
+            # word, one for a changed or inserted one.
+            between = index - start - 2
+            if between <= EDIT and self._near(ordered[start - 1], ordered[index]):
+                return True
+        return False
+
+    def _near(self, before: tuple[str, ...], after: tuple[str, ...]) -> bool:
+        """Whether one chunk above holds ``before`` and then ``after``, a few words apart."""
+        for positions in self._at:
+            for left in positions.get(before, ()):
+                for right in positions.get(after, ()):
+                    if 0 <= right - left - SHINGLE <= EDIT:
+                        return True
+        return False
+
+
 class CollapseStage:
     """Drop a candidate that repeats text already ranked above it in the same conversation."""
 
@@ -84,7 +139,7 @@ class CollapseStage:
         conversations = await self._conversations(query, candidates)
         if not conversations:
             return list(candidates)
-        shown: dict[tuple[str, str], set[tuple[str, ...]]] = {}
+        shown: dict[tuple[str, str], _Shown] = {}
         kept: list[Candidate] = []
         for candidate in candidates:
             conversation = conversations.get(candidate.chunk.document_id)
@@ -92,35 +147,23 @@ class CollapseStage:
                 kept.append(candidate)
                 continue
             ordered = trigrams(candidate.chunk.text)
-            seen = shown.setdefault(conversation, set())
-            if self._repeats(ordered, seen):
+            above = shown.setdefault(conversation, _Shown())
+            if self._repeats(ordered, above):
                 continue
-            seen.update(ordered)
+            above.add(ordered)
             kept.append(candidate)
         return kept
 
-    def _repeats(self, ordered: list[tuple[str, ...]], seen: set[tuple[str, ...]]) -> bool:
-        """Whether this text was already shown, give or take its chunk's seams.
+    def _repeats(self, ordered: list[tuple[str, ...]], above: _Shown) -> bool:
+        """Whether this text was already shown, and is not a correction of what was.
 
-        Two conditions. Enough of it appears above — ``containment`` of its distinct trigrams.
-        And nothing in its middle is new: one changed or inserted word puts three consecutive
-        trigrams that were never shown inside a sentence, so a corrected figure is never dropped
-        as a copy of what it corrects. Fewer than three in a row is a seam — the two trigrams
-        that straddle the join between two passages shown in different chunks above — and
-        unshown text at either end is where this chunk began or ended differently.
+        Enough of it must appear above — ``containment`` of its distinct trigrams — and none of
+        what does not may be an edit (:meth:`_Shown.edits`).
         """
         own = set(ordered)
-        if not own or len(own & seen) < self._config.containment * len(own):
+        if not own or len(own & above.trigrams) < self._config.containment * len(own):
             return False
-        covered = [trigram in seen for trigram in ordered]
-        first = covered.index(True)
-        last = len(covered) - 1 - covered[::-1].index(True)
-        run = 0
-        for shown in covered[first : last + 1]:
-            run = 0 if shown else run + 1
-            if run >= SHINGLE:
-                return False
-        return True
+        return not above.edits(ordered)
 
     async def _conversations(
         self, query: Query, candidates: list[Candidate]
