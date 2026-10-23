@@ -21,8 +21,8 @@ from manicule.connectors import (
     Deployment,
     resolve_credentials,
 )
-from manicule.connectors.config import GitSiteConfig
-from manicule.connectors.plugin import PLUGIN, build_confluence, build_git_site
+from manicule.connectors.config import GitSiteConfig, GmailConfig
+from manicule.connectors.plugin import PLUGIN, build_confluence, build_git_site, build_gmail
 from manicule.container import keys
 from manicule.core.errors import ConfigError
 from manicule.core.protocols import Connector
@@ -89,6 +89,9 @@ def test_discovery_finds_the_connector_with_its_configuration_model() -> None:
     git_site = registry.record(keys.CONNECTOR.named("git-site"))
     assert git_site.config_model is GitSiteConfig
 
+    gmail = registry.record(keys.CONNECTOR.named("gmail"))
+    assert gmail.config_model is GmailConfig
+
 
 @pytest.mark.contract
 def test_registering_the_connector_loads_no_http_client() -> None:
@@ -131,10 +134,13 @@ def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
         build_confluence(context)
     with pytest.raises(ConfigError, match="GitSiteConfig"):
         build_git_site(context)
+    with pytest.raises(ConfigError, match="GmailConfig"):
+        build_gmail(context)
 
 
 def test_the_plugin_registers_the_sources_this_build_ships() -> None:
-    """Confluence live, Confluence from disk, and the local filesystem ``manicule index`` walks.
+    """Confluence live, Confluence from disk, the local filesystem ``manicule index`` walks, and
+    Gmail, which is registered for its configuration and credential and not yet for reading mail.
 
     Asserted as an exact list rather than a membership check: a connector registered and
     never mentioned anywhere is a source nobody knows they can configure.
@@ -152,6 +158,7 @@ def test_the_plugin_registers_the_sources_this_build_ships() -> None:
         "confluence-snapshot",
         "filesystem",
         "git-site",
+        "gmail",
     ]
 
 

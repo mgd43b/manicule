@@ -62,6 +62,7 @@ from manicule.connectors.errors import (
     BodyUnavailableError,
     CursorExpiredError,
     NotFoundError,
+    PinnedIdentityError,
     RemoteError,
     RequestTimeoutError,
     SessionExpiredError,
@@ -966,6 +967,9 @@ class _Sync:
 
 
 JOURNAL_PAGE: Final = 64
+
+PINNED_IDENTITY_KEY: Final = "pinned_identity"
+"""The connector-metadata key holding the identity a source was last synced as."""
 """How many acquisition records a journal reader takes per query.
 
 The three readers walked the journal with ``limit=1``, so a durable run issued one SQL query
@@ -1384,6 +1388,51 @@ class IngestPipeline:
                 retain_source_bytes=retain_source_bytes,
             )
 
+    async def _hold_pinned_identity(self, connector: Connector) -> None:
+        """Refuse to sync a source that has synced as one identity under another.
+
+        **For a connector whose identity is not its location.** A mailbox is chosen by the
+        credential, and credentials are replaced routinely, so a connector can declare
+        ``pinned_identity`` — a digest, never the identity itself — and this holds the instance to
+        it. The scope fingerprint cannot: it includes the identity, so a different one makes the
+        stored watermark invisible rather than wrong, and the run would quietly begin a complete
+        walk of someone else's data beside the first person's. Nor can the fingerprint tell an
+        edit to the identity from an edit to the scope, and only one of those keeps the source.
+
+        **"Synced" is state that would be left behind**: documents the source still holds, or a
+        run that began and did not settle. A never-synced instance changes identity freely, and
+        deleting the documents is what releases a pin, which is the instruction the error gives.
+        A connector without the attribute is unaffected.
+
+        Raises:
+            PinnedIdentityError: The identity differs from the one recorded and the source has
+                synced. Raised before the watermark is read or anything is enumerated.
+        """
+        declared = getattr(connector, "pinned_identity", None)
+        if not isinstance(declared, str) or not declared:
+            return
+        recorded = (await self._store.connector_metadata(connector.name)).get(PINNED_IDENTITY_KEY)
+        if recorded == declared:
+            return
+        if isinstance(recorded, str) and recorded:
+            holds_documents = await self._store.count_documents(source=connector.name) > 0
+            unsettled = (
+                self._acquisitions is not None
+                and await self._acquisitions.latest_unsettled_acquisition_run(connector.name)
+                is not None
+            )
+            if holds_documents or unsettled:
+                msg = (
+                    f"connector {connector.name!r} has synced as a different identity than the "
+                    f"one it is now configured with. Indexing another account is a different "
+                    f"instance: give it a new name, and delete the documents this instance "
+                    f"indexed. This one is refused rather than treated as a change of scope, "
+                    f"because a change of scope keeps the source and would leave the first "
+                    f"account's data indexed beside the second's."
+                )
+                raise PinnedIdentityError(msg)
+        await self._store.record_connector_metadata(connector.name, {PINNED_IDENTITY_KEY: declared})
+
     async def _run_guarded(  # noqa: PLR0912, PLR0915 - orchestrates durable recovery stages
         self,
         connector: Connector,
@@ -1443,6 +1492,7 @@ class IngestPipeline:
         if not acquire_only and not self._derivation_enabled:
             msg = "this runtime was assembled for source acquisition only"
             raise RuntimeError(msg)
+        await self._hold_pinned_identity(connector)
         retain = self._retain_source_bytes if retain_source_bytes is None else retain_source_bytes
         if acquire_only and (not retain or self._acquisitions is None):
             msg = "acquire-only requires durable source-byte retention"

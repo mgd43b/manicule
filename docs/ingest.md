@@ -2640,6 +2640,30 @@ by the time the *N*th is accepted, so the bound is applied where discovery hands
   thousand documents that advanced a position would skip the other nine thousand nine hundred
   and ninety on every subsequent sync, silently.
 
+### 13.2.3 A pinned identity holds an instance to one account
+
+For a connector whose identity is not where it reads from. A mailbox is chosen by the
+credential, and credentials are replaced routinely, so a connector may expose a
+`pinned_identity` string — a digest, never the identity itself, because it is stored beside the
+source's run metadata. Before a run reads a watermark or enumerates anything,
+`IngestPipeline._hold_pinned_identity` compares it with the one recorded for that source:
+
+- **Equal, or none recorded yet:** the run proceeds, and the first run records it.
+- **Different, and the source has synced:** the run is refused with `PinnedIdentityError`, a
+  `ConfigError`, and nothing is read. *Synced* means the source still holds documents, or has an
+  acquisition run that began and did not settle. The message says to give the other account a
+  new connector name and to delete the documents the old instance indexed.
+- **Different, and the source never synced:** the pin moves freely. Deleting a source's
+  documents is what releases a pin on one that has.
+
+The scope fingerprint cannot do this job. It includes the identity, so a different one makes
+the stored watermark invisible rather than wrong, and the run would begin a complete walk of
+the second account beside the first account's documents; and it cannot tell an edit to the
+identity from an edit to the scope, only one of which should keep the source. A connector
+without the attribute is unaffected. The only one that declares it today is Gmail's
+configuration (`GmailConfig.pinned_identity`; [`connectors/gmail.md`](connectors/gmail.md) §1.4),
+and the connector that would be held to it is [#460](https://github.com/mgd43b/manicule/issues/460).
+
 ### 13.3 Cancellation
 
 `Ctrl-C`, `manicule sync --stop`, or shutdown:
@@ -2750,6 +2774,9 @@ checks are shipped today and are named in `surfaces.md` rather than repeated her
 for documents filed under a connector *type* while an instance of that type is configured, and
 `collection-membership`, for a corpus no collection holds — the second of which the pipeline
 also reports per run, as `collected`/`uncollected` on `IngestReport` (§13.1).
+A third check sits beside them but asks a different question: `gmail-credential` is about a
+source's credential rather than about what the pipeline stored, and it contacts Google, which
+neither of those does.
 
 | Check | Detects |
 |---|---|

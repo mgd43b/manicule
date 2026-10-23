@@ -58,8 +58,12 @@ vectors are filtered during hydration and reclaimed by the normal sweep. The sam
 applies when parsing, middleware or chunking concludes that a document has no chunks.
 
 > [!IMPORTANT]
-> **Two sources exist today**: a local directory tree, and Confluence. Seven more — GitHub,
-> Notion, Drive, S3/GCS, Swagger, a crawler and web search — are designed in
+> **Four sources are built**: a local directory tree, Confluence (live, or from a directory of
+> mirrored pages), and a pinned Git checkout of a site you own. Gmail is partly built: its
+> configuration, credential and `doctor` check exist, and a Gmail source refuses to start until
+> the connector that reads mail lands ([`docs/connectors/gmail.md`](docs/connectors/gmail.md),
+> tracked in [#464](https://github.com/mgd43b/manicule/issues/464)). Seven more — GitHub, Notion,
+> Drive, S3/GCS, Swagger, an HTTP crawler and web search — are designed in
 > [`PLAN.md`](PLAN.md) and tracked in [#16](https://github.com/mgd43b/manicule/issues/16). None
 > of them is built, and nothing below describes them.
 

@@ -2585,7 +2585,8 @@ class Check(Payload):
     ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``sign_in``,
     ``plugins``,
     ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
-    ``authoring``, ``collection-membership``, ``sessions``, ``security_alerts``,
+    ``authoring``, ``collection-membership``, ``sessions``, ``gmail-credential``,
+    ``security_alerts``,
     ``document-identity``, ``document-content``, ``extractable-text``, ``wiki-provenance``,
     ``grammars``, ``vocabularies``, ``models``, and ``component:<kind>:<name>`` for anything
     already constructed. ``vector_backend`` is emitted too and had been missing from this list
