@@ -4307,7 +4307,7 @@ class ApplicationService:
         found = await asyncio.gather(
             *(_gmail_source_outcome(name, options) for name, options in sources)
         )
-        outcomes = {name: word for (name, _), word in zip(sources, found, strict=True) if word}
+        outcomes = dict(zip((name for name, _ in sources), found, strict=True))
 
         facts = cast("dict[str, JsonValue]", {"sources": dict(sorted(outcomes.items()))})
         if not outcomes:
@@ -4330,6 +4330,7 @@ class ApplicationService:
             )
         first, why = next(iter(broken.items()))
         sentences = {
+            "invalid_options": "has options that do not validate",
             "missing_secret": (
                 "has no client secret or refresh token in its configuration or environment"
             ),
@@ -4340,7 +4341,12 @@ class ApplicationService:
         }
         problems = "; ".join(f"{name!r} {sentences[reason]}" for name, reason in broken.items())
         only_unreachable = all(reason == "unreachable" for reason in broken.values())
-        if why == "missing_secret":
+        if why == "invalid_options":
+            remedy = (
+                "fix the source's options: account and client_id are required, and a key "
+                "the connector does not define is refused (docs/connectors/gmail.md §1.3)"
+            )
+        elif why == "missing_secret":
             remedy = (
                 "set client_secret and refresh_token, or the variables named in the source's "
                 "options (docs/connectors/gmail.md §1.3)"
@@ -8837,13 +8843,14 @@ def _severity(state: r.CheckState) -> int:
     return {"ok": 0, "degraded": 1, "failing": 2, "unknown": 1}.get(state, 1)
 
 
-async def _gmail_source_outcome(name: str, options: Mapping[str, Any]) -> str | None:
-    """One Gmail source's credential outcome as a fixed word, or ``None`` if it is not ours to say.
+async def _gmail_source_outcome(name: str, options: Mapping[str, Any]) -> str:
+    """One Gmail source's credential outcome, as a word from a closed set.
 
-    ``None`` is configuration that does not validate, which is ``_configuration_check``'s finding:
-    reporting it here too would send an operator to a credential for a source whose real problem
-    is a setting. Every other answer is one of a closed set of words, because the outcome reaches
-    ``doctor``'s ``facts`` and nothing a mailbox, Google or a secret supplied may reach those.
+    Every outcome is a fixed word, because the outcome reaches ``doctor``'s ``facts`` and nothing
+    a mailbox, Google or a secret supplied may reach those. Options that do not validate are
+    ``invalid_options``: nothing else reports them — startup checks a connector's type, not its
+    options — and a source dropped here would read as a healthy corpus with no Gmail source in
+    it. The word never carries the value that failed.
     """
     from manicule.connectors.config import (  # noqa: PLC0415 - no HTTP stack at import
         GmailConfig,
@@ -8860,7 +8867,7 @@ async def _gmail_source_outcome(name: str, options: Mapping[str, Any]) -> str | 
     try:
         config = GmailConfig.model_validate(options)
     except ValidationError:
-        return None
+        return "invalid_options"
     try:
         resolved = resolve_gmail_credentials(config, instance=name)
     except ConfigError:

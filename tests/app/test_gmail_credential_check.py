@@ -163,13 +163,26 @@ async def test_each_source_is_reported_and_the_first_broken_one_names_the_remedy
     assert check.remedy == "manicule connector login beta"
 
 
-async def test_configuration_that_does_not_validate_is_left_to_the_configuration_check(
+async def test_options_that_do_not_validate_fail_the_check_instead_of_vanishing(
     google: FakeGoogleOAuth,
 ) -> None:
+    """Nothing else reports them, and a dropped source reads as a corpus with no Gmail in it."""
     check = await gmail_check(mail={"type": "gmail", "options": {"client_id": "x"}})
 
-    assert check.state == "ok"
-    assert check.facts == {"sources": {}}
+    assert check.state == "failing"
+    assert check.facts == {"sources": {"mail": "invalid_options"}}
+    assert "'mail'" in check.detail
+    assert "account and client_id" in check.remedy
+    assert google.requests == []
+
+
+async def test_a_rejected_value_is_not_echoed_when_options_do_not_validate(
+    google: FakeGoogleOAuth,
+) -> None:
+    check = await gmail_check(mail=mail(account="not-an-address-sentinel"))
+
+    assert check.facts == {"sources": {"mail": "invalid_options"}}
+    assert "sentinel" not in check.model_dump_json()
 
 
 async def test_nothing_a_secret_or_a_token_reaches_the_check(google: FakeGoogleOAuth) -> None:

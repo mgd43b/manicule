@@ -1023,7 +1023,8 @@ never sees it fail. For each enabled source it resolves the client secret and re
 refreshes an access token and calls `users.getProfile` once, then compares the mailbox that
 answered with the configured `account` — the same `confirm_mailbox` the Gmail connector will run
 before it reads anything ([`connectors/gmail.md`](connectors/gmail.md) §1.2, §1.4). It is
-`failing` when a sync would stop on the credential: a missing client secret or refresh token, a
+`failing` when a sync would stop on the source's settings or credential: options that do not
+validate (nothing else reports those), a missing client secret or refresh token, a
 grant Google no longer honors, an OAuth client Google refuses (or a project with the Gmail API off), or a token for a different
 mailbox. It is `degraded` when the only trouble is that Google did not answer, which says
 nothing about the credential. This check is a network call, one refresh and one `getProfile`
@@ -1031,7 +1032,7 @@ per enabled Gmail source, and it is the only check besides `component:*` that co
 machine. Every surface that runs `doctor` runs it — the command line, the MCP tool, `GET /api/v1/health` and the web
 dashboard — so a deployment with a Gmail source spends that call each time one of them is
 opened. (`/healthz` and `/readyz` run no check.) `facts.sources` maps each source's name to one of a fixed set of words —
-`ok`, `missing_secret`, `different_mailbox`, `grant_revoked`, `credential_rejected` or
+`ok`, `invalid_options`, `missing_secret`, `different_mailbox`, `grant_revoked`, `credential_rejected` or
 `unreachable` — and neither it nor `detail` ever carries an address, a token or a secret:
 `doctor` output is read by more people than the mailbox is. The remedy is `manicule connector
 login <name>` for a revoked grant, a refused client or a token for the wrong mailbox, which
