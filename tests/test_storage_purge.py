@@ -191,6 +191,7 @@ async def test_a_restore_that_lands_before_the_purge_wins(
     restoration = await store.restore_document(document_id)
     assert restoration.restored
     assert not restoration.needs_reparse
+    assert await store.purge_document(document_id, reason=REASON) is False
     assert await store.purge_document(document_id, reason=REASON, deleted_before=_after()) is False
 
     row = await _row(engine, document_id)
