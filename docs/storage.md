@@ -2190,6 +2190,15 @@ source still lists it is different: every run that lists it records a new refere
 bytes, and the file stays for as long as that continues. An installation that stops syncing keeps
 the journal, and with it those bytes.
 
+**What else holds a journal run, and so its bytes, past the 30 days.** The cleanup only removes a
+run that has no unfinished records (a record still `discovered`, `acquiring`, `acquired`,
+`indexing` or `retry` keeps it), no acquisition marker, no unfinished replacement run naming it as
+its predecessor, and no derived generation or generation snapshot naming it. The last is the one
+that surprises: a rebuild's snapshot run, and the bytes it retained, stay until that generation is
+cleaned up or the snapshot is deleted on purpose (`lifecycle_cleanup_generations`,
+`lifecycle_delete_snapshot`). So the lifetime stated above is the floor for a document in a plain
+installation, and an installation that rebuilds keeps more.
+
 Prior versions' bytes are kept for a bounded window — 30 days,
 `manicule.storage.history.DEFAULT_VERSION_BYTES_RETENTION_S` — because a chatty wiki otherwise
 grows the blob store without bound. This is a real policy decision that no existing document
@@ -2352,7 +2361,7 @@ document and on each of its versions, and `original_omitted_reason` is set to sa
 released after the grace period rather than never kept. Restore then costs a re-sync from the
 source, rung 4, which can fail; there is nothing left to re-parse (§11.6). This is a real trade
 rather than a free lunch: unbounded free restore would mean unbounded dilution of every vector
-search, and a deleted document that pinned its raw bytes for ever would make "deleted" mean "no
+search, and a deleted document that pinned its raw bytes forever would make "deleted" mean "no
 longer searchable" and nothing more. `doctor` reports the soft-deleted fraction of the vector
 table so the over-fetch factor can be set against a measured number.
 
@@ -2360,7 +2369,7 @@ table so the over-fetch factor can be set against a measured number.
 trash, deletes its chunks (the trigger below writes their vector tombstones in the same
 transaction), sets `status = 'deleted'` and releases the references. One transaction because the
 sweep selects on `status != 'deleted'`; a crash between a status flip and a release would never be
-retried and would pin the bytes for ever. The re-check is the `UPDATE`'s own predicate, so a restore
+retried and would pin the bytes forever. The re-check is the `UPDATE`'s own predicate, so a restore
 that lands after the sweep selected the document wins — nothing is changed — and so does a restore
 followed by a second delete, which restarts the clock. The vectors are deleted after the commit;
 a crash in between leaves them to the tombstones. The release does not apply to documents

@@ -36,7 +36,7 @@ free. After it, the document is *purged*
 does its claim on the raw bytes it was built from — the reference on the document and on each
 of its versions is cleared in the same transaction as the status flip. A restore after that is
 a re-sync from the source, not a re-parse. The bytes are given back because a deleted document
-that pinned them for ever would make "deleted" mean "no longer searchable" and nothing more.
+that pinned them forever would make "deleted" mean "no longer searchable" and nothing more.
 The trade is real rather than free: unbounded free restore means unbounded dilution of every
 vector search, because a soft-deleted chunk is still in the vector table competing for top-``k``
 slots before the join that hides it can run. This applies to every document past the grace
@@ -66,7 +66,9 @@ if TYPE_CHECKING:
 
     from manicule.ingest.ports import IngestStore
 
-PURGE_DETAIL: Final = "soft-delete grace period expired; chunks, vectors and retained bytes purged"
+PURGE_DETAIL: Final = (
+    "soft-delete grace period expired; chunks and vectors purged, retained bytes released"
+)
 """The ``status_detail`` of a document the sweep has purged."""
 
 UNREFERENCED_BLOB_MIN_AGE_S: Final = 24 * 3600.0
@@ -201,7 +203,7 @@ async def sweep_vectors(
         # **And the status flip is what makes the sweep terminate.** `soft_deleted_before`
         # selects on `deleted_at`, which purging does not change, and excludes `deleted`
         # documents; without the flip the same first `batch` would be re-selected on every pass,
-        # re-purged and re-counted for ever, and anything past them never reached. The release
+        # re-purged and re-counted forever, and anything past them never reached. The release
         # of the bytes is in the same transaction because of that: once the status says purged
         # the document is never selected again, so a crash between the two would pin the bytes
         # permanently.

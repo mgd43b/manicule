@@ -2,7 +2,7 @@
 
 ``docs/storage.md`` §8.2. The sweep used to flip a soft-deleted document to ``deleted`` and stop,
 leaving ``original_ref`` on the document and on every version of it; blob collection treats
-those as roots whatever the status, so the raw bytes of a deleted document were kept for ever.
+those as roots whatever the status, so the raw bytes of a deleted document were kept forever.
 :meth:`~manicule.storage.history.TrashMixin.purge_document` is the one transaction that ends
 that, and every test here runs it against the real store and the real blob store.
 """
@@ -97,9 +97,11 @@ async def test_purge_releases_the_document_its_versions_and_its_chunks_together(
 
     await store.soft_delete_document(document_id)
     assert await blobs.collect_garbage() == [], "a soft delete alone releases nothing"
+    stamped = (await _row(engine, document_id)).updated_at
     assert await store.purge_document(document_id, reason=REASON) is True
 
     row = await _row(engine, document_id)
+    assert row.updated_at > stamped, "a purge is a change to the row and says so"
     assert row.status is DocumentStatus.DELETED
     assert row.status_detail == REASON
     assert row.deleted_at is not None
@@ -235,7 +237,7 @@ async def test_the_purge_is_one_transaction(
     """A failure at the last step must undo the first.
 
     ``soft_deleted_before`` skips ``deleted`` rows, so a purge that committed the status flip and
-    then failed to release the bytes would never be retried and would pin them for ever.
+    then failed to release the bytes would never be retried and would pin them forever.
     ``utcnow`` is called by the release step, after the status update and the chunk delete have
     run; making it fail is how this reaches the last step without reaching into the store.
     """

@@ -18,7 +18,7 @@ however it went, so there is no stale-lock state to reason about.
 
 - A **backup** takes it *exclusive* and waits for it, up to a bound
   (:func:`backup_lock`). The wait is a poll on the event loop rather than a blocking ``flock``
-  in a worker thread: a thread that is already inside ``flock`` cannot be cancelled, so a
+  in a worker thread: a thread that is already inside ``flock`` cannot be canceled, so a
   backup abandoned while it waited would later acquire the lock with nobody left to release
   it, and every sweep after that would report itself blocked until the process exited.
 - A **removing pass** takes it *shared* and never waits (:class:`MaintenanceHold`). It holds

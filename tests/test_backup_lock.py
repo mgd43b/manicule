@@ -140,10 +140,10 @@ async def test_waiting_for_the_lock_does_not_block_the_event_loop(tmp_path: Path
     assert ticks >= 10, "other work stalled while a backup waited"
 
 
-async def test_a_backup_cancelled_while_waiting_leaves_nothing_held(tmp_path: Path) -> None:
+async def test_a_backup_canceled_while_waiting_leaves_nothing_held(tmp_path: Path) -> None:
     """The reason the wait polls rather than blocking in a thread.
 
-    A thread already inside ``flock`` cannot be cancelled: it would acquire the lock after its
+    A thread already inside ``flock`` cannot be canceled: it would acquire the lock after its
     waiter was gone and nothing would ever release it, and every later pass would decline.
     """
     holder = MaintenanceHold(tmp_path)
@@ -162,7 +162,7 @@ async def test_a_backup_cancelled_while_waiting_leaves_nothing_held(tmp_path: Pa
     await asyncio.sleep(0.2)
 
     probe = MaintenanceHold(tmp_path)
-    assert probe.acquire() == "", "a cancelled backup leaked the lock"
+    assert probe.acquire() == "", "a canceled backup leaked the lock"
     probe.release()
     async with backup_lock(tmp_path, wait_s=0.0):
         pass

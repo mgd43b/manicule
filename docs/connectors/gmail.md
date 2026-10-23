@@ -452,13 +452,16 @@ so a mail source can reconcile daily or hourly.
   that a citation can explain itself. The raw bytes are not yet gone: the acquisition journal that
   fetched them names them too, for 30 days after the last run that listed the message settled,
   and the next durable sync cleans that up (`storage.md` §7). The scheduled blob collection
-  deletes the file once both have let go. The two clocks run side by side, so **a message the
-  source deleted has its raw bytes removed about one grace period after the deletion** — 30 days
-  with the defaults, plus the wait for the next sync and the next sweep, and longer if no sync runs
-  to clean the journal. A message deleted while the source still lists it is renewed in the
-  journal by every run that lists it, and its file stays for as long as that continues. Lowering
-  `soft_delete_grace_s` shortens the wait; the journal retention is not configurable. Until the
-  file is deleted it is still in the data directory and in any backup of it.
+  deletes the file once both have let go. The two clocks run side by side, so in a plain
+  installation **a message the source deleted has its raw bytes removed about one grace period
+  after the deletion** — 30 days with the defaults, plus the wait for the next sync and the next
+  sweep, and longer if no sync runs to clean the journal. It is longer still when something else
+  holds the run that listed the message: unfinished records in it, a rebuild generation or
+  snapshot that names it, or a source-inventory replacement still in progress (`storage.md` §7).
+  A message deleted while the source still lists it is renewed in the journal by every run that
+  lists it, and its file stays for as long as that continues. Lowering `soft_delete_grace_s`
+  shortens the wait; the journal retention is not configurable. Until the file is deleted it is
+  still in the data directory and in any backup of it.
 
   Erasing one message at once is manual: `manicule document delete --hard` removes the row, its
   versions and its chunks, and the raw bytes go once no acquisition record still references them

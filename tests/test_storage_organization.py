@@ -570,14 +570,15 @@ async def test_restoring_after_the_sweep_names_the_rung_the_repair_lands_on(
     for document in (kept, lost):
         await _with_chunks(store, document, 2)
         await store.soft_delete_document(document.id)
-        # Exactly what `sweep_vectors` does once the grace period has passed.
+        # What the sweep did before it released retained bytes: the rows it left behind still
+        # hold their reference, which is what makes the cheap repair real for them.
         await store.replace_chunks(document.id, [])
         await store.set_status(document.id, DocumentStatus.DELETED, "grace period expired")
 
     repairable = await store.restore_document(kept.id)
     assert repairable.restored
     assert repairable.needs_reparse
-    assert "Re-parse it from its retained bytes" in repairable.reason
+    assert "re-parse it from its retained bytes" in repairable.reason
 
     unrepairable = await store.restore_document(lost.id)
     assert unrepairable.needs_reparse

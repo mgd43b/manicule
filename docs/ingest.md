@@ -2800,7 +2800,7 @@ Calls made in the absence of a stated position.
 | Three re-ingest verbs mapped to ladder rungs; re-parse is first-class | §10 |
 | The corpus-wide re-parse is a flag on the document verb, and command line only | §10.1 |
 | Reconcile: clean-completion-only, a deletion ceiling, soft delete only | §11.1 |
-| The sweep is scheduled and yields to backup and sync | §11.2 |
+| The sweep is scheduled, yields to a backup through a cross-process lock, and does not wait for a sync | §11.2 |
 | Watch never reconciles; debounce with a post-debounce re-`stat` | §12 |
 | Enumeration coverage is journaled; continuation stays a supervisor's, under a stated contract | §13.4 |
 

@@ -337,7 +337,7 @@ class TrashMixin(WorkspaceScoped):
         **One transaction, because the sweep cannot retry a half of it.** The selection of what
         to purge (:meth:`~manicule.storage.docstore.SqliteDocStore.soft_deleted_before`) skips
         ``deleted`` rows, so a crash between "flip the status" and "release the bytes" would
-        leave a purged document that pins its bytes for ever and is never looked at again.
+        leave a purged document that pins its bytes forever and is never looked at again.
         Everything below commits together or not at all.
 
         **The check and the write are one statement.** The ``UPDATE`` carries the predicate —
