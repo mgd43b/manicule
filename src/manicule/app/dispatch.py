@@ -298,8 +298,10 @@ def _unsuccessful_reconciliation(payload: Payload) -> ErrorInfo | None:
                 message=f"no deletion proposal is waiting for connector {name!r}",
                 hint=(
                     "A proposal exists only after a pass is refused by the deletion ceiling, "
-                    "and only for the scope the connector is configured with now. "
-                    "`manicule connector list` shows whether one is waiting."
+                    "and can be answered only under the scope the connector is configured with "
+                    "now. `manicule connector list` shows whether one is waiting; if its "
+                    f"configuration changed since, `manicule connector reconcile {name}` runs a "
+                    "fresh pass that replaces it."
                 ),
             )
         case _:

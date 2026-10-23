@@ -1255,6 +1255,10 @@ def _confirmed(connector: str, applied: Reconciliation | Sequence[str]) -> Recon
 
     if isinstance(applied, Reconciliation):
         return applied
+    if not applied:
+        # The in-memory path answers an absent proposal with an empty list, and a real proposal
+        # always names at least one document, so empty means there was nothing to confirm.
+        return Reconciliation(connector=connector, refused="no deletion proposal exists")
     return Reconciliation(connector=connector, applied_count=len(applied))
 
 

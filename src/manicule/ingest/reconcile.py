@@ -104,18 +104,22 @@ class ReconciliationStanding:
 
     def due(self, *, interval_s: float, now: datetime | None = None) -> bool:
         """Whether the schedule should reconcile this connector now."""
-        return (
-            self.live_documents > 0
-            and not self.proposal_pending
-            and _elapsed(self.last_attempt_at, now) >= interval_s
-        )
+        return self._behind(interval_s, now)
 
     def overdue(self, *, interval_s: float, now: datetime | None = None) -> bool:
         """Whether reconciliation has fallen behind by more than the slack allows."""
+        return self._behind(interval_s * OVERDUE_FACTOR, now)
+
+    def _behind(self, threshold_s: float, now: datetime | None) -> bool:
+        """The one rule both questions share: only a connector worth asking is ever behind.
+
+        A connector with no documents has nothing to lose, and one with a proposal waiting is
+        waiting on a person, not on the clock; neither is due or late however old the record.
+        """
         return (
             self.live_documents > 0
             and not self.proposal_pending
-            and _elapsed(self.last_attempt_at, now) >= interval_s * OVERDUE_FACTOR
+            and _elapsed(self.last_attempt_at, now) >= threshold_s
         )
 
 
@@ -177,11 +181,6 @@ def last_attempt(metadata: Mapping[str, object]) -> datetime | None:
         if (moment := _moment(metadata.get(key))) is not None
     ]
     return max(moments) if moments else None
-
-
-def has_proposal(metadata: Mapping[str, object]) -> bool:
-    """Whether a refused deletion is waiting for an operator."""
-    return isinstance(metadata.get(PROPOSED_DELETION_KEY), dict)
 
 
 def due(metadata: Mapping[str, object], *, interval_s: float, now: datetime | None = None) -> bool:
@@ -545,7 +544,6 @@ __all__ = [
     "connector_scope",
     "discard_proposed_deletion",
     "due",
-    "has_proposal",
     "last_attempt",
     "reconcile",
     "standing",

@@ -12,7 +12,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 import manicule.cli.main as cli
 from manicule.app import commands
@@ -24,8 +24,6 @@ from tests.app.fakes import FakeBackend, make_document
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-    from click.testing import Result
 
     from manicule.app.commands import Command
     from manicule.app.results import Envelope

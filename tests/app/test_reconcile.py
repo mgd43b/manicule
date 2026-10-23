@@ -234,6 +234,9 @@ async def test_answering_a_proposal_that_is_not_there_says_so_as_a_not_found() -
     assert envelope.error is not None
     assert envelope.error.type == "UnknownEntityError"
     assert status_for(envelope) == NOT_FOUND
+    assert "manicule connector reconcile wiki" in envelope.error.hint, (
+        "a proposal stranded by a configuration change needs a way out named"
+    )
 
 
 async def test_a_proposal_waiting_when_a_connector_was_switched_off_can_still_be_answered() -> None:
@@ -587,3 +590,19 @@ async def test_an_unreadable_store_makes_both_checks_unknown_rather_than_ok(
 
     assert check(diagnosis, "reconciliation-overdue").state == "unknown"
     assert check(diagnosis, "reconciliation-proposals").state == "unknown"
+
+
+def test_confirming_on_a_store_without_a_journal_distinguishes_nothing_pending() -> None:
+    """The in-memory path answers an absent proposal with an empty list."""
+    from manicule.app.runtime import (  # noqa: PLC0415 - the private seam under test
+        _confirmed,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    nothing = _confirmed("wiki", [])
+    some = _confirmed("wiki", ["a", "b"])
+
+    assert nothing.refused
+    assert nothing.applied_count == 0
+    assert not some.refused
+    assert some.applied_count == 2
+    assert some.deleted == (), "ids stop at this seam"

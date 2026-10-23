@@ -1906,11 +1906,7 @@ class ApplicationService:
                 worse than no switch at all: the switch is what they trusted.
         """
         started = time.monotonic()
-        configured = self.settings.connectors.get(name)
-        if configured is None:
-            known = ", ".join(sorted(self.settings.connectors)) or "none configured"
-            msg = f"no connector named {name!r}. Configured: {known}"
-            raise UnknownEntityError(msg)
+        configured = self._configured_connector(name)
         if not configured.enabled:
             msg = (
                 f"connector {name!r} is configured `enabled = false`. Set it to true in "
