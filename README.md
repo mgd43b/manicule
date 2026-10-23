@@ -58,11 +58,15 @@ vectors are filtered during hydration and reclaimed by the normal sweep. The sam
 applies when parsing, middleware or chunking concludes that a document has no chunks.
 
 > [!IMPORTANT]
-> **Four sources are built**: a local directory tree, Confluence (live, or from a directory of
-> mirrored pages), and a pinned Git checkout of a site you own. Gmail is partly built: its
-> configuration, credential and `doctor` check exist, and a Gmail source refuses to start until
-> the connector that reads mail lands ([`docs/connectors/gmail.md`](docs/connectors/gmail.md),
-> tracked in [#464](https://github.com/mgd43b/manicule/issues/464)). Seven more — GitHub, Notion,
+> **Five sources are built**: a local directory tree, Confluence (live, or from a directory of
+> mirrored pages), a pinned Git checkout of a site you own, and a Google Workspace mailbox. Gmail
+> is read-only and syncs from Gmail's own change log, but `manicule connector login` for it
+> ([#461](https://github.com/mgd43b/manicule/issues/461)) and the refusal to serve a mailbox
+> without authentication ([#462](https://github.com/mgd43b/manicule/issues/462)) are not built
+> yet, so a refresh token comes from the environment and a Gmail source belongs in a
+> workspace served with authentication on
+> ([`docs/connectors/gmail.md`](docs/connectors/gmail.md), tracked in
+> [#464](https://github.com/mgd43b/manicule/issues/464)). Seven more — GitHub, Notion,
 > Drive, S3/GCS, Swagger, an HTTP crawler and web search — are designed in
 > [`PLAN.md`](PLAN.md) and tracked in [#16](https://github.com/mgd43b/manicule/issues/16). None
 > of them is built, and nothing below describes them.

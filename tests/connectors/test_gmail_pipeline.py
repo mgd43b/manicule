@@ -20,6 +20,7 @@ import pytest_asyncio
 
 from manicule.connectors import config as gmail_settings
 from manicule.connectors.gmail import GmailConnector
+from manicule.core.acquisition import SnapshotPromotionPolicy
 from manicule.core.content import DocumentStatus
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline, RunReport
@@ -66,14 +67,16 @@ class Harness:
         return {d.source_id: d.status for d in documents if "!/" not in d.source_id}
 
 
-@pytest_asyncio.fixture
-async def harness(
-    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
-) -> AsyncIterator[Harness]:
-    vectors = LanceVectorStore(data_dir / "vectors")
-    await vectors.ensure_ready(HashEmbedder().fingerprint)
+def mail_pipeline(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    vectors: LanceVectorStore,
+    **options: Any,
+) -> IngestPipeline:
+    """The real pipeline, with the mail parser, durable acquisition and retained bytes."""
     chunker = fakes.BlockChunker()
-    pipeline = IngestPipeline(
+    return IngestPipeline(
         store=store,
         acquisitions=store,
         chunker=chunker,
@@ -84,12 +87,24 @@ async def harness(
         middleware=MiddlewareRunner([]),
         chunk_fingerprint=chunker.fingerprint,
         blobs=BlobStore(engine, data_dir),
+        **options,
     )
+
+
+@pytest_asyncio.fixture
+async def vectors(data_dir: Path) -> AsyncIterator[LanceVectorStore]:
+    store = LanceVectorStore(data_dir / "vectors")
+    await store.ensure_ready(HashEmbedder().fingerprint)
+    yield store
+    await store.teardown()
+
+
+@pytest_asyncio.fixture
+async def harness(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path, vectors: LanceVectorStore
+) -> Harness:
     server, time = mailbox()
-    try:
-        yield Harness(pipeline, store, server, time)
-    finally:
-        await vectors.teardown()
+    return Harness(mail_pipeline(store, engine, data_dir, vectors), store, server, time)
 
 
 async def opened(harness: Harness, **options: Any) -> GmailConnector:
@@ -486,38 +501,40 @@ async def test_no_surface_carries_an_address_a_subject_a_label_or_a_message_id(
         assert secret.casefold() not in everything, secret
 
 
+@pytest.mark.parametrize(
+    "policy", [SnapshotPromotionPolicy.REQUIRE_COMPLETE, SnapshotPromotionPolicy.ALLOW_OMISSIONS]
+)
 async def test_a_message_over_the_fetch_cap_is_refused_and_counted_never_truncated(
-    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    vectors: LanceVectorStore,
+    policy: SnapshotPromotionPolicy,
 ) -> None:
-    vectors = LanceVectorStore(data_dir / "vectors")
-    await vectors.ensure_ready(HashEmbedder().fingerprint)
-    chunker = fakes.BlockChunker()
-    pipeline = IngestPipeline(
-        store=store,
-        acquisitions=store,
-        chunker=chunker,
-        embedder=HashEmbedder(),
-        vectors=vectors,
-        runner=InProcessRunner({"email": MailParser(MailConfig()), "lines": fakes.LineParser()}),
-        resolve_chain=lambda _: ["email", "lines"],
-        middleware=MiddlewareRunner([]),
-        chunk_fingerprint=chunker.fingerprint,
-        blobs=BlobStore(engine, data_dir),
-        max_fetch_bytes=2_000,
+    """The pipeline's cap, not a Gmail setting: the oversize message is an omission, in counts.
+
+    Under the default policy a run with an omission is not complete and advances nothing, which is
+    the pipeline's rule for any body it could not acquire; ``allow_omissions`` is how an
+    installation that knows it has one lets the rest of the mailbox move on.
+    """
+    pipeline = mail_pipeline(
+        store, engine, data_dir, vectors, max_fetch_bytes=2_000, snapshot_policy=policy
     )
     server, time = mailbox()
     small = server.add_message(mail("Small"))
-    server.add_message(mail("Huge", "x" * 10_000))
+    huge = server.add_message(mail("Huge", "x" * 10_000))
     connector = connector_over(server, time)
     await connector.setup()
     try:
         report = await pipeline.run(connector)
     finally:
         await connector.teardown()
-        await vectors.teardown()
 
     live = {d.source_id for d in await store.list_documents(limit=100)}
     assert small.id in live
-    assert report.retry_required, "the refusal is counted in the run, not hidden"
+    assert huge.id not in live, "never truncated, never half-indexed"
     assert report.snapshot_omissions == 1
+    assert report.retry_required, "the omission is still owed a retry (the cap may be raised)"
+    assert report.watermark_advanced is (policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS)
     assert SUBJECT not in json.dumps(report.as_metadata(), default=str)
+    assert huge.id not in json.dumps(report.as_metadata(), default=str)

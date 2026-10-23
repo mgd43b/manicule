@@ -475,3 +475,11 @@ is a feature list entry, not a feature.
 - `api_keys.allowed_ips` / `api_keys.rate_limit` — per-key CIDR scoping and a per-key override
   of `security.rate_limit.per_minute`, set at mint time rather than in the config file: a key is
   an identity issued to one caller, and its own bounds belong beside it. `docs/surfaces.md` §9.2.
+- `connectors.<name>` with `type = "gmail"` — one Google Workspace mailbox, indexed read-only
+  (`gmail.readonly`) through Gmail's own change log, one document per message, attachments through
+  the parser chain. Scope is label ids: SPAM, TRASH and DRAFT are always out and `exclude_labels`
+  names the rest; there is deliberately no query setting. A message that is deleted, trashed,
+  marked spam or given an excluded label leaves the index at the next reconciliation. `account`
+  pins the mailbox, and a token for any other is refused. Listed by `connector list` like any
+  other source, which reports counts only. Not built: `connector login` for Gmail (#461) and
+  refusing to serve a mailbox with authentication off (#462). `docs/connectors/gmail.md`.

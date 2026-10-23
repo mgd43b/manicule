@@ -2,16 +2,27 @@
 
 ## Unreleased
 
-### Gmail source configuration, credential and a `doctor` check
+### The Gmail source reads a mailbox
 
-A `type = "gmail"` source now has its configuration and its credential, and nothing more. The
-settings (`account`, `client_id`, the secret and refresh-token variables, `exclude_labels`, and
-two pacing bounds) are validated at startup, a refresh token is exchanged for access tokens and
-kept until a minute before it expires, and a token that belongs to a different mailbox than
-`account` is refused. **Reading mail is not built yet.** A Gmail source that passes all of this
-is still refused when it is constructed, with a message saying so, until the connector lands
-([#460](https://github.com/mgd43b/manicule/issues/460)); leave such a source disabled. The
-design is in [`connectors/gmail.md`](connectors/gmail.md).
+A `type = "gmail"` source now syncs one Google Workspace mailbox, read-only. The first sync walks
+the mailbox once; every sync after it reads Gmail's own change log from a stored `historyId`, so it
+costs what changed rather than the mailbox, and a message already stored is never fetched again.
+Each message is fetched raw and indexed through the existing `message/rfc822` parser, attachments
+included. Scope is label ids only: SPAM, TRASH and DRAFT are always out, `exclude_labels` takes
+label names, and there is no search query. A message deleted, trashed, marked spam or given an
+excluded label leaves the index at the next reconciliation, which a served manicule runs on
+`reconcile_interval_s` and after every complete walk; set `reconcile_interval_s` on a mail source
+to bound how long deleted mail stays searchable. Fetches are paced under Gmail's per-user quota,
+about a hundred raw messages a minute, so a first sync of a large mailbox takes hours.
+
+Read [`connectors/gmail.md`](connectors/gmail.md) §9 and §10 before pointing this at a real
+mailbox: whoever can search the workspace reads every message, and
+`manicule connector login` ([#461](https://github.com/mgd43b/manicule/issues/461)) and the refusal
+to serve a mailbox with authentication off ([#462](https://github.com/mgd43b/manicule/issues/462))
+are not built yet. Until they are, keep a Gmail source in a workspace of its own and serve it with
+authentication on.
+
+Configuration, the credential and a check in `manicule doctor` shipped first:
 
 `manicule doctor` gained a `gmail-credential` check. For each enabled Gmail source it refreshes
 a token and asks Google which mailbox it reads, so a revoked grant or a token for the wrong
