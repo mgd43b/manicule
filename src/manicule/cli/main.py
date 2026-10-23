@@ -722,6 +722,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "snapshot_verify": r.SnapshotStatusReport,
     "browser_auth_install": r.MessagingHostInstalled,
     "connector_login": r.ConnectorSignedIn,
+    "connector_login_gmail": r.ConnectorTokenIssued,
     "connector_sidecar": r.SidecarReport,
     "connector_reconcile": r.ConnectorReconciled,
     "connector_reconcile_resolve": r.ConnectorReconciled,
@@ -808,6 +809,91 @@ def read_secret(prompt: str) -> str:
         msg = "nothing was pasted, so there is no session to store"
         raise ConfigError(msg)
     return text
+
+
+GMAIL_FILE_OPTION_ON_ANOTHER_SOURCE = (
+    "--token-file writes the refresh token a Gmail source signs in with, and this is not a "
+    "Gmail source. A Confluence session is handed to the running server and written nowhere."
+)
+OVERWRITE_WITHOUT_A_FILE = "--overwrite-token-file replaces --token-file, and none was given."
+
+
+def _configured_type(name: str) -> str | None:
+    """The type of the source configured under ``name``, or ``None`` when it cannot be told.
+
+    ``None`` for a name that is not configured and for settings that will not load alike: both
+    are reported properly by the path that goes on to use them, and reporting either from here
+    would report it twice.
+    """
+    try:
+        configured = Settings(**STATE.overrides).connectors.get(name)
+    except (ManiculeError, ValueError, OSError):
+        return None
+    return None if configured is None else configured.type
+
+
+def _gmail_login(
+    name: str,
+    *,
+    token_file: Path | None,
+    overwrite: bool,
+    timeout: float | None,
+    confluence_options: list[str],
+) -> None:
+    """Mint a Gmail source's refresh token, and put it where the operator said.
+
+    Separate from the Confluence path because nothing about it is shared: it needs no server
+    (the token goes to a person, not to a process), it takes no pasted secret, and its result is
+    a token on a channel that must not be the one the result is printed on.
+
+    **When the token goes to standard output, the result goes to standard error.** Standard
+    output then carries the token and nothing else, so ``| secret-store`` receives exactly it.
+    ``--json`` is refused in that case rather than interleaved: a JSON envelope and a token on one
+    stream is neither.
+    """
+    from manicule.connectors.gmail_login import FileSink, StreamSink  # noqa: PLC0415
+
+    if confluence_options:
+        raise typer.BadParameter(
+            f"{' and '.join(confluence_options)} capture a Confluence session, and {name!r} is "
+            f"a Gmail source: it signs in with a refresh token that goes to --token-file or "
+            f"to a pipe."
+        )
+    if timeout is not None and timeout <= 0:
+        raise typer.BadParameter(BROWSER_TIMEOUT_MUST_BE_POSITIVE)
+    if token_file is None and STATE.json_output:
+        raise typer.BadParameter(
+            "--json prints the result on standard output, which is where the token goes "
+            "without --token-file. Name a --token-file, or drop --json."
+        )
+    sink = (
+        FileSink(token_file, overwrite=overwrite)
+        if token_file is not None
+        else StreamSink(sys.stdout)
+    )
+    envelope = asyncio.run(
+        _execute(
+            "connector_login_gmail",
+            lambda service: service.gmail_login(
+                name, sink=sink, timeout_seconds=timeout, announce=_say
+            ),
+        )
+    )
+    if token_file is None and envelope.ok and envelope.data is not None:
+        # Standard output is the token's. The result is for the person, so it goes to the stream
+        # they are watching.
+        render.render(
+            render.console(stderr=True),
+            PAYLOADS[envelope.op].model_validate(envelope.data),
+        )
+        return
+    print_envelope(envelope)
+
+
+def _say(message: str) -> None:
+    """A progress line for the person at the terminal, on standard error and nowhere else."""
+    sys.stderr.write(f"{message}\n")
+    sys.stderr.flush()
 
 
 def _from_stdin(given: str | None) -> str:
@@ -1829,8 +1915,33 @@ def connector_login(
     forget: Annotated[
         bool, typer.Option("--forget", help="Remove the stored session instead of taking one.")
     ] = False,
+    token_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--token-file",
+            help="Gmail: write the refresh token to this new file, created readable only by "
+            "you. Without it the token goes to standard output, which must not be a terminal.",
+        ),
+    ] = None,
+    overwrite_token_file: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite-token-file",
+            help="Gmail: replace --token-file if it already exists.",
+        ),
+    ] = False,
 ) -> None:
-    """Capture the browser session a Confluence source behind single sign-on signs in with.
+    """Sign in to a source: capture a Confluence session, or mint a Gmail refresh token.
+
+    **A Gmail source** signs in with Google's installed-app flow: this opens your browser, you
+    choose the account the source indexes, and the refresh token comes back to a port opened
+    on 127.0.0.1 for this one sign-in. It is checked against the source's `account` before it
+    is written, and a token for another mailbox is refused. The token goes to `--token-file`
+    (created readable only by you), or to standard output when that is not a terminal, so it
+    can be piped into a secret store. It is never written to the configuration file, shown on a
+    terminal or logged. No server is needed. `--timeout` bounds the wait.
+
+    **A Confluence source** is signed in as follows.
 
     `--browser` opens a browser at the source's URL and waits while you sign in — including any
     second factor or conditional-access step. Nothing is typed for you and no page content is
@@ -1857,6 +1968,32 @@ def connector_login(
     # in the service, because that one is a fact about the operation and every surface needs it.
     if allow_insecure_state and browser_state is None:
         raise typer.BadParameter(INSECURE_STATE_IS_AN_IMPORT_OPTION)
+    if overwrite_token_file and token_file is None:
+        raise typer.BadParameter(OVERWRITE_WITHOUT_A_FILE)
+    from manicule.connectors.config import GMAIL_CONNECTOR_NAME  # noqa: PLC0415 - pydantic only
+
+    if _configured_type(name) == GMAIL_CONNECTOR_NAME:
+        _gmail_login(
+            name,
+            token_file=token_file,
+            overwrite=overwrite_token_file,
+            timeout=timeout,
+            confluence_options=[
+                label
+                for label, asked in (
+                    ("--browser", browser),
+                    ("--browser-provider", browser_provider is not None),
+                    ("--browser-state", browser_state is not None),
+                    ("--manual-cookie", manual_cookie),
+                    ("--allow-insecure-state", allow_insecure_state),
+                    ("--forget", forget),
+                )
+                if asked
+            ],
+        )
+        return
+    if token_file is not None:
+        raise typer.BadParameter(GMAIL_FILE_OPTION_ON_ANOTHER_SOURCE)
     # Which flags were typed together, and whether the provider named is one — both facts about
     # the *invocation*, so both answered here and before the server probe below. The service
     # checks mutual exclusion too, because every surface needs it; what this adds is the order.

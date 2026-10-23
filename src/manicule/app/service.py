@@ -118,6 +118,7 @@ from manicule.storage.history import RESTORED_AFTER_PURGE_DETAIL
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 
+    import httpx
     from pydantic import SecretStr
 
     from manicule.app.alerts import AlertEvent
@@ -129,6 +130,7 @@ if TYPE_CHECKING:
     from manicule.connectors.config import ConfluenceConfig, GmailConfig
     from manicule.connectors.enriched import EnrichedProfile
     from manicule.connectors.filesystem import FilesystemConnector
+    from manicule.connectors.gmail_login import TokenSink
     from manicule.connectors.sessions import SessionStore
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.ann import AnnIndexState
@@ -2151,6 +2153,7 @@ class ApplicationService:
         """
         from manicule.connectors.config import (  # noqa: PLC0415 - no HTTP stack at import
             CONNECTOR_NAME,
+            GMAIL_CONNECTOR_NAME,
             ConfluenceConfig,
         )
         from manicule.connectors.sessions import (  # noqa: PLC0415
@@ -2181,23 +2184,18 @@ class ApplicationService:
         # connector operation uses. That builds the connector, and building it resolves the
         # credential — which is the thing this operation exists to capture, and which by
         # definition is not there yet the first time somebody runs this.
-        configured = self.settings.connectors.get(name)
-        if configured is None:
-            known = ", ".join(sorted(self.settings.connectors)) or "none configured"
-            msg = f"no connector named {name!r}. Configured: {known}"
-            raise UnknownEntityError(msg)
-        if not configured.enabled:
-            msg = (
-                f"connector {name!r} is configured `enabled = false`, so a credential captured "
-                f"for it would not be used by anything. Set it to true in [connectors.{name}] "
-                f"first."
-            )
-            raise PolicyError(msg)
+        configured = self._enabled_source(name)
         if configured.type != CONNECTOR_NAME:
+            hint = (
+                " A Gmail source is signed in with a refresh token instead, which the command "
+                "line mints (`manicule connector login`)."
+                if configured.type == GMAIL_CONNECTOR_NAME
+                else ""
+            )
             msg = (
                 f"{name!r} is a {configured.type!r} source, and a browser session is how the "
                 f"{CONNECTOR_NAME!r} connector authenticates against an instance behind an "
-                f"identity provider. Nothing else has a session to capture."
+                f"identity provider. Nothing else has a session to capture.{hint}"
             )
             raise ConfigError(msg)
         config = ConfluenceConfig.model_validate(configured.options)
@@ -2255,6 +2253,142 @@ class ApplicationService:
             captured_at=session.captured_at.isoformat(),
             expires_at=expires.isoformat(),
             stored_in=keeper.describe(),
+        )
+
+    def _enabled_source(self, name: str) -> ConnectorSettings:
+        """The configured source by that name, which must exist and be enabled.
+
+        Settings directly rather than ``Runtime.connector(name)``, which every other connector
+        operation uses. That builds the connector, and building it resolves the credential —
+        which is the thing a login exists to produce, and which by definition is not there yet
+        the first time somebody runs one.
+
+        Raises:
+            UnknownEntityError: Configuration has no connector by that name.
+            PolicyError: The source is configured ``enabled = false``.
+        """
+        configured = self._configured_connector(name)
+        if not configured.enabled:
+            msg = (
+                f"connector {name!r} is configured `enabled = false`, so a credential captured "
+                f"for it would not be used by anything. Set it to true in [connectors.{name}] "
+                f"first."
+            )
+            raise PolicyError(msg)
+        return configured
+
+    async def gmail_login(
+        self,
+        name: str,
+        *,
+        sink: TokenSink,
+        timeout_seconds: float | None = None,
+        announce: Callable[[str], None] | None = None,
+        open_browser: Callable[[str], object] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> r.ConnectorTokenIssued:
+        """Mint a refresh token for a Gmail source, prove it reads the source's mailbox, and put it.
+
+        Google's installed-app flow in a browser on this machine
+        (:func:`~manicule.connectors.gmail_login.mint_refresh_token`), then the same check
+        ``doctor`` makes — one refresh and one ``users.getProfile`` — against the source's
+        ``account``, then the sink. In that order and no other:
+
+        - **The sink is checked first**, before the browser opens, so a destination that could
+          not take the token is found before somebody has signed in, not after.
+        - **The mailbox is checked before anything is written.** A browser signed in to a
+          different Google account yields a perfectly good token for the wrong mailbox, and the
+          instance pins one mailbox (``docs/connectors/gmail.md`` §1.4). That token is refused
+          and written nowhere; neither address is printed.
+
+        **Nothing is stored by manicule.** The token goes where the caller said and the result
+        records where, never what. The configuration file is not touched.
+
+        Args:
+            name: The configured source. It must exist, be enabled and be a Gmail source.
+            sink: Where the token goes: a file created ``0600``, or a stream that is not a
+                terminal.
+            timeout_seconds: How long to wait for the sign-in. ``None`` waits five minutes.
+            announce: Receives the progress lines, which include the address to open by hand.
+            open_browser: Opens an address; the default browser when ``None``.
+            transport: Replaces the network, for the reason ``capture``'s parameter does.
+
+        Raises:
+            UnknownEntityError: Configuration has no connector by that name.
+            PolicyError: The source is configured ``enabled = false``.
+            ConfigError: Not a Gmail source, its options or client secret do not resolve, the
+                sink is unusable, or the HTTP client is not installed.
+            CredentialError: The sign-in failed, or the token reads another mailbox.
+        """
+        from manicule.connectors.config import (  # noqa: PLC0415 - no HTTP stack at import
+            GMAIL_CONNECTOR_NAME,
+            GmailConfig,
+            resolve_gmail_client_secret,
+        )
+        from manicule.connectors.credentials import gmail_credential  # noqa: PLC0415
+        from manicule.connectors.errors import MailboxMismatchError  # noqa: PLC0415
+        from manicule.connectors.gmail_login import (  # noqa: PLC0415
+            DEFAULT_SIGN_IN_TIMEOUT_SECONDS,
+            GMAIL_READONLY_SCOPE,
+            mint_refresh_token,
+        )
+
+        configured = self._enabled_source(name)
+        if configured.type != GMAIL_CONNECTOR_NAME:
+            msg = (
+                f"{name!r} is a {configured.type!r} source. A refresh token is how a "
+                f"{GMAIL_CONNECTOR_NAME!r} source authenticates; nothing else has one to mint."
+            )
+            raise ConfigError(msg)
+        # The same merge `doctor` makes, so the two read one set of options.
+        options = {
+            **self.settings.component_config("connector", GMAIL_CONNECTOR_NAME),
+            **configured.options,
+        }
+        try:
+            config = GmailConfig.model_validate(options)
+        except ValidationError as exc:
+            fields = ", ".join(sorted({".".join(map(str, e["loc"])) for e in exc.errors()}))
+            msg = (
+                f"the options of {name!r} are not valid ({fields}). Fix [connectors.{name}."
+                f"options] as docs/connectors/gmail.md §1.3 shows."
+            )
+            raise ConfigError(msg) from exc
+        config = config.model_copy(
+            update={"client_secret": resolve_gmail_client_secret(config, instance=name)}
+        )
+
+        sink.check()
+        token = await mint_refresh_token(
+            config,
+            announce=announce if announce is not None else (lambda _message: None),
+            open_browser=open_browser,
+            timeout_seconds=(
+                DEFAULT_SIGN_IN_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+            ),
+            transport=transport,
+        )
+        credential = gmail_credential(
+            config.model_copy(update={"refresh_token": token}), instance=name, transport=transport
+        )
+        try:
+            await credential.confirm_mailbox(config.account)
+        except MailboxMismatchError:
+            # Not the credential's own message, which says a *run* did not begin and points at
+            # `connector login` as the cure — advice that is circular here.
+            msg = (
+                "the account that signed in is not the mailbox this instance indexes, so the "
+                "token was discarded and nothing was written. Sign in as the configured "
+                "account (an alias of it counts as different; configure the primary address). "
+                "The extra grant can be removed from that account's third-party access."
+            )
+            raise MailboxMismatchError(msg) from None
+        sink.write(token)
+        return r.ConnectorTokenIssued(
+            name=name,
+            account=config.account,
+            scope=GMAIL_READONLY_SCOPE,
+            written_to=sink.describe(),
         )
 
     def _selected_provider(
@@ -4656,8 +4790,9 @@ class ApplicationService:
             remedy = "check the machine can reach Google, then run `manicule doctor` again"
         else:
             remedy = (
-                f"mint a new Gmail refresh token for {first!r} as the account it is configured "
-                f"for and supply it as its refresh_token (docs/connectors/gmail.md §1.3)"
+                f"run `manicule connector login {first}` as the account it is configured for, "
+                f"then supply the token it writes as the source's refresh_token "
+                f"(docs/connectors/gmail.md §1.3)"
             )
         return r.Check(
             name="gmail-credential",

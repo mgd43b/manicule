@@ -12,11 +12,12 @@ epic [#464](https://github.com/mgd43b/manicule/issues/464).
 > client, whose calls, pacing and error typing (§5, §6) are in `manicule/connectors/gmail_client.py`,
 > tested against the synthetic Gmail in `tests/connectors/fake_gmail.py`. A `type = "gmail"` source
 > validates and resolves its credential, and then the factory refuses to build it, because the
-> connector is [#460](https://github.com/mgd43b/manicule/issues/460). Everything else on this page
+> connector is [#460](https://github.com/mgd43b/manicule/issues/460).
+> [#461](https://github.com/mgd43b/manicule/issues/461) is `connector login`, which mints the
+> refresh token (§1.3, `manicule/connectors/gmail_login.py`). Everything else on this page
 > — discovery, fetching and reconciliation
 > ([#460](https://github.com/mgd43b/manicule/issues/460),
-> [#466](https://github.com/mgd43b/manicule/issues/466)), `connector login`
-> ([#461](https://github.com/mgd43b/manicule/issues/461)) and the serving refusal
+> [#466](https://github.com/mgd43b/manicule/issues/466)) and the serving refusal
 > ([#462](https://github.com/mgd43b/manicule/issues/462)) — is still design: a decision for
 > those tickets to implement, not a description of code that exists. §12 says which module
 > implements which part; when a ticket ships, it replaces its sections' "will" with the module.
@@ -76,7 +77,7 @@ The Confluence browser session deliberately lives only in the running server's m
 ([`confluence.md`](confluence.md) §1.1, `connectors/sessions.py`): re-taking it is a few seconds
 of clicking, so a credential whose lifetime is the process's is re-taken on purpose rather than
 persisted. That reasoning does not carry over. A refresh token is minted once by a person at a
-browser ([#461](https://github.com/mgd43b/manicule/issues/461)) and then has to survive every
+browser (`manicule connector login`, §1.3) and then has to survive every
 restart of a server that may run where no browser exists. Holding it only in memory would mean
 a person signs in again after every restart, deploy and node failure.
 
@@ -130,14 +131,11 @@ For a Workspace administrator, once per organization:
 4. If the domain restricts access to Google data for unconfigured third-party apps, mark the
    client **Trusted** under Security → Access and data control → API controls.
 
-Then, as the account whose mail is indexed. Only `manicule doctor` exists today:
-`manicule connector login` for Gmail is [#461](https://github.com/mgd43b/manicule/issues/461),
-and syncing is [#460](https://github.com/mgd43b/manicule/issues/460). Until `login` lands, a
-refresh token has to be obtained by other means and supplied through the environment variable
-below.
+Then, as the account whose mail is indexed, with the source configured (below) and
+`GMAIL_CLIENT_SECRET` set in the environment of the shell that runs `login`:
 
 ```console
-$ manicule connector login mail          # planned (#461): opens a browser; writes the refresh token where told
+$ manicule connector login mail --token-file ./gmail-refresh-token   # opens a browser; see below
 $ manicule doctor                        # the gmail-credential check should pass (implemented)
 $ manicule connector sync mail           # planned (#460): the factory refuses until then
 ```
@@ -163,6 +161,53 @@ request_timeout_seconds = 30      # the default
 
 Any other key is refused at startup, which is how the settings that are deliberately absent
 (a `query`, an `include_spam_trash`, a `user`, a token endpoint) stay absent.
+
+#### Minting the token: `manicule connector login <name>`
+
+`login` runs Google's installed-app flow for the instance, on the machine you are sitting at,
+and needs no running server: the token is handed to you, not to a process.
+
+1. It listens on `127.0.0.1`, on a port the operating system picks for this one sign-in, and
+   opens your browser at Google's sign-in page. The address is also printed to standard error,
+   for a machine where no browser could be started.
+2. You choose the account the instance indexes. manicule never asks for, sees or handles a
+   password, a code or a second factor; the browser does the sign-in.
+3. Google redirects the browser to that port with an authorization code. The request is PKCE
+   (`S256`), and the redirect is refused unless it carries the `state` the command chose. The
+   only scope requested is `gmail.readonly`, with `access_type=offline` and `prompt=consent`, so
+   Google issues a refresh token on every run and not only the first. A token Google reports as
+   carrying any other scope is discarded.
+4. The command exchanges the code for the refresh token, then checks it exactly as `doctor`
+   does: one refresh and one `users.getProfile`. **A token whose mailbox is not the instance's
+   `account` is refused and written nowhere** (§1.4). Neither address is printed; an alias of
+   the account counts as another mailbox. The grant that was refused stays on that account until
+   it is removed under the account's third-party access.
+5. Only then is the token written, to where you said:
+
+| You pass | The token goes to |
+|---|---|
+| `--token-file PATH` | A new file created with mode `0600`, containing the token and a newline. An existing path is refused; `--overwrite-token-file` replaces it by writing a new `0600` file beside it and renaming it into place. |
+| nothing | Standard output, **only when it is not a terminal**, as in `manicule connector login mail \| <store-secret>`. On a terminal the command refuses before opening the browser. |
+
+Where the token goes is checked *before* the browser opens. It is never written to the
+configuration file, to a terminal, to standard error or to a log, and the result the command
+prints names where it went and never what. With the token on standard output the result moves
+to standard error, so the pipe receives the token alone; `--json` is refused in that case.
+`--timeout SECONDS` bounds the wait for the sign-in (five minutes by default).
+
+Take the token to the secret store your deployment already uses, and expose it to the server as
+the variable `refresh_token_env` names. `<store-secret>` below stands for whatever command that
+store provides:
+
+```console
+$ manicule connector login mail | <store-secret> --name gmail-refresh-token
+$ # or, through a file you remove once it is stored:
+$ manicule connector login mail --token-file ./gmail-refresh-token
+$ <store-secret> --name gmail-refresh-token < ./gmail-refresh-token && rm ./gmail-refresh-token
+```
+
+then give the server `GMAIL_REFRESH_TOKEN` from that store, in its environment. Running `login`
+again mints a replacement (§1.2): put the new token in the store and restart the server.
 
 ### 1.4 One instance, one mailbox, pinned
 
@@ -683,7 +728,7 @@ differ, it is here — check these first when one is available:
 | Registration (configuration and credential only; the factory always refuses) | `manicule/connectors/plugin.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented; completed, and marked sensitive, by [#460](https://github.com/mgd43b/manicule/issues/460) |
 | REST calls, pacing, error typing | `manicule/connectors/gmail_client.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
 | `discover`, `fetch`, `reconcile`, watermarks | `manicule/connectors/gmail.py` | [#460](https://github.com/mgd43b/manicule/issues/460) | Planned |
-| `connector login` for Gmail | `manicule/connectors/` and the CLI | [#461](https://github.com/mgd43b/manicule/issues/461) | Planned |
+| `connector login` for Gmail | `manicule/connectors/gmail_login.py`, `manicule/app/service.py` (`gmail_login`) and the CLI | [#461](https://github.com/mgd43b/manicule/issues/461) | Implemented |
 | Refusing to serve a sensitive source unauthenticated | `manicule/app/bind.py` | [#462](https://github.com/mgd43b/manicule/issues/462) | Planned |
 | Reconciliation after a full walk | `manicule/connectors/gmail.py` and the pipeline | [#466](https://github.com/mgd43b/manicule/issues/466) | Planned |
 | The synthetic Gmail | `tests/connectors/fake_gmail.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |

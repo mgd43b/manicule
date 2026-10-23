@@ -24,6 +24,18 @@ connector may declare a pinned identity, and editing it on a source that still h
 is refused before anything is read, with the instruction to use a new name for the other
 account. Only Gmail declares one, so no existing source is affected.
 
+### `manicule connector login` mints a Gmail refresh token
+
+For a `type = "gmail"` source, `connector login <name>` now runs Google's installed-app flow: it
+opens your browser, you sign in as the account the source indexes, and the refresh token comes
+back to a port opened on `127.0.0.1` for that one sign-in (PKCE, `state` checked, `gmail.readonly`
+only). The token is checked with one refresh and one `getProfile`, and one for any mailbox other
+than the source's `account` is refused. It is written to `--token-file` (created readable only by
+you) or to standard output when that is not a terminal, and never to the configuration file, a
+terminal or a log. No server has to be running. The `gmail-credential` `doctor` remedy now names
+the command. Steps and placeholders for the secret-store hand-off are in
+[`connectors/gmail.md`](connectors/gmail.md) §1.3.
+
 ### A repeated search is served from the query cache
 
 The query cache never hit through the CLI, HTTP, MCP or the web. Its invalidation counter counted

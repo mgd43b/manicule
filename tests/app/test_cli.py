@@ -1308,7 +1308,9 @@ MINIMUM_CLI_MODULES = 5
 Present to catch a scan reading the wrong directory, not to track the package's size.
 """
 
-OP_TAKING_CALLS: frozenset[str] = frozenset({"emit", "run_op", "succeeded", "failed", "Command"})
+OP_TAKING_CALLS: frozenset[str] = frozenset(
+    {"emit", "run_op", "succeeded", "failed", "Command", "_execute"}
+)
 """Functions whose **first positional argument** is an operation name.
 
 ``Envelope(op=...)`` is the sixth shape and is a keyword rather than a positional, which is
@@ -1319,6 +1321,10 @@ why it is handled separately below. It is also the one a scan written from a qui
 and hands it to :func:`~manicule.cli.main.submit`, which either runs it here or sends it to a
 server. It is a constructor rather than a function and the scan does not care — what it reads
 is the first positional literal, and for a command that is the op.
+
+``_execute`` is what ``emit`` calls, and ``connector login`` for a Gmail source calls it
+directly: it cannot use ``emit``, whose printing would put the result on the same standard
+output as the token it hands over.
 """
 
 

@@ -305,6 +305,7 @@ server and the built command tree.
 | `connector_reconcile` | ✓ | `connector reconcile NAME [--dry-run]` | counts only: ids seen, live documents compared, missing, deleted |
 | `connector_reconcile_resolve` | ✓ | `connector reconcile NAME --confirm` / `--discard` | the same counts, for the proposal the deletion ceiling refused |
 | `connector_login` | — | `connector login` | who a captured browser session belongs to |
+| `connector_login_gmail` | — | `connector login` (a Gmail source) | where a refresh token was written, never the token |
 | `config_get` | ✓ | `config get` / `config show` | configuration, redacted |
 | `config_set` | ✓ | `config set` | the key, before and after |
 | `workspace_list` | ✓ | `workspace list` | workspaces, active marked |
@@ -389,7 +390,7 @@ incremental walk, and is not the same claim as `false`. Absent `enumeration_offs
 ### Operations with no MCP tool, and why
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
-`connector_sidecar`, `collection_orphans`, `document_reindex_stale`, `document_reembed`, the
+`connector_login_gmail`, `connector_sidecar`, `collection_orphans`, `document_reindex_stale`, `document_reembed`, the
 five mutating or corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs — keys
 and people alike — have no tool; the `auth` verbs are on the HTTP surface for an administrator
 too (§9.2). Each of them either destroys data, mints a credential, writes into the
@@ -1092,10 +1093,9 @@ measures. (`/healthz` and `/readyz` run no check.) `facts.sources` maps each sou
 `ok`, `invalid_options`, `dependency_missing`, `missing_secret`, `different_mailbox`, `grant_revoked`, `credential_rejected` or
 `unreachable` — and neither it nor `detail` ever carries an address, a token or a secret:
 `doctor` output is read by more people than the mailbox is. The remedy for a
-revoked grant, a refused client or a token for the wrong mailbox is to mint a new refresh token
-as the configured account and supply it as the source's `refresh_token`; `manicule connector
-login` does not support Gmail yet ([#461](https://github.com/mgd43b/manicule/issues/461)), so the
-remedy does not name it. For a missing secret it names the two settings, and for an unreachable Google it says to check the
+revoked grant, a refused client or a token for the wrong mailbox is to run `manicule connector login
+<name>` as the configured account and supply the token it writes as the source's
+`refresh_token`. For a missing secret it names the two settings, and for an unreachable Google it says to check the
 network and run `doctor` again. The connector this credential is for does not exist yet
 ([#460](https://github.com/mgd43b/manicule/issues/460)), so a passing check means the credential
 is ready, not that mail is being indexed.
