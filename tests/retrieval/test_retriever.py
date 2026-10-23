@@ -16,6 +16,7 @@ from manicule.core.retrieval import ConfidenceBand, Filter, Query
 from manicule.plugins.registry import ComponentRegistry
 from manicule.retrieval.assembly import ContextAssembler
 from manicule.retrieval.cache import L1QueryCache
+from manicule.retrieval.collapse import CollapseStage
 from manicule.retrieval.confidence import AGREEMENT
 from manicule.retrieval.dense import DenseStage
 from manicule.retrieval.fusion import RRFStage
@@ -416,6 +417,24 @@ def test_fusion_accepts_the_legs_the_pipeline_does_declare() -> None:
     stage = Container(settings, _registry()).get(keys.RETRIEVAL_STAGE.named("rrf"))
     assert isinstance(stage, RRFStage)
     assert stage.legs == ("dense", "lexical")
+
+
+def test_collapse_declared_before_fusion_is_refused() -> None:
+    """Before fusion there is no ranking, only one leg's list and then the other's."""
+    settings = _settings(pipeline=("dense", "lexical", "collapse", "rrf"))
+    container = Container(settings, _registry())
+
+    with pytest.raises(ConfigError, match="before 'rrf'"):
+        container.get(keys.RETRIEVAL_STAGE.named("collapse"))
+
+
+def test_collapse_after_fusion_is_built(store: SqliteDocStore) -> None:
+    registry = _registry()
+    registry.add(keys.DOC_STORE.named("bound"), lambda _: store)
+    settings = _settings(pipeline=("dense", "lexical", "rrf", "collapse"))
+    settings.storage.db = "bound"  # pyright: ignore[reportAttributeAccessIssue]
+    stage = Container(settings, registry).get(keys.RETRIEVAL_STAGE.named("collapse"))
+    assert isinstance(stage, CollapseStage)
 
 
 def test_a_pipeline_naming_one_stage_twice_is_refused_before_construction() -> None:

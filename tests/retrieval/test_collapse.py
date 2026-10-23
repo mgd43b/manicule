@@ -152,6 +152,20 @@ async def test_another_conversation_is_never_compared(store: SqliteDocStore) -> 
     assert await CollapseStage(docstore=store).run(a_query(), ranked) == ranked
 
 
+async def test_the_same_thread_id_from_two_sources_is_two_conversations(
+    store: SqliteDocStore,
+) -> None:
+    """A thread id is unique within the mailbox that issued it, not across two mailboxes."""
+    mine = await message(store, "m1", {"gmail_thread_id": "t1"})
+    theirs = make_document("other-mail", "m1", media_type="message/rfc822").model_copy(
+        update={"metadata": {"gmail_thread_id": "t1"}}
+    )
+    await store.upsert_document(theirs)
+    ranked = [candidate(mine, ORIGINAL, 0.9), candidate(theirs, quoted(ORIGINAL), 0.8)]
+
+    assert await CollapseStage(docstore=store).run(a_query(), ranked) == ranked
+
+
 async def test_a_document_without_a_conversation_passes_through_untouched(
     store: SqliteDocStore,
 ) -> None:

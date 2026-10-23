@@ -558,7 +558,15 @@ class Row:
 
 
 def summarize(label: str, outcomes: Sequence[Outcome]) -> Row:
+    """One row over ``outcomes``.
+
+    Raises:
+        ValueError: There are none — a row of zeros would read as a measurement.
+    """
     count = len(outcomes)
+    if not count:
+        msg = f"no queries for {label!r}: the corpus has no threads of that kind"
+        raise ValueError(msg)
     states: dict[str, int] = dict.fromkeys(ORIGIN_STATES, 0)
     for outcome in outcomes:
         states[outcome.origin] += 1
@@ -670,8 +678,8 @@ class Verdict:
 def verdict(outcomes: Sequence[Outcome], *, pipeline: str = "hybrid", k: int = 10) -> Verdict:
     chosen = [o for o in outcomes if o.pipeline == pipeline and o.k == k]
     return Verdict(
-        long=summarize("long", [o for o in chosen if o.asked.length >= 10]),
-        short=summarize("short", [o for o in chosen if o.asked.length == 2]),
+        long=summarize("threads of 10+", [o for o in chosen if o.asked.length >= 10]),
+        short=summarize("2-message threads", [o for o in chosen if o.asked.length == 2]),
     )
 
 

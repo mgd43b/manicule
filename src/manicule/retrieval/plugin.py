@@ -114,9 +114,28 @@ def build_fusion(context: BuildContext) -> RetrievalStage:
 
 
 def build_collapse(context: BuildContext) -> RetrievalStage:
-    """Near-duplicate collapse within a conversation, reading document metadata."""
+    """Near-duplicate collapse within a conversation, reading document metadata.
+
+    Raises:
+        ConfigError: ``rag.pipeline`` declares it before fusion. It walks its input best first,
+            and before fusion the input is the legs' lists one after the other, so which copy
+            it kept would be decided by which leg ran first.
+    """
     from manicule.retrieval.collapse import CollapseStage  # noqa: PLC0415
 
+    declared = list(context.settings.rag.pipeline)
+    if (
+        COLLAPSE_NAME in declared
+        and FUSION_NAME in declared
+        and declared.index(COLLAPSE_NAME) < declared.index(FUSION_NAME)
+    ):
+        msg = (
+            f"rag.pipeline declares {COLLAPSE_NAME!r} before {FUSION_NAME!r}. Collapse keeps the "
+            f"best-ranked copy of what a conversation repeats, and before fusion there is no "
+            f"ranking: the list is one leg's candidates and then the other's. Declare it after "
+            f"{FUSION_NAME!r}."
+        )
+        raise ConfigError(msg)
     return CollapseStage(
         docstore=context.components.get(keys.DOC_STORE),
         config=_config(context, CollapseConfig),

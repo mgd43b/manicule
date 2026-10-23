@@ -145,8 +145,9 @@ class CollapseConfig(StageConfig):
         default="gmail_thread_id",
         min_length=1,
         description="The document metadata field naming the conversation a document belongs "
-        "to. Only candidates whose documents share a value are compared, and a document "
-        "without the field is never collapsed. The Gmail connector records this one.",
+        "to. Only candidates from the same source whose documents share a value are compared, "
+        "and a document without the field is never collapsed. The Gmail connector records "
+        "this one.",
     )
     containment: float = Field(
         default=0.8,

@@ -32,6 +32,7 @@ from tests.benchmarks.thread_duplication import (
     measure,
     rows,
     score,
+    summarize,
 )
 from tests.fakes import HashEmbedder
 
@@ -155,6 +156,11 @@ def test_scoring_a_hand_built_page() -> None:
         "not found"
     )
     assert score(_asked(origin, companion), page[1:], pipeline="hybrid", k=1).origin == "first"
+
+
+def test_a_group_with_no_queries_is_refused_rather_than_reported_as_zeros() -> None:
+    with pytest.raises(ValueError, match="no queries"):
+        summarize("threads of 10+", [])
 
 
 async def test_the_program_runs_end_to_end_through_the_runtime(

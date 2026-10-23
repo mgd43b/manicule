@@ -76,7 +76,7 @@ class CollapseStage:
         conversations = await self._conversations(query, candidates)
         if not conversations:
             return list(candidates)
-        shown: dict[str, set[tuple[str, ...]]] = {}
+        shown: dict[tuple[str, str], set[tuple[str, ...]]] = {}
         kept: list[Candidate] = []
         for candidate in candidates:
             conversation = conversations.get(candidate.chunk.document_id)
@@ -91,8 +91,13 @@ class CollapseStage:
             kept.append(candidate)
         return kept
 
-    async def _conversations(self, query: Query, candidates: list[Candidate]) -> dict[str, str]:
+    async def _conversations(
+        self, query: Query, candidates: list[Candidate]
+    ) -> dict[str, tuple[str, str]]:
         """The conversation each candidate's document belongs to, where it names one.
+
+        Keyed by source as well as by the field's value: a thread id is unique within the
+        mailbox that issued it, and two sources in one workspace can issue the same one.
 
         Read under the query's own filter, narrowed to these documents, so this is no wider a
         read than the one that produced the candidates.
@@ -107,7 +112,7 @@ class CollapseStage:
         )
         key = self._config.thread_key
         return {
-            document.id: str(document.metadata[key])
+            document.id: (document.source, str(document.metadata[key]))
             for document in documents
             if document.metadata.get(key) not in (None, "")
         }
