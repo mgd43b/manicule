@@ -123,7 +123,7 @@ if TYPE_CHECKING:
     from manicule.app.ports import Backend, Conversing, DocumentSurface, OpenedWorkspace
     from manicule.config.settings import OAuthProvider
     from manicule.connectors.browser import BrowserSessionProvider
-    from manicule.connectors.config import ConfluenceConfig
+    from manicule.connectors.config import ConfluenceConfig, GmailConfig
     from manicule.connectors.enriched import EnrichedProfile
     from manicule.connectors.filesystem import FilesystemConnector
     from manicule.connectors.sessions import SessionStore
@@ -4369,7 +4369,10 @@ class ApplicationService:
         elif why == "unreachable":
             remedy = "check the machine can reach Google, then run `manicule doctor` again"
         else:
-            remedy = f"manicule connector login {first}"
+            remedy = (
+                f"mint a new Gmail refresh token for {first!r} as the account it is configured "
+                f"for and supply it as its refresh_token (docs/connectors/gmail.md §1.3)"
+            )
         return r.Check(
             name="gmail-credential",
             state="degraded" if only_unreachable else "failing",
@@ -8871,10 +8874,6 @@ _gmail_observations: dict[tuple[str, str], tuple[float, str]] = {}
 """``(source, digest of its options)`` to ``(when, outcome)``. Digested so a secret set in the
 options is not kept as a dictionary key, and keyed by options so editing a source is a miss."""
 
-_GMAIL_LOCAL_OUTCOMES = frozenset({"invalid_options", "missing_secret", "dependency_missing"})
-"""Outcomes decided without asking Google. Never cached: they cost nothing, and caching them
-would keep reporting a problem the operator has just fixed."""
-
 GMAIL_PROBE_DEADLINE_SECONDS = 15.0
 """How long ``doctor`` waits for one Gmail source's probe before calling it unreachable.
 
@@ -8884,39 +8883,65 @@ large download. Sources are probed concurrently, so this bounds the whole sweep.
 """
 
 
-async def _observed_gmail_outcome(name: str, options: Mapping[str, Any]) -> tuple[str, float]:
-    """A source's outcome and how many seconds old it is (``0.0`` when measured just now)."""
-    key = (
-        name,
-        hashlib.blake2b(
-            json.dumps(options, sort_keys=True, default=str).encode(), digest_size=16
-        ).hexdigest(),
+def _resolve_gmail_source(name: str, options: Mapping[str, Any]) -> GmailConfig | str:
+    """The source's settings with its secrets resolved, or the fixed word for what is wrong.
+
+    Done on every call, ahead of any reuse of an earlier probe: a secret removed from the
+    environment a moment ago must not be reported as a working credential for the rest of the
+    reuse window. Nothing here asks Google.
+    """
+    from manicule.connectors.config import (  # noqa: PLC0415 - no HTTP stack at import
+        GmailConfig,
+        resolve_gmail_credentials,
     )
+
+    try:
+        config = GmailConfig.model_validate(options)
+    except ValidationError:
+        return "invalid_options"
+    try:
+        return resolve_gmail_credentials(config, instance=name)
+    except ConfigError:
+        return "missing_secret"
+
+
+async def _observed_gmail_outcome(name: str, options: Mapping[str, Any]) -> tuple[str, float]:
+    """A source's outcome and how many seconds old it is (``0.0`` when measured just now).
+
+    A probe is reused only for the same source with the same settings **and the same resolved
+    secrets**, so replacing a token is a new measurement rather than a stale answer about the old
+    one, and a problem found locally is reported as it stands, never remembered.
+    """
+    resolved = _resolve_gmail_source(name, options)
+    if isinstance(resolved, str):
+        return resolved, 0.0
+    material = json.dumps(
+        [
+            resolved.model_dump(mode="json"),
+            resolved.client_secret.get_secret_value() if resolved.client_secret else "",
+            resolved.refresh_token.get_secret_value() if resolved.refresh_token else "",
+        ],
+        sort_keys=True,
+    )
+    key = (name, hashlib.blake2b(material.encode(), digest_size=16).hexdigest())
     now = _gmail_clock()
     held = _gmail_observations.get(key)
     if held is not None and now - held[0] < GMAIL_PROBE_TTL_SECONDS:
         return held[1], now - held[0]
-    word = await _gmail_source_outcome(name, options)
-    if word in _GMAIL_LOCAL_OUTCOMES:
+    word = await _probe_gmail_source(name, resolved)
+    if word == "dependency_missing":
         _gmail_observations.pop(key, None)
     else:
         _gmail_observations[key] = (_gmail_clock(), word)
     return word, 0.0
 
 
-async def _gmail_source_outcome(name: str, options: Mapping[str, Any]) -> str:
-    """One Gmail source's credential outcome, as a word from a closed set.
+async def _probe_gmail_source(name: str, resolved: GmailConfig) -> str:
+    """One refresh and one ``getProfile`` for a source, as a word from a closed set.
 
     Every outcome is a fixed word, because the outcome reaches ``doctor``'s ``facts`` and nothing
-    a mailbox, Google or a secret supplied may reach those. Options that do not validate are
-    ``invalid_options``: nothing else reports them — startup checks a connector's type, not its
-    options — and a source dropped here would read as a healthy corpus with no Gmail source in
-    it. The word never carries the value that failed.
+    a mailbox, Google or a secret supplied may reach those. The word never carries a value.
     """
-    from manicule.connectors.config import (  # noqa: PLC0415 - no HTTP stack at import
-        GmailConfig,
-        resolve_gmail_credentials,
-    )
     from manicule.connectors.credentials import gmail_credential  # noqa: PLC0415
     from manicule.connectors.errors import (  # noqa: PLC0415
         ConnectorError,
@@ -8925,14 +8950,6 @@ async def _gmail_source_outcome(name: str, options: Mapping[str, Any]) -> str:
         MailboxMismatchError,
     )
 
-    try:
-        config = GmailConfig.model_validate(options)
-    except ValidationError:
-        return "invalid_options"
-    try:
-        resolved = resolve_gmail_credentials(config, instance=name)
-    except ConfigError:
-        return "missing_secret"
     credential = gmail_credential(resolved, instance=name)
     try:
         async with asyncio.timeout(GMAIL_PROBE_DEADLINE_SECONDS):

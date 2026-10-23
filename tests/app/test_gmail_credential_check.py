@@ -128,7 +128,7 @@ async def test_a_revoked_grant_fails_with_the_login_command_as_the_remedy(
 
     assert check.state == "failing"
     assert check.facts["sources"] == {"mail": "grant_revoked"}
-    assert check.remedy == "manicule connector login mail"
+    assert "mint a new Gmail refresh token for 'mail'" in check.remedy
 
 
 async def test_a_refused_oauth_client_fails(google: FakeGoogleOAuth) -> None:
@@ -174,7 +174,7 @@ async def test_each_source_is_reported_and_the_first_broken_one_names_the_remedy
 
     assert check.state == "failing"
     assert check.facts["sources"] == {"alpha": "ok", "beta": "different_mailbox"}
-    assert check.remedy == "manicule connector login beta"
+    assert "'beta'" in check.remedy
 
 
 async def test_options_that_do_not_validate_fail_the_check_instead_of_vanishing(
@@ -353,3 +353,29 @@ async def test_a_problem_found_without_asking_google_is_never_remembered(
 
 async def gmail_check_of(service: ApplicationService) -> r.Check:
     return next(c for c in (await service.doctor()).checks if c.name == CHECK)
+
+
+async def test_a_secret_removed_while_a_probe_is_remembered_is_reported_not_hidden(
+    google: FakeGoogleOAuth, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service_module, "_gmail_clock", Moments())
+    service = service_with(mail=mail())
+    assert (await gmail_check_of(service)).facts["sources"] == {"mail": "ok"}
+
+    monkeypatch.delenv("GMAIL_REFRESH_TOKEN")
+    gone = await gmail_check_of(service)
+
+    assert gone.facts["sources"] == {"mail": "missing_secret"}
+    assert gone.facts["freshly_measured"] is True
+
+
+async def test_replacing_a_token_is_a_new_measurement_not_the_old_answer(
+    google: FakeGoogleOAuth, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service_module, "_gmail_clock", Moments())
+    service = service_with(mail=mail())
+    assert (await gmail_check_of(service)).facts["sources"] == {"mail": "ok"}
+
+    monkeypatch.setenv("GMAIL_REFRESH_TOKEN", "a-different-token")
+
+    assert (await gmail_check_of(service)).facts["sources"] == {"mail": "grant_revoked"}

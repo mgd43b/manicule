@@ -1040,10 +1040,11 @@ without asking it (options, a missing secret or client library) is re-checked ev
 measures. (`/healthz` and `/readyz` run no check.) `facts.sources` maps each source's name to one of a fixed set of words —
 `ok`, `invalid_options`, `dependency_missing`, `missing_secret`, `different_mailbox`, `grant_revoked`, `credential_rejected` or
 `unreachable` — and neither it nor `detail` ever carries an address, a token or a secret:
-`doctor` output is read by more people than the mailbox is. The remedy is `manicule connector
-login <name>` for a revoked grant, a refused client or a token for the wrong mailbox, which
-the command for Gmail ([#461](https://github.com/mgd43b/manicule/issues/461)) will provide; for
-a missing secret it names the two settings, and for an unreachable Google it says to check the
+`doctor` output is read by more people than the mailbox is. The remedy for a
+revoked grant, a refused client or a token for the wrong mailbox is to mint a new refresh token
+as the configured account and supply it as the source's `refresh_token`; `manicule connector
+login` does not support Gmail yet ([#461](https://github.com/mgd43b/manicule/issues/461)), so the
+remedy does not name it. For a missing secret it names the two settings, and for an unreachable Google it says to check the
 network and run `doctor` again. The connector this credential is for does not exist yet
 ([#460](https://github.com/mgd43b/manicule/issues/460)), so a passing check means the credential
 is ready, not that mail is being indexed.
