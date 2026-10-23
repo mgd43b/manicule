@@ -211,6 +211,9 @@ class FakeGmail:
         """Answer ``format=raw`` with this text in place of the encoded message."""
         self.request_times: list[float] = []
         """When each request reached the server, by the fake's clock."""
+        self.before_request: Callable[[httpx.Request], None] | None = None
+        """Called with each request before the fake answers it: how a test makes the mailbox
+        change *while* a walk is under way."""
         self.corrupt_raw = False
         """Answer ``format=raw`` with a stray character in the middle of the base64url."""
         self.rejecting_all_tokens = False
@@ -395,6 +398,8 @@ class FakeGmail:
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         self.request_times.append(self._clock())
+        if self.before_request is not None:
+            self.before_request(request)
         if request.url.host != HOST or not request.url.path.startswith(PREFIX):
             return httpx.Response(404, json=_error(404, "NOT_FOUND", "notFound"))
         path = request.url.path[len(PREFIX) :]

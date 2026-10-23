@@ -31,6 +31,8 @@ from datetime import UTC, datetime
 from typing import Final
 from urllib.parse import quote
 
+from pydantic import JsonValue
+
 from manicule.connectors import config as gmail_settings
 from manicule.connectors.config import (
     ALWAYS_EXCLUDED_LABELS,
@@ -43,6 +45,7 @@ from manicule.connectors.errors import ConnectorError, CursorExpiredError, NotFo
 from manicule.connectors.gmail_client import GmailClient, HistoryPage, Profile
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.lifecycle import HealthReport, Metric
+from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
 
 __all__ = [
@@ -351,15 +354,43 @@ class GmailConnector:
         metadata: Metadata = {_VERSION_KEY: gmail_settings.REPRESENTATION_VERSION}
         if message.thread_id is not None:
             metadata["gmail_thread_id"] = message.thread_id
+        arrived = None
         if message.internal_date_ms is not None:
-            metadata["internal_date"] = _iso(message.internal_date_ms)
+            arrived = _arrival(message.internal_date_ms)
+            metadata["internal_date"] = arrived.isoformat()
+        subject, rfc822_id = _headers(message.raw)
+        uri = self._uri(ref.source_id, rfc822_id)
+        metadata[PROVENANCE_KEY] = self._provenance(ref.source_id, subject, uri, arrived)
         return RawDocument(
             source_id=ref.source_id,
-            uri=self._uri(ref.source_id, _message_id(message.raw)),
+            uri=uri,
             media_type=MESSAGE_MEDIA_TYPE,
             content=message.raw,
             metadata=metadata,
         )
+
+    @staticmethod
+    def _provenance(message_id: str, subject: str, uri: str, arrived: datetime | None) -> JsonValue:
+        """What a citation says about the message: its subject, its link, when it arrived.
+
+        A subject Gmail delivers with a control character is a message that is still indexed
+        and cited by its link; the record then says it could not be described, in words that
+        do not quote the subject.
+        """
+        try:
+            source = SourceMetadata(
+                title=subject,
+                canonical_uri=uri,
+                source_id=message_id,
+                version=gmail_settings.REPRESENTATION_VERSION,
+                created_at=arrived,
+                content_type=MESSAGE_MEDIA_TYPE,
+            )
+        except ValueError:
+            return Provenance(
+                unavailable_reason="the message's subject could not be recorded as its title"
+            ).as_metadata_value()
+        return Provenance(source=source).as_metadata_value()
 
     # --- reconciliation ------------------------------------------------------------------
 
@@ -396,18 +427,25 @@ class GmailConnector:
         )
 
 
-def _message_id(raw: bytes) -> str | None:
-    """The ``Message-ID`` header without its angle brackets, or ``None`` if there is none."""
+def _headers(raw: bytes) -> tuple[str, str | None]:
+    """The ``Subject`` and the ``Message-ID`` (without its angle brackets) of a message.
+
+    Both are read from the headers only and neither is ever logged. An unreadable or absent
+    header is an empty subject or no id, never an error: the message is still indexed.
+    """
     try:
         headers = email.parser.BytesHeaderParser(policy=email.policy.default).parsebytes(raw)
-        value = headers.get("Message-ID")
+        subject = headers.get("Subject")
+        message_id = headers.get("Message-ID")
     except (ValueError, TypeError, IndexError):
-        return None
-    if value is None:
-        return None
-    text = str(value).strip().removeprefix("<").removesuffix(">").strip()
-    return text or None
+        return "", None
+    cleaned = (
+        str(message_id).strip().removeprefix("<").removesuffix(">").strip()
+        if message_id is not None
+        else ""
+    )
+    return " ".join(str(subject).split()) if subject is not None else "", cleaned or None
 
 
-def _iso(milliseconds: int) -> str:
-    return datetime.fromtimestamp(milliseconds / 1000, tz=UTC).isoformat()
+def _arrival(milliseconds: int) -> datetime:
+    return datetime.fromtimestamp(milliseconds / 1000, tz=UTC)

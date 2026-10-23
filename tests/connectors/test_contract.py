@@ -25,12 +25,17 @@ from manicule.connectors.config import GitSiteConfig, GmailConfig
 from manicule.connectors.plugin import PLUGIN, build_confluence, build_git_site, build_gmail
 from manicule.container import keys
 from manicule.core.errors import ConfigError
-from manicule.core.protocols import Connector
+from manicule.core.protocols import (
+    BatchedDiscoveryConnector,
+    BatchedReconciliationConnector,
+    Connector,
+)
 from manicule.plugins import ComponentRegistry, discover
 from manicule.plugins.manifest import ComponentKind
 from manicule.plugins.registry import BuildContext
 from manicule.testing import assert_connector_contract, assert_protocol_signatures
 from tests.connectors.fake_confluence import FakeAttachment, FakeConfluence, FakePage
+from tests.connectors.gmail_support import mail, mailbox, opened
 from tests.connectors.support import Waits, cloud_config, connected
 
 
@@ -52,6 +57,19 @@ async def test_the_confluence_connector_satisfies_the_connector_contract() -> No
         await assert_connector_contract(connector)
     finally:
         await connector.teardown()
+
+
+@pytest.mark.contract
+async def test_the_gmail_connector_satisfies_the_connector_contract() -> None:
+    """Including that ``reconcile`` reports every message ``discover`` just returned."""
+    server, time = mailbox()
+    for number in range(3):
+        server.add_message(mail(f"Message {number}"))
+    async with opened(server, time) as connector:
+        await assert_connector_contract(connector)
+        assert_protocol_signatures(connector, Connector)
+        assert isinstance(connector, BatchedDiscoveryConnector)
+        assert isinstance(connector, BatchedReconciliationConnector)
 
 
 @pytest.mark.contract
@@ -116,6 +134,7 @@ def test_registering_the_connector_loads_no_http_client() -> None:
     assert "manicule.connectors.git_reader" not in loaded
     assert "manicule.connectors.git_site" not in loaded
     assert "manicule.connectors.gmail_client" not in loaded
+    assert "manicule.connectors.gmail" not in loaded
 
 
 def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
@@ -140,8 +159,8 @@ def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
 
 
 def test_the_plugin_registers_the_sources_this_build_ships() -> None:
-    """Confluence live, Confluence from disk, the local filesystem ``manicule index`` walks, and
-    Gmail, which is registered for its configuration and credential and not yet for reading mail.
+    """Confluence live, Confluence from disk, the local filesystem ``manicule index`` walks, the
+    pinned Git site, and Gmail.
 
     Asserted as an exact list rather than a membership check: a connector registered and
     never mentioned anywhere is a source nobody knows they can configure.
