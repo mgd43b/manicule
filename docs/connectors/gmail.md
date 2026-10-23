@@ -3,16 +3,18 @@
 Design for the Gmail connector. Ticket [#457](https://github.com/mgd43b/manicule/issues/457),
 epic [#464](https://github.com/mgd43b/manicule/issues/464).
 
-> **Status: partly implemented; the connector that reads mail does not exist yet.** What
-> [#458](https://github.com/mgd43b/manicule/issues/458) shipped is the configuration
+> **Status: partly implemented; the connector that reads mail does not exist yet.** Two tickets
+> have shipped. [#458](https://github.com/mgd43b/manicule/issues/458) is the configuration
 > (`GmailConfig`, `manicule/connectors/config.py`), the refresh-token credential and the mailbox
 > check (`manicule/connectors/credentials.py`), the pipeline's pinned-identity check
 > (`manicule/ingest/pipeline.py`) and the `gmail-credential` `doctor` check
-> (`manicule/app/service.py`). A `type = "gmail"` source validates and resolves its credential,
-> and then the factory refuses to build it, because the connector is
-> [#460](https://github.com/mgd43b/manicule/issues/460). Everything else on this page — the REST
-> client ([#459](https://github.com/mgd43b/manicule/issues/459)), discovery, fetching and
-> reconciliation ([#460](https://github.com/mgd43b/manicule/issues/460),
+> (`manicule/app/service.py`). [#459](https://github.com/mgd43b/manicule/issues/459) is the REST
+> client, whose calls, pacing and error typing (§5, §6) are in `manicule/connectors/gmail_client.py`,
+> tested against the synthetic Gmail in `tests/connectors/fake_gmail.py`. A `type = "gmail"` source
+> validates and resolves its credential, and then the factory refuses to build it, because the
+> connector is [#460](https://github.com/mgd43b/manicule/issues/460). Everything else on this page
+> — discovery, fetching and reconciliation
+> ([#460](https://github.com/mgd43b/manicule/issues/460),
 > [#466](https://github.com/mgd43b/manicule/issues/466)), `connector login`
 > ([#461](https://github.com/mgd43b/manicule/issues/461)) and the serving refusal
 > ([#462](https://github.com/mgd43b/manicule/issues/462)) — is still design: a decision for
@@ -440,7 +442,10 @@ pages cost 2 units, and a complete inventory of 100,000 ids is about 1,000 units
 
 **Paced, not throttled into.** The client meters its own spending against a per-minute budget,
 `quota_units_per_minute` (default 5,400 — 90% of the per-user limit, leaving room for anything
-else using the same project), and waits before a request would exceed it. A 429 is still
+else using the same project), and waits before a request would exceed it. The budget is a
+rolling minute, not a bucket that resets on the clock: the units spent in *any* sixty seconds
+stay within it, and every attempt is charged, a retry included. A budget below 60 is refused at
+construction, because no raw fetch could ever fit in it. A 429 is still
 handled — honoring `Retry-After` in both its forms, and stopping the run when the requested
 pause exceeds `max_retry_after_seconds`, as the Confluence client does — but it is the
 exception, not the steering mechanism. A client that discovers its limit by hitting it spends
@@ -458,7 +463,16 @@ growing the journal without bound, and the first sync cannot complete. A mailbox
 about a million messages in scope therefore needs that limit raised, with the disk it implies,
 or `exclude_labels` used to bring the first sync under it.
 
-**Errors**, as the client types them ([#459](https://github.com/mgd43b/manicule/issues/459)):
+**Errors**, as the client types them ([#459](https://github.com/mgd43b/manicule/issues/459)).
+A 403 is a rate limit when its `reason` is `rateLimitExceeded` or `userRateLimitExceeded`,
+compared without regard to case or underscores and read from both `error.errors[]` and
+`error.details[]` (which of the two Google uses is not yet verified, §11). A 404 is typed by the
+call that received it, so a 404 from `getProfile` or `labels.list` is an ordinary unusable
+answer rather than a deleted message. A second 401 raises whatever the credential
+builds for it, which carries its own renewal sentence. Every message names the operation and a status, never an id,
+an address or a label name (§10), and the client redacts Gmail's request URLs from `httpx`'s
+own INFO log, which would otherwise print each message id (other clients' records are left
+alone):
 
 | Gmail answers | Typed as | Effect |
 |---|---|---|
@@ -651,15 +665,18 @@ differ, it is here — check these first when one is available:
 | Holding a synced source to its pinned identity | `manicule/ingest/pipeline.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
 | The `gmail-credential` `doctor` check | `manicule/app/service.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
 | Registration (configuration and credential only; the factory always refuses) | `manicule/connectors/plugin.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented; completed, and marked sensitive, by [#460](https://github.com/mgd43b/manicule/issues/460) |
-| REST calls, pacing, error typing | `manicule/connectors/gmail_client.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Planned |
+| REST calls, pacing, error typing | `manicule/connectors/gmail_client.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
 | `discover`, `fetch`, `reconcile`, watermarks | `manicule/connectors/gmail.py` | [#460](https://github.com/mgd43b/manicule/issues/460) | Planned |
 | `connector login` for Gmail | `manicule/connectors/` and the CLI | [#461](https://github.com/mgd43b/manicule/issues/461) | Planned |
 | Refusing to serve a sensitive source unauthenticated | `manicule/app/bind.py` | [#462](https://github.com/mgd43b/manicule/issues/462) | Planned |
 | Reconciliation after a full walk | `manicule/connectors/gmail.py` and the pipeline | [#466](https://github.com/mgd43b/manicule/issues/466) | Planned |
-| The synthetic Gmail | `tests/connectors/fake_gmail.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Planned |
+| The synthetic Gmail | `tests/connectors/fake_gmail.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
 
-No Google client library is added. The four REST calls go through the HTTP stack the Confluence
-client already uses, imported by the factory rather than at plugin discovery.
+No Google client library is added. The six REST calls (`getProfile`, `labels.list`,
+`messages.list`, `messages.get` in `raw` and `minimal`, and `history.list`) go through the HTTP
+stack the Confluence client already uses, imported by the factory rather than at plugin
+discovery: `gmail_client.py` imports it inside `GmailClient.setup()`, so importing the module
+costs no HTTP stack either.
 
 ---
 
