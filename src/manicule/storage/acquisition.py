@@ -20,6 +20,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import aliased
 
 from manicule.core.acquisition import (
+    MAX_DISCOVERY_BATCH,
     UNSET,
     AcquiredSource,
     AcquisitionDiagnostic,
@@ -74,8 +75,6 @@ _SOURCE = TypeAdapter(AcquisitionSource)
 _ACQUIRED_SOURCE = TypeAdapter(AcquiredSource)
 _DIAGNOSTIC = TypeAdapter(AcquisitionDiagnostic)
 _OMISSION_REASONS = TypeAdapter(dict[AcquisitionFailureCode, int])
-
-_ACQUISITION_BATCH_LIMIT = 250
 
 
 def _empty_abandoned_leases() -> set[tuple[str, str, str, int]]:
@@ -1896,8 +1895,8 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         if sequence < 0:
             msg = "sequence must not be negative"
             raise ValueError(msg)
-        if len(sources) > _ACQUISITION_BATCH_LIMIT:
-            msg = f"acquisition discovery batches are limited to {_ACQUISITION_BATCH_LIMIT} records"
+        if len(sources) > MAX_DISCOVERY_BATCH:
+            msg = f"acquisition discovery batches are limited to {MAX_DISCOVERY_BATCH} records"
             raise ValueError(msg)
         if not sources:
             return ()

@@ -483,6 +483,13 @@ Each `messages.list` page and each `history.list` page is one discovery batch
 (`BatchedDiscoveryConnector`), so durable ingest commits a page's records before the next page
 token is followed ([`ingest.md`](../ingest.md) §8.3.1).
 
+A batch holds at most 250 records (`MAX_DISCOVERY_BATCH`, `manicule/core/acquisition.py`), and a
+page does not: `messages.list` returns up to 500 ids, and a `history.list` page can name more
+messages than it has records. So a larger page is yielded as consecutive batches of at most 250,
+in order, all of them before the next page is requested — the next token is still followed only
+once its whole page is durable. Asking for 250 ids a page instead would have doubled the listing
+calls of every walk and still left the history page to split.
+
 ---
 
 ## 5. Fetching

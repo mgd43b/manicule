@@ -21,7 +21,8 @@ import pytest_asyncio
 
 from manicule.connectors import config as gmail_settings
 from manicule.connectors.gmail import GmailConnector
-from manicule.core.acquisition import SnapshotPromotionPolicy
+from manicule.connectors.gmail_client import PAGE_SIZE
+from manicule.core.acquisition import MAX_DISCOVERY_BATCH, SnapshotPromotionPolicy
 from manicule.core.content import DocumentStatus
 from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline, RunReport
@@ -755,3 +756,55 @@ async def test_a_message_over_the_fetch_cap_is_refused_and_counted_never_truncat
     assert report.watermark_advanced is (policy is SnapshotPromotionPolicy.ALLOW_OMISSIONS)
     assert SUBJECT not in json.dumps(report.as_metadata(), default=str)
     assert huge.id not in json.dumps(report.as_metadata(), default=str)
+
+
+# --- a listing page larger than one durable batch (§4.4) -----------------------------------------
+
+
+OVER_ONE_BATCH = MAX_DISCOVERY_BATCH + 10
+"""More messages than one durable discovery batch admits, in a single listing page."""
+
+
+async def test_a_full_listing_page_larger_than_one_batch_is_indexed_whole(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path, vectors: LanceVectorStore
+) -> None:
+    """Gmail returns up to 500 ids a page; the journal admits at most 250 records a batch.
+
+    The suites served pages of two, so a first sync of any mailbox with a full page failed
+    enumeration and indexed nothing, and nothing here noticed.
+    """
+    pipeline = mail_pipeline(store, engine, data_dir, vectors)
+    server, time = mailbox(page_size=PAGE_SIZE)
+    for number in range(OVER_ONE_BATCH):
+        server.add_message(mail(f"Message {number}"))
+    connector = connector_over(server, time)
+    await connector.setup()
+    try:
+        report = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    assert report.error == ""
+    assert report.full_enumeration
+    assert report.indexed == OVER_ONE_BATCH
+
+
+async def test_a_history_page_naming_more_than_one_batch_is_indexed_whole(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path, vectors: LanceVectorStore
+) -> None:
+    pipeline = mail_pipeline(store, engine, data_dir, vectors)
+    server, time = mailbox(page_size=PAGE_SIZE)
+    server.add_message(mail("Before"))
+    connector = connector_over(server, time)
+    await connector.setup()
+    try:
+        await pipeline.run(connector)
+        for number in range(OVER_ONE_BATCH):
+            server.add_message(mail(f"Arrived {number}"))
+        report = await pipeline.run(connector)
+    finally:
+        await connector.teardown()
+
+    assert report.error == ""
+    assert not report.full_enumeration, "read from the history log, not a complete walk"
+    assert report.indexed == OVER_ONE_BATCH
