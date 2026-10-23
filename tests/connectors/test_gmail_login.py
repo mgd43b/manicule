@@ -147,7 +147,7 @@ async def test_a_redirect_with_the_wrong_state_is_refused_and_nothing_is_exchang
     with pytest.raises(CredentialError, match="state"):
         await login(service, google, FileSink(target), open_browser=browser(google, state="forged"))
 
-    assert google.visits == [400]  # the socket itself refused the forged redirect
+    assert google.settled() == [400]  # the socket itself refused the forged redirect
     assert google.exchanges == []
     assert not target.exists()
 
@@ -248,14 +248,14 @@ async def test_the_listener_ignores_strays_and_answers_only_the_real_redirect(
                 b"GET /?code=x&state=y HTTP/1.1\r\nHost: evil.example\r\n\r\n",
             )
         )
-        google.visits.append(visit(redirect))
+        google.record(visit(redirect))
         return True
 
     target = tmp_path / "token"
     await login(service, google, FileSink(target), open_browser=noisy)
 
     assert answers == [b"HTTP/1.1 404", b"HTTP/1.1 404", b"HTTP/1.1 405", b"HTTP/1.1 400"]
-    assert google.visits == [200]
+    assert google.settled() == [200]
     assert target.read_text() == REFRESH_TOKEN + "\n"
 
 

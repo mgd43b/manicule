@@ -16,7 +16,13 @@ from typing import TYPE_CHECKING
 from manicule.container import keys
 from manicule.core.errors import ConfigError
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
-from manicule.retrieval.config import DenseConfig, FusionConfig, LexicalConfig, RerankConfig
+from manicule.retrieval.config import (
+    CollapseConfig,
+    DenseConfig,
+    FusionConfig,
+    LexicalConfig,
+    RerankConfig,
+)
 from manicule.retrieval.profile import Profiles
 
 if TYPE_CHECKING:
@@ -28,6 +34,7 @@ DENSE_NAME = "dense"
 LEXICAL_NAME = "lexical"
 FUSION_NAME = "rrf"
 CROSS_ENCODER_NAME = "cross_encoder"
+COLLAPSE_NAME = "collapse"
 
 
 def _config[T: BaseModel](context: BuildContext, expected: type[T]) -> T:
@@ -106,6 +113,36 @@ def build_fusion(context: BuildContext) -> RetrievalStage:
     return RRFStage(config=config, name=FUSION_NAME)
 
 
+def build_collapse(context: BuildContext) -> RetrievalStage:
+    """Near-duplicate collapse within a conversation, reading document metadata.
+
+    Raises:
+        ConfigError: ``rag.pipeline`` declares it before fusion. It walks its input best first,
+            and before fusion the input is the legs' lists one after the other, so which copy
+            it kept would be decided by which leg ran first.
+    """
+    from manicule.retrieval.collapse import CollapseStage  # noqa: PLC0415
+
+    declared = list(context.settings.rag.pipeline)
+    if (
+        COLLAPSE_NAME in declared
+        and FUSION_NAME in declared
+        and declared.index(COLLAPSE_NAME) < declared.index(FUSION_NAME)
+    ):
+        msg = (
+            f"rag.pipeline declares {COLLAPSE_NAME!r} before {FUSION_NAME!r}. Collapse keeps the "
+            f"best-ranked copy of what a conversation repeats, and before fusion there is no "
+            f"ranking: the list is one leg's candidates and then the other's. Declare it after "
+            f"{FUSION_NAME!r}."
+        )
+        raise ConfigError(msg)
+    return CollapseStage(
+        docstore=context.components.get(keys.DOC_STORE),
+        config=_config(context, CollapseConfig),
+        name=COLLAPSE_NAME,
+    )
+
+
 def build_cross_encoder(context: BuildContext) -> Reranker:
     """The cross-encoder reranker. This is where torch is eventually loaded."""
     from manicule.retrieval.rerank import CrossEncoderReranker  # noqa: PLC0415
@@ -151,6 +188,12 @@ class RetrievalPlugin:
             summary="Reciprocal rank fusion over named legs. Ranks only, never scores.",
         )
         registry.add(
+            keys.RETRIEVAL_STAGE.named(COLLAPSE_NAME),
+            build_collapse,
+            config_model=CollapseConfig,
+            summary="Drops a candidate repeating text ranked above it in the same conversation.",
+        )
+        registry.add(
             keys.RERANKER.named(CROSS_ENCODER_NAME),
             build_cross_encoder,
             config_model=RerankConfig,
@@ -165,12 +208,14 @@ PLUGIN = RetrievalPlugin()
 _plugin: Plugin = PLUGIN
 
 __all__ = [
+    "COLLAPSE_NAME",
     "CROSS_ENCODER_NAME",
     "DENSE_NAME",
     "FUSION_NAME",
     "LEXICAL_NAME",
     "PLUGIN",
     "RetrievalPlugin",
+    "build_collapse",
     "build_cross_encoder",
     "build_dense",
     "build_fusion",

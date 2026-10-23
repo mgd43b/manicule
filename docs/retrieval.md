@@ -58,6 +58,8 @@ can fail on.
         ├────────────────┤
         │ rrf            │   per-leg rank ladders → reciprocal rank fusion
         ├────────────────┤
+        │ collapse       │   drops what a conversation repeats; §5.5
+        ├────────────────┤
         │ rerank         │   cross-encoder over the head; profile-gated
         └───────┬────────┘
    ─────────────┼─────────────────────────────
@@ -70,8 +72,8 @@ can fail on.
         Context + Confidence + RetrievalTrace
 ```
 
-The declared part is `rag.pipeline`, which ships as `("dense", "lexical", "rrf")` with the
-reranker appended when the profile asks for one and configuration names one
+The declared part is `rag.pipeline`, which ships as `("dense", "lexical", "rrf", "collapse")`
+with the reranker appended when the profile asks for one and configuration names one
 (`manicule.container.Container.retrieval_pipeline`). Everything outside the fenced region is
 not a stage, and §2.4 says why that is not a loophole.
 
@@ -769,6 +771,71 @@ because the ladder is longer.
 Two things follow. Lowering `K` sharpens within-leg ranking and weakens the consensus effect,
 which is the *opposite* of why RRF was chosen. And the fused list is a good candidate set and a
 mediocre final ordering, which is exactly the job description for a cross-encoder.
+
+### 5.5 Collapse: what a conversation repeats is shown once
+
+A mail message keeps the reply chain it quotes ([`parsing.md`](parsing.md) §10), so a thread of
+thirty messages carries its first message thirty times, and a fused list ranked per chunk fills
+with copies of one paragraph from different replies. The cost was measured before anything was
+built: on synthetic threads through the shipped pipeline, the copies took roughly four of ten
+slots for a question about a long thread, and the separate note that answered the same question
+in other words fell off the page. [`connectors/gmail.md`](connectors/gmail.md) §8 has the
+numbers and the program that produced them.
+
+The `collapse` stage runs after fusion and removes the repeats. Walking the fused list best
+first, a candidate is dropped when its document names a conversation, at least `containment`
+(0.8) of its word trigrams already appear in candidates kept above it from the same
+conversation, and nothing new sits in its middle. Coverage is counted against everything kept
+above, not against one candidate, because chunk boundaries fall in different places in different
+replies and no single earlier chunk holds exactly what a later one quotes.
+
+- **A correction is never a copy.** One changed word inside a sentence leaves most of its
+  trigrams in place — fourteen of seventeen for a retry budget changed from four to five — and
+  would clear 0.8 alone. What gives it away is its neighbors: the shown trigram just before the
+  unshown run and the one just after stand together in one chunk above, at most three words
+  apart, with at most three words between them here. That is a change, an insertion or a
+  removal of up to three words, and the candidate is kept. A seam between two passages shown in
+  different chunks, a passage nothing above showed, and unshown text at either end of the chunk
+  have no such neighbors. Header lines (`From:`, `To:`, `Date:` and the like) are left out of
+  this test, because two messages' headers differ in exactly that way; they still count towards
+  containment.
+
+- **Within one conversation only.** The conversation is a document metadata field,
+  `thread_key` — `gmail_thread_id` by default, which the Gmail connector records — taken
+  together with the document's source, since a thread id is unique only within the mailbox
+  that issued it. Two documents from different threads are never compared, however alike
+  their text: a repeat there is not a quotation and may be the difference a question is about.
+  A document with no conversation passes through untouched, so the stage changes nothing for a
+  source that does not record one. **Only Gmail records one today**: `.eml` files read from a
+  filesystem source carry no thread key, so their quoted chains are not collapsed.
+- **After fusion, or refused.** It walks its input best first, and before fusion the input is
+  one leg's list followed by the other's, so `rag.pipeline` naming it before `rrf` is refused
+  when the pipeline is built.
+- **Quote markers are not text.** `>` at the start of a line, at any depth, is stripped before
+  comparing, and case and whitespace are folded. An HTML-only reply arrives with no markers at
+  all once converted, so this is what makes a quoted copy and its original the same text.
+- **It removes and does nothing else.** No reordering and no rescoring: what survives keeps the
+  rank fusion gave it.
+- **Whichever copy ranked first is kept, so the original can be the one dropped.** When a reply
+  quoting a message outranks it, the message's own chunk repeats what was shown and goes, and
+  the passage is cited to the reply that quoted it. Measured, that moved two to three of about a
+  hundred questions from "the original was on the page" to "only a quotation was". Protecting the
+  original was tried and not adopted: a message's opening chunk holds its own new text beside
+  the history it quotes, so every rule that kept originals also kept most of the copies.
+  [`connectors/gmail.md`](connectors/gmail.md) §8 has both measurements.
+- **It reads one thing.** The candidates' documents, once per query, under the query's own
+  filter narrowed to those documents — no wider a read than the one that produced them. The
+  trace times it like any stage (§2.2); measured, about 3 ms.
+- **A page can come back shorter.** The stage drops from the fused list and does not fetch
+  more, so a page whose fused list was mostly repeats holds fewer than `limit` hits — about
+  eight of ten on threads of twenty messages or more, in the measurement. That is the honest
+  outcome: what was dropped would have been the same text again. It also means collapse cannot
+  surface a document fusion never handed it.
+
+It sits before the reranker when one is configured, which is where `rag.pipeline` puts it —
+the reranker is appended to the declared stages — so a cross-encoder scores no repeats. A
+cross-workspace search (§3.2) runs the dense leg and the reranker alone, so it does not
+collapse.
 
 ---
 
@@ -2125,6 +2192,7 @@ Calls made in the absence of a stated position.
 | Three distinct shortfall outcomes; `exhausted_budget` is a defect and the others are not | §4.4 |
 | `min_score` applies to dense cosine only, is 0.35 everywhere, and is a junk filter rather than the relevance decision | §4.5, §8.4 |
 | RRF is rank-only: no score weighting, no leg weighting, no normalization | §5.1 |
+| What a conversation repeats is dropped after fusion, within a conversation only; the copy ranked first is kept, even when it is a quotation; on by default | §5.5 |
 | Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |
 | The reranker raises rather than passing through, and truncates to what it scored | §6.1 |

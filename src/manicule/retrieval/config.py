@@ -138,6 +138,27 @@ class FusionConfig(StageConfig):
         return self
 
 
+class CollapseConfig(StageConfig):
+    """Near-duplicate collapse within a conversation (``docs/retrieval.md`` §5.5)."""
+
+    thread_key: str = Field(
+        default="gmail_thread_id",
+        min_length=1,
+        description="The document metadata field naming the conversation a document belongs "
+        "to. Only candidates from the same source whose documents share a value are compared, "
+        "and a document without the field is never collapsed. The Gmail connector records "
+        "this one.",
+    )
+    containment: float = Field(
+        default=0.8,
+        gt=0.0,
+        le=1.0,
+        description="The share of a candidate's word trigrams that must already appear in "
+        "candidates kept above it, from the same conversation, for it to be dropped as "
+        "repeating them.",
+    )
+
+
 class RerankConfig(StageConfig):
     """The cross-encoder (``docs/retrieval.md`` §6)."""
 
@@ -158,6 +179,7 @@ class RerankConfig(StageConfig):
 
 __all__ = [
     "DEFAULT_RERANKER_MODEL",
+    "CollapseConfig",
     "DenseConfig",
     "FusionConfig",
     "LexicalConfig",

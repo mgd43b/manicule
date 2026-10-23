@@ -16,6 +16,7 @@ from manicule.core.retrieval import ConfidenceBand, Filter, Query
 from manicule.plugins.registry import ComponentRegistry
 from manicule.retrieval.assembly import ContextAssembler
 from manicule.retrieval.cache import L1QueryCache
+from manicule.retrieval.collapse import CollapseStage
 from manicule.retrieval.confidence import AGREEMENT
 from manicule.retrieval.dense import DenseStage
 from manicule.retrieval.fusion import RRFStage
@@ -385,10 +386,15 @@ def _settings(**rag: object) -> Settings:
     return Settings(rag=RagSettings(**rag))  # pyright: ignore[reportArgumentType]
 
 
-def test_the_plugin_registers_the_two_legs_the_fusion_and_a_reranker() -> None:
+def test_the_plugin_registers_the_two_legs_the_fusion_the_collapse_and_a_reranker() -> None:
     """Built-in components take the same route a third-party plugin takes."""
     registry = _registry()
-    assert set(registry.names(keys.RETRIEVAL_STAGE.kind)) == {"dense", "lexical", "rrf"}
+    assert set(registry.names(keys.RETRIEVAL_STAGE.kind)) == {
+        "dense",
+        "lexical",
+        "rrf",
+        "collapse",
+    }
     assert "cross_encoder" in registry.names(keys.RERANKER.kind)
 
 
@@ -411,6 +417,24 @@ def test_fusion_accepts_the_legs_the_pipeline_does_declare() -> None:
     stage = Container(settings, _registry()).get(keys.RETRIEVAL_STAGE.named("rrf"))
     assert isinstance(stage, RRFStage)
     assert stage.legs == ("dense", "lexical")
+
+
+def test_collapse_declared_before_fusion_is_refused() -> None:
+    """Before fusion there is no ranking, only one leg's list and then the other's."""
+    settings = _settings(pipeline=("dense", "lexical", "collapse", "rrf"))
+    container = Container(settings, _registry())
+
+    with pytest.raises(ConfigError, match="before 'rrf'"):
+        container.get(keys.RETRIEVAL_STAGE.named("collapse"))
+
+
+def test_collapse_after_fusion_is_built(store: SqliteDocStore) -> None:
+    registry = _registry()
+    registry.add(keys.DOC_STORE.named("bound"), lambda _: store)
+    settings = _settings(pipeline=("dense", "lexical", "rrf", "collapse"))
+    settings.storage.db = "bound"  # pyright: ignore[reportAttributeAccessIssue]
+    stage = Container(settings, registry).get(keys.RETRIEVAL_STAGE.named("collapse"))
+    assert isinstance(stage, CollapseStage)
 
 
 def test_a_pipeline_naming_one_stage_twice_is_refused_before_construction() -> None:
@@ -448,7 +472,7 @@ async def test_the_composition_root_assembles_a_working_retriever(
         retriever = await build_retriever(container)
         result = await retriever.retrieve(a_query("authentication"))
 
-    assert [span.name for span in result.trace.stages] == ["dense", "lexical", "rrf"]
+    assert [span.name for span in result.trace.stages] == ["dense", "lexical", "rrf", "collapse"]
     assert result.trace.pipeline.rrf_k == 60
     assert result.trace.pipeline.embed_fingerprint
     assert result.context.passages

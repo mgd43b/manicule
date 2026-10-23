@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### A reply chain no longer fills a search with copies of one message
+
+Mail is indexed one document per message, and each message keeps the reply chain it quotes, so a
+long thread repeats its early messages in every later one. Measured on synthetic threads through
+the shipped pipeline, a question about a long thread got the same paragraph back from several
+replies, and a separate message answering the same question was pushed off the page.
+
+Retrieval now has a `collapse` stage, after fusion, in the default `rag.pipeline`. It drops a hit
+whose text already appeared higher up the same results from the same conversation, with `>`
+quote markers ignored, and changes nothing else: what is kept keeps its rank, and a source that
+records no conversation is not affected at all. Gmail records one per thread. Whichever copy
+ranked first is the one kept, so when a reply quoting a message outranks it, the passage is
+cited to the reply. A reply that restates something with a few words changed is a correction,
+not a copy, and is kept. A page can also hold fewer hits than asked for, since what was dropped
+is not replaced — about eight of ten on threads of twenty messages or more. A configuration
+that sets `rag.pipeline` itself keeps the pipeline it names; add `"collapse"` after `"rrf"` to
+use it. Every search's recorded pipeline identity now includes the new stage, so a result
+recorded before this release is not comparable with one recorded after it.
+
+[`connectors/gmail.md`](connectors/gmail.md) §8 has the measurement and the program that re-runs
+it; [`retrieval.md`](retrieval.md) §5.5 the rule.
+
 ### The Gmail source reads a mailbox
 
 A `type = "gmail"` source now syncs one Google Workspace mailbox, read-only. The first sync walks
