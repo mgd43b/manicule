@@ -661,9 +661,15 @@ async def test_narrowing_past_the_deletion_ceiling_waits_for_confirmation(
 
 
 async def test_no_surface_carries_an_address_a_subject_a_label_or_a_message_id(
-    harness: Harness, caplog: pytest.LogCaptureFixture
+    harness: Harness, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     caplog.set_level(logging.DEBUG)
+    # A test elsewhere in the same worker may have disabled or silenced this logger (a logging
+    # configuration that disables existing loggers does); this one needs it speaking, because
+    # what it asserts is that nothing it says carries a message id.
+    monkeypatch.setattr(logging.getLogger("httpx"), "disabled", False)
+    monkeypatch.setattr(logging.getLogger("httpx"), "propagate", True)
+    caplog.set_level(logging.INFO, logger="httpx")
     server = harness.server
     message = server.add_message(mail(SUBJECT, message_id="<secret.id@example.org>"))
     other = server.add_message(mail("Another subject"))
