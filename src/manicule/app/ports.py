@@ -147,6 +147,10 @@ class DocumentSurface(Protocol):
 
     async def delete_document(self, document_id: str) -> None: ...
 
+    async def delete_source_documents(self, source: str) -> int:
+        """Hard-delete this workspace's documents from ``source`` in every state; the count."""
+        ...
+
     async def soft_delete_document(self, document_id: str) -> None: ...
 
     async def document_statistics(self) -> Mapping[str, Mapping[str, int]]:

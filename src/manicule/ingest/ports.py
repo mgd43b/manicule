@@ -356,6 +356,15 @@ class IngestStore(Protocol):
         """
         ...
 
+    async def mark_source_sensitive(self, connector: str) -> None:
+        """Record durably, once, that a sensitive connector has synced this source.
+
+        Written before the source's first document, and never cleared by a store: it is what
+        keeps the refusal to serve without authentication in force after the connector is
+        disabled or removed from configuration.
+        """
+        ...
+
     # --- index state -------------------------------------------------------------------
 
     async def index_fingerprints(self) -> IndexFingerprints: ...

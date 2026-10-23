@@ -292,6 +292,13 @@ class FakeStore:
         self.deleted.append((document_id, "hard"))
         self.documents.pop(document_id, None)
 
+    async def delete_source_documents(self, source: str) -> int:
+        doomed = [key for key, doc in self.documents.items() if doc.source == source]
+        for key in doomed:
+            self.deleted.append((key, "hard"))
+            del self.documents[key]
+        return len(doomed)
+
     async def soft_delete_document(self, document_id: str) -> None:
         self.deleted.append((document_id, "soft"))
 

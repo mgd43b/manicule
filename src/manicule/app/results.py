@@ -1096,6 +1096,13 @@ class DocumentDeleted(Payload):
     mode: Literal["soft", "hard"]
 
 
+class SourceDocumentsDeleted(Payload):
+    """The outcome of a hard delete of every document one source holds in this workspace."""
+
+    source: str
+    deleted: int
+
+
 class DocumentCreated(Payload):
     """One authored document: where its file is, and whether the index has it yet.
 
@@ -3320,6 +3327,7 @@ __all__ = [
     "SharedTurnPayload",
     "SignedIn",
     "SignedOut",
+    "SourceDocumentsDeleted",
     "SourceReference",
     # `StaleReparseReport` is listed here for the first time, and it is not this change's.
     # #113 added the class and not the name, so `from manicule.app.results import *` produced a

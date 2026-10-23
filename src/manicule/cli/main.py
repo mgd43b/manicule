@@ -694,6 +694,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "document_resolve": r.DocumentResolved,
     "document_create": r.DocumentCreated,
     "document_delete": r.DocumentDeleted,
+    "document_delete_source": r.SourceDocumentsDeleted,
     "document_reindex": r.DocumentReindexed,
     "document_reindex_stale": r.StaleReparseReport,
     "document_redetect_glossary": r.StaleGlossaryReport,
@@ -1217,6 +1218,25 @@ def document_delete(
 ) -> None:
     """Remove a document from the index."""
     submit(Command("document_delete", {"document_id": document_id, "hard": hard}))
+
+
+@document_app.command("delete-source")
+def document_delete_source(
+    source: Annotated[str, typer.Argument(help="The source name, as `document list` shows it.")],
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes", help="Confirm the permanent delete of every document from this source."
+        ),
+    ] = False,
+) -> None:
+    """Permanently delete every document from one source, trash and purged rows included."""
+    if not yes:
+        raise typer.BadParameter(
+            "delete-source requires --yes; nothing was deleted. It removes every document "
+            "from the source, including trashed and purged ones, with no restore."
+        )
+    submit(Command("document_delete_source", {"source": source}))
 
 
 @document_app.command("reindex")
@@ -2611,7 +2631,8 @@ def start(
             "--allow-public-bind",
             help=(
                 "Say explicitly that a non-loopback bind is intended. Needs authentication, "
-                "or --no-authentication, as well."
+                "or --no-authentication (not allowed in team mode or with a sensitive "
+                "source), as well."
             ),
         ),
     ] = False,
@@ -2620,8 +2641,9 @@ def start(
         typer.Option(
             "--no-authentication",
             help=(
-                "Waive the refusals that stop an unauthenticated bind. Only does anything "
-                "with security.auth.mode = none, where every caller is an administrator."
+                "Allow a non-loopback bind with security.auth.mode = none, where every caller "
+                "is an administrator. Does not waive the team-mode or sensitive-source "
+                "refusals, which hold on loopback too."
             ),
         ),
     ] = False,
@@ -2645,11 +2667,13 @@ def start(
     one missing is a refusal naming which.
 
     ``--no-authentication`` is the way past that third condition and nothing else — a wide bind
-    still needs ``--allow-public-bind`` beside it. Pass it for a private single-operator
-    install on a network you trust, where an API key between a person and their own index is
-    ceremony. It is a flag rather than a setting because no file should be able to put an
-    unauthenticated listener on a network, it is said out loud at startup, and ``manicule
-    doctor`` reports it for as long as it holds.
+    still needs ``--allow-public-bind`` beside it, and it does not waive the two refusals that
+    hold on every address, loopback included: team mode, and a sensitive source (a Gmail
+    mailbox, synced or configured), each without authentication. Pass it for a private
+    single-operator install on a network you trust, where an API key between a person and their
+    own index is ceremony. It is a flag rather than a setting because no file should be able to
+    put an unauthenticated listener on a network, it is said out loud at startup, and
+    ``manicule doctor`` reports it for as long as it holds.
 
     **It buys the whole surface, authoring included, and that is the point.** The deployment
     this exists for is manicule serving a corpus to assistants running no manicule of their own,

@@ -506,7 +506,10 @@ divergence source that is load-bearing exactly when it is wrong — the natural 
 drifts. Stale-chunk deletion is `DELETE FROM chunks WHERE document_id = ? AND id NOT IN (…)`,
 which needs no counter and is correct even after a crash.
 
-Indexes: `(workspace_id, status)`, `(workspace_id, uri)`, `(content_hash)`,
+Indexes: `(workspace_id, status)`, `(workspace_id, uri)`,
+`(workspace_id, source)` (`ix_documents_workspace_id_source`, which answers whether a source still
+has a row in any state, soft-deleted and purged included; `uq_documents_identity` is partial on
+`deleted_at IS NULL` and cannot), `(content_hash)`,
 `(workspace_id, deleted_at) WHERE deleted_at IS NOT NULL` (the trash view; live-row queries
 fold `deleted_at IS NULL` into the partial indexes above), `(connector_id)`,
 `(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`, `(glossary_fp)`, `(relation_fp)`.
@@ -723,7 +726,7 @@ Anything fractional is carried as a string.
 |---|---|---|
 | `workspaces` | `id`, `name UNIQUE`, `mode`, `settings JSON` | `mode` gets a `CHECK` (`personal`/`team`) |
 | `workspace_members` | composite PK, `role` | **`api_key` column removed.** It held a raw, unhashed key — precisely what `api_keys.key_hash` exists to avoid. `api_keys` is the only key store. `role` gets a `CHECK` (`admin`/`member`/`viewer`). Team mode makes `user_id` a foreign key to `users` and adds `disabled_at`: a disabled membership is kept, not deleted, so the audit trail still names somebody and re-enabling restores the role (§4.8) |
-| `connectors` | `type`, `config JSON`, `sync_interval_seconds`, `last_synced_at`, `status`, `error_message`, `deleted_at` | `config` validated by the connector's Pydantic schema, not stored blind. `UNIQUE (workspace_id, name) WHERE deleted_at IS NULL`. `watermark JSON` added — `Connector.discover` takes a watermark (`contracts.md` §3) and it has to persist somewhere; `last_synced_at` is a timestamp, and a watermark is not always a timestamp. `metadata JSON` added, matching `documents` — last-run counters live here ([`ingest.md`](ingest.md) §13.1), overwritten per run rather than accumulated, which is the right retention policy for a diagnostic |
+| `connectors` | `type`, `config JSON`, `sync_interval_seconds`, `last_synced_at`, `status`, `error_message`, `deleted_at` | `config` validated by the connector's Pydantic schema, not stored blind. `UNIQUE (workspace_id, name) WHERE deleted_at IS NULL`. `watermark JSON` added — `Connector.discover` takes a watermark (`contracts.md` §3) and it has to persist somewhere; `last_synced_at` is a timestamp, and a watermark is not always a timestamp. `metadata JSON` added, matching `documents` — last-run counters live here ([`ingest.md`](ingest.md) §13.1), overwritten per run rather than accumulated, which is the right retention policy for a diagnostic. `sensitive_synced_at` added (nullable) — when a connector of a *sensitive* registered type first began syncing this source, set before the first document is written and never cleared. It is a column rather than a key in `metadata` because a refusal to serve unauthenticated rests on it and `metadata` is rewritten every run; it is not backfilled, and `NULL` means "never synced by a sensitive connector" (`surfaces.md` §6) |
 | `tags` | `UNIQUE(workspace_id, name)`, `color` | `workspace_id NOT NULL` |
 | `document_tags` | composite PK, both cascades | `WITHOUT ROWID` |
 | `collections` | `auto_rules JSON` | `UNIQUE (workspace_id, name)`; `workspace_id NOT NULL` |
@@ -2989,6 +2992,7 @@ one.
 | `workspace_members.api_key` dropped | §4.7 |
 | `plugins` becomes the real registry; `permissions` column dropped | §4.7 |
 | `connectors.watermark` added | §4.7 |
+| `connectors.sensitive_synced_at` added: the durable mark behind the sensitive-source refusal | §4.7 |
 | `audit_logs` deliberately has no foreign keys; `query_logs` deliberately cascades | §4.7 |
 | People are installation-wide and keyed by provider account, never by address; memberships and sessions are per workspace | §4.8 |
 | A browser session is a revocable row holding a token digest, not a signed identity | §4.8 |

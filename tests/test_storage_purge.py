@@ -403,3 +403,57 @@ async def test_writing_identical_bytes_again_restarts_the_age_floor(
     assert again.ref == first.ref
     assert await blobs.collect_garbage(min_age_s=24 * 3600.0) == []
     assert blobs.path_for(first.ref).exists()
+
+
+async def _remaining(engine: AsyncEngine, workspace_id: str, source: str) -> list[str]:
+    """Every document row for a source in a workspace, in any state, as ids."""
+    async with session_factory(engine)() as session:
+        rows = (
+            await session.execute(
+                select(models.Document.id).where(
+                    models.Document.workspace_id == workspace_id,
+                    models.Document.source == source,
+                )
+            )
+        ).scalars()
+        return sorted(rows)
+
+
+async def test_deleting_a_source_removes_its_rows_in_every_state_and_only_its_own(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """Live, trashed and purged rows of one source go; another source and tenant are untouched.
+
+    A purged row stays in ``documents`` with status ``deleted`` and still carries its title, so
+    a delete that filtered on status or ``deleted_at`` would leave the very rows the command
+    exists to remove.
+    """
+    live = await store.upsert_document(make_document(source="mail", source_id="live"))
+    trashed = await store.upsert_document(make_document(source="mail", source_id="trashed"))
+    purged = await store.upsert_document(make_document(source="mail", source_id="purged"))
+    for document in (live, trashed, purged):
+        await store.replace_chunks(document.id, [make_chunk(document, 0, "mail text")])
+    await store.soft_delete_document(trashed.id)
+    await store.soft_delete_document(purged.id)
+    assert await store.purge_document(purged.id, reason=REASON) is True
+    assert (await _row(engine, purged.id)).status is DocumentStatus.DELETED
+    other_source = await store.upsert_document(make_document(source="fs", source_id="keep"))
+    await store.replace_chunks(other_source.id, [make_chunk(other_source, 0, "kept text")])
+    theirs = SqliteDocStore(engine, workspace_id="other")
+    await theirs.ensure_workspace()
+    foreign = await theirs.upsert_document(
+        make_document(source="mail", source_id="live", workspace_id="other")
+    )
+    before = len(await store.take_tombstones(100))  # the purge left the first one
+
+    assert await store.delete_source_documents("mail") == 3
+
+    assert await _remaining(engine, "default", "mail") == []
+    assert await _remaining(engine, "default", "fs") == [other_source.id]
+    assert await _remaining(engine, "other", "mail") == [foreign.id]
+    assert await _chunk_count(engine, other_source.id) == 1
+    assert len(await store.take_tombstones(100)) == before + 2, (
+        "the live and trashed documents' chunks each left a vector tombstone"
+    )
+    assert await store.delete_source_documents("mail") == 0, "idempotent"
+    assert await store.delete_source_documents("nothing-by-this-name") == 0

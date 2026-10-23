@@ -3,14 +3,17 @@
 Design for the Gmail connector. Ticket [#457](https://github.com/mgd43b/manicule/issues/457),
 epic [#464](https://github.com/mgd43b/manicule/issues/464).
 
-> **Status: partly implemented; the connector that reads mail does not exist yet.** Two tickets
+> **Status: partly implemented; the connector that reads mail does not exist yet.** Three tickets
 > have shipped. [#458](https://github.com/mgd43b/manicule/issues/458) is the configuration
 > (`GmailConfig`, `manicule/connectors/config.py`), the refresh-token credential and the mailbox
 > check (`manicule/connectors/credentials.py`), the pipeline's pinned-identity check
 > (`manicule/ingest/pipeline.py`) and the `gmail-credential` `doctor` check
 > (`manicule/app/service.py`). [#459](https://github.com/mgd43b/manicule/issues/459) is the REST
 > client, whose calls, pacing and error typing (§5, §6) are in `manicule/connectors/gmail_client.py`,
-> tested against the synthetic Gmail in `tests/connectors/fake_gmail.py`. A `type = "gmail"` source
+> tested against the synthetic Gmail in `tests/connectors/fake_gmail.py`.
+> [#462](https://github.com/mgd43b/manicule/issues/462) is the refusal to serve a sensitive
+> source without authentication (§10, `manicule/app/bind.py` and `manicule/app/sensitive.py`),
+> which is in force before any mail can be read. A `type = "gmail"` source
 > validates and resolves its credential, and then the factory refuses to build it, because the
 > connector is [#460](https://github.com/mgd43b/manicule/issues/460). Everything else on this page
 > — discovery, fetching and reconciliation
@@ -618,21 +621,43 @@ answers included. Roles decide what a person may do, not what they may read.
   else never returns mail. A process serves one workspace at a time today, so in practice that
   is an installation of its own.
 - **That installation serves with authentication, for as long as it holds any mail.** The
-  `gmail` connector type is registered as *sensitive*. An installation refuses to serve with
-  `security.auth.mode = "none"`, on any bind including loopback — another local account or
-  process can reach a loopback port — and `--no-authentication` does not override it, when
-  either holds ([#462](https://github.com/mgd43b/manicule/issues/462)):
-  - an enabled connector instance is sensitive; or
+  `gmail` connector type is registered as *sensitive* (`sensitive=True` beside its
+  `config_model`; `ComponentRegistry.sensitive_names`). An installation refuses to serve with
+  `security.auth.mode = "none"` when either holds:
+  - an enabled connector instance is of a sensitive type; or
   - **the data directory holds any document, in any state, from a source a sensitive connector
-    has synced.** The first sync of a sensitive source records that durably, beside the source's
-    other stored sync state. Disabling the connector or removing it from configuration does not
-    lift the refusal, because neither removes a message; only deleting that source's documents
-    does, and soft-deleted and purged rows count, since they still carry subjects (§7).
+    has synced.** The first sync of a sensitive source records that durably, in
+    `connectors.sensitive_synced_at` on the source's row, beside its stored sync state — before
+    the sync enumerates anything, so a first sync that fails halfway still leaves it. Nothing
+    clears it. The check asks whether any `documents` row, in any workspace of the data
+    directory, still carries a marked source's name, with no filter on status or `deleted_at`:
+    soft-deleted rows count, and so do purged ones, which keep their title — for mail, the
+    subject (§7).
 
+  The refusal applies in the two places that make a listener, `resolve_bind` (the MCP and HTTP
+  socket servers) and `build_app` (an application started by something other than
+  `manicule serve`), on **every address, loopback included** — another local account or
+  process can reach a loopback port — and **`--no-authentication` does not override it**:
+  there is no flag, setting or environment variable that does, and the error says so when the
+  flag was passed. stdio opens no socket and is not refused. The message names each source by
+  instance name and says what to do.
+
+  Disabling the connector or removing it from configuration does not lift the refusal, because
+  neither removes a message. Only deleting the source's documents does:
+  `manicule document delete-source <name> --yes` hard-deletes every document of that source in
+  the workspace, trashed and purged rows included, and returns the count. It is a write, so it
+  runs in the serving process, which means serving *with* authentication first; it is not
+  offered over MCP or HTTP. `manicule document delete <id> --hard` removes one live document
+  at a time and cannot reach the trashed or purged ones, which is why the bulk command exists.
   Checking configuration alone was the first proposal and was rejected: it stops protecting the
-  mail at the moment somebody disables the connector, and the mail is still there. A
-  configuration slip should not be able to publish a mailbox to whoever can route to a port, and
-  neither should tidying up a configuration.
+  mail at the moment somebody disables the connector, and the mail is still there.
+
+  **A database that cannot be read refuses; it does not pass.** Only "no database yet" and a
+  database from before the mark existed are treated as holding nothing. A lock that outlasts the
+  read timeout, or a corrupt file, refuses when authentication is off and is ignored when it is
+  on. `manicule doctor`'s `transport` check reports the same facts as a failure, without
+  serving, with the instance names in its `sensitive_sources` fact (and nothing from inside a
+  message).
 - **Models see the text.** Embedding sends every chunk to the configured embedder, and `ask`
   sends retrieved passages to the configured generator. With a remote provider, mail leaves the
   machine in both directions. Use local models for a mail installation, or decide that this is
@@ -680,11 +705,11 @@ differ, it is here — check these first when one is available:
 | Token refresh and caching, 401 retry, mailbox check, credential errors | `manicule/connectors/credentials.py`, `manicule/connectors/errors.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
 | Holding a synced source to its pinned identity | `manicule/ingest/pipeline.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
 | The `gmail-credential` `doctor` check | `manicule/app/service.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
-| Registration (configuration and credential only; the factory always refuses) | `manicule/connectors/plugin.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented; completed, and marked sensitive, by [#460](https://github.com/mgd43b/manicule/issues/460) |
+| Registration (configuration and credential only; the factory always refuses), marked `sensitive=True` | `manicule/connectors/plugin.py` | [#458](https://github.com/mgd43b/manicule/issues/458), [#462](https://github.com/mgd43b/manicule/issues/462) | Implemented; the factory is completed by [#460](https://github.com/mgd43b/manicule/issues/460) |
 | REST calls, pacing, error typing | `manicule/connectors/gmail_client.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
 | `discover`, `fetch`, `reconcile`, watermarks | `manicule/connectors/gmail.py` | [#460](https://github.com/mgd43b/manicule/issues/460) | Planned |
 | `connector login` for Gmail | `manicule/connectors/` and the CLI | [#461](https://github.com/mgd43b/manicule/issues/461) | Planned |
-| Refusing to serve a sensitive source unauthenticated | `manicule/app/bind.py` | [#462](https://github.com/mgd43b/manicule/issues/462) | Planned |
+| Refusing to serve a sensitive source unauthenticated; the durable mark; `document delete-source` | `manicule/app/bind.py`, `manicule/app/sensitive.py`, `manicule/ingest/pipeline.py` | [#462](https://github.com/mgd43b/manicule/issues/462) | Implemented |
 | Reconciliation after a full walk | `manicule/connectors/gmail.py` and the pipeline | [#466](https://github.com/mgd43b/manicule/issues/466) | Planned |
 | The synthetic Gmail | `tests/connectors/fake_gmail.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
 

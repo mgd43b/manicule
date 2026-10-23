@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, Final, Self, cast, override
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from manicule.app.results import ApiKeySummary, Check, CheckState, UserSummary
+from manicule.app.sensitive import sensitive_instances as configured_sensitive_instances
 from manicule.config.loader import load_settings
 from manicule.container import keys
 from manicule.container.container import Container, build_container
@@ -409,6 +410,16 @@ class Runtime:
     def container(self) -> Container:
         """Configured component graph shared by ingestion and offline derivation assembly."""
         return self._container
+
+    def sensitive_instances(self) -> frozenset[str]:
+        """Configured connector instances whose registered type is sensitive.
+
+        What the pipeline marks on a sync, resolved from the registry's flag so that no
+        connector has to declare it about itself — one that forgot would fail open.
+        """
+        return configured_sensitive_instances(
+            self._settings, self._container.registry.sensitive_names(ComponentKind.CONNECTOR)
+        )
 
     @property
     def workspace(self) -> str:
@@ -1072,6 +1083,7 @@ class Runtime:
             max_fetch_bytes=settings.ingest.max_fetch_bytes,
             snapshot_policy=settings.ingest.snapshot_promotion_policy,
             mutation_guard=self.derived_mutation_guard,
+            sensitive_sources=self.sensitive_instances(),
         )
 
     async def _build_pipeline(self) -> IngestPipeline:
@@ -1171,6 +1183,7 @@ class Runtime:
             snapshot_policy=settings.ingest.snapshot_promotion_policy,
             mutation_guard=self.derived_mutation_guard,
             expected_reset_epoch=expected_reset_epoch,
+            sensitive_sources=self.sensitive_instances(),
             # Passed rather than defaulted, which it had been since the setting shipped. The
             # field is documented as the switch an operator throws while investigating a
             # detector that is producing rubbish, and nothing outside `settings.py` read it: a

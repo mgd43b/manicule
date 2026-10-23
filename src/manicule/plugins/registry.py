@@ -166,6 +166,14 @@ class ComponentRecord[T]:
     """
     metadata_factory: MetadataFactory | None = None
     """Configured identity without constructing the executable component."""
+    sensitive: bool = False
+    """Whether what this component ingests must never be served to an anonymous caller.
+
+    Declared beside ``config_model`` and readable without constructing the component, because
+    the refusal it drives (:mod:`manicule.app.sensitive`) has to be decided before anything is
+    built. The index is not permission-aware, so a source whose content is private to one
+    person — a mailbox — makes the whole installation private to whoever may search it.
+    """
 
     @property
     def key(self) -> ComponentKey[T]:
@@ -203,6 +211,7 @@ class ComponentRegistry:
         summary: str = "",
         media_types: AbstractSet[str] = frozenset(),
         metadata_factory: MetadataFactory | None = None,
+        sensitive: bool = False,
     ) -> None:
         """Register a factory under ``key``.
 
@@ -219,6 +228,9 @@ class ComponentRegistry:
                 Declared here so that routing a document does not have to build every
                 installed parser to ask each one what it handles. The parser is checked
                 against this declaration when it is first used, so the two cannot drift.
+            sensitive: Meaningful for connectors. An installation refuses to serve without
+                authentication while an enabled instance of a sensitive connector exists, or
+                while the data directory still holds documents from a source one has synced.
 
         Raises:
             ValueError: ``key`` has no name, or a parser declared no media types.
@@ -251,6 +263,7 @@ class ComponentRegistry:
             summary=summary,
             media_types=frozenset(media_types),
             metadata_factory=metadata_factory,
+            sensitive=sensitive,
         )
         self._records[slot] = record
 
@@ -284,6 +297,10 @@ class ComponentRegistry:
     def names(self, kind: ComponentKind) -> list[str]:
         """Registered implementation names for a kind, sorted."""
         return sorted(name for (k, name) in self._records if k is kind)
+
+    def sensitive_names(self, kind: ComponentKind) -> frozenset[str]:
+        """Names of the implementations of ``kind`` registered as sensitive."""
+        return frozenset(r.name for r in self._records.values() if r.kind is kind and r.sensitive)
 
     def records(self, kind: ComponentKind | None = None) -> list[ComponentRecord[object]]:
         """Every record, or every record of one kind, in a stable order."""
