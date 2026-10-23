@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from manicule.core.content import BlockKind
 from manicule.core.retrieval import Candidate, Filter, Query
 from manicule.retrieval.collapse import CollapseStage, shingles
 from manicule.retrieval.config import CollapseConfig
@@ -108,6 +109,43 @@ async def test_one_quotation_removes_a_later_quotation_of_the_same_text(
 
     kept = await CollapseStage(docstore=store).run(
         a_query(), [shown, candidate(second, quoted(ORIGINAL, depth=2), 0.8)]
+    )
+
+    assert kept == [shown]
+
+
+@pytest.mark.parametrize(
+    "corrected",
+    [
+        pytest.param(ORIGINAL.replace("four", "five"), id="a changed figure"),
+        pytest.param(ORIGINAL.replace("thirty second", "thirty second jittered"), id="inserted"),
+        pytest.param(quoted(ORIGINAL.replace("four", "five")), id="quoted, then corrected"),
+    ],
+)
+async def test_a_correction_is_never_dropped_as_a_copy_of_what_it_corrects(
+    store: SqliteDocStore, corrected: str
+) -> None:
+    """One word in the middle differs, most trigrams survive, and the answer is different."""
+    original = await message(store, "m1", {"gmail_thread_id": "t1"})
+    reply = await message(store, "m2", {"gmail_thread_id": "t1"})
+    ranked = [candidate(original, ORIGINAL, 0.9), candidate(reply, corrected, 0.8)]
+
+    assert await CollapseStage(docstore=store).run(a_query(), ranked) == ranked
+
+
+async def test_unshown_text_at_a_chunk_s_ends_is_a_seam_not_new_text(
+    store: SqliteDocStore,
+) -> None:
+    """A quotation whose chunk began earlier and ended later than what was shown is a repeat."""
+    original = await message(store, "m1", {"gmail_thread_id": "t1"})
+    reply = await message(store, "m2", {"gmail_thread_id": "t1"})
+    shown = candidate(original, f"{ORIGINAL} {REPLY}", 0.9)
+    seamed = (
+        f"Thanks Sam, on Monday Pat wrote:\n{quoted(ORIGINAL)}\n> {REPLY.split('.', maxsplit=1)[0]}"
+    )
+
+    kept = await CollapseStage(docstore=store).run(
+        a_query(), [shown, candidate(reply, seamed, 0.8)]
     )
 
     assert kept == [shown]
@@ -244,6 +282,32 @@ async def test_the_metadata_read_is_no_wider_than_the_query(store: SqliteDocStor
     assert read.workspace_ids == SCOPE
     assert read.document_ids == frozenset({first.id})
     assert len(kept) == 2, "a document the query cannot see names no conversation"
+
+
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        pytest.param({"kinds": frozenset({BlockKind.PROSE})}, id="kinds"),
+        pytest.param({"langs": frozenset({"en"})}, id="langs"),
+    ],
+)
+async def test_a_chunk_level_restriction_is_not_sent_to_the_document_read(
+    store: SqliteDocStore, restriction: dict[str, Any]
+) -> None:
+    """A list of documents cannot apply ``kinds`` or ``langs``, and the candidates meet them."""
+    first = await message(store, "m1", {"gmail_thread_id": "t1"})
+    second = await message(store, "m2", {"gmail_thread_id": "t1"})
+    recording = RecordingStore(store)
+    query = Query(text="retry budget", limit=3, filter=Filter(workspace_ids=SCOPE, **restriction))
+
+    kept = await CollapseStage(docstore=recording).run(  # pyright: ignore[reportArgumentType]
+        query, [candidate(first, ORIGINAL, 0.9), candidate(second, quoted(ORIGINAL), 0.8)]
+    )
+
+    [read] = recording.filters
+    assert not read.kinds
+    assert not read.langs
+    assert len(kept) == 1, "the metadata was read, and the quotation dropped"
 
 
 async def test_nothing_to_compare_reads_nothing(store: SqliteDocStore) -> None:

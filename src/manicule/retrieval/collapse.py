@@ -8,7 +8,9 @@ the measurement.
 
 **The rule.** Walk the ranking best first. A candidate whose document names a conversation is
 dropped when at least ``containment`` of its word trigrams already appear in candidates kept
-above it from the same conversation. Nothing is reordered and nothing is rescored, so what
+above it from the same conversation, and nothing new sits in its middle: what was not shown lies
+only where its chunk began or ended or at a seam between two passages shown apart, never inside a
+sentence, where a corrected figure would be. Nothing is reordered and nothing is rescored, so what
 survives keeps the rank fusion gave it; the stage only removes what would show a person text
 they have already been shown.
 
@@ -36,6 +38,7 @@ import re
 from typing import TYPE_CHECKING
 
 from manicule.retrieval.config import CollapseConfig
+from manicule.retrieval.prefilter import join_filter
 
 if TYPE_CHECKING:
     from manicule.core.content import Metadata
@@ -50,12 +53,17 @@ _QUOTE_MARKERS = re.compile(r"^[ \t]*(?:>[ \t]?)+", re.MULTILINE)
 _WORD = re.compile(r"\w+")
 
 
-def shingles(text: str) -> frozenset[tuple[str, ...]]:
-    """The word trigrams of ``text``, with quote markers, case and whitespace folded away."""
+def trigrams(text: str) -> list[tuple[str, ...]]:
+    """The word trigrams of ``text`` in order, with quote markers, case and whitespace folded."""
     words = _WORD.findall(_QUOTE_MARKERS.sub("", text).casefold())
     if len(words) < SHINGLE:
-        return frozenset({tuple(words)}) if words else frozenset()
-    return frozenset(tuple(words[i : i + SHINGLE]) for i in range(len(words) - SHINGLE + 1))
+        return [tuple(words)] if words else []
+    return [tuple(words[i : i + SHINGLE]) for i in range(len(words) - SHINGLE + 1)]
+
+
+def shingles(text: str) -> frozenset[tuple[str, ...]]:
+    """The word trigrams of ``text`` as a set, folded as :func:`trigrams` folds them."""
+    return frozenset(trigrams(text))
 
 
 class CollapseStage:
@@ -83,13 +91,36 @@ class CollapseStage:
             if conversation is None:
                 kept.append(candidate)
                 continue
-            own = shingles(candidate.chunk.text)
+            ordered = trigrams(candidate.chunk.text)
             seen = shown.setdefault(conversation, set())
-            if own and len(own & seen) >= self._config.containment * len(own):
+            if self._repeats(ordered, seen):
                 continue
-            seen |= own
+            seen.update(ordered)
             kept.append(candidate)
         return kept
+
+    def _repeats(self, ordered: list[tuple[str, ...]], seen: set[tuple[str, ...]]) -> bool:
+        """Whether this text was already shown, give or take its chunk's seams.
+
+        Two conditions. Enough of it appears above — ``containment`` of its distinct trigrams.
+        And nothing in its middle is new: one changed or inserted word puts three consecutive
+        trigrams that were never shown inside a sentence, so a corrected figure is never dropped
+        as a copy of what it corrects. Fewer than three in a row is a seam — the two trigrams
+        that straddle the join between two passages shown in different chunks above — and
+        unshown text at either end is where this chunk began or ended differently.
+        """
+        own = set(ordered)
+        if not own or len(own & seen) < self._config.containment * len(own):
+            return False
+        covered = [trigram in seen for trigram in ordered]
+        first = covered.index(True)
+        last = len(covered) - 1 - covered[::-1].index(True)
+        run = 0
+        for shown in covered[first : last + 1]:
+            run = 0 if shown else run + 1
+            if run >= SHINGLE:
+                return False
+        return True
 
     async def _conversations(
         self, query: Query, candidates: list[Candidate]
@@ -99,16 +130,19 @@ class CollapseStage:
         Keyed by source as well as by the field's value: a thread id is unique within the
         mailbox that issued it, and two sources in one workspace can issue the same one.
 
-        Read under the query's own filter, narrowed to these documents, so this is no wider a
-        read than the one that produced the candidates.
+        Read under the document-level half of the query's filter, narrowed to these documents,
+        so this is no wider a read than the one that produced the candidates. Only that half:
+        ``kinds`` and ``langs`` restrict chunks, which a list of documents cannot apply and the
+        store refuses, and the candidates already satisfy them.
         """
+        scope = join_filter(query.filter)
         wanted = frozenset(candidate.chunk.document_id for candidate in candidates)
-        if query.filter.document_ids:
-            wanted &= query.filter.document_ids
+        if scope.document_ids:
+            wanted &= scope.document_ids
         if not wanted:
             return {}
         documents = await self._docstore.list_documents(
-            query.filter.model_copy(update={"document_ids": wanted}), limit=len(wanted)
+            scope.model_copy(update={"document_ids": wanted}), limit=len(wanted)
         )
         key = self._config.thread_key
         return {
@@ -118,4 +152,4 @@ class CollapseStage:
         }
 
 
-__all__ = ["SHINGLE", "CollapseStage", "shingles"]
+__all__ = ["SHINGLE", "CollapseStage", "shingles", "trigrams"]
