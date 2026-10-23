@@ -5088,15 +5088,28 @@ def declared_identity(connector: Connector) -> str:
 
 
 def snapshot_scope(connector: Connector) -> tuple[str, str]:
-    """Read a connector's non-secret scope identity, with a safe whole-instance default."""
+    """Read a connector's non-secret scope identity, with a safe whole-instance default.
+
+    **A declared identity is part of the fingerprint whoever computes it.** A durable cursor is
+    reused only under the fingerprint it was committed with, so folding the identity in here —
+    including when the connector supplies its own fingerprint — means no connector that
+    declares one can have its cursor read back under another account's, whatever its own
+    fingerprint chose to include. A connector without an identity is unchanged.
+    """
     declared = getattr(connector, "source_scope", None)
     source_scope = (
         declared if isinstance(declared, str) and declared else f"instance:{connector.name}"
     )
     declared_fingerprint = getattr(connector, "scope_fingerprint", None)
     if isinstance(declared_fingerprint, str) and declared_fingerprint:
-        return source_scope, declared_fingerprint
-    fingerprint = hashlib.blake2b(source_scope.encode(), digest_size=20).hexdigest()
+        fingerprint = declared_fingerprint
+    else:
+        fingerprint = hashlib.blake2b(source_scope.encode(), digest_size=20).hexdigest()
+    identity = declared_identity(connector)
+    if identity:
+        fingerprint = hashlib.blake2b(
+            f"{fingerprint}|identity={identity}".encode(), digest_size=20
+        ).hexdigest()
     return source_scope, fingerprint
 
 

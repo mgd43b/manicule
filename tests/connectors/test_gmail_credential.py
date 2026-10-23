@@ -11,6 +11,8 @@ import asyncio
 import logging
 import subprocess
 import sys
+from importlib.machinery import ModuleSpec
+from importlib.util import find_spec as _find_spec
 from typing import Any
 
 import httpx
@@ -39,9 +41,9 @@ from tests.connectors.fake_google_oauth import CLIENT_SECRET, REFRESH_TOKEN, Fak
 ACCOUNT = "mail@example.org"
 
 
-def _without_httpx(name: str) -> object | None:
+def _without_httpx(name: str, package: str | None = None) -> ModuleSpec | None:
     """``importlib.util.find_spec`` on an installation lacking the HTTP client."""
-    return None if name == "httpx" else object()
+    return None if name == "httpx" else _find_spec(name, package)
 
 
 class Clock:

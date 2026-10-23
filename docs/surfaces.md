@@ -1031,8 +1031,13 @@ nothing about the credential (a source whose probe takes longer than 15 seconds 
 that way, and sources are probed concurrently, so the check holds `doctor` for 15 seconds at most). This check is a network call, one refresh and one `getProfile`
 per enabled Gmail source, and it is the only check besides `component:*` that contacts another
 machine. Every surface that runs `doctor` runs it — the command line, the MCP tool, `GET /api/v1/health` and the web
-dashboard — so a deployment with a Gmail source spends that call each time one of them is
-opened. (`/healthz` and `/readyz` run no check.) `facts.sources` maps each source's name to one of a fixed set of words —
+dashboard — so a running server reuses a source's result for 30 seconds rather than
+spending that call each time one of them is opened, and says so the way `component:*` does:
+`facts.observed_seconds_ago` and `facts.freshly_measured`, with `(observed Ns ago)` in `detail`
+when it was not measured just now. Only results that needed Google are reused; a problem found
+without asking it (options, a missing secret or client library) is re-checked every time. A
+`manicule doctor` from the command line is a new process with nothing reused, so it always
+measures. (`/healthz` and `/readyz` run no check.) `facts.sources` maps each source's name to one of a fixed set of words —
 `ok`, `invalid_options`, `dependency_missing`, `missing_secret`, `different_mailbox`, `grant_revoked`, `credential_rejected` or
 `unreachable` — and neither it nor `detail` ever carries an address, a token or a secret:
 `doctor` output is read by more people than the mailbox is. The remedy is `manicule connector

@@ -16,7 +16,11 @@ import pytest
 from manicule.connectors.errors import PinnedIdentityError
 from manicule.core.errors import ConfigError
 from manicule.core.sources import Watermark
-from manicule.ingest.pipeline import PINNED_IDENTITY_KEY, WATERMARK_IDENTITY_KEY
+from manicule.ingest.pipeline import (
+    PINNED_IDENTITY_KEY,
+    WATERMARK_IDENTITY_KEY,
+    snapshot_scope,
+)
 from tests.ingest import fakes
 from tests.ingest.test_pipeline import build
 
@@ -194,3 +198,25 @@ async def test_an_interrupted_switch_still_does_not_trust_the_old_cursor() -> No
     await pipeline.run(retried)
 
     assert retried.handed == [None]
+
+
+def with_own_fingerprint(connector: Pinned | fakes.DictConnector) -> object:
+    """The connector, supplying a fingerprint of its own that knows nothing of the identity."""
+    connector.scope_fingerprint = "the-connectors-own-fingerprint"  # type: ignore[attr-defined]
+    return connector
+
+
+def test_a_declared_identity_is_part_of_the_durable_scope_fingerprint() -> None:
+    """Whoever computes the connector's own fingerprint, another account is another scope."""
+    first = with_own_fingerprint(Pinned(FIRST))
+    second = with_own_fingerprint(Pinned(SECOND))
+    again = with_own_fingerprint(Pinned(FIRST))
+
+    assert snapshot_scope(first)[1] != snapshot_scope(second)[1]  # type: ignore[arg-type]
+    assert snapshot_scope(first)[1] == snapshot_scope(again)[1]  # type: ignore[arg-type]
+
+
+def test_a_connector_without_an_identity_keeps_its_fingerprint() -> None:
+    connector = with_own_fingerprint(fakes.DictConnector({}))
+
+    assert snapshot_scope(connector)[1] == "the-connectors-own-fingerprint"  # type: ignore[arg-type]

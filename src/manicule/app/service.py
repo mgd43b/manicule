@@ -4305,11 +4305,23 @@ class ApplicationService:
         # Concurrently: each source can wait out Google's timeout twice, and a deployment with
         # several would otherwise hold `doctor` for the sum of them.
         found = await asyncio.gather(
-            *(_gmail_source_outcome(name, options) for name, options in sources)
+            *(_observed_gmail_outcome(name, options) for name, options in sources)
         )
-        outcomes = dict(zip((name for name, _ in sources), found, strict=True))
+        outcomes = {name: word for (name, _), (word, _) in zip(sources, found, strict=True)}
+        age = max((seen for _, seen in found), default=0.0)
+        fresh = age == 0.0
 
-        facts = cast("dict[str, JsonValue]", {"sources": dict(sorted(outcomes.items()))})
+        # The same two facts the `component:*` checks carry (`runtime.py`): a result reused from
+        # a moment ago says how old it is, instead of presenting an old green as a new one.
+        facts = cast(
+            "dict[str, JsonValue]",
+            {
+                "sources": dict(sorted(outcomes.items())),
+                "observed_seconds_ago": round(age, 3),
+                "freshly_measured": fresh,
+            },
+        )
+        stale = "" if fresh else f" (observed {age:.0f}s ago)"
         if not outcomes:
             return r.Check(
                 name="gmail-credential",
@@ -4324,7 +4336,7 @@ class ApplicationService:
                 state="ok",
                 detail=(
                     f"{_listed(outcomes)} refresh(es) a Gmail access token and read the "
-                    f"configured mailbox"
+                    f"configured mailbox{stale}"
                 ),
                 facts=facts,
             )
@@ -4361,7 +4373,7 @@ class ApplicationService:
         return r.Check(
             name="gmail-credential",
             state="degraded" if only_unreachable else "failing",
-            detail=f"{problems}. Nothing was read from any mailbox.",
+            detail=f"{problems}. Nothing was read from any mailbox.{stale}",
             facts=facts,
             remedy=remedy,
         )
@@ -8846,6 +8858,23 @@ def _severity(state: r.CheckState) -> int:
     return {"ok": 0, "degraded": 1, "failing": 2, "unknown": 1}.get(state, 1)
 
 
+GMAIL_PROBE_TTL_SECONDS = 30.0
+"""How long a Gmail source's probe result is reused.
+
+``doctor`` is asked for repeatedly by anything that renders it — the web dashboard, a health
+poll — and each probe is a token exchange and a ``users.getProfile`` against Google's quota. A
+fresh process (the command line) has nothing cached, so ``manicule doctor`` always measures.
+"""
+
+_gmail_clock: Callable[[], float] = time.monotonic
+_gmail_observations: dict[tuple[str, str], tuple[float, str]] = {}
+"""``(source, digest of its options)`` to ``(when, outcome)``. Digested so a secret set in the
+options is not kept as a dictionary key, and keyed by options so editing a source is a miss."""
+
+_GMAIL_LOCAL_OUTCOMES = frozenset({"invalid_options", "missing_secret", "dependency_missing"})
+"""Outcomes decided without asking Google. Never cached: they cost nothing, and caching them
+would keep reporting a problem the operator has just fixed."""
+
 GMAIL_PROBE_DEADLINE_SECONDS = 15.0
 """How long ``doctor`` waits for one Gmail source's probe before calling it unreachable.
 
@@ -8853,6 +8882,26 @@ The credential's own timeout is the *sync* request timeout, and it applies to ea
 requests a probe makes; a diagnostic's latency should not be set by a setting meant for a
 large download. Sources are probed concurrently, so this bounds the whole sweep.
 """
+
+
+async def _observed_gmail_outcome(name: str, options: Mapping[str, Any]) -> tuple[str, float]:
+    """A source's outcome and how many seconds old it is (``0.0`` when measured just now)."""
+    key = (
+        name,
+        hashlib.blake2b(
+            json.dumps(options, sort_keys=True, default=str).encode(), digest_size=16
+        ).hexdigest(),
+    )
+    now = _gmail_clock()
+    held = _gmail_observations.get(key)
+    if held is not None and now - held[0] < GMAIL_PROBE_TTL_SECONDS:
+        return held[1], now - held[0]
+    word = await _gmail_source_outcome(name, options)
+    if word in _GMAIL_LOCAL_OUTCOMES:
+        _gmail_observations.pop(key, None)
+    else:
+        _gmail_observations[key] = (_gmail_clock(), word)
+    return word, 0.0
 
 
 async def _gmail_source_outcome(name: str, options: Mapping[str, Any]) -> str:

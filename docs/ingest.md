@@ -2662,7 +2662,11 @@ would be handed to the new account. A run that commits a watermark records the i
 (`watermark_identity`), and a cursor whose recorded identity is not the connector's current one
 is not used: that run does a complete walk, and its own watermark replaces the old one.
 
-The scope fingerprint cannot do this job. It includes the identity, so a different one makes
+The durable cursor is held to the identity too: `snapshot_scope` folds a declared identity into
+the fingerprint it hands the acquisition store, whether the connector computed its own fingerprint
+or not, so a cursor committed under one identity is never read back under another.
+
+The scope fingerprint alone cannot do this job. It includes the identity, so a different one makes
 the stored watermark invisible rather than wrong, and the run would begin a complete walk of
 the second account beside the first account's documents; and it cannot tell an edit to the
 identity from an edit to the scope, only one of which should keep the source. A connector
