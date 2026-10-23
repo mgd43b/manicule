@@ -16,7 +16,13 @@ from typing import TYPE_CHECKING
 from manicule.container import keys
 from manicule.core.errors import ConfigError
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
-from manicule.retrieval.config import DenseConfig, FusionConfig, LexicalConfig, RerankConfig
+from manicule.retrieval.config import (
+    CollapseConfig,
+    DenseConfig,
+    FusionConfig,
+    LexicalConfig,
+    RerankConfig,
+)
 from manicule.retrieval.profile import Profiles
 
 if TYPE_CHECKING:
@@ -28,6 +34,7 @@ DENSE_NAME = "dense"
 LEXICAL_NAME = "lexical"
 FUSION_NAME = "rrf"
 CROSS_ENCODER_NAME = "cross_encoder"
+COLLAPSE_NAME = "collapse"
 
 
 def _config[T: BaseModel](context: BuildContext, expected: type[T]) -> T:
@@ -106,6 +113,17 @@ def build_fusion(context: BuildContext) -> RetrievalStage:
     return RRFStage(config=config, name=FUSION_NAME)
 
 
+def build_collapse(context: BuildContext) -> RetrievalStage:
+    """Near-duplicate collapse within a conversation, reading document metadata."""
+    from manicule.retrieval.collapse import CollapseStage  # noqa: PLC0415
+
+    return CollapseStage(
+        docstore=context.components.get(keys.DOC_STORE),
+        config=_config(context, CollapseConfig),
+        name=COLLAPSE_NAME,
+    )
+
+
 def build_cross_encoder(context: BuildContext) -> Reranker:
     """The cross-encoder reranker. This is where torch is eventually loaded."""
     from manicule.retrieval.rerank import CrossEncoderReranker  # noqa: PLC0415
@@ -151,6 +169,12 @@ class RetrievalPlugin:
             summary="Reciprocal rank fusion over named legs. Ranks only, never scores.",
         )
         registry.add(
+            keys.RETRIEVAL_STAGE.named(COLLAPSE_NAME),
+            build_collapse,
+            config_model=CollapseConfig,
+            summary="Drops a candidate repeating text ranked above it in the same conversation.",
+        )
+        registry.add(
             keys.RERANKER.named(CROSS_ENCODER_NAME),
             build_cross_encoder,
             config_model=RerankConfig,
@@ -165,12 +189,14 @@ PLUGIN = RetrievalPlugin()
 _plugin: Plugin = PLUGIN
 
 __all__ = [
+    "COLLAPSE_NAME",
     "CROSS_ENCODER_NAME",
     "DENSE_NAME",
     "FUSION_NAME",
     "LEXICAL_NAME",
     "PLUGIN",
     "RetrievalPlugin",
+    "build_collapse",
     "build_cross_encoder",
     "build_dense",
     "build_fusion",

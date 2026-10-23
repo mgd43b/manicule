@@ -183,6 +183,9 @@ async def rehydrate_across(
             chunk_ids=tuple(entry.chunk_ids[position] for position in positions),
             scores=tuple(entry.scores[position] for position in positions),
             identity=entry.identity,
+            effective=tuple(entry.effective[position] for position in positions)
+            if entry.effective
+            else (),
         )
         candidates = await rehydrate(subset, docstore, join)
         if candidates is None:

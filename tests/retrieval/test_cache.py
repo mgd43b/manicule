@@ -360,6 +360,28 @@ async def test_a_hit_is_rehydrated_through_the_store(store: SqliteDocStore) -> N
     assert rebuilt[0].scores == {"rrf": 0.03}
 
 
+async def test_a_hit_keeps_its_score_when_the_last_stage_only_drops(
+    store: SqliteDocStore,
+) -> None:
+    """A stage that removes without scoring keys nothing, so the score cannot be read off it.
+
+    ``collapse`` is such a stage. Read back off its name, every cached hit scored 0.0 while the
+    same ranking computed fresh carried fusion's scores.
+    """
+    chunks = await _live(store)
+    identity = PipelineIdentity(stages=("dense", "lexical", "rrf", "collapse"), rrf_k=60)
+    candidates = [
+        Candidate(chunk=chunk, score=0.03 - position / 1000, scores={"rrf": 0.03 - position / 1000})
+        for position, chunk in enumerate(chunks)
+    ]
+    entry = L1QueryCache.record(candidates, identity)
+
+    rebuilt = await rehydrate(entry, store, Filter(workspace_ids=SCOPE))
+
+    assert rebuilt is not None
+    assert [candidate.score for candidate in rebuilt] == [c.score for c in candidates]
+
+
 async def test_a_chunk_level_restriction_does_not_break_rehydration(
     store: SqliteDocStore,
 ) -> None:

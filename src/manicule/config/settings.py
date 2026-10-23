@@ -1482,10 +1482,12 @@ class RagSettings(Section):
     profile: RetrievalProfile = RetrievalProfile.BALANCED
     chunker: str = Field(default="structural", description="Registered chunker to use.")
     pipeline: tuple[str, ...] = Field(
-        default=("dense", "lexical", "rrf"),
+        default=("dense", "lexical", "rrf", "collapse"),
         min_length=1,
         description="Retrieval stages, in order. A pipeline is declared here rather than "
-        "assembled in code, so two of them can be compared by configuration alone.",
+        "assembled in code, so two of them can be compared by configuration alone. "
+        "``collapse`` drops a hit repeating text ranked above it in the same conversation, "
+        "and does nothing for a source that records none.",
     )
     reranker: str | None = Field(
         default=None,

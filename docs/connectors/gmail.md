@@ -20,8 +20,10 @@ epic [#464](https://github.com/mgd43b/manicule/issues/464).
 > of every run (§2–§7). Reconciliation running in a served installation
 > ([#466](https://github.com/mgd43b/manicule/issues/466)) is what makes deletions take effect.
 > [#461](https://github.com/mgd43b/manicule/issues/461) is `connector login`, which mints the
-> refresh token (§1.3, `manicule/connectors/gmail_login.py`). §12 says which module implements
-> which part; when a ticket changes that, it updates this page.
+> refresh token (§1.3, `manicule/connectors/gmail_login.py`).
+> [#463](https://github.com/mgd43b/manicule/issues/463) measured what quoted reply chains cost
+> retrieval and added the `collapse` retrieval stage (§8, `manicule/retrieval/collapse.py`). §12
+> says which module implements which part; when a ticket changes that, it updates this page.
 
 A mailbox is the most sensitive source manicule has been pointed at, and the obvious
 implementation gets three things wrong quietly: it re-downloads the whole mailbox to find what
@@ -675,12 +677,129 @@ Each message is a document. Quoted reply chains are kept, as [`parsing.md`](../p
 decides for every email: the quoted text is frequently the only statement of what was being
 replied to, and trimming it is a retrieval decision rather than a parsing one.
 
-The cost is that a long thread repeats its early messages in every later one, and a search can
-return the same quoted paragraph several times from several messages. Whether that is worth
-changing — collapsing hits from one thread at retrieval, or indexing threads instead of messages
-— is measured on synthetic threads before it is decided, in
-[#463](https://github.com/mgd43b/manicule/issues/463). Thread-level documents would also change
-what a citation points at, which is why it is not assumed.
+The cost is that a long thread repeats its early messages in every later one. Whether that cost
+needed anything changed — and whether the change should be collapsing near-duplicate hits at
+retrieval or indexing threads instead of messages — was measured before it was decided, in
+[#463](https://github.com/mgd43b/manicule/issues/463). **Decision: collapse at retrieval.** The
+`collapse` stage ([`retrieval.md`](../retrieval.md) §5.5) is in the default `rag.pipeline`.
+Messages stay one document each, so a citation still points at a message.
+
+### 8.1 How it was measured
+
+`tests/benchmarks/thread_duplication.py` is the program, and `tests/benchmarks/thread_corpus.py`
+the corpus; the suite runs both at a size that costs nothing, so neither rots. To re-run:
+
+```
+.venv/bin/python -m tests.benchmarks.thread_duplication                # seed 463, bge-m3
+.venv/bin/python -m tests.benchmarks.thread_duplication --seed 1729
+```
+
+**The corpus is synthetic and seeded.** Two threads for each of 2, 5, 10, 20 and 30 messages in
+each of three quoting styles: top-posted with the full history quoted (`>` nesting one level
+deeper per reply), inline replies quoting only the last two passages, and HTML-only bodies with
+the history in nested `blockquote`s. Every message writes one passage stating one decision, and
+the generator records which message wrote it. Beside the threads: a *companion* message
+restating each queried decision in other words — a second relevant document outside the
+thread — and twenty unrelated messages. 506 messages in all, at `example.org`.
+
+**Through the shipped path.** The synthetic Gmail serves the corpus, the real connector reads
+it, and `Runtime.pipeline()` indexes it with the mail parser, the structural chunker and bge-m3
+on ONNX. Each pipeline is a `Runtime` over the same index with only `rag.pipeline` changed,
+queried through the evaluation harness's `RetrieverSystem` ([`evaluation.md`](../evaluation.md)
+§4) with the query cache off.
+
+**Queries.** The first, middle and last message of every thread, each asked two ways: a natural
+question, and a few words the passage contains. They are reported apart because the lexical leg
+matches a chunk only when it holds every query term, so a natural question reaches the dense leg
+alone. 168 queries.
+
+**What is scored, per query, in the top ten.** A chunk *carries* a passage when it holds at
+least half of the passage's characters, placed by the chunk's line anchor; every passage the
+generator wrote must be found in the parsed message or the run refuses.
+
+- *redundant* — hits carrying nothing the hits above them did not already carry;
+- *companion* — whether the restating message made the page;
+- *origin* — whether the message that wrote the passage ranks above every chunk quoting it, or
+  sits below one, or is absent while a quotation is present (*quote only*);
+- *page* — how many hits came back.
+
+**The rule was written down before the first run.** Over threads of ten or more messages, on the
+shipped pipeline at `k = 10`, duplication is a cost worth changing something for if (A) there
+are two or more redundant hits per query, or companion recall is 0.15 or more below the
+two-message threads; or (B) the origin is below a quotation, or absent behind one, for a quarter
+or more of the queries that found the passage. If either holds, collapse at retrieval — provided
+it brings both under their thresholds without lowering *found*; thread-level documents only if
+it cannot.
+
+### 8.2 What it found
+
+Threads of ten messages or more, `k = 10`. Seed 463 was used while the stage was designed;
+**seed 1729 was run once, after the design was fixed, and is the one the decision rests on.**
+Intervals are 95% Wilson intervals.
+
+| | Seed | Page | Found | Redundant | Companion (2 messages → 10+) | Origin misplaced |
+|---|---:|---:|---:|---:|---|---|
+| Shipped before (dense, BM25, RRF) | 1729 | 10.0 | 0.98 | 3.79 | 1.00 → 0.71 [0.62, 0.79] | 0.16 [0.10, 0.24] |
+| With `collapse` | 1729 | 8.4 | 0.99 | 1.19 | 1.00 → 0.85 [0.77, 0.91] | 0.15 [0.09, 0.23] |
+| Shipped before | 463 | 10.0 | 0.99 | 4.03 | 1.00 → 0.72 [0.63, 0.80] | 0.24 [0.17, 0.33] |
+| With `collapse` | 463 | 8.2 | 0.99 | 1.07 | 1.00 → 0.88 [0.80, 0.93] | 0.25 [0.18, 0.34] |
+
+**Duplication costs retrieval, and rule A fires on both seeds.** Four of ten hits on a long
+thread repeated text already shown, against fewer than two on a two-message thread, and the
+companion fell off the page for close to three questions in ten. The repetition is worst where
+the whole history is quoted — top-posted and HTML-only threads, five redundant hits a page —
+and mild for inline replies, which quote little. The dense leg alone repeats as much as the
+hybrid; BM25 alone never sees a natural question, and on keywords returns about five hits.
+
+**HTML-only replies are textually their originals.** The HTML converter keeps blockquoted text
+and drops the blockquote, so a quoted passage arrives with no `>` at all. Nothing short of
+comparing text could tell it from the message that wrote it, which is why the stage compares
+text with markers stripped rather than looking for markers.
+
+**Collapse fixes A without lowering *found*.** On the held-out seed, redundant hits fall from
+3.8 to 1.2 and the companion is recovered for all but about one question in seven. The
+companion drop that remains, 0.148, is just under the 0.15 line — a margin the intervals do not
+resolve, so it is reported as under rather than as comfortably under. On 30-message threads the
+companion reaches fusion's candidate list at all for only 0.67 of questions (seed 1729), and
+collapse recovers 0.64: what is left is fusion depth, which no stage after fusion can change.
+
+**Rule B never fires on the held-out seed, and sits on its line on the other.** The origin
+ranks below a quotation for about one question in six on seed 1729 and one in four on seed
+463, in every pipeline, with or without collapse — inline replies account for most of it,
+because a reply quoting two lines of a short message is about as close to the question as the
+message is. At about a hundred found queries the interval spans 0.17 to 0.34, so seed 463's
+0.24 and 0.25 are the same measurement. It is a property of per-message documents, not of the
+stage; thread-level documents would remove it only by citing no message at all.
+
+### 8.3 What collapse costs
+
+- **The original can be the copy dropped.** The stage keeps whichever copy ranked first, so when
+  a reply quoting a message outranks it, the message's own chunk goes and the passage is cited
+  to the reply. *Quote only* rose from 0 to 4 of 106 found queries on seed 1729, and from 4 to 6
+  of 107 on seed 463.
+- **Protecting the original was tried and rejected.** Two refinements, measured on seed 463:
+  never dropping a chunk from an older message for text kept from a newer one (bge-m3: 3.44
+  redundant against 1.07 without it, companion 0.81 against 0.88), and never dropping a
+  message's opening chunk for a later reply's quotation (bge-small: 3.61, against 4.20 with no
+  collapse at all). Both kept the originals and most of the repetition, for the same reason: a
+  message's opening chunk holds its own new text beside the history it quotes, so every opening
+  chunk is the original of something and a rule that protects originals protects nearly every
+  copy.
+- **Pages come back shorter.** What is dropped is not replaced, so on threads of twenty
+  messages or more a page of ten holds seven or eight hits, and an HTML-only long thread about
+  seven. What was dropped would have been the same text again.
+- **About 2 ms a query**, the stage's median wall time — one read of the candidates' documents.
+
+**Thread-level documents were not needed**, and would have cost what collapse does not: a
+citation naming a thread instead of a message, a thread document rebuilt every time a reply
+arrives, and deletion and reconciliation reasoning about parts of a document rather than whole
+ones.
+
+### 8.4 Also found
+
+The connector yields each `messages.list` page as one discovery batch and asks for 500 ids a
+page, and durable acquisition refuses a batch of more than 250 records. The harness serves
+pages of 250 and says why; the defect is outside what this measured.
 
 ---
 
@@ -825,6 +944,8 @@ differ, it is here — check these first when one is available:
 | Refusing to serve a sensitive source unauthenticated; the durable mark; `document delete-source` | `manicule/app/bind.py`, `manicule/app/sensitive.py`, `manicule/ingest/pipeline.py` | [#462](https://github.com/mgd43b/manicule/issues/462) | Implemented |
 | Reconciliation on a schedule and after a full walk | `manicule/ingest/reconcile.py`, `manicule/connectors/gmail.py` (the inventory) | [#466](https://github.com/mgd43b/manicule/issues/466), [#460](https://github.com/mgd43b/manicule/issues/460) | Implemented |
 | The synthetic Gmail | `tests/connectors/fake_gmail.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
+| Collapsing what a thread repeats, at retrieval | `manicule/retrieval/collapse.py` | [#463](https://github.com/mgd43b/manicule/issues/463) | Implemented |
+| The reply-chain measurement and its synthetic threads | `tests/benchmarks/thread_duplication.py`, `tests/benchmarks/thread_corpus.py` | [#463](https://github.com/mgd43b/manicule/issues/463) | Implemented |
 
 No Google client library is added. The six REST calls (`getProfile`, `labels.list`,
 `messages.list`, `messages.get` in `raw` and `minimal`, and `history.list`) go through the HTTP
@@ -845,4 +966,5 @@ costs no HTTP stack either.
 | Scope | labels only, tested identically on every path | a query the incremental path cannot evaluate |
 | Pacing | a metered budget under the per-user quota | a first sync spent hitting 429s |
 | Deletions | complete-inventory reconciliation, on a schedule and after every full walk | deleted mail searchable forever |
+| Long threads | what a thread repeats is collapsed at retrieval | the same paragraph from every reply, and the other answer off the page |
 | Exposure | refused unless served with authentication | a mailbox open to whoever can reach the port |

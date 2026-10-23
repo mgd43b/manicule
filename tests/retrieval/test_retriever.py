@@ -385,10 +385,15 @@ def _settings(**rag: object) -> Settings:
     return Settings(rag=RagSettings(**rag))  # pyright: ignore[reportArgumentType]
 
 
-def test_the_plugin_registers_the_two_legs_the_fusion_and_a_reranker() -> None:
+def test_the_plugin_registers_the_two_legs_the_fusion_the_collapse_and_a_reranker() -> None:
     """Built-in components take the same route a third-party plugin takes."""
     registry = _registry()
-    assert set(registry.names(keys.RETRIEVAL_STAGE.kind)) == {"dense", "lexical", "rrf"}
+    assert set(registry.names(keys.RETRIEVAL_STAGE.kind)) == {
+        "dense",
+        "lexical",
+        "rrf",
+        "collapse",
+    }
     assert "cross_encoder" in registry.names(keys.RERANKER.kind)
 
 
@@ -448,7 +453,7 @@ async def test_the_composition_root_assembles_a_working_retriever(
         retriever = await build_retriever(container)
         result = await retriever.retrieve(a_query("authentication"))
 
-    assert [span.name for span in result.trace.stages] == ["dense", "lexical", "rrf"]
+    assert [span.name for span in result.trace.stages] == ["dense", "lexical", "rrf", "collapse"]
     assert result.trace.pipeline.rrf_k == 60
     assert result.trace.pipeline.embed_fingerprint
     assert result.context.passages

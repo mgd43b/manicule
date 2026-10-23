@@ -56,6 +56,14 @@ class CachedRanking:
     """
 
     identity: PipelineIdentity
+    effective: tuple[float, ...] = ()
+    """Per candidate, the score it carried out of the pipeline.
+
+    Recorded rather than read back off the last stage's key, because a stage may drop candidates
+    without scoring them (``collapse`` does), and its name then keys nothing. Empty on an entry
+    built by hand, which falls back to the last stage's key.
+    """
+
     incomparable: tuple[str, ...] = ()
     """Why the run that populated this entry was inadmissible as a measurement.
 
@@ -217,6 +225,7 @@ class L1QueryCache:
             chunk_ids=tuple(candidate.chunk.id for candidate in candidates),
             scores=tuple(tuple(sorted(candidate.scores.items())) for candidate in candidates),
             identity=identity,
+            effective=tuple(candidate.score for candidate in candidates),
             incomparable=tuple(incomparable),
             exhausted_budget=exhausted_budget,
             origins=()
@@ -246,13 +255,14 @@ async def rehydrate(
     if any(chunk.document_id not in visible for chunk in chunks):
         return None
     last = entry.identity.stages[-1] if entry.identity.stages else ""
+    recorded = entry.effective if len(entry.effective) == len(entry.chunk_ids) else None
     rebuilt: list[Candidate] = []
-    for chunk_id, pairs in zip(entry.chunk_ids, entry.scores, strict=True):
+    for position, (chunk_id, pairs) in enumerate(zip(entry.chunk_ids, entry.scores, strict=True)):
         scores = dict(pairs)
-        # The effective score is the last stage's, exactly as it was when the ranking was
-        # computed. Recomputing it from whatever key looks largest would silently reorder a
-        # ranking on its way out of the cache.
-        effective = scores.get(last, 0.0)
+        # The effective score exactly as it was when the ranking was computed. Recomputing it
+        # from whatever key looks largest would silently reorder a ranking on its way out of the
+        # cache.
+        effective = recorded[position] if recorded is not None else scores.get(last, 0.0)
         chunk = by_id[chunk_id]
         rebuilt.append(
             Candidate(
