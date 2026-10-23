@@ -10,12 +10,14 @@ else.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
 import socket
 import stat
 import threading
+import time
 from typing import TYPE_CHECKING, Any, override
 
 import pytest
@@ -444,24 +446,32 @@ async def test_no_failure_message_carries_a_secret(
     assert "sentinel-prose" not in str(caught.value)
 
 
-async def test_a_browser_that_stays_open_does_not_hold_the_sign_in_up(
+def test_a_browser_that_stays_open_does_not_hold_up_the_token_or_the_exit(
     service: ApplicationService, google: FakeGoogleSignIn, tmp_path: Path
 ) -> None:
-    """A console browser does not return until the person quits it; the token must not wait."""
+    """A console browser does not return until the person quits it.
+
+    Run through ``asyncio.run``, as the command line does: it joins the loop's default executor
+    on the way out, so a browser launched there would keep the command from printing its result
+    or finishing a token pipe until the person closed the browser.
+    """
     quit_browser = threading.Event()
 
     def lingering(url: str) -> bool:
         google.browse(url)
-        quit_browser.wait(timeout=10)
+        quit_browser.wait(timeout=30)
         return True
 
     target = tmp_path / "token"
+    started = time.monotonic()
     try:
-        await login(service, google, FileSink(target), open_browser=lingering)
+        asyncio.run(login(service, google, FileSink(target), open_browser=lingering))
+        elapsed = time.monotonic() - started
     finally:
         quit_browser.set()
 
     assert target.read_text() == REFRESH_TOKEN + "\n"
+    assert elapsed < 10
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can write anywhere")

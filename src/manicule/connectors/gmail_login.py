@@ -44,6 +44,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Protocol, TextIO, cast
@@ -235,10 +236,6 @@ class StreamSink:
         self.stream.flush()
 
 
-_OPENING: set[asyncio.Future[None]] = set()
-"""Browser launches in flight. Held so the loop's weak reference is not the only one."""
-
-
 def _ignore(message: str) -> None:
     del message
 
@@ -312,11 +309,13 @@ async def mint_refresh_token(
             "Opening your browser to sign in. Choose the account this instance indexes. "
             f"If nothing opens, open this address yourself:\n  {url}"
         )
-        # Off the event loop, and not waited for: a console browser blocks until the person
-        # quits it, and neither the redirect nor the timeout below may wait on that.
-        opening = asyncio.ensure_future(asyncio.to_thread(_open, open_browser, url))
-        _OPENING.add(opening)
-        opening.add_done_callback(_OPENING.discard)
+        # On a thread of its own, not waited for, and a daemon: a console browser blocks until
+        # the person quits it, and neither the redirect, the timeout below nor the process's
+        # exit may wait on that. The loop's default executor would be joined by `asyncio.run`
+        # on the way out, which is exactly the wait this avoids.
+        threading.Thread(
+            target=_open, args=(open_browser, url), name="gmail-login-browser", daemon=True
+        ).start()
         announce(f"Waiting up to {timeout_seconds:g} seconds for the sign-in to finish.")
         try:
             async with asyncio.timeout(timeout_seconds):
