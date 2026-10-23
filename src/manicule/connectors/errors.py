@@ -147,11 +147,16 @@ class CursorExpiredError(ConnectorError):
 class RequestTimeoutError(ConnectorError):
     """One request ran out of time while the source stayed reachable and healthy.
 
-    Raised only when the caller asked for timeouts surfaced
+    Confluence raises it only when the caller asked for timeouts surfaced
     (``ConfluenceClient.get_json(..., surface_read_timeouts=True)``), for a read timeout or an
     explicitly classified transient gateway timeout (504). Everything else — a connection
     refused, a 500, a throttle — keeps the ordinary retry policy, because those are not
     statements about the *shape* of the request.
+
+    Gmail raises it differently: once the ordinary retry budget is spent on timeouts, with no
+    opt-in and no claim about the request's shape, since its pages are a fixed size
+    (``docs/connectors/gmail.md`` §6). A caller that shrinks a request on this type is
+    reasoning about Confluence's inventory and not about a Gmail call.
 
     Its own class because a timeout at a deep pagination offset is the one failure where
     repeating the same request is known to be useless and *changing* it is known to help: the
