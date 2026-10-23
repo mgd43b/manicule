@@ -174,10 +174,19 @@ slash, a nested label, a category such as `CATEGORY_PROMOTIONS` that search spel
 `category:promotions` rather than `label:`. So:
 
 - **A full walk and reconciliation** list the excluded labels first — one
-  `messages.list?labelIds=<id>` walk per excluded label, DRAFT included — into a durable
-  exclusion set, then page `messages.list?includeSpamTrash=false` and skip every id in that
-  set. The set is journaled like any inventory, never held as a process-sized collection.
+  `messages.list?labelIds=<id>` walk per excluded label, DRAFT included — into an exclusion
+  set, then page `messages.list?includeSpamTrash=false` and skip every id in that set.
   Listing is 5 units per 500 ids, so each excluded label costs what its size costs to list.
+
+  **The exclusion set is held in memory, and that is a bounded exception, not the inventory.**
+  A connector has no storage of its own — the protocol gives it `discover`, `fetch` and
+  `reconcile`, and durable ingest journals what they yield — so the set lives in the connector
+  for the length of one walk. It holds only the ids of excluded messages: the drafts, for a
+  mailbox indexed whole, and the size of any label added to `exclude_labels` beyond that —
+  tens of thousands of ids for a busy category, a few megabytes. The complete inventory is never
+  held this way, which is the invariant durable acquisition protects. A mailbox whose exclusions
+  run to millions of messages is the case that would need a storage seam for this, and it would
+  be a core change rather than this connector's.
 - **Incremental discovery** tests each message's label ids against the same set of excluded
   label ids (§4.2).
 
@@ -319,13 +328,13 @@ most of a day's first sync being told no.
 ([`ingest.md`](../ingest.md) §13.2): committed messages are not fetched again, so stopping a long
 first sync costs the minutes since the last commit, not the hours before it.
 
-**The discovery journal bounds the largest mailbox a first sync can take.** Listing is fast —
-a million ids is 2,000 calls — and fetching is slow, so a first walk admits every id long before
-the fetches drain them, and every one of them is an unsettled discovery record until its
-message is fetched. `ingest.max_journal_records` (default 1,000,000) caps those records, and a
-walk that reaches the cap stops safely rather than growing the journal without bound. A mailbox
-of more than about a million messages in scope therefore needs that limit raised, with the disk
-it implies, or `exclude_labels` used to bring the first sync under it.
+**The discovery journal bounds the largest mailbox a first sync can take.**
+`ingest.max_journal_records` (default 1,000,000) caps the discovery records held by acquisition
+runs that have not settled, and a run settles only when it finishes — so the cap applies to the
+whole first walk, however far fetching has got. A walk that reaches it stops safely rather than
+growing the journal without bound, and the first sync cannot complete. A mailbox of more than
+about a million messages in scope therefore needs that limit raised, with the disk it implies,
+or `exclude_labels` used to bring the first sync under it.
 
 **Errors**, as the client types them ([#459](https://github.com/mgd43b/manicule/issues/459)):
 
