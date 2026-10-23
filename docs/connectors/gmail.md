@@ -147,8 +147,8 @@ So the mailbox is configuration, not a side effect of the credential:
   therefore a new source identity. The old instance's documents do not leave by themselves —
   reconciliation is not wired (§7) — so they are deleted explicitly before or after the switch.
   Editing `account` on an existing instance is refused with the same instruction rather than
-  treated as a scope change, because a scope change keeps the source and replaces its contents,
-  and the contents being replaced here are someone's mail.
+  treated as a scope change, because a scope change keeps the source and re-walks it, leaving
+  removal to reconciliation — and what would be left behind here is someone else's mail.
 
 ---
 
@@ -226,8 +226,14 @@ A label applied or removed between the exclusion listing and the main walk is ca
 overlap §4.1 describes: the position is captured before either listing, so the next incremental
 sync sees that label change and acts on it.
 
-**`exclude_labels` is a scope field.** It enters the scope fingerprint, and changing it forces a
-complete replacement from a fresh inventory, as every membership-affecting field does.
+**`exclude_labels` is a scope field.** It enters the scope fingerprint, and changing it discards
+the stored history position, so the next sync is a complete walk under the new scope. **A walk
+does not remove anything.** Widening the scope is handled by it: newly included messages are
+yielded and fetched. Narrowing is not: messages that are now excluded stay indexed until a
+reconciliation against the new inventory removes them, and a narrowing large enough to trip the
+deletion ceiling waits for confirmation (§7). Reconciliation after every full walk is part of
+[#466](https://github.com/mgd43b/manicule/issues/466), so a scope change is deletion-capable only
+once that lands.
 
 ---
 
@@ -282,10 +288,18 @@ unchanged.
 
 | Record | Effect |
 |---|---|
-| `messageAdded` | Yield the message if it is in scope. History records "typically" carry only the id and thread id, so a record without label ids costs one `messages.get?format=minimal` to learn them. |
-| `labelRemoved` that brings a message back into scope | Yield it — this is a message restored from Trash or released from an excluded label. |
-| `labelAdded` that takes a message out of scope | Nothing at discovery. It leaves the index through reconciliation (§7). |
+| `messageAdded` | A candidate. |
+| `labelRemoved` | A candidate — it may be a message restored from Trash or released from an excluded label. |
+| `labelAdded` | Nothing at discovery. A label can only take a message out of scope, and out-of-scope messages leave through reconciliation (§7). |
 | `messageDeleted` | Nothing at discovery, for the same reason. |
+
+**A candidate is yielded only if its *current* label set is in scope**, and the current set is
+looked up, never inferred from the record. A `labelRemoved` record names the labels removed, not
+the ones that remain: a message taken out of Trash that still carries an excluded label is out of
+scope, and only its full label set says so. History records also "typically" carry only the
+message and thread ids. So each candidate costs one `messages.get?format=minimal` (20 units) for
+its current label ids, once per walk however many records name it; a message that no longer
+exists answers 404 and is skipped.
 
 **Discovery cannot report a deletion**, because the connector protocol has no channel for one:
 `discover` yields documents that exist, and absence is established only by a complete inventory
@@ -443,15 +457,15 @@ so a mail source can reconcile daily or hourly.
   Erasing one message today is manual: `manicule document delete --hard` removes the row, its
   versions and its chunks, and the raw bytes go only once no acquisition record still references
   them and blob collection runs. For an installation that must be able to forget, the honest
-  configuration is retention off (§9), which leaves no raw copy to erase — at the re-fetch cost §9
-  states. Erasure that follows the source on its own is not designed here; it is a requirement
+  configuration is retention off **from the first sync** (§9), which leaves no raw copy to erase —
+  at the re-fetch cost §9 states. Turning it off later does not remove copies already kept. Erasure that follows the source on its own is not designed here; it is a requirement
   on the reconciliation work §7 depends on
   ([#466](https://github.com/mgd43b/manicule/issues/466) decides what happens to a reconciled
   document's retained bytes), not something this connector can add.
 
-**A message restored from Trash comes back.** Its `labelRemoved` record yields it at discovery
-(§4.2), and the pipeline must restore the soft-deleted document rather than skip it as
-unchanged. [#460](https://github.com/mgd43b/manicule/issues/460) tests that round trip.
+**A message restored from Trash comes back**, unless it still carries another excluded label.
+Its `labelRemoved` record makes it a candidate and its current labels decide (§4.2). Once it is
+yielded, the pipeline must restore the soft-deleted document rather than skip it as unchanged. [#460](https://github.com/mgd43b/manicule/issues/460) tests that round trip.
 
 ---
 
@@ -487,6 +501,15 @@ a real trade with no default that suits everyone:
 
 The connector does not override the installation's storage default; the deployment decides, and
 this section is what it decides with.
+
+**The setting applies to fetches, not to what is already stored.** It is read at each sync and
+decides whether that sync keeps the bytes it fetches. Nothing purges bytes already retained when
+it changes. For this connector that makes the first sync's value close to permanent: a stored
+message is never fetched again (§4.1), so switching retention off later leaves every
+already-retained message's raw copy in place, removed only by a hard delete of its document
+followed by blob collection (§7) — or by whatever [#466](https://github.com/mgd43b/manicule/issues/466)
+decides for reconciled documents. Switching it on later retains only messages fetched from then
+on. Choose before the first sync, and choose off then if the installation must be able to forget.
 
 ---
 
@@ -536,8 +559,9 @@ The connector will be built and tested against a synthetic Gmail
 ([#459](https://github.com/mgd43b/manicule/issues/459)). Where a real mailbox could still
 differ, it is here — check these first when one is available:
 
-- Whether `messageAdded` history records carry `labelIds` in practice. §4.2 pays a `minimal` get
-  when they do not; if they always do, that cost disappears.
+- What label ids history records carry in practice, and whether they are a message's full current
+  set. §4.2 pays a `minimal` get per candidate because a `labelRemoved` record is not the full
+  set; if `messageAdded` records always carry it, that one case could skip the lookup.
 - Whether saving a draft replaces its message id, and whether `in:drafts` in a list query excludes
   every draft revision.
 - Whether messages labeled `CHAT` (old Hangouts conversations saved to Gmail) appear in
