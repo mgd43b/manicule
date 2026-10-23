@@ -157,6 +157,9 @@ def test_no_tool_opens_a_browser_or_captures_a_credential() -> None:
     block until the timeout — which is a new kind of authority rather than a new operation.
     """
     assert "connector_login" not in TOOL_NAMES
+    # The Gmail flavor opens the same browser window and mints a longer-lived secret, so the
+    # reasoning is the same and it is stated once.
+    assert "connector_login_gmail" not in TOOL_NAMES
 
 
 def test_no_tool_re_parses_the_whole_corpus() -> None:

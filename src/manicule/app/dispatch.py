@@ -380,9 +380,16 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         # Capturing a Confluence session. It used to write one to the macOS Keychain, which
         # was not the data directory either; now it hands the session to the server over the
         # control socket and writes nothing anywhere. What it still needs is a server to hand
-        # it to, and `manicule connector login` refuses on its own when there is not one —
-        # which is a different requirement from this lock and is stated where it applies.
+        # it to, and `manicule connector login` for a Confluence source refuses on its own when
+        # there is not one — which is a different requirement from this lock and is stated where
+        # it applies.
         "connector_login",
+        # Minting a Gmail refresh token. It writes a file the operator names (or a pipe) and
+        # nothing in the data directory, and it needs no server: the token is handed to a person
+        # to put in their secret store, not to a running process. Requiring a server first
+        # would refuse the command on exactly the machine it exists for — the one with a browser
+        # — when the server is somewhere else.
+        "connector_login_gmail",
         # Installing the browser extension's messaging host. It writes two files — a shim and
         # a manifest per browser — and neither is corpus state: the shim lands in a directory
         # of its own beneath the data directory and the manifests land in the browsers'. There

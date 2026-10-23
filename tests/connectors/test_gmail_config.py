@@ -12,6 +12,7 @@ from manicule.connectors.config import (
     ALWAYS_EXCLUDED_LABELS,
     REPRESENTATION_VERSION,
     GmailConfig,
+    resolve_gmail_client_secret,
     resolve_gmail_credentials,
     resolve_label_ids,
 )
@@ -261,3 +262,15 @@ def test_printing_the_configuration_never_shows_a_secret() -> None:
     for rendered in (repr(config), str(config), config.model_dump_json(), str(config.model_dump())):
         assert "client-secret-sentinel" not in rendered
         assert "refresh-sentinel" not in rendered
+
+
+def test_the_client_secret_resolves_on_its_own_when_there_is_no_refresh_token_yet() -> None:
+    """``connector login`` runs before a refresh token exists, so it cannot ask for one."""
+    secret = resolve_gmail_client_secret(gmail(), environ={"GMAIL_CLIENT_SECRET": "s"})
+
+    assert secret.get_secret_value() == "s"
+
+
+def test_a_missing_client_secret_is_the_same_refusal_whichever_resolver_asked() -> None:
+    with pytest.raises(ConfigError, match=r"client_secret.*\$GMAIL_CLIENT_SECRET"):
+        resolve_gmail_client_secret(gmail(), environ={}, instance="mail")

@@ -197,11 +197,10 @@ protocol is proven against a real implementation. Full Confluence design in
 *Status.* Beyond Confluence, the local filesystem, mirrored Confluence pages and a pinned Git
 site (the first half of the web-crawler row) are built. Gmail is in progress, with its design in
 [`docs/connectors/gmail.md`](docs/connectors/gmail.md): configuration, credential and a `doctor`
-check are done ([#458](https://github.com/mgd43b/manicule/issues/458)), and the REST client, the
-connector, `connector login` and reconciliation are tracked in
-[#459](https://github.com/mgd43b/manicule/issues/459),
-[#460](https://github.com/mgd43b/manicule/issues/460),
-[#461](https://github.com/mgd43b/manicule/issues/461) and
+check are done ([#458](https://github.com/mgd43b/manicule/issues/458)), as are the REST client
+([#459](https://github.com/mgd43b/manicule/issues/459)) and `connector login`
+([#461](https://github.com/mgd43b/manicule/issues/461)); the connector and reconciliation are
+tracked in [#460](https://github.com/mgd43b/manicule/issues/460) and
 [#466](https://github.com/mgd43b/manicule/issues/466).
 
 OpenDocuments re-enumerates nearly everything on every sync and dedups by content hash.

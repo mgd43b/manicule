@@ -178,8 +178,9 @@ async def forward(path: Path, command: Command, *, workspace: str) -> Envelope:
 class HandoverStore:
     """A session store whose writes are hand-offs to the running server.
 
-    ``manicule connector login`` runs in *this* process, and it has to: ``--browser`` opens a
-    window, and a window opened by a background server is a window nobody is sitting at. But
+    ``manicule connector login`` for a Confluence source runs in *this* process, and it has to:
+    ``--browser`` opens a window, and a window opened by a background server is a window nobody
+    is sitting at. But
     the syncs run in the server, so the credential has to end up there. This is the seam
     between those two facts, and it is a
     :class:`~manicule.connectors.sessions.SessionStore` rather than a special case inside the

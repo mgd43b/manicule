@@ -2917,6 +2917,22 @@ class ConnectorSignedIn(Payload):
     )
 
 
+class ConnectorTokenIssued(Payload):
+    """A Gmail refresh token minted for a source, verified against its mailbox, and put somewhere.
+
+    Carries no part of the token and never will: it is a secret the caller has just been handed
+    by another route (a file, a pipe), and a result that echoed any of it would put it in a
+    second place — a terminal's scrollback, a JSON log — for no purpose at all. It carries no
+    address Google reported either; ``account`` is the instance's own configured value, which
+    the verification has just shown is the mailbox the token reads.
+    """
+
+    name: str = Field(description="The configured source the token was minted for.")
+    account: str = Field(description="The mailbox the source indexes, confirmed to be the token's.")
+    scope: str = Field(description="The one scope the token carries.")
+    written_to: str = Field(description="Where the token was put, in words. Never the token.")
+
+
 # --- configuration -------------------------------------------------------------------------
 
 
