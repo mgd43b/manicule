@@ -2378,7 +2378,10 @@ a computed answer rather than an operator's habit.
 - **A missing session** is handled as a scheduled sync handles it: the loop records that the
   connector awaits sign-in, announces it, and looks again at the next poll. Any other failure is
   recorded and retried at the next look; nothing ends the loop.
-- **After a full sync.** A sync that enumerated the whole source from no cursor, reached the end,
+- **After a full sync.** A sync that enumerated the whole source from no cursor (or that its
+  connector says fell back to a complete walk during discovery, because it could not use the cursor
+  it was handed: the optional `walked_full_inventory` attribute, read once enumeration has ended,
+  which Gmail sets when its change history has expired), reached the end,
   and landed everything it accepted (`RunReport.full_enumeration`, `enumeration_completed`,
   `complete`, and no error) and was not bounded by `--limit` or `--acquire-only` is followed by a
   pass, whether or not the interval has elapsed. A bounded or incomplete run holds a prefix, which
@@ -2799,9 +2802,9 @@ The scope fingerprint alone cannot do this job. It includes the identity, so a d
 the stored watermark invisible rather than wrong, and the run would begin a complete walk of
 the second account beside the first account's documents; and it cannot tell an edit to the
 identity from an edit to the scope, only one of which should keep the source. A connector
-without the attribute is unaffected. The only one that declares it today is Gmail's
-configuration (`GmailConfig.pinned_identity`; [`connectors/gmail.md`](connectors/gmail.md) §1.4),
-and the connector that would be held to it is [#460](https://github.com/mgd43b/manicule/issues/460).
+without the attribute is unaffected. The only one that declares it today is the Gmail connector,
+from its configuration (`GmailConfig.pinned_identity`; [`connectors/gmail.md`](connectors/gmail.md)
+§1.4).
 The hold is taken by `IngestPipeline.run` and by the runtime's reconcile operation
 (`_Ingestion.reconcile`, and the confirming half of `resolve_proposal`) through the same function,
 before anything is enumerated, so that a replaced credential cannot reconcile one account's

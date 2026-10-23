@@ -232,28 +232,22 @@ def build_git_site(context: BuildContext) -> Connector:
 
 
 def build_gmail(context: BuildContext) -> Connector:
-    """Resolve and check the Gmail credential, then refuse: the connector itself is not built yet.
+    """Construct the Gmail connector from validated configuration.
 
-    What this build has of Gmail is its configuration and its credential, and this factory
-    exercises both so that a misconfigured source is named at startup: the settings validate
-    against :class:`~manicule.connectors.config.GmailConfig` before this runs, the client secret
-    and refresh token are resolved from the environment, and a credential is constructed from
-    them. What it cannot do is return a connector, because the object that discovers and
-    fetches messages does not exist yet — handing back anything else would be a connector the
-    scheduler could try to sync and that read nothing.
-
-    **No network here.** The container calls factories synchronously from inside its event loop,
-    so a refresh and a ``users.getProfile`` would block every other request. They are
-    ``RefreshTokenCredential.confirm_mailbox``, which ``doctor`` calls and which belongs in the
-    connector's setup: the container awaits that before ``Container.connector`` hands the
-    connector to anyone, so the mailbox is checked before a caller can use it.
+    The client secret and refresh token are resolved here, so a source missing either fails at
+    startup naming the setting and the environment variable. **No network here**: the container
+    calls factories synchronously from inside its event loop, so a refresh and a
+    ``users.getProfile`` would block every other request. They are the connector's ``setup()``,
+    which the container awaits before ``Container.connector`` hands the connector to anyone, so
+    a token for another mailbox is refused before a caller can use it.
 
     Raises:
-        ConfigError: The context carries configuration of some other type, the client secret or
-            refresh token is absent (naming the setting and the environment variable), or —
-            always, once those pass — the connector that would use them is not available.
+        ConfigError: The context carries configuration of some other type, or the client secret
+            or refresh token is absent (naming the setting and the environment variable).
     """
-    from manicule.connectors.credentials import gmail_credential  # noqa: PLC0415 - see above
+    from manicule.connectors.credentials import gmail_credential  # noqa: PLC0415 - see module docstring
+    from manicule.connectors.gmail import GmailConnector  # noqa: PLC0415
+    from manicule.connectors.gmail_client import GmailClient  # noqa: PLC0415
 
     settings = context.config
     if not isinstance(settings, GmailConfig):
@@ -266,13 +260,10 @@ def build_gmail(context: BuildContext) -> Connector:
         raise ConfigError(msg)
     name = _source_name(context, GMAIL_CONNECTOR_NAME)
     resolved = resolve_gmail_credentials(settings, instance=context.instance)
-    gmail_credential(resolved, instance=name)
-    msg = (
-        f"the Gmail source {name!r} is configured correctly and its credential resolved, but "
-        f"this build cannot read a mailbox: the Gmail connector's discovery and fetching are "
-        f"not implemented yet. Disable the source until they are."
+    credential = gmail_credential(resolved, instance=name)
+    return GmailConnector(
+        resolved, GmailClient(resolved, credential), name=name, renewal=credential.renewal()
     )
-    raise ConfigError(msg)
 
 
 class ConnectorsPlugin:
@@ -314,8 +305,8 @@ class ConnectorsPlugin:
             keys.CONNECTOR.named(GMAIL_CONNECTOR_NAME),
             build_gmail,
             config_model=GmailConfig,
-            summary="A Google Workspace mailbox, read-only. Configuration and credential only: "
-            "reading mail is not implemented yet.",
+            summary="A Google Workspace mailbox, read-only: history-based sync, raw messages, "
+            "scoped by label id, with deletions removed by complete reconciliation.",
             # The index is not permission-aware, so an installation holding mail must never be
             # served without authentication (`docs/connectors/gmail.md` §10).
             sensitive=True,

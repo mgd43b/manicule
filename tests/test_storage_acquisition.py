@@ -2702,6 +2702,125 @@ async def test_reuse_never_falls_back_behind_the_authoritative_latest_snapshot(
     assert reusable.run_id == latest.id
 
 
+def _retained_source(source_id: str, version_token: str) -> AcquisitionSource:
+    """A source whose declared size is the size ``_retain_record`` actually retains."""
+    base = _source(source_id, version_token=version_token)
+    size = len(f"retained {source_id}".encode())
+    discovered = DiscoveredDoc(
+        ref=base.ref,
+        version_token=version_token,
+        title=base.title,
+        media_type="text/html",
+        size_bytes=size,
+        metadata=base.metadata,
+    )
+    return AcquisitionSource.from_discovered(
+        discovered, source_modified_at=base.source_modified_at, provenance=base.provenance
+    )
+
+
+async def _promoted_run(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    run_id: str,
+    records: list[tuple[str, str]],
+    *,
+    scope: str = "history-scope",
+) -> None:
+    """A promoted run holding ``(source_id, version_token)`` records with retained bytes."""
+    created = await store.create_acquisition_run(
+        run_id, "wiki", source_scope="space:ENG", scope_fingerprint=scope
+    )
+    owner = f"worker-{run_id}"
+    run = await store.claim_acquisition_run(
+        created.id, owner, now=_NOW, expires_at=_NOW + timedelta(minutes=1)
+    )
+    assert run is not None
+    for sequence, (source_id, version_token) in enumerate(records):
+        await store.append_acquisition_record(
+            run.id,
+            sequence,
+            _retained_source(source_id, version_token),
+            lease_owner=owner,
+            lease_generation=run.lease_generation,
+            now=_NOW,
+        )
+    await store.complete_acquisition_enumeration(
+        run.id, None, lease_owner=owner, lease_generation=run.lease_generation, now=_NOW
+    )
+    for source_id, version_token in records:
+        await _retain_record(
+            store,
+            engine,
+            data_dir,
+            run,
+            source_id=source_id,
+            owner=owner,
+            version_token=version_token,
+        )
+    await store.complete_snapshot_acquisition(
+        run.id, lease_owner=owner, lease_generation=run.lease_generation, now=_NOW
+    )
+    await store.promote_snapshot_and_commit_watermark(
+        run.id,
+        expected_scope_fingerprint=scope,
+        lease_owner=owner,
+        lease_generation=run.lease_generation,
+        now=_NOW,
+    )
+
+
+async def test_history_reuse_finds_bytes_an_incremental_manifest_leaves_out(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    """After a delta the newest manifest holds one document; the older run still holds the rest."""
+    await _promoted_run(store, engine, data_dir, "a-full", [("page-1", "v1"), ("page-2", "v1")])
+    await _promoted_run(store, engine, data_dir, "z-delta", [("page-3", "v1")])
+
+    latest = await store.latest_promoted_snapshot("wiki", "history-scope")
+    assert latest is not None
+    assert latest.id == "z-delta"
+    assert (
+        await store.reusable_record_from_verified_snapshot(
+            latest.id, _retained_source("page-1", "v1")
+        )
+        is None
+    )
+
+    found = await store.reusable_record_from_promoted_history(
+        "wiki", "history-scope", _retained_source("page-1", "v1")
+    )
+
+    assert found is not None
+    assert found.run_id != latest.id
+    assert found.source.source_id == "page-1"
+
+
+async def test_history_reuse_never_falls_back_behind_a_newer_revision_or_another_scope(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    await _promoted_run(store, engine, data_dir, "a-full", [("page-1", "v1")])
+    await _promoted_run(store, engine, data_dir, "z-newer", [("page-1", "v2")])
+    await _promoted_run(
+        store, engine, data_dir, "m-elsewhere", [("page-9", "v1")], scope="another-scope"
+    )
+
+    behind = await store.reusable_record_from_promoted_history(
+        "wiki", "history-scope", _retained_source("page-1", "v1")
+    )
+    current = await store.reusable_record_from_promoted_history(
+        "wiki", "history-scope", _retained_source("page-1", "v2")
+    )
+    other_scope = await store.reusable_record_from_promoted_history(
+        "wiki", "history-scope", _retained_source("page-9", "v1")
+    )
+
+    assert behind is None, "the newest manifest naming the page holds v2"
+    assert current is not None
+    assert other_scope is None
+
+
 async def test_concurrent_blob_reservations_preserve_backlog_and_publications(
     engine: AsyncEngine,
     data_dir: Path,

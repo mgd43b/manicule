@@ -195,13 +195,14 @@ protocol is proven against a real implementation. Full Confluence design in
 [`docs/connectors/confluence.md`](docs/connectors/confluence.md).
 
 *Status.* Beyond Confluence, the local filesystem, mirrored Confluence pages and a pinned Git
-site (the first half of the web-crawler row) are built. Gmail is in progress, with its design in
+site (the first half of the web-crawler row) are built, and so is Gmail, with its design in
 [`docs/connectors/gmail.md`](docs/connectors/gmail.md): configuration, credential and a `doctor`
-check are done ([#458](https://github.com/mgd43b/manicule/issues/458)), as are the REST client
-([#459](https://github.com/mgd43b/manicule/issues/459)) and `connector login`
-([#461](https://github.com/mgd43b/manicule/issues/461)); the connector and reconciliation are
-tracked in [#460](https://github.com/mgd43b/manicule/issues/460) and
-[#466](https://github.com/mgd43b/manicule/issues/466).
+check ([#458](https://github.com/mgd43b/manicule/issues/458)), the REST client
+([#459](https://github.com/mgd43b/manicule/issues/459)), the connector
+([#460](https://github.com/mgd43b/manicule/issues/460)), `connector login`
+([#461](https://github.com/mgd43b/manicule/issues/461)), the refusal to serve a mailbox
+unauthenticated ([#462](https://github.com/mgd43b/manicule/issues/462)) and reconciliation
+([#466](https://github.com/mgd43b/manicule/issues/466)).
 
 OpenDocuments re-enumerates nearly everything on every sync and dedups by content hash.
 Only GitHub has a real change token. Each connector below gets proper incremental sync.
@@ -216,7 +217,7 @@ Only GitHub has a real change token. Each connector below gets proper incrementa
 | **Swagger** | fetch, no change signal | Fetch and hash the spec; chunk **per endpoint** with parameters and schemas | httpx + `openapi-spec-validator` |
 | **Web crawler** | content hash | **[Git-backed site first, then HTTP](docs/connectors/web-crawler.md)**; Conditional GET (ETag / If-Modified-Since) plus content hash; honor `robots.txt` | httpx + **protego** + selectolax |
 | **Web search** | Tavily, query time | unchanged — no sync | httpx |
-| **Gmail** | not in OpenDocuments | **History API** (`history.list` from a stored `historyId`) with a complete-walk fallback, per-message raw RFC 5322 through the `message/rfc822` parser, read-only scope; **in progress** ([#464](https://github.com/mgd43b/manicule/issues/464)), see [`docs/connectors/gmail.md`](docs/connectors/gmail.md) | httpx |
+| **Gmail** | not in OpenDocuments | **History API** (`history.list` from a stored `historyId`) with a complete-walk fallback, per-message raw RFC 5322 through the `message/rfc822` parser, read-only scope; **built** apart from `connector login` ([#464](https://github.com/mgd43b/manicule/issues/464)), see [`docs/connectors/gmail.md`](docs/connectors/gmail.md) | httpx |
 
 Plus local filesystem with watch mode (**watchfiles**, Rust-backed) and web upload.
 

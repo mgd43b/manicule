@@ -84,6 +84,7 @@ __all__ = [
     "TokenCredential",
     "credential_for",
     "gmail_credential",
+    "mailbox_mismatch",
     "token_credential",
 ]
 
@@ -696,9 +697,11 @@ class RefreshTokenCredential:
         """Check that this credential reads the mailbox the instance is configured for.
 
         One refresh if none is cached and one ``users.getProfile``, compared with ``account``.
-        Called by ``doctor``, by the connector's setup — which the container awaits before a
-        connector is handed to anyone — and at the start of every run, because the token is
-        replaced routinely and the mailbox must not change with it (``gmail.md`` §1.4).
+        Called by ``doctor``. The connector, which has to read the profile anyway for its
+        ``historyId``, compares the one it read with :func:`mailbox_mismatch` — at setup, which the
+        container awaits before a connector is handed to anyone, and at the start of every run,
+        because the token is replaced routinely and the mailbox must not change with it
+        (``gmail.md`` §1.4).
 
         Args:
             account: The configured address, already lowercase (see :class:`GmailConfig`).
@@ -735,14 +738,9 @@ class RefreshTokenCredential:
                 "Gmail answered users.getProfile without an address; the mailbox cannot be checked"
             )
             raise CredentialError(msg)
-        if reported.strip().casefold() != account.strip().casefold():
-            msg = (
-                "the credential belongs to a different mailbox than this instance's configured "
-                "account (an alias of the account counts as different: configure the primary "
-                "address). Indexing another mailbox is a different instance under a new name, "
-                "so the run did not begin. " + self.renewal()
-            )
-            raise MailboxMismatchError(msg)
+        mismatch = mailbox_mismatch(reported, account, self.renewal())
+        if mismatch is not None:
+            raise mismatch
 
     # -- the exchange ----------------------------------------------------------------
 
@@ -861,6 +859,25 @@ def _usable_lifetime(expires_in: object) -> float:
     if expires_in > 2 * REFRESH_MARGIN_SECONDS:
         return float(expires_in) - REFRESH_MARGIN_SECONDS
     return float(expires_in) / 2
+
+
+def mailbox_mismatch(reported: str, account: str, renewal: str) -> MailboxMismatchError | None:
+    """The refusal for a token that reads another mailbox than ``account``, or ``None``.
+
+    One rule for every place that compares ``users.getProfile``'s address with the configured one
+    — ``doctor``, the connector's setup and the start of each run — so that they refuse alike and
+    none of them prints either address (``gmail.md`` §1.4). Addresses compare without regard to
+    case, and an alias of the account counts as different: the profile reports the primary one.
+    """
+    if reported.strip().casefold() == account.strip().casefold():
+        return None
+    msg = (
+        "the credential belongs to a different mailbox than this instance's configured "
+        "account (an alias of the account counts as different: configure the primary "
+        "address). Indexing another mailbox is a different instance under a new name, "
+        "so the run did not begin. " + renewal
+    ).rstrip()
+    return MailboxMismatchError(msg)
 
 
 def gmail_credential(

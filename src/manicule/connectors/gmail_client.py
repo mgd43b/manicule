@@ -74,6 +74,7 @@ __all__ = [
     "MessageLabels",
     "Profile",
     "QuotaPacer",
+    "RawMessage",
 ]
 
 _ORIGIN: Final = "https://gmail.googleapis.com"
@@ -213,6 +214,22 @@ class MessageLabels:
 
     message_id: str
     label_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RawMessage:
+    """``users.messages.get?format=raw``: the message's bytes and the two facts only Gmail has.
+
+    The thread id and the arrival time are not in the RFC 5322 text (``Date`` is the sender's
+    claim, ``internalDate`` is when Gmail received it), and the design carries both as document
+    metadata (``gmail.md`` §2).
+    """
+
+    raw: bytes
+    """The whole RFC 5322 message, attachments inline."""
+    thread_id: str | None
+    internal_date_ms: int | None
+    """Milliseconds since the epoch, or ``None`` if Gmail sent no usable value."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,8 +407,8 @@ class GmailClient:
                 for entry in _entries(payload, "messages", "users.messages.list")
             )
 
-    async def get_raw(self, message_id: str) -> bytes:
-        """``users.messages.get?format=raw``, base64url-decoded to the RFC 5322 message.
+    async def get_raw(self, message_id: str) -> RawMessage:
+        """``users.messages.get?format=raw``: the RFC 5322 message, base64url-decoded.
 
         Raises:
             NotFoundError: The message was deleted between discovery and fetch.
@@ -410,12 +427,18 @@ class GmailClient:
             # Gmail omits the base64 padding, which the decoder insists on. ``validate`` is what
             # makes a stray character an error: left off, the decoder discards it and returns
             # a message with bytes missing, which would be parsed, cited and answered from.
-            return base64.b64decode(
+            raw = base64.b64decode(
                 encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True
             )
         except (binascii.Error, ValueError):
             msg = f"Gmail {operation} returned a body that is not base64url"
             raise ConnectorError(msg) from None
+        thread = payload.get("threadId")
+        return RawMessage(
+            raw=raw,
+            thread_id=thread if isinstance(thread, str) and thread else None,
+            internal_date_ms=_epoch_ms(payload.get("internalDate")),
+        )
 
     async def get_minimal(self, message_id: str) -> MessageLabels:
         """``users.messages.get?format=minimal``: the message's current label ids.
@@ -708,6 +731,17 @@ def _entries(payload: Json, key: str, operation: str) -> list[Json]:
         msg = f"Gmail {operation} returned {key!r} in an unexpected shape"
         raise ConnectorError(msg)
     return [entry for entry in entries if entry is not None]
+
+
+def _epoch_ms(value: object) -> int | None:
+    """``internalDate`` (a decimal string of milliseconds), or ``None`` if it is anything else."""
+    if isinstance(value, bool) or not isinstance(value, str | int):
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _strings(value: object, operation: str) -> tuple[str, ...]:

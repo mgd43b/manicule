@@ -1354,6 +1354,63 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             reusable = _record(row)
             return reusable if _source_evidence_is_reusable(source, reusable) else None
 
+    async def reusable_record_from_promoted_history(
+        self,
+        connector: str,
+        scope_fingerprint: str,
+        source: AcquisitionSource,
+    ) -> AcquisitionRecord | None:
+        """Return exact retained evidence from the newest earlier promoted run that holds it.
+
+        An incremental run's manifest names only what that run discovered, so after one the
+        newest promoted manifest no longer holds the bytes of every document the connector
+        indexed, and a complete walk that follows (a source that expired its change history)
+        would fetch again everything that manifest leaves out. The evidence is still there, in
+        the run that fetched it. This finds that run with one indexed query, newest first, in the
+        same exact scope, and holds its record to the same identity and version checks as the
+        newest manifest's.
+        """
+        if source.version_token is None:
+            return None
+        async with self._sessions() as session:
+            row = (
+                await session.execute(
+                    select(models.AcquisitionRecord, models.AcquisitionRun)
+                    .join(
+                        models.AcquisitionRun,
+                        models.AcquisitionRun.id == models.AcquisitionRecord.run_id,
+                    )
+                    .where(
+                        models.AcquisitionRun.workspace_id == self._workspace_id,
+                        models.AcquisitionRun.connector_name == connector,
+                        models.AcquisitionRun.scope_fingerprint == scope_fingerprint,
+                        models.AcquisitionRun.superseded_at.is_(None),
+                        models.AcquisitionRun.promoted_at.is_not(None),
+                        models.AcquisitionRecord.source_id == source.source_id,
+                    )
+                    .order_by(
+                        models.AcquisitionRun.promoted_at.desc(),
+                        models.AcquisitionRun.id.desc(),
+                    )
+                    .limit(1)
+                )
+            ).first()
+            # The newest run that names this document decides, whatever it recorded: a newer
+            # manifest holding another revision, or no retained bytes, is the authoritative
+            # answer, and falling back behind it would reuse a revision the source has left.
+            if row is None:
+                return None
+            record, run = row
+            if (
+                record.blob_ref is None
+                or record.acquired_source is None
+                or not run.membership_hash
+                or not await _manifest_matches(session, run.id, run.membership_hash)
+            ):
+                return None
+            reusable = _record(record)
+            return reusable if _source_evidence_is_reusable(source, reusable) else None
+
     async def reusable_record_from_superseded_run(
         self,
         run_id: str,

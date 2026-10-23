@@ -3,26 +3,25 @@
 Design for the Gmail connector. Ticket [#457](https://github.com/mgd43b/manicule/issues/457),
 epic [#464](https://github.com/mgd43b/manicule/issues/464).
 
-> **Status: partly implemented; the connector that reads mail does not exist yet.** Three tickets
-> have shipped. [#458](https://github.com/mgd43b/manicule/issues/458) is the configuration
-> (`GmailConfig`, `manicule/connectors/config.py`), the refresh-token credential and the mailbox
-> check (`manicule/connectors/credentials.py`), the pipeline's pinned-identity check
+> **Status: implemented.**
+> [#458](https://github.com/mgd43b/manicule/issues/458) is the configuration (`GmailConfig`,
+> `manicule/connectors/config.py`), the refresh-token credential and the mailbox check
+> (`manicule/connectors/credentials.py`), the pipeline's pinned-identity check
 > (`manicule/ingest/pipeline.py`) and the `gmail-credential` `doctor` check
 > (`manicule/app/service.py`). [#459](https://github.com/mgd43b/manicule/issues/459) is the REST
 > client, whose calls, pacing and error typing (§5, §6) are in `manicule/connectors/gmail_client.py`,
 > tested against the synthetic Gmail in `tests/connectors/fake_gmail.py`.
 > [#462](https://github.com/mgd43b/manicule/issues/462) is the refusal to serve a sensitive
 > source without authentication (§10, `manicule/app/bind.py` and `manicule/app/sensitive.py`),
-> which is in force before any mail can be read. A `type = "gmail"` source
-> validates and resolves its credential, and then the factory refuses to build it, because the
-> connector is [#460](https://github.com/mgd43b/manicule/issues/460).
+> in force before any mail can be read.
+> [#460](https://github.com/mgd43b/manicule/issues/460) is the connector itself,
+> `manicule/connectors/gmail.py`: scope by label id, the full and incremental walks over Gmail's
+> history, the raw fetch, complete reconciliation, and the mailbox check at setup and at the start
+> of every run (§2–§7). Reconciliation running in a served installation
+> ([#466](https://github.com/mgd43b/manicule/issues/466)) is what makes deletions take effect.
 > [#461](https://github.com/mgd43b/manicule/issues/461) is `connector login`, which mints the
-> refresh token (§1.3, `manicule/connectors/gmail_login.py`). Everything else on this page
-> — discovery, fetching and reconciliation
-> ([#460](https://github.com/mgd43b/manicule/issues/460),
-> [#466](https://github.com/mgd43b/manicule/issues/466)) — is still design: a decision for
-> those tickets to implement, not a description of code that exists. §12 says which module
-> implements which part; when a ticket ships, it replaces its sections' "will" with the module.
+> refresh token (§1.3, `manicule/connectors/gmail_login.py`). §12 says which module implements
+> which part; when a ticket changes that, it updates this page.
 
 A mailbox is the most sensitive source manicule has been pointed at, and the obvious
 implementation gets three things wrong quietly: it re-downloads the whole mailbox to find what
@@ -93,15 +92,13 @@ so the documented path is the environment variable.
 `resolve_gmail_credentials`). A missing client secret or refresh token is a `ConfigError`
 naming the setting and the environment variable, never a value. The factory is synchronous, so
 it does no network I/O: it validates, resolves the secrets and constructs the credential
-object, and that is all. Today it then always refuses with a `ConfigError`, because the
-connector that would use the credential is [#460](https://github.com/mgd43b/manicule/issues/460)
-and handing back anything else would be a source the scheduler could try to sync that reads
-nothing. Disable a Gmail source until that lands.
+object, and returns the connector. The first network call is the connector's `setup()`, which the
+container awaits before it hands the connector to anyone (§1.4).
 
-**Whether a refresh succeeds is checked by `doctor` today** (the `gmail-credential` check,
+**Whether a refresh succeeds is checked by `doctor`** (the `gmail-credential` check,
 [`surfaces.md`](../surfaces.md)), so a revoked grant is visible before a sync rather than at its
-first request. [#460](https://github.com/mgd43b/manicule/issues/460) adds the same check to the
-connector's setup and to the start of each run, where it can refuse to begin.
+first request. The connector makes the same check in its setup and at the start of each run,
+where it refuses to begin.
 
 **Access tokens are minted from it and cached until shortly before `expires_in`** (implemented,
 `RefreshTokenCredential`: the cache expires 60 seconds early). The REST client
@@ -139,7 +136,7 @@ Then, as the account whose mail is indexed, with the source configured (below) a
 ```console
 $ manicule connector login mail --token-file ./gmail-refresh-token   # opens a browser; see below
 $ manicule doctor                        # the gmail-credential check should pass (implemented)
-$ manicule connector sync mail           # planned (#460): the factory refuses until then
+$ manicule connector sync mail           # implemented (#460)
 ```
 
 ```toml
@@ -226,16 +223,21 @@ So the mailbox is configuration, not a side effect of the credential:
 - **`account` is required**, and it is the address the instance indexes. It is stored
   lowercase, because Google compares addresses without regard to case and two spellings of one
   address must not be two scopes. A malformed value is refused without echoing it.
-- **It is checked against `users.getProfile`'s `emailAddress`.** Implemented:
-  `RefreshTokenCredential.confirm_mailbox`, which does one refresh and one `getProfile` call and
+- **It is checked against `users.getProfile`'s `emailAddress`.** Implemented, as one rule
+  (`mailbox_mismatch`, `credentials.py`) applied in three places: `doctor`'s `gmail-credential`
+  check (`RefreshTokenCredential.confirm_mailbox`, which does its own refresh and `getProfile`),
+  the connector's `setup()`, and the start of every discovery and every reconciliation. Each
   raises `MailboxMismatchError` for a token that belongs to another mailbox, without printing
-  either address, since run-level errors are aggregate (§10). Today it runs in `doctor`'s
-  `gmail-credential` check and in `connector login` (§1.3), which makes it before writing the
-  token it has just minted. [#460](https://github.com/mgd43b/manicule/issues/460) adds it to the
-  connector's setup and to the start of each run, so that a mismatch stops the run before
-  anything is read; the factory itself cannot call it, because it is synchronous and does no
-  network I/O (§1.2). `getProfile` reports the *primary* address, so configure the primary
-  address: an alias of the account is refused as a mismatch rather than followed.
+  either address, since run-level errors are aggregate (§10), and the connector does so before a
+  message or a label is read: the only call made is the `getProfile` it needed for its
+  `historyId` anyway. `connector login` (§1.3) makes the same check before it writes the token it
+  has just minted. The factory cannot do it, because it is synchronous and does no network
+  I/O (§1.2), which is why it is `setup()`'s. A run that resumes at acquisition, after a fetch
+  failed once enumeration had finished, never passes through discovery, so `fetch` repeats the
+  check when the last one is more than a minute old: one `getProfile` (1 unit) at most a minute,
+  against 60 for a raw fetch, and the refusal comes before the message is read. `getProfile`
+  reports the *primary* address, so configure the primary address: an alias of the account is
+  refused as a mismatch rather than followed.
 - **`account` is part of the scope fingerprint** as well (`GmailConfig.scope_fingerprint`, which
   also hashes the source scope, the resolved label ids and the representation version), so
   stored state from one mailbox is never resumed for another even if the check were bypassed.
@@ -277,11 +279,21 @@ So the mailbox is configuration, not a side effect of the credential:
   they are inserted**: a `Message-ID` can contain `+`, `%` and `#`, an address can contain `+`,
   and none is safe raw — a `#` ends the search term and a `+` reads as a space. The angle
   brackets around a `Message-ID` are stripped first, as Gmail's own `rfc822msgid:` examples
-  show it without them. A message without a `Message-ID` falls back to `#all/<gmail id>`. §11
-  lists the link as unverified against a live account.
-- **Title** is `Subject`, which the parser already makes the first element of the heading path.
-- **Metadata** carries the thread id and `internalDate`. Neither appears on any status surface:
-  status reports aggregate counts only, never an id, address, subject or label.
+  show it without them. A message without a `Message-ID` falls back to `#all/<gmail id>`. Discovery
+  yields the fallback, because listing returns ids and nothing else. The fetch reads the header, and
+  the search link travels as the provenance record's canonical address, which the pipeline stores
+  as the document's address; the fetched envelope keeps discovery's address, because retained
+  bytes are reusable only while the envelope names the address of the record asking for them.
+  §11 lists the link as unverified against a
+  live account.
+- **Title** is `Subject`, which the parser also makes the first element of the heading path. A
+  listing does not carry it, so it reaches the document at fetch, in the provenance record
+  (`PROVENANCE_KEY`) beside the link, the message id and the arrival time. A subject that cannot
+  be recorded (a control character) leaves the message indexed and cited by its link, with a
+  record that says so in words that do not quote it.
+- **Metadata** carries the thread id (`gmail_thread_id`) and `internalDate` as an ISO 8601
+  timestamp (`internal_date`). Both belong to the message's own document. Neither appears on any
+  status surface: status reports aggregate counts only, never an id, address, subject or label.
 
 ---
 
@@ -391,9 +403,10 @@ never yielded, never reaches the version comparison, and keeps its old token for
 representation version is therefore **also part of the scope fingerprint**. The pipeline reuses
 a stored watermark only under the fingerprint it was recorded with, so bumping the version
 discards the history position, the next sync is a complete walk (§4.1), and every in-scope
-message is yielded with the new token and fetched. An unfinished run recorded under the old
-version must not be resumed either; [#460](https://github.com/mgd43b/manicule/issues/460) tests
-that a bump mid-run starts a fresh complete walk rather than finishing the old one.
+message is yielded with the new token and fetched. An unfinished run recorded under the
+old version is not resumed either: a run is claimed under the fingerprint, so a bump mid-run
+starts a fresh complete walk rather than finishing the old one (tested through the pipeline in
+`tests/connectors/test_gmail_pipeline.py`).
 
 The alternative was a hash of the message's label ids, which would let labels become searchable
 metadata later. It is rejected for now because labels move constantly — every read, star and
@@ -427,14 +440,39 @@ exists answers 404 and is skipped.
 ([`contracts.md`](../contracts.md) §3). That is why the last two rows do nothing here, and §7 is
 where they take effect.
 
+**The history position is also the watermark's value, and what makes it valid is in its
+metadata.** The watermark is `Watermark(value=<historyId>)`, readable only after a walk
+completed (a walk abandoned part-way advances nothing), and it records the scope fingerprint and
+the pinned identity it was written under. The pipeline already reuses a stored position only under
+the fingerprint it was claimed with; the connector checks both again itself, because the
+fingerprint it hands the pipeline is a synchronous property over the label ids resolved at setup
+or at the start of the last run (resolving needs `labels.list`, and the pipeline reads the
+fingerprint before discovery begins), so a label deleted and recreated under the same name
+between runs would otherwise be read stale. The cost of the stale read is one complete walk, not
+a wrong scope.
+
+**A candidate's lookup is remembered for the length of the walk.** The ids a `history.list` walk
+has already looked up are held in a set so that a message named by many records costs one
+`format=minimal` get (§4.2). It holds ids the log named, not the mailbox's inventory, and it is
+gone when the walk is.
+
 ### 4.3 When the history is gone
 
 Google keeps history "typically" for at least a week, and in rare cases only for hours. A
 `startHistoryId` that is too old is answered with **404**, typed as `CursorExpiredError`, and the
 run falls back to a complete walk from §4.1.
 
+**The fallback is reported as what it is.** The pipeline decides whether a sync was a full
+enumeration before discovery runs, from the watermark it hands over, so a walk that began as an
+incremental one would otherwise be treated as a delta and skip the reconciliation that follows a
+complete walk (§7). The connector says, once discovery has ended, that it walked everything
+(`walked_full_inventory`), and the pipeline reads that as it reads the other signal. The same
+holds when a stored position is set aside because the scope or the representation changed.
+
 **That fallback is cheap, and the constant version token is the reason.** A complete walk lists
-ids at 5 quota units per request of up to 500 ids, and fetches only the ids not already stored,
+ids at 5 quota units per request of up to 500 ids, and fetches only the ids not already stored
+(the retained bytes of a message are found in whichever earlier promoted run fetched it, not only
+in the newest manifest, which after an incremental sync names only that sync's delta),
 so a mailbox of 100,000 messages that missed a week of history costs about 200 requests and
 1,000 units of listing plus the new
 mail — seconds of quota, not a re-download (§6).
@@ -456,13 +494,22 @@ cost. Attachments become documents of their own through the parser chain, with `
 pointing at the message, exactly as an `.eml` file's do.
 
 **A 404 at fetch is a message deleted between discovery and fetch**, typed `NotFoundError`, and
-proves nothing about anything else in the mailbox.
+proves nothing about anything else in the mailbox. The run records it and the next complete walk
+no longer lists the message.
 
-**Size** is the pipeline's existing limit on a fetched body, `ingest.max_fetch_bytes`, not a
-Gmail setting. A message that exceeds it is refused, never truncated: a truncated message would
-parse, cite and answer from the half that arrived. The refusal is recorded against that
-message's own document, inside the workspace like the message itself, and counted in the run
-report; the count is all that reaches a status surface (§10).
+**Size** is the pipeline's existing limit on a fetched body, `ingest.max_fetch_bytes` (256 MiB by
+default, well above the 25 MB Gmail accepts), not a Gmail setting. A message that exceeds it is
+refused, never truncated: a truncated message would parse, cite and answer from the half that
+arrived. The refusal is the pipeline's own for any source, and it is an *omission*, not a
+document: the message gets no row, the run counts it as an omission of type `fetch_failed`
+(an aggregate; no id, subject or label reaches a status surface), and the run reports that a
+retry is owed. Under the default `ingest.snapshot_promotion_policy`, a run with an omission is not
+complete and advances no watermark, so the next sync is a complete walk again; under
+`allow_omissions` the rest of the mailbox moves on and the message is retried on every sync until
+the limit is raised. Either way the cost is a 60-unit fetch per attempt (§6). An earlier draft of
+this page said the refusal was recorded on the message's own document; the pipeline does not do
+that for any source, and changing it is a change to the acquisition journal, not to this
+connector.
 
 ---
 
@@ -570,6 +617,11 @@ That meets the prerequisite this section used to state: reconciliation runs on a
 the Gmail connector ships. The schedule lives in `manicule serve`, so an installation that is not
 served has no process to run it, and only the command above reconciles it.
 
+A pass and a held deletion proposal are fenced to the scope they were built under
+(`reconciliation_scope`, which carries the scope fingerprint), so a proposal made while a label
+was excluded cannot be confirmed after the exclusion is removed, which would delete messages that
+are in scope again.
+
 **Two behaviors matter more for mail than for anything else:**
 
 - **The deletion ceiling.** A reconciliation that would delete more than
@@ -608,7 +660,12 @@ served has no process to run it, and only the command above reconciles it.
 
 **A message restored from Trash comes back**, unless it still carries another excluded label.
 Its `labelRemoved` record makes it a candidate and its current labels decide (§4.2). Once it is
-yielded, the pipeline must restore the soft-deleted document rather than skip it as unchanged. [#460](https://github.com/mgd43b/manicule/issues/460) tests that round trip.
+yielded, the pipeline restores the soft-deleted document rather than skipping it as unchanged: a
+soft-deleted row is invisible to change detection, so the message is fetched again and written
+over the old row, clearing the deletion. `tests/connectors/test_gmail_pipeline.py` drives that
+round trip (trashed, reconciled away, restored, indexed again), and the same walk with another
+excluded label still on the message yields nothing. A restore costs one raw fetch, because the
+message was deleted from the index and not merely hidden.
 
 ---
 
@@ -732,7 +789,7 @@ answers included. Roles decide what a person may do, not what they may read.
 
 ## 11. Not yet verified against a live mailbox
 
-The connector will be built and tested against a synthetic Gmail
+The connector is built and tested against a synthetic Gmail
 ([#459](https://github.com/mgd43b/manicule/issues/459)). Where a real mailbox could still
 differ, it is here — check these first when one is available:
 
@@ -761,12 +818,12 @@ differ, it is here — check these first when one is available:
 | Token refresh and caching, 401 retry, mailbox check, credential errors | `manicule/connectors/credentials.py`, `manicule/connectors/errors.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
 | Holding a synced source to its pinned identity | `manicule/ingest/pipeline.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
 | The `gmail-credential` `doctor` check | `manicule/app/service.py` | [#458](https://github.com/mgd43b/manicule/issues/458) | Implemented |
-| Registration (configuration and credential only; the factory always refuses), marked `sensitive=True` | `manicule/connectors/plugin.py` | [#458](https://github.com/mgd43b/manicule/issues/458), [#462](https://github.com/mgd43b/manicule/issues/462) | Implemented; the factory is completed by [#460](https://github.com/mgd43b/manicule/issues/460) |
+| Registration and the factory (resolves the credential, returns the connector), marked `sensitive=True` | `manicule/connectors/plugin.py` | [#458](https://github.com/mgd43b/manicule/issues/458), [#460](https://github.com/mgd43b/manicule/issues/460), [#462](https://github.com/mgd43b/manicule/issues/462) | Implemented |
 | REST calls, pacing, error typing | `manicule/connectors/gmail_client.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
-| `discover`, `fetch`, `reconcile`, watermarks | `manicule/connectors/gmail.py` | [#460](https://github.com/mgd43b/manicule/issues/460) | Planned |
+| `discover`, `fetch`, `reconcile`, watermarks, the mailbox check at setup and run start | `manicule/connectors/gmail.py` | [#460](https://github.com/mgd43b/manicule/issues/460) | Implemented |
 | `connector login` for Gmail | `manicule/connectors/gmail_login.py`, `manicule/app/service.py` (`connector_login_gmail`) and the CLI | [#461](https://github.com/mgd43b/manicule/issues/461) | Implemented |
 | Refusing to serve a sensitive source unauthenticated; the durable mark; `document delete-source` | `manicule/app/bind.py`, `manicule/app/sensitive.py`, `manicule/ingest/pipeline.py` | [#462](https://github.com/mgd43b/manicule/issues/462) | Implemented |
-| Reconciliation after a full walk | `manicule/connectors/gmail.py` and the pipeline | [#466](https://github.com/mgd43b/manicule/issues/466) | Planned |
+| Reconciliation on a schedule and after a full walk | `manicule/ingest/reconcile.py`, `manicule/connectors/gmail.py` (the inventory) | [#466](https://github.com/mgd43b/manicule/issues/466), [#460](https://github.com/mgd43b/manicule/issues/460) | Implemented |
 | The synthetic Gmail | `tests/connectors/fake_gmail.py` | [#459](https://github.com/mgd43b/manicule/issues/459) | Implemented |
 
 No Google client library is added. The six REST calls (`getProfile`, `labels.list`,

@@ -579,8 +579,10 @@ class RunReport:
     full_enumeration: bool = False
     """Whether this run walked the whole source rather than resuming from a cursor.
 
-    True when discovery was handed no watermark, or when the connector walks its whole scope
-    whatever cursor it is handed (:func:`snapshot_enumerates_full_inventory`). Not persisted: it
+    True when discovery was handed no watermark, when the connector walks its whole scope
+    whatever cursor it is handed (:func:`snapshot_enumerates_full_inventory`), or when the
+    connector fell back to a complete walk during discovery because it could not use the cursor
+    it was handed (:func:`snapshot_walked_full_inventory`). Not persisted: it
     describes this invocation, and its one reader is the caller that decides whether a
     reconciliation should follow (``docs/ingest.md`` §11 — after every full sync). It says
     nothing about whether the walk *completed*; that is :attr:`enumeration_completed`, and
@@ -2187,6 +2189,7 @@ class IngestPipeline:
                     break
             else:
                 run.report.enumeration_completed = True
+                run.report.full_enumeration |= snapshot_walked_full_inventory(run.connector)
         except Exception as exc:  # noqa: BLE001 - an enumeration failure is not a crash
             run.report.error_type = type(exc).__name__
             run.report.error_message = "source enumeration failed"
@@ -2411,6 +2414,7 @@ class IngestPipeline:
                 run.candidate_watermark = completed.candidate_watermark
                 run.report.candidate_watermark_present = completed.candidate_watermark is not None
                 run.report.enumeration_completed = True
+                run.report.full_enumeration |= snapshot_walked_full_inventory(run.connector)
         except Exception as exc:  # noqa: BLE001 - an enumeration/admission failure is reported
             if isinstance(exc, CapacityRefusedError):
                 run.report.refuse_capacity(exc)
@@ -2692,12 +2696,18 @@ class IngestPipeline:
                     )
                 run.reusable_snapshot_run_id = None if promoted is None else promoted.id
                 run.reusable_snapshot_checked = True
-        if run.reusable_snapshot_run_id is None:
-            return None
-        reusable = await acquisitions.reusable_record_from_verified_snapshot(
-            run.reusable_snapshot_run_id,
-            record.source,
-        )
+        reusable: AcquisitionRecord | None = None
+        if run.reusable_snapshot_run_id is not None:
+            reusable = await acquisitions.reusable_record_from_verified_snapshot(
+                run.reusable_snapshot_run_id,
+                record.source,
+            )
+        if reusable is None:
+            # The newest manifest names only what its own run discovered, so an incremental one
+            # leaves out documents whose retained bytes an earlier promoted run still holds.
+            reusable = await acquisitions.reusable_record_from_promoted_history(
+                run.connector.name, run.scope_fingerprint, record.source
+            )
         if reusable is None or reusable.acquired_source is None:
             return None
         try:
@@ -5192,6 +5202,22 @@ def snapshot_enumerates_full_inventory(connector: Connector) -> bool:
     wrong in, so a plugin author who never hears about this attribute loses nothing but speed.
     """
     declared = getattr(connector, "enumerates_full_inventory", False)
+    if callable(declared):
+        declared = declared()
+    return bool(declared)
+
+
+def snapshot_walked_full_inventory(connector: Connector) -> bool:
+    """Whether the enumeration that just completed walked the whole scope, whatever it was handed.
+
+    The other half of :func:`snapshot_enumerates_full_inventory`, which is asked *before*
+    discovery and so can only answer for a connector that always walks everything. A connector
+    that resumes from a cursor but can find it unusable (a change history the source no longer
+    holds) decides during discovery, and answers here once discovery has ended. Duck-typed and
+    defaulting to ``False``, so a connector that never makes the claim is unchanged; read only
+    after an enumeration completed, because mid-walk it describes nothing.
+    """
+    declared = getattr(connector, "walked_full_inventory", False)
     if callable(declared):
         declared = declared()
     return bool(declared)

@@ -1077,8 +1077,9 @@ setting the thing up.
 mailbox it names. It is `ok` when no enabled source is of that type, so a corpus without Gmail
 never sees it fail. For each enabled source it resolves the client secret and refresh token,
 refreshes an access token and calls `users.getProfile` once, then compares the mailbox that
-answered with the configured `account` — the same `confirm_mailbox` the Gmail connector will run
-before it reads anything ([`connectors/gmail.md`](connectors/gmail.md) §1.2, §1.4). It is
+answered with the configured `account` — by the rule (`mailbox_mismatch`) the Gmail connector applies
+at setup and at the start of every run, before it reads anything
+([`connectors/gmail.md`](connectors/gmail.md) §1.2, §1.4). It is
 `failing` when a sync would stop on the source's settings or credential: options that do not
 validate (nothing else reports those), an installation without the HTTP client (`pip install 'manicule[connectors]'`), a missing client secret or refresh token, a
 grant Google no longer honors, an OAuth client Google refuses (or a project with the Gmail API off), or a token for a different
@@ -1100,9 +1101,8 @@ measures. (`/healthz` and `/readyz` run no check.) `facts.sources` maps each sou
 revoked grant, a refused client or a token for the wrong mailbox is to run `manicule connector login
 <name>` as the configured account and supply the token it writes as the source's
 `refresh_token`. For a missing secret it names the two settings, and for an unreachable Google it says to check the
-network and run `doctor` again. The connector this credential is for does not exist yet
-([#460](https://github.com/mgd43b/manicule/issues/460)), so a passing check means the credential
-is ready, not that mail is being indexed.
+network and run `doctor` again. A passing check means the credential is ready, not that mail is
+being indexed: whether a sync completed is `connector list`'s question.
 
 **`name` is the stable identifier.** It is what a monitor selects on, so it is chosen once and
 does not move with the wording. `detail` is the sentence a person reads and is free to be
