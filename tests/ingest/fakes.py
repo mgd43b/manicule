@@ -197,6 +197,7 @@ class MemoryIngestStore:
         self.updated_at: dict[str, datetime] = {}
         self.watermarks: dict[str, Watermark] = {}
         self.connector_meta: dict[str, Metadata] = {}
+        self.sensitive_sources: set[str] = set()
         self.state = IndexFingerprints()
         self.staged_publications: list[tuple[str, tuple[str, ...]]] = []
         self.source_dependencies: dict[str, tuple[str, ...]] = {}
@@ -582,6 +583,9 @@ class MemoryIngestStore:
             else:
                 merged[key] = value
         self.connector_meta[connector] = merged
+
+    async def mark_source_sensitive(self, connector: str) -> None:
+        self.sensitive_sources.add(connector)
 
     # index state
 

@@ -58,6 +58,7 @@ from manicule.app.people import (
     serving_problems,
 )
 from manicule.app.ports import RetrievingAcross, SpansWorkspaces
+from manicule.app.sensitive import UnreadableDatabaseError, sensitive_exposure
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
 from manicule.app.throttle import RateLimiter
 from manicule.config.loader import load_settings
@@ -972,6 +973,18 @@ class ApplicationService:
         mid-life is one whose workspace checks describe the wrong workspace.
         """
         return self._backend
+
+    def sensitive_types(self) -> frozenset[str]:
+        """Connector types the registry marks sensitive: mail, today.
+
+        What :func:`~manicule.app.bind.require_sensitive_source_authentication` needs from the
+        registry. Empty only for a backend with no discovery, which a running installation never
+        is; a suite driving a fake registers none and sees none.
+        """
+        discovery = self._backend.discovery
+        if discovery is None:
+            return frozenset()
+        return discovery.registry.sensitive_names(_connector_kind())
 
     @property
     def settings(self) -> Settings:
@@ -3312,6 +3325,24 @@ class ApplicationService:
             document_id=document_id, deleted=True, mode="hard" if hard else "soft"
         )
 
+    async def document_delete_source(self, source: str) -> r.SourceDocumentsDeleted:
+        """Hard-delete every document this workspace holds from one source, in any state.
+
+        The remedy for an installation refusing to serve unauthenticated while it holds the
+        documents of a mail source: live, trashed and purged rows are all removed, with no
+        restore. It does not look the connector up, because the connector may already be gone
+        from configuration, which is the case this exists for. The count is this workspace's.
+
+        Raises:
+            ValueError: The source is empty or blank.
+        """
+        if not source.strip():
+            msg = "a source name is required, and it was empty"
+            raise ValueError(msg)
+        store = await self._backend.documents()
+        deleted = await store.delete_source_documents(source)
+        return r.SourceDocumentsDeleted(source=source, deleted=deleted)
+
     async def document_reindex(self, document_id: str) -> r.DocumentReindexed:
         """Re-parse one document from its retained bytes. Touches no network."""
         store = await self._backend.documents()
@@ -3849,7 +3880,7 @@ class ApplicationService:
         """
         checks: list[r.Check] = [
             self._configuration_check(),
-            self._transport_check(),
+            await self._transport_check(),
             self._sign_in_check(),
             self._plugin_check(),
         ]
@@ -3914,7 +3945,55 @@ class ApplicationService:
             remedy="manicule config show",
         )
 
-    def _transport_check(self) -> r.Check:
+    async def _sensitive_source_check(self, facts: dict[str, JsonValue]) -> r.Check | None:
+        """The ``transport`` failure for an installation holding a sensitive source, or ``None``.
+
+        The same facts :func:`~manicule.app.bind.require_sensitive_source_authentication` refuses
+        on, so this reports what a serve would meet without serving. Read only when
+        authentication is off, for the refusal's reason: an installation that authenticates is
+        never failed because its database could not be read. Placed before the loopback answer
+        and not waivable, because another local account or process can reach a loopback port and
+        the index is not permission-aware. Adds ``sensitive_sources`` to ``facts`` — connector
+        instance names, never anything read from inside a source.
+        """
+        if self.settings.security.auth.mode is not AuthMode.NONE:
+            return None
+        remedy = "manicule config set security.auth.mode api_key"
+        try:
+            exposure = await asyncio.to_thread(
+                sensitive_exposure, self.settings, self.sensitive_types()
+            )
+        except UnreadableDatabaseError as exc:
+            # Redacted like every other path in this output; the exception's own message names it
+            # in full for an operator at a terminal.
+            detail = (
+                f"refusing to serve without authentication: the database at "
+                f"{r.redacted_path(exc.path)} could not be read to tell whether it holds "
+                f"documents from a sensitive source ({exc.cause}). Set security.auth.mode to "
+                f"'api_key' or 'oauth', or fix the database."
+            )
+            return r.Check(
+                name="transport", state="failing", detail=detail, facts=facts, remedy=remedy
+            )
+        facts["sensitive_sources"] = list(exposure.sources)
+        if not exposure:
+            return None
+        return r.Check(
+            name="transport",
+            state="failing",
+            detail=(
+                f"security.auth.mode is 'none' and this installation holds a sensitive source "
+                f"({', '.join(map(repr, exposure.sources))}), so every server start is refused "
+                f"on every address, loopback included, and --no-authentication does not change "
+                f"that: an enabled connector instance is of a sensitive type, or the data "
+                f"directory still holds documents (in any state) from a source one has synced. "
+                f"Disabling the connector does not lift it."
+            ),
+            facts=facts,
+            remedy=remedy,
+        )
+
+    async def _transport_check(self) -> r.Check:
         transport = self.settings.security.transport
         mode = self.settings.security.auth.mode
         # **The address this process actually took, when it knows one.** `--host` is argv, so a
@@ -3969,6 +4048,9 @@ class ApplicationService:
                 facts=facts,
                 remedy="manicule config set security.auth.mode api_key",
             )
+        sensitive = await self._sensitive_source_check(facts)
+        if sensitive is not None:
+            return sensitive
         if loopback:
             return r.Check(
                 name="transport",

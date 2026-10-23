@@ -192,6 +192,21 @@ def test_no_tool_re_embeds_the_whole_corpus_in_place() -> None:
     assert "document_reembed" not in TOOL_NAMES
 
 
+def test_no_tool_hard_deletes_every_document_of_a_source() -> None:
+    """``document delete-source`` is command line only, for ``reset-index``'s reason.
+
+    It permanently removes every row a source holds, trashed and purged ones included, with no
+    restore. It is the remedy a person applies when an installation holding mail refuses to
+    serve unauthenticated, so an unattended caller that could issue it could destroy a corpus
+    by naming a source. The per-document ``document_delete`` stays on every surface; it is
+    bounded by one document and goes to the trash unless ``hard`` is passed.
+    """
+    assert "document_delete_source" not in TOOL_NAMES
+    assert "document_delete" in TOOL_NAMES, (
+        "an absence test that passed because both verbs had gone would say nothing"
+    )
+
+
 def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
     """Corpus scans and accelerator work stay local; one aggregate journal read has parity."""
     assert "reembed_status" in TOOL_NAMES

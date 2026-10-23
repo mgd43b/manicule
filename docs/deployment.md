@@ -319,18 +319,33 @@ wrote into configuration, `--allow-public-bind` on the command line where no con
 supply it, and `security.auth.mode` set to something other than `none`. Any one missing is a
 refusal.
 
+Two more refusals hold on every address, **loopback included**, and `--no-authentication` does
+not waive either. A team installation (§4.1) with `security.auth.mode = "none"` is refused. So is
+an installation with `none` that holds a **sensitive source**: an enabled connector instance of a
+sensitive type (`gmail` is the only one), or any document, in any state, from a source such a
+connector has synced, in any workspace of the data directory. Disabling the connector or deleting
+it from configuration does not lift the second case, because the documents are still in the data
+directory. They have to be gone: `manicule document delete-source SOURCE --yes`, which runs in the
+serving process, so it needs a server running with authentication on. See
+[`surfaces.md` §6](surfaces.md#6-where-a-server-listens).
+
 **Commands that open no socket are not subject to it**, which matters in a container: a pod
 serving with `--no-authentication` has a wide `bind_host` in its configuration, and
 `kubectl exec … manicule index --stats` or `manicule doctor` runs there normally. The bind
 policy governs binding; it is enforced when an address or an application is made, not when the
-data directory is opened.
+data directory is opened. (The sensitive-source rule reads the data directory, but only when a
+socket is about to be made and authentication is off.)
 
 `manicule doctor`'s `transport` check reports what that produced: `ok` for a loopback bind,
 `degraded` for a non-loopback bind with authentication on — reachable from the network, which
-you meant, and worth saying — and `failing` for a non-loopback bind with authentication off.
+you meant, and worth saying — and `failing` for a non-loopback bind with authentication off. It
+is also `failing` on loopback when authentication is off and the installation is a team
+installation or holds a sensitive source, since every server start would be refused; for a
+sensitive source `facts.sensitive_sources` names the connector instances.
 
 **A private installation on a trusted network can serve unauthenticated on purpose**, with
-`--no-authentication` beside `--allow-public-bind`. Both are required and neither implies the
+`--no-authentication` beside `--allow-public-bind`, unless it is a team installation or holds a
+sensitive source, which the flag cannot waive. Both flags are required and neither implies the
 other. It is an argument rather than a setting for the reason `--allow-public-bind` is: a
 configuration key granting it would put an unauthenticated listener one file edit away, in a
 file that gets copied between machines. Three consequences to plan for.
@@ -354,8 +369,9 @@ rest — so this is for a network an operator owns, and `--no-web` is worth cons
 **In a container the two decisions compose, and both are yours.** A loopback bind *inside* a
 container is reachable only from inside it — `-p` forwards to the container's routable
 address, not to its `127.0.0.1` — so publishing anything at all means the container-side bind
-was already widened, which means manicule's three refusals were already satisfied: either
-authentication is on, or `--no-authentication` is in the command that started it. What `-p`
+was already widened, which means manicule's three bind conditions were already satisfied: either
+authentication is on, or `--no-authentication` is in the command that started it (which a team
+or sensitive-source installation cannot use). What `-p`
 then decides is which of the **host's** interfaces see it, and `-p PORT:PORT` decides all of
 them. The guard inside the container cannot make that
 choice for you and does not try to.

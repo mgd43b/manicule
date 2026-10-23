@@ -148,6 +148,7 @@ def address_for(
     require_authoring_authentication(service.settings, allow_unauthenticated=allow_unauthenticated)
     bind = resolve_bind(
         service.settings,
+        sensitive_types=service.sensitive_types(),
         host=host,
         port=port,
         allow_public=allow_public,

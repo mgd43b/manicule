@@ -94,6 +94,7 @@ def address_for(
     """
     bind = resolve_bind(
         service.settings,
+        sensitive_types=service.sensitive_types(),
         host=host,
         port=port,
         allow_public=allow_public,

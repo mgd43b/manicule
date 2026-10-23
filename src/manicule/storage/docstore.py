@@ -921,6 +921,34 @@ class SqliteDocStore(
                 )
             )
 
+    async def delete_source_documents(self, source: str) -> int:
+        """Hard-delete every document this workspace holds from ``source``, in any state.
+
+        Live, soft-deleted and purged rows all go: a purged row stays in ``documents`` with
+        status ``deleted`` and still carries its title, so it is no less a copy of the source
+        than a live one. There is no ``deleted_at`` or status filter here for that reason.
+        Container members of the same source match too, and members cascade by foreign key
+        either way. The cascade and its triggers are those of :meth:`delete_document`.
+
+        Returns:
+            How many of this source's ``documents`` rows were removed, counted before the delete
+            so cascaded container members are included. Idempotent: ``0`` when there were none.
+        """
+        async with self._sessions.begin() as session:
+            # Counted first, in the same transaction: `rowcount` omits rows a foreign-key cascade
+            # removes, so an archive's members would be deleted and not reported.
+            matching = (
+                models.Document.source == source,
+                models.Document.workspace_id == self._workspace_id,
+            )
+            counted = (
+                await session.execute(
+                    select(func.count()).select_from(models.Document).where(*matching)
+                )
+            ).scalar_one()
+            await session.execute(delete(models.Document).where(*matching))
+            return int(counted)
+
     # --- ingest bookkeeping -----------------------------------------------------------------
 
     async def record_seen(self, document_id: str, *, version_token: str | None = None) -> None:
@@ -1573,6 +1601,39 @@ class SqliteDocStore(
             row.watermark = watermark.model_dump(mode="json")
             row.watermark_scope_fingerprint = None
             row.last_synced_at = utcnow()
+
+    async def marked_sensitive_sources(self) -> frozenset[str]:
+        """Sources of this workspace that a sensitive connector has synced."""
+        async with self._sessions() as session:
+            rows = await session.execute(
+                select(models.Connector.name).where(
+                    models.Connector.workspace_id == self._workspace_id,
+                    models.Connector.sensitive_synced_at.is_not(None),
+                )
+            )
+            return frozenset(rows.scalars().all())
+
+    async def mark_source_sensitive(self, connector: str) -> None:
+        """Record, once, that a sensitive connector has synced this source.
+
+        Idempotent and monotonic: the first call stamps the time and every later one leaves it
+        alone, and nothing here ever clears it. The row is created if the source has none, so
+        the mark can be written before the first document, the first watermark or the first
+        acquisition run exists — a sync that fails halfway through still leaves it.
+        """
+        async with self._sessions.begin() as session:
+            row = await self._connector_row(session, connector)
+            if row is None:
+                row = models.Connector(
+                    id=f"{self._workspace_id}:{connector}",
+                    workspace_id=self._workspace_id,
+                    name=connector,
+                    type=connector,
+                    config={},
+                )
+                session.add(row)
+            if row.sensitive_synced_at is None:
+                row.sensitive_synced_at = utcnow()
 
     async def connector_metadata(self, connector: str) -> dict[str, Any]:
         """A connector's diagnostic state: last run's counters, last clean reconcile."""

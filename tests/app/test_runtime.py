@@ -35,7 +35,7 @@ from manicule.app.service import ApplicationService, pre_upgrade_destination
 from manicule.config.settings import Settings
 from manicule.container import keys
 from manicule.container.container import build_container, check_wiring
-from manicule.core.errors import InsecureTargetError, ManiculeError
+from manicule.core.errors import InsecureTargetError, ManiculeError, PolicyError
 from manicule.core.lifecycle import HealthReport
 from manicule.generation.config import GENERATOR_NAME
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
@@ -2257,3 +2257,127 @@ async def test_the_scheduled_sweep_holds_the_backup_lock_until_its_collection_is
     assert refused_during_collection == [True], "a backup could have started mid-collection"
     async with backup_lock(runtime.settings.data_dir, wait_s=0.0):
         pass  # and the hold was given back when the pass ended
+
+
+# --- a sensitive source stays sensitive across export and import -------------------------------
+
+
+async def test_an_export_marks_the_entries_of_a_sensitive_source(
+    runtime: Runtime, manicule_environment: Path
+) -> None:
+    """The archive carries the fact, because the configuration that implied it stays behind."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    await _retain_one_document(runtime, manicule_environment / "data")
+    store = SqliteDocStore(runtime.require_engine())
+    await store.mark_source_sensitive("fs")  # the source `make_document` uses
+    target = manicule_environment / "archive"
+
+    await ApplicationService(runtime).export_corpus(target)
+
+    manifest = ArchiveManifest.model_validate_json((target / "manicule-export.json").read_text())
+    assert [entry.sensitive for entry in manifest.documents] == [True]
+
+
+async def test_an_export_of_nothing_sensitive_writes_no_new_field(
+    runtime: Runtime, manicule_environment: Path
+) -> None:
+    """So an archive without mail is byte-for-byte what it was, and older builds still read it."""
+    await _retain_one_document(runtime, manicule_environment / "data")
+    target = manicule_environment / "archive"
+
+    await ApplicationService(runtime).export_corpus(target)
+
+    assert "sensitive" not in (target / "manicule-export.json").read_text()
+
+
+async def test_an_import_marks_a_source_the_archive_says_was_sensitive(tmp_path: Path) -> None:
+    """Otherwise mail exported from one installation arrives in another that serves it open."""
+    marked: list[str] = []
+
+    class Documents:
+        async def mark_source_sensitive(self, source: str) -> None:
+            marked.append(source)
+
+    class Pipeline:
+        async def ingest_raw(self, *args: object, **kwargs: object) -> list[object]:
+            del args, kwargs
+            return []
+
+    class StubRuntime:
+        settings = Settings(security={"auth": {"mode": "api_key"}})  # pyright: ignore[reportArgumentType]
+
+        async def documents(self) -> Documents:
+            return Documents()
+
+        async def pipeline(self) -> Pipeline:
+            return Pipeline()
+
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (archive / "a.blob").write_bytes(b"body")
+    entries = tuple(
+        ArchiveEntry(
+            source=source,
+            source_id=f"id-{position}",
+            uri=f"https://example.org/{position}",
+            media_type="text/plain",
+            blob="a.blob",
+            sensitive=sensitive,
+        )
+        for position, (source, sensitive) in enumerate(
+            [("mail", True), ("mail", True), ("wiki", False)]
+        )
+    )
+    (archive / "manicule-export.json").write_text(
+        ArchiveManifest(version=ARCHIVE_VERSION, documents=entries).model_dump_json()
+    )
+
+    await _Ingestion(cast("Runtime", StubRuntime())).import_archive(archive)
+
+    assert marked == ["mail"]
+
+
+async def test_an_import_of_a_sensitive_source_is_refused_whole_by_an_unauthenticated_server(
+    tmp_path: Path,
+) -> None:
+    """A running server that started without mail was never refused; the import must refuse.
+
+    Otherwise mail would be readable by whoever can reach the port until the next restart, which
+    is when the mark would finally be read.
+    """
+    written: list[object] = []
+
+    class Pipeline:
+        async def ingest_raw(self, *args: object, **kwargs: object) -> list[object]:
+            written.append((args, kwargs))
+            return []
+
+    class StubRuntime:
+        settings = Settings()
+
+        async def pipeline(self) -> Pipeline:
+            return Pipeline()
+
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (archive / "a.blob").write_bytes(b"body")
+    entries = tuple(
+        ArchiveEntry(
+            source=source,
+            source_id=f"id-{position}",
+            uri=f"https://example.org/{position}",
+            media_type="text/plain",
+            blob="a.blob",
+            sensitive=sensitive,
+        )
+        for position, (source, sensitive) in enumerate([("wiki", False), ("mail", True)])
+    )
+    (archive / "manicule-export.json").write_text(
+        ArchiveManifest(version=ARCHIVE_VERSION, documents=entries).model_dump_json()
+    )
+
+    with pytest.raises(PolicyError, match="'mail'"):
+        await _Ingestion(cast("Runtime", StubRuntime())).import_archive(archive)
+
+    assert written == [], "the unmarked entry must not have been written either"

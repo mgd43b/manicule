@@ -500,6 +500,13 @@ def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:
     out.print(f"removed [bold]{payload.document_id}[/bold] into {where}")
 
 
+def render_source_documents_deleted(out: Console, payload: r.SourceDocumentsDeleted) -> None:
+    out.print(
+        f"deleted {payload.deleted} document(s) from source [bold]{escape(payload.source)}[/bold]"
+        f" permanently, trashed and purged ones included; there is no restore"
+    )
+
+
 def render_document_reindexed(out: Console, payload: r.DocumentReindexed) -> None:
     """One document's outcome, with the detail colored by whether it is a problem.
 
@@ -1816,6 +1823,9 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.DocumentResolved: lambda out, p: render_document_resolved(out, _as(r.DocumentResolved, p)),
     r.DocumentCreated: lambda out, p: render_document_created(out, _as(r.DocumentCreated, p)),
     r.DocumentDeleted: lambda out, p: render_document_deleted(out, _as(r.DocumentDeleted, p)),
+    r.SourceDocumentsDeleted: lambda out, p: render_source_documents_deleted(
+        out, _as(r.SourceDocumentsDeleted, p)
+    ),
     r.DocumentReindexed: lambda out, p: render_document_reindexed(out, _as(r.DocumentReindexed, p)),
     r.StaleReparseReport: lambda out, p: render_stale_reparse(out, _as(r.StaleReparseReport, p)),
     r.StaleGlossaryReport: lambda out, p: render_stale_glossary(out, _as(r.StaleGlossaryReport, p)),

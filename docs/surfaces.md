@@ -277,6 +277,7 @@ server and the built command tree.
 | `document_get` | ✓ | `document get` | one document, optionally its chunks |
 | `document_resolve` | ✓ | `document resolve` | one document by page id, URI or document id, with its retained bytes |
 | `document_delete` | ✓ | `document delete` | what was removed, and how |
+| `document_delete_source` | — | `document delete-source <source> --yes` | how many documents were removed from the source |
 | `document_reindex` | ✓ | `document reindex <id>` | what was repaired |
 | `document_reindex_stale` | — | `document reindex --stale` | counts for a corpus-wide re-parse |
 | `document_reembed` | — | `document reindex --re-embed` | counts for a corpus-wide re-embed that reuses no vector |
@@ -1032,7 +1033,10 @@ authentication on, and `failing` for one without it — including when `--no-aut
 that deliberate, where the wording says so and the remedy becomes "configure authentication"
 rather than "bind loopback". In team mode with no authentication it is `failing` on any address,
 loopback included, because every server start will be refused (§6); `facts.installation_mode`
-says which mode was read.
+says which mode was read. It is likewise `failing` on loopback when authentication is off and the
+installation holds a sensitive source (§6, "Sensitive sources take the way out away"), without
+serving, and `--no-authentication` does not change that. In that case `facts.sensitive_sources`
+lists the connector instance names; with authentication on, the key is absent.
 
 `sign_in` is `ok` when `security.auth.mode` is not `oauth` — there is no browser sign-in to get
 wrong — and otherwise lists every condition `build_app` would refuse to serve with (§9.2.1): a
@@ -1198,7 +1202,9 @@ is unreachable from a network by construction.
    no configuration file can set either.
 
 Any one missing is a refusal naming which. None of the three can be reached by omission: the
-absent value in each case is the safe one.
+absent value in each case is the safe one. Two further refusals hold on every address, loopback
+included, and no argument waives them: team mode without authentication, and a sensitive source
+without authentication (both below).
 
 `tests/app/test_bind.py` asserts each condition separately, asserts the positive case so the
 policy is not merely "refuse everything", and reads the source tree to check that **no module
@@ -1223,7 +1229,8 @@ to assert there never is one.
 authentication" and "I meant to put this on the network" are two statements, so
 `--no-authentication` satisfies the third condition and only the third: a wide bind still needs
 `--allow-public-bind` beside it. Folding them into one argument would hand a public bind to
-somebody who wanted a private unauthenticated one.
+somebody who wanted a private unauthenticated one. It waives nothing else: team mode and a
+sensitive source refuse an unauthenticated socket whatever is typed (below).
 
 **It is loud rather than silent, in two places.** The start banner names the flag, says that
 every caller is an administrator, and — when authoring is configured — names the corpus they can
@@ -1252,7 +1259,8 @@ on `serve`, so every other command answered with an unknown option.
 
 A rule about what may *listen* belongs where something listens. It is enforced at the two points
 above and nowhere else, and `doctor`'s `transport` check reports the same condition as a finding
-for anybody who wants to know without serving.
+for anybody who wants to know without serving. The same two points enforce the team-mode and
+sensitive-source refusals below; `stdio` opens no socket and is not refused by either.
 
 #### Team mode takes the way out away
 
@@ -1265,6 +1273,34 @@ administrator is a single-operator arrangement by definition. The refusal is
 for the reason each of the other refusals is repeated in both, and `doctor`'s `transport` check
 reports it as failing without serving. It is not a `policy_problems` entry, for the same reason
 the wide-bind rule is not: `manicule index` in a team installation opens no socket.
+
+#### Sensitive sources take the way out away
+
+The index is not permission-aware: whoever can search a workspace reads everything in it. A
+connector type can register as **sensitive** (`ComponentRegistry.add(..., sensitive=True)`;
+`gmail` is the only one that does), because a mailbox is one person's and loopback reaches every
+other local account and process. An installation with `security.auth.mode = none` is then refused
+wherever a socket is made, **loopback included**, when either of these is true:
+
+1. an enabled connector instance is of a sensitive type; or
+2. the data directory holds any `documents` row, in any state (soft-deleted and purged rows
+   count), whose source is a connector instance that a sensitive connector has synced, in any
+   workspace of its SQLite database.
+
+`--no-authentication` is refused rather than allowed to waive it; the error says the flag does
+not apply. The second condition is why the refusal outlives the configuration. The pipeline records
+a mark on the source's `connectors` row (`sensitive_synced_at`) before the first sync writes
+anything, and the mark is never cleared. Disabling the connector or deleting it from
+configuration does not lift the refusal. Only deleting the source's documents outright does:
+`manicule document delete-source SOURCE --yes` (§4, and §6.1). A database that cannot be read
+also refuses when authentication is off; only "no database yet" and "a database from before the
+mark existed" count as empty. With authentication on the data directory is not read for this.
+
+The refusal is `manicule.app.bind.require_sensitive_source_authentication`, called from
+`resolve_bind` and from `build_app` beside `require_team_authentication`, and `doctor`'s
+`transport` check reports it as failing without serving. Write commands such as `connector sync`,
+`index <path>` and `document delete` do not call it, but they run inside the serving process, so
+reaching `document delete-source` takes a server running with authentication.
 
 `workspace switch NAME --mode team` writes the mode beside the workspace in one edit of the
 configuration file. The mode is installation configuration; what a workspace row records is the
@@ -1297,6 +1333,15 @@ not true, so there is no handler behind `document_delete`, `connector_sync`, `co
 `collection_rename`, `collection_update`, `collection_rule_set`, `collection_rule_clear`,
 `collection_delete`, `collection_add`, and `collection_remove`) on that server object. A call to
 one is an unknown tool; the four read-only collection tools remain available.
+
+`document_delete_source` (the command `document delete-source <source> --yes`) is not offered on
+either MCP server, local or network, and has no HTTP route: it is a bulk, unrecoverable delete,
+so it is a command a person types. Like `document delete` it runs in the serving process, so it is
+refused with a message naming `manicule serve` when none is answering. It hard-deletes every
+document row this workspace holds from the named source in every state: live, in the trash and
+purged (a purged row stays in the index with its title until it is deleted this way). It is
+scoped to the workspace in use, does not require the connector to still be configured, and prints
+how many rows it removed. Without `--yes` it deletes nothing and says so.
 
 **The exception is `document_create`, by name, in one frozenset.**
 `manicule.mcp.server.NETWORK_AUTHORING` holds it and nothing else, and the surface a socket
@@ -1604,7 +1649,8 @@ loopback (§6), and reachable off loopback only by a person typing `--no-authent
 that bind the "operator" is anything that can route to the port — able to read the index and to
 author into the configured source. That is the exposure the flag buys, named at startup and
 reported by `manicule doctor` for as long as it holds. In team mode it is not available at all
-(§6, "Team mode takes the way out away").
+(§6, "Team mode takes the way out away"), and neither is it for an installation holding a
+sensitive source, on loopback or off it (§6, "Sensitive sources take the way out away").
 
 #### 9.2.1 Signing in, and the browser session
 
@@ -1798,6 +1844,7 @@ unattended caller reaches, so each of them is absent rather than merely guarded:
 | Absent | Why |
 |---|---|
 | `document delete --hard` | Unrecoverable. The route soft-deletes, and `POST /documents/{id}/restore` undoes it |
+| `document delete-source` | Permanently removes every document of a source, trashed and purged ones included, with no restore. It has no MCP tool either |
 | `reset-index` | Resets derived search state while retaining durable source and history roots |
 | `backup` / `restore` | One writes wherever the caller names; the other overwrites the live data directory |
 | `import` / `export` | The same, over a corpus archive |
@@ -1825,8 +1872,8 @@ An unsafe method a browser says came from another origin is refused unless that 
 before routing.
 
 The threat needs a browser holding *ambient* authority, which is the posture manicule ships as:
-loopback with `security.auth.mode = none`, where there is no credential and the caller is whoever
-can reach the port. A signed-in browser's session cookie is the other case (§9.2.1). CORS hides the **response** to a cross-origin request and does not stop a
+loopback with `security.auth.mode = none` (refused once the installation holds a sensitive source,
+§6), where there is no credential and the caller is whoever can reach the port. A signed-in browser's session cookie is the other case (§9.2.1). CORS hides the **response** to a cross-origin request and does not stop a
 "simple" one being sent, so a form `POST` from a page the operator merely visited would take
 effect. `Sec-Fetch-Site` is the primary signal because page script cannot set it; `Origin`
 compared against `Host` is the fallback. A request with neither header — every non-browser
