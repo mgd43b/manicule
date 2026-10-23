@@ -98,7 +98,8 @@ def test_an_enabled_sensitive_instance_is_refused_on_loopback_and_wide(tmp_path:
     with pytest.raises(PolicyError, match=repr(MAIL)) as caught:
         resolve_bind(settings, sensitive_types=SENSITIVE)
     assert "security.auth.mode" in str(caught.value)
-    assert "delete-source" in str(caught.value)
+    assert "disable or remove the connector" in str(caught.value)
+    assert "delete-source" not in str(caught.value)  # nothing is indexed yet to delete
 
 
 def test_authentication_lifts_the_configuration_half(tmp_path: Path) -> None:
@@ -169,8 +170,9 @@ async def test_a_marked_source_with_documents_refuses_after_the_connector_is_rem
     settings = _settings(data_dir, configured=False)
     assert held_sources(data_dir) == (MAIL,)
     _refused_everywhere(settings)
-    with pytest.raises(PolicyError, match=repr(MAIL)):
+    with pytest.raises(PolicyError, match=repr(MAIL)) as caught:
         resolve_bind(settings, sensitive_types=SENSITIVE)
+    assert "manicule document delete-source <name> --yes" in str(caught.value)
 
 
 async def test_a_disabled_connector_still_refuses_while_its_documents_remain(
@@ -392,3 +394,28 @@ def test_every_configured_instance_of_a_sensitive_type_is_marked_enabled_or_not(
         },
     )
     assert sensitive_instances(settings, SENSITIVE) == {"a", "b"}
+
+
+@pytest.mark.parametrize("directory", ["with#hash", "with?query", "with%percent", "with space"])
+async def test_a_data_directory_whose_path_has_uri_metacharacters_is_still_read(
+    tmp_path: Path, migrated_template: Path, directory: str
+) -> None:
+    """``#`` and ``?`` end a SQLite URI's path, so an unescaped one opens a different database.
+
+    That database is empty, its "no such table" reads as "holds nothing", and the mailbox in the
+    real one would be served. Each of these must find the mail.
+    """
+    import shutil  # noqa: PLC0415
+
+    from manicule.storage.engine import create_engine, prepare_data_dir  # noqa: PLC0415
+
+    root = tmp_path / directory
+    prepare_data_dir(root)
+    shutil.copy2(migrated_template, database_path(root))
+    built = create_engine(root)
+    try:
+        await _synced_mail(built, "m1")
+    finally:
+        await built.dispose()
+
+    assert held_sources(root) == (MAIL,)

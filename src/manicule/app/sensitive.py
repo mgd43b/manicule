@@ -130,7 +130,11 @@ def held_sources(data_dir: Path) -> tuple[str, ...]:
     if not path.exists():
         return ()
     try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=_READ_TIMEOUT_S)
+        # `as_uri` percent-encodes. A bare `file:{path}` truncates at a `#` or `?` in the data
+        # directory's path and opens a different — empty — database, whose "no such table" would
+        # read as "holds nothing" and let a mailbox be served.
+        uri = f"{path.absolute().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=_READ_TIMEOUT_S)
     except sqlite3.Error as error:
         raise _unreadable(path, error) from error
     try:

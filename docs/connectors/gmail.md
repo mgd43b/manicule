@@ -649,6 +649,10 @@ answers included. Roles decide what a person may do, not what they may read.
   runs in the serving process, which means serving *with* authentication first; it is not
   offered over MCP or HTTP. `manicule document delete <id> --hard` removes one live document
   at a time and cannot reach the trashed or purged ones, which is why the bulk command exists.
+  It removes the `documents` rows (and what cascades from them: chunks, versions, tags,
+  relations); the retained source bytes and acquisition journal rows are released by the journal
+  cleanup (§7), and the vectors of the removed chunks by the vector sweep, as for any hard
+  delete.
   Checking configuration alone was the first proposal and was rejected: it stops protecting the
   mail at the moment somebody disables the connector, and the mail is still there.
 

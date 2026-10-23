@@ -300,6 +300,15 @@ def require_sensitive_source_authentication(
             f"connector has synced — disabling or removing the connector does not lift this"
         )
     joined = "\n  - ".join(lines)
+    ways_back: list[str] = []
+    if exposure.held:
+        ways_back.append(
+            "delete the source's documents outright from an authenticated server with "
+            "`manicule document delete-source <name> --yes`"
+        )
+    if exposure.configured:
+        ways_back.append("disable or remove the connector")
+    remedy = f" To serve without authentication again, {' and '.join(ways_back)}."
     waiver = (
         "\n--no-authentication was passed and does not apply here: it makes every anonymous "
         "caller an administrator, and a sensitive source is not something an operator can "
@@ -311,10 +320,7 @@ def require_sensitive_source_authentication(
         f"refusing to serve workspace {settings.workspace!r} without authentication, on any "
         f"address (loopback included — another local account or process can reach it):\n"
         f"  - {joined}{waiver}\n"
-        f"Set security.auth.mode to 'api_key' or 'oauth'. To serve without authentication "
-        f"again, delete the source's documents outright from an authenticated server with "
-        f"`manicule document delete-source <name> --yes`"
-        f"{' and disable or remove the connector' if exposure.configured else ''}."
+        f"Set security.auth.mode to 'api_key' or 'oauth'.{remedy}"
     )
     raise PolicyError(msg)
 
