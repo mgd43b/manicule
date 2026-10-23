@@ -10,6 +10,7 @@ Addresses are at ``example.org``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from urllib.parse import parse_qs
 
 import httpx
@@ -26,7 +27,13 @@ REFRESH_TOKEN = "refresh-token-sentinel-7730"  # noqa: S105 - a fixture value
 class FakeGoogleOAuth:
     """Serves the two endpoints, records every request, and lets a test break either."""
 
-    def __init__(self, *, address: str = "mail@example.org", expires_in: object = 3599) -> None:
+    def __init__(
+        self,
+        *,
+        address: str = "mail@example.org",
+        expires_in: object = 3599,
+        issue: Callable[[], str] | None = None,
+    ) -> None:
         self.address = address
         self.expires_in = expires_in
         self.requests: list[httpx.Request] = []
@@ -36,6 +43,8 @@ class FakeGoogleOAuth:
         self.profile_error: dict[str, object] = {"error": {"code": 403}}
         self._valid: set[str] = set()
         self.minted: list[str] = []
+        self._issue = issue
+        """Where tokens come from when another fake (the synthetic Gmail) accepts them."""
 
     @property
     def transport(self) -> httpx.MockTransport:
@@ -69,7 +78,7 @@ class FakeGoogleOAuth:
         ):
             return httpx.Response(400, json={"error": "invalid_grant"})
         self.refreshes += 1
-        token = f"access-token-sentinel-{self.refreshes}"
+        token = self._issue() if self._issue else f"access-token-sentinel-{self.refreshes}"
         self._valid.add(token)
         self.minted.append(token)
         body: dict[str, object] = {"access_token": token, "token_type": "Bearer"}

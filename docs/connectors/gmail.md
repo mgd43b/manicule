@@ -101,9 +101,11 @@ first request. [#460](https://github.com/mgd43b/manicule/issues/460) adds the sa
 connector's setup and to the start of each run, where it can refuse to begin.
 
 **Access tokens are minted from it and cached until shortly before `expires_in`** (implemented,
-`RefreshTokenCredential`: the cache expires 60 seconds early). `send(attempt)` — the wrapper the
-REST client of [#459](https://github.com/mgd43b/manicule/issues/459) will call through — refreshes
-once on a 401 and resends; a second 401 raises `TokenRejectedError`. Google answering the
+`RefreshTokenCredential`: the cache expires 60 seconds early). The REST client
+([#459](https://github.com/mgd43b/manicule/issues/459)) asks it for `access_token()`, asks again
+with `refresh=True` after a 401 and retries once, and raises the credential's `rejected()` on a
+second 401, which is a `TokenRejectedError`; `send(attempt)` does the same refresh-and-resend for
+a caller that has no retry of its own. Google answering the
 refresh with `invalid_grant` — the grant was revoked, the account's password changed under a
 policy that revokes tokens, or the token aged out — raises `GrantRevokedError`, and its renewal
 text names `manicule connector login <name>`. The token endpoint is a constant in the module,
