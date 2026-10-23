@@ -15,13 +15,15 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from manicule.app.served import Scheduler
+from manicule.app.served import RECONCILE_POLL_S, Scheduler, SchedulerConfiguration
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors.errors import ConnectorError, SessionMissingError
+from manicule.ingest.pipeline import RunReport
+from manicule.ingest.reconcile import LAST_RECONCILE_KEY, PROPOSED_DELETION_KEY, Reconciliation
 from manicule.ingest.reembed import ReembedRecovery
 from manicule.ingest.sweeps import SweepResult
-from tests.app.fakes import FakeBackend, FakeIngestion
+from tests.app.fakes import FakeBackend, FakeIngestion, make_document
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -183,7 +185,7 @@ async def test_the_vector_sweep_runs_on_cadence_without_a_command_being_typed() 
     loop above.
     """
     service, ingestion = service_with({})
-    ingestion.vector_sweep = SweepResult(vectors_removed=7, documents_purged=2)
+    ingestion.vector_sweep = SweepResult(vectors_removed=7, documents_purged=2, blobs_collected=5)
     clock = Clock()
     scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
 
@@ -201,6 +203,7 @@ async def test_the_vector_sweep_runs_on_cadence_without_a_command_being_typed() 
     assert scheduler.sweeps is not None
     assert scheduler.sweeps.vectors_removed == 7
     assert scheduler.sweeps.documents_purged == 2
+    assert scheduler.sweeps.blobs_collected == 5
     assert scheduler.sweeps.failures == 0
 
 
@@ -661,3 +664,294 @@ async def test_a_scheduled_sync_with_no_session_refuses_and_keeps_its_place() ->
     assert record.awaiting_sign_in is True
     assert record.failures == 1
     assert record.runs == 0, "an unauthenticated run must not be counted as a completed sync"
+
+
+# --- deletion detection ---------------------------------------------------------------------------
+
+
+def reconciling(
+    service: ApplicationService, clock: Clock, intervals: dict[str, float]
+) -> Scheduler:
+    """A scheduler that runs only deletion detection for the given sources.
+
+    Built by hand rather than from :meth:`Scheduler.configure` so that its one loop is the only
+    thing waiting on the shared clock: a tick then means exactly one pass of the loop under test.
+    """
+    return Scheduler(
+        service,
+        SchedulerConfiguration(
+            {}, lifecycle_interval_s=None, sweep_interval_s=None, reconcile_intervals=intervals
+        ),
+        sleep=clock.sleep,
+    )
+
+
+def documented(
+    service: ApplicationService, ingestion: FakeIngestion, name: str = "handbook"
+) -> FakeBackend:
+    """Give a source the one document that makes a pass worth running."""
+    del ingestion
+    backend = service._backend  # pyright: ignore[reportPrivateUsage] - the fake behind the service
+    assert isinstance(backend, FakeBackend)
+    backend.store.add(make_document(backend.workspace, source=name, source_id="page.md"))
+    return backend
+
+
+def test_every_enabled_source_is_reconciled_whether_or_not_it_is_scheduled() -> None:
+    """A source synced only by hand still loses documents, and nobody types a command to notice."""
+    service, _ = service_with(
+        {
+            "handbook": source(),
+            "runbooks": source(schedule_s=600),
+            "retired": source(enabled=False),
+        }
+    )
+
+    configured = Scheduler.configure(service)
+
+    assert set(configured.reconcile_intervals) == {"handbook", "runbooks"}
+    assert configured == {"runbooks": 600}, "reconciling must not schedule syncs"
+
+
+def test_a_sources_own_reconcile_interval_reaches_the_schedule() -> None:
+    service, _ = service_with({"mail": source(), "wiki": source()})
+    service.settings.connectors["mail"].reconcile_interval_s = 3600
+    service.settings.ingest.reconcile_interval_s = 7 * 24 * 3600
+
+    configured = Scheduler.configure(service)
+
+    assert configured.reconcile_intervals == {"mail": 3600, "wiki": 7 * 24 * 3600}
+
+
+async def test_a_due_connector_is_reconciled_without_a_command_being_typed() -> None:
+    """Criterion 1, through the scheduler: no operator, and the pass is recorded."""
+    service, ingestion = service_with({"handbook": source()})
+    documented(service, ingestion)
+    ingestion.reconcile_result = Reconciliation(connector="handbook", live_count=4, applied_count=2)
+    clock = Clock()
+    scheduler = reconciling(service, clock, {"handbook": 600})
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        assert ingestion.reconcile_calls == [], "a pass ran before the first look"
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert ingestion.reconcile_calls == [("handbook", False, 0.1)]
+    record = scheduler.reconciling["handbook"]
+    assert (record.runs, record.deleted, record.failures) == (1, 2, 0)
+    assert record.last_outcome == "applied"
+
+
+async def test_the_loop_looks_often_rather_than_sleeping_a_whole_weekly_interval() -> None:
+    """A server restarted more often than weekly would otherwise never reconcile.
+
+    The schedule lives in the connector's stored metadata, not in this process's memory, so the
+    loop's job is to notice that a pass has become due. Its first look is within the poll
+    ceiling whatever the interval.
+    """
+    service, ingestion = service_with({"handbook": source()})
+    documented(service, ingestion)
+    clock = Clock()
+    scheduler = reconciling(service, clock, {"handbook": 7 * 24 * 3600})
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+    finally:
+        await scheduler.aclose()
+
+    assert clock.asked == [RECONCILE_POLL_S]
+
+
+async def test_a_short_interval_is_looked_at_on_its_own_cadence() -> None:
+    service, ingestion = service_with({"mail": source()})
+    documented(service, ingestion, "mail")
+    clock = Clock()
+    scheduler = reconciling(service, clock, {"mail": 600})
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+    finally:
+        await scheduler.aclose()
+
+    assert clock.asked == [600]
+
+
+async def test_a_look_at_a_connector_that_is_not_due_runs_nothing_and_looks_again() -> None:
+    service, ingestion = service_with({"handbook": source()})
+    backend = documented(service, ingestion)
+    backend.store.connector_state["handbook"] = {LAST_RECONCILE_KEY: datetime.now(UTC).isoformat()}
+    clock = Clock()
+    scheduler = reconciling(service, clock, {"handbook": 7 * 24 * 3600})
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert ingestion.reconcile_calls == []
+    assert scheduler.reconciling["handbook"].runs == 0
+    assert clock.asked == [RECONCILE_POLL_S, RECONCILE_POLL_S, RECONCILE_POLL_S]
+
+
+async def test_a_proposal_waiting_for_a_person_is_not_asked_again() -> None:
+    service, ingestion = service_with({"handbook": source()})
+    backend = documented(service, ingestion)
+    backend.store.connector_state["handbook"] = {PROPOSED_DELETION_KEY: {"live": 10, "missing": 6}}
+    clock = Clock()
+    scheduler = reconciling(service, clock, {"handbook": 600})
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert ingestion.reconcile_calls == []
+
+
+async def test_a_refused_pass_is_recorded_as_a_proposal_and_announced(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, ingestion = service_with({"handbook": source()})
+    documented(service, ingestion)
+    ingestion.reconcile_result = Reconciliation(
+        connector="handbook",
+        refused="over the ceiling",
+        proposed=("secret-id-1",),
+        live_count=10,
+        missing_count=6,
+    )
+    clock = Clock()
+    scheduler = reconciling(service, clock, {"handbook": 600})
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    record = scheduler.reconciling["handbook"]
+    assert (record.proposals, record.runs, record.deleted) == (1, 1, 0)
+    announced = capsys.readouterr().err
+    assert "6 of 10 live document(s)" in announced
+    assert "--confirm" in announced
+    assert "secret-id-1" not in announced
+
+
+async def test_a_backup_holding_the_data_is_counted_apart_from_a_failure() -> None:
+    service, ingestion = service_with({"handbook": source()})
+    documented(service, ingestion)
+    ingestion.reconcile_result = Reconciliation(connector="handbook", blocked="a backup is running")
+    clock = Clock()
+    scheduler = reconciling(service, clock, {"handbook": 600})
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    record = scheduler.reconciling["handbook"]
+    assert (record.blocked, record.failures, record.runs) == (1, 0, 0)
+
+
+async def test_a_source_that_cannot_be_enumerated_is_a_failure_and_the_loop_carries_on(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, ingestion = service_with({"handbook": source()})
+    documented(service, ingestion)
+    ingestion.reconcile_result = Reconciliation(
+        connector="handbook",
+        error="RemoteError: 502 for https://wiki.example.org/secret",
+        error_type="RemoteError",
+    )
+    clock = Clock()
+    scheduler = reconciling(service, clock, {"handbook": 600})
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        ingestion.reconcile_result = Reconciliation(connector="handbook", live_count=4)
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    record = scheduler.reconciling["handbook"]
+    assert (record.failures, record.runs) == (1, 1)
+    assert record.last_error_type == ""
+    announced = capsys.readouterr().err
+    assert "RemoteError" in announced
+    assert "wiki.example.org" not in announced
+
+
+async def test_a_missing_session_is_reported_as_itself_and_cleared_by_the_next_success() -> None:
+    service, ingestion = service_with({"handbook": source()})
+    documented(service, ingestion)
+    ingestion.reconcile_failure = SessionMissingError("nobody has signed in")
+    clock = Clock()
+    scheduler = reconciling(service, clock, {"handbook": 600})
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        record = scheduler.reconciling["handbook"]
+        assert record.awaiting_sign_in is True
+        assert (record.failures, record.runs) == (1, 0)
+        ingestion.reconcile_failure = None
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert scheduler.reconciling["handbook"].awaiting_sign_in is False
+    assert scheduler.reconciling["handbook"].runs == 1
+
+
+async def test_the_pass_after_a_scheduled_sync_is_counted_in_the_same_record() -> None:
+    """The sync chains a pass itself (`docs/ingest.md` §11), so the record has to see it."""
+    service, ingestion = service_with({"handbook": source(schedule_s=600)})
+    backend = documented(service, ingestion)
+    backend.store.connector_state["handbook"] = {LAST_RECONCILE_KEY: datetime.now(UTC).isoformat()}
+    full = RunReport(connector="handbook", discovered=3)
+    full.full_enumeration = True
+    full.enumeration_completed = True
+    ingestion.report = full
+    ingestion.reconcile_result = Reconciliation(connector="handbook", live_count=4, applied_count=3)
+    clock = Clock()
+    scheduler = Scheduler(
+        service,
+        SchedulerConfiguration(
+            {"handbook": 600},
+            lifecycle_interval_s=None,
+            sweep_interval_s=None,
+            reconcile_intervals={"handbook": 7 * 24 * 3600},
+        ),
+        sleep=clock.sleep,
+    )
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        for _ in range(1000):
+            if scheduler.reconciling["handbook"].runs:
+                break
+            await asyncio.sleep(0)
+    finally:
+        await scheduler.aclose()
+
+    assert ingestion.synced == ["handbook"]
+    assert ingestion.reconcile_calls == [("handbook", False, 0.1)]
+    assert scheduler.reconciling["handbook"].deleted == 3

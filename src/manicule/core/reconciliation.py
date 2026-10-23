@@ -7,6 +7,20 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+LAST_RECONCILE_KEY = "last_clean_reconcile_at"
+"""Set only when a pass completed cleanly. A pass that raised must not advance it."""
+
+LAST_DISCARDED_KEY = "last_discarded_reconcile_at"
+"""When an operator discarded a refused proposal.
+
+Discarding says "I looked, and the source is what is wrong". It is not a clean pass and does not
+advance :data:`LAST_RECONCILE_KEY`, but it does restart the interval: otherwise the next
+scheduled pass would enumerate the source again and re-propose the same deletion within the hour.
+"""
+
+PROPOSED_DELETION_KEY = "proposed_deletion"
+"""Where a refused proposal waits for a human, rather than being recomputed from scratch."""
+
 
 class ReconciliationRunState(StrEnum):
     """Forward-only lifecycle of a full-source inventory."""
@@ -61,6 +75,9 @@ class ReconciliationAssessment(BaseModel):
 
 
 __all__ = [
+    "LAST_DISCARDED_KEY",
+    "LAST_RECONCILE_KEY",
+    "PROPOSED_DELETION_KEY",
     "CompletedInventory",
     "ReconciliationAssessment",
     "ReconciliationRunState",

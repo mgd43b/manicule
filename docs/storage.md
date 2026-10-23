@@ -56,6 +56,7 @@ for anything except genuinely new content — which is what `original_ref` in
 ```
 <data_dir>/
   manicule.lock            exclusive; one instance per directory
+  backup.lock              advisory; a backup holds it exclusively, a pass that removes data shared
   manicule.db              SQLite — the authority
   manicule.db-wal
   manicule.db-shm
@@ -75,6 +76,15 @@ commands take nothing and run beside a writer; [`ingest.md`](ingest.md) §8.6 is
 classification, and §8.5 is the guarantee about concurrent writers that does not depend on any
 of it. The file is a note carrying the holder's process id — deleting it releases nothing, and
 §6.5 says why.
+
+`backup.lock` is a second, separate `flock`, and it is the one that matters while a server is
+up. `manicule.lock` is held exclusively for a writer's whole life, so it cannot also be what a
+backup waits on. `backup.lock` is taken **exclusively by `create_backup` for the length of the
+snapshot** and **shared, without waiting, by each pass that removes data** — the scheduled vector
+sweep (which purges soft-deleted documents and then collects unreferenced blobs) and any other
+pass that takes `Runtime.maintenance_window()`. It is a file in the data directory and not a
+lock in memory because `backup` runs in the command line's own process and the sweep in the
+server's. §9.1 is the procedure it serves.
 
 `<data_dir>` resolution and precedence belong to config
 ([#1](https://github.com/mgd43b/manicule/issues/1)). The only requirement storage places on
@@ -2133,11 +2143,21 @@ in both directions. The sweep is a query:
 
 ```sql
 SELECT hash FROM blobs WHERE hash NOT IN (
-    SELECT original_ref FROM documents         WHERE original_ref IS NOT NULL
+    SELECT original_ref FROM documents           WHERE original_ref IS NOT NULL
     UNION
-    SELECT original_ref FROM document_versions WHERE original_ref IS NOT NULL
+    SELECT original_ref FROM document_versions   WHERE original_ref IS NOT NULL
+    UNION
+    SELECT blob_ref     FROM acquisition_records WHERE blob_ref IS NOT NULL
+    UNION
+    SELECT blob_ref     FROM acquisition_markers WHERE blob_ref IS NOT NULL
 )
 ```
+
+These four are all the roots, and **none is conditioned on a document's status**. A soft-deleted
+document is a root, and so is one `reset_derived` left `deleted` with its bytes (a rebuild reads
+them), so a status predicate here would destroy bytes a rebuild needs. A deleted document stops
+being a root by having its reference *cleared* — which is what the purge does (§8.2) — and not
+by being filtered.
 
 For each candidate: delete the row in a transaction, **then** unlink the file. Crashing
 between the two leaks a file, which a directory scan against `blobs` reclaims on the next
@@ -2145,7 +2165,40 @@ pass. The reverse order would leave a row pointing at nothing, which is a broken
 rather than wasted disk. Every ordering decision in this document resolves the same way:
 prefer the failure that costs space over the failure that costs correctness.
 
-**Retention.** The live document's bytes are kept for as long as the document exists.
+**Retention.** The live document's bytes are kept for as long as the document is live, and
+while it is in the trash. When the sweep purges it after `ingest.soft_delete_grace_s` (§8.2) the
+purge clears `original_ref` on the document and on every one of its versions, in the same
+transaction as the status flip, and records on the document that the bytes were released rather
+than never kept. That applies to every soft-deleted document past the grace period, whatever
+deleted it — a reconciliation, a `document delete`, a collection's `orphans` move — and only to
+purges from then on: a document an older sweep flipped to `deleted` before it released bytes still
+holds its reference, the sweep never selects a `deleted` document again, and it keeps its bytes
+until it is hard-deleted.
+
+**When the file is actually gone.** Clearing the references is necessary and not sufficient:
+a durable sync also journals what it acquired, and `acquisition_records.blob_ref` and
+`acquisition_markers.blob_ref` are roots of their own. The journal's cleanup
+(`cleanup_acquisition_history`) removes a run's rows once the run has been settled for 30 days,
+and it runs at the start of each durable sync. The file is deleted by the first scheduled blob
+collection after **both** have let go: the document's reference, released at the purge (the grace
+period after the delete), and the journal's, which lapses 30 days after the last run that listed
+the document settled and is cleaned at the next durable sync. The two clocks run side by side, not
+one after the other. For a document the source deleted, the last run that listed it came just
+before the deletion was noticed, so with the defaults the file goes about a grace period after
+the deletion, plus the wait for the next sync and the next sweep. A document deleted while the
+source still lists it is different: every run that lists it records a new reference to the same
+bytes, and the file stays for as long as that continues. An installation that stops syncing keeps
+the journal, and with it those bytes.
+
+**What else holds a journal run, and so its bytes, past the 30 days.** The cleanup only removes a
+run that has no unfinished records (a record still `discovered`, `acquiring`, `acquired`,
+`indexing` or `retry` keeps it), no acquisition marker, no unfinished replacement run naming it as
+its predecessor, and no derived generation or generation snapshot naming it. The last is the one
+that surprises: a rebuild's snapshot run, and the bytes it retained, stay until that generation is
+cleaned up or the snapshot is deleted on purpose (`lifecycle_cleanup_generations`,
+`lifecycle_delete_snapshot`). So the lifetime stated above is the floor for a document in a plain
+installation, and an installation that rebuilds keeps more.
+
 Prior versions' bytes are kept for a bounded window — 30 days,
 `manicule.storage.history.DEFAULT_VERSION_BYTES_RETENTION_S` — because a chatty wiki otherwise
 grows the blob store without bound. This is a real policy decision that no existing document
@@ -2161,9 +2214,16 @@ release is written onto the row rather than left to be inferred — "never retai
 reason `documents.original_omitted_reason` exists.
 
 It is a constant rather than a configuration setting, and that is the honest position rather
-than the tidy one: nothing schedules the pass that would read a setting. `collect_garbage`
-itself is a verb with no scheduler, and a setting nothing reads is a promise nothing keeps.
-Both become configurable at the point something runs them on a timer.
+than the tidy one: the release is an operator's action (`lifecycle_release_history`; the
+scheduler only plans it), and a setting nothing reads is a promise nothing keeps.
+
+**Blob collection is scheduled.** `collect_garbage` runs as the last step of every unblocked
+vector-sweep pass (§8.2), on `ingest.sweep_interval_s`, and by hand through `manicule
+sweep-vectors`. It is not tied to a purge having happened, because references lapse through paths
+the sweep does not see — the journal cleanup above, a history release. The scheduled call skips
+unreferenced blobs younger than a day: a blob is written before the document that references it
+commits, and a collection racing that window would delete bytes a publication is about to point
+at. It holds the backup lock shared (§9.1), so a backup in progress makes it decline.
 
 ### 7.1 What the data directory now contains
 
@@ -2295,11 +2355,25 @@ soft delete a write to the vector store, which is exactly the coupling deferred 
 exists to remove, and it re-introduces a value that can disagree with SQLite.
 
 **So the sweep also collects soft-deleted documents, after a grace period.** Within
-`soft_delete_grace` (default 30 days) restore is free. After it, the sweep purges the
-chunks — and restore then costs a re-parse from retained bytes, rung 3, still not a re-fetch.
-This is a real trade rather than a free lunch: unbounded free restore would mean unbounded
-dilution of every vector search. `doctor` reports the soft-deleted fraction of the vector
+`soft_delete_grace` (default 30 days) restore is free. After it, the sweep purges the document:
+its chunks and vectors go, and **so do its retained bytes** — `original_ref` is cleared on the
+document and on each of its versions, and `original_omitted_reason` is set to say the bytes were
+released after the grace period rather than never kept. Restore then costs a re-sync from the
+source, rung 4, which can fail; there is nothing left to re-parse (§11.6). This is a real trade
+rather than a free lunch: unbounded free restore would mean unbounded dilution of every vector
+search, and a deleted document that pinned its raw bytes forever would make "deleted" mean "no
+longer searchable" and nothing more. `doctor` reports the soft-deleted fraction of the vector
 table so the over-fetch factor can be set against a measured number.
+
+**The purge is one transaction** (`purge_document`): it re-checks that the document is still in the
+trash, deletes its chunks (the trigger below writes their vector tombstones in the same
+transaction), sets `status = 'deleted'` and releases the references. One transaction because the
+sweep selects on `status != 'deleted'`; a crash between a status flip and a release would never be
+retried and would pin the bytes forever. The re-check is the `UPDATE`'s own predicate, so a restore
+that lands after the sweep selected the document wins — nothing is changed — and so does a restore
+followed by a second delete, which restarts the clock. The vectors are deleted after the commit;
+a crash in between leaves them to the tombstones. The release does not apply to documents
+`reset_derived` leaves `deleted`: the selection skips them, and their bytes are what a rebuild reads.
 
 ```sql
 CREATE TRIGGER chunks_ad_tomb AFTER DELETE ON chunks BEGIN
@@ -2326,11 +2400,14 @@ whole index.
 The runner lives in `manicule.ingest.sweeps` and is scheduled rather than triggered by
 deletion. Its ordering is this document's ordering: the vectors go first and the tombstones are
 cleared second, so a crash between them costs one wasted pass rather than a live vector with
-nothing left to record that it should go.
+nothing left to record that it should go. For a purged document the order is the other way
+round — the transaction deletes the chunks and so writes the tombstones, then the vectors are
+removed — which is equally safe, because the tombstones exist before anything is removed.
 
 **What schedules it.** A served process runs one bounded pass every
-`ingest.sweep_interval_s` (default one hour), retiring `ingest.sweep_batch` tombstones and
-purging documents past `ingest.soft_delete_grace_s`. The first pass is one interval after
+`ingest.sweep_interval_s` (default one hour), retiring `ingest.sweep_batch` tombstones,
+purging documents past `ingest.soft_delete_grace_s` and then collecting unreferenced blobs (§7).
+It reports the count of each — never an id or a hash. The first pass is one interval after
 startup, not at startup: restarting the server is something an operator does deliberately and
 often, and a restart that immediately began deleting would make it an event rather than a
 no-op. `manicule sweep-vectors` runs the same pass by hand, for draining a backlog now rather
@@ -2348,10 +2425,11 @@ serializes it against a reset, a rebuild and a re-embed publication — the oper
 the publication pointer underneath it. It is deliberately *not* serialized against a running
 sync, and the tombstone design is what makes that safe rather than merely tolerable: the list
 only ever names ids that were already deleted, so a vector written after the pass began cannot
-be in it. **The exclusion against a hot backup is not yet enforced by a lock** — `backup.py`
-records it as the caller's responsibility, and that remains true; a backup taken during a sweep
-can capture a torn moment between a vector's removal and its tombstone being cleared, which the
-next pass then repairs on the restored copy.
+be in it. **A hot backup is excluded by the backup lock** (§2, §9.1). The pass holds
+`backup.lock` shared from before its first removal to after the blob collection, and a backup holds
+it exclusively, so neither starts inside the other: a backup waits for a running pass, up to a
+bound, and then refuses; a pass that finds a backup running declines with a reason and runs at its
+next interval. The scheduler counts that as `blocked`, not as a failure.
 
 ### 8.3 Recovery
 
@@ -2390,8 +2468,17 @@ sweeps the vector store only grows.
 
 **So the procedure is:**
 
-1. Take the backup lock. It blocks the vector sweep and the blob GC — the only two things
-   that remove data — and nothing else. Ingest and queries continue.
+1. Take the backup lock (`create_backup` does; `backup.lock`, §2). It blocks the vector sweep
+   and the blob GC, and the step of a reconciliation that soft-deletes (and a confirmed
+   proposal's apply) — the passes that remove data — and anything else that takes
+   `Runtime.maintenance_window()`, and nothing else. Ingest and queries continue. If a pass is
+   running the backup waits for it (60 seconds by default) and then refuses, saying a maintenance
+   pass holds the lock; the wait never blocks the event loop. A backup that is canceled while it
+   copies keeps the lock until the copying thread has stopped, because canceling the await does
+   not stop the thread.
+   The operator-run lifecycle operations that also remove data (`reset-index`, `reset-derived`,
+   `cleanup-derived-generations`, `release-source-history`, `snapshot-delete`) do not take the
+   lock; do not run one while a backup is copying.
 2. Snapshot SQLite with the online backup API (`sqlite3.Connection.backup()`) or
    `VACUUM INTO`. Both produce one consistent file from a live WAL database.
 3. Record `table.version` for the Lance table. Lance is versioned; this pins the instant.
@@ -2401,6 +2488,14 @@ sweeps the vector store only grows.
 
 On restore, `checkout` the recorded Lance version, discarding anything written after step 2.
 The pair is then consistent as of one instant, with writes never having stopped.
+
+**What `create_backup` does of that, exactly.** Steps 1, 2, 4, 5 and 6, in that order, with the
+lock a real `flock` as described in step 1. It does **not** perform step 3 or the checkout on
+restore: no Lance version is recorded in the manifest and `restore_backup` copies the vector
+directory back as it was captured. The safe skew is therefore the one the ordering argument
+above gives — the vector copy can only be ahead of the SQLite snapshot, and rows it holds that
+the snapshot does not are tombstone-sweep and reconciliation work (§8.3) — rather than one
+instant restored exactly.
 
 > **Prior art, and the trap to avoid.** The existing procedure copies `opendocuments.db`,
 > `.db-wal` and `.db-shm` with `copyFileSync`. A file-by-file copy of a live WAL database is
@@ -2763,17 +2858,23 @@ Restore has two outcomes and the caller has to be able to tell them apart:
 | When | What restore does | What it costs |
 |---|---|---|
 | Inside `soft_delete_grace` | Clears `deleted_at` | Nothing. Chunks, vectors and FTS rows were never removed |
-| After the sweep purged it | Clears `deleted_at`, sets `status = 'pending'` | A re-parse from retained bytes — rung 3 |
-| After the sweep, no retained bytes | The same, and says so | A forced re-sync — rung 4, **may fail** |
+| After the sweep purged it | Clears `deleted_at`, sets `status = 'pending'`, and says the bytes were released | A re-sync from the source — rung 4, **may fail** |
+| After the sweep, bytes never retained | The same, and says they were not retained | A forced re-sync — rung 4, **may fail** |
+| Purged by a sweep older than the release | The same, and offers the re-parse | A re-parse from retained bytes — rung 3 |
+
+The last row is the old behavior, kept for rows that still hold a reference: a purge now clears
+`original_ref`, so rung 3 is gone for everything purged since (§8.2). The second and third rows
+are told apart by `original_omitted_reason`, not by `NULL`.
 
 `pending` is exactly what that state means everywhere else: nothing has claimed it, retrieval
 does not serve it, and a repair pass selects it. A restore that reported plain success in the
 second row would hand back a document with no chunks, invisible to every search, with nothing
 to explain why — so `Restoration` carries `needs_reparse` and a reason naming which rung
-applies. The repair is `manicule.ingest.reindex.reindex_document`, which resolves one id
-through the store and re-parses it from `original_ref`; the id lookup skips the trash, so
-**restore first, then reindex** — the other order finds nothing, and says that rather than
-doing nothing.
+applies. Where bytes remain, the repair is `manicule.ingest.reindex.reindex_document`, which
+resolves one id through the store and re-parses it from `original_ref`; the id lookup skips the
+trash, so **restore first, then reindex** — the other order finds nothing, and says that rather
+than doing nothing. Where they do not, it reports the document as unrepairable and the repair is
+a re-sync.
 
 ### 11.7 Chunk relations
 
@@ -2900,7 +3001,7 @@ one.
 | A refresh is the first build's comparison applied to the rows the index does not cover | §6.2.3 |
 | The build is an operator action; publication makes it due and does not perform it | §6.2.4 |
 | The lexical query is one joined statement so `LIMIT` applies after filtering | §6.1 |
-| The sweep collects soft-deleted documents after a grace period, trading free restore against vector top-`k` dilution | §8.2 |
+| The sweep collects soft-deleted documents after a grace period, trading free restore against vector top-`k` dilution, and releases their retained bytes in the same transaction | §8.2 |
 | Two FTS columns with BM25 weights `1.0 / 0.4` | §6.1 |
 | `porter unicode61 remove_diacritics 2`, no `tokenchars` | §6.1 |
 | The refusal covers retrieval, not just ingest | §6.3 |
@@ -2908,7 +3009,7 @@ one.
 | Per-document `chunk_fp` / `embed_fp` lineage for partial invalidation | §6.4 |
 | `index_state.vector_table` is a pointer; re-embed builds alongside and swaps | §6.5 |
 | `Filter.workspace_ids` required and set-valued | §6.6 — the rest of `Filter` settled later in [`retrieval.md`](retrieval.md) §3 |
-| Blob retention: current version forever, prior versions 30 days; 256 MiB cap | §7 |
+| Blob retention: the live document's bytes while it lives and while it is in the trash, released at the purge; prior versions 30 days; 256 MiB cap | §7 |
 | `<data_dir>` is `0700`/`0600`; `doctor` fails on a looser mode; backup refuses a world-readable target | §7.1 |
 | Deletion from derived stores is always deferred to a sweep | §8.2 |
 | Soft delete is idempotent and never restarts the grace period | §8.2 |
@@ -2920,7 +3021,7 @@ one.
 | Restore after the grace period returns `pending` and names the rung its repair lands on | §11.6 |
 | `chunk_relations` rows are written once and read from both ends; no `CHECK` on `relation_type` | §11.7 |
 | Prior versions release their bytes rather than deleting their history | §7 |
-| Backup order is SQLite first, the vector store second, under a sweep-blocking lock | §9.1 |
+| Backup order is SQLite first, the vector store second, under a cross-process `flock` that the sweep and blob GC take shared | §9.1 |
 | `STRICT` tables rejected for v1 | §3.4 |
 
 ## Appendix B: deliberately not here

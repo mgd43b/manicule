@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import subprocess
@@ -268,3 +269,34 @@ def test_git_site_configuration_is_closed_and_canonical(repository: Path) -> Non
         _config(repository, include=("/absolute/*.md",))
     with pytest.raises(ValidationError):
         _config(repository, exclude=("../outside/**",))
+
+
+async def test_a_standalone_pass_after_a_restart_enumerates_the_current_revision(
+    repository: Path,
+) -> None:
+    """A fresh process has run no discovery, so there is no inventory to reuse."""
+    connector = GitSiteConnector(_config(repository), name="handbook")
+    try:
+        assert [identity async for identity in connector.reconcile()] == ["/guide/", "/"]
+    finally:
+        await connector.teardown()
+
+
+async def test_a_standalone_pass_sees_a_page_the_revision_has_since_dropped(
+    repository: Path,
+) -> None:
+    """After a sync, the next pass must not reuse the commit that sync pinned.
+
+    Discovery runs in a task of its own so its pinned inventory is not this task's, which is
+    how a scheduled pass relates to the sync before it.
+    """
+    connector = GitSiteConnector(_config(repository), name="handbook")
+    await connector.setup()
+    try:
+        await asyncio.create_task(_discovered(connector))
+        (repository / "docs" / "guide.md").unlink()
+        _commit(repository, "drop the guide")
+
+        assert [identity async for identity in connector.reconcile()] == ["/"]
+    finally:
+        await connector.teardown()

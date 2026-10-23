@@ -54,6 +54,7 @@ from manicule.storage.engine import (
 if TYPE_CHECKING:
     from collections.abc import Coroutine, Iterator, Sequence
 
+    from sqlalchemy import ColumnElement
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
@@ -576,6 +577,12 @@ class BlobStore:
                     "size_bytes": stored.size_bytes,
                     "stored_bytes": stored.stored_bytes,
                     "compression": stored.compression,
+                    # Writing identical bytes again is a write. The age floor on collection
+                    # (``collect_garbage(min_age_s=...)``) protects a blob a publication is about
+                    # to reference, and without this refresh a re-ingest of bytes an earlier
+                    # document orphaned would find the old row already past the floor and
+                    # unreferenced — collectable in the window before the new document commits.
+                    "created_at": datetime.now(UTC),
                 },
             )
         )
@@ -1807,11 +1814,23 @@ class BlobStore:
             if descriptor is not None:
                 os.close(descriptor)
 
-    async def collect_garbage(self) -> Sequence[str]:
+    async def collect_garbage(self, *, min_age_s: float = 0.0) -> Sequence[str]:
         """Delete blobs nothing references. Mark and sweep, never refcounts.
 
         A refcount is a number that has to survive every crash in every path that touches it,
         and when it is wrong it is wrong silently in both directions.
+
+        **``min_age_s`` is for a collector that runs beside ingest.** A blob is written before
+        the document that references it commits, and on the direct path (``manicule.ingest``
+        retaining bytes it was handed rather than ones an acquisition journal staged) nothing
+        else names it in between — through parsing and embedding, which can take a while. A
+        pass that finds it in that window and sees no reference would delete bytes a publication
+        is about to point at. Skipping unreferenced blobs younger than ``min_age_s`` closes
+        that: the scheduled sweep passes a day, and the default of zero keeps the immediate
+        collection that callers with no concurrent writer — tests, an offline repair — want.
+        Intents already in progress are finished regardless of age. The age is the descriptor's
+        ``created_at``, which a later ``put`` of identical bytes refreshes, so the window is
+        measured from the latest write of the bytes and not the first.
 
         The descriptor remains capacity-accounting state while the owned file is unlinked and
         its parent directory fsynced. Only then is the row removed. A failed deletion therefore
@@ -1826,6 +1845,11 @@ class BlobStore:
             return []
         if not await asyncio.to_thread(self._gc_root_is_scannable):
             return []
+        old_enough: list[ColumnElement[bool]] = []
+        if min_age_s > 0:
+            old_enough.append(
+                models.Blob.created_at < datetime.now(UTC) - timedelta(seconds=min_age_s)
+            )
         async with self._sessions() as session:
             referenced_documents = select(models.Document.original_ref).where(
                 models.Document.original_ref.is_not(None)
@@ -1850,7 +1874,8 @@ class BlobStore:
                                     referenced_acquisitions,
                                     referenced_markers,
                                 )
-                            )
+                            ),
+                            *old_enough,
                         )
                     )
                 )

@@ -78,6 +78,8 @@ MUTATIONS: tuple[str, ...] = (
     "document_delete",
     "document_reindex",
     "connector_sync",
+    "connector_reconcile",
+    "connector_reconcile_resolve",
     "config_set",
     "workspace_switch",
     "plugin_add",

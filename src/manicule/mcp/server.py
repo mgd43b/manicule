@@ -1,4 +1,4 @@
-"""The MCP server: forty-five tools, each a few lines over the application service.
+"""The MCP server: forty-seven tools, each a few lines over the application service.
 
 FastMCP derives every tool's schema from the function's type hints and its description from
 the docstring, so what an assistant sees is what the signature says. There is no protocol
@@ -44,7 +44,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -235,6 +235,8 @@ TOOL_NAMES: tuple[str, ...] = (
     "rebuild_plan",
     "rebuild_status",
     "connector_sync",
+    "connector_reconcile",
+    "connector_reconcile_resolve",
     "config_get",
     "config_set",
     "workspace_list",
@@ -443,7 +445,7 @@ class _Registrar:
 
         :data:`NETWORK_AUTHORING` is the one way past that test, and it is a membership check
         against a named set rather than a flag on a registration. A tool that carried its own
-        "but I am allowed on a socket" argument would put the decision at forty-five call sites;
+        "but I am allowed on a socket" argument would put the decision at forty-seven call sites;
         here the whole of it is one frozenset a reader can hold in their head and a test can
         assert as a set operation.
         """
@@ -1319,6 +1321,41 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             lambda: service.connector_sync(name, limit=limit, acquire_only=acquire_only),
         )
 
+    @register.tool(hints(reads=False, removes=True, repeatable=True, reaches_out=True))
+    async def connector_reconcile(name: str, dry_run: bool = False) -> dict[str, Any]:
+        """Find documents that have left a connector's source, and soft-delete them.
+
+        Incremental sync cannot see a deletion, so this asks the source which ids it still has
+        and soft-deletes the live documents it does not (restorable inside the grace period).
+        A pass that would delete more than the configured ceiling is refused and recorded as a
+        proposal: answer it with ``connector_reconcile_resolve``. The result is counts only.
+
+        Args:
+            name: The instance name from the ``connectors`` section of configuration.
+            dry_run: Enumerate and report what would be deleted, deleting nothing. A dry run
+                cannot be applied later; applying enumerates the source again.
+        """
+        return await dispatch(
+            "connector_reconcile",
+            lambda: service.connector_reconcile(name, dry_run=dry_run),
+        )
+
+    @register.tool(hints(reads=False, removes=True, repeatable=True, reaches_out=False))
+    async def connector_reconcile_resolve(
+        name: str, action: Literal["confirm", "discard"]
+    ) -> dict[str, Any]:
+        """Confirm or discard the deletion proposal that a reconciliation pass was refused.
+
+        Args:
+            name: The instance name from the ``connectors`` section of configuration.
+            action: ``confirm`` soft-deletes exactly the documents the proposal named, without
+                enumerating the source again. ``discard`` deletes nothing and clears it.
+        """
+        return await dispatch(
+            "connector_reconcile_resolve",
+            lambda: service.connector_reconcile_resolve(name, confirm=action == "confirm"),
+        )
+
     # --- configuration --------------------------------------------------------------------
 
     @register.tool(READS)
@@ -1451,6 +1488,8 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             rebuild_plan,
             rebuild_status,
             connector_sync,
+            connector_reconcile,
+            connector_reconcile_resolve,
             config_get,
             config_set,
             workspace_list,

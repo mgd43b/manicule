@@ -77,6 +77,7 @@ from manicule.generation.ports import (
 from manicule.generation.prompt import ChatMessage
 from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.ingest.pipeline import RunReport, Watching
+from manicule.ingest.reconcile import Reconciliation, ReconciliationStanding
 from manicule.ingest.reembed import (
     CorpusSnapshot,
     LivePublication,
@@ -310,9 +311,13 @@ class FakeStore:
     async def index_fingerprints(self) -> IndexFingerprints:
         return self.index_fingerprints_
 
+    connector_state: dict[str, dict[str, object]] = field(
+        default_factory=dict[str, dict[str, object]]
+    )
+    """What each connector's stored metadata holds, for the checks and listings that read it."""
+
     async def connector_metadata(self, connector: str) -> Mapping[str, object]:
-        del connector
-        return {}
+        return self.connector_state.get(connector, {})
 
 
 class LeakyStore(FakeStore):
@@ -1045,6 +1050,68 @@ class FakeIngestion:
             msg = f"no connector named {name!r} in configuration"
             raise UnknownComponentError(msg)
         return built
+
+    reconcile_result: Reconciliation | None = None
+    """What the next pass reports, or ``None`` for a clean pass over a connector with ids to hide.
+
+    The default names source ids on purpose: the port is allowed to carry them, the service is
+    not allowed to pass them on, and a test of that needs ids there to leak.
+    """
+    reconcile_failure: Exception | None = None
+    reconcile_calls: list[tuple[str, bool, float]] = field(
+        default_factory=list[tuple[str, bool, float]]
+    )
+    """``(connector, dry_run, max_delete_fraction)`` per pass asked for."""
+    resolve_result: Reconciliation | None = None
+    resolve_calls: list[tuple[str, bool]] = field(default_factory=list[tuple[str, bool]])
+    """``(connector, confirm)`` per proposal resolution asked for."""
+
+    eligibility_state: ReconciliationStanding | None = None
+    """What the fake tells an ``eligible`` test the connector's standing is, when one is given.
+
+    ``None`` means the real answer: eligible. A test sets it to the state another pass just left
+    behind, to show an automatic pass stepping aside after it queued for the guard.
+    """
+
+    async def reconcile(
+        self,
+        connector: str,
+        *,
+        dry_run: bool,
+        max_delete_fraction: float,
+        eligible: Callable[[ReconciliationStanding], bool] | None = None,
+    ) -> Reconciliation:
+        if (
+            eligible is not None
+            and self.eligibility_state is not None
+            and not eligible(self.eligibility_state)
+        ):
+            return Reconciliation(connector=connector, skipped=True)
+        self.reconcile_calls.append((connector, dry_run, max_delete_fraction))
+        if self.reconcile_failure is not None:
+            raise self.reconcile_failure
+        if self.reconcile_result is not None:
+            return self.reconcile_result
+        return Reconciliation(
+            connector=connector,
+            seen=11,
+            deleted=() if dry_run else ("secret-id-1", "secret-id-2"),
+            live_count=13,
+            missing_count=2,
+            applied_count=0 if dry_run else 2,
+            dry_run=dry_run,
+        )
+
+    async def resolve_proposal(self, connector: str, *, confirm: bool) -> Reconciliation:
+        self.resolve_calls.append((connector, confirm))
+        if self.resolve_result is not None:
+            return self.resolve_result
+        return Reconciliation(
+            connector=connector,
+            live_count=13,
+            missing_count=5,
+            applied_count=5 if confirm else 0,
+        )
 
     async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
         if self.snapshot is None or self.snapshot.connector != connector:

@@ -40,6 +40,8 @@ WRITE_TOOLS = frozenset(
     {
         "index_path",
         "connector_sync",
+        "connector_reconcile",
+        "connector_reconcile_resolve",
         "document_create",
         "document_delete",
         "document_reindex",

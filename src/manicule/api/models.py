@@ -12,6 +12,8 @@ would be a second opinion for the surfaces to disagree over.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from manicule.core.organization import CollectionRule
@@ -184,6 +186,18 @@ class SyncBody(Body):
     acquire_only: bool = False
 
 
+class ReconcileBody(Body):
+    """A request to find the documents one connector's source no longer has."""
+
+    dry_run: bool = False
+
+
+class ResolveProposalBody(Body):
+    """The answer to a deletion proposal the ceiling refused."""
+
+    action: Literal["confirm", "discard"]
+
+
 __all__ = [
     "AskBody",
     "Body",
@@ -193,6 +207,8 @@ __all__ = [
     "DocumentBody",
     "FeedbackBody",
     "KeyBody",
+    "ReconcileBody",
+    "ResolveProposalBody",
     "ShareBody",
     "SyncBody",
     "TagBody",

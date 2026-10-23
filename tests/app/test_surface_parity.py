@@ -118,12 +118,12 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_forty_five_tools(service: ApplicationService) -> None:
-    """Forty-five, named, and matching the declared surface."""
+def test_the_server_offers_exactly_forty_seven_tools(service: ApplicationService) -> None:
+    """Forty-seven, named, and matching the declared surface."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 45
+    assert len(offered) == 47
 
 
 def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:
@@ -496,6 +496,31 @@ PAIRS: tuple[tuple[str, dict[str, Any], list[str], HttpCall, WebPage], ...] = (
         ["snapshot-delete", "snapshot-run"],
         ("GET", "/api/v1/admin/lifecycle/snapshots/snapshot-run", {}),
         ("/ui/lifecycle?run_id=snapshot-run", ("operation",)),
+    ),
+    (
+        # A source that is not configured, so all three surfaces refuse it the same way. What
+        # is being compared is the failure envelope — the ingest port behind this service is a
+        # fake, and the counts a real pass reports are asserted in `test_reconcile.py`.
+        "connector_reconcile",
+        {"name": "missing-source", "dry_run": True},
+        ["connector", "reconcile", "missing-source", "--dry-run"],
+        (
+            "POST",
+            "/api/v1/admin/connectors/missing-source/reconcile",
+            {"json": {"dry_run": True}},
+        ),
+        None,
+    ),
+    (
+        "connector_reconcile_resolve",
+        {"name": "missing-source", "action": "discard"},
+        ["connector", "reconcile", "missing-source", "--discard"],
+        (
+            "POST",
+            "/api/v1/admin/connectors/missing-source/reconcile/resolve",
+            {"json": {"action": "discard"}},
+        ),
+        None,
     ),
     (
         "collection_list",

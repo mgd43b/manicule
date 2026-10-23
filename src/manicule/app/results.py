@@ -249,8 +249,32 @@ class Envelope(BaseModel):
         if self.op == "document_create":
             self._retained_authoring()
             return self
+        if self.op in {"connector_reconcile", "connector_reconcile_resolve"}:
+            self._retained_reconciliation()
+            return self
         self._retained_ingest()
         return self
+
+    def _retained_reconciliation(self) -> None:
+        """A reconciliation that did not conclude keeps its counts, and only those.
+
+        A refused pass has recorded a proposal and a blocked or failed one has recorded nothing,
+        and in every case the counts are what the operator's next move depends on. They are
+        counts: no source id, title or URI is in this payload to retain.
+
+        Raises:
+            ValueError: The data is not a ``ConnectorReconciled`` whose outcome is one of the
+                unsuccessful ones, or its own reason does not match the error beside it.
+        """
+        partial = ConnectorReconciled.model_validate(self.data)
+        if partial.outcome not in UNSUCCESSFUL_RECONCILIATIONS or (
+            partial.error_type != (self.error.type if self.error else "")
+        ):
+            msg = (
+                "a failed reconciliation envelope may retain data only for an unsuccessful "
+                "ConnectorReconciled whose error type matches error"
+            )
+            raise ValueError(msg)
 
     def _retained_ingest(self) -> None:
         """An incomplete ingest keeps its counters, and only then.
@@ -318,13 +342,14 @@ def failed(
     workspace: str,
     error: ErrorInfo,
     *,
-    payload: IngestReport | DocumentCreated | None = None,
+    payload: IngestReport | DocumentCreated | ConnectorReconciled | None = None,
 ) -> Envelope:
     """Wrap a failure, retaining a partial result when the operation produced one.
 
-    Two payload types reach here, and both are operations that did part of what was asked and
+    Three payload types reach here, and each is an operation that did part of what was asked and
     must say which part. An ingest run that has to be retried names its watermark; an authored
-    document that could not be indexed names the file it left on disk. In both cases the
+    document that could not be indexed names the file it left on disk; a reconciliation the
+    ceiling refused names how many documents it would have deleted. In every case the
     alternative — an error with no data — would leave a caller unable to find the work that
     was in fact done.
     """
@@ -2147,6 +2172,57 @@ class SignedOut(Payload):
 type IngestOutcome = Literal["complete", "bounded", "incomplete"]
 
 
+type ReconcileAction = Literal["reconcile", "dry_run", "confirm", "discard"]
+
+type ReconcileOutcome = Literal[
+    "applied",
+    "previewed",
+    "proposed",
+    "blocked",
+    "failed",
+    "confirmed",
+    "discarded",
+    "none_pending",
+]
+"""How one reconciliation concluded.
+
+``applied``: the diff was applied, possibly deleting nothing. ``previewed``: a dry run, which
+consumed its inventory and changed nothing. ``proposed``: the deletion ceiling refused the diff
+and recorded it for an operator. ``blocked``: something else held the data, so nothing ran.
+``failed``: the source could not be enumerated completely, so nothing was deleted. ``confirmed``
+and ``discarded``: an operator answered a proposal. ``none_pending``: they answered one that was
+not there.
+"""
+
+UNSUCCESSFUL_RECONCILIATIONS = frozenset({"proposed", "blocked", "failed", "none_pending"})
+
+
+class ConnectorReconciled(Payload):
+    """What one reconciliation, confirmation or discard did, as counts.
+
+    Never a source id, title or URI: this payload is returned over every surface and recorded by
+    the scheduler, and a list of what was deleted from a mailbox is itself the thing a deletion
+    exists to get rid of. ``error_type`` names the class of failure, never its message, because a
+    source client's message can carry the URL it was asking for.
+    """
+
+    connector: str
+    action: ReconcileAction
+    outcome: ReconcileOutcome
+    seen: int = Field(default=0, ge=0, description="Ids the source reported it still has.")
+    live: int = Field(default=0, ge=0, description="Live documents compared against them.")
+    missing: int = Field(default=0, ge=0, description="Live documents the source no longer has.")
+    deleted: int = Field(
+        default=0, ge=0, description="Documents soft-deleted, derived members included."
+    )
+    proposal_pending: bool = Field(
+        default=False,
+        description="Whether a refused deletion now waits for `connector reconcile "
+        "--confirm` or `--discard`.",
+    )
+    error_type: str = Field(default="", description="The failure class, empty unless one failed.")
+
+
 class IngestReport(Payload):
     """What one ingest run did. Shared by ``index_path``, ``connector_sync`` and ``import``.
 
@@ -2204,6 +2280,11 @@ class IngestReport(Payload):
     elapsed_ms: int = Field(default=0, ge=0)
     lifecycle: LifecycleProgress = Field(
         default_factory=lambda: LifecycleProgress(phase="complete", outcome="complete")
+    )
+    reconciliation: ConnectorReconciled | None = Field(
+        default=None,
+        description="The deletion-detection pass that followed this run, when it was a full "
+        "sync of a connector (`docs/ingest.md` §11). None when no pass was due to follow.",
     )
 
 
@@ -2533,7 +2614,14 @@ class VectorSweepReport(Payload):
         default=0,
         ge=0,
         description="Soft-deleted documents whose grace period expired and whose chunks were "
-        "removed. Past this point a restore costs a re-parse from retained bytes.",
+        "removed and retained bytes released. Past this point a restore needs a re-sync "
+        "from the source.",
+    )
+    blobs_collected: int = Field(
+        default=0,
+        ge=0,
+        description="Retained blobs nothing references any more, deleted from disk by the "
+        "collection that ends the pass. A count: never a hash.",
     )
     blocked_by: str = Field(
         default="",
@@ -2585,8 +2673,8 @@ class Check(Payload):
     ``name`` is the **stable identifier**: ``configuration``, ``transport``, ``sign_in``,
     ``plugins``,
     ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
-    ``authoring``, ``collection-membership``, ``sessions``, ``gmail-credential``,
-    ``security_alerts``,
+    ``authoring``, ``collection-membership``, ``reconciliation-overdue``,
+    ``reconciliation-proposals``, ``sessions``, ``gmail-credential``, ``security_alerts``,
     ``document-identity``, ``document-content``, ``extractable-text``, ``wiki-provenance``,
     ``grammars``, ``vocabularies``, ``models``, and ``component:<kind>:<name>`` for anything
     already constructed. ``vector_backend`` is emitted too and had been missing from this list
@@ -2672,6 +2760,29 @@ class ConnectorSummary(Payload):
     last_watermark_advanced: bool | None = None
     last_lifecycle: LifecycleProgress | None = None
     full_inventory_authority: FullInventoryAuthority = ""
+    reconcile_interval_s: float | None = Field(
+        default=None,
+        description="Seconds between deletion-detection passes; the connector's own value "
+        "when configured, else ingest.reconcile_interval_s. None for a disabled connector, "
+        "which is never reconciled.",
+    )
+    last_reconciled_at: str | None = Field(
+        default=None, description="When a pass last completed cleanly; None if none has."
+    )
+    reconcile_overdue: bool = Field(
+        default=False,
+        description="Whether reconciliation is later than twice its interval. Said of an "
+        "enabled connector that holds documents and has no proposal waiting.",
+    )
+    reconcile_proposal_pending: bool = Field(
+        default=False, description="Whether a refused deletion waits for an operator."
+    )
+    reconcile_proposal_missing: int = Field(
+        default=0, ge=0, description="Documents the waiting proposal would soft-delete."
+    )
+    reconcile_proposal_live: int = Field(
+        default=0, ge=0, description="Live documents that proposal was measured against."
+    )
 
 
 class ConnectorList(Payload):
@@ -3117,6 +3228,7 @@ class SecurityAlertAcknowledged(Payload):
 __all__ = [
     "CONTRACT_VERSION",
     "DOCTOR_SCHEMA_VERSION",
+    "UNSUCCESSFUL_RECONCILIATIONS",
     "Anchored",
     "AnswerCitation",
     "AnswerResultPayload",
@@ -3140,6 +3252,7 @@ __all__ = [
     "ConfigChange",
     "ConfigValue",
     "ConnectorList",
+    "ConnectorReconciled",
     "ConnectorSummary",
     "ConversationDeleted",
     "ConversationList",
@@ -3181,6 +3294,8 @@ __all__ = [
     "PluginSummary",
     "QueryLogEntry",
     "QueryLogPage",
+    "ReconcileAction",
+    "ReconcileOutcome",
     "ReembedCleanupReport",
     "ReembedPlanReport",
     "ReembedRunReport",

@@ -19,7 +19,7 @@ import uuid
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import func, select
+from sqlalchemy import case, delete, func, select, update
 
 from manicule.core.content import Document, DocumentStatus
 from manicule.core.organization import (
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import datetime
 
+    from sqlalchemy import CursorResult
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from manicule.core.content import Metadata
@@ -45,12 +46,30 @@ if TYPE_CHECKING:
 DEFAULT_VERSION_BYTES_RETENTION_S = 30 * 24 * 3600.0
 """How long a superseded version's retained bytes are kept, by default.
 
-``docs/storage.md`` §7 sets the policy: the live document's bytes are kept for as long as the
-document exists, and a prior version's for a bounded window, because a chatty wiki otherwise
-grows the blob store without bound. It is a default rather than a configuration setting
-because nothing schedules the pass that would read one — blob collection
-(:meth:`manicule.storage.blobs.BlobStore.collect_garbage`) is likewise a verb with no
-scheduler — and a setting nothing reads is a promise nothing keeps.
+``docs/storage.md`` §7 sets the policy: the live document's bytes are kept until the document
+is purged from the trash, and a prior version's for a bounded window, because a chatty wiki
+otherwise grows the blob store without bound. It is a default rather than a configuration
+setting because nothing schedules the pass that would read one —
+:meth:`VersionsMixin.release_expired_versions` is reached by an operator, not a timer (blob
+collection, the pass that then deletes the files, *is* scheduled: ``docs/storage.md`` §8.2) —
+and a setting nothing reads is a promise nothing keeps.
+"""
+
+RESTORED_AFTER_PURGE_DETAIL = "restored from the trash after the sweep purged its content"
+"""The ``status_detail`` of a purged document that was brought back without its content.
+
+Named because the service reads it: a purged row's ``original_omitted_reason`` is not on the
+:class:`~manicule.core.content.Document` a surface holds, but this detail is, and it is how a
+caller tells "the bytes were released" from "retention was off".
+"""
+
+RELEASED_AFTER_GRACE_REASON = "bytes released after the soft-delete grace period expired"
+"""The ``documents.original_omitted_reason`` :meth:`TrashMixin.purge_document` records.
+
+A constant, and compared exactly, because "the bytes were never kept" and "the bytes were kept
+and have since been released" are different facts that a bare ``NULL`` ``original_ref`` cannot
+tell apart, and the restore message and the citation resolution each say a different thing
+depending on which it is.
 """
 
 _VERSIONED_FIELDS = ("uri", "title", "media_type", "version_token", "content_hash", "status")
@@ -132,8 +151,7 @@ class VersionsMixin(WorkspaceScoped):
                     reason=(
                         f"document {document_id!r} is in the trash"
                         + (
-                            "; its content has been purged and restoring it costs a re-parse "
-                            "from retained bytes"
+                            f"; its content has been purged, and {_restore_cost(row)}"
                             if purged
                             else "; restoring it costs nothing while the grace period lasts"
                         )
@@ -277,6 +295,27 @@ class VersionsMixin(WorkspaceScoped):
         ).scalar_one_or_none()
 
 
+def _restore_cost(row: models.Document) -> str:
+    """What bringing a purged document back costs, from what its row says survived.
+
+    Three answers, because three different things leave ``original_ref`` unset or set on a
+    purged row. A reference still present is a purge from before the sweep released bytes (or
+    one the sweep has not yet reached), and the cheap re-parse is real. The released reason is
+    a purge that gave the bytes back, and only the source can supply them again. Anything else
+    is a document whose bytes were never retained, with ``original_omitted_reason`` saying why.
+    """
+    if row.original_ref is not None:
+        return "re-parse it from its retained bytes to serve it again"
+    if row.original_omitted_reason == RELEASED_AFTER_GRACE_REASON:
+        return (
+            "its retained bytes were released with it when the grace period ended, so only a "
+            "re-sync from the source can bring its content back"
+        )
+    return (
+        "its bytes were not retained, so only a re-sync from the source can bring its content back"
+    )
+
+
 class TrashMixin(WorkspaceScoped):
     """:class:`~manicule.core.protocols.TrashStore` over SQLite."""
 
@@ -297,6 +336,114 @@ class TrashMixin(WorkspaceScoped):
             row = await self._any_document(session, document_id)
             if row is not None and row.deleted_at is None:
                 row.deleted_at = utcnow()
+
+    async def purge_document(
+        self, document_id: str, *, reason: str, deleted_before: datetime | None = None
+    ) -> bool:
+        """Finish a soft delete: drop the content, release the retained bytes, mark it purged.
+
+        **One transaction, because the sweep cannot retry a half of it.** The selection of what
+        to purge (:meth:`~manicule.storage.docstore.SqliteDocStore.soft_deleted_before`) skips
+        ``deleted`` rows, so a crash between "flip the status" and "release the bytes" would
+        leave a purged document that pins its bytes forever and is never looked at again.
+        Everything below commits together or not at all.
+
+        **The check and the write are one statement.** The ``UPDATE`` carries the predicate —
+        still in the trash, not already purged, and, when ``deleted_before`` is given, still
+        deleted *before* that cutoff — and its row count is the answer. A restore that lands
+        between the sweep's selection and this call has cleared ``deleted_at``, matches
+        nothing, and wins: the document keeps its chunks, its status and its bytes. A restore
+        followed by a second delete inside that window restarts the clock, and the cutoff is
+        what keeps the sweep from purging it with no grace period at all.
+
+        **What it does, when it matches:**
+
+        - sets ``status = 'deleted'`` with ``reason`` as the detail, and clears ``failed_stage``
+          as the schema's iff constraint requires;
+        - deletes the document's chunks, which writes their vector tombstones in the same
+          transaction (the trigger in ``docs/storage.md`` §8.2), so a crash after the commit
+          leaves the vectors to the next sweep rather than orphaned;
+        - sets ``documents.original_ref`` to ``NULL`` and, only if there was a reference, sets
+          ``original_omitted_reason`` to :data:`RELEASED_AFTER_GRACE_REASON` — a document whose
+          bytes were never kept keeps the reason it already had;
+        - clears ``original_ref`` on every version of the document, stamping
+          ``bytes_released_at`` on the row and in ``changes`` — the two places
+          :meth:`VersionsMixin.release_expired_versions` and the source-history release each
+          record it.
+
+        The blobs themselves are not touched. Releasing the references is what makes them
+        unreferenced, and :meth:`~manicule.storage.blobs.BlobStore.collect_garbage` deletes
+        them — once the acquisition journal's own references to them have aged out as well.
+
+        Not for ``reset_derived``'s documents, which are also ``deleted`` with ``deleted_at``
+        set and whose retained bytes a rebuild needs: the predicate on ``status`` excludes them.
+
+        Args:
+            document_id: The document to purge.
+            reason: What to record in ``status_detail``.
+            deleted_before: Purge only if the document was soft-deleted before this instant.
+
+        Returns:
+            ``True`` if the document was purged. ``False`` if it was restored, already purged,
+            or not found — in every case there is nothing more for the caller to do.
+        """
+        predicates = [
+            models.Document.id == document_id,
+            models.Document.workspace_id == self._workspace_id,
+            models.Document.deleted_at.is_not(None),
+            models.Document.status != DocumentStatus.DELETED,
+        ]
+        if deleted_before is not None:
+            predicates.append(models.Document.deleted_at < deleted_before)
+        async with self._sessions.begin() as session:
+            marked = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(models.Document)
+                    .where(*predicates)
+                    .values(
+                        status=DocumentStatus.DELETED,
+                        status_detail=reason,
+                        failed_stage=None,
+                        # Evaluated against the row as it was, so the reference that is about to be
+                        # cleared is what decides whether there is a release to record.
+                        original_omitted_reason=case(
+                            (
+                                models.Document.original_ref.is_not(None),
+                                RELEASED_AFTER_GRACE_REASON,
+                            ),
+                            else_=models.Document.original_omitted_reason,
+                        ),
+                        original_ref=None,
+                    )
+                    .execution_options(synchronize_session=False)
+                ),
+            )
+            if marked.rowcount != 1:
+                return False
+            await session.execute(
+                delete(models.Chunk).where(models.Chunk.document_id == document_id)
+            )
+            released_at = utcnow()
+            versions = (
+                (
+                    await session.execute(
+                        select(models.DocumentVersion).where(
+                            models.DocumentVersion.document_id == document_id,
+                            models.DocumentVersion.original_ref.is_not(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for version in versions:
+                changes: dict[str, Any] = dict(cast("Any", version.changes) or {})
+                changes["bytes_released_at"] = released_at.isoformat()
+                version.changes = cast("Any", changes)
+                version.original_ref = None
+                version.bytes_released_at = released_at
+        return True
 
     async def restore_document(self, document_id: str) -> Restoration:
         """Take a document out of the trash, and say what that achieved."""
@@ -348,20 +495,14 @@ class TrashMixin(WorkspaceScoped):
             # is exactly what that state means elsewhere: nothing has claimed it, retrieval does
             # not serve it, and a repair pass selects it.
             row.status = DocumentStatus.PENDING
-            row.status_detail = "restored from the trash after the sweep purged its content"
+            row.status_detail = RESTORED_AFTER_PURGE_DETAIL
             row.failed_stage = None
-            retained = row.original_ref is not None
             return Restoration(
                 document_id=document_id,
                 restored=True,
                 needs_reparse=True,
                 reason=(
-                    "restored after the grace period, so it holds no chunks. Re-parse it from "
-                    "its retained bytes to serve it again"
-                    if retained
-                    else "restored after the grace period, so it holds no chunks — and its "
-                    "bytes were not retained, so only a re-sync from the source can bring its "
-                    "content back"
+                    f"restored after the grace period, so it holds no chunks: {_restore_cost(row)}"
                 ),
             )
 

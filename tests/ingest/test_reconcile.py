@@ -7,11 +7,15 @@ from datetime import UTC, datetime, timedelta
 from manicule.core.content import DocumentStatus
 from manicule.core.ids import document_id
 from manicule.ingest.reconcile import (
+    LAST_DISCARDED_KEY,
     LAST_RECONCILE_KEY,
     PROPOSED_DELETION_KEY,
     confirm_proposed_deletion,
+    discard_proposed_deletion,
     due,
+    last_attempt,
     reconcile,
+    standing,
 )
 from tests.fakes import make_document
 from tests.ingest import fakes
@@ -199,3 +203,157 @@ def test_a_connector_reconciled_before_the_interval_is_due() -> None:
 def test_an_unreadable_timestamp_is_treated_as_overdue() -> None:
     """Failing closed: an unreadable record must not silently disable deletion detection."""
     assert due({LAST_RECONCILE_KEY: "not a timestamp"}, interval_s=1)
+
+
+async def test_a_partial_enumeration_names_the_failure_class_for_the_surfaces_to_report() -> None:
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", [f"doc-{n}" for n in range(20)])
+    connector = fakes.DictConnector({f"doc-{n}": "text" for n in range(20)})
+    connector.reconcile_fails_after = 3
+
+    result = await reconcile(connector, store)
+
+    assert (result.error_type, result.deleted) == ("RuntimeError", ())
+
+
+async def test_a_refused_proposal_can_be_discarded_and_deletes_nothing() -> None:
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", [f"doc-{n}" for n in range(10)])
+    connector = fakes.DictConnector({f"doc-{n}": "text" for n in range(10)})
+    connector.hidden = {f"doc-{n}" for n in range(5)}
+    await reconcile(connector, store, max_delete_fraction=0.1)
+
+    result = await discard_proposed_deletion("memory", store, now=NOW)
+
+    assert (result.missing_count, result.live_count, result.applied_count) == (5, 10, 0)
+    assert store.deleted_at == {}
+    metadata = store.connector_meta["memory"]
+    assert PROPOSED_DELETION_KEY not in metadata
+    assert metadata[LAST_DISCARDED_KEY] == NOW.isoformat()
+    assert LAST_RECONCILE_KEY not in metadata, "a discard is not a clean pass"
+    assert (await discard_proposed_deletion("memory", store, now=NOW)).refused
+
+
+NOW = datetime(2026, 10, 1, 12, tzinfo=UTC)
+
+
+def test_a_connector_with_a_proposal_waiting_is_not_due_however_old_it_is() -> None:
+    """A newer inventory would take the proposal from the person answering it."""
+    metadata = {
+        LAST_RECONCILE_KEY: (NOW - timedelta(days=90)).isoformat(),
+        PROPOSED_DELETION_KEY: {"live": 10, "missing": 6},
+    }
+
+    assert not due(metadata, interval_s=3600, now=NOW)
+
+
+def test_a_discard_restarts_the_interval_without_counting_as_a_clean_pass() -> None:
+    metadata = {
+        LAST_RECONCILE_KEY: (NOW - timedelta(days=30)).isoformat(),
+        LAST_DISCARDED_KEY: (NOW - timedelta(minutes=5)).isoformat(),
+    }
+
+    assert not due(metadata, interval_s=3600, now=NOW)
+    assert last_attempt(metadata) == NOW - timedelta(minutes=5)
+    assert standing(metadata, live_documents=1).last_clean_at == NOW - timedelta(days=30)
+
+
+def test_overdue_allows_a_pass_in_progress_some_slack() -> None:
+    metadata = {LAST_RECONCILE_KEY: (NOW - timedelta(seconds=5000)).isoformat()}
+    state = standing(metadata, live_documents=4)
+
+    assert state.due(interval_s=3600, now=NOW)
+    assert not state.overdue(interval_s=3600, now=NOW), "late is not yet overdue"
+    assert state.overdue(interval_s=2000, now=NOW)
+
+
+def test_a_connector_with_no_documents_is_neither_due_nor_overdue() -> None:
+    state = standing({}, live_documents=0)
+
+    assert not state.due(interval_s=60, now=NOW)
+    assert not state.overdue(interval_s=60, now=NOW)
+
+
+def test_standing_reads_counts_from_either_kind_of_proposal() -> None:
+    durable = standing(
+        {PROPOSED_DELETION_KEY: {"live": 10, "missing": 6, "recorded_at": NOW.isoformat()}},
+        live_documents=10,
+    )
+    in_memory = standing(
+        {PROPOSED_DELETION_KEY: {"live": 10, "source_ids": ["a", "b", "c"]}}, live_documents=10
+    )
+
+    assert (durable.proposal_pending, durable.proposal_missing, durable.proposal_live) == (
+        True,
+        6,
+        10,
+    )
+    assert durable.proposal_recorded_at == NOW
+    assert (in_memory.proposal_missing, in_memory.proposal_live) == (3, 10)
+
+
+def test_standing_survives_a_malformed_record() -> None:
+    state = standing(
+        {LAST_RECONCILE_KEY: "not a time", PROPOSED_DELETION_KEY: {"live": "x"}}, live_documents=2
+    )
+
+    assert state.last_clean_at is None
+    assert state.proposal_pending is True
+    assert (state.proposal_missing, state.proposal_live) == (0, 0)
+
+
+def _window(reason: str):  # noqa: ANN202 - a test double for the production context manager
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    entered: list[str] = []
+
+    @asynccontextmanager
+    async def window():  # noqa: ANN202
+        entered.append("entered")
+        yield reason
+
+    return window, entered
+
+
+async def test_a_pass_declines_and_deletes_nothing_while_something_holds_the_data() -> None:
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", [f"doc-{n}" for n in range(20)])
+    connector = fakes.DictConnector({f"doc-{n}": "text" for n in range(20)})
+    connector.hidden = {"doc-7"}
+    held, entered = _window("a backup is running")
+
+    result = await reconcile(connector, store, window=held)
+
+    assert result.blocked == "a backup is running"
+    assert not result.clean
+    assert (result.deleted, result.missing_count) == ((), 1)
+    assert store.deleted_at == {}
+    assert LAST_RECONCILE_KEY not in store.connector_meta.get("memory", {})
+    assert entered == ["entered"]
+
+
+async def test_a_pass_proceeds_when_the_window_is_open() -> None:
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", [f"doc-{n}" for n in range(20)])
+    connector = fakes.DictConnector({f"doc-{n}": "text" for n in range(20)})
+    connector.hidden = {"doc-7"}
+    held, _ = _window("")
+
+    result = await reconcile(connector, store, window=held)
+
+    assert result.deleted == ("doc-7",)
+
+
+async def test_a_dry_run_and_a_clean_pass_do_not_need_the_window() -> None:
+    """Neither removes anything, so a backup never has to wait for either."""
+    store = fakes.MemoryIngestStore()
+    _indexed(store, "memory", [f"doc-{n}" for n in range(20)])
+    connector = fakes.DictConnector({f"doc-{n}": "text" for n in range(20)})
+    held, entered = _window("a backup is running")
+
+    preview = await reconcile(connector, store, dry_run=True, window=held)
+    nothing_missing = await reconcile(connector, store, window=held)
+
+    assert preview.dry_run
+    assert nothing_missing.clean
+    assert entered == []

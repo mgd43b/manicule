@@ -46,7 +46,7 @@ from manicule.storage.config import DOC_STORE_NAME, VECTOR_STORE_NAME
 from tests.ingest import fakes
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 
 STALE_INSTALL = (
     "an entry point declared in pyproject.toml is missing from the installed distribution. "
@@ -2144,3 +2144,116 @@ async def test_a_forced_run_that_stops_at_the_limit_says_so() -> None:
     )
     assert whole.limited is False
     assert whole.enumeration_completed is True, "an unlimited run still reaches the end"
+
+
+# --- the backup lock, from the runtime's side ---------------------------------------------------
+
+
+async def test_the_maintenance_window_yields_empty_when_held_and_a_reason_when_a_backup_runs(
+    runtime: Runtime,
+) -> None:
+    """The contract the deletion-detection pass relies on, both ways round."""
+    from manicule.storage.backup_lock import (  # noqa: PLC0415
+        MaintenanceBusyError,
+        MaintenanceHold,
+        backup_lock,
+    )
+
+    data_dir = runtime.settings.data_dir
+    async with runtime.maintenance_window() as blocked:
+        assert blocked == ""
+        probe = MaintenanceHold(data_dir)
+        assert probe.acquire() == "", "windows are shared; they do not exclude each other"
+        probe.release()
+        with pytest.raises(MaintenanceBusyError, match="maintenance pass"):
+            async with backup_lock(data_dir, wait_s=0.1, poll_s=0.02):
+                pytest.fail("a backup got in while the window was held")
+
+    async with backup_lock(data_dir, wait_s=0.0), runtime.maintenance_window() as blocked:
+        assert "backup is running" in blocked
+
+    async with runtime.maintenance_window() as blocked:
+        assert blocked == "", "and it is released on exit, however the last holder left"
+
+
+async def test_the_scheduled_sweep_declines_while_a_backup_runs_and_collects_blobs_after(
+    runtime: Runtime,
+) -> None:
+    """Through the runtime, with the real stores: the gate, the hold and the collection.
+
+    The blob is unreferenced and old, which is what a purged document's bytes look like once
+    nothing names them; the first pass is made while the lock is held exclusively and must
+    neither run nor delete it.
+    """
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from sqlalchemy import update  # noqa: PLC0415
+
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.backup_lock import backup_lock  # noqa: PLC0415
+    from manicule.storage.blobs import BlobStore  # noqa: PLC0415
+    from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+    await runtime.documents()
+    blobs = await runtime.blobs()
+    assert isinstance(blobs, BlobStore)
+    stored = await blobs.retain(b"bytes nothing references any more", "text/plain")
+    assert stored.ref is not None
+    fresh = await blobs.retain(b"bytes a publication is about to reference", "text/plain")
+    assert fresh.ref is not None
+    async with session_factory(runtime.require_engine()).begin() as session:
+        await session.execute(
+            update(models.Blob)
+            .where(models.Blob.hash == stored.ref)
+            .values(created_at=datetime.now(UTC) - timedelta(days=3))
+        )
+    ingestion = _Ingestion(runtime)
+
+    async with backup_lock(runtime.settings.data_dir, wait_s=0.0):
+        declined = await ingestion.sweep_vectors(batch=10, soft_delete_grace_s=3600.0)
+    assert not declined.ran
+    assert "backup" in declined.blocked_by
+    assert blobs.path_for(stored.ref).exists(), "a declined pass deletes nothing"
+
+    ran = await ingestion.sweep_vectors(batch=10, soft_delete_grace_s=3600.0)
+    assert ran.ran
+    assert ran.blobs_collected == 1, "only the old blob: the fresh one is inside the age floor"
+    assert not blobs.path_for(stored.ref).exists()
+    assert blobs.path_for(fresh.ref).exists()
+
+
+async def test_the_scheduled_sweep_holds_the_backup_lock_until_its_collection_is_done(
+    runtime: Runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hold spans the whole pass, not a probe at its start.
+
+    A check that took the lock and dropped it would still pass the test above, and would leave a
+    window in which a backup starts halfway through a purge. Observed from inside the pass, at
+    its last step — the blob collection, the step that deletes files.
+    """
+    from manicule.storage.backup_lock import (  # noqa: PLC0415
+        MaintenanceBusyError,
+        backup_lock,
+    )
+    from manicule.storage.blobs import BlobStore  # noqa: PLC0415
+
+    await runtime.documents()
+    refused_during_collection: list[bool] = []
+    original = BlobStore.collect_garbage
+
+    async def observing(self: BlobStore, *, min_age_s: float = 0.0) -> Sequence[str]:
+        try:
+            async with backup_lock(runtime.settings.data_dir, wait_s=0.0):
+                refused_during_collection.append(False)
+        except MaintenanceBusyError:
+            refused_during_collection.append(True)
+        return await original(self, min_age_s=min_age_s)
+
+    monkeypatch.setattr(BlobStore, "collect_garbage", observing)
+
+    outcome = await _Ingestion(runtime).sweep_vectors(batch=10, soft_delete_grace_s=3600.0)
+
+    assert outcome.ran
+    assert refused_during_collection == [True], "a backup could have started mid-collection"
+    async with backup_lock(runtime.settings.data_dir, wait_s=0.0):
+        pass  # and the hold was given back when the pass ended

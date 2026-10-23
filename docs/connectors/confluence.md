@@ -1072,11 +1072,15 @@ exists. The reconciliation diff is the mechanism.
   **no `expand` parameter at all**; an earlier version of this line said `expand=` empty, which
   is a parameter that is not sent and would not be worth sending.
 
-**The connector's half is built; nothing schedules the pass yet.** `reconcile()` enumerates
-as this section says and the pipeline's diff is tested, but no command or schedule invokes it
-([`ingest.md`](../ingest.md) §11), so a page deleted in Confluence stays indexed until
-`manicule document delete` removes it. The offline snapshot connector (§12) has the same gap.
-Wiring the pass in is [#466](https://github.com/mgd43b/manicule/issues/466).
+**Both halves are built, and a served manicule runs the pass.** `reconcile()` enumerates as this
+section says, and the pipeline's diff is tested and scheduled ([`ingest.md`](../ingest.md) §11):
+every enabled connector is reconciled on `ingest.reconcile_interval_s` (default weekly) or its own
+`reconcile_interval_s`, and a completed full sync is followed by a pass, whether or not
+`schedule_s` is set. A page deleted in Confluence therefore leaves the search results at the
+next pass; `manicule connector reconcile NAME` runs the pass now, and `--dry-run` previews it. A pass
+that would delete more than `ingest.reconcile_max_delete_fraction` of the connector's live
+documents is refused and waits for `--confirm` or `--discard`. The offline snapshot connector
+(§12) is reconciled the same way.
 
 **Attachments are reconciled with pages**, because they are enumerated with pages (§2). A
 document the pass omits is a document the pipeline deletes, so "attachments are handled

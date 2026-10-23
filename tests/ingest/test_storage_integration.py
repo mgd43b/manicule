@@ -69,7 +69,7 @@ from manicule.ingest.pipeline import IngestPipeline, RunReport, Watching
 from manicule.ingest.rebuild import build_offline_rebuilder
 from manicule.ingest.recovery import requeue_interrupted
 from manicule.ingest.reembed import ReembedState, resume_reembed, start_reembed
-from manicule.ingest.reindex import re_parse, reindex_document
+from manicule.ingest.reindex import NO_RETAINED_BYTES, re_parse, reindex_document
 from manicule.ingest.sweeps import sweep_vectors
 from manicule.ingest.workers import InProcessRunner
 from manicule.parsers.chain import ParserChain
@@ -6511,14 +6511,14 @@ async def test_the_blob_store_speaks_the_retention_vocabulary(
     assert refused.omitted_reason is not None
 
 
-async def test_a_purged_document_comes_back_with_its_citations_intact(
+async def test_a_document_restored_inside_its_grace_period_keeps_its_citations_intact(
     store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
 ) -> None:
-    """Delete, purge, restore, reindex — the whole loop, on the real stores.
+    """Delete, sweep inside the grace period, restore, reindex — on the real stores.
 
-    This is the claim the trash rests on. Inside the grace period a restore is free; outside
-    it the sweep has taken the chunks and the vectors, and the way back is a single-document
-    re-parse from retained bytes — rung 3, no network, and the source is never consulted.
+    Inside the grace period a restore is free: the sweep takes nothing, the chunks and vectors
+    are still there, and the retained bytes are still referenced, so the single-document
+    re-parse that follows (rung 3, no network, the source never consulted) is available too.
 
     The assertion that matters is the last one. ``chunks.id`` is derived from
     ``(document_id, position, text)``, so re-parsing the same retained bytes reproduces the
@@ -6536,15 +6536,18 @@ async def test_a_purged_document_comes_back_with_its_citations_intact(
     assert document is not None
     before = [chunk.id for chunk in await store.document_chunks(document.id)]
     assert before, "the fixture must produce chunks, or this proves nothing about keeping them"
+    stored_vectors = await vectors.count()
+    assert stored_vectors
 
     await store.soft_delete_document(document.id)
-    swept = await sweep_vectors(store, vectors, soft_delete_grace_s=-1.0)
-    assert swept.documents_purged == 1
-    assert await vectors.count() == 0
+    swept = await sweep_vectors(store, vectors, blobs=blobs, blob_min_age_s=0.0)
+    assert swept.documents_purged == 0, "the grace period has not passed"
+    assert swept.blobs_collected == 0
+    assert await vectors.count() == stored_vectors
 
     restoration = await store.restore_document(document.id)
     assert restoration.restored
-    assert restoration.needs_reparse, "the sweep took the content, so the row came back empty"
+    assert not restoration.needs_reparse, "inside the grace period nothing was taken"
 
     report = await reindex_document(document.id, store=store, pipeline=pipeline, blobs=blobs)
     assert report.unrepairable == []
@@ -6558,6 +6561,111 @@ async def test_a_purged_document_comes_back_with_its_citations_intact(
     served = await store.get_document(document.id)
     assert served is not None
     assert served.status is DocumentStatus.INDEXED
+
+
+async def test_a_purged_document_has_given_its_bytes_back_and_reindex_says_so(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Delete, purge, restore, reindex — and the way back is the source, not the retained bytes.
+
+    The purge releases the raw bytes along with the chunks: the reference on the document is
+    cleared in the same transaction as the status flip, and the collection that ends the sweep
+    deletes the file. A restore after that cannot re-parse, and has to say so rather than hand
+    back a document that a repair will then fail on without explanation.
+    """
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    blobs = BlobStore(engine, data_dir)
+    pipeline = _pipeline(store, vectors, blobs)
+    await pipeline.run(fakes.DictConnector({"a": "alpha\nbeta"}))
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    retained = document.original_ref
+    assert retained is not None
+    assert blobs.path_for(retained.removeprefix("blob:sha256:")).exists()
+
+    await store.soft_delete_document(document.id)
+    swept = await sweep_vectors(
+        store, vectors, soft_delete_grace_s=-1.0, blobs=blobs, blob_min_age_s=0.0
+    )
+    assert swept.documents_purged == 1
+    assert swept.blobs_collected == 1, "nothing else references the bytes, so they are freed"
+    assert await vectors.count() == 0
+    assert not blobs.path_for(retained.removeprefix("blob:sha256:")).exists()
+
+    restoration = await store.restore_document(document.id)
+    assert restoration.restored
+    assert restoration.needs_reparse, "the sweep took the content, so the row came back empty"
+    assert "released" in restoration.reason
+    assert "re-sync" in restoration.reason
+
+    report = await reindex_document(document.id, store=store, pipeline=pipeline, blobs=blobs)
+    assert report.documents == 0
+    assert len(report.unrepairable) == 1
+    assert NO_RETAINED_BYTES in report.unrepairable[0]
+
+
+async def test_a_purged_documents_file_outlives_the_purge_until_the_journal_lets_go(
+    store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
+) -> None:
+    """The real lifetime of a deleted document's raw bytes, end to end, on the real stores.
+
+    Releasing the document's reference is necessary and not sufficient: a durable sync also
+    journals the bytes it acquired, and that record is a blob root of its own until the
+    journal's cleanup — which runs at the start of the next sync, once the run is older than the
+    history window — removes it. So the file goes once both have let go, and not before:
+    collecting early would be deleting bytes a record still names, and never collecting would be
+    the retained-for-ever behavior this replaces.
+    """
+    vectors = LanceVectorStore(data_dir / "vectors")
+    await vectors.ensure_ready(HashEmbedder().fingerprint)
+    blobs = BlobStore(engine, data_dir)
+    now = datetime.now(UTC)
+    clock = {"now": now}
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=vectors,
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner([]),
+        chunk_fingerprint=chunker.fingerprint,
+        blobs=blobs,
+        acquisition_clock=lambda: clock["now"],
+        acquisition_history_s=30 * 24 * 3600.0,
+    )
+    await pipeline.run(fakes.DictConnector({"a": "alpha\nbeta"}))
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    assert document.original_ref is not None
+    doomed = blobs.path_for(document.original_ref.removeprefix("blob:sha256:"))
+    assert doomed.exists()
+
+    await store.soft_delete_document(document.id)
+    purge = await sweep_vectors(
+        store, vectors, soft_delete_grace_s=-1.0, blobs=blobs, blob_min_age_s=0.0
+    )
+
+    assert purge.documents_purged == 1
+    assert (await store.find_document("memory", "a")) is None
+    assert purge.blobs_collected == 0, "the acquisition journal still names those bytes"
+    assert doomed.exists()
+
+    clock["now"] = now + timedelta(days=31)
+    await pipeline.run(fakes.DictConnector({"b": "gamma"}))
+    later = await sweep_vectors(
+        store, vectors, soft_delete_grace_s=30 * 24 * 3600.0, blobs=blobs, blob_min_age_s=0.0
+    )
+
+    assert later.blobs_collected == 1, "the journal let go, so the file is finally garbage"
+    assert not doomed.exists()
+    live = await store.find_document("memory", "b")
+    assert live is not None
+    assert live.original_ref is not None
+    assert blobs.path_for(live.original_ref.removeprefix("blob:sha256:")).exists()
 
 
 async def test_a_single_document_reindex_refuses_an_id_that_is_still_in_the_trash(

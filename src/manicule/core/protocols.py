@@ -1019,7 +1019,9 @@ class TrashStore(Protocol):
     and touches neither the chunks, the vectors nor the lexical rows, all of which become
     invisible at the hydrating join. That is what makes a restore inside the grace period
     free — and what makes the scheduled sweep, which purges content once the grace period has
-    passed, the thing a restore has to be designed around rather than against.
+    passed, the thing a restore has to be designed around rather than against. The purge also
+    releases the document's retained bytes (``docs/storage.md`` §8.2), so a restore after it
+    cannot re-parse from them and needs a re-sync from the source.
     """
 
     async def soft_delete_document(self, document_id: str) -> None:
@@ -1037,8 +1039,10 @@ class TrashStore(Protocol):
         Two outcomes, and the caller has to be able to tell them apart. Inside the grace
         period the content is still there and clearing the timestamp puts the document back
         into service. Once the sweep has purged it, the row comes back holding no text: the
-        result says so, and the repair is a single-document re-parse from retained bytes —
-        rung 3 of the ladder, still not a re-crawl.
+        result says so. The purge releases the retained bytes, so for a document purged that
+        way the repair is a re-sync from the source — rung 4 of the ladder, which can fail;
+        only a document purged before the release existed still holds bytes for the cheaper
+        single-document re-parse, rung 3.
         """
         ...
 

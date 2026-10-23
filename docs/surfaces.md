@@ -258,7 +258,7 @@ for reading.
 
 ## 4. The operations
 
-Forty-five MCP tools and thirty-two CLI commands. They are not a one-to-one mapping: some
+Forty-seven MCP tools and thirty-two CLI commands. They are not a one-to-one mapping: some
 commands group several operations, and some operations have no tool at all. Both counts are
 asserted rather than written down — `tests/app/test_surface_parity.py` reads them off the built
 server and the built command tree.
@@ -292,7 +292,7 @@ server and the built command tree.
 | `vector_index_build` | ✓ dry-run only | `build-vector-index [--yes] [--force]` | ANN index state before and after; whether a build ran |
 | `vector_checksum` | ✓ verify only | `vector-checksum [--verify] [--yes]` | aggregate numerical-integrity coverage and typed failure counts; no checksum value or chunk id |
 | `vector_migrate` | — | `migrate-vectors [--yes]` | counts, the destination's own name for where they landed, and the source generation; no chunk or document id |
-| `vector_sweep` | — | `sweep-vectors` | vectors removed and documents purged in one bounded pass |
+| `vector_sweep` | — | `sweep-vectors` | vectors removed, documents purged and blobs collected in one bounded pass |
 | `lifecycle_reset_derived` | ✓ dry-run only | `reset-derived --dry-run/--yes` | aggregate derived rows removed; source roots retained |
 | `lifecycle_cleanup_generations` | ✓ dry-run only | `cleanup-derived-generations [--yes]` | eligible/protected generations and temporary bytes |
 | `lifecycle_release_history` | ✓ dry-run only | `release-source-history BEFORE [--yes]` | policy-eligible history and uniquely released bytes |
@@ -301,7 +301,9 @@ server and the built command tree.
 | `connector_list` | ✓ | `connector list` | configured sources |
 | `snapshot_status` | ✓ | `connector snapshot` | aggregate durable snapshot status |
 | `snapshot_verify` | ✓ | `connector verify` | aggregate manifest integrity result |
-| `connector_sync` | ✓ | `connector sync [--acquire-only]` | run counters and shared lifecycle status |
+| `connector_sync` | ✓ | `connector sync [--acquire-only]` | run counters and shared lifecycle status, and the `reconciliation` pass that followed a full sync |
+| `connector_reconcile` | ✓ | `connector reconcile NAME [--dry-run]` | counts only: ids seen, live documents compared, missing, deleted |
+| `connector_reconcile_resolve` | ✓ | `connector reconcile NAME --confirm` / `--discard` | the same counts, for the proposal the deletion ceiling refused |
 | `connector_login` | — | `connector login` | who a captured browser session belongs to |
 | `config_get` | ✓ | `config get` / `config show` | configuration, redacted |
 | `config_set` | ✓ | `config set` | the key, before and after |
@@ -392,7 +394,7 @@ five mutating or corpus-scanning `reembed` operations, `rebuild_run`, and the `a
 and people alike — have no tool; the `auth` verbs are on the HTTP surface for an administrator
 too (§9.2). Each of them either destroys data, mints a credential, writes into the
 operator's own corpus directory, or changes what the installation *is* — and a tool an
-assistant can call unattended should not be able to do any of that. The forty-five tools read
+assistant can call unattended should not be able to do any of that. The forty-seven tools read
 the corpus, write documents into it, group them, and adjust configuration. That is the whole
 surface. Five of these absences are asserted by name in `tests/app/test_surface_parity.py` —
 `collection_orphans`, `connector_sidecar`, `connector_login`, `document_reindex_stale` and
@@ -421,7 +423,7 @@ secret as a parameter, and a session cookie in a tool call is a session cookie i
 ### 4.1 What each tool says it does, and why that is not permission
 
 Every tool publishes the four hints MCP defines — `readOnlyHint`, `destructiveHint`,
-`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-six of the forty-five say they only
+`idempotentHint`, `openWorldHint` — in `tools/list`. Twenty-six of the forty-seven say they only
 read.
 
 **They are a description, and nothing in manicule reads them back.** No tool is gated on its own
@@ -810,7 +812,14 @@ now.
 
 `connector`, `discovered`, `ingested`, `skipped`, `failed`, `expanded`, `collected`,
 `uncollected`, `by_status`, `error`, `outcome`, `enumeration_completed`, `watermark_advanced`,
-`retry_required`, `intentionally_bounded`, `unrecorded`, `incomplete_reason`, `elapsed_ms`.
+`retry_required`, `intentionally_bounded`, `unrecorded`, `incomplete_reason`, `elapsed_ms`, and, on
+a full `connector_sync` only, `reconciliation`.
+
+`reconciliation` is the `ConnectorReconciled` payload below, for the deletion-detection pass that
+follows a completed full sync (`ingest.md` §11), and `null` when no pass followed: the run was
+bounded, acquire-only, incremental, incomplete, the connector holds no documents, or a proposal
+was already waiting. A pass that failed or was refused is reported there and does not change the
+sync's own `outcome`, because the sync succeeded.
 
 `by_status` is the run's own counter table rather than a summary of it. A document that ended
 `no_extractable_text` is neither an ingest nor a failure, and collapsing the two would hide
@@ -855,7 +864,11 @@ The control socket proxies the same envelope unchanged. MCP returns it as a tool
 scheduler counts `incomplete` as a failure and retries on its next interval. `connector_list`
 exposes `last_outcome`, `retry_required`, `last_error_type`,
 `last_enumeration_completed`, and `last_watermark_advanced` from the connector's last-run
-metadata, so an operator need not infer failure from a missing `last_synced_at`.
+metadata, so an operator need not infer failure from a missing `last_synced_at`. It also exposes
+where deletion detection stands: `reconcile_interval_s` (the connector's own or the installation
+default; `null` for a disabled connector), `last_reconciled_at` (the last clean pass),
+`reconcile_overdue`, `reconcile_proposal_pending`, and the waiting proposal's
+`reconcile_proposal_missing` and `reconcile_proposal_live`.
 
 Before this contract, a cursor expiry could return `ok: true` with `data.error` populated. It
 now retains the counters while failing explicitly:
@@ -903,6 +916,33 @@ a collection-scoped search over this corpus reaches none of it. The command line
 as `in collections` and `in no collection`, and says the sentence out loud when the first is
 zero.
 
+### `connector_reconcile` / `connector_reconcile_resolve` → `ConnectorReconciled`
+
+`connector`, `action` (`reconcile`, `dry_run`, `confirm`, `discard`), `outcome`, `seen`, `live`,
+`missing`, `deleted`, `proposal_pending` and `error_type`. **Counts and a class name, and nothing
+else:** never a source id, title or URI, because this payload is returned over every surface and a
+list of what was deleted from a mailbox is itself what a deletion exists to get rid of.
+`error_type` is the failure's class, never its message, since a source client's message can carry
+the URL it was asking for.
+
+| Outcome | Envelope | Meaning |
+|---|---|---|
+| `applied` | `ok: true` | The diff was applied; `deleted` may be zero. |
+| `previewed` | `ok: true` | A dry run: `missing` is what would be deleted. It consumed its inventory and cannot be applied later, so applying enumerates again. |
+| `confirmed` | `ok: true` | The proposal's reviewed set was soft-deleted, without enumerating again; documents republished or seen since are skipped, so `deleted` can be below `missing`. |
+| `discarded` | `ok: true` | Nothing was deleted, the proposal was cleared and the interval restarted. |
+| `proposed` | `ok: false`, HTTP 409, `ReconciliationRefusedError` | The diff exceeded `ingest.reconcile_max_delete_fraction`. Nothing was deleted; `proposal_pending` is true. |
+| `blocked` | `ok: false`, HTTP 503, `ReconciliationBlockedError` | A backup held the data when the pass reached the step that deletes (or when a confirmation would have applied). Nothing was deleted; a completed inventory is kept, so the next attempt applies it without asking the source again. |
+| `failed` | `ok: false`, HTTP 503 | The source could not be enumerated completely, so nothing was deleted. `error_type` names the class. |
+| `none_pending` | `ok: false`, HTTP 404, `UnknownEntityError` | `--confirm` or `--discard` found no proposal for the connector's current scope. |
+
+An unsuccessful outcome retains its counts in `data` beside the error, the way an incomplete
+ingest retains its counters. Both operations are writers: the command line proxies them to a
+running server. An unknown connector is `UnknownEntityError`, and a disabled one is refused with
+`PolicyError` for a pass but not for answering a proposal that was already waiting. Neither tool
+is on the socket or HTTP-mounted MCP surface (§6.1), because both write; that surface keeps its
+twenty-seven.
+
 ### `doctor` → `Diagnosis`
 
 `state`, `schema_version`, `manicule_version`, `checked_at` and `checks[]`, each
@@ -917,9 +957,8 @@ release whether or not anything changed.
 
 Checks, in the order `doctor` emits them: `configuration`, `transport`, `sign_in`, `plugins`,
 `storage`, `permissions`, `index`, `vector_integrity`, `vector_backend`, `glossary`,
-`connectors`, `authoring`, `collection-membership`, `sessions`, `gmail-credential`,
-`security_alerts`,
-`document-identity`,
+`connectors`, `reconciliation-overdue`, `reconciliation-proposals`, `authoring`,
+`collection-membership`, `sessions`, `gmail-credential`, `security_alerts`, `document-identity`,
 `document-content`, `extractable-text`, `wiki-provenance`, `grammars`, `vocabularies`, `models`,
 and
 `component:<kind>:<name>` for anything already constructed.
@@ -948,8 +987,20 @@ component name to the instance name. Those documents keep working; the next sync
 same pages again under new ids and leaves the existing rows behind, so the corpus appears to
 have doubled with nothing reporting an error. `degraded` rather than `failing`, because the
 damage is prospective: it names the affected type names in `facts.affected`, the count in
-`facts.documents`, and a `document list --source` command to inspect them with. There is no bulk
-reconciliation for this and the wording deliberately does not imply one.
+`facts.documents`, and a `document list --source` command to inspect them with. `connector
+reconcile` does not reach them: it only compares documents filed under an instance's own name,
+and these are filed under the type's, so the wording deliberately offers no reconciliation for
+them.
+
+`reconciliation-overdue` is `degraded` when an enabled connector that holds documents and has no
+deletion proposal waiting has gone more than twice its reconcile interval since a pass last
+concluded, by a clean pass or an operator's discard (a connector that has never reconciled counts
+as overdue). `facts` carry `overdue`, the connector names, and `count`. The remedy is
+`manicule connector reconcile NAME`, because a served manicule would have run the pass itself.
+`reconciliation-proposals` is `degraded` while a pass refused by the deletion ceiling waits for
+`--confirm` or `--discard`; `facts` carry `waiting`, the connector names, and `missing`, the total
+documents those proposals would delete. Both name connectors and counts, never a source id, and
+both are `unknown` if the corpus could not be examined. Both are `ok` when no source is configured.
 
 `collection-membership` asks the same question of every collection rather than only the ones
 authoring names, and it asks it of the corpus rather than of the configuration. `facts` carry
@@ -1240,7 +1291,8 @@ sending a `POST` to `/mcp/` and getting a 307 it may not re-send a body for.
 
 **Every mutating tool but one is absent from it.** Not refused — absent. `manicule.mcp.server` is
 asked for the read-only surface, and it never calls `@mcp.tool` for a tool whose `readOnlyHint` is
-not true, so there is no handler behind `document_delete`, `connector_sync`, `config_set`,
+not true, so there is no handler behind `document_delete`, `connector_sync`, `connector_reconcile`,
+`connector_reconcile_resolve`, `config_set`,
 `plugin_add`, `index_path`, `ask` or the eight mutating collection verbs (`collection_create`,
 `collection_rename`, `collection_update`, `collection_rule_set`, `collection_rule_clear`,
 `collection_delete`, `collection_add`, and `collection_remove`) on that server object. A call to
@@ -1470,7 +1522,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | conversations | `GET`/`POST /api/v1/conversations`, `GET /api/v1/conversations/{id}/messages`, `PATCH`/`DELETE /api/v1/conversations/{id}`, `POST`/`DELETE /api/v1/conversations/{id}/share`, `GET /shared/{token}` |
 | collections | `GET`/`POST /api/v1/collections`, `PATCH`/`DELETE /api/v1/collections/{id}`, `POST /api/v1/collections/{id}/name`, `GET`/`PUT`/`DELETE /api/v1/collections/{id}/rule`, `GET /api/v1/collections/{id}/counts`, `GET /api/v1/collections/{id}/documents`, `POST`/`DELETE /api/v1/collections/{id}/documents/{docId}` |
 | tags | `GET`/`POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`, `POST`/`DELETE /api/v1/documents/{docId}/tags/{tagId}` |
-| admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/alerts`, `POST /api/v1/admin/alerts/{id}/acknowledge`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync` |
+| admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/alerts`, `POST /api/v1/admin/alerts/{id}/acknowledge`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync`, `POST /api/v1/admin/connectors/{name}/reconcile` (body `{dry_run}`), `POST /api/v1/admin/connectors/{name}/reconcile/resolve` (body `{action: confirm\|discard}`) |
 | plugins | `GET /api/v1/plugins`, `GET /api/v1/plugins/search`, `POST`/`DELETE /api/v1/plugins/{name}` |
 | auth | `GET /auth/providers`, `GET /auth/session`, `GET /auth/login/{provider}`, `GET /auth/callback/{provider}`, `POST /auth/logout`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}`, `GET /api/v1/auth/users`, `PATCH /api/v1/auth/users/{user}`, `POST /api/v1/auth/users/{user}/sign-out` |
 | workbench | `GET /api/v1/workbench?document_id=…` |

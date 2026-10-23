@@ -277,6 +277,8 @@ WRITERS: frozenset[str] = frozenset(
         "collection_rule_set",
         "collection_rule_clear",
         "config_set",
+        "connector_reconcile",
+        "connector_reconcile_resolve",
         "connector_sidecar",
         "connector_sync",
         # Authoring writes a file into the corpus directory and then indexes it, so it takes

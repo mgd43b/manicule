@@ -95,26 +95,34 @@ work kept because it is the record of what was tried — and must never rank bes
 it. The alternative people reach for otherwise is deleting the directory, which is content leaving
 the working tree purely to keep it out of an index.
 
-### 2.2 It governs what enters the index, not what is already in it
+### 2.2 It governs what enters the index; a reconciliation pass removes what is already in it
 
-Adding a pattern stops those paths being discovered. It does **not** remove documents indexed
-before it was written: they stay, served and going stale, because nothing in the product runs a
-deletion-detection pass today — `manicule.ingest.reconcile.reconcile` exists and is tested, and
-nothing calls it.
+Adding a pattern stops those paths being discovered, and discovery alone does not remove
+documents indexed before it was written: an incremental sync cannot see an absence. What removes
+them is the deletion-detection pass ([`ingest.md`](../ingest.md) §11). The exclusion is applied in
+the walk that `discover` and `reconcile` both read, so the two never disagree about what this
+source holds, and the pass finds the newly excluded files absent from its inventory and
+soft-deletes them.
 
-So after adding an `exclude` over content that has already been indexed, remove those documents
-explicitly:
+A served manicule runs that pass on `ingest.reconcile_interval_s` (or this source's own
+`reconcile_interval_s`) and after every full sync. Until it does, the excluded documents stay
+served and going stale, so "I excluded it and it is still in my results" is a question of when the
+next pass is, not a defect. To remove them now:
+
+```bash
+manicule connector reconcile <source> --dry-run   # counts only: what would be deleted
+manicule connector reconcile <source>
+```
+
+An exclusion that covers more than `ingest.reconcile_max_delete_fraction` (default 10%) of the
+source's live documents trips the deletion ceiling: nothing is deleted, the proposal is recorded,
+and `manicule connector reconcile <source> --confirm` applies exactly the reviewed set (or
+`--discard` keeps it). Either way the deletion is soft, so it is recoverable inside the grace
+period. To remove one document without a pass:
 
 ```bash
 manicule document delete <document-id>
 ```
-
-Soft by default, so it is recoverable inside the grace period.
-
-The connector is nonetheless written so that this is a wiring gap rather than a design one: the
-exclusion is applied in the walk that `discover` and `reconcile` both read, so the two never
-disagree about what this source holds, and a reconciliation pass would remove exactly these
-documents on the day one runs.
 
 ## 3. Authoring into an excluded directory is refused
 

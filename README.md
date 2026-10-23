@@ -348,7 +348,7 @@ shared result shape is in [`docs/surfaces.md`](docs/surfaces.md#401-shared-lifec
 
 | Surface | Started by | Shape |
 |:---|:---|:---|
-| **MCP** | `manicule start --mcp-only` | 45 tools over stdio, which opens no socket; 27 at `/mcp/` when served over a port — the read-only ones, plus `document_create` |
+| **MCP** | `manicule start --mcp-only` | 47 tools over stdio, which opens no socket; 27 at `/mcp/` when served over a port — the read-only ones, plus `document_create` |
 | **Command line** | `manicule <command>` | 32 commands; `--json` anywhere data is emitted |
 | **HTTP API** | `manicule start --transport http` | 12 route groups on `127.0.0.1:8765`, OpenAPI at `/api/docs` |
 | **Browser** | the same process, at `/ui` | Functional operator and retrieval-inspection console; 15 areas of server-rendered HTML, 14 in the navigation, and a sign-in page |
@@ -471,7 +471,7 @@ has a route, so there is no upload and no configuration write here either.
 
 ### The MCP server
 
-The primary interface: forty-five tools over the same service, speaking stdio by default,
+The primary interface: forty-seven tools over the same service, speaking stdio by default,
 which opens no socket at all. To let Claude Code use your index:
 
 ```bash
@@ -599,7 +599,7 @@ $ manicule serve                    # holds the data directory, runs the schedul
 One process owns the data directory at a time. `manicule serve` is that process for as long as
 it runs, and three things follow:
 
-- **Write commands go to it.** `connector sync`, `index`, `document reindex`, `rebuild execute`
+- **Write commands go to it.** `connector sync`, `connector reconcile`, `index`, `document reindex`, `rebuild execute`
   and the repair verbs detect the running server and forward to it over a `0600` Unix domain
   socket, streaming progress back. You get the same result, the same output and the same exit
   status you would have got locally, because it is the same operation. With no server they refuse
@@ -619,7 +619,16 @@ Per-source schedules are configuration:
 [connectors.handbook]
 type = "confluence"
 schedule_s = 3600      # a served manicule syncs this hourly, with nothing typed
+reconcile_interval_s = 86400   # and looks for documents deleted at the source daily
 ```
+
+An incremental sync cannot see a deletion, so a served manicule also reconciles every enabled
+source: it asks the source which documents still exist and soft-deletes the ones that left. That
+runs after every full sync and on `ingest.reconcile_interval_s` (weekly by default), which a
+source's own `reconcile_interval_s` overrides, with or without a `schedule_s`. A pass that would
+delete more than 10% of a source's documents (by default) is refused and recorded instead;
+`manicule connector reconcile handbook --dry-run` previews a pass, and `--confirm` or `--discard`
+answers a refused one. `connector list` and `doctor` show what is overdue or waiting.
 
 A website whose source pages already live in a local Git repository can be indexed without
 copying those source bytes into Manicule's blob store:
@@ -658,12 +667,14 @@ That is for material which has to stay in the directory — superseded work kept
 record of what was tried — and must never rank beside what replaced it. The alternative people
 reach for otherwise is deleting it, which is content leaving the working tree purely to keep it out
 of an index. [`docs/connectors/filesystem.md`](docs/connectors/filesystem.md) has the field table,
-and is honest about what an exclusion does *not* do to documents already indexed.
+and says when an exclusion removes documents that were already indexed: at the next reconciliation pass.
 
 An admin may also start one already-configured connector through
-`POST /api/v1/admin/connectors/{name}/sync`. The route cannot declare or reconfigure a source:
-connectors hold credentials and reach remote systems, so the complete set remains in
-configuration where it can be reviewed. Per-source schedules remain the unattended path.
+`POST /api/v1/admin/connectors/{name}/sync`, and run or answer a deletion-detection pass through
+`POST /api/v1/admin/connectors/{name}/reconcile` and `.../reconcile/resolve`. The routes cannot
+declare or reconfigure a source: connectors hold credentials and reach remote systems, so the
+complete set remains in configuration where it can be reviewed. Per-source schedules remain the
+unattended path.
 `docs/deployment.md` §6 has the whole of it.
 
 ## In a container
@@ -748,7 +759,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/testing` | Conformance suites every implementation must pass |
 | `src/manicule/app` | The application service. All the behavior, once, for every surface |
 | `src/manicule/cli` | Thirty-two commands over that service, and nothing else |
-| `src/manicule/mcp` | Forty-five MCP tools over that service, and nothing else |
+| `src/manicule/mcp` | Forty-seven MCP tools over that service, and nothing else |
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/extension` | A Chrome extension that hands this browser's Confluence session to a local manicule. No build step |
 | `src/manicule/web` | Fifteen areas of HTML — fourteen pages and the frame they render inside — plus a sign-in page. No build step, no new operation |

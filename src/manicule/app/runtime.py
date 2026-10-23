@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
+    from manicule.ingest.reconcile import Reconciliation, ReconciliationStanding
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import (
         GlossarySweep,
@@ -110,6 +111,7 @@ if TYPE_CHECKING:
     )
     from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
+    from manicule.storage.backup_lock import MaintenanceHold
     from manicule.storage.docstore import SqliteDocStore
     from manicule.storage.reembed import (
         LanceShadowGenerations,
@@ -431,6 +433,53 @@ class Runtime:
                 yield
             finally:
                 _DERIVED_MUTATION_GUARDS.reset(token)
+
+    @asynccontextmanager
+    async def maintenance_hold(self) -> AsyncGenerator[MaintenanceHold]:
+        """Hold the data directory's backup lock shared, without waiting, for the body.
+
+        The primitive under :meth:`maintenance_window` and the scheduled sweep, yielding the
+        :class:`~manicule.storage.backup_lock.MaintenanceHold` itself — which the sweep needs
+        because it is the :class:`~manicule.ingest.sweeps.SweepGate` too. Releases on every
+        exit, including cancellation.
+        """
+        from manicule.storage.backup_lock import MaintenanceHold  # noqa: PLC0415
+
+        hold = MaintenanceHold(self._settings.data_dir)
+        hold.acquire()
+        try:
+            yield hold
+        finally:
+            hold.release()
+
+    @asynccontextmanager
+    async def maintenance_window(self) -> AsyncGenerator[str]:
+        """Hold off a hot backup for the body of a pass that removes data.
+
+        **The contract:** the value yielded is ``""`` when the window is held and the body may
+        remove data, and a non-empty sentence saying what is in the way when it is not — a
+        backup is running, or the lock file cannot be opened or locked. It never raises for a
+        lock that is merely taken, and it never waits: a pass that finds a backup running
+        declines, exactly as the scheduled sweep does, and is expected to report the yielded
+        sentence as the reason. **A body that sees a non-empty value must not remove anything.**
+        The lock is released when the ``async with`` exits, however it exits.
+
+        The lock is shared, so passes taking this window do not exclude each other, and it is
+        the very lock :func:`~manicule.storage.backup.create_backup` takes exclusively: a backup
+        waits for an open window (up to its own bound) rather than copying beside it. The
+        window is advisory and cross-process (``flock`` on ``<data_dir>/backup.lock``,
+        :mod:`manicule.storage.backup_lock`). It does not take the derived-mutation guard, the
+        instance lock or any in-process lock; a pass that needs those takes them itself.
+
+        Used as::
+
+            async with runtime.maintenance_window() as blocked:
+                if blocked:
+                    return declined(blocked)
+                ...  # remove data
+        """
+        async with self.maintenance_hold() as hold:
+            yield hold.blocked_by
 
     @property
     def discovery(self) -> Discovery | None:
@@ -1243,6 +1292,40 @@ async def _publication_bound_vectors(runtime: Runtime) -> PublicationBoundVector
     return vectors if isinstance(vectors, PublicationBoundVectorStore) else None
 
 
+async def _hold_pinned_identity(connector: Connector, store: IngestStore) -> None:
+    """Hold a reconciliation to the identity its source synced as, before it reads anything.
+
+    The rule is the pipeline's (:func:`~manicule.ingest.pipeline.hold_pinned_identity`), taken
+    here directly because a pass does not construct a pipeline, which needs an embedder. Without
+    it a replaced credential would diff one account's inventory against another account's
+    documents.
+    """
+    from manicule.ingest.pipeline import hold_pinned_identity  # noqa: PLC0415
+    from manicule.ingest.ports import AcquisitionStore  # noqa: PLC0415
+
+    await hold_pinned_identity(
+        connector, store, store if isinstance(store, AcquisitionStore) else None
+    )
+
+
+def _confirmed(connector: str, applied: Reconciliation | Sequence[str]) -> Reconciliation:
+    """One result shape for confirming a proposal, whichever store kept it.
+
+    The durable store answers with the counts it applied; a store without a durable journal
+    answers with the source ids it removed. The ids stop here: nothing past this function
+    carries them.
+    """
+    from manicule.ingest.reconcile import Reconciliation  # noqa: PLC0415
+
+    if isinstance(applied, Reconciliation):
+        return applied
+    if not applied:
+        # The in-memory path answers an absent proposal with an empty list, and a real proposal
+        # always names at least one document, so empty means there was nothing to confirm.
+        return Reconciliation(connector=connector, refused="no deletion proposal exists")
+    return Reconciliation(connector=connector, applied_count=len(applied))
+
+
 class _Ingestion:
     """The ingest operations a surface can start, over one runtime."""
 
@@ -1368,6 +1451,100 @@ class _Ingestion:
         readings of one configuration.
         """
         return await self._runtime.connector(name)
+
+    async def reconcile(
+        self,
+        connector: str,
+        *,
+        dry_run: bool,
+        max_delete_fraction: float,
+        eligible: Callable[[ReconciliationStanding], bool] | None = None,
+    ) -> Reconciliation:
+        """Enumerate one connector's source and soft-delete what left it.
+
+        The whole pass, enumeration included, runs under the derived-mutation guard, and only
+        the step that soft-deletes takes the backup window (``Runtime.maintenance_window``): a
+        backup waits for that step, not for an enumeration that can take minutes, and a pass
+        that finds a backup running declines with ``blocked`` set and deletes nothing.
+
+        The derived-mutation guard is also what stops a sync of the same connector. A sync
+        holds it across its own network walk, so this adds no new kind of wait, and holding it
+        is what keeps a sync of the same connector from publishing documents between the
+        inventory and the diff — the race the inventory's own newer-evidence rule would
+        otherwise have to catch.
+
+        The connector is built first and outside the guard: building it is where a missing
+        session surfaces, and a pass that cannot authenticate should not queue behind a sync
+        to say so.
+        """
+        from manicule.ingest.reconcile import (  # noqa: PLC0415
+            Reconciliation,
+            standing,
+        )
+        from manicule.ingest.reconcile import reconcile as run_reconcile  # noqa: PLC0415
+
+        built = await self._runtime.connector(connector)
+        store = cast("IngestStore", await self._runtime.documents())
+        await _hold_pinned_identity(built, store)
+        async with self._runtime.derived_mutation_guard():
+            if eligible is not None:
+                # Asked here, under the guard, and not before queuing for it: see the port.
+                state = standing(
+                    await store.connector_metadata(connector),
+                    live_documents=await store.count_documents(source=connector),
+                )
+                if not eligible(state):
+                    return Reconciliation(connector=connector, skipped=True)
+            return await run_reconcile(
+                built,
+                store,
+                max_delete_fraction=max_delete_fraction,
+                dry_run=dry_run,
+                window=self._runtime.maintenance_window,
+            )
+
+    async def resolve_proposal(self, connector: str, *, confirm: bool) -> Reconciliation:
+        """Apply or discard the deletion proposal the ceiling refused.
+
+        **Confirming** presents the scope the connector is configured with *now*, not the
+        recorded proposal's, so a configuration change since the proposal was made cannot confirm
+        a question about a different source (``docs/ingest.md`` §11.1). That needs the connector
+        built, which for a source that authenticates with a browser session needs the session.
+
+        **Discarding** deletes nothing, so it needs none of that: it presents the scope the
+        proposal itself recorded and never builds the connector. An operator can therefore clear
+        a proposal after a restart ended the session, and can clear one stranded by a
+        configuration change, which confirming correctly refuses.
+        """
+        from manicule.ingest.ports import ReconciliationStore  # noqa: PLC0415
+        from manicule.ingest.reconcile import (  # noqa: PLC0415
+            PROPOSED_DELETION_KEY,
+            Reconciliation,
+            confirm_proposed_deletion,
+            connector_scope,
+            discard_proposed_deletion,
+        )
+
+        store = cast("IngestStore", await self._runtime.documents())
+        if not confirm:
+            held = (await store.connector_metadata(connector)).get(PROPOSED_DELETION_KEY)
+            recorded = held.get("scope") if isinstance(held, dict) else None
+            if isinstance(store, ReconciliationStore) and not isinstance(recorded, str):
+                return Reconciliation(connector=connector, refused="no deletion proposal exists")
+            async with self._runtime.derived_mutation_guard():
+                return await discard_proposed_deletion(
+                    connector, store, scope=recorded if isinstance(recorded, str) else None
+                )
+        built = await self._runtime.connector(connector)
+        await _hold_pinned_identity(built, store)
+        scope = connector_scope(built)
+        async with self._runtime.derived_mutation_guard():
+            # Only the apply takes the window: it removes documents, where discarding keeps them.
+            async with self._runtime.maintenance_window() as blocked:
+                if blocked:
+                    return Reconciliation(connector=connector, blocked=blocked)
+                confirmed = await confirm_proposed_deletion(connector, store, scope=scope)
+            return _confirmed(connector, confirmed)
 
     async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
         """Read the active or newest promoted manifest from durable local identity."""
@@ -1984,7 +2161,12 @@ class _Ingestion:
         )
 
     async def sweep_vectors(self, *, batch: int, soft_delete_grace_s: float) -> SweepResult:
-        """One bounded pass of the tombstone sweep and the soft-delete purge.
+        """One bounded pass of the tombstone sweep, the soft-delete purge and blob collection.
+
+        Holds the backup lock shared for the whole pass (:meth:`maintenance_hold`), so a hot
+        backup waits for it and a pass that finds a backup running declines with the reason in
+        ``blocked_by``. Collection of unreferenced blobs is the last step; it is what turns the
+        references a purge released into freed files (``docs/storage.md`` §7, §8.2).
 
         Guarded like the other two sweeps, which is what serializes it against a reset, a
         rebuild and a re-embed publication — the operations that move the publication pointer
@@ -1999,6 +2181,7 @@ class _Ingestion:
         draining.
         """
         from manicule.ingest.sweeps import (  # noqa: PLC0415
+            BlobCollector,
             SweepResult,
             VectorSweepTarget,
             sweep_vectors,
@@ -2017,13 +2200,21 @@ class _Ingestion:
                         f"individual chunks, so tombstoned vectors cannot be swept from it"
                     )
                 )
-            store = await self._runtime.documents()
-            return await sweep_vectors(
-                store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
-                vectors,
-                batch=batch,
-                soft_delete_grace_s=soft_delete_grace_s,
-            )
+            async with self._runtime.maintenance_hold() as hold:
+                if not hold.held:
+                    return SweepResult(blocked_by=hold.blocked_by)
+                store = await self._runtime.documents()
+                blobs = await self._runtime.blobs()
+                return await sweep_vectors(
+                    store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
+                    vectors,
+                    batch=batch,
+                    soft_delete_grace_s=soft_delete_grace_s,
+                    gate=hold,
+                    # `_build_blobs` is the only builder, and it makes a `BlobStore`; the check
+                    # narrows the type rather than guarding against a store that cannot happen.
+                    blobs=blobs if isinstance(blobs, BlobCollector) else None,
+                )
 
     async def glossary_fingerprint(self) -> GlossaryFingerprint:
         """What the installed detector would produce under this configuration.

@@ -342,8 +342,8 @@ class CitationState(StrEnum):
     DELETED = "deleted"
     """The document is in the trash, or its content was purged after the grace period.
 
-    Restorable — freely inside the grace period, and by a re-parse from retained bytes
-    outside it (``docs/ingest.md`` §11.2).
+    Restorable — freely inside the grace period, and by a re-sync from the source outside
+    it, because the purge releases the retained bytes (``docs/ingest.md`` §11.2).
     """
 
     UNKNOWN = "unknown"

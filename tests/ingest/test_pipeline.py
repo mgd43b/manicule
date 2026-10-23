@@ -1431,6 +1431,31 @@ class _Prefixing(fakes.PassThrough):
         return raw.model_copy(update={"content": f"# header\n{raw.as_text()}"})
 
 
+async def test_a_run_says_whether_it_walked_the_whole_source() -> None:
+    """The one fact the caller needs to decide that a reconciliation should follow.
+
+    The first run has no cursor and walks everything. The second inherits the committed
+    watermark and is incremental. A connector that discards its cursor walks everything every
+    time and says so, whatever position it inherited.
+    """
+    pipeline, _, _ = build()
+    connector = _Positioned({"a": "alpha"})
+
+    first = await pipeline.run(connector)
+    second = await pipeline.run(connector)
+
+    assert first.full_enumeration is True
+    assert second.full_enumeration is False
+
+    class Rewalking(_Positioned):
+        enumerates_full_inventory = True
+
+    again, _, _ = build()
+    walker = Rewalking({"a": "alpha"})
+    await again.run(walker)
+    assert (await again.run(walker)).full_enumeration is True
+
+
 async def test_run_counters_land_on_the_connector_row() -> None:
     """Diagnostic, not relational: overwritten rather than accumulated, and no new table."""
     pipeline, store, _ = build()

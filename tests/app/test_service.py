@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -2410,23 +2411,39 @@ async def test_the_check_states_the_consequence_rather_than_only_the_condition(
 
 
 async def test_the_check_names_only_remedies_that_exist(backend: FakeBackend) -> None:
-    """It must not point at a regime that cannot be invoked.
+    """Every command it names must be one an operator can run, and it must not oversell one.
 
-    ``manicule.ingest.reconcile.reconcile`` exists and is tested, and **nothing in the product
-    calls it** — there is no command, no service method and no sweep that runs it. Naming it here
-    would read as though there were a way to bulk-reconcile and the operator had missed it. The
-    two commands named instead were run against a real index before this was written.
+    ``manicule connector reconcile`` exists now, and the check says so only to say what it
+    cannot do: it compares the documents filed under an *instance's* name against that
+    instance's inventory, and the documents this check finds are filed under the connector
+    *type's* name, so a pass would neither find nor remove them. Naming it as the remedy would
+    send an operator to a command that reports a clean pass and changes nothing. The commands
+    named instead were run against a real index before this was written, and each is resolved
+    against the real command tree below rather than trusted.
     """
+    from typer.testing import CliRunner  # noqa: PLC0415
+
+    from manicule.cli.main import app  # noqa: PLC0415
+
     backend.store.add(make_document(backend.workspace, source="confluence-snapshot"))
     service = _with_connectors(
         backend, **{"team-handbook": {"type": "confluence-snapshot", "options": {"root": "/x"}}}
     )
 
-    detail = _check(await service.doctor(), "connectors").detail
+    check = _check(await service.doctor(), "connectors")
 
-    assert "manicule document list --source confluence-snapshot" in detail
-    assert "manicule document delete" in detail
-    assert "reconcile" not in detail.replace("bulk reconciliation", "")
+    assert "manicule document list --source confluence-snapshot" in check.detail
+    assert "manicule document delete" in check.detail
+    assert "`connector reconcile` does not reach them" in check.detail
+    assert "reconcile" not in check.remedy
+    named = {
+        match.removeprefix("manicule ").split(" <")[0].split(" --")[0]
+        for match in re.findall(r"`(manicule [^`]+)`", check.detail)
+    } | {check.remedy.removeprefix("manicule ").split(" --")[0]}
+    assert {"document list", "document delete"} <= named
+    for command in sorted(named):
+        result = CliRunner().invoke(app, [*command.split(), "--help"])
+        assert result.exit_code == 0, f"`manicule {command}` is named but does not exist"
 
 
 async def test_an_instance_named_after_its_own_type_is_not_reported(
@@ -3227,13 +3244,16 @@ async def test_the_vector_sweep_carries_the_settings_that_bound_it(
     """
     service.settings.ingest.sweep_batch = 11
     service.settings.ingest.soft_delete_grace_s = 5.0
-    backend.ingestion_.vector_sweep = SweepResult(vectors_removed=4, documents_purged=1)
+    backend.ingestion_.vector_sweep = SweepResult(
+        vectors_removed=4, documents_purged=1, blobs_collected=3
+    )
 
     report = await service.sweep_vectors()
 
     assert backend.ingestion_.vector_sweeps == [(11, 5.0)]
     assert report.vectors_removed == 4
     assert report.documents_purged == 1
+    assert report.blobs_collected == 3
     assert report.ran
     assert not report.blocked_by
 

@@ -719,6 +719,16 @@ def _retry_advice(payload: r.IngestReport) -> str:
     return "the watermark was not advanced, so running it again resumes"
 
 
+def _add_reconciliation_row(table: Table, payload: r.IngestReport) -> None:
+    """The deletion-detection pass that followed a full sync, when there was one."""
+    if payload.reconciliation is not None:
+        table.add_row(
+            "deletion detection",
+            f"{payload.reconciliation.outcome.replace('_', ' ')}, "
+            f"{payload.reconciliation.deleted} soft-deleted",
+        )
+
+
 def render_ingest(out: Console, payload: r.IngestReport) -> None:
     table = Table(box=None, show_header=False, pad_edge=False)
     table.add_row("source", escape(payload.connector))
@@ -749,6 +759,7 @@ def render_ingest(out: Console, payload: r.IngestReport) -> None:
     for status, count in sorted(payload.by_status.items()):
         table.add_row(f"  {status}", str(count))
     table.add_row("elapsed", f"{payload.elapsed_ms} ms")
+    _add_reconciliation_row(table, payload)
     out.print(table)
     if payload.error:
         out.print(f"[red]the run did not finish: {escape(payload.error)}[/red]")
@@ -855,8 +866,9 @@ def render_vector_sweep(out: Console, payload: r.VectorSweepReport) -> None:
     table = _folding_table()
     table.add_row("vectors removed", str(payload.vectors_removed))
     table.add_row("documents purged", str(payload.documents_purged))
+    table.add_row("blobs collected", str(payload.blobs_collected))
     out.print(table)
-    if not payload.vectors_removed and not payload.documents_purged:
+    if not (payload.vectors_removed or payload.documents_purged or payload.blobs_collected):
         out.print("[dim]nothing was waiting to be swept[/dim]")
 
 
@@ -1074,6 +1086,47 @@ def render_connectors(out: Console, payload: r.ConnectorList) -> None:
     out.print(table)
     if not payload.connectors:
         out.print("[dim]no sources configured[/dim]")
+    # Said under the table rather than as a column: it is the exception, not a property of every
+    # row, and a tenth column is one a narrow terminal truncates exactly where it matters.
+    for connector in payload.connectors:
+        if connector.reconcile_proposal_pending:
+            out.print(
+                f"[yellow]{escape(connector.name)}: a deletion of "
+                f"{connector.reconcile_proposal_missing} of {connector.reconcile_proposal_live} "
+                f"live document(s) is waiting. `manicule connector reconcile "
+                f"{escape(connector.name)} --confirm` deletes them; `--discard` keeps "
+                f"them.[/yellow]"
+            )
+        elif connector.reconcile_overdue:
+            out.print(
+                f"[yellow]{escape(connector.name)}: deletion detection is overdue, so documents "
+                f"deleted at the source are still searchable. `manicule connector reconcile "
+                f"{escape(connector.name)}` runs it now.[/yellow]"
+            )
+
+
+def render_reconciled(out: Console, payload: r.ConnectorReconciled) -> None:
+    """Counts, and what they mean for the next move. Never a source id."""
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_row("source", escape(payload.connector))
+    table.add_row("action", payload.action.replace("_", " "))
+    table.add_row("outcome", payload.outcome.replace("_", " "))
+    if payload.action in {"reconcile", "dry_run"}:
+        table.add_row("ids the source still has", str(payload.seen))
+    table.add_row("live documents compared", str(payload.live))
+    table.add_row("absent from the source", str(payload.missing))
+    table.add_row("soft-deleted", str(payload.deleted))
+    out.print(table)
+    if payload.outcome == "previewed":
+        out.print("[dim]a dry run: nothing was deleted, and it cannot be applied later[/dim]")
+    elif payload.outcome == "proposed":
+        out.print(
+            f"[yellow]above the deletion ceiling, so nothing was deleted and the proposal is "
+            f"recorded. `manicule connector reconcile {escape(payload.connector)} --confirm` "
+            f"deletes exactly these; `--discard` keeps them.[/yellow]"
+        )
+    elif payload.outcome == "confirmed":
+        out.print("[dim]soft-deleted: restorable inside the grace period[/dim]")
 
 
 def render_sidecar(out: Console, payload: r.SidecarReport) -> None:
@@ -1773,6 +1826,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.Stats: lambda out, p: render_stats(out, _as(r.Stats, p)),
     r.Diagnosis: lambda out, p: render_diagnosis(out, _as(r.Diagnosis, p)),
     r.ConnectorList: lambda out, p: render_connectors(out, _as(r.ConnectorList, p)),
+    r.ConnectorReconciled: lambda out, p: render_reconciled(out, _as(r.ConnectorReconciled, p)),
     r.MessagingHostInstalled: lambda out, p: render_messaging_host_installed(
         out, _as(r.MessagingHostInstalled, p)
     ),
