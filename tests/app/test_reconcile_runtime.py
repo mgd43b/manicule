@@ -360,3 +360,28 @@ async def test_a_backup_waits_for_a_pass_in_its_removal_step_and_not_for_its_enu
     await service.connector_reconcile("docs")
 
     assert during_enumeration == [True], "a backup could take the lock mid-enumeration"
+
+
+async def test_a_replaced_credential_cannot_reconcile_one_accounts_documents_against_anothers(
+    service: ApplicationService, source_root: Path
+) -> None:
+    """A pass is held to the identity the source synced as, before it reads anything.
+
+    The connector here declares a pinned identity the way a mailbox does. After documents are
+    indexed under one, a different one would enumerate the second account's ids and soft-delete
+    the first account's whole corpus as 'absent'.
+    """
+    from manicule.connectors.errors import PinnedIdentityError  # noqa: PLC0415
+
+    connector = await (await service._backend.ingestion()).connector("docs")  # pyright: ignore[reportPrivateUsage]
+    object.__setattr__(connector, "pinned_identity", "digest-of-the-first-account")
+    await service.connector_sync("docs")
+    object.__setattr__(connector, "pinned_identity", "digest-of-another-account")
+    remove(source_root, *range(10))
+
+    with pytest.raises(PinnedIdentityError):
+        await service.connector_reconcile("docs")
+    with pytest.raises(PinnedIdentityError):
+        await service.connector_reconcile("docs", dry_run=True)
+
+    assert await live(service) == 10, "nothing was enumerated, so nothing could be deleted"

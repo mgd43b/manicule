@@ -2674,7 +2674,7 @@ class Check(Payload):
     ``plugins``,
     ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
     ``authoring``, ``collection-membership``, ``reconciliation-overdue``,
-    ``reconciliation-proposals``, ``sessions``, ``security_alerts``,
+    ``reconciliation-proposals``, ``sessions``, ``gmail-credential``, ``security_alerts``,
     ``document-identity``, ``document-content``, ``extractable-text``, ``wiki-provenance``,
     ``grammars``, ``vocabularies``, ``models``, and ``component:<kind>:<name>`` for anything
     already constructed. ``vector_backend`` is emitted too and had been missing from this list

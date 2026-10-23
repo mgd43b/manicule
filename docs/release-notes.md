@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Gmail source configuration, credential and a `doctor` check
+
+A `type = "gmail"` source now has its configuration and its credential, and nothing more. The
+settings (`account`, `client_id`, the secret and refresh-token variables, `exclude_labels`, and
+two pacing bounds) are validated at startup, a refresh token is exchanged for access tokens and
+kept until a minute before it expires, and a token that belongs to a different mailbox than
+`account` is refused. **Reading mail is not built yet.** A Gmail source that passes all of this
+is still refused when it is constructed, with a message saying so, until the connector lands
+([#460](https://github.com/mgd43b/manicule/issues/460)); leave such a source disabled. The
+design is in [`connectors/gmail.md`](connectors/gmail.md).
+
+`manicule doctor` gained a `gmail-credential` check. For each enabled Gmail source it refreshes
+a token and asks Google which mailbox it reads, so a revoked grant or a token for the wrong
+account shows up before a sync does. It contacts Google, once per enabled Gmail source, and
+reports source names and a fixed word for each outcome, never an address. With no Gmail source it
+is `ok` and does nothing.
+
+Separately, the ingest pipeline can now hold a source to the account it first synced as. A
+connector may declare a pinned identity, and editing it on a source that still holds documents
+is refused before anything is read, with the instruction to use a new name for the other
+account. Only Gmail declares one, so no existing source is affected.
+
 ### A repeated search is served from the query cache
 
 The query cache never hit through the CLI, HTTP, MCP or the web. Its invalidation counter counted

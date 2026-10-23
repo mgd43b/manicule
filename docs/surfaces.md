@@ -958,7 +958,7 @@ release whether or not anything changed.
 Checks, in the order `doctor` emits them: `configuration`, `transport`, `sign_in`, `plugins`,
 `storage`, `permissions`, `index`, `vector_integrity`, `vector_backend`, `glossary`,
 `connectors`, `reconciliation-overdue`, `reconciliation-proposals`, `authoring`,
-`collection-membership`, `sessions`, `security_alerts`, `document-identity`,
+`collection-membership`, `sessions`, `gmail-credential`, `security_alerts`, `document-identity`,
 `document-content`, `extractable-text`, `wiki-provenance`, `grammars`, `vocabularies`, `models`,
 and
 `component:<kind>:<name>` for anything already constructed.
@@ -1068,6 +1068,38 @@ question — a collection nobody has created yet is one `collection_create` away
 reported "no exposure" until somebody made it would go quiet exactly while an operator was
 setting the thing up.
 
+`gmail-credential` asks Google whether each enabled `gmail` source's credential works for the
+mailbox it names. It is `ok` when no enabled source is of that type, so a corpus without Gmail
+never sees it fail. For each enabled source it resolves the client secret and refresh token,
+refreshes an access token and calls `users.getProfile` once, then compares the mailbox that
+answered with the configured `account` — the same `confirm_mailbox` the Gmail connector will run
+before it reads anything ([`connectors/gmail.md`](connectors/gmail.md) §1.2, §1.4). It is
+`failing` when a sync would stop on the source's settings or credential: options that do not
+validate (nothing else reports those), an installation without the HTTP client (`pip install 'manicule[connectors]'`), a missing client secret or refresh token, a
+grant Google no longer honors, an OAuth client Google refuses (or a project with the Gmail API off), or a token for a different
+mailbox. It is `degraded` when the only trouble is that Google did not answer, which says
+nothing about the credential (a source whose probe takes longer than 15 seconds is counted
+that way, and sources are probed concurrently, so the check holds `doctor` for 15 seconds at most). This check is a network call, one refresh and one `getProfile`
+per enabled Gmail source, and it is the only check besides `component:*` that contacts another
+machine. Every surface that runs `doctor` runs it — the command line, the MCP tool, `GET /api/v1/health` and the web
+dashboard — so a running server reuses a source's result for 30 seconds rather than
+spending that call each time one of them is opened, and says so the way `component:*` does:
+`facts.observed_seconds_ago` and `facts.freshly_measured`, with `(observed Ns ago)` in `detail`
+when it was not measured just now. Only results that needed Google are reused; a problem found
+without asking it (options, a missing secret or client library) is re-checked every time. A
+`manicule doctor` from the command line is a new process with nothing reused, so it always
+measures. (`/healthz` and `/readyz` run no check.) `facts.sources` maps each source's name to one of a fixed set of words —
+`ok`, `invalid_options`, `dependency_missing`, `missing_secret`, `different_mailbox`, `grant_revoked`, `credential_rejected` or
+`unreachable` — and neither it nor `detail` ever carries an address, a token or a secret:
+`doctor` output is read by more people than the mailbox is. The remedy for a
+revoked grant, a refused client or a token for the wrong mailbox is to mint a new refresh token
+as the configured account and supply it as the source's `refresh_token`; `manicule connector
+login` does not support Gmail yet ([#461](https://github.com/mgd43b/manicule/issues/461)), so the
+remedy does not name it. For a missing secret it names the two settings, and for an unreachable Google it says to check the
+network and run `doctor` again. The connector this credential is for does not exist yet
+([#460](https://github.com/mgd43b/manicule/issues/460)), so a passing check means the credential
+is ready, not that mail is being indexed.
+
 **`name` is the stable identifier.** It is what a monitor selects on, so it is chosen once and
 does not move with the wording. `detail` is the sentence a person reads and is free to be
 reworded; `facts` is the same finding as data, so that nobody has to recover a number by
@@ -1076,8 +1108,8 @@ shortest actionable instruction. `remedy` is empty on a healthy check, and on on
 depends on how the state was reached rather than on a step that can be named: an empty `remedy`
 means manicule has nothing specific to suggest, never that the check is fine.
 
-**`component:*` checks are the only part of a diagnosis that leaves the machine**, and they
-are bounded twice because of it. Components are asked concurrently rather than in turn, so a
+**`component:*` checks, and `gmail-credential` for a configured Gmail source, are the only parts
+of a diagnosis that leave the machine**, and `component:*` is bounded twice because of it. Components are asked concurrently rather than in turn, so a
 diagnosis costs the slowest remote check instead of the sum of all of them; one that does not
 answer within its own timeout is `degraded` with a detail saying so, and the whole sweep has a
 deadline past which outstanding checks are named as outstanding rather than dropped. "It did
@@ -1129,8 +1161,8 @@ libraries with the same gap: seeding the declared tree-sitter grammars
 vocabularies every search measures a context with
 ([`retrieval.md`](retrieval.md#72-two-token-counters-and-using-the-wrong-one-is-a-category-error) §7.2), each from an offline
 bundle if one is installed and from its upstream otherwise — and then reports the state that
-resulted. They are the only parts of this command that write to the machine or use the network,
-and the flag is passed by **the command line alone**: the MCP tool and `GET /api/v1/health`
+resulted. They are the only parts of this command that write to the machine, and with
+`component:*` and `gmail-credential` the only ones that use the network. The flag is passed by **the command line alone**: the MCP tool and `GET /api/v1/health`
 call the report, because a diagnostic an assistant can reach should not be able to start a
 download. `manicule init` runs the same repairs, which is how a fresh install ends up able to
 parse code and answer a question rather than discovering at first index, or at first search,

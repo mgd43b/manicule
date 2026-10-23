@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import Self
 from urllib.parse import urlsplit
@@ -38,9 +38,12 @@ from manicule.connectors.site_routes import normalize_base_url, normalize_reposi
 from manicule.core.errors import ConfigError
 
 __all__ = [
+    "ALWAYS_EXCLUDED_LABELS",
     "CONNECTOR_NAME",
     "FILESYSTEM_CONNECTOR_NAME",
     "GIT_SITE_CONNECTOR_NAME",
+    "GMAIL_CONNECTOR_NAME",
+    "REPRESENTATION_VERSION",
     "SNAPSHOT_CONNECTOR_NAME",
     "AuthMethod",
     "ConfluenceConfig",
@@ -50,7 +53,10 @@ __all__ = [
     "FilesystemConfig",
     "FullInventoryAuthority",
     "GitSiteConfig",
+    "GmailConfig",
     "resolve_credentials",
+    "resolve_gmail_credentials",
+    "resolve_label_ids",
 ]
 
 CONNECTOR_NAME = "confluence"
@@ -71,6 +77,27 @@ reaches no network cannot be misconfigured into trying.
 
 GIT_SITE_CONNECTOR_NAME = "git-site"
 """The registered name of the commit-pinned local website connector."""
+
+GMAIL_CONNECTOR_NAME = "gmail"
+"""The registered name of the Gmail connector."""
+
+REPRESENTATION_VERSION = "rfc822/1"
+"""What the Gmail connector fetches and hands to the parser, as a version token.
+
+Part of the scope fingerprint (:meth:`GmailConfig.scope_fingerprint`), because a stored message
+is never fetched again by id: changing what is fetched has to discard the stored history
+position, or no message would ever be re-fetched (``docs/connectors/gmail.md`` §4.1). Bump the
+number when the representation changes.
+"""
+
+ALWAYS_EXCLUDED_LABELS = ("SPAM", "TRASH", "DRAFT")
+"""The labels no Gmail configuration can bring back into scope (``gmail.md`` §3)."""
+
+GMAIL_QUOTA_UNITS_PER_MINUTE = 6_000
+"""Gmail's per-user limit, in quota units a minute. The ceiling for ``quota_units_per_minute``."""
+
+GMAIL_RAW_MESSAGE_UNITS = 60
+"""What one ``messages.get?format=raw`` costs. A budget below it could never fetch a message."""
 
 
 class GitSiteConfig(BaseModel):
@@ -821,6 +848,287 @@ def resolve_credentials(
         resolved = config.model_copy(update={"personal_access_token": token})
 
     return resolved
+
+
+_SYSTEM_LABELS = frozenset(label.casefold() for label in ALWAYS_EXCLUDED_LABELS)
+
+
+class GmailConfig(BaseModel):
+    """Configuration for the Gmail connector (``docs/connectors/gmail.md`` §1, §3).
+
+    Set under ``[connectors.<name>.options]`` for a ``type = "gmail"`` source. Printing it never
+    shows a secret: both are :class:`~pydantic.SecretStr`, and ``hide_input_in_errors`` keeps a
+    rejected value, the mailbox address included, out of a validation message.
+
+    **What is deliberately not a setting** (``gmail.md`` §3, §5), so that its absence reads as a
+    decision rather than an omission, and ``extra="forbid"`` turns an attempt to set one into a
+    startup error instead of a silently ignored line:
+
+    - No free-form ``query``. Incremental discovery cannot evaluate one, so a query would be
+      honored by the full walk and by nothing after it. Label membership is the only scope all
+      three discovery paths can test.
+    - No ``include_spam_trash``. SPAM, TRASH and DRAFT are always excluded.
+    - No ``user``. A grant reads only its own mailbox; ``account`` pins which one that must be.
+    - No message or attachment size cap. Size is the pipeline's ``ingest.max_fetch_bytes``.
+    - No token endpoint. The refresh goes to Google's, and a setting for it would let one line of
+      configuration send the client secret and the refresh token to any host.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    account: str = Field(
+        min_length=1,
+        description="The one mailbox this instance indexes, as its primary address. A token for "
+        "any other mailbox is refused, and editing this on an instance that has synced is "
+        "refused too: indexing a different mailbox is a different instance.",
+    )
+    """**Required, and the primary address.** The token decides which mailbox is read, and a
+    token is replaced routinely, so the mailbox is configuration rather than a side effect of
+    whichever credential happens to be supplied (``gmail.md`` §1.4). It is compared with what
+    ``users.getProfile`` reports, which is the primary address: an alias is refused as a
+    mismatch rather than followed. Stored lowercase, because Google compares addresses without
+    regard to case and two spellings of one address must not be two scopes."""
+
+    client_id: str = Field(
+        min_length=1,
+        description="The OAuth client's id. Not a secret.",
+    )
+
+    client_secret: SecretStr | None = Field(
+        default=None,
+        description="The OAuth client's secret. Resolved from the environment when unset — see "
+        "``client_secret_env``. Held as a secret so printing configuration cannot leak it.",
+    )
+
+    client_secret_env: str = Field(
+        default="GMAIL_CLIENT_SECRET",
+        min_length=1,
+        description="Environment variable consulted when no client secret is set here.",
+    )
+
+    refresh_token: SecretStr | None = Field(
+        default=None,
+        description="The long-lived refresh token ``manicule connector login`` mints. Resolved "
+        "from the environment when unset — see ``refresh_token_env``.",
+    )
+
+    refresh_token_env: str = Field(
+        default="GMAIL_REFRESH_TOKEN",
+        min_length=1,
+        description="Environment variable consulted when no refresh token is set here. A "
+        "credential in a configuration file is a credential in version control eventually, so "
+        "this is the documented path.",
+    )
+
+    exclude_labels: tuple[str, ...] = Field(
+        default=(),
+        max_length=256,
+        description="Label **names** whose messages are never indexed, resolved to ids through "
+        "``users.labels.list``. SPAM, TRASH and DRAFT are always excluded and are not listed "
+        "here. A name the mailbox does not have is a configuration error, never an empty "
+        "exclusion.",
+    )
+
+    quota_units_per_minute: int = Field(
+        default=5_400,
+        ge=GMAIL_RAW_MESSAGE_UNITS,
+        le=GMAIL_QUOTA_UNITS_PER_MINUTE,
+        description="The client's own pacing budget: 90% of Gmail's per-user limit of 6,000 "
+        "units a minute. Requests wait before they would exceed it, so the client is steered by "
+        "its own accounting rather than by 429s.",
+    )
+    """Bounded on both sides, and for different reasons. Above 6,000 the budget is a promise
+    the source will not keep, and the client is back to steering by 429s. Below 60 — the cost of
+    one raw message — no fetch could ever be admitted, and the run would wait forever instead of
+    saying why."""
+
+    max_retry_after_seconds: float = Field(
+        default=120.0,
+        gt=0.0,
+        description="Longest single pause honored from a ``Retry-After`` header; a longer "
+        "request stops the run.",
+    )
+    """As :attr:`ConfluenceConfig.max_retry_after_seconds`: a sync that sleeps for an hour inside
+    one HTTP call is indistinguishable from a hung one, and a stopped run re-runs against an
+    unadvanced watermark."""
+
+    max_retries: int = Field(
+        default=5,
+        ge=0,
+        description="Attempts after the first for a throttled, failed or interrupted request.",
+    )
+
+    request_timeout_seconds: float = Field(default=30.0, gt=0.0)
+
+    @field_validator("account")
+    @classmethod
+    def _account(cls, value: str) -> str:
+        # The value is never echoed: it is the address this whole connector is careful not to
+        # print, and a configuration error is read by a wider audience than the mailbox is.
+        address = value.strip().casefold()
+        local, separator, domain = address.partition("@")
+        if (
+            not separator
+            or not local
+            or not domain
+            or "@" in domain
+            or any(c.isspace() for c in address)
+        ):
+            msg = (
+                "account must be a mailbox address of the form name@example.org: the primary "
+                "address of the Google Workspace account whose mail this instance indexes"
+            )
+            raise ValueError(msg)
+        return address
+
+    @field_validator("client_id")
+    @classmethod
+    def _client_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("client_id is blank; set the OAuth client's id")
+        return value.strip()
+
+    @field_validator("exclude_labels")
+    @classmethod
+    def _exclude_labels(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        names: list[str] = []
+        for raw in values:
+            name = raw.strip()
+            if not name:
+                msg = (
+                    "exclude_labels contains an empty name; remove it rather than excluding nothing"
+                )
+                raise ValueError(msg)
+            if name.casefold() in _SYSTEM_LABELS:
+                msg = (
+                    f"exclude_labels lists {name!r}, which is always excluded. SPAM, TRASH and "
+                    f"DRAFT cannot be brought back into scope, so listing one does nothing; "
+                    f"remove it — a setting that silently does nothing reads like one in force."
+                )
+                raise ValueError(msg)
+            names.append(name)
+        return tuple(dict.fromkeys(names))
+
+    @model_validator(mode="after")
+    def _secrets_not_blank(self) -> Self:
+        for field_name in ("client_secret", "refresh_token"):
+            secret = getattr(self, field_name)
+            if secret is not None and not secret.get_secret_value():
+                msg = (
+                    f"{field_name} is set to an empty string. Leave it unset to read "
+                    f"${getattr(self, field_name + '_env')}, or give it a value."
+                )
+                raise ValueError(msg)
+        return self
+
+    @property
+    def pinned_identity(self) -> str:
+        """A digest of the configured mailbox, for the pipeline to compare across runs.
+
+        A digest rather than the address, because it is stored beside the instance's run
+        metadata, which status surfaces read, and those carry no address (``gmail.md`` §10).
+        Independent of :meth:`scope_fingerprint` on purpose: a scope change keeps the source and
+        re-walks it, and a different mailbox must never be treated as one.
+        """
+        return hashlib.blake2b(f"gmail-account:{self.account}".encode(), digest_size=20).hexdigest()
+
+    def scope_fingerprint(self, source_scope: str, excluded_label_ids: Iterable[str]) -> str:
+        """The scope a stored history position is valid for.
+
+        Takes the **resolved** label ids rather than the configured names, because ids are what
+        every discovery path tests (``gmail.md`` §3) and a label renamed in Gmail is the same
+        scope. Resolving them needs ``users.labels.list``, which is the REST client's call, so
+        the connector resolves first (:func:`resolve_label_ids`) and passes the result.
+
+        ``account`` and the representation version are in it as well, so state recorded for one
+        mailbox is never resumed for another even if the credential check were bypassed, and a
+        change to what is fetched discards the history position (``gmail.md`` §1.4, §4.1).
+        """
+        material = json.dumps(
+            {
+                "source_scope": source_scope,
+                "account": self.account,
+                "excluded_label_ids": sorted(set(excluded_label_ids)),
+                "representation": REPRESENTATION_VERSION,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.blake2b(material.encode(), digest_size=20).hexdigest()
+
+
+def resolve_label_ids(names: Iterable[str], name_to_id: Mapping[str, str]) -> tuple[str, ...]:
+    """The label ids for configured label names, sorted and without duplicates.
+
+    Pure, so the rule is testable without a mailbox: ``name_to_id`` is whatever
+    ``users.labels.list`` returned. Matching is exact, because a near match is a guess about
+    which mail to keep out.
+
+    Raises:
+        ConfigError: A name is not in ``name_to_id``. It names the **configured** name, which is
+            the operator's own text, and never lists the labels the mailbox has: label names are
+            mail-derived, and run-level errors carry none (``gmail.md`` §3, §10). Refused rather
+            than skipped, because a typo that silently excluded nothing would index precisely the
+            mail the operator meant to keep out.
+    """
+    ids: set[str] = set()
+    for name in names:
+        label_id = name_to_id.get(name)
+        if label_id is None:
+            msg = (
+                f"exclude_labels names {name!r}, which is not a label in this mailbox. Names "
+                f"are matched exactly, nested labels are written with their slashes "
+                f"('Parent/Child'), and a label that does not exist excludes nothing — which "
+                f"is why it is refused rather than ignored."
+            )
+            raise ConfigError(msg)
+        ids.add(label_id)
+    return tuple(sorted(ids))
+
+
+def resolve_gmail_credentials(
+    config: GmailConfig, environ: Mapping[str, str] | None = None, *, instance: str = ""
+) -> GmailConfig:
+    """Fill in the client secret and refresh token from the environment, refusing any gap.
+
+    Runs in the factory, before the connector is constructed, on the principle
+    :func:`resolve_credentials` states: a credential problem found at the first request of the
+    first sync is a run that reports progress and indexes nothing. An explicitly configured
+    value is never overwritten by an environment variable, and a blank variable counts as unset.
+
+    Args:
+        config: The validated settings. ``account`` and ``client_id`` are required by the model,
+            so the container has already named them if either was missing.
+        environ: The environment to read; the process's own by default.
+        instance: The configured source's name, so the message points at the table the setting
+            belongs in rather than at the global slot.
+
+    Raises:
+        ConfigError: The client secret or the refresh token is absent. The message names the
+            setting and the environment variable, and never a value.
+    """
+    env = os.environ if environ is None else environ
+    where = f"[connectors.{instance}.options]" if instance else 'plugins.config."connector.gmail"'
+
+    client_secret = config.client_secret or _secret(env.get(config.client_secret_env))
+    if client_secret is None:
+        msg = (
+            f"the Gmail connector needs the OAuth client's secret. Set client_secret in {where}, "
+            f"or put it in ${config.client_secret_env}. It is the secret of the Desktop-app "
+            f"OAuth client created in docs/connectors/gmail.md §1.3."
+        )
+        raise ConfigError(msg)
+    refresh_token = config.refresh_token or _secret(env.get(config.refresh_token_env))
+    if refresh_token is None:
+        msg = (
+            f"the Gmail connector needs a refresh token. Set refresh_token in {where}, or put it "
+            f"in ${config.refresh_token_env}. `manicule connector login "
+            f"{instance or '<name>'}` mints one."
+        )
+        raise ConfigError(msg)
+    return config.model_copy(
+        update={"client_secret": client_secret, "refresh_token": refresh_token}
+    )
 
 
 def _secret(value: str | None) -> SecretStr | None:

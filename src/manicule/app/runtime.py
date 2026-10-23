@@ -1292,6 +1292,22 @@ async def _publication_bound_vectors(runtime: Runtime) -> PublicationBoundVector
     return vectors if isinstance(vectors, PublicationBoundVectorStore) else None
 
 
+async def _hold_pinned_identity(connector: Connector, store: IngestStore) -> None:
+    """Hold a reconciliation to the identity its source synced as, before it reads anything.
+
+    The rule is the pipeline's (:func:`~manicule.ingest.pipeline.hold_pinned_identity`), taken
+    here directly because a pass does not construct a pipeline, which needs an embedder. Without
+    it a replaced credential would diff one account's inventory against another account's
+    documents.
+    """
+    from manicule.ingest.pipeline import hold_pinned_identity  # noqa: PLC0415
+    from manicule.ingest.ports import AcquisitionStore  # noqa: PLC0415
+
+    await hold_pinned_identity(
+        connector, store, store if isinstance(store, AcquisitionStore) else None
+    )
+
+
 def _confirmed(connector: str, applied: Reconciliation | Sequence[str]) -> Reconciliation:
     """One result shape for confirming a proposal, whichever store kept it.
 
@@ -1460,6 +1476,7 @@ class _Ingestion:
 
         built = await self._runtime.connector(connector)
         store = cast("IngestStore", await self._runtime.documents())
+        await _hold_pinned_identity(built, store)
         async with self._runtime.derived_mutation_guard():
             return await run_reconcile(
                 built,
@@ -1485,6 +1502,8 @@ class _Ingestion:
 
         built = await self._runtime.connector(connector)
         store = cast("IngestStore", await self._runtime.documents())
+        if confirm:
+            await _hold_pinned_identity(built, store)
         scope = connector_scope(built)
         async with self._runtime.derived_mutation_guard():
             if not confirm:

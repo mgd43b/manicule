@@ -2747,6 +2747,46 @@ by the time the *N*th is accepted, so the bound is applied where discovery hands
   thousand documents that advanced a position would skip the other nine thousand nine hundred
   and ninety on every subsequent sync, silently.
 
+### 13.2.3 A pinned identity holds an instance to one account
+
+For a connector whose identity is not where it reads from. A mailbox is chosen by the
+credential, and credentials are replaced routinely, so a connector may expose a
+`pinned_identity` string — a digest, never the identity itself, because it is stored beside the
+source's run metadata. Before a run reads a watermark or enumerates anything,
+`hold_pinned_identity` (which `IngestPipeline.run` calls) compares it with the one recorded for that
+source:
+
+- **Equal, or none recorded yet:** the run proceeds, and the first run records it.
+- **Different, and the source has synced:** the run is refused with `PinnedIdentityError`, a
+  `ConfigError`, and nothing is read. *Synced* means the source still holds documents, or has an
+  acquisition run that began and did not settle. The message says to give the other account a
+  new connector name and to delete the documents the old instance indexed.
+- **Different, and the source never synced:** the pin moves freely. Deleting a source's
+  documents is what releases a pin on one that has.
+
+The stored cursor is held to the identity as well. The non-durable path reads a watermark with no
+scope fingerprint, so after a pin is released the old account's cursor would still be stored and
+would be handed to the new account. A run that commits a watermark records the identity beside it
+(`watermark_identity`), and a cursor whose recorded identity is not the connector's current one
+is not used: that run does a complete walk, and its own watermark replaces the old one.
+
+The durable cursor is held to the identity too: `snapshot_scope` folds a declared identity into
+the fingerprint it hands the acquisition store, whether the connector computed its own fingerprint
+or not, so a cursor committed under one identity is never read back under another.
+
+The scope fingerprint alone cannot do this job. It includes the identity, so a different one makes
+the stored watermark invisible rather than wrong, and the run would begin a complete walk of
+the second account beside the first account's documents; and it cannot tell an edit to the
+identity from an edit to the scope, only one of which should keep the source. A connector
+without the attribute is unaffected. The only one that declares it today is Gmail's
+configuration (`GmailConfig.pinned_identity`; [`connectors/gmail.md`](connectors/gmail.md) §1.4),
+and the connector that would be held to it is [#460](https://github.com/mgd43b/manicule/issues/460).
+The hold is taken by `IngestPipeline.run` and by the runtime's reconcile operation
+(`_Ingestion.reconcile`, and the confirming half of `resolve_proposal`) through the same function,
+before anything is enumerated, so that a replaced credential cannot reconcile one account's
+documents against another account's inventory. A reconciliation does not construct a pipeline
+(which needs an embedder), which is why the rule is a function and not only a method.
+
 ### 13.3 Cancellation
 
 `Ctrl-C`, `manicule sync --stop`, or shutdown:
@@ -2858,6 +2898,9 @@ for documents filed under a connector *type* while an instance of that type is c
 `collection-membership`, for a corpus no collection holds — which the pipeline also reports per
 run, as `collected`/`uncollected` on `IngestReport` (§13.1); and `reconciliation-overdue` and
 `reconciliation-proposals`, for the cadence and the guard-2 refusals of §11.
+A fifth check sits beside them but asks a different question: `gmail-credential` is about a
+source's credential rather than about what the pipeline stored, and it contacts Google, which
+none of the others do.
 
 | Check | Detects |
 |---|---|
