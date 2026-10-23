@@ -2337,7 +2337,9 @@ someone remembers is deletion detection that does not run.
 **That cadence is the design, and nothing runs it yet.** `manicule.ingest.reconcile.reconcile`
 is implemented and tested as described below, but no command, service method or schedule
 calls it, and `reconcile_interval_s` is read nowhere but its own definition. So today a
-document that leaves its source stays indexed until `manicule document delete` removes it.
+document that leaves a configured connector's source stays indexed until `manicule document
+delete` removes it. `manicule index --watch` is the exception for a watched directory: it
+removes a file on its delete event (§12), which is evidence of its own rather than an absence.
 [`connectors/gmail.md`](connectors/gmail.md) §7 makes wiring it in a prerequisite of the Gmail
 connector, because for a mailbox the consequence is deleted mail that stays searchable.
 

@@ -168,11 +168,22 @@ at most a message's label ids. A query that mentioned a sender, a date or a word
 evaluated on the full walk and impossible to evaluate on every incremental sync after it. Label
 membership is the only scope all three paths can test, so it is the only scope there is.
 
-**Each path tests it the same way.** A full walk and reconciliation ask `messages.list` for
-`includeSpamTrash=false` with a query *derived mechanically* from the exclusion set
-(`-in:drafts -label:<name> …`), never written by the operator. Incremental discovery tests the
-same set against each message's label ids (§4.2). Both are tests of one set of label ids, so
-they cannot disagree about what a label means.
+**Each path tests label ids, and no path translates a label into a search query.** A query
+built from names would be lossy in exactly the cases that matter: a name with spaces or a
+slash, a nested label, a category such as `CATEGORY_PROMOTIONS` that search spells
+`category:promotions` rather than `label:`. So:
+
+- **A full walk and reconciliation** list the excluded labels first — one
+  `messages.list?labelIds=<id>` walk per excluded label, DRAFT included — into a durable
+  exclusion set, then page `messages.list?includeSpamTrash=false` and skip every id in that
+  set. The set is journaled like any inventory, never held as a process-sized collection.
+  Listing is 5 units per 500 ids, so each excluded label costs what its size costs to list.
+- **Incremental discovery** tests each message's label ids against the same set of excluded
+  label ids (§4.2).
+
+A label applied or removed between the exclusion listing and the main walk is caught by the
+overlap §4.1 describes: the position is captured before either listing, so the next incremental
+sync sees that label change and acts on it.
 
 **`exclude_labels` is a scope field.** It enters the scope fingerprint, and changing it forces a
 complete replacement from a fresh inventory, as every membership-affecting field does.
@@ -189,8 +200,9 @@ records after a given id. That is the change signal, and the watermark is a `his
 
 1. Call `users.getProfile` and keep its `historyId`. **This is captured before the walk begins**,
    and it becomes the watermark if the walk completes.
-2. Page `users.messages.list` (500 ids a page, the maximum) under the derived scope query.
-3. Yield each id with its version token.
+2. List the excluded labels into the exclusion set (§3).
+3. Page `users.messages.list` (500 ids a page, the maximum) with `includeSpamTrash=false`, and
+   yield each id not in the exclusion set, with its version token.
 
 **Why the position is captured first.** Google's own sync recipe takes the `historyId` of the
 newest message *after* listing. Anything that arrives while a long walk is in progress — and a
@@ -261,8 +273,10 @@ pointing at the message, exactly as an `.eml` file's do.
 proves nothing about anything else in the mailbox.
 
 **Size** is the pipeline's existing limit on a fetched body, `ingest.max_fetch_bytes`, not a
-Gmail setting. A message that exceeds it is refused by name and counted, never truncated: a
-truncated message would parse, cite and answer from the half that arrived.
+Gmail setting. A message that exceeds it is refused, never truncated: a truncated message would
+parse, cite and answer from the half that arrived. The refusal is recorded against that
+message's own document, inside the workspace like the message itself, and counted in the run
+report; the count is all that reaches a status surface (§10).
 
 ---
 
@@ -282,13 +296,13 @@ Google's quota page (last updated 2026-10-16; checked for this document on 2026-
 
 **The consequence is the most important number on this page: about 100 raw messages a minute
 per mailbox.** 6,000 units divided by 60. A first sync is bound by that, not by parsing or
-embedding:
+embedding. At the default pacing budget below (90 messages a minute):
 
-| Messages | First-sync fetch time at the ceiling |
+| Messages | First-sync fetch time at the default budget |
 |---|---|
-| 10,000 | about 1 hour 40 minutes |
-| 100,000 | about 17 hours |
-| 500,000 | about 3.5 days |
+| 10,000 | about 1 hour 50 minutes |
+| 100,000 | about 18.5 hours |
+| 500,000 | about 3.9 days |
 
 After the first sync the budget is ample: a day's new mail is a few hundred fetches, history
 pages cost 2 units, and a complete inventory of 100,000 ids is about 1,000 units.
@@ -298,12 +312,20 @@ pages cost 2 units, and a complete inventory of 100,000 ids is about 1,000 units
 else using the same project), and waits before a request would exceed it. A 429 is still
 handled — honoring `Retry-After` in both its forms, and stopping the run when the requested
 pause exceeds `max_retry_after_seconds`, as the Confluence client does — but it is the
-exception, not the steering mechanism. A client that discovers its limit by hitting it spends a
-first sync of seventeen hours being told no.
+exception, not the steering mechanism. A client that discovers its limit by hitting it spends
+most of a day's first sync being told no.
 
 **An interrupted first sync resumes**, through durable acquisition
 ([`ingest.md`](../ingest.md) §13.2): committed messages are not fetched again, so stopping a long
 first sync costs the minutes since the last commit, not the hours before it.
+
+**The discovery journal bounds the largest mailbox a first sync can take.** Listing is fast —
+a million ids is 2,000 calls — and fetching is slow, so a first walk admits every id long before
+the fetches drain them, and every one of them is an unsettled discovery record until its
+message is fetched. `ingest.max_journal_records` (default 1,000,000) caps those records, and a
+walk that reaches the cap stops safely rather than growing the journal without bound. A mailbox
+of more than about a million messages in scope therefore needs that limit raised, with the disk
+it implies, or `exclude_labels` used to bring the first sync under it.
 
 **Errors**, as the client types them ([#459](https://github.com/mgd43b/manicule/issues/459)):
 
@@ -325,8 +347,8 @@ leave the index.** For mail this is not housekeeping. Deleting a message is how 
 it should not exist, and an index that keeps serving it has overruled them.
 
 **The mechanism is reconciliation: a complete id inventory diffed against what is stored**
-([`ingest.md`](../ingest.md) §11). `reconcile` pages `messages.list` under the same derived
-scope query as the full walk — the same scope, by construction — through
+([`ingest.md`](../ingest.md) §11). `reconcile` builds the same exclusion set and pages the same
+`messages.list` walk as the full walk — the same scope, by construction — through
 `BatchedReconciliationConnector`, and raises rather than returning a prefix if any page fails.
 It is cheap: ids only, 5 units per 500, so a 100,000-message mailbox is about 1,000 units, a
 few seconds of the per-minute budget. A mail installation can afford to reconcile daily or
@@ -335,9 +357,11 @@ hourly.
 **Nothing in manicule runs reconciliation today, for any connector.**
 `manicule.ingest.reconcile.reconcile` exists, is tested, and has no caller in the product; no
 command, service method or schedule invokes it, and `reconcile_interval_s` is read nowhere but
-its own definition. `connector sync` never removes a document that left its source. The only
-bulk retirement in the product is offline rebuild publication ([`ingest.md`](../ingest.md)
-§10.4), which needs retained source bytes and is not a sync. [`ingest.md`](../ingest.md) §11's
+its own definition. `connector sync` never removes a document that left its source. Two things
+do remove documents, and neither helps here: `manicule index --watch` removes a file on its
+delete event, which only a watched directory has; and offline rebuild publication
+([`ingest.md`](../ingest.md) §10.4) retires what a replacement does not contain, which needs
+retained source bytes and is not a sync. [`ingest.md`](../ingest.md) §11's
 "after every full sync, and on a schedule" describes the design, not the code.
 
 For Confluence that means a deleted page lingers. For a mailbox it means deleted mail is
@@ -390,9 +414,9 @@ a real trade with no default that suits everyone:
   byte-identical copy of the mailbox at rest, reachable by whoever can read the data directory or
   its backups.
 - **Not retained**: only parsed text, chunks and vectors persist. The cost is that every re-parse
-  is a re-fetch, at the §6 ceiling — a parser change that touches every message of a
-  100,000-message mailbox is seventeen hours of quota, and an offline rebuild is not available at
-  all.
+  is a re-fetch, at the §6 pace — a parser change that touches every message of a
+  100,000-message mailbox is about eighteen hours of quota, and an offline rebuild is not
+  available at all.
 
 The connector does not override the installation's storage default; the deployment decides, and
 this section is what it decides with.
@@ -420,8 +444,10 @@ answers included. Roles decide what a person may do, not what they may read.
 - **At rest**: retained bytes (§9), soft-deleted mail for the grace period (§7), and any backup
   of the data directory hold mail. Exclude the installation from backups that are kept longer or
   more widely than the mail itself would be.
-- **Diagnostics are aggregate.** No log, telemetry record, status surface, error message or
-  fixture carries an address, subject, label name, message id or body.
+- **Diagnostics are aggregate.** No log, telemetry record, status surface, run-level error or
+  fixture carries an address, subject, label name, message id or body. A record about one
+  message — its status, a refusal (§5) — belongs to that message's document and is as private
+  as the message is; it is never copied into anything wider.
 
 ---
 
