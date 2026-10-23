@@ -203,6 +203,10 @@ class FakeGmail:
         self.records: list[dict[str, object]] = []
         self.loop_pagination = False
         """Send ``messages.list`` pagination back to the first page's token."""
+        self.raw_override: str | None = None
+        """Answer ``format=raw`` with this text in place of the encoded message."""
+        self.request_times: list[float] = []
+        """When each request reached the server, by the fake's clock."""
         self.corrupt_raw = False
         """Answer ``format=raw`` with a stray character in the middle of the base64url."""
         self.rejecting_all_tokens = False
@@ -349,6 +353,11 @@ class FakeGmail:
 
         self._faults.extend([refuse_connection] * times)
 
+    @property
+    def faults_pending(self) -> int:
+        """Injected faults no request has consumed yet."""
+        return len(self._faults)
+
     def queries(self) -> list[dict[str, list[str]]]:
         """Every request's query string, parameter names to all their values."""
         found: list[dict[str, list[str]]] = []
@@ -363,6 +372,7 @@ class FakeGmail:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        self.request_times.append(self._clock())
         if request.url.host != HOST or not request.url.path.startswith(PREFIX):
             return httpx.Response(404, json=_error(404, "NOT_FOUND", "notFound"))
         path = request.url.path[len(PREFIX) :]
@@ -491,6 +501,8 @@ class FakeGmail:
             # One stray character inside otherwise valid base64: the kind of damage a lenient
             # decoder discards without a word, returning a message with bytes missing.
             body["raw"] = encoded[:8] + "*" + encoded[8:] if self.corrupt_raw else encoded
+            if self.raw_override is not None:
+                body["raw"] = self.raw_override
         elif shape != "minimal":
             return httpx.Response(400, json=_error(400, "INVALID_ARGUMENT", "invalidArgument"))
         return httpx.Response(200, json=body)

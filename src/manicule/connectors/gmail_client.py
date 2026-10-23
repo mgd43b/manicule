@@ -30,13 +30,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import logging
 import re
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast, override
 from urllib.parse import quote
 
 from manicule.connectors.errors import (
@@ -76,7 +77,9 @@ __all__ = [
     "QuotaPacer",
 ]
 
-API_BASE: Final = "https://gmail.googleapis.com/gmail/v1/users/me"
+_ORIGIN: Final = "https://gmail.googleapis.com"
+
+API_BASE: Final = f"{_ORIGIN}/gmail/v1/users/me"
 """Every call is made as the authenticated user (``me``); there is no setting for another."""
 
 PAGE_SIZE: Final = 500
@@ -99,6 +102,31 @@ _RATE_LIMIT_REASONS: Final = frozenset({"ratelimitexceeded", "userratelimitexcee
 
 _SAFE_REASON: Final = re.compile(r"[A-Za-z_]{1,64}")
 """What a ``reason`` must look like to be quoted: a token, never free text naming a label."""
+
+_HTTPX_LOGGER: Final = "httpx"
+
+
+class _RedactGmailUrls(logging.Filter):
+    """Keeps a Gmail request's path and query out of the HTTP stack's own log records.
+
+    ``httpx`` logs every request it sends at INFO, URL included, and for ``messages.get`` the URL
+    holds the message id; its query holds page tokens, history positions and label ids. An
+    application that turns that logger up would then write what §10 forbids, whatever this
+    client does with its own exceptions. Only records naming Gmail's host are touched, so no
+    other client's logging changes.
+    """
+
+    @override
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                f"{_ORIGIN}/[redacted]" if str(argument).startswith(_ORIGIN) else argument
+                for argument in record.args
+            )
+        return True
+
+
+_REDACT_GMAIL_URLS: Final = _RedactGmailUrls()
 
 type Params = Sequence[tuple[str, str]]
 type Json = Mapping[str, object]
@@ -304,6 +332,8 @@ class GmailClient:
         # does and plugin discovery does not — is the only thing that pulls in the HTTP stack.
         import httpx  # noqa: PLC0415 - see the module docstring
 
+        # Idempotent: a filter already on the logger is not added twice.
+        logging.getLogger(_HTTPX_LOGGER).addFilter(_REDACT_GMAIL_URLS)
         self._client = httpx.AsyncClient(
             transport=self._transport,
             headers={"Accept": "application/json"},
@@ -488,10 +518,13 @@ class GmailClient:
         refresh = False
         refreshed = False
         while True:
-            await self._pacer.acquire(cost)
-            self.requests += 1
+            # The token first: asking for one can be an HTTP call of its own (a refresh), and a
+            # charge made before it would be a second old by the time the request left, so two
+            # requests could land inside one window with the budget spent twice.
             token = await self._credential.access_token(refresh=refresh)
             refresh = False
+            await self._pacer.acquire(cost)
+            self.requests += 1
             try:
                 response = await client.get(
                     API_BASE + path,

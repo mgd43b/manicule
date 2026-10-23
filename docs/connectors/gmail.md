@@ -406,7 +406,9 @@ compared without regard to case or underscores and read from both `error.errors[
 call that received it, so a 404 from `getProfile` or `labels.list` is an ordinary unusable
 answer rather than a deleted message. A second 401 is a `SessionExpiredError` carrying the
 credential's own renewal sentence. Every message names the operation and a status, never an id,
-an address or a label name (§10):
+an address or a label name (§10), and the client redacts Gmail's request URLs from `httpx`'s
+own INFO log, which would otherwise print each message id (other clients' records are left
+alone):
 
 | Gmail answers | Typed as | Effect |
 |---|---|---|

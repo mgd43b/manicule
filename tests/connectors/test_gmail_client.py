@@ -10,13 +10,15 @@ import asyncio
 import email
 import email.policy
 import json
+import logging
 import subprocess
 import sys
 import tomllib
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from pathlib import Path
+from typing import override
 
 import pytest
 
@@ -573,6 +575,23 @@ async def test_an_unreachable_server_is_a_connector_error_after_the_budget() -> 
         await client.teardown()
 
 
+@pytest.mark.parametrize("raw", ["!!!!", "$$$$$$$$", "abc*def"])
+async def test_a_body_with_characters_outside_base64url_is_not_decoded_to_something(
+    raw: str,
+) -> None:
+    """A lenient decoder discards the characters and returns empty or shortened bytes."""
+    time = SimulatedTime()
+    server = _server(time)
+    message = server.add_message()
+    server.raw_override = raw
+    client, _ = await _client(server, time)
+    try:
+        with pytest.raises(ConnectorError, match="not base64url"):
+            await client.get_raw(message.id)
+    finally:
+        await client.teardown()
+
+
 async def test_a_body_that_is_not_base64url_is_a_connector_error() -> None:
     time = SimulatedTime()
     server = _server(time)
@@ -609,38 +628,80 @@ async def test_no_error_carries_a_message_id_an_address_or_a_label_name() -> Non
     message = server.add_message(labels=("INBOX", "Clients/Acme Corp"))
     server.delete_message(message, still_listed=True)
     client, _ = await _client(server, time, max_retries=1)
-    raised: list[str] = []
+    raised: list[ConnectorError] = []
+
+    async def failing(
+        call: Callable[[], Awaitable[object]], expected: type[ConnectorError]
+    ) -> None:
+        with pytest.raises(expected) as caught:
+            await call()
+        raised.append(caught.value)
+
     try:
-        for call in (
-            lambda: client.get_raw(message.id),
-            lambda: client.get_minimal(message.id),
-            lambda: _pages(client.history("1")),
-        ):
-            server.expire_history_through(server.history_id)
-            with pytest.raises(ConnectorError) as caught:
-                await call()
-            raised.append(str(caught.value))
-        server.time_out(5)
-        with pytest.raises(ConnectorError) as caught:
-            await client.get_raw(message.id)
-        raised.append(str(caught.value))
-        server.fail(503, times=5)
-        with pytest.raises(ConnectorError) as caught:
-            await client.get_minimal(message.id)
-        raised.append(str(caught.value))
+        await failing(lambda: client.get_raw(message.id), NotFoundError)
+        await failing(lambda: client.get_minimal(message.id), NotFoundError)
+        server.expire_history_through(server.history_id)
+        await failing(lambda: _pages(client.history("1")), CursorExpiredError)
+        # With max_retries=1 a failing call consumes exactly two queued faults.
+        server.time_out(2)
+        await failing(lambda: client.get_raw(message.id), RequestTimeoutError)
+        server.fail(503, times=2)
+        await failing(lambda: client.get_minimal(message.id), RemoteError)
         server.refuse("forbidden")
-        with pytest.raises(ConnectorError) as caught:
-            await client.get_minimal(message.id)
-        raised.append(str(caught.value))
+        await failing(lambda: client.get_minimal(message.id), PermissionDeniedError)
+        server.throttle(2, retry_after="1")
+        await failing(lambda: client.get_raw(message.id), RateLimitedError)
     finally:
         await client.teardown()
 
-    assert len(raised) == 6
-    for text in raised:
+    assert server.faults_pending == 0
+    assert [type(error) for error in raised] == [
+        NotFoundError,
+        NotFoundError,
+        CursorExpiredError,
+        RequestTimeoutError,
+        RemoteError,
+        PermissionDeniedError,
+        RateLimitedError,
+    ]
+    assert isinstance(raised[4], RemoteError)
+    assert raised[4].status_code == 503
+    for error in raised:
+        text = str(error)
         assert message.id not in text
         assert ADDRESS not in text
         assert "Acme" not in text
         assert "googleapis" not in text
+
+
+async def test_the_http_stacks_own_request_log_does_not_name_a_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``httpx`` logs each request's full URL at INFO; for ``messages.get`` that is the id."""
+    import httpx  # noqa: PLC0415
+
+    time = SimulatedTime()
+    server = _server(time)
+    message = server.add_message(labels=("INBOX", "Clients/Acme Corp"))
+    client, _ = await _client(server, time)
+    other = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={}))
+    )
+    caplog.set_level(logging.INFO, logger="httpx")
+    try:
+        await client.get_raw(message.id)
+        await _pages(client.history("1"))
+        await other.get("https://example.org/unrelated/path?page=7")
+    finally:
+        await client.teardown()
+        await other.aclose()
+
+    logged = [record.getMessage() for record in caplog.records if record.name == "httpx"]
+    gmail = [line for line in logged if "gmail.googleapis.com" in line]
+    assert len(gmail) == 2
+    assert all(message.id not in line and "startHistoryId" not in line for line in gmail)
+    # Another client's request is logged exactly as before.
+    assert any("https://example.org/unrelated/path?page=7" in line for line in logged)
 
 
 async def test_a_request_before_setup_is_refused() -> None:
@@ -725,6 +786,45 @@ async def test_concurrent_fetchers_share_one_budget() -> None:
 
     assert server.overruns == 0
     assert server.peak_units <= 5400
+
+
+class _SlowFirstToken(FakeCredential):
+    """A credential whose first token costs a second, as a refresh over HTTP would."""
+
+    def __init__(self, server: FakeGmail, time: SimulatedTime) -> None:
+        super().__init__(server)
+        self._time = time
+        self._asked = False
+
+    @override
+    async def access_token(self, *, refresh: bool = False) -> str:
+        if not self._asked:
+            self._asked = True
+            await self._time.sleep(1.0)
+        return await super().access_token(refresh=refresh)
+
+
+async def test_a_slow_token_lookup_does_not_shorten_the_gap_between_charges() -> None:
+    """The charge is made when the request leaves, not when the token was first asked for."""
+    time = SimulatedTime()
+    server = _server(time)
+    messages = [server.add_message() for _ in range(2)]
+    client = GmailClient(
+        FakeGmailSettings(quota_units_per_minute=COST_GET_RAW),
+        _SlowFirstToken(server, time),
+        transport=server.transport(),
+        sleep=time.sleep,
+        clock=time,
+    )
+    await client.setup()
+    try:
+        for message in messages:
+            await client.get_raw(message.id)
+    finally:
+        await client.teardown()
+
+    first, second = server.request_times
+    assert second - first >= WINDOW_SECONDS
 
 
 async def test_a_smaller_budget_is_honored() -> None:
