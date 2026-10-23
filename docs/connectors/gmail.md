@@ -116,15 +116,39 @@ type = "gmail"
 enabled = true
 
 [connectors.mail.options]
+account = "someone@example.org"   # the mailbox this instance indexes, and no other (§1.4)
 client_id = "1234567890-example.apps.googleusercontent.com"
 client_secret_env = "GMAIL_CLIENT_SECRET"
 refresh_token_env = "GMAIL_REFRESH_TOKEN"
 exclude_labels = []          # SPAM, TRASH and DRAFT are always excluded (§3)
 ```
 
-**The mailbox is the one the refresh token was granted by.** There is no `user` setting: with
-a per-person grant, the only mailbox the token can read is its own, and a setting that could
-name another would only ever produce a 403.
+### 1.4 One instance, one mailbox, pinned
+
+**A token can only read the mailbox that granted it, so the token decides which mailbox is
+indexed — and a token is replaced routinely.** Renewing a revoked grant, or re-running
+`connector login` from a browser signed in to a different account, would otherwise switch an
+instance to another mailbox with every configured field unchanged. The pipeline keys stored
+sync state on the connector's name and scope fingerprint and reuses a watermark whenever the
+fingerprint matches, so the new mailbox would resume from the old one's history position and
+unfinished inventory, while the old mailbox's mail stayed indexed beside it.
+
+So the mailbox is configuration, not a side effect of the credential:
+
+- **`account` is required**, and it is the address the instance indexes.
+- **It is checked against `users.getProfile`'s `emailAddress`** in the factory, in `doctor`'s
+  credential check and at the start of every run. A token for any other mailbox is a typed
+  credential error, and the run does not begin. The error says the token belongs to a different
+  mailbox without printing either address, since run-level errors are aggregate (§10). Ordinary
+  renewal cannot switch mailboxes, because the check fails before anything is read.
+- **`account` is part of the scope fingerprint** as well, so stored state from one mailbox is
+  never resumed for another even if the check were bypassed.
+- **Indexing a different mailbox is a different instance**, under a new connector name and
+  therefore a new source identity. The old instance's documents do not leave by themselves —
+  reconciliation is not wired (§7) — so they are deleted explicitly before or after the switch.
+  Editing `account` on an existing instance is refused with the same instruction rather than
+  treated as a scope change, because a scope change keeps the source and replaces its contents,
+  and the contents being replaced here are someone's mail.
 
 ---
 
@@ -135,7 +159,7 @@ name another would only ever produce a 403.
   the RFC 5322 `Message-ID` header, which the sender chooses, may be absent, and is shared by
   every copy of a message — a message sent to yourself is two Gmail messages with one header.
 - **`uri` is a link a person can open.** The search URL for the message's `Message-ID`
-  (`https://mail.google.com/mail/?authuser=<address>#search/rfc822msgid:<id>`), which survives
+  (`https://mail.google.com/mail/?authuser=<account>#search/rfc822msgid:<id>`), which survives
   Gmail interface changes better than an internal view path, and names the account so a
   browser signed in to several opens the right one. A message without a `Message-ID` falls back
   to `#all/<gmail id>`. §11 lists this as unverified against a live account.
@@ -223,9 +247,18 @@ reach-back ([`confluence.md`](confluence.md) §2) is structural here.
 
 **The version token is a constant.** A Gmail message's bytes never change after it is created —
 edits create new messages, and labels are not part of the bytes. So every message carries the
-same token (`rfc822/1`), and a message already stored is never fetched again by id. The `1` is
-there so that a change to what this connector fetches can force one complete re-fetch by
-changing it.
+same token (`rfc822/1`), and a message already stored is never fetched again by id.
+
+**The `1` is a representation version, and changing it alone would change nothing.** Its purpose
+is to force one complete re-fetch when what this connector fetches changes. But incremental
+discovery resumes from the stored history position (§4.2), so a message with no new history is
+never yielded, never reaches the version comparison, and keeps its old token forever. The
+representation version is therefore **also part of the scope fingerprint**. The pipeline reuses
+a stored watermark only under the fingerprint it was recorded with, so bumping the version
+discards the history position, the next sync is a complete walk (§4.1), and every in-scope
+message is yielded with the new token and fetched. An unfinished run recorded under the old
+version must not be resumed either; [#460](https://github.com/mgd43b/manicule/issues/460) tests
+that a bump mid-run starts a fresh complete walk rather than finishing the old one.
 
 The alternative was a hash of the message's label ids, which would let labels become searchable
 metadata later. It is rejected for now because labels move constantly — every read, star and
@@ -385,11 +418,22 @@ reconciliation runs on the schedule `reconcile_interval_s` describes.
   recorded as a proposal for confirmation (§11.1). Emptying a large folder into Trash, or adding
   a busy label to `exclude_labels`, will trip it. That is the guard working, and the proposal is
   confirmed rather than the ceiling raised.
-- **Soft deletion keeps mail for the grace period.** A reconciled message is soft-deleted, and
-  its chunks and vectors survive until the sweep, 30 days by default
-  ([`storage.md`](../storage.md) §8.2); its retained bytes, if any, until blob collection. Removed
-  from results is not removed from disk. An installation that must forget promptly sets
-  `soft_delete_grace_s` accordingly.
+- **Removed from results is not removed from disk, and nothing here erases a message.** A
+  reconciled message is soft-deleted. When the grace period ends (`soft_delete_grace_s`, 30 days
+  by default, [`storage.md`](../storage.md) §8.2), the sweep removes its chunks and vectors — the
+  derived text — and keeps the document row, which still carries the subject as its title, and
+  its reference to the retained bytes, so that a citation can explain itself. Blob collection
+  treats every document, version and acquisition reference as a root whatever the document's
+  status, so **retained raw mail is kept indefinitely** after the grace period. Lowering
+  `soft_delete_grace_s` shortens how long deleted mail is *searchable as derived text*; it does
+  not erase it.
+
+  Erasing one message today is manual: `manicule document delete --hard` removes the row, its
+  versions and its chunks, and the raw bytes go only once no acquisition record still references
+  them and blob collection runs. For an installation that must be able to forget, the honest
+  configuration is retention off (§9), which leaves no raw copy to erase — at the re-fetch cost §9
+  states. Erasure that follows the source on its own is not designed here; it is a requirement
+  on the reconciliation work §7 depends on, not something this connector can add.
 
 **A message restored from Trash comes back.** Its `labelRemoved` record yields it at discovery
 (§4.2), and the pipeline must restore the soft-deleted document rather than skip it as
@@ -441,17 +485,28 @@ answers included. Roles decide what a person may do, not what they may read.
 - **Mail belongs in a workspace of its own**, holding nothing else, so that searching anything
   else never returns mail. A process serves one workspace at a time today, so in practice that
   is an installation of its own.
-- **That installation serves with authentication.** The `gmail` connector type is registered as
-  *sensitive*, and an installation with an enabled sensitive connector refuses to serve with
-  `security.auth.mode = "none"`; `--no-authentication` does not override it
-  ([#462](https://github.com/mgd43b/manicule/issues/462)). A configuration slip should not be
-  able to publish a mailbox to whoever can route to a port.
+- **That installation serves with authentication, for as long as it holds any mail.** The
+  `gmail` connector type is registered as *sensitive*. An installation refuses to serve with
+  `security.auth.mode = "none"` — and `--no-authentication` does not override it — when either
+  holds ([#462](https://github.com/mgd43b/manicule/issues/462)):
+  - an enabled connector instance is sensitive; or
+  - **the data directory holds any document, in any state, from a source a sensitive connector
+    has synced.** The first sync of a sensitive source records that durably, beside the source's
+    other stored sync state. Disabling the connector or removing it from configuration does not
+    lift the refusal, because neither removes a message; only deleting that source's documents
+    does, and soft-deleted and purged rows count, since they still carry subjects (§7).
+
+  Checking configuration alone was the first proposal and was rejected: it stops protecting the
+  mail at the moment somebody disables the connector, and the mail is still there. A
+  configuration slip should not be able to publish a mailbox to whoever can route to a port, and
+  neither should tidying up a configuration.
 - **Models see the text.** Embedding sends every chunk to the configured embedder, and `ask`
   sends retrieved passages to the configured generator. With a remote provider, mail leaves the
   machine in both directions. Use local models for a mail installation, or decide that this is
   acceptable knowing it happens.
-- **At rest**: retained bytes (§9), soft-deleted mail for the grace period (§7), and any backup
-  of the data directory hold mail. Exclude the installation from backups that are kept longer or
+- **At rest**: retained bytes (§9) — indefinitely, including for deleted mail (§7) — soft-deleted
+  mail's derived text for the grace period, purged rows' subjects, and any backup of the data
+  directory hold mail. Exclude the installation from backups that are kept longer or
   more widely than the mail itself would be.
 - **Diagnostics are aggregate.** No log, telemetry record, status surface, run-level error or
   fixture carries an address, subject, label name, message id or body. A record about one
