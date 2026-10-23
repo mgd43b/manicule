@@ -789,13 +789,16 @@ conversation, and nothing new sits in its middle. Coverage is counted against ev
 above, not against one candidate, because chunk boundaries fall in different places in different
 replies and no single earlier chunk holds exactly what a later one quotes.
 
-- **A correction is never a copy.** One changed or inserted word inside a sentence leaves most of
-  its trigrams in place — fourteen of seventeen for a retry budget changed from four to five —
-  and would clear 0.8 alone. But it puts three consecutive never-shown trigrams in the middle of
-  the text, and that keeps it. Unshown text at either end is where the chunk began or ended, and
-  fewer than three in a row inside it is a seam between two passages shown in different chunks
-  above; neither keeps it. A single deleted word leaves only two unshown trigrams and is not
-  told apart from a seam.
+- **A correction is never a copy.** One changed word inside a sentence leaves most of its
+  trigrams in place — fourteen of seventeen for a retry budget changed from four to five — and
+  would clear 0.8 alone. What gives it away is its neighbors: the shown trigram just before the
+  unshown run and the one just after stand together in one chunk above, at most three words
+  apart, with at most three words between them here. That is a change, an insertion or a
+  removal of up to three words, and the candidate is kept. A seam between two passages shown in
+  different chunks, a passage nothing above showed, and unshown text at either end of the chunk
+  have no such neighbors. Header lines (`From:`, `To:`, `Date:` and the like) are left out of
+  this test, because two messages' headers differ in exactly that way; they still count towards
+  containment.
 
 - **Within one conversation only.** The conversation is a document metadata field,
   `thread_key` — `gmail_thread_id` by default, which the Gmail connector records — taken
@@ -815,17 +818,17 @@ replies and no single earlier chunk holds exactly what a later one quotes.
   rank fusion gave it.
 - **Whichever copy ranked first is kept, so the original can be the one dropped.** When a reply
   quoting a message outranks it, the message's own chunk repeats what was shown and goes, and
-  the passage is cited to the reply that quoted it. Measured, that moved four of about a hundred
-  questions from "the original was on the page" to "only a quotation was". Protecting the
+  the passage is cited to the reply that quoted it. Measured, that moved two to three of about a
+  hundred questions from "the original was on the page" to "only a quotation was". Protecting the
   original was tried and not adopted: a message's opening chunk holds its own new text beside
   the history it quotes, so every rule that kept originals also kept most of the copies.
   [`connectors/gmail.md`](connectors/gmail.md) §8 has both measurements.
 - **It reads one thing.** The candidates' documents, once per query, under the query's own
   filter narrowed to those documents — no wider a read than the one that produced them. The
-  trace times it like any stage (§2.2); measured, about 2 ms.
+  trace times it like any stage (§2.2); measured, about 3 ms.
 - **A page can come back shorter.** The stage drops from the fused list and does not fetch
   more, so a page whose fused list was mostly repeats holds fewer than `limit` hits — about
-  three in four on threads of twenty messages or more, in the measurement. That is the honest
+  eight of ten on threads of twenty messages or more, in the measurement. That is the honest
   outcome: what was dropped would have been the same text again. It also means collapse cannot
   surface a document fusion never handed it.
 

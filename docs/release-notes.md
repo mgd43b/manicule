@@ -14,8 +14,9 @@ whose text already appeared higher up the same results from the same conversatio
 quote markers ignored, and changes nothing else: what is kept keeps its rank, and a source that
 records no conversation is not affected at all. Gmail records one per thread. Whichever copy
 ranked first is the one kept, so when a reply quoting a message outranks it, the passage is
-cited to the reply. A page can also hold fewer hits than asked for, since what was dropped is
-not replaced — about three in four on threads of twenty messages or more. A configuration
+cited to the reply. A reply that restates something with a few words changed is a correction,
+not a copy, and is kept. A page can also hold fewer hits than asked for, since what was dropped
+is not replaced — about eight of ten on threads of twenty messages or more. A configuration
 that sets `rag.pipeline` itself keeps the pipeline it names; add `"collapse"` after `"rrf"` to
 use it. Every search's recorded pipeline identity now includes the new stage, so a result
 recorded before this release is not comparable with one recorded after it.

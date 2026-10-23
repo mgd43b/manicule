@@ -734,15 +734,16 @@ it cannot.
 ### 8.2 What it found
 
 Threads of ten messages or more, `k = 10`. Seed 463 was used while the stage was designed;
-**seed 1729 was run once, after the design was fixed, and is the one the decision rests on.**
-Intervals are 95% Wilson intervals.
+**seed 1729 was first run after the rule was fixed, and is the one the decision rests on.** Review
+then added the guard against dropping corrections (§8.3); the rows below are that final rule,
+re-measured on both seeds. Intervals are 95% Wilson intervals.
 
 | | Seed | Page | Found | Redundant | Companion (2 messages → 10+) | Origin misplaced |
 |---|---:|---:|---:|---:|---|---|
 | Shipped before (dense, BM25, RRF) | 1729 | 10.0 | 0.98 | 3.79 | 1.00 → 0.71 [0.62, 0.79] | 0.16 [0.10, 0.24] |
-| With `collapse` | 1729 | 8.4 | 0.99 | 1.19 | 1.00 → 0.85 [0.77, 0.91] | 0.15 [0.09, 0.23] |
+| With `collapse` | 1729 | 8.6 | 0.99 | 1.43 | 1.00 → 0.85 [0.77, 0.91] | 0.15 [0.09, 0.23] |
 | Shipped before | 463 | 10.0 | 0.99 | 4.03 | 1.00 → 0.72 [0.63, 0.80] | 0.24 [0.17, 0.33] |
-| With `collapse` | 463 | 8.2 | 0.99 | 1.07 | 1.00 → 0.88 [0.80, 0.93] | 0.25 [0.18, 0.34] |
+| With `collapse` | 463 | 8.4 | 0.99 | 1.38 | 1.00 → 0.87 [0.79, 0.92] | 0.25 [0.18, 0.34] |
 
 **Duplication costs retrieval, and rule A fires on both seeds.** Four of ten hits on a long
 thread repeated text already shown, against fewer than two on a two-message thread, and the
@@ -757,7 +758,7 @@ comparing text could tell it from the message that wrote it, which is why the st
 text with markers stripped rather than looking for markers.
 
 **Collapse fixes A without lowering *found*.** On the held-out seed, redundant hits fall from
-3.8 to 1.2 and the companion is recovered for all but about one question in seven. The
+3.8 to 1.4 and the companion is recovered for all but about one question in seven. The
 companion drop that remains, 0.148, is just under the 0.15 line — a margin the intervals do not
 resolve, so it is reported as under rather than as comfortably under. On 30-message threads the
 companion reaches fusion's candidate list at all for only 0.67 of questions (seed 1729), and
@@ -775,20 +776,29 @@ stage; thread-level documents would remove it only by citing no message at all.
 
 - **The original can be the copy dropped.** The stage keeps whichever copy ranked first, so when
   a reply quoting a message outranks it, the message's own chunk goes and the passage is cited
-  to the reply. *Quote only* rose from 0 to 4 of 106 found queries on seed 1729, and from 4 to 6
+  to the reply. *Quote only* rose from 0 to 3 of 106 found queries on seed 1729, and from 4 to 6
   of 107 on seed 463.
-- **Protecting the original was tried and rejected.** Two refinements, measured on seed 463:
-  never dropping a chunk from an older message for text kept from a newer one (bge-m3: 3.44
-  redundant against 1.07 without it, companion 0.81 against 0.88), and never dropping a
+- **Protecting the original was tried and rejected.** Two refinements, measured on seed 463
+  against the stage before the correction guard: never dropping a chunk from an older message
+  for text kept from a newer one (bge-m3: 3.44 redundant against 1.07 without it, companion 0.81
+  against 0.88), and never dropping a
   message's opening chunk for a later reply's quotation (bge-small: 3.61, against 4.20 with no
   collapse at all). Both kept the originals and most of the repetition, for the same reason: a
   message's opening chunk holds its own new text beside the history it quotes, so every opening
   chunk is the original of something and a rule that protects originals protects nearly every
   copy.
+- **A correction is never dropped, which costs a little.** A reply restating a decision with one
+  figure changed keeps most of its trigrams and would clear 0.8 on its own. The stage keeps a
+  candidate whose unshown text is a few words inside text shown above — the words either side
+  of the change standing together in one kept chunk — and leaves header lines out of that test,
+  since two messages' headers differ in just that way. Review asked for it, the synthetic threads
+  contain no corrections, and on them it costs about a quarter of a slot a page: 1.43 redundant
+  where the stage without it measured 1.19 (seed 1729), 1.38 against 1.07 (seed 463).
 - **Pages come back shorter.** What is dropped is not replaced, so on threads of twenty
-  messages or more a page of ten holds seven or eight hits, and an HTML-only long thread about
+  messages or more a page of ten holds about eight hits, and an HTML-only long thread about
   seven. What was dropped would have been the same text again.
-- **About 2 ms a query**, the stage's median wall time — one read of the candidates' documents.
+- **About 3 ms a query**, the stage's median wall time — one read of the candidates' documents
+  and the comparison.
 
 **Thread-level documents were not needed**, and would have cost what collapse does not: a
 citation naming a thread instead of a message, a thread document rebuilt every time a reply
