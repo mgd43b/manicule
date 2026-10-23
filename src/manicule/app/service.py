@@ -3328,6 +3328,7 @@ class ApplicationService:
         return r.VectorSweepReport(
             vectors_removed=swept.vectors_removed,
             documents_purged=swept.documents_purged,
+            blobs_collected=swept.blobs_collected,
             blocked_by=swept.blocked_by,
             ran=swept.ran,
         )

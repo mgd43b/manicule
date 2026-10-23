@@ -855,8 +855,9 @@ def render_vector_sweep(out: Console, payload: r.VectorSweepReport) -> None:
     table = _folding_table()
     table.add_row("vectors removed", str(payload.vectors_removed))
     table.add_row("documents purged", str(payload.documents_purged))
+    table.add_row("blobs collected", str(payload.blobs_collected))
     out.print(table)
-    if not payload.vectors_removed and not payload.documents_purged:
+    if not (payload.vectors_removed or payload.documents_purged or payload.blobs_collected):
         out.print("[dim]nothing was waiting to be swept[/dim]")
 
 

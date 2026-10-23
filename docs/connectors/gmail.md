@@ -444,24 +444,29 @@ so a mail source can reconcile daily or hourly.
   recorded as a proposal for confirmation (§11.1). Emptying a large folder into Trash, or adding
   a busy label to `exclude_labels`, will trip it. That is the guard working, and the proposal is
   confirmed rather than the ceiling raised.
-- **Removed from results is not removed from disk, and nothing here erases a message.** A
-  reconciled message is soft-deleted. When the grace period ends (`soft_delete_grace_s`, 30 days
-  by default, [`storage.md`](../storage.md) §8.2), the sweep removes its chunks and vectors — the
-  derived text — and keeps the document row, which still carries the subject as its title, and
-  its reference to the retained bytes, so that a citation can explain itself. Blob collection
-  treats every document, version and acquisition reference as a root whatever the document's
-  status, so **retained raw mail is kept indefinitely** after the grace period. Lowering
-  `soft_delete_grace_s` shortens how long deleted mail is *searchable as derived text*; it does
-  not erase it.
+- **Removed from results is removed from disk late, and nothing here erases a message on
+  demand.** A reconciled message is soft-deleted. When the grace period ends
+  (`soft_delete_grace_s`, 30 days by default, [`storage.md`](../storage.md) §8.2), the sweep
+  removes its chunks and vectors — the derived text — and releases the document's reference to
+  the retained bytes, keeping the document row, which still carries the subject as its title, so
+  that a citation can explain itself. The raw bytes are not yet gone: the acquisition journal that
+  fetched them names them too, for 30 days after the last run that listed the message settled,
+  and the next durable sync cleans that up (`storage.md` §7). The scheduled blob collection
+  deletes the file once both have let go. The two clocks run side by side, so **a message the
+  source deleted has its raw bytes removed about one grace period after the deletion** — 30 days
+  with the defaults, plus the wait for the next sync and the next sweep, and longer if no sync runs
+  to clean the journal. A message deleted while the source still lists it is renewed in the
+  journal by every run that lists it, and its file stays for as long as that continues. Lowering
+  `soft_delete_grace_s` shortens the wait; the journal retention is not configurable. Until the
+  file is deleted it is still in the data directory and in any backup of it.
 
-  Erasing one message today is manual: `manicule document delete --hard` removes the row, its
-  versions and its chunks, and the raw bytes go only once no acquisition record still references
-  them and blob collection runs. For an installation that must be able to forget, the honest
+  Erasing one message at once is manual: `manicule document delete --hard` removes the row, its
+  versions and its chunks, and the raw bytes go once no acquisition record still references them
+  and the next blob collection runs. For an installation that must be able to forget, the honest
   configuration is retention off **from the first sync** (§9), which leaves no raw copy to erase —
-  at the re-fetch cost §9 states. Turning it off later does not remove copies already kept. Erasure that follows the source on its own is not designed here; it is a requirement
-  on the reconciliation work §7 depends on
-  ([#466](https://github.com/mgd43b/manicule/issues/466) decides what happens to a reconciled
-  document's retained bytes), not something this connector can add.
+  at the re-fetch cost §9 states. Turning it off later does not remove copies already kept, though
+  a deleted message's copy goes on the schedule above. Erasure at the moment the source deletes a
+  message is not designed here.
 
 **A message restored from Trash comes back**, unless it still carries another excluded label.
 Its `labelRemoved` record makes it a candidate and its current labels decide (§4.2). Once it is
@@ -506,10 +511,10 @@ this section is what it decides with.
 decides whether that sync keeps the bytes it fetches. Nothing purges bytes already retained when
 it changes. For this connector that makes the first sync's value close to permanent: a stored
 message is never fetched again (§4.1), so switching retention off later leaves every
-already-retained message's raw copy in place, removed only by a hard delete of its document
-followed by blob collection (§7) — or by whatever [#466](https://github.com/mgd43b/manicule/issues/466)
-decides for reconciled documents. Switching it on later retains only messages fetched from then
-on. Choose before the first sync, and choose off then if the installation must be able to forget.
+already-retained message's raw copy in place, removed by a hard delete of its document followed
+by blob collection, or — for a message the source deletes — by the purge and the journal cleanup
+(§7). Switching it on later retains only messages fetched from
+then on. Choose before the first sync, and choose off then if the installation must be able to forget.
 
 ---
 
@@ -542,7 +547,8 @@ answers included. Roles decide what a person may do, not what they may read.
   sends retrieved passages to the configured generator. With a remote provider, mail leaves the
   machine in both directions. Use local models for a mail installation, or decide that this is
   acceptable knowing it happens.
-- **At rest**: retained bytes (§9) — indefinitely, including for deleted mail (§7) — soft-deleted
+- **At rest**: retained bytes (§9) — for as long as the message is indexed, and for a deleted
+  message until the purge and the journal cleanup have both let go (§7) — soft-deleted
   mail's derived text for the grace period, purged rows' subjects, and any backup of the data
   directory hold mail. Exclude the installation from backups that are kept longer or
   more widely than the mail itself would be.

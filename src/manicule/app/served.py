@@ -333,6 +333,7 @@ class ScheduledVectorSweep:
     blocked: int = 0
     vectors_removed: int = 0
     documents_purged: int = 0
+    blobs_collected: int = 0
     last_error_type: str = ""
 
 
@@ -573,6 +574,7 @@ class Scheduler:
                 continue
             record.vectors_removed += swept.vectors_removed
             record.documents_purged += swept.documents_purged
+            record.blobs_collected += swept.blobs_collected
 
     async def _recover_reembedding(self) -> None:
         """Resume ownerless durable runs once at startup; run status remains authoritative."""

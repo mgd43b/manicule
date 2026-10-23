@@ -60,6 +60,7 @@ from manicule.parsers.expansion import (
     MemberOutcome,
     container_depth_of,
 )
+from manicule.storage.history import RELEASED_AFTER_GRACE_REASON
 from tests.fakes import MEDIA_TYPE, HashEmbedder
 
 CONTAINER_MEDIA_TYPE = "application/x-fake-archive"
@@ -603,9 +604,41 @@ class MemoryIngestStore:
                 self.tombstones.remove(chunk_id_)
 
     async def soft_deleted_before(self, cutoff: datetime, *, limit: int = 1000) -> Sequence[str]:
+        """Like the real store: a document already purged (`deleted`) is not selected again."""
         return [
-            document_id for document_id, stamp in list(self.deleted_at.items()) if stamp < cutoff
+            document_id
+            for document_id, stamp in list(self.deleted_at.items())
+            if stamp < cutoff
+            and not (
+                document_id in self.documents
+                and self.documents[document_id].status is DocumentStatus.DELETED
+            )
         ][:limit]
+
+    async def purge_document(
+        self, document_id: str, *, reason: str, deleted_before: datetime | None = None
+    ) -> bool:
+        stamp = self.deleted_at.get(document_id)
+        document = self.documents.get(document_id)
+        if stamp is None or document is None or document.status is DocumentStatus.DELETED:
+            return False
+        if deleted_before is not None and not stamp < deleted_before:
+            return False
+        await self.replace_chunks(document_id, [])
+        ref, omitted = self.originals.get(document_id, (None, None))
+        self.originals[document_id] = (
+            None,
+            RELEASED_AFTER_GRACE_REASON if ref is not None else omitted,
+        )
+        self.documents[document_id] = document.model_copy(
+            update={
+                "status": DocumentStatus.DELETED,
+                "status_detail": reason,
+                "failed_stage": None,
+                "original_ref": None,
+            }
+        )
+        return True
 
 
 class MemoryGlossaryStore(MemoryIngestStore):
