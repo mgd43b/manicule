@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import pytest
 import pytest_asyncio
 
@@ -265,6 +266,34 @@ async def test_an_expired_history_falls_back_to_a_walk_that_fetches_only_what_is
     assert report.indexed == 1
     assert harness.raw_fetches() - before == 1, "the walk listed ids and fetched the new one only"
     assert fresh.id in await harness.live()
+
+
+async def test_history_that_expires_part_way_through_a_run_still_indexes_every_message_once(
+    harness: Harness,
+) -> None:
+    """The fallback walk re-yields ids the half-finished incremental walk already yielded."""
+    server = harness.server
+    for number in range(3):
+        server.add_message(mail(f"Message {number}"))
+    connector = await opened(harness)
+    try:
+        await harness.sync(connector)
+        for number in range(3, 8):
+            server.add_message(mail(f"Message {number}"))
+
+        def expires_on_the_second_page(request: httpx.Request) -> None:
+            if request.url.path.endswith("/history") and "pageToken" in request.url.params:
+                server.history_floor = server.history_id + 1
+
+        server.before_request = expires_on_the_second_page
+        report = await harness.sync(connector)
+    finally:
+        await connector.teardown()
+
+    assert report.error == ""
+    assert not report.retry_required
+    assert len(await harness.live()) == 8
+    assert harness.raw_fetches() == 8, "each message was fetched exactly once"
 
 
 async def test_a_representation_bump_mid_run_starts_a_fresh_complete_walk(

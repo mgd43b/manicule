@@ -23,10 +23,13 @@ counts and operation names; a record about one message belongs to that message's
 
 from __future__ import annotations
 
+import email.errors
 import email.parser
 import email.policy
 import logging
+import re
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
 from urllib.parse import quote
@@ -67,6 +70,26 @@ _VERSION_KEY: Final = "version_token"
 _CANDIDATES: Final = frozenset({"messageAdded", "labelRemoved"})
 """History records that make a message a candidate (§4.2). ``labelAdded`` and ``messageDeleted``
 can only take a message out of scope, and that is reconciliation's to act on."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Run:
+    """What one walk was started with, held by the walk and not by the connector.
+
+    The connector is one object for the life of the process and a discovery and a reconciliation
+    can overlap, so the label ids a walk skips and the position it captured are its own: a
+    second run resolving the labels afresh must not change what a walk already under way tests.
+    """
+
+    history_id: str
+    """The mailbox's position, read before anything is listed (§4.1)."""
+    excluded: tuple[str, ...]
+    """The resolved ids of ``exclude_labels``."""
+
+    @property
+    def excluded_labels(self) -> frozenset[str]:
+        """Every label id that takes a message out of scope; system labels' ids are their names."""
+        return frozenset((*ALWAYS_EXCLUDED_LABELS, *self.excluded))
 
 
 class GmailConnector:
@@ -126,11 +149,6 @@ class GmailConnector:
             raise ConnectorError(msg)
         return self._config.scope_fingerprint(self.source_scope, self._user_excluded)
 
-    @property
-    def _excluded_label_ids(self) -> frozenset[str]:
-        """Every label id that takes a message out of scope. System labels' ids are their names."""
-        return frozenset((*ALWAYS_EXCLUDED_LABELS, *self._user_excluded))
-
     # --- lifecycle -----------------------------------------------------------------------
 
     async def setup(self) -> None:
@@ -171,7 +189,7 @@ class GmailConnector:
             raise mismatch
         return profile
 
-    async def _begin(self) -> Profile:
+    async def _begin(self) -> _Run:
         """Start of a run: the mailbox pin, then the excluded label names as ids, afresh.
 
         The profile's ``historyId`` is returned because a complete walk needs it captured
@@ -182,13 +200,15 @@ class GmailConnector:
             ConfigError: An ``exclude_labels`` name is not a label of this mailbox.
         """
         profile = await self._check_mailbox()
+        excluded: tuple[str, ...] = ()
         if self._config.exclude_labels:
             labels = await self._client.list_labels()
-            self._user_excluded = resolve_label_ids(
+            excluded = resolve_label_ids(
                 self._config.exclude_labels, {label.name: label.id for label in labels}
             )
+        self._user_excluded = excluded
         self._resolved = True
-        return profile
+        return _Run(history_id=profile.history_id, excluded=excluded)
 
     # --- watermark -----------------------------------------------------------------------
 
@@ -235,11 +255,11 @@ class GmailConnector:
         """One batch per ``messages.list`` or ``history.list`` page (§4.4)."""
         self._enumerated = False
         self._next = None
-        profile = await self._begin()
+        run = await self._begin()
         position = self._resume_position(watermark)
         if position is not None:
             try:
-                async for batch in self._incremental(position):
+                async for batch in self._incremental(position, run):
                     yield batch
             except CursorExpiredError:
                 # Google no longer holds history that far back (§4.3). Nothing that was yielded is
@@ -254,19 +274,21 @@ class GmailConnector:
                 self._enumerated = False
             else:
                 return
-        async for batch in self._full(profile.history_id):
+        async for batch in self._full(run):
             yield batch
 
-    async def _full(self, history_id: str) -> AsyncIterator[Sequence[DiscoveredDoc]]:
-        """§4.1: ``history_id`` was read before the first listing and is the next watermark."""
-        async for ids in self._inventory():
+    async def _full(self, run: _Run) -> AsyncIterator[Sequence[DiscoveredDoc]]:
+        """§4.1: the run's ``historyId`` was read before the first listing and is the watermark."""
+        async for ids in self._inventory(run):
             yield [self._discovered(message_id) for message_id in ids]
-        self._next = history_id
+        self._next = run.history_id
         self._enumerated = True
 
-    async def _incremental(self, position: str) -> AsyncIterator[Sequence[DiscoveredDoc]]:
+    async def _incremental(
+        self, position: str, run: _Run
+    ) -> AsyncIterator[Sequence[DiscoveredDoc]]:
         """§4.2: candidates from the history log, each judged by its current label ids."""
-        excluded = self._excluded_label_ids
+        excluded = run.excluded_labels
         judged: set[str] = set()
         """Candidates already looked up this walk; ids of messages the log named, not the
         mailbox's inventory, and gone when the walk is."""
@@ -316,19 +338,19 @@ class GmailConnector:
 
     # --- the inventory shared by the full walk and reconciliation --------------------------
 
-    async def _inventory(self) -> AsyncIterator[tuple[str, ...]]:
+    async def _inventory(self, run: _Run) -> AsyncIterator[tuple[str, ...]]:
         """Every in-scope message id, a page at a time (§3).
 
         Lists the excluded labels into a set first, then pages the mailbox and skips them. A
         failure anywhere raises, so what a caller has seen is never mistaken for the whole.
         """
-        excluded = await self._excluded_message_ids()
+        excluded = await self._excluded_message_ids(run)
         async for ids in self._client.list_messages():
             kept = tuple(message_id for message_id in ids if message_id not in excluded)
             if kept:
                 yield kept
 
-    async def _excluded_message_ids(self) -> set[str]:
+    async def _excluded_message_ids(self, run: _Run) -> set[str]:
         """The ids of messages carrying a label that is excluded and that listing does not skip.
 
         SPAM and TRASH are left out of ``messages.list`` by the client, so only DRAFT and the
@@ -336,7 +358,7 @@ class GmailConnector:
         the excluded messages, a bounded exception to never holding the inventory (§3).
         """
         found: set[str] = set()
-        for label in ("DRAFT", *self._user_excluded):
+        for label in ("DRAFT", *run.excluded):
             async for ids in self._client.list_messages([label]):
                 found.update(ids)
         return found
@@ -406,8 +428,8 @@ class GmailConnector:
         listed. Raises, rather than ending early, on any failure: only exhaustion of this
         iterator is a complete inventory.
         """
-        await self._begin()
-        async for ids in self._inventory():
+        run = await self._begin()
+        async for ids in self._inventory(run):
             yield ids
 
     # --- links ---------------------------------------------------------------------------
@@ -427,24 +449,33 @@ class GmailConnector:
         )
 
 
+_HEADER_END: Final = re.compile(rb"\r?\n\r?\n")
+_HEADER_LIMIT: Final = 1 << 20
+"""Headers are read from the front of the message and never past this, so a 25 MB message with a
+huge attachment costs a header's worth of parsing, not a second copy of the bytes."""
+
+
 def _headers(raw: bytes) -> tuple[str, str | None]:
     """The ``Subject`` and the ``Message-ID`` (without its angle brackets) of a message.
 
     Both are read from the headers only and neither is ever logged. An unreadable or absent
     header is an empty subject or no id, never an error: the message is still indexed.
     """
+    end = _HEADER_END.search(raw, 0, _HEADER_LIMIT)
+    head = raw[: end.start()] if end is not None else raw[:_HEADER_LIMIT]
     try:
-        headers = email.parser.BytesHeaderParser(policy=email.policy.default).parsebytes(raw)
+        headers = email.parser.BytesHeaderParser(policy=email.policy.default).parsebytes(head)
         subject = headers.get("Subject")
         message_id = headers.get("Message-ID")
-    except (ValueError, TypeError, IndexError):
+        subject_text = " ".join(str(subject).split()) if subject is not None else ""
+        cleaned = (
+            str(message_id).strip().removeprefix("<").removesuffix(">").strip()
+            if message_id is not None
+            else ""
+        )
+    except (ValueError, TypeError, IndexError, email.errors.MessageError):
         return "", None
-    cleaned = (
-        str(message_id).strip().removeprefix("<").removesuffix(">").strip()
-        if message_id is not None
-        else ""
-    )
-    return " ".join(str(subject).split()) if subject is not None else "", cleaned or None
+    return subject_text, cleaned or None
 
 
 def _arrival(milliseconds: int) -> datetime:

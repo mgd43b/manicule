@@ -876,7 +876,7 @@ def mailbox_mismatch(reported: str, account: str, renewal: str) -> MailboxMismat
         "account (an alias of the account counts as different: configure the primary "
         "address). Indexing another mailbox is a different instance under a new name, "
         "so the run did not begin. " + renewal
-    )
+    ).rstrip()
     return MailboxMismatchError(msg)
 
 
