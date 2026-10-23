@@ -217,10 +217,17 @@ async def test_hit_rate_for_definitional_questions(store: SqliteDocStore) -> Non
     ====  =============  ====================
     k     Baseline       Glossary wired
     ====  =============  ====================
-    1     0/14 = 0.000   13/14 = **0.929**
-    3     0/14 = 0.000   13/14 = **0.929**
-    10    2/14 = 0.143   14/14 = **1.000**
+    1     7/14 = 0.500   13/14 = **0.929**
+    3     9/14 = 0.643   13/14 = **0.929**
+    10    13/14 = 0.929  14/14 = **1.000**
     ====  =============  ====================
+
+    **The baseline moved when the lexical leg stopped requiring function words** (#481). It used
+    to be 0, 0 and 2 of 14: ``What is SORT?`` asked the lexical leg for "what" and "is" as well,
+    so it matched nothing and the definition had to win on the stand-in embedder's similarity
+    alone. It now asks for ``SORT``, so the page that defines it can be found by the term itself.
+    The glossary still adds six questions at k = 1 and four at k = 3, because a lookup fetches the
+    defining chunk by id rather than leaving it to win a ranking.
 
     The thirteen are all rank 1 exactly, and that is a property of the mechanism rather than a
     good score: an alias hit is a **lookup**, so the defining chunk is fetched by id and promoted
@@ -254,8 +261,8 @@ async def test_hit_rate_for_definitional_questions(store: SqliteDocStore) -> Non
             baseline_hits[cutoff] += before is not None and before <= cutoff
 
     assert hits == {1: 13, 3: 13, 10: 14}
-    assert baseline_hits == {1: 0, 3: 0, 10: 2}, (
-        "the corpus no longer buries the definitions, so promoting them shows nothing"
+    assert baseline_hits == {1: 7, 3: 9, 10: 13}, (
+        "the baseline moved, so what the glossary adds over search has to be measured again"
     )
 
 

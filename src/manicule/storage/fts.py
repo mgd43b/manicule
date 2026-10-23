@@ -197,13 +197,53 @@ reference, so a query that aliases the FTS table fails with ``no such column``.
 """
 
 
-def escape_match_query(text: str) -> str:
-    """Turn user input into an FTS5 ``MATCH`` expression that cannot be an operator.
+_FUNCTION_WORDS = (
+    # interrogatives
+    "how what why when where which who whom whose"
+    # auxiliaries and modals
+    " do does did is are was were be been being am can could should would will shall may"
+    " might must has have had"
+    # pronouns and determiners
+    " i me my we us our you your it its they them their he him his she her this that these"
+    " those a an the some any"
+    # prepositions and conjunctions
+    " of to in on at by for from with about into as than then there and or if so but"
+    # contractions that are only a pronoun and an auxiliary
+    " i'm i've it's what's that's there's let's"
+)
+FUNCTION_WORDS = frozenset(_FUNCTION_WORDS.split())
+"""Words that carry the shape of a question rather than its subject, dropped from the match.
 
-    FTS5's query language has operators (``AND``, ``OR``, ``NOT``, ``NEAR``, ``*``, ``:``,
-    parentheses). A user typing ``NOT`` means the word, and a user typing an unbalanced
-    quote means nothing at all — both currently produce a syntax error rather than a search.
-    Each token is quoted, which makes it a literal phrase.
+**Deliberately small, and deliberately missing** ``not``, ``no`` and every negated contraction:
+dropping those would make "why is the vector not published" ask for its opposite. This is not
+:mod:`manicule.retrieval.homographs`, which keeps its words and only asks for a second reason
+before a glossary term expands; these are removed, and only from the lexical leg's match — the
+dense leg embeds the whole question.
+"""
+
+
+def escape_match_query(text: str) -> str:
+    """Turn user input into an FTS5 ``MATCH`` expression: every content word, each a literal.
+
+    **Every word is quoted, so none can be an operator.** FTS5's query language has operators
+    (``AND``, ``OR``, ``NOT``, ``NEAR``, ``*``, ``:``, parentheses). A user typing ``NOT``
+    means the word, and a user typing an unbalanced quote means nothing at all — unquoted, both
+    are a syntax error rather than a search. The phrases are joined by juxtaposition, which
+    FTS5 reads as ``AND``; no operator is ever written here.
+
+    **Function words are dropped first, and that is the difference between a question reaching
+    this leg and not.** A conjunction over "how do I rotate the signing token" matches only a
+    chunk that also says "how", "do" and "I", so a question used to match nothing and the hybrid
+    pipeline ran on its dense leg alone. Measured over this repository's ``docs/`` with BGE-M3
+    (``tests/benchmarks/lexical_questions.py``, ``docs/retrieval.md`` §4.1): on 754 questions
+    each naming an identifier, ``hit@10`` went from 506 to 603 and MRR from 0.476 to 0.643, with
+    no set losing more than 0.005 of MRR. A disjunction — the other obvious repair — lost
+    multi-hop hits and cost 82 to 98 ms a query at 100,000 chunks, because "the" and "how" match
+    nearly every row and the statement scores all of them before ``LIMIT``.
+
+    **A query made only of function words keeps them.** "What is it" is then a search for those
+    three words rather than no search, and ``NOT`` or ``OR`` on its own is still the word. Each
+    word is kept once: a repeated phrase is scored twice by ``bm25()``.
 
     Args:
         text: Whatever the user typed.
@@ -211,13 +251,16 @@ def escape_match_query(text: str) -> str:
     Returns:
         A ``MATCH`` expression, or the empty string when nothing searchable remains.
     """
-    tokens: list[str] = []
+    words: list[str] = []
+    seen: set[str] = set()
     for raw in text.split():
         cleaned = "".join(char for char in raw if char.isalnum() or char in "-_.'")
-        if not cleaned:
+        if not any(char.isalnum() for char in cleaned) or cleaned.lower() in seen:
             continue
-        tokens.append('"' + cleaned.replace('"', '""') + '"')
-    return " ".join(tokens)
+        seen.add(cleaned.lower())
+        words.append(cleaned)
+    content = [word for word in words if word.strip("-_.'").lower() not in FUNCTION_WORDS]
+    return " ".join('"' + word.replace('"', '""') + '"' for word in content or words)
 
 
 __all__ = [
@@ -227,6 +270,7 @@ __all__ = [
     "DROP_TRIGGERS",
     "FTS_SHADOW_TABLES",
     "FTS_TABLE",
+    "FUNCTION_WORDS",
     "INTEGRITY_CHECK_FTS",
     "REBUILD_FTS",
     "SEARCH_SQL",

@@ -482,15 +482,23 @@ async def test_a_definition_neither_search_returned_is_still_promoted(
 ) -> None:
     """The case that separates a lookup from a re-ranking.
 
-    With a candidate depth of one, neither the original nor the expanded search can possibly
-    return the definition — so a feature that only reordered what search found would return
-    nothing here. The entry names the chunk, so it is fetched by id.
+    Neither the original nor the expanded search returns the definition here — so a feature that
+    only reordered what search found would return nothing. The entry names the chunk, so it is
+    fetched by id.
+
+    The question asks what ``NOW`` *means*, and the glossary page never writes "mean": the
+    lexical leg needs every content word in one chunk (``docs/retrieval.md`` §4.1), so neither
+    pass matches it there, and the stand-in embedder ranks the page outside the candidates.
+    ``What is NOW?`` used to be this case, while the lexical leg also required "what" and "is";
+    since #481 the expanded pass finds the page by its expansion, which is the expansion working.
     """
     retriever = await _with_glossary(store, indexed)
 
     result = await retriever.retrieve(
-        Query(text=corpus.QUERY_ACRONYM, limit=1, filter=system.query_filter())
+        Query(text="What does NOW mean?", limit=1, filter=system.query_filter())
     )
+    lexical = [stage for stage in result.trace.stages if stage.name == "lexical"]
+    assert lexical[0].diagnostics["matched"] == 0, "the premise: no lexical match to reorder"
 
     assert result.trace.glossary is not None
     assert result.trace.glossary.promoted_from_store == 1

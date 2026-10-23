@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -179,6 +180,73 @@ def test_an_empty_query_produces_no_match_expression() -> None:
     """Punctuation alone must not become a match-everything expression."""
     assert escape_match_query("   ") == ""
     assert escape_match_query("!!! ???") == ""
+    assert escape_match_query(". - ' _") == "", "a phrase with no token in it is not a word"
+
+
+async def test_a_question_reaches_a_chunk_that_never_says_how_do_or_i(
+    store: SqliteDocStore,
+) -> None:
+    """The defect #481 fixed: every word of a question used to be required, function words too."""
+    await _seed(store, "s1", ["Rotate the signing token every thirty days."])
+    assert escape_match_query("how do I rotate the signing token?") == (
+        '"rotate" "signing" "token"'
+    )
+    assert await store.search_lexical("how do I rotate the signing token?", k=5)
+
+
+async def test_every_content_word_is_still_required(store: SqliteDocStore) -> None:
+    """Dropping function words is not a disjunction: a chunk missing a subject word is no match."""
+    await _seed(store, "s1", ["Rotate the signing token every thirty days."])
+    assert await store.search_lexical("how do I rotate the encryption token", k=5) == []
+
+
+async def test_a_query_of_function_words_alone_searches_for_them(store: SqliteDocStore) -> None:
+    """Dropping every word would turn a question into no search at all."""
+    await _seed(store, "s1", ["What is it that the sweep removes?"])
+    assert escape_match_query("what is it") == '"what" "is" "it"'
+    assert await store.search_lexical("what is it", k=5)
+
+
+def test_negation_is_a_subject_word_and_is_kept() -> None:
+    """Dropping ``not`` would make the question ask for its opposite."""
+    assert escape_match_query("why is the vector not published") == ('"vector" "not" "published"')
+    assert escape_match_query("why doesn't it publish") == '"doesn\'t" "publish"'
+
+
+def test_function_words_are_recognized_through_case_and_punctuation() -> None:
+    assert escape_match_query("How does THE sweep work, then?") == '"sweep" "work"'
+    assert escape_match_query("what's it for.") == '"what\'s" "it" "for."'
+
+
+def test_each_word_is_matched_once() -> None:
+    """``bm25()`` scores a repeated phrase twice, so a repeated word would outweigh the rest."""
+    assert escape_match_query("token Token TOKEN rotation") == '"token" "rotation"'
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("NOT", '"NOT"'),
+        ("OR", '"OR"'),
+        ("AND OR", '"AND" "OR"'),
+        ("what is NEAR", '"NEAR"'),
+        ("published NOT deleted", '"published" "NOT" "deleted"'),
+        ('col:value "unbalanced', '"colvalue" "unbalanced"'),
+        ("token* (unclosed", '"token" "unclosed"'),
+    ],
+)
+def test_every_word_is_a_quoted_literal_and_no_operator_is_written(raw: str, expected: str) -> None:
+    """Outside the quotes there is nothing but spaces, so FTS5 can only read juxtaposition."""
+    match = escape_match_query(raw)
+    assert match == expected
+    assert re.sub(r'"(?:[^"]|"")*"', "", match).strip() == ""
+
+
+async def test_operator_words_alone_search_for_the_words(store: SqliteDocStore) -> None:
+    """``OR`` is a function word, so a query of only ``AND OR`` keeps both, as words."""
+    await _seed(store, "s1", ["Choose this or that, and say which."])
+    assert await store.search_lexical("AND OR", k=5)
+    assert await store.search_lexical("NOT", k=5) == []
 
 
 async def test_search_is_scoped_to_the_stores_workspace(engine: AsyncEngine) -> None:
