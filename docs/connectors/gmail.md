@@ -3,8 +3,12 @@
 Design for the Gmail connector. Ticket [#457](https://github.com/mgd43b/manicule/issues/457),
 epic [#464](https://github.com/mgd43b/manicule/issues/464).
 
-> **Status: design. Nothing on this page is implemented yet.** Every "does" below is a
-> decision for [#458](https://github.com/mgd43b/manicule/issues/458)–[#463](https://github.com/mgd43b/manicule/issues/463)
+> **Status: design, with the REST client built.** The calls, pacing and error typing of §5 and
+> §6 are implemented in `manicule/connectors/gmail_client.py`, against the synthetic Gmail in
+> `tests/connectors/fake_gmail.py` ([#459](https://github.com/mgd43b/manicule/issues/459)).
+> Everything else below is a decision for
+> [#458](https://github.com/mgd43b/manicule/issues/458) and
+> [#460](https://github.com/mgd43b/manicule/issues/460)–[#463](https://github.com/mgd43b/manicule/issues/463)
 > to implement, not a description of code that exists. When a section ships, its ticket
 > replaces this banner's claim for that section with the module that implements it (§12).
 
@@ -374,7 +378,10 @@ pages cost 2 units, and a complete inventory of 100,000 ids is about 1,000 units
 
 **Paced, not throttled into.** The client meters its own spending against a per-minute budget,
 `quota_units_per_minute` (default 5,400 — 90% of the per-user limit, leaving room for anything
-else using the same project), and waits before a request would exceed it. A 429 is still
+else using the same project), and waits before a request would exceed it. The budget is a
+rolling minute, not a bucket that resets on the clock: the units spent in *any* sixty seconds
+stay within it, and every attempt is charged, a retry included. A budget below 60 is refused at
+construction, because no raw fetch could ever fit in it. A 429 is still
 handled — honoring `Retry-After` in both its forms, and stopping the run when the requested
 pause exceeds `max_retry_after_seconds`, as the Confluence client does — but it is the
 exception, not the steering mechanism. A client that discovers its limit by hitting it spends
@@ -392,7 +399,16 @@ growing the journal without bound, and the first sync cannot complete. A mailbox
 about a million messages in scope therefore needs that limit raised, with the disk it implies,
 or `exclude_labels` used to bring the first sync under it.
 
-**Errors**, as the client types them ([#459](https://github.com/mgd43b/manicule/issues/459)):
+**Errors**, as the client types them ([#459](https://github.com/mgd43b/manicule/issues/459)).
+A 403 is a rate limit when its `reason` is `rateLimitExceeded` or `userRateLimitExceeded`,
+compared without regard to case or underscores and read from both `error.errors[]` and
+`error.details[]` (which of the two Google uses is not yet verified, §11). A 404 is typed by the
+call that received it, so a 404 from `getProfile` or `labels.list` is an ordinary unusable
+answer rather than a deleted message. A second 401 raises whatever the credential
+builds for it, which carries its own renewal sentence. Every message names the operation and a status, never an id,
+an address or a label name (§10), and the client redacts Gmail's request URLs from `httpx`'s
+own INFO log, which would otherwise print each message id (other clients' records are left
+alone):
 
 | Gmail answers | Typed as | Effect |
 |---|---|---|
@@ -582,15 +598,18 @@ differ, it is here — check these first when one is available:
 |---|---|---|
 | `GmailConfig`, credential resolution | `manicule/connectors/config.py` | [#458](https://github.com/mgd43b/manicule/issues/458) |
 | Token refresh and caching | `manicule/connectors/credentials.py` | [#458](https://github.com/mgd43b/manicule/issues/458) |
-| REST calls, pacing, error typing | `manicule/connectors/gmail_client.py` | [#459](https://github.com/mgd43b/manicule/issues/459) |
+| REST calls, pacing, error typing | `manicule/connectors/gmail_client.py` (built) | [#459](https://github.com/mgd43b/manicule/issues/459) |
 | `discover`, `fetch`, `reconcile`, watermarks | `manicule/connectors/gmail.py` | [#460](https://github.com/mgd43b/manicule/issues/460) |
 | Registration, marked sensitive | `manicule/connectors/plugin.py` | [#460](https://github.com/mgd43b/manicule/issues/460) |
 | `connector login` for Gmail | `manicule/connectors/` and the CLI | [#461](https://github.com/mgd43b/manicule/issues/461) |
 | Refusing to serve a sensitive source unauthenticated | `manicule/app/bind.py` | [#462](https://github.com/mgd43b/manicule/issues/462) |
-| The synthetic Gmail | `tests/connectors/fake_gmail.py` | [#459](https://github.com/mgd43b/manicule/issues/459) |
+| The synthetic Gmail | `tests/connectors/fake_gmail.py` (built) | [#459](https://github.com/mgd43b/manicule/issues/459) |
 
-No Google client library is added. The four REST calls go through the HTTP stack the Confluence
-client already uses, imported by the factory rather than at plugin discovery.
+No Google client library is added. The six REST calls (`getProfile`, `labels.list`,
+`messages.list`, `messages.get` in `raw` and `minimal`, and `history.list`) go through the HTTP
+stack the Confluence client already uses, imported by the factory rather than at plugin
+discovery: `gmail_client.py` imports it inside `GmailClient.setup()`, so importing the module
+costs no HTTP stack either.
 
 ---
 

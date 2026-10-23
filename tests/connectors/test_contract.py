@@ -112,6 +112,7 @@ def test_registering_the_connector_loads_no_http_client() -> None:
     assert not [name for name in loaded if name == "httpx" or name.startswith("httpx.")]
     assert "manicule.connectors.git_reader" not in loaded
     assert "manicule.connectors.git_site" not in loaded
+    assert "manicule.connectors.gmail_client" not in loaded
 
 
 def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
