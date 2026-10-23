@@ -24,8 +24,8 @@ MAX_DISCOVERY_BATCH: Final = 250
 """The most records one durable discovery batch may carry.
 
 The journal admits a batch in one writer transaction, so this bounds what one transaction holds
-and what the live record buffer can grow to. A connector whose source pages can be larger splits
-each page into batches of at most this many, all committed before it follows the page's cursor.
+and what the live record buffer can grow to. Durable ingest admits a larger source page as
+consecutive slices of at most this many, all before the connector is asked for its next page.
 """
 
 

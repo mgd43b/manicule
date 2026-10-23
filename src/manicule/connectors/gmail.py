@@ -47,7 +47,6 @@ from manicule.connectors.config import (
 from manicule.connectors.credentials import mailbox_mismatch
 from manicule.connectors.errors import ConnectorError, CursorExpiredError, NotFoundError
 from manicule.connectors.gmail_client import GmailClient, HistoryPage, Profile
-from manicule.core.acquisition import MAX_DISCOVERY_BATCH
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.lifecycle import HealthReport, Metric
 from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
@@ -59,22 +58,6 @@ __all__ = [
 ]
 
 _log = logging.getLogger("manicule.connectors.gmail")
-
-
-def _fitted(page: list[DiscoveredDoc]) -> list[list[DiscoveredDoc]]:
-    """One listing page as durable discovery batches, none larger than the journal admits.
-
-    A ``messages.list`` page holds up to 500 ids and a ``history.list`` page can name more
-    messages than it has records, while one batch is at most :data:`MAX_DISCOVERY_BATCH`. The
-    batches of a page are all yielded, and so all committed, before the next page is requested,
-    so the cursor is followed only once its whole page is durable — the property one batch per
-    page exists for. An empty page yields nothing.
-    """
-    return [
-        page[start : start + MAX_DISCOVERY_BATCH]
-        for start in range(0, len(page), MAX_DISCOVERY_BATCH)
-    ]
-
 
 MESSAGE_MEDIA_TYPE: Final = "message/rfc822"
 """What a fetched message is handed to the pipeline as; the existing mail parser reads it."""
@@ -312,7 +295,7 @@ class GmailConnector:
     async def discover_batches(
         self, watermark: Watermark | None
     ) -> AsyncIterator[Sequence[DiscoveredDoc]]:
-        """One batch per ``messages.list`` or ``history.list`` page, split to fit (§4.4)."""
+        """One batch per ``messages.list`` or ``history.list`` page (§4.4)."""
         self._enumerated = False
         self._walked_full = False
         self._next = None
@@ -342,8 +325,7 @@ class GmailConnector:
     async def _full(self, run: _Run) -> AsyncIterator[Sequence[DiscoveredDoc]]:
         """§4.1: the run's ``historyId`` was read before the first listing and is the watermark."""
         async for ids in self._inventory(run):
-            for batch in _fitted([self._discovered(message_id) for message_id in ids]):
-                yield batch
+            yield [self._discovered(message_id) for message_id in ids]
         self._next = run.history_id
         self._walked_full = True
         self._enumerated = True
@@ -360,7 +342,8 @@ class GmailConnector:
         async for page in self._client.history(position):
             if following is None:
                 following = page.history_id
-            for batch in _fitted(await self._judge(page, judged, excluded)):
+            batch = await self._judge(page, judged, excluded)
+            if batch:
                 yield batch
         # ``history`` yields at least one page, but a position is only worth storing if it
         # was read: the alternative is to pretend the walk has no end.

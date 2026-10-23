@@ -11,8 +11,6 @@ import pytest
 
 from manicule.connectors import config as gmail_settings
 from manicule.connectors.errors import ConnectorError, MailboxMismatchError, RemoteError
-from manicule.connectors.gmail_client import PAGE_SIZE
-from manicule.core.acquisition import MAX_DISCOVERY_BATCH
 from manicule.core.content import RawDocument
 from manicule.core.errors import ConfigError
 from manicule.core.provenance import PROVENANCE_KEY, Provenance
@@ -165,18 +163,6 @@ async def test_each_listing_page_is_one_batch() -> None:
         batches = [len(batch) async for batch in connector.discover_batches(None)]
 
     assert batches == [2, 2, 1]
-
-
-async def test_a_page_larger_than_one_durable_batch_is_split_in_order() -> None:
-    """Gmail's 500 ids a page against the journal's 250 a batch: two batches, nothing lost."""
-    server, time = mailbox(page_size=PAGE_SIZE)
-    added = [server.add_message().id for _ in range(MAX_DISCOVERY_BATCH + 3)]
-
-    async with opened(server, time) as connector:
-        batches = [list(batch) async for batch in connector.discover_batches(None)]
-
-    assert [len(batch) for batch in batches] == [MAX_DISCOVERY_BATCH, 3]
-    assert sorted(doc.source_id for batch in batches for doc in batch) == sorted(added)
 
 
 async def test_the_watermark_exists_only_after_a_complete_walk() -> None:

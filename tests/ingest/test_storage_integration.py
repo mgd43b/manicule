@@ -31,6 +31,7 @@ from manicule.connectors.config import FullInventoryAuthority
 from manicule.connectors.confluence import ConfluenceConnector
 from manicule.connectors.sessions import SessionVault
 from manicule.core.acquisition import (
+    MAX_DISCOVERY_BATCH,
     UNSET,
     AcquiredSource,
     AcquisitionDiagnostic,
@@ -1743,6 +1744,66 @@ async def test_nonbatched_connector_uses_the_dedicated_scalar_admission(
     assert report.error_type == "EnumerationObservedError"
     assert journal.scalar_appends == 2
     assert journal.batch_appends == 0
+
+
+async def test_a_source_page_larger_than_one_batch_is_admitted_whole_before_the_next_cursor(
+    engine: AsyncEngine,
+) -> None:
+    """A page past the journal's limit is admitted in order, in slices, then the cursor moves.
+
+    Gmail's listing pages hold 500 ids against 250 a batch, and a first sync of any full page
+    failed enumeration and indexed nothing. Every batched connector is split here, at the one
+    place its pages reach the journal, rather than in each connector.
+    """
+    admitted: list[tuple[int, int, int]] = []
+    """Each admission: how many records, at what sequence, while which page was outstanding."""
+
+    class CountingJournal(SqliteDocStore):
+        @override
+        async def append_acquisition_records(
+            self,
+            run_id: str,
+            sequence: int,
+            sources: Sequence[AcquisitionSource],
+            *,
+            lease_owner: str,
+            lease_generation: int,
+            now: datetime,
+        ) -> Sequence[AcquisitionRecord]:
+            admitted.append((len(sources), sequence, connector.pages_requested))
+            return await super().append_acquisition_records(
+                run_id,
+                sequence,
+                sources,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+                now=now,
+            )
+
+    page = MAX_DISCOVERY_BATCH * 2 + 20
+    journal = CountingJournal(engine)
+    await journal.ensure_workspace()
+    connector = fakes.ExpiringCursorConnector(
+        {f"synthetic-{number:04d}": "public" for number in range(page + 7)},
+        clock=fakes.ManualClock(),
+        page_size=page,
+        cursor_lifetime_seconds=60,
+    )
+
+    report = await IngestPipeline(store=journal, acquisitions=journal).run(
+        connector, acquire_only=True
+    )
+
+    assert report.error == ""
+    assert admitted == [
+        (MAX_DISCOVERY_BATCH, 0, 1),
+        (MAX_DISCOVERY_BATCH, MAX_DISCOVERY_BATCH, 1),
+        (20, MAX_DISCOVERY_BATCH * 2, 1),
+        (7, page, 2),
+    ], "the first page whole, in order, before the second was requested"
+    durable = await journal.latest_unsettled_acquisition_run(connector.name)
+    assert durable is not None
+    assert durable.discovered_count == page + 7
 
 
 async def test_cancellation_after_page_commit_does_not_request_the_next_cursor(
