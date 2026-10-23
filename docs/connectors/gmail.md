@@ -161,8 +161,12 @@ So the mailbox is configuration, not a side effect of the credential:
 - **`uri` is a link a person can open.** The search URL for the message's `Message-ID`
   (`https://mail.google.com/mail/?authuser=<account>#search/rfc822msgid:<id>`), which survives
   Gmail interface changes better than an internal view path, and names the account so a
-  browser signed in to several opens the right one. A message without a `Message-ID` falls back
-  to `#all/<gmail id>`. §11 lists this as unverified against a live account.
+  browser signed in to several opens the right one. **Both values are percent-encoded before
+  they are inserted**: a `Message-ID` can contain `+`, `%` and `#`, an address can contain `+`,
+  and none is safe raw — a `#` ends the search term and a `+` reads as a space. The angle
+  brackets around a `Message-ID` are stripped first, as Gmail's own `rfc822msgid:` examples
+  show it without them. A message without a `Message-ID` falls back to `#all/<gmail id>`. §11
+  lists the link as unverified against a live account.
 - **Title** is `Subject`, which the parser already makes the first element of the heading path.
 - **Metadata** carries the thread id and `internalDate`. Neither appears on any status surface:
   status reports aggregate counts only, never an id, address, subject or label.
@@ -200,7 +204,8 @@ slash, a nested label, a category such as `CATEGORY_PROMOTIONS` that search spel
 - **A full walk and reconciliation** list the excluded labels first — one
   `messages.list?labelIds=<id>` walk per excluded label, DRAFT included — into an exclusion
   set, then page `messages.list?includeSpamTrash=false` and skip every id in that set.
-  Listing is 5 units per 500 ids, so each excluded label costs what its size costs to list.
+  Listing costs 5 units per request, each returning up to 500 ids, so each excluded label costs
+  what its size costs to list.
 
   **The exclusion set is held in memory, and that is a bounded exception, not the inventory.**
   A connector has no storage of its own — the protocol gives it `discover`, `fetch` and
@@ -211,8 +216,11 @@ slash, a nested label, a category such as `CATEGORY_PROMOTIONS` that search spel
   held this way, which is the invariant durable acquisition protects. A mailbox whose exclusions
   run to millions of messages is the case that would need a storage seam for this, and it would
   be a core change rather than this connector's.
-- **Incremental discovery** tests each message's label ids against the same set of excluded
-  label ids (§4.2).
+- **Incremental discovery** needs no exclusion set of message ids. Each `discover(watermark)`
+  walk resolves `exclude_labels` to label ids afresh (one `labels.list` call) and tests each
+  message's label ids against that set of excluded *label* ids (§4.2). Nothing is carried from
+  one walk to the next, and a changed `exclude_labels` never reaches an incremental walk at
+  all: it changes the scope fingerprint, which forces a complete walk first.
 
 A label applied or removed between the exclusion listing and the main walk is caught by the
 overlap §4.1 describes: the position is captured before either listing, so the next incremental
@@ -291,8 +299,9 @@ Google keeps history "typically" for at least a week, and in rare cases only for
 run falls back to a complete walk from §4.1.
 
 **That fallback is cheap, and the constant version token is the reason.** A complete walk lists
-ids at 5 quota units per 500 and fetches only the ids not already stored, so a mailbox of
-100,000 messages that missed a week of history costs about 1,000 units of listing plus the new
+ids at 5 quota units per request of up to 500 ids, and fetches only the ids not already stored,
+so a mailbox of 100,000 messages that missed a week of history costs about 200 requests and
+1,000 units of listing plus the new
 mail — seconds of quota, not a re-download (§6).
 
 ### 4.4 Batches
@@ -392,7 +401,8 @@ it should not exist, and an index that keeps serving it has overruled them.
 ([`ingest.md`](../ingest.md) §11). `reconcile` builds the same exclusion set and pages the same
 `messages.list` walk as the full walk — the same scope, by construction — through
 `BatchedReconciliationConnector`, and raises rather than returning a prefix if any page fails.
-It is cheap: ids only, 5 units per 500, so a 100,000-message mailbox is about 1,000 units, a
+It is cheap: ids only, 5 units per request of up to 500 ids, so a 100,000-message mailbox is
+about 200 requests and 1,000 units, a
 few seconds of the per-minute budget. A mail installation can afford to reconcile daily or
 hourly.
 
@@ -528,7 +538,8 @@ differ, it is here — check these first when one is available:
 - Whether messages labeled `CHAT` (old Hangouts conversations saved to Gmail) appear in
   `messages.list` and parse as mail. They are in scope unless excluded.
 - Whether the `rfc822msgid` search link (§2) opens the right message with several accounts signed
-  in, and what it does for a `Message-ID` containing characters that need escaping.
+  in; whether the percent-encoded form finds a `Message-ID` containing `+`, `%` or `#`; and
+  whether `authuser` accepts a percent-encoded address containing `+`.
 - The exact reason strings on 403 rate-limit answers, which the error table types by.
 - How long history is actually retained for a busy mailbox.
 - Whether the quota figures in §6 still hold. Google has changed them before; the page carries
