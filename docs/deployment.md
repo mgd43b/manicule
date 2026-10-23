@@ -753,7 +753,8 @@ Unix domain socket. `manicule start` is the same command under its older name; b
 |---|---|---|
 | `search`, `ask`, `doctor`, `document list`, `connector snapshot/verify`, `rebuild plan/status` | work | work |
 | `connector sync`, `connector reconcile`, `index`, `document reindex`, `rebuild execute`, the repair verbs | run **in the server** | refused, naming `manicule serve` |
-| `connector login` | captures here, hands the session to the server | refused before it opens a browser |
+| `connector login` (Confluence) | captures here, hands the session to the server | refused before it opens a browser |
+| `connector login` (Gmail) | opens a browser here and writes the refresh token where you say; no server involved | the same |
 | A Confluence sync | uses the session the server holds | there is no session to use |
 
 The refusal is deliberate and it is not a fallback. A Confluence session lives in the server's

@@ -2277,7 +2277,7 @@ class ApplicationService:
             raise PolicyError(msg)
         return configured
 
-    async def gmail_login(
+    async def connector_login_gmail(
         self,
         name: str,
         *,

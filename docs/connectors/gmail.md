@@ -171,7 +171,7 @@ and needs no running server: the token is handed to you, not to a process.
    opens your browser at Google's sign-in page. The address is also printed to standard error,
    for a machine where no browser could be started.
 2. You choose the account the instance indexes. manicule never asks for, sees or handles a
-   password, a code or a second factor; the browser does the sign-in.
+   password or a second-factor code; the browser does the sign-in.
 3. Google redirects the browser to that port with an authorization code. The request is PKCE
    (`S256`), and the redirect is refused unless it carries the `state` the command chose. The
    only scope requested is `gmail.readonly`, with `access_type=offline` and `prompt=consent`, so
@@ -228,7 +228,8 @@ So the mailbox is configuration, not a side effect of the credential:
   `RefreshTokenCredential.confirm_mailbox`, which does one refresh and one `getProfile` call and
   raises `MailboxMismatchError` for a token that belongs to another mailbox, without printing
   either address, since run-level errors are aggregate (§10). Today it runs in `doctor`'s
-  `gmail-credential` check. [#460](https://github.com/mgd43b/manicule/issues/460) adds it to the
+  `gmail-credential` check and in `connector login` (§1.3), which makes it before writing the
+  token it has just minted. [#460](https://github.com/mgd43b/manicule/issues/460) adds it to the
   connector's setup and to the start of each run, so that a mismatch stops the run before
   anything is read; the factory itself cannot call it, because it is synchronous and does no
   network I/O (§1.2). `getProfile` reports the *primary* address, so configure the primary

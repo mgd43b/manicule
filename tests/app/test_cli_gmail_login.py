@@ -23,7 +23,7 @@ from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings, Settings
 from tests.app.fakes import FakeBackend
 from tests.connectors.fake_google_oauth import CLIENT_SECRET, REFRESH_TOKEN
-from tests.connectors.fake_google_signin import FakeGoogleSignIn, visit
+from tests.connectors.fake_google_signin import FakeGoogleSignIn
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -62,17 +62,13 @@ def google(monkeypatch: pytest.MonkeyPatch) -> FakeGoogleSignIn:
     async def execute(op: str, call: Any) -> Envelope:
         return await run_op(op, service.workspace, lambda: call(service))
 
-    def browser(url: str) -> bool:
-        assert visit(fake.consent(url)) == 200
-        return True
-
-    real = ApplicationService.gmail_login
+    real = ApplicationService.connector_login_gmail
 
     async def through_the_fakes(self: ApplicationService, name: str, **kwargs: Any) -> Any:
-        return await real(self, name, open_browser=browser, transport=fake.transport, **kwargs)
+        return await real(self, name, open_browser=fake.browse, transport=fake.transport, **kwargs)
 
     monkeypatch.setattr(cli, "_execute", execute)
-    monkeypatch.setattr(ApplicationService, "gmail_login", through_the_fakes)
+    monkeypatch.setattr(ApplicationService, "connector_login_gmail", through_the_fakes)
 
     def configured_type(name: str) -> str:
         return backend.settings.connectors[name].type
@@ -95,6 +91,7 @@ def test_a_token_file_is_created_private_and_the_result_never_shows_the_token(
     result = login("mail", "--token-file", str(target))
 
     assert result.exit_code == 0, result.output
+    assert google.visits == [200]
     assert target.read_text() == REFRESH_TOKEN + "\n"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert REFRESH_TOKEN not in result.output
@@ -217,3 +214,37 @@ def test_overwriting_needs_a_file_to_overwrite(google: FakeGoogleSignIn) -> None
 
     assert result.exit_code != 0
     assert "--token-file" in result.output.replace("\n", " ")
+
+
+def test_a_gmail_source_is_routed_by_the_real_configuration_and_needs_no_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Nothing is bound: the configuration file, the type lookup and the runtime are real.
+
+    The bound fixtures above replace both the lookup that sends a Gmail source down this path and
+    the runtime it runs in, so on their own they would pass even if a real Gmail source fell into
+    the Confluence branch — which would tell its operator to start a server. With no client secret
+    in the environment, the first thing the real path can say is that one is missing; the
+    Confluence path's refusal is that no server is running.
+    """
+    config = tmp_path / "manicule.toml"
+    config.write_text(
+        "[connectors.mail]\n"
+        'type = "gmail"\n'
+        "[connectors.mail.options]\n"
+        f'account = "{ACCOUNT}"\n'
+        'client_id = "1234-example.apps.googleusercontent.com"\n'
+    )
+    monkeypatch.setenv("MANICULE_CONFIG_FILE", str(config))
+    monkeypatch.setenv("MANICULE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("GMAIL_CLIENT_SECRET", raising=False)
+    cli.STATE.overrides = {}
+    cli.STATE.workspace = None
+
+    result = login("mail", "--token-file", str(tmp_path / "token"))
+
+    assert result.exit_code != 0
+    text = result.output.replace("\n", " ")
+    assert "GMAIL_CLIENT_SECRET" in text
+    assert "no manicule server" not in text
+    assert not (tmp_path / "token").exists()

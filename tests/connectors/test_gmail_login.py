@@ -79,12 +79,7 @@ def service() -> ApplicationService:
 
 def browser(google: FakeGoogleSignIn, **choices: Any) -> Callable[[str], bool]:
     """A browser that sends the person's choice to the loopback socket the command opened."""
-
-    def open_browser(url: str) -> bool:
-        assert visit(google.consent(url, **choices)) == 200
-        return True
-
-    return open_browser
+    return lambda url: google.browse(url, **choices)
 
 
 async def login(
@@ -96,7 +91,7 @@ async def login(
     timeout_seconds: float = 20.0,
     announce: Callable[[str], None] | None = None,
 ) -> Any:
-    return await service.gmail_login(
+    return await service.connector_login_gmail(
         "mail",
         sink=sink,
         timeout_seconds=timeout_seconds,
@@ -146,14 +141,10 @@ async def test_a_redirect_with_the_wrong_state_is_refused_and_nothing_is_exchang
 ) -> None:
     target = tmp_path / "token"
 
-    def forged_browser(url: str) -> bool:
-        # The loopback socket answers 400 to a forged redirect.
-        assert visit(google.consent(url, state="forged")) == 400
-        return True
-
     with pytest.raises(CredentialError, match="state"):
-        await login(service, google, FileSink(target), open_browser=forged_browser)
+        await login(service, google, FileSink(target), open_browser=browser(google, state="forged"))
 
+    assert google.visits == [400]  # the socket itself refused the forged redirect
     assert google.exchanges == []
     assert not target.exists()
 
@@ -238,22 +229,30 @@ async def test_the_listener_ignores_strays_and_answers_only_the_real_redirect(
             conn.sendall(request)
             return conn.recv(4096)
 
+    answers: list[bytes] = []
+
     def noisy(url: str) -> bool:
         redirect = google.consent(url)
         port = int(redirect.split(":")[2].split("/")[0])
         host = f"Host: 127.0.0.1:{port}\r\n\r\n".encode()
-        assert raw(port, b"GET /favicon.ico HTTP/1.1\r\n" + host).startswith(b"HTTP/1.1 404")
-        assert raw(port, b"GET / HTTP/1.1\r\n" + host).startswith(b"HTTP/1.1 404")
-        assert raw(port, b"POST /?code=x HTTP/1.1\r\n" + host).startswith(b"HTTP/1.1 405")
-        rebound = raw(port, b"GET /?code=x&state=y HTTP/1.1\r\nHost: evil.example\r\n\r\n")
-        assert rebound.startswith(b"HTTP/1.1 400")
-        # A name that resolves here is still not this socket's address.
-        assert visit(redirect) == 200
+        answers.extend(
+            raw(port, request)[:12]
+            for request in (
+                b"GET /favicon.ico HTTP/1.1\r\n" + host,
+                b"GET / HTTP/1.1\r\n" + host,
+                b"POST /?code=x HTTP/1.1\r\n" + host,
+                # A name that resolves here is still not this socket's address.
+                b"GET /?code=x&state=y HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+            )
+        )
+        google.visits.append(visit(redirect))
         return True
 
     target = tmp_path / "token"
     await login(service, google, FileSink(target), open_browser=noisy)
 
+    assert answers == [b"HTTP/1.1 404", b"HTTP/1.1 404", b"HTTP/1.1 405", b"HTTP/1.1 400"]
+    assert google.visits == [200]
     assert target.read_text() == REFRESH_TOKEN + "\n"
 
 
@@ -384,11 +383,11 @@ async def test_only_a_gmail_source_that_is_enabled_can_sign_in(
 ) -> None:
     sink = FileSink(tmp_path / "token")
     with pytest.raises(ConfigError, match="filesystem"):
-        await service.gmail_login("notes", sink=sink, transport=google.transport)
+        await service.connector_login_gmail("notes", sink=sink, transport=google.transport)
     with pytest.raises(Exception, match="enabled = false"):
-        await service.gmail_login("off", sink=sink, transport=google.transport)
+        await service.connector_login_gmail("off", sink=sink, transport=google.transport)
     with pytest.raises(Exception, match="no connector named"):
-        await service.gmail_login("absent", sink=sink, transport=google.transport)
+        await service.connector_login_gmail("absent", sink=sink, transport=google.transport)
 
 
 async def test_a_missing_client_secret_names_the_variable_and_does_not_open_a_browser(
@@ -425,6 +424,7 @@ async def test_no_log_record_carries_the_token_or_the_code(
 
     await login(service, google, FileSink(tmp_path / "token"))
 
+    assert caplog.records, "a log with nothing in it proves nothing"
     logged = "\n".join(f"{r.name} {r.getMessage()}" for r in caplog.records)
     code = google.exchanges[0]["code"]
     for secret in (REFRESH_TOKEN, CLIENT_SECRET, code, "access-token-sentinel"):

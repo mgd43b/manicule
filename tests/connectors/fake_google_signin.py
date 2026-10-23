@@ -47,6 +47,11 @@ class FakeGoogleSignIn(FakeGoogleOAuth):
     def __init__(self, *, address: str = "mail@example.org") -> None:
         super().__init__(address=address)
         self.authorizations: list[dict[str, str]] = []
+        self.visits: list[int] = []
+        """The status the loopback socket answered each browser visit with.
+
+        A browser stub runs inside the command's own error handling, which swallows what it
+        raises, so what it saw is recorded here and asserted on after the command returns."""
         self.exchanges: list[dict[str, str]] = []
         self._codes: dict[str, _Issued] = {}
         self.granted_scope = GMAIL_READONLY_SCOPE
@@ -90,6 +95,11 @@ class FakeGoogleSignIn(FakeGoogleOAuth):
             challenge=asked["code_challenge"],
         )
         return f"{asked['redirect_uri']}/?" + urlencode({"code": code, "state": sent_state})
+
+    def browse(self, auth_url: str, *, approve: bool = True, state: str | None = None) -> bool:
+        """The whole browser step: choose, follow the redirect, and note the status it got."""
+        self.visits.append(visit(self.consent(auth_url, approve=approve, state=state)))
+        return True
 
     @override
     def _token(self, request: httpx.Request) -> httpx.Response:

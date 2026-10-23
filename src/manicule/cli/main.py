@@ -874,7 +874,7 @@ def _gmail_login(
     envelope = asyncio.run(
         _execute(
             "connector_login_gmail",
-            lambda service: service.gmail_login(
+            lambda service: service.connector_login_gmail(
                 name, sink=sink, timeout_seconds=timeout, announce=_say
             ),
         )
@@ -1902,7 +1902,8 @@ def connector_login(
         float | None,
         typer.Option(
             "--timeout",
-            help="Seconds to wait for browser sign-in. Defaults to browser_timeout_seconds.",
+            help="Seconds to wait for browser sign-in. Defaults to browser_timeout_seconds "
+            "for Confluence and to 300 for Gmail.",
         ),
     ] = None,
     allow_insecure_state: Annotated[

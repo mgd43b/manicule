@@ -380,8 +380,9 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         # Capturing a Confluence session. It used to write one to the macOS Keychain, which
         # was not the data directory either; now it hands the session to the server over the
         # control socket and writes nothing anywhere. What it still needs is a server to hand
-        # it to, and `manicule connector login` refuses on its own when there is not one —
-        # which is a different requirement from this lock and is stated where it applies.
+        # it to, and `manicule connector login` for a Confluence source refuses on its own when
+        # there is not one — which is a different requirement from this lock and is stated where
+        # it applies.
         "connector_login",
         # Minting a Gmail refresh token. It writes a file the operator names (or a pipe) and
         # nothing in the data directory, and it needs no server: the token is handed to a person
