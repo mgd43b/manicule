@@ -189,6 +189,7 @@ async def test_pagination_sent_back_to_a_followed_page_is_refused() -> None:
         (html_only_message("Letter"), "Letter"),
         (message_with_attachment("Filed"), "Filed"),
     ],
+    ids=["plain", "html-only", "attachment"],
 )
 async def test_raw_fetch_returns_the_rfc_5322_bytes_unpadded_base64_decoded(
     raw: bytes, marker: str

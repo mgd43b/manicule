@@ -29,6 +29,7 @@ narrowing what it indexes.
 from __future__ import annotations
 
 import base64
+import zlib
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -150,7 +151,7 @@ def plain_message(subject: str = "Quarterly figures", *, sender: str = "pat@exam
     message["From"] = sender
     message["To"] = ADDRESS
     message["Subject"] = subject
-    message["Message-ID"] = f"<{abs(hash(subject))}@example.org>"
+    message["Message-ID"] = f"<{zlib.crc32(subject.encode()):08x}@example.org>"
     message.set_content("The figures are attached to nothing; they are in this sentence.\n")
     return message.as_bytes()
 
