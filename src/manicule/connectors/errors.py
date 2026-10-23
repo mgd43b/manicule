@@ -112,7 +112,7 @@ class NotFoundError(RemoteError):
 
 
 class PermissionDeniedError(RemoteError):
-    """The authenticated account cannot read a specific Confluence resource."""
+    """The authenticated account cannot read a specific resource: a 403 that is not a throttle."""
 
     def __init__(self, message: str) -> None:
         super().__init__(message, status_code=403)
@@ -132,9 +132,11 @@ class RateLimitedError(RemoteError):
 
 
 class CursorExpiredError(ConnectorError):
-    """A pagination cursor was held longer than the source keeps one alive.
+    """A cursor was held longer than the source keeps it alive.
 
-    Search cursors expire (``docs/connectors/confluence.md`` §2), so a sync whose consumer
+    Gmail's is a history position the mailbox no longer holds, answered with a 404
+    (``docs/connectors/gmail.md`` §4.3); the run falls back to a complete walk. Confluence's is
+    a search cursor that expires (``docs/connectors/confluence.md`` §2), so a sync whose consumer
     stalls mid-enumeration resumes onto a cursor the server has forgotten. The server's own
     answer to that is an error or, worse, a fresh first page — which would enumerate the
     opening of the corpus twice and the tail never. Refusing before the request is sent makes
@@ -145,11 +147,16 @@ class CursorExpiredError(ConnectorError):
 class RequestTimeoutError(ConnectorError):
     """One request ran out of time while the source stayed reachable and healthy.
 
-    Raised only when the caller asked for timeouts surfaced
+    Confluence raises it only when the caller asked for timeouts surfaced
     (``ConfluenceClient.get_json(..., surface_read_timeouts=True)``), for a read timeout or an
     explicitly classified transient gateway timeout (504). Everything else — a connection
     refused, a 500, a throttle — keeps the ordinary retry policy, because those are not
     statements about the *shape* of the request.
+
+    Gmail raises it differently: once the ordinary retry budget is spent on timeouts, with no
+    opt-in and no claim about the request's shape, since its pages are a fixed size
+    (``docs/connectors/gmail.md`` §6). A caller that shrinks a request on this type is
+    reasoning about Confluence's inventory and not about a Gmail call.
 
     Its own class because a timeout at a deep pagination offset is the one failure where
     repeating the same request is known to be useless and *changing* it is known to help: the
