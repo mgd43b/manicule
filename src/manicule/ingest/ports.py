@@ -637,6 +637,10 @@ class AcquisitionStore(Protocol):
         source: AcquisitionSource,
     ) -> AcquisitionRecord | None: ...
 
+    async def reusable_record_from_promoted_history(
+        self, connector: str, scope_fingerprint: str, source: AcquisitionSource
+    ) -> AcquisitionRecord | None: ...
+
     async def reusable_record_from_superseded_run(
         self, run_id: str, source: AcquisitionSource
     ) -> AcquisitionRecord | None: ...

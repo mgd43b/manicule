@@ -268,6 +268,110 @@ async def test_an_expired_history_falls_back_to_a_walk_that_fetches_only_what_is
     assert fresh.id in await harness.live()
 
 
+@pytest.mark.parametrize("retain", [True, False])
+async def test_an_expired_history_after_an_incremental_sync_still_fetches_only_new_mail(
+    harness: Harness, retain: bool
+) -> None:
+    """The latest promoted manifest is a delta then, and older messages are not in it."""
+    server = harness.server
+    for number in range(4):
+        server.add_message(mail(f"Message {number}"))
+    connector = await opened(harness)
+    try:
+        await harness.sync(connector, retain=retain)
+        server.add_message(mail("Arrived later"))
+        await harness.sync(connector, retain=retain)
+        fresh = server.add_message(mail("While away"))
+        server.expire_history_through(server.history_id)
+        before = harness.raw_fetches()
+        report = await harness.sync(connector, retain=retain)
+    finally:
+        await connector.teardown()
+
+    assert report.error == ""
+    assert harness.raw_fetches() - before == 1, "only the message not already stored"
+    assert fresh.id in await harness.live()
+    assert len(await harness.live()) == 6
+
+
+async def test_a_fallback_to_a_complete_walk_is_reported_as_a_full_enumeration(
+    harness: Harness,
+) -> None:
+    """A full enumeration is followed by a reconciliation; a delta cannot see deletions."""
+    server = harness.server
+    server.add_message(mail("First"))
+    connector = await opened(harness)
+    try:
+        first = await harness.sync(connector)
+        server.add_message(mail("Second"))
+        incremental = await harness.sync(connector)
+        server.expire_history_through(server.history_id)
+        fallback = await harness.sync(connector)
+    finally:
+        await connector.teardown()
+
+    assert first.full_enumeration
+    assert not incremental.full_enumeration
+    assert fallback.full_enumeration, "history expired: the walk listed the whole mailbox"
+    assert fallback.enumeration_completed
+
+
+async def test_a_deletion_proposal_made_under_one_scope_cannot_be_confirmed_under_another(
+    harness: Harness,
+) -> None:
+    server = harness.server
+    for number in range(6):
+        server.add_message(mail(f"Keep {number}"))
+    for number in range(4):
+        server.add_message(mail(f"Drop {number}"), labels=("INBOX", LABEL))
+    wide = await opened(harness)
+    try:
+        await harness.sync(wide)
+    finally:
+        await wide.teardown()
+    narrow = await opened(harness, exclude_labels=[LABEL])
+    try:
+        await harness.sync(narrow)
+        assert (await reconcile(narrow, harness.store)).refused
+    finally:
+        await narrow.teardown()
+
+    widened = await opened(harness)
+    try:
+        confirmed = await confirm_proposed_deletion(
+            widened.name, harness.store, scope=connector_scope(widened)
+        )
+    finally:
+        await widened.teardown()
+
+    assert confirmed.refused, "the proposal belongs to the narrower scope"
+    assert confirmed.applied_count == 0
+    assert len(await harness.live()) == 10
+
+
+async def test_a_run_resumed_at_acquisition_still_refuses_another_mailbox_before_reading(
+    harness: Harness,
+) -> None:
+    """Enumeration finished, one fetch failed; the retry never passes through discovery."""
+    server = harness.server
+    messages = [server.add_message(mail(f"Message {n}")) for n in range(3)]
+    connector = connector_over(server, harness.time, max_retries=0)
+    await connector.setup()
+    try:
+        server.fail(503, times=1)  # the first fetch fails; the walk before it has completed
+        first = await harness.sync(connector)
+        assert first.retry_required
+        server.switch_mailbox("someone.else@example.org")
+        harness.time.now += 300.0
+        raw_before = harness.raw_fetches()
+        await harness.sync(connector)
+    finally:
+        await connector.teardown()
+
+    assert harness.raw_fetches() == raw_before, "refused before any message was read"
+    assert len(await harness.live()) < len(messages)
+
+
 async def test_history_that_expires_part_way_through_a_run_still_indexes_every_message_once(
     harness: Harness,
 ) -> None:

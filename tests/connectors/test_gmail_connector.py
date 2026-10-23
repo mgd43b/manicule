@@ -11,8 +11,9 @@ import pytest
 
 from manicule.connectors import config as gmail_settings
 from manicule.connectors.errors import ConnectorError, MailboxMismatchError, RemoteError
+from manicule.core.content import RawDocument
 from manicule.core.errors import ConfigError
-from manicule.core.provenance import PROVENANCE_KEY
+from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.core.sources import DocRef
 from manicule.testing import closing
 from tests.connectors.fake_gmail import ADDRESS, FakeGmail, SimulatedTime
@@ -33,6 +34,14 @@ SCOPED_LABELS = (
 )
 """Names with spaces and slashes, a nested label, and a category label (search spells that one
 ``category:promotions``, which is why no path translates a label into a query)."""
+
+
+def _canonical(fetched: RawDocument) -> str:
+    """The address a citation opens: the provenance record's, which the pipeline stores."""
+    record = Provenance.from_metadata(fetched.metadata)
+    assert record is not None
+    assert record.source is not None
+    return record.source.canonical_uri
 
 
 def paths(server: FakeGmail) -> list[str]:
@@ -67,7 +76,8 @@ async def test_a_fetch_returns_the_raw_message_with_the_rfc822msgid_link_and_its
     assert fetched.media_type == "message/rfc822"
     assert fetched.as_bytes() == raw
     assert fetched.source_id == message.id
-    assert fetched.uri == (
+    assert fetched.uri == "https://unused.example", "the address discovery gave"
+    assert _canonical(fetched) == (
         "https://mail.google.com/mail/?authuser=sync.user%40example.org"
         "#search/rfc822msgid:abc.123%40example.org"
     )
@@ -93,17 +103,17 @@ async def test_a_message_id_is_percent_encoded_because_plus_percent_and_hash_are
     async with opened(server, time) as connector:
         fetched = await connector.fetch(DocRef(source_id=message.id, uri="https://unused.example"))
 
-    assert fetched.uri.endswith(f"#search/rfc822msgid:{encoded}")
+    assert _canonical(fetched).endswith(f"#search/rfc822msgid:{encoded}")
 
 
 async def test_a_message_without_a_message_id_links_by_its_gmail_id() -> None:
     server, time = mailbox()
-    message = server.add_message(mail("Anonymous"))
+    message = server.add_message(mail("Anonymous", with_id=False))
 
     async with opened(server, time) as connector:
         fetched = await connector.fetch(DocRef(source_id=message.id, uri="https://unused.example"))
 
-    assert fetched.uri.endswith(f"#all/{message.id}")
+    assert _canonical(fetched).endswith(f"#all/{message.id}")
 
 
 async def test_a_message_deleted_between_discovery_and_fetch_is_not_found() -> None:
@@ -686,11 +696,12 @@ async def test_a_subject_that_cannot_be_a_title_leaves_the_message_indexable_by_
     async with opened(server, time) as connector:
         fetched = await connector.fetch(DocRef(source_id=message.id, uri="https://unused.example"))
 
-    provenance = fetched.metadata[PROVENANCE_KEY]
-    assert fetched.uri.endswith("#search/rfc822msgid:c1%40example.org")
-    assert isinstance(provenance, dict)
-    assert "bad" not in str(provenance)
-    assert provenance.get("unavailable_reason")
+    assert "bad" not in str(fetched.metadata[PROVENANCE_KEY])
+    assert _canonical(fetched).endswith("#search/rfc822msgid:c1%40example.org")
+    record = Provenance.from_metadata(fetched.metadata)
+    assert record is not None
+    assert record.source is not None
+    assert record.source.title == "", "no title, but the link survives"
 
 
 async def test_a_message_with_no_subject_is_fetched_with_an_empty_title() -> None:
@@ -701,4 +712,54 @@ async def test_a_message_with_no_subject_is_fetched_with_an_empty_title() -> Non
         fetched = await connector.fetch(DocRef(source_id=message.id, uri="https://unused.example"))
 
     assert fetched.as_bytes().endswith(b"Just a body.\r\n")
-    assert fetched.uri.endswith(f"#all/{message.id}")
+    assert _canonical(fetched).endswith(f"#all/{message.id}")
+
+
+async def test_a_fetch_reconfirms_the_mailbox_once_the_last_check_has_gone_stale() -> None:
+    """A run resumed at acquisition never passes through discovery; the fetch is its check."""
+    server, time = mailbox()
+    first = server.add_message()
+    second = server.add_message()
+    ref = DocRef(source_id=first.id, uri="https://unused.example")
+
+    async with opened(server, time) as connector:
+        await connector.fetch(ref)
+        assert paths(server).count("/profile") == 1, "setup's check is still fresh"
+        server.switch_mailbox("someone.else@example.org")
+        await connector.fetch(DocRef(source_id=second.id, uri="https://unused.example"))
+        time.now += 120.0
+        raw_before = sum(1 for r in server.requests if r.url.params.get("format") == "raw")
+
+        with pytest.raises(MailboxMismatchError) as caught:
+            await connector.fetch(ref)
+
+    assert sum(1 for r in server.requests if r.url.params.get("format") == "raw") == raw_before
+    assert "example.org" not in str(caught.value)
+
+
+async def test_the_reconciliation_scope_follows_the_excluded_labels() -> None:
+    server, time = mailbox()
+
+    async with (
+        opened(server, time) as wide,
+        opened(server, time, exclude_labels=["Receipts 2026"]) as narrow,
+    ):
+        assert wide.reconciliation_scope != narrow.reconciliation_scope
+        assert "example" not in narrow.reconciliation_scope
+
+
+async def test_a_complete_walk_says_so_and_an_incremental_one_does_not() -> None:
+    server, time = mailbox()
+    server.add_message()
+
+    async with opened(server, time) as connector:
+        assert not connector.walked_full_inventory
+        await drain(connector)
+        assert connector.walked_full_inventory
+        watermark = connector.watermark
+        server.add_message()
+        await drain(connector, watermark)
+        assert not connector.walked_full_inventory
+        server.expire_history_through(server.history_id)
+        await drain(connector, connector.watermark)
+        assert connector.walked_full_inventory, "the fallback walked everything"

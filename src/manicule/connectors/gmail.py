@@ -28,7 +28,8 @@ import email.parser
 import email.policy
 import logging
 import re
-from collections.abc import AsyncIterator, Sequence
+import time
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
@@ -67,6 +68,9 @@ _FINGERPRINT_KEY: Final = "scope_fingerprint"
 _IDENTITY_KEY: Final = "pinned_identity"
 _VERSION_KEY: Final = "version_token"
 
+_RECHECK_SECONDS: Final = 60.0
+"""How long a confirmation that the credential reads the configured mailbox stays fresh."""
+
 _CANDIDATES: Final = frozenset({"messageAdded", "labelRemoved"})
 """History records that make a message a candidate (§4.2). ``labelAdded`` and ``messageDeleted``
 can only take a message out of scope, and that is reconciliation's to act on."""
@@ -102,6 +106,7 @@ class GmailConnector:
         *,
         name: str = GMAIL_CONNECTOR_NAME,
         renewal: str = "",
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Args:
         config: The validated Gmail settings.
@@ -110,6 +115,7 @@ class GmailConnector:
             ``plugin._source_name``).
         renewal: What a person does about a token for the wrong mailbox, appended to that
             refusal. The credential knows the sentence; the connector only repeats it.
+        clock: A monotonic clock, for how long a mailbox check stays fresh (see :meth:`fetch`).
         """
         self.name = name
         self._config = config
@@ -118,8 +124,11 @@ class GmailConnector:
         self._user_excluded: tuple[str, ...] = ()
         """Label ids of ``exclude_labels``, resolved at setup and again at the start of a run."""
         self._resolved = not config.exclude_labels
+        self._clock = clock
+        self._checked_at: float | None = None
         self._next: str | None = None
         self._enumerated = False
+        self._walked_full = False
         self._fetched = 0
 
     # --- identity and scope --------------------------------------------------------------
@@ -133,6 +142,26 @@ class GmailConnector:
     def source_scope(self) -> str:
         """A non-secret name for this scope: the mailbox's digest, never its address or labels."""
         return f"gmail:{self._config.pinned_identity[:16]}"
+
+    @property
+    def reconciliation_scope(self) -> str:
+        """Fences a completed inventory, and a held deletion proposal, to this exact scope.
+
+        Without it a proposal made while labels were excluded could be confirmed after the
+        exclusion was removed, deleting messages that are in scope again, and an inventory
+        awaiting application could be applied under a scope it was not built for.
+        """
+        return f"gmail:{self.scope_fingerprint}"
+
+    @property
+    def walked_full_inventory(self) -> bool:
+        """Whether the walk that last completed listed the whole scope, however it began.
+
+        An incremental sync resumes from a history position and can find it gone, or recorded
+        under another scope, and then walks everything; the pipeline asked before discovery and
+        needs this answer after it to know a reconciliation should follow (``gmail.md`` §7).
+        """
+        return self._enumerated and self._walked_full
 
     @property
     def scope_fingerprint(self) -> str:
@@ -186,8 +215,22 @@ class GmailConnector:
         profile = await self._client.get_profile()
         mismatch = mailbox_mismatch(profile.email_address, self._config.account, self._renewal)
         if mismatch is not None:
+            self._checked_at = None
             raise mismatch
+        self._checked_at = self._clock()
         return profile
+
+    async def _recheck_mailbox(self) -> None:
+        """Re-confirm the mailbox before a fetch if the last confirmation is not recent.
+
+        A run that resumes at acquisition (a fetch failed after enumeration finished) never goes
+        through discovery, so neither ``setup()`` nor the check at the start of a run has run
+        for it, and the connector is cached for the life of the process. The check is one
+        ``getProfile`` (1 quota unit) at most once a minute, so it costs nothing against 60 for
+        a raw fetch, and a refusal comes before the message is read.
+        """
+        if self._checked_at is None or self._clock() - self._checked_at >= _RECHECK_SECONDS:
+            await self._check_mailbox()
 
     async def _begin(self) -> _Run:
         """Start of a run: the mailbox pin, then the excluded label names as ids, afresh.
@@ -254,6 +297,7 @@ class GmailConnector:
     ) -> AsyncIterator[Sequence[DiscoveredDoc]]:
         """One batch per ``messages.list`` or ``history.list`` page (§4.4)."""
         self._enumerated = False
+        self._walked_full = False
         self._next = None
         run = await self._begin()
         position = self._resume_position(watermark)
@@ -272,6 +316,7 @@ class GmailConnector:
                 )
                 self._next = None
                 self._enumerated = False
+                self._walked_full = False
             else:
                 return
         async for batch in self._full(run):
@@ -282,6 +327,7 @@ class GmailConnector:
         async for ids in self._inventory(run):
             yield [self._discovered(message_id) for message_id in ids]
         self._next = run.history_id
+        self._walked_full = True
         self._enumerated = True
 
     async def _incremental(
@@ -371,6 +417,7 @@ class GmailConnector:
         Raises:
             NotFoundError: The message was deleted between discovery and fetch.
         """
+        await self._recheck_mailbox()
         message = await self._client.get_raw(ref.source_id)
         self._fetched += 1
         metadata: Metadata = {_VERSION_KEY: gmail_settings.REPRESENTATION_VERSION}
@@ -381,38 +428,46 @@ class GmailConnector:
             arrived = _arrival(message.internal_date_ms)
             metadata["internal_date"] = arrived.isoformat()
         subject, rfc822_id = _headers(message.raw)
-        uri = self._uri(ref.source_id, rfc822_id)
-        metadata[PROVENANCE_KEY] = self._provenance(ref.source_id, subject, uri, arrived)
+        link = self._link(ref.source_id, rfc822_id)
+        metadata[PROVENANCE_KEY] = self._provenance(ref.source_id, subject, link, arrived)
         return RawDocument(
             source_id=ref.source_id,
-            uri=uri,
+            # The address discovery gave, not the search link: a retained fetch is reusable only
+            # while its envelope names the same address as the record asking for it, and the
+            # link is not known until the headers are read. The pipeline titles and addresses
+            # the document from the provenance record below.
+            uri=ref.uri,
             media_type=MESSAGE_MEDIA_TYPE,
             content=message.raw,
             metadata=metadata,
         )
 
     @staticmethod
-    def _provenance(message_id: str, subject: str, uri: str, arrived: datetime | None) -> JsonValue:
+    def _provenance(
+        message_id: str, subject: str, link: str, arrived: datetime | None
+    ) -> JsonValue:
         """What a citation says about the message: its subject, its link, when it arrived.
 
-        A subject Gmail delivers with a control character is a message that is still indexed
-        and cited by its link; the record then says it could not be described, in words that
-        do not quote the subject.
+        A subject Gmail delivers with a control character cannot be a title. The message is
+        still cited by its link, and the record keeps that link; only if the link too is refused
+        does it say, in words that do not quote the subject, that it could not be described.
         """
-        try:
-            source = SourceMetadata(
-                title=subject,
-                canonical_uri=uri,
-                source_id=message_id,
-                version=gmail_settings.REPRESENTATION_VERSION,
-                created_at=arrived,
-                content_type=MESSAGE_MEDIA_TYPE,
-            )
-        except ValueError:
-            return Provenance(
-                unavailable_reason="the message's subject could not be recorded as its title"
-            ).as_metadata_value()
-        return Provenance(source=source).as_metadata_value()
+        for title in (subject, ""):
+            try:
+                source = SourceMetadata(
+                    title=title,
+                    canonical_uri=link,
+                    source_id=message_id,
+                    version=gmail_settings.REPRESENTATION_VERSION,
+                    created_at=arrived,
+                    content_type=MESSAGE_MEDIA_TYPE,
+                )
+            except ValueError:
+                continue
+            return Provenance(source=source).as_metadata_value()
+        return Provenance(
+            unavailable_reason="the message could not be described by a title and a link"
+        ).as_metadata_value()
 
     # --- reconciliation ------------------------------------------------------------------
 
@@ -439,8 +494,8 @@ class GmailConnector:
         account = quote(self._config.account, safe="")
         return f"{_VIEW}?authuser={account}#all/{quote(message_id, safe='')}"
 
-    def _uri(self, message_id: str, rfc822_id: str | None) -> str:
-        """The ``rfc822msgid`` search link (§2); both values percent-encoded."""
+    def _link(self, message_id: str, rfc822_id: str | None) -> str:
+        """The link a person opens (§2): the ``rfc822msgid`` search, both values percent-encoded."""
         if rfc822_id is None:
             return self._fallback_uri(message_id)
         return (

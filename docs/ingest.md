@@ -2378,7 +2378,10 @@ a computed answer rather than an operator's habit.
 - **A missing session** is handled as a scheduled sync handles it: the loop records that the
   connector awaits sign-in, announces it, and looks again at the next poll. Any other failure is
   recorded and retried at the next look; nothing ends the loop.
-- **After a full sync.** A sync that enumerated the whole source from no cursor, reached the end,
+- **After a full sync.** A sync that enumerated the whole source from no cursor (or that its
+  connector says fell back to a complete walk during discovery, because it could not use the cursor
+  it was handed: the optional `walked_full_inventory` attribute, read once enumeration has ended,
+  which Gmail sets when its change history has expired), reached the end,
   and landed everything it accepted (`RunReport.full_enumeration`, `enumeration_completed`,
   `complete`, and no error) and was not bounded by `--limit` or `--acquire-only` is followed by a
   pass, whether or not the interval has elapsed. A bounded or incomplete run holds a prefix, which

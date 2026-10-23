@@ -6,6 +6,7 @@ touches the network or needs a Google account. Addresses are at ``example.org``.
 
 from __future__ import annotations
 
+import zlib
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from email.message import EmailMessage
@@ -46,9 +47,15 @@ def mail(
     body: str = "The figures are in this sentence.",
     *,
     message_id: str | None = None,
+    with_id: bool = True,
     attachment: bool = False,
 ) -> bytes:
-    """A real message from the standard library's writer, with a stable ``Message-ID``."""
+    """A real message from the standard library's writer.
+
+    It carries a ``Message-ID`` (derived from the subject unless one is given) because nearly
+    every real message does and the link it yields is what citations show; ``with_id=False`` is
+    the message that has none.
+    """
     built = EmailMessage()
     built["From"] = "pat@example.org"
     built["To"] = ADDRESS
@@ -56,6 +63,8 @@ def mail(
     built["Date"] = "Tue, 03 Feb 2026 09:14:00 +0000"
     if message_id is not None:
         built["Message-ID"] = message_id
+    elif with_id:
+        built["Message-ID"] = f"<{zlib.crc32(subject.encode()):08x}@example.org>"
     built.set_content(body + "\n")
     if attachment:
         built.add_attachment(
@@ -91,7 +100,11 @@ def connector_over(
         clock=time,
     )
     return GmailConnector(
-        gmail_config(**options), client, name=name, renewal="Run `manicule connector login mail`."
+        gmail_config(**options),
+        client,
+        name=name,
+        renewal="Run `manicule connector login mail`.",
+        clock=time,
     )
 
 

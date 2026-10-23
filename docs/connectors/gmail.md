@@ -187,7 +187,10 @@ So the mailbox is configuration, not a side effect of the credential:
   either address, since run-level errors are aggregate (§10), and the connector does so before a
   message or a label is read: the only call made is the `getProfile` it needed for its
   `historyId` anyway. The factory cannot do it, because it is synchronous and does no network
-  I/O (§1.2), which is why it is `setup()`'s. `getProfile` reports the *primary* address, so
+  I/O (§1.2), which is why it is `setup()`'s. A run that resumes at acquisition, after a fetch
+  failed once enumeration had finished, never passes through discovery, so `fetch` repeats the
+  check when the last one is more than a minute old: one `getProfile` (1 unit) at most a minute,
+  against 60 for a raw fetch, and the refusal comes before the message is read. `getProfile` reports the *primary* address, so
   configure the primary address: an alias of the account is refused as a mismatch rather than
   followed.
 - **`account` is part of the scope fingerprint** as well (`GmailConfig.scope_fingerprint`, which
@@ -232,8 +235,11 @@ So the mailbox is configuration, not a side effect of the credential:
   and none is safe raw — a `#` ends the search term and a `+` reads as a space. The angle
   brackets around a `Message-ID` are stripped first, as Gmail's own `rfc822msgid:` examples
   show it without them. A message without a `Message-ID` falls back to `#all/<gmail id>`. Discovery
-  yields the fallback, because listing returns ids and nothing else; the fetch reads the header
-  and the document is stored with the search link. §11 lists the link as unverified against a
+  yields the fallback, because listing returns ids and nothing else. The fetch reads the header, and
+  the search link travels as the provenance record's canonical address, which the pipeline stores
+  as the document's address; the fetched envelope keeps discovery's address, because retained
+  bytes are reusable only while the envelope names the address of the record asking for them.
+  §11 lists the link as unverified against a
   live account.
 - **Title** is `Subject`, which the parser also makes the first element of the heading path. A
   listing does not carry it, so it reaches the document at fetch, in the provenance record
@@ -411,8 +417,17 @@ Google keeps history "typically" for at least a week, and in rare cases only for
 `startHistoryId` that is too old is answered with **404**, typed as `CursorExpiredError`, and the
 run falls back to a complete walk from §4.1.
 
+**The fallback is reported as what it is.** The pipeline decides whether a sync was a full
+enumeration before discovery runs, from the watermark it hands over, so a walk that began as an
+incremental one would otherwise be treated as a delta and skip the reconciliation that follows a
+complete walk (§7). The connector says, once discovery has ended, that it walked everything
+(`walked_full_inventory`), and the pipeline reads that as it reads the other signal. The same
+holds when a stored position is set aside because the scope or the representation changed.
+
 **That fallback is cheap, and the constant version token is the reason.** A complete walk lists
-ids at 5 quota units per request of up to 500 ids, and fetches only the ids not already stored,
+ids at 5 quota units per request of up to 500 ids, and fetches only the ids not already stored
+(the retained bytes of a message are found in whichever earlier promoted run fetched it, not only
+in the newest manifest, which after an incremental sync names only that sync's delta),
 so a mailbox of 100,000 messages that missed a week of history costs about 200 requests and
 1,000 units of listing plus the new
 mail — seconds of quota, not a re-download (§6).
@@ -556,6 +571,11 @@ address.
 That meets the prerequisite this section used to state: reconciliation runs on a schedule before
 the Gmail connector ships. The schedule lives in `manicule serve`, so an installation that is not
 served has no process to run it, and only the command above reconciles it.
+
+A pass and a held deletion proposal are fenced to the scope they were built under
+(`reconciliation_scope`, which carries the scope fingerprint), so a proposal made while a label
+was excluded cannot be confirmed after the exclusion is removed, which would delete messages that
+are in scope again.
 
 **Two behaviors matter more for mail than for anything else:**
 
