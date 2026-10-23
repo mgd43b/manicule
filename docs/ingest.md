@@ -2330,9 +2330,16 @@ than an implementation detail (`contracts.md` §3). A typed `source_deleted` aft
 enumeration is different: §8.3.1 invalidates that manifest and requires a fresh complete
 enumeration before the absence may be reconciled.
 
-**Cadence.** After every full sync, and on a schedule (`reconcile_interval`, default weekly)
+**Cadence.** After every full sync, and on a schedule (`reconcile_interval_s`, default weekly)
 for connectors that only ever sync incrementally. Deletion detection that runs only when
 someone remembers is deletion detection that does not run.
+
+**That cadence is the design, and nothing runs it yet.** `manicule.ingest.reconcile.reconcile`
+is implemented and tested as described below, but no command, service method or schedule
+calls it, and `reconcile_interval_s` is read nowhere but its own definition. So today a
+document that leaves its source stays indexed until `manicule document delete` removes it.
+[`connectors/gmail.md`](connectors/gmail.md) §7 makes wiring it in a prerequisite of the Gmail
+connector, because for a mailbox the consequence is deleted mail that stays searchable.
 
 **Mechanics.** `reconcile()` yields the `SourceId`s that currently exist. Storage journals them
 in pages under an immutable workspace, connector and configured-scope identity. Only iterator
