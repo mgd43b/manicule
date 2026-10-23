@@ -813,12 +813,6 @@ citation naming a thread instead of a message, a thread document rebuilt every t
 arrives, and deletion and reconciliation reasoning about parts of a document rather than whole
 ones.
 
-### 8.4 Also found
-
-The connector yields each `messages.list` page as one discovery batch and asks for 500 ids a
-page, and durable acquisition refuses a batch of more than 250 records. The harness serves
-pages of 250 and says why; the defect is outside what this measured.
-
 ---
 
 ## 9. Retention

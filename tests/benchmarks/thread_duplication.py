@@ -75,6 +75,7 @@ from typing import TYPE_CHECKING, Any, cast
 from manicule.app.runtime import Runtime
 from manicule.cli.render import console
 from manicule.config.settings import Settings
+from manicule.connectors.gmail_client import PAGE_SIZE
 from manicule.core.anchors import LineAnchor
 from manicule.core.content import RawDocument
 from manicule.core.retrieval import Filter, Query
@@ -109,11 +110,6 @@ KS = (5, 10)
 SOURCE = "mail"
 CARRIES = 0.5
 """The share of a passage's characters a chunk must hold to count as carrying it."""
-
-PAGE = 250
-"""Ids per listing page. Not Gmail's 500: the connector makes each page one discovery batch,
-and durable acquisition refuses a batch of more than 250 records, so a full page of 500 fails
-the sync. That is a defect of its own, outside what this measures."""
 
 _QUOTE_MARKERS = re.compile(r"^\s*(?:>\s?)+")
 
@@ -232,7 +228,7 @@ async def index(
 ) -> Indexed:
     """Serve the corpus from the synthetic Gmail and sync it through the shipped pipeline."""
     clock = SimulatedTime()
-    server = FakeGmail(clock=clock, page_size=PAGE)
+    server = FakeGmail(clock=clock, page_size=PAGE_SIZE)
     for thread in corpus.threads:
         first = ""
         for message in thread.messages:
