@@ -153,6 +153,11 @@ class FileSink:
         if not parent.is_dir():
             msg = f"{str(parent)!r} is not a directory, so there is nowhere to create the file."
             raise ConfigError(msg)
+        # Found now rather than after a sign-in: a minted token that cannot be written is a
+        # grant on the account with nothing to show for it.
+        if not os.access(parent, os.W_OK | os.X_OK):
+            msg = f"{str(parent)!r} is not writable by you, so the file cannot be created there."
+            raise ConfigError(msg)
         if self.path.is_symlink() or self.path.exists():
             if not self.overwrite:
                 msg = (
@@ -230,8 +235,18 @@ class StreamSink:
         self.stream.flush()
 
 
+_OPENING: set[asyncio.Future[None]] = set()
+"""Browser launches in flight. Held so the loop's weak reference is not the only one."""
+
+
 def _ignore(message: str) -> None:
     del message
+
+
+def _open(open_browser: Callable[[str], object], url: str) -> None:
+    """Start the browser. Failing to is not an error: the address was announced for that case."""
+    with contextlib.suppress(Exception):
+        open_browser(url)
 
 
 async def mint_refresh_token(
@@ -297,10 +312,11 @@ async def mint_refresh_token(
             "Opening your browser to sign in. Choose the account this instance indexes. "
             f"If nothing opens, open this address yourself:\n  {url}"
         )
-        # Off the event loop: starting a browser can block, and the redirect has to be served
-        # while it does.
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(open_browser, url)
+        # Off the event loop, and not waited for: a console browser blocks until the person
+        # quits it, and neither the redirect nor the timeout below may wait on that.
+        opening = asyncio.ensure_future(asyncio.to_thread(_open, open_browser, url))
+        _OPENING.add(opening)
+        opening.add_done_callback(_OPENING.discard)
         announce(f"Waiting up to {timeout_seconds:g} seconds for the sign-in to finish.")
         try:
             async with asyncio.timeout(timeout_seconds):
@@ -481,7 +497,7 @@ class _Loopback:
             try:
                 async with asyncio.timeout(_CONNECTION_TIMEOUT_SECONDS):
                     head = await reader.readuntil(b"\r\n\r\n")
-            except (TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            except (TimeoutError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
                 return
             status, page = self._answer(head)
             body = f"<!doctype html><title>manicule</title><p>{page}</p>".encode() if page else b""

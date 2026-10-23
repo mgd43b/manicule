@@ -15,6 +15,7 @@ import logging
 import os
 import socket
 import stat
+import threading
 from typing import TYPE_CHECKING, Any, override
 
 import pytest
@@ -441,3 +442,45 @@ async def test_no_failure_message_carries_a_secret(
     assert REFRESH_TOKEN not in str(caught.value)
     assert CLIENT_SECRET not in str(caught.value)
     assert "sentinel-prose" not in str(caught.value)
+
+
+async def test_a_browser_that_stays_open_does_not_hold_the_sign_in_up(
+    service: ApplicationService, google: FakeGoogleSignIn, tmp_path: Path
+) -> None:
+    """A console browser does not return until the person quits it; the token must not wait."""
+    quit_browser = threading.Event()
+
+    def lingering(url: str) -> bool:
+        google.browse(url)
+        quit_browser.wait(timeout=10)
+        return True
+
+    target = tmp_path / "token"
+    try:
+        await login(service, google, FileSink(target), open_browser=lingering)
+    finally:
+        quit_browser.set()
+
+    assert target.read_text() == REFRESH_TOKEN + "\n"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write anywhere")
+async def test_a_directory_that_cannot_be_written_is_found_before_the_browser_opens(
+    service: ApplicationService, google: FakeGoogleSignIn, tmp_path: Path
+) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    opened: list[str] = []
+    try:
+        with pytest.raises(ConfigError, match="not writable"):
+            await login(
+                service,
+                google,
+                FileSink(locked / "token"),
+                open_browser=lambda u: opened.append(u) or True,
+            )
+    finally:
+        locked.chmod(0o700)
+
+    assert opened == []
