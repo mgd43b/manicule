@@ -117,13 +117,17 @@ class _RedactGmailUrls(logging.Filter):
 
     @override
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.args, tuple):
-            record.args = tuple(
-                f"{_ORIGIN}/[redacted]" if str(argument).startswith(_ORIGIN) else argument
-                for argument in record.args
-            )
+        # Works on the formatted text, not on ``record.args``: another filter on the same
+        # logger (litellm installs one when it is imported) may already have folded the
+        # arguments into the message, and then there are no arguments left to look at.
+        text = record.getMessage()
+        if _ORIGIN in text:
+            record.msg = _GMAIL_URL.sub(f"{_ORIGIN}/[redacted]", text)
+            record.args = ()
         return True
 
+
+_GMAIL_URL: Final = re.compile(re.escape(_ORIGIN) + r"\S*")
 
 _REDACT_GMAIL_URLS: Final = _RedactGmailUrls()
 

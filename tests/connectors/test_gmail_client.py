@@ -674,6 +674,16 @@ async def test_no_error_carries_a_message_id_an_address_or_a_label_name() -> Non
         assert "googleapis" not in text
 
 
+class _FoldsArgsIntoMessage(logging.Filter):
+    """What litellm's filter on the same logger does: format the record, leave no arguments."""
+
+    @override
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = record.getMessage()
+        record.args = ()
+        return True
+
+
 async def test_the_http_stacks_own_request_log_does_not_name_a_message(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -688,11 +698,15 @@ async def test_the_http_stacks_own_request_log_does_not_name_a_message(
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={}))
     )
     caplog.set_level(logging.INFO, logger="httpx")
+    # Another library's filter on the same logger may have formatted the record already.
+    folding = _FoldsArgsIntoMessage()
+    logging.getLogger("httpx").filters.insert(0, folding)
     try:
         await client.get_raw(message.id)
         await _pages(client.history("1"))
         await other.get("https://example.org/unrelated/path?page=7")
     finally:
+        logging.getLogger("httpx").removeFilter(folding)
         await client.teardown()
         await other.aclose()
 
@@ -701,9 +715,7 @@ async def test_the_http_stacks_own_request_log_does_not_name_a_message(
     assert len(gmail) == 2
     httpx_logger = logging.getLogger("httpx")
     assert all(message.id not in line and "startHistoryId" not in line for line in gmail), (
-        f"filters={httpx_logger.filters!r} disabled={httpx_logger.disabled} "
-        f"module={GmailClient.__module__}@{id(sys.modules.get(GmailClient.__module__))} "
-        f"lines={gmail!r}"
+        f"filters={httpx_logger.filters!r} disabled={httpx_logger.disabled} lines={gmail!r}"
     )
     # Another client's request is logged exactly as before.
     assert any("https://example.org/unrelated/path?page=7" in line for line in logged)
