@@ -50,6 +50,9 @@ short enough that one wrapped differently still is."""
 
 _QUOTE_MARKERS = re.compile(r"^[ \t]*(?:>[ \t]?)+", re.MULTILINE)
 _WORD = re.compile(r"\w+")
+_HEADER_LINE = re.compile(
+    r"^[ \t]*(?:>[ \t]?)*(?:from|to|cc|bcc|date|sent|subject):.*$", re.IGNORECASE | re.MULTILINE
+)
 
 
 def trigrams(text: str) -> list[tuple[str, ...]]:
@@ -58,6 +61,16 @@ def trigrams(text: str) -> list[tuple[str, ...]]:
     if len(words) < SHINGLE:
         return [tuple(words)] if words else []
     return [tuple(words[i : i + SHINGLE]) for i in range(len(words) - SHINGLE + 1)]
+
+
+def body_trigrams(text: str) -> list[tuple[str, ...]]:
+    """:func:`trigrams` with header lines — ``From:``, ``To:``, ``Date:`` and the like — removed.
+
+    Two messages' headers differ the way a correction does, a few words apart inside text that
+    is otherwise the same, so they are left out of the search for corrections. They still count
+    towards how much of a candidate was shown.
+    """
+    return trigrams(_HEADER_LINE.sub("", text))
 
 
 def shingles(text: str) -> frozenset[tuple[str, ...]]:
@@ -77,10 +90,11 @@ class _Shown:
         self.trigrams: set[tuple[str, ...]] = set()
         self._at: list[dict[tuple[str, ...], list[int]]] = []
 
-    def add(self, ordered: list[tuple[str, ...]]) -> None:
+    def add(self, ordered: list[tuple[str, ...]], body: list[tuple[str, ...]]) -> None:
+        """Record a kept candidate: all of its trigrams, and where its body's stood."""
         self.trigrams.update(ordered)
         positions: dict[tuple[str, ...], list[int]] = {}
-        for index, trigram in enumerate(ordered):
+        for index, trigram in enumerate(body):
             positions.setdefault(trigram, []).append(index)
         self._at.append(positions)
 
@@ -146,15 +160,18 @@ class CollapseStage:
             if conversation is None:
                 kept.append(candidate)
                 continue
-            ordered = trigrams(candidate.chunk.text)
+            text = candidate.chunk.text
+            ordered, body = trigrams(text), body_trigrams(text)
             above = shown.setdefault(conversation, _Shown())
-            if self._repeats(ordered, above):
+            if self._repeats(ordered, body, above):
                 continue
-            above.add(ordered)
+            above.add(ordered, body)
             kept.append(candidate)
         return kept
 
-    def _repeats(self, ordered: list[tuple[str, ...]], above: _Shown) -> bool:
+    def _repeats(
+        self, ordered: list[tuple[str, ...]], body: list[tuple[str, ...]], above: _Shown
+    ) -> bool:
         """Whether this text was already shown, and is not a correction of what was.
 
         Enough of it must appear above — ``containment`` of its distinct trigrams — and none of
@@ -163,7 +180,7 @@ class CollapseStage:
         own = set(ordered)
         if not own or len(own & above.trigrams) < self._config.containment * len(own):
             return False
-        return not above.edits(ordered)
+        return not above.edits(body)
 
     async def _conversations(
         self, query: Query, candidates: list[Candidate]
@@ -195,4 +212,4 @@ class CollapseStage:
         }
 
 
-__all__ = ["SHINGLE", "CollapseStage", "shingles", "trigrams"]
+__all__ = ["EDIT", "SHINGLE", "CollapseStage", "body_trigrams", "shingles", "trigrams"]

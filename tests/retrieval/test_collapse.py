@@ -153,6 +153,26 @@ async def test_unshown_text_at_a_chunk_s_ends_is_a_seam_not_new_text(
     assert kept == [shown]
 
 
+async def test_another_message_s_headers_are_not_mistaken_for_a_correction(
+    store: SqliteDocStore,
+) -> None:
+    """Every message's headers differ from the next one's a word or two apart, like an edit."""
+    first = await message(store, "m1", {"gmail_thread_id": "t1"})
+    second = await message(store, "m2", {"gmail_thread_id": "t1"})
+
+    def headed(sender: str, to: str, day: str) -> str:
+        return (
+            f"From: {sender} <{sender.lower()}@example.org>\nTo: {to} <{to.lower()}@example.org>"
+            f"\nDate: {day}, 02 Feb 2026 09:00:00 +0000\nSubject: Re: Aurora ledger planning"
+            f"\n\n{ORIGINAL}\n\n{REPLY}"
+        )
+
+    shown = candidate(first, headed("Pat", "Sam", "Mon"), 0.9)
+    ranked = [shown, candidate(second, headed("Sam", "Pat", "Tue"), 0.8)]
+
+    assert await CollapseStage(docstore=store).run(a_query(), ranked) == [shown]
+
+
 async def test_a_seam_between_passages_shown_apart_is_not_mistaken_for_a_correction(
     store: SqliteDocStore,
 ) -> None:
