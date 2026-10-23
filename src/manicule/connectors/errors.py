@@ -112,7 +112,7 @@ class NotFoundError(RemoteError):
 
 
 class PermissionDeniedError(RemoteError):
-    """The authenticated account cannot read a specific Confluence resource."""
+    """The authenticated account cannot read a specific resource: a 403 that is not a throttle."""
 
     def __init__(self, message: str) -> None:
         super().__init__(message, status_code=403)
@@ -132,9 +132,11 @@ class RateLimitedError(RemoteError):
 
 
 class CursorExpiredError(ConnectorError):
-    """A pagination cursor was held longer than the source keeps one alive.
+    """A cursor was held longer than the source keeps it alive.
 
-    Search cursors expire (``docs/connectors/confluence.md`` §2), so a sync whose consumer
+    Gmail's is a history position the mailbox no longer holds, answered with a 404
+    (``docs/connectors/gmail.md`` §4.3); the run falls back to a complete walk. Confluence's is
+    a search cursor that expires (``docs/connectors/confluence.md`` §2), so a sync whose consumer
     stalls mid-enumeration resumes onto a cursor the server has forgotten. The server's own
     answer to that is an error or, worse, a fresh first page — which would enumerate the
     opening of the corpus twice and the tail never. Refusing before the request is sent makes
@@ -188,7 +190,12 @@ class AttachmentTooLargeError(ConnectorError):
 
 
 class SessionExpiredError(ConnectorError):
-    """The browser session this connector authenticates with is no longer usable.
+    """The credential this connector authenticates with is no longer usable.
+
+    Written for Confluence's browser session, which is the harder case and the one described
+    below. Gmail raises it too, when an access token is rejected a second time right after it
+    was refreshed (``docs/connectors/gmail.md`` §6), and its message carries the credential's
+    own renewal sentence.
 
     Its own class because it is the one credential failure a person answers by going back to a
     browser rather than by editing configuration, and because it does not arrive as a 401. An

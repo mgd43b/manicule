@@ -31,10 +31,8 @@ import hashlib
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 from manicule.connectors.config import ConfluenceConfig
 from manicule.connectors.credentials import Authorization, Credential, token_credential
@@ -58,6 +56,7 @@ from manicule.connectors.intercept import (
     signin_path,
 )
 from manicule.connectors.pagination import next_page, origin_of
+from manicule.connectors.retry import BACKOFF_BASE_SECONDS, backoff, retry_after
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     import httpx
@@ -69,9 +68,6 @@ __all__ = [
     "ConfluenceClient",
     "Downloaded",
 ]
-
-BACKOFF_BASE_SECONDS = 0.5
-"""First delay after a retryable failure. Doubles per attempt, capped by configuration."""
 
 MAX_REDIRECTS = 5
 """How many redirects one request may take before the client calls it a loop."""
@@ -572,8 +568,8 @@ class ConfluenceClient:
         config = self._config
         if status_code == HTTPStatus.TOO_MANY_REQUESTS:
             self.throttled += 1
-            requested = _retry_after(headers)
-            wait = requested if requested is not None else _backoff(attempt)
+            requested = retry_after(headers)
+            wait = requested if requested is not None else backoff(attempt)
             if wait > config.max_retry_after_seconds:
                 msg = (
                     f"Confluence asked for a {wait:.0f}s pause, longer than the "
@@ -601,7 +597,7 @@ class ConfluenceClient:
                     f"of them, that page is the thing to look at."
                 )
                 raise RemoteError(msg, status_code=status_code)
-            return _backoff(attempt)
+            return backoff(attempt)
         return None
 
     async def _retry_transport(self, exc: Exception, url: str, attempt: int) -> None:
@@ -616,7 +612,7 @@ class ConfluenceClient:
                 f"The run stops without advancing the watermark, so re-running resumes."
             )
             raise ConnectorError(msg) from exc
-        await self._sleep(_backoff(attempt))
+        await self._sleep(backoff(attempt))
 
     def _raise_for_status(self, status: int, url: str, headers: Mapping[str, str]) -> None:
         if status < HTTPStatus.BAD_REQUEST:
@@ -680,35 +676,3 @@ class ConfluenceClient:
             f"this is what an instance does when a sign-in it insists on cannot be completed by "
             f"a client that only holds cookies. {self._credential.renewal()}"
         )
-
-
-def _backoff(attempt: int) -> float:
-    """Exponential, from :data:`BACKOFF_BASE_SECONDS`, doubling per attempt."""
-    return BACKOFF_BASE_SECONDS * (2**attempt)
-
-
-def _retry_after(headers: Mapping[str, str]) -> float | None:
-    """The pause a ``Retry-After`` header asks for, in seconds.
-
-    Both forms are accepted, because both are sent: a delay in seconds, and an HTTP-date. A
-    client that reads only the first waits zero seconds when it gets the second, and retries
-    straight into the same limit — which is how a throttled sync turns into a throttled sync
-    that also looks like a hot loop.
-    """
-    raw: Any = headers.get("retry-after")
-    if raw is None:
-        return None
-    value = str(raw).strip()
-    if not value:
-        return None
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        pass
-    try:
-        when = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return max(0.0, (when - datetime.now(tz=UTC)).total_seconds())
