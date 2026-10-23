@@ -258,7 +258,9 @@ Two constraints ride along and both are enforced:
 - **Auth is non-negotiable on a socket unless an operator says otherwise at a terminal.**
   `manicule.app.bind.require_authoring_authentication`
   refuses when authoring is configured and `security.auth.mode` is `none` — loopback included,
-  where `resolve_bind` asks for nothing. Two callers, because there are two ways a socket carries
+  where `resolve_bind` asks for nothing about the address (it does ask for authentication when
+  the installation is in team mode or holds a sensitive source, whatever else is configured).
+  Two callers, because there are two ways a socket carries
   the tool: `manicule.mcp.serve.address_for` for `--mcp-only`, and `manicule.api.app.build_app`
   for the application everything else is served from — the second so the refusal fires when a
   container entry point or a production ASGI server is doing the listening. The condition is
@@ -274,7 +276,10 @@ Two constraints ride along and both are enforced:
   and an anonymous administrator clears the member floor on either. In team mode the waiver does
   not exist: several people share that installation, so there is no one operator for an
   anonymous caller to be, and the flag is refused
-  ([`surfaces.md` §6](surfaces.md#team-mode-takes-the-way-out-away)).
+  ([`surfaces.md` §6](surfaces.md#team-mode-takes-the-way-out-away)). The waiver covers this
+  refusal only: an installation that holds a sensitive source is refused without authentication
+  on every address, and the flag does not apply to that either
+  ([`surfaces.md` §6](surfaces.md#sensitive-sources-take-the-way-out-away)).
 - **Scope is a configured writable collection**, not any collection the workspace holds. Creating a
   collection is therefore not also the act of granting write access to it.
 

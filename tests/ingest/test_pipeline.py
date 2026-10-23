@@ -53,6 +53,7 @@ def build(
     parse_fingerprints: Callable[[str], ParseFingerprint | None] = parse_fingerprint,
     detect_glossary: bool = True,
     chunker: Chunker | None = None,
+    sensitive_sources: frozenset[str] = frozenset(),
 ) -> tuple[IngestPipeline, fakes.MemoryIngestStore, fakes.MemoryVectors]:
     """A pipeline over in-memory everything, plus the store and vectors to assert against.
 
@@ -80,6 +81,7 @@ def build(
         max_fetch_bytes=max_fetch_bytes,
         parse_fingerprints=parse_fingerprints,
         detect_glossary=detect_glossary,
+        sensitive_sources=sensitive_sources,
     )
     return pipeline, store, vectors
 

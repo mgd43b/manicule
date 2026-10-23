@@ -197,7 +197,9 @@ on `security.auth.mode`, and so does what this surface says when it refuses one:
   off loopback takes `manicule serve --no-authentication` alongside `--allow-public-bind`
   ([`deployment.md` §4](deployment.md#4-binding-a-port)), and it hands every caller on that
   address the same authority — so it is for a network an operator owns, and `--no-web` is worth
-  considering beside it. Team mode refuses it outright.
+  considering beside it. Team mode refuses it outright, and so does an installation that holds a
+  sensitive source (a Gmail mailbox, for one), on loopback too; `--no-authentication` waives
+  neither ([`surfaces.md` §6](surfaces.md#6-where-a-server-listens)).
 - **`api_key`** — a key is presented on every request in a header, and there is **no session
   cookie in this mode**. A page load carries no credential, so this surface refuses it — with an
   HTML page that says so and points at the HTTP API and the command line, rather than a JSON
@@ -304,7 +306,8 @@ unless configuration named that site.**
 
 The question only arises with a browser surface, because cross-site request forgery needs a
 browser that will attach *ambient* authority to a request some other page caused — and manicule's
-ambient case is the one it ships as: loopback with no credential at all. Where people sign in
+ambient case is the one it ships as: loopback with no credential at all (which an installation
+holding a sensitive source does not get to serve). Where people sign in
 there is a second one, the session cookie; it is `SameSite=Strict`, so a browser does not attach
 it to a request another site caused, and this check is the half of the defense that holds even
 if one did. A page on the internet cannot read the response, but with a "simple" request it does

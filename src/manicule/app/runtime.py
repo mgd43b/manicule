@@ -29,10 +29,19 @@ from time import monotonic
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Final, Self, cast, override
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    model_serializer,
+)
 
 from manicule.app.results import ApiKeySummary, Check, CheckState, UserSummary
+from manicule.app.sensitive import sensitive_instances as configured_sensitive_instances
 from manicule.config.loader import load_settings
+from manicule.config.settings import AuthMode
 from manicule.container import keys
 from manicule.container.container import Container, build_container
 from manicule.core.content import RawDocument
@@ -182,6 +191,21 @@ class ArchiveEntry(BaseModel):
     media_type: str = Field(min_length=1)
     version_token: str | None = None
     blob: str = Field(min_length=1, description="Path to the retained bytes, inside the archive.")
+    sensitive: bool = False
+    """Whether a sensitive connector had synced this entry's source where it was exported.
+
+    Carried so that an import into another installation marks the source as the exporting one
+    had, and the refusal to serve it without authentication follows the documents instead of
+    being left behind with the configuration. Written only when ``True``, so an archive holding
+    nothing sensitive is byte-for-byte what it was and older builds still read it.
+    """
+
+    @model_serializer(mode="wrap")
+    def _omit_default_sensitive(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        serialized = handler(self)
+        if not self.sensitive:
+            serialized.pop("sensitive", None)
+        return serialized
 
 
 class ArchiveManifest(BaseModel):
@@ -409,6 +433,16 @@ class Runtime:
     def container(self) -> Container:
         """Configured component graph shared by ingestion and offline derivation assembly."""
         return self._container
+
+    def sensitive_instances(self) -> frozenset[str]:
+        """Configured connector instances whose registered type is sensitive.
+
+        What the pipeline marks on a sync, resolved from the registry's flag so that no
+        connector has to declare it about itself — one that forgot would fail open.
+        """
+        return configured_sensitive_instances(
+            self._settings, self._container.registry.sensitive_names(ComponentKind.CONNECTOR)
+        )
 
     @property
     def workspace(self) -> str:
@@ -1072,6 +1106,7 @@ class Runtime:
             max_fetch_bytes=settings.ingest.max_fetch_bytes,
             snapshot_policy=settings.ingest.snapshot_promotion_policy,
             mutation_guard=self.derived_mutation_guard,
+            sensitive_sources=self.sensitive_instances(),
         )
 
     async def _build_pipeline(self) -> IngestPipeline:
@@ -1171,6 +1206,7 @@ class Runtime:
             snapshot_policy=settings.ingest.snapshot_promotion_policy,
             mutation_guard=self.derived_mutation_guard,
             expected_reset_epoch=expected_reset_epoch,
+            sensitive_sources=self.sensitive_instances(),
             # Passed rather than defaulted, which it had been since the setting shipped. The
             # field is documented as the switch an operator throws while investigating a
             # detector that is producing rubbish, and nothing outside `settings.py` read it: a
@@ -2354,8 +2390,27 @@ class _Ingestion:
         manifest_path, manifest = await asyncio.to_thread(_open_archive, path)
         root = manifest_path.parent
         pipeline = await self._runtime.pipeline()
+        sensitive = sorted({entry.source for entry in manifest.documents if entry.sensitive})
+        if sensitive and self._runtime.settings.security.auth.mode is AuthMode.NONE:
+            # Refused whole, before a document is written. This process is already serving, and
+            # it started without a sensitive source, so nothing refused it: importing now would
+            # put mail in front of whoever can reach the port until the next restart.
+            msg = (
+                f"refusing to import: the archive carries sensitive source(s) "
+                f"{', '.join(map(repr, sensitive))} and this installation has "
+                f"security.auth.mode = 'none'. Set it to 'api_key' or 'oauth' and restart, then "
+                f"import again."
+            )
+            raise PolicyError(msg)
         report = RunReport(connector="import")
+        marked: set[str] = set()
         for entry in manifest.documents:
+            # Before the document is written, for the reason a sync marks first: the archive says
+            # this source held mail where it came from, and nothing else on this installation
+            # would otherwise know.
+            if entry.sensitive and entry.source not in marked:
+                await (await self._runtime.documents()).mark_source_sensitive(entry.source)
+                marked.add(entry.source)
             blob = root / entry.blob
             content = await asyncio.to_thread(_read_blob, blob)
             if content is None:
@@ -4318,6 +4373,7 @@ class _Maintenance:
             _prepare_archive_dir, target, allow_insecure_target=allow_insecure_target
         )
         selector = Filter(workspace_ids=frozenset({self._runtime.workspace}))
+        sensitive = await store.marked_sensitive_sources() | self._runtime.sensitive_instances()
         entries: list[ArchiveEntry] = []
         written = 0
         offset = 0
@@ -4344,6 +4400,7 @@ class _Maintenance:
                         media_type=document.media_type,
                         version_token=document.version_token,
                         blob=f"blobs/{document.original_ref}",
+                        sensitive=document.source in sensitive,
                     )
                 )
         manifest = ArchiveManifest(

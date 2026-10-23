@@ -267,6 +267,12 @@ own so a change to its rules makes the corpus visibly stale rather than quietly 
   a parser that disagrees with its own declaration is caught the first time it is used.
 - Declare a `config_model`. Settings written for a component with no model are rejected
   rather than ignored.
+- **A connector whose content is one person's, such as a mailbox, registers with
+  `sensitive=True`** (`registry.add(..., sensitive=True)`; it means nothing for other kinds).
+  The index is not permission-aware, so an installation with such an enabled connector, or with
+  documents left in its data directory by one that has synced, is refused when it serves without
+  authentication, loopback included and `--no-authentication` notwithstanding. See
+  [`docs/surfaces.md` §6](docs/surfaces.md#sensitive-sources-take-the-way-out-away).
 - **An embedder records `[embedding] prefix_scheme` on its fingerprint, and never applies a
   prefix itself.** Building the fingerprint through `ModelCard.fingerprint()` does both for
   you, which is why the two shipped backends and `manicule-ollama` all go that way. A backend

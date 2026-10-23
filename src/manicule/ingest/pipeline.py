@@ -141,6 +141,7 @@ from manicule.parsers.versions import parse_fingerprint
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
+    from collections.abc import Set as AbstractSet
 
     from manicule.core.content import Chunk, Metadata
     from manicule.core.fingerprints import ChunkFingerprint, ParseFingerprint
@@ -1081,6 +1082,7 @@ class IngestPipeline:
         snapshot_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         mutation_guard: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
         expected_reset_epoch: int | None = None,
+        sensitive_sources: AbstractSet[str] = frozenset(),
     ) -> None:
         derived = (chunker, embedder, vectors, runner, resolve_chain, middleware, chunk_fingerprint)
         if any(component is None for component in derived) and not all(
@@ -1097,6 +1099,7 @@ class IngestPipeline:
         if chunk_fingerprint is not None:
             require_measured(chunk_fingerprint)
         self._store = store
+        self._sensitive_sources, self._marked_sensitive = frozenset(sensitive_sources), set[str]()
         # Explicit protocol injection keeps the legacy bounded path available to protocol-only
         # stores and unit tests. Production wires the SQLite acquisition store here, making the
         # blob-backed snapshot path the normal connector topology rather than structural guesswork.
@@ -1424,6 +1427,28 @@ class IngestPipeline:
         )
         return watermark if recorded == identity else None
 
+    async def _mark_sensitive(self, connector: Connector) -> None:
+        """Record, before anything is enumerated, that a sensitive connector syncs this source.
+
+        **Before the first document, and not after the first success.** A run that dies halfway
+        through its first walk has already written documents, and a mark written only at the end
+        would be missing exactly when the installation holds mail it has not finished indexing.
+        The refusal to serve without authentication reads this mark (``docs/connectors/gmail.md``
+        §10), so it is the one write in a run that must not depend on the run going well.
+
+        ``sensitive_sources`` names *instances*, resolved by the runtime from the registry's
+        ``sensitive`` flag on each configured connector's type. A connector the runtime did not
+        name is not marked, which is why no connector class declares this about itself: one that
+        forgot to would fail open. :meth:`ingest_raw` marks too, since it is where every document
+        is written whether or not a run is driving it (a forced sync, an import).
+        """
+        await self._mark_sensitive_source(connector.name)
+
+    async def _mark_sensitive_source(self, source: str) -> None:
+        if source in self._sensitive_sources and source not in self._marked_sensitive:
+            await self._store.mark_source_sensitive(source)
+            self._marked_sensitive.add(source)
+
     async def _hold_pinned_identity(self, connector: Connector) -> None:
         """Refuse to sync a source that has synced as one identity under another.
 
@@ -1491,6 +1516,7 @@ class IngestPipeline:
         if not acquire_only and not self._derivation_enabled:
             msg = "this runtime was assembled for source acquisition only"
             raise RuntimeError(msg)
+        await self._mark_sensitive(connector)
         await self._hold_pinned_identity(connector)
         retain = self._retain_source_bytes if retain_source_bytes is None else retain_source_bytes
         if acquire_only and (not retain or self._acquisitions is None):
@@ -3422,6 +3448,9 @@ class IngestPipeline:
         """Publish fetched bytes under the runtime-wide reset/publication barrier."""
         async with self._mutation_guard():
             await self._assert_current_reset_epoch()
+            # The choke point every document write passes through, so a path that does not go
+            # through `run` (a forced sync, an archive import) cannot leave mail unmarked.
+            await self._mark_sensitive_source(source)
             return await self._ingest_raw_guarded(
                 raw,
                 source=source,

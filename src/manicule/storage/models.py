@@ -330,6 +330,15 @@ class Connector(Base):
     """
     watermark_scope_fingerprint: Mapped[str | None] = mapped_column(Text)
 
+    sensitive_synced_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    """When a connector of a *sensitive* registered type first began syncing this source.
+
+    ``NULL`` for every other source. Set once, before the first document is written, and never
+    cleared: it is what lets the refusal to serve unauthenticated outlive the connector being
+    disabled or removed from configuration (:mod:`manicule.app.sensitive`). A column of its own
+    rather than a key in :attr:`run_metadata`, which is a per-run diagnostic.
+    """
+
     sync_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300)
     last_synced_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
@@ -870,6 +879,7 @@ class Document(Base):
         ),
         Index("ix_documents_workspace_id_status", "workspace_id", "status"),
         Index("ix_documents_workspace_id_uri", "workspace_id", "uri"),
+        Index("ix_documents_workspace_id_source", "workspace_id", "source"),
         Index("ix_documents_content_hash", "content_hash"),
         Index("ix_documents_parse_fp", "parse_fp"),
         Index("ix_documents_chunk_fp", "chunk_fp"),

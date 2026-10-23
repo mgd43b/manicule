@@ -86,6 +86,7 @@ from manicule.app import frontdoor
 from manicule.app.bind import (
     is_loopback,
     require_authoring_authentication,
+    require_sensitive_source_authentication,
     require_team_authentication,
 )
 from manicule.app.caller import acting_as
@@ -275,7 +276,9 @@ def build_app(  # noqa: PLR0915 - assembling every route group, middleware and r
 
     Raises:
         PolicyError: The application would serve an unauthenticated surface on something that
-            is not loopback, and nobody said on the command line that they meant it.
+            is not loopback, and nobody said on the command line that they meant it — or the
+            installation holds a sensitive source and authentication is off, which nothing on
+            the command line waives.
     """
     # The browser surface, imported here rather than at module scope. Its pages are routes
     # over the same dependencies this package defines, so importing it from the top would make
@@ -301,6 +304,12 @@ def build_app(  # noqa: PLR0915 - assembling every route group, middleware and r
     # Team mode's refusal, repeated here from `resolve_bind` for that function's own reason:
     # an application can be served by something that never resolved a bind.
     require_team_authentication(settings, allow_unauthenticated=allow_unauthenticated)
+    # And the sensitive-source refusal, for the same reason. It reads the data directory as
+    # well as configuration, so it also fires for an application started over documents a
+    # since-removed connector left behind.
+    require_sensitive_source_authentication(
+        settings, service.sensitive_types(), allow_unauthenticated=allow_unauthenticated
+    )
     _require_a_sign_in_that_can_complete(service)
 
     # Built before the application, because the application needs its lifespan. FastMCP's ASGI

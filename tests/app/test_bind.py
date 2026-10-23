@@ -21,7 +21,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, get_args
+from typing import TYPE_CHECKING, Any, get_args
 
 import pytest
 from pydantic import BaseModel
@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from manicule.app.bind import (
     EVERY_INTERFACE,
     LOOPBACK_HOSTS,
+    Bind,
     is_every_interface,
     is_loopback,
     resolve_bind,
@@ -43,13 +44,24 @@ SOURCE = Path(__file__).resolve().parents[2] / "src" / "manicule"
 
 AUTHENTICATED = {"security": {"auth": {"mode": "api_key"}}}
 
+
+def bind_of(settings: Settings, **overrides: Any) -> Bind:
+    """:func:`resolve_bind` for an installation with no sensitive connector type registered.
+
+    ``sensitive_types`` is a required argument of the real function, so that no caller can
+    forget it; the tests in this file are about the address rules and say so once, here. The
+    sensitive-source refusal has its own file.
+    """
+    return resolve_bind(settings, sensitive_types=frozenset(), **overrides)
+
+
 EVERYWHERE = "0.0.0.0"  # noqa: S104 - the address these tests exist to refuse
 """Named once, so the literal a linter objects to appears once and is explained once."""
 
 
 def test_the_default_bind_is_loopback() -> None:
     """No configuration, no flags: the address reaches this machine and nowhere else."""
-    bind = resolve_bind(Settings())
+    bind = bind_of(Settings())
     assert bind.host == "127.0.0.1"
     assert bind.loopback
     assert not bind.every_interface
@@ -81,7 +93,7 @@ def test_a_non_loopback_host_is_refused_without_the_explicit_flag(host: str) -> 
     """
     settings = Settings(security={"transport": {"bind_host": host}, **AUTHENTICATED["security"]})  # pyright: ignore[reportArgumentType]
     with pytest.raises(PolicyError) as caught:
-        resolve_bind(settings)
+        bind_of(settings)
     assert "--allow-public-bind" in str(caught.value)
 
 
@@ -95,7 +107,7 @@ def test_a_non_loopback_host_is_refused_without_authentication(host: str) -> Non
     """
     settings = Settings(security={"transport": {"bind_host": host}})  # pyright: ignore[reportArgumentType]
     with pytest.raises(PolicyError) as caught:
-        resolve_bind(settings, allow_public=True)
+        bind_of(settings, allow_public=True)
     message = str(caught.value)
     assert "security.auth.mode" in message
     assert "--no-authentication" in message
@@ -116,7 +128,7 @@ def test_accepting_no_authentication_does_not_also_ask_for_the_wide_bind(host: s
     """
     settings = Settings(security={"transport": {"bind_host": host}})  # pyright: ignore[reportArgumentType]
     with pytest.raises(PolicyError) as caught:
-        resolve_bind(settings, allow_unauthenticated=True)
+        bind_of(settings, allow_unauthenticated=True)
     message = str(caught.value)
     assert "--allow-public-bind" in message
     assert "security.auth.mode" not in message, (
@@ -139,7 +151,7 @@ def test_a_wide_unauthenticated_bind_is_possible_when_both_flags_are_passed() ->
     settings = Settings(security={"transport": {"bind_host": EVERYWHERE}})  # pyright: ignore[reportArgumentType]
     assert settings.security.auth.mode is AuthMode.NONE
 
-    bind = resolve_bind(settings, allow_public=True, allow_unauthenticated=True)
+    bind = bind_of(settings, allow_public=True, allow_unauthenticated=True)
 
     assert bind.host == EVERYWHERE
     assert not bind.loopback
@@ -182,10 +194,10 @@ def test_the_bind_itself_still_refuses_that_configuration() -> None:
     settings = Settings(security={"transport": {"bind_host": EVERYWHERE}})  # pyright: ignore[reportArgumentType]
 
     with pytest.raises(PolicyError) as caught:
-        resolve_bind(settings, allow_public=True)
+        bind_of(settings, allow_public=True)
     assert "security.auth.mode" in str(caught.value)
 
-    assert resolve_bind(settings, allow_public=True, allow_unauthenticated=True).host == EVERYWHERE
+    assert bind_of(settings, allow_public=True, allow_unauthenticated=True).host == EVERYWHERE
 
 
 @pytest.mark.parametrize("host", sorted(LOOPBACK_HOSTS))
@@ -207,7 +219,7 @@ def test_one_definition_of_loopback_answers_the_bind_and_the_preflight(host: str
     settings = Settings(security={"transport": {"bind_host": host}})  # pyright: ignore[reportArgumentType]
 
     assert settings.security.transport.is_loopback, "the preflight disagrees with the bind policy"
-    assert resolve_bind(settings).loopback
+    assert bind_of(settings).loopback
     assert settings.policy_problems() == []
 
 
@@ -248,7 +260,7 @@ def test_the_refusal_lists_everything_that_is_missing_at_once() -> None:
     """Fixing one problem only to be told about the next is a poor way to spend an afternoon."""
     settings = Settings(security={"transport": {"bind_host": "0.0.0.0"}})  # pyright: ignore[reportArgumentType]  # noqa: S104 - the subject of the refusal
     with pytest.raises(PolicyError) as caught:
-        resolve_bind(settings)
+        bind_of(settings)
     message = str(caught.value)
     assert "--allow-public-bind" in message
     assert "security.auth.mode" in message
@@ -263,7 +275,7 @@ def test_a_wide_bind_is_possible_when_all_three_conditions_hold() -> None:
     settings = Settings(
         security={"transport": {"bind_host": "0.0.0.0"}, **AUTHENTICATED["security"]}  # pyright: ignore[reportArgumentType]  # noqa: S104 - deliberate, and the subject of this test
     )
-    bind = resolve_bind(settings, allow_public=True)
+    bind = bind_of(settings, allow_public=True)
     assert bind.host == EVERYWHERE
     assert not bind.loopback
     assert bind.every_interface
@@ -273,19 +285,19 @@ def test_a_wide_bind_is_possible_when_all_three_conditions_hold() -> None:
 def test_a_command_line_host_cannot_widen_the_bind_on_its_own() -> None:
     """A flag that named an address would otherwise be a one-word route past the policy."""
     with pytest.raises(PolicyError):
-        resolve_bind(Settings(), host="0.0.0.0")  # noqa: S104 - the refusal is the assertion
+        bind_of(Settings(), host="0.0.0.0")  # noqa: S104 - the refusal is the assertion
 
 
 def test_an_omitted_host_takes_the_configured_one_and_never_widens_it() -> None:
     """``host=None`` means "whatever is configured", and the configured default is loopback."""
-    assert resolve_bind(Settings(), host=None).loopback
+    assert bind_of(Settings(), host=None).loopback
 
 
 def test_an_out_of_range_port_is_refused_before_a_socket_exists() -> None:
     with pytest.raises(PolicyError):
-        resolve_bind(Settings(), port=0)
+        bind_of(Settings(), port=0)
     with pytest.raises(PolicyError):
-        resolve_bind(Settings(), port=70000)
+        bind_of(Settings(), port=70000)
 
 
 # --- team mode --------------------------------------------------------------------------------
@@ -300,7 +312,7 @@ def test_team_mode_without_authentication_is_refused_even_on_loopback() -> None:
     anonymous caller to be — and the refusal holds on the one address every other rule admits.
     """
     with pytest.raises(PolicyError, match="team mode"):
-        resolve_bind(Settings(**TEAM))  # pyright: ignore[reportArgumentType]
+        bind_of(Settings(**TEAM))  # pyright: ignore[reportArgumentType]
 
 
 def test_no_authentication_is_refused_in_team_mode_rather_than_waiving_anything() -> None:
@@ -311,9 +323,9 @@ def test_no_authentication_is_refused_in_team_mode_rather_than_waiving_anything(
     noticed they were relying on.
     """
     with pytest.raises(PolicyError, match="single-operator"):
-        resolve_bind(Settings(**TEAM), allow_unauthenticated=True)  # pyright: ignore[reportArgumentType]
+        bind_of(Settings(**TEAM), allow_unauthenticated=True)  # pyright: ignore[reportArgumentType]
     with pytest.raises(PolicyError, match="--no-authentication"):
-        resolve_bind(
+        bind_of(
             Settings(**TEAM, **AUTHENTICATED),  # pyright: ignore[reportArgumentType]
             allow_unauthenticated=True,
         )
@@ -321,8 +333,8 @@ def test_no_authentication_is_refused_in_team_mode_rather_than_waiving_anything(
 
 def test_team_mode_with_authentication_binds_like_any_other_installation() -> None:
     """The control: team mode asks for a credential, not for anything else."""
-    assert resolve_bind(Settings(**TEAM, **AUTHENTICATED)).loopback  # pyright: ignore[reportArgumentType]
-    wide = resolve_bind(
+    assert bind_of(Settings(**TEAM, **AUTHENTICATED)).loopback  # pyright: ignore[reportArgumentType]
+    wide = bind_of(
         Settings(**TEAM, **AUTHENTICATED),  # pyright: ignore[reportArgumentType]
         host=EVERYWHERE,
         allow_public=True,
@@ -332,8 +344,8 @@ def test_team_mode_with_authentication_binds_like_any_other_installation() -> No
 
 def test_personal_mode_keeps_its_unauthenticated_loopback() -> None:
     """The shipped posture is unchanged by team mode existing."""
-    assert resolve_bind(Settings()).loopback
-    assert resolve_bind(Settings(), allow_unauthenticated=True).loopback
+    assert bind_of(Settings()).loopback
+    assert bind_of(Settings(), allow_unauthenticated=True).loopback
 
 
 # --- the check that survives a future server ------------------------------------------------

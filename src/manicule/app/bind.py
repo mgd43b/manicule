@@ -49,6 +49,16 @@ Stdio transports never come here at all, and that is the point of
 :func:`stdio` — a bind decision that is not made cannot be made wrongly, so the MCP server's
 default mode has no address to get wrong.
 
+**Nor does it apply to an installation holding mail.** The index is not permission-aware, so a
+source whose content is one person's — a mailbox — makes the whole installation private to
+whoever may search it, and "anyone who can reach the port" on loopback is every other local
+account and process. :func:`require_sensitive_source_authentication` refuses a socket without
+authentication on every address, loopback included, for as long as an enabled connector
+instance is of a *sensitive* type or the data directory still holds a document from a source one
+has synced. ``--no-authentication`` cannot waive it, for team mode's reason: it extends a
+single-operator arrangement to a network the operator owns, and mail is not the operator's to
+extend.
+
 **None of that applies in team mode.** Everything above about an anonymous caller rests on
 there being one operator for that caller to be. ``mode = "team"`` says there is not, so
 :func:`require_team_authentication` refuses a socket without authentication on every address,
@@ -67,10 +77,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from manicule.app.sensitive import exposure_when_unauthenticated
 from manicule.config.settings import AuthMode, Mode
 from manicule.core.errors import PolicyError
 
 if TYPE_CHECKING:
+    from collections.abc import Set as AbstractSet
+
     from manicule.config.settings import Settings
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"})
@@ -235,6 +248,83 @@ def require_team_authentication(settings: Settings, *, allow_unauthenticated: bo
         raise PolicyError(msg)
 
 
+def require_sensitive_source_authentication(
+    settings: Settings,
+    sensitive_types: AbstractSet[str],
+    *,
+    allow_unauthenticated: bool = False,
+) -> None:
+    """Refuse to serve a sensitive source on a socket without authentication.
+
+    Called where a socket is made — :func:`resolve_bind` — and where an application is —
+    :func:`manicule.api.app.build_app` — beside :func:`require_team_authentication` and for its
+    reason: an ASGI application can be started by something other than ``manicule serve``.
+    Not called for stdio, which has no port.
+
+    **Not waivable, and ``allow_unauthenticated`` is accepted only to be refused.** Everything
+    :func:`resolve_bind` says about an anonymous caller being the operator at this machine is
+    false for mail: loopback reaches every local account and process, and ``--no-authentication``
+    reaches a network. An operator who typed the flag believes it did something, so the message
+    says it did not.
+
+    Two facts decide it (see :mod:`manicule.app.sensitive`): an enabled instance of a sensitive
+    connector type, or any document in the data directory, in any state, from a source one has
+    synced. The second is why disabling the connector or deleting it from configuration does
+    not lift the refusal; only deleting the source's documents does.
+
+    Args:
+        settings: Configuration. ``security.auth.mode``, ``connectors`` and ``data_dir`` decide.
+        sensitive_types: Connector types the registry marks sensitive. **Required**, with no
+            default: an omitted argument would read as "nothing is sensitive", which is the
+            failure this function exists to prevent. A caller with a service gets it from
+            :meth:`~manicule.app.service.ApplicationService.sensitive_types`.
+        allow_unauthenticated: ``--no-authentication``, which this refuses to honor.
+
+    Raises:
+        PolicyError: Authentication is off and the installation is sensitive, or the data
+            directory's database could not be read to tell.
+    """
+    exposure = exposure_when_unauthenticated(settings, sensitive_types)
+    if not exposure:
+        return
+    lines: list[str] = []
+    if exposure.configured:
+        lines.append(
+            f"enabled connector instance(s) {', '.join(map(repr, exposure.configured))} read a "
+            f"sensitive source (their type is registered as sensitive)"
+        )
+    if exposure.held:
+        lines.append(
+            f"the data directory still holds documents, in some state (soft-deleted and purged "
+            f"rows count), from {', '.join(map(repr, exposure.held))}, which a sensitive "
+            f"connector has synced — disabling or removing the connector does not lift this"
+        )
+    joined = "\n  - ".join(lines)
+    ways_back: list[str] = []
+    if exposure.held:
+        ways_back.append(
+            "delete the source's documents outright from an authenticated server with "
+            "`manicule document delete-source <name> --yes`"
+        )
+    if exposure.configured:
+        ways_back.append("disable or remove the connector")
+    remedy = f" To serve without authentication again, {' and '.join(ways_back)}."
+    waiver = (
+        "\n--no-authentication was passed and does not apply here: it makes every anonymous "
+        "caller an administrator, and a sensitive source is not something an operator can "
+        "extend to whoever can reach a port."
+        if allow_unauthenticated
+        else ""
+    )
+    msg = (
+        f"refusing to serve workspace {settings.workspace!r} without authentication, on any "
+        f"address (loopback included — another local account or process can reach it):\n"
+        f"  - {joined}{waiver}\n"
+        f"Set security.auth.mode to 'api_key' or 'oauth'.{remedy}"
+    )
+    raise PolicyError(msg)
+
+
 def stdio() -> None:
     """The transport that binds nothing.
 
@@ -248,6 +338,7 @@ def stdio() -> None:
 def resolve_bind(
     settings: Settings,
     *,
+    sensitive_types: AbstractSet[str],
     host: str | None = None,
     port: int | None = None,
     allow_public: bool = False,
@@ -258,6 +349,8 @@ def resolve_bind(
     Args:
         settings: Configuration. ``security.transport`` supplies the defaults, and its own
             default host is loopback.
+        sensitive_types: Connector types the registry marks sensitive. Required, with no
+            default — see :func:`require_sensitive_source_authentication`.
         host: An override from the command line. ``None`` means "whatever is configured",
             which is the case that must never be able to widen the bind.
         port: An override from the command line.
@@ -277,11 +370,16 @@ def resolve_bind(
     Raises:
         PolicyError: The address is not loopback and something required to widen it is
             missing, or the installation is in team mode without authentication — see
-            :func:`require_team_authentication`. The message names which, and what to do
-            instead.
+            :func:`require_team_authentication` — or holds a sensitive source without it — see
+            :func:`require_sensitive_source_authentication`. The message names which, and what
+            to do instead.
     """
     # First, and before the loopback answer below: team mode's refusal holds on every address.
     require_team_authentication(settings, allow_unauthenticated=allow_unauthenticated)
+    # Beside it, for the same reason: loopback does not help a mailbox.
+    require_sensitive_source_authentication(
+        settings, sensitive_types, allow_unauthenticated=allow_unauthenticated
+    )
     transport = settings.security.transport
     chosen = (host if host is not None else transport.bind_host).strip()
     chosen_port = port if port is not None else transport.port
@@ -328,6 +426,7 @@ __all__ = [
     "is_every_interface",
     "is_loopback",
     "require_authoring_authentication",
+    "require_sensitive_source_authentication",
     "require_team_authentication",
     "resolve_bind",
     "stdio",

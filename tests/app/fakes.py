@@ -182,6 +182,7 @@ class FakeStore:
     chunks: dict[str, list[Chunk]] = field(default_factory=dict[str, list[Chunk]])
     deleted: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
     glossary_lineage: dict[str, str] = field(default_factory=dict[str, str])
+    sensitive_marks: set[str] = field(default_factory=set[str])
     """``documents.glossary_fp`` per document. Empty by default, which is the honest starting
     state for a fixture nobody has run a detector over — and the one `doctor` must report as
     work outstanding rather than as a clean corpus."""
@@ -291,6 +292,19 @@ class FakeStore:
     async def delete_document(self, document_id: str) -> None:
         self.deleted.append((document_id, "hard"))
         self.documents.pop(document_id, None)
+
+    async def marked_sensitive_sources(self) -> frozenset[str]:
+        return frozenset(self.sensitive_marks)
+
+    async def mark_source_sensitive(self, connector: str) -> None:
+        self.sensitive_marks.add(connector)
+
+    async def delete_source_documents(self, source: str) -> int:
+        doomed = [key for key, doc in self.documents.items() if doc.source == source]
+        for key in doomed:
+            self.deleted.append((key, "hard"))
+            del self.documents[key]
+        return len(doomed)
 
     async def soft_delete_document(self, document_id: str) -> None:
         self.deleted.append((document_id, "soft"))

@@ -354,6 +354,9 @@ BINDERS: Mapping[str, Binder] = {
     "document_delete": lambda service, args, report: service.document_delete(
         args.text("document_id"), hard=args.flag("hard")
     ),
+    "document_delete_source": lambda service, args, report: service.document_delete_source(
+        args.text("source")
+    ),
     "document_redetect_glossary": lambda service, args, report: service.document_redetect_glossary(
         batch=args.count("batch", default=DEFAULT_SWEEP_BATCH), dry_run=args.flag("dry_run")
     ),
