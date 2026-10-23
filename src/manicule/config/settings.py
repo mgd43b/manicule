@@ -1061,8 +1061,10 @@ class IngestSettings(Section):
     reconcile_interval_s: float = Field(
         default=7 * 24 * 3600.0,
         gt=0,
-        description="Deletion detection that runs only when someone remembers is deletion "
-        "detection that does not run.",
+        description="Seconds between deletion-detection passes over each enabled connector, run "
+        "by `manicule serve`. A connector's own reconcile_interval_s overrides it. Deletion "
+        "detection that runs only when someone remembers is deletion detection that does not "
+        "run.",
     )
     reconcile_max_delete_fraction: float = Field(
         default=0.1,
@@ -1523,16 +1525,17 @@ class ConnectorSettings(Section):
     loudly ever since instead of silently ignored.
 
     :class:`~manicule.app.served.Scheduler` is what makes it true. A served manicule reads this
-    field, and nothing else does — an unserved installation has no process to run a schedule in,
-    which is the same reason write commands need a server at all.
+    field and ``reconcile_interval_s``, and nothing else does — an unserved installation has no
+    process to run a schedule in, which is the same reason write commands need a server at all.
     """
 
     type: str = Field(min_length=1, description="Registered connector implementation.")
     enabled: bool = Field(
         default=True,
-        description="Whether `manicule connector sync` will run this source. False refuses the "
-        "sync rather than skipping it quietly, so a disabled source that somebody tries to run "
-        "says so.",
+        description="Whether `manicule connector sync` or `connector reconcile` will run this "
+        "source. False refuses the command rather than skipping it quietly, so a disabled "
+        "source that somebody tries to run says so; a served manicule neither syncs nor "
+        "reconciles it on a schedule.",
     )
     schedule_s: float | None = Field(
         default=None,
@@ -1554,6 +1557,25 @@ class ConnectorSettings(Section):
     scheduled source the moment it started would turn a restart — which is how a session is
     re-taken, and therefore something an operator does deliberately and often — into a full
     corpus sync nobody asked for.
+    """
+    reconcile_interval_s: float | None = Field(
+        default=None,
+        gt=0,
+        description="Seconds between deletion-detection passes over this source, overriding "
+        "ingest.reconcile_interval_s. None inherits the installation default.",
+    )
+    """How often a served manicule asks this source what it still has, to find what left.
+
+    **Per source rather than only the installation default**, because the cost and the
+    consequence differ by source. A mailbox is a place where a deleted message must stop being
+    searchable promptly, and listing its ids costs about two hundred requests per hundred
+    thousand messages, so daily or hourly is affordable. A large wiki is a place where a
+    full enumeration is expensive and a stale page is a nuisance, so weekly is right.
+
+    **Independent of** :attr:`schedule_s`. A source that is only ever synced by hand is still
+    reconciled on this interval by a served manicule, because a deletion is something nobody
+    types a command to notice. A disabled source is never reconciled, for the reason it is never
+    scheduled.
     """
     retain_source_bytes: bool | None = Field(
         default=None,

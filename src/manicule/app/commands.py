@@ -330,6 +330,12 @@ BINDERS: Mapping[str, Binder] = {
         args.text("key"), args.text("value")
     ),
     "connector_list": lambda service, args, report: service.connector_list(),
+    "connector_reconcile": lambda service, args, report: service.connector_reconcile(
+        args.text("name"), dry_run=args.flag("dry_run")
+    ),
+    "connector_reconcile_resolve": lambda service, args, report: (
+        service.connector_reconcile_resolve(args.text("name"), confirm=args.flag("confirm"))
+    ),
     "connector_sidecar": lambda service, args, report: service.connector_sidecar(
         args.optional_path("root"), source=args.text("source"), force=args.flag("force")
     ),

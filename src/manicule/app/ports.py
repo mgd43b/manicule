@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     )
     from manicule.generation.sharing import ShareLink
     from manicule.ingest.pipeline import RunReport, Watching
+    from manicule.ingest.reconcile import Reconciliation
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import (
         GlossarySweep,
@@ -277,6 +278,26 @@ class Ingesting(Protocol):
         Raises:
             UnknownComponentError: Configuration has no connector by that name. Surfaces
                 translate it; the container raises it.
+        """
+        ...
+
+    async def reconcile(
+        self, connector: str, *, dry_run: bool, max_delete_fraction: float
+    ) -> Reconciliation:
+        """Enumerate one connector's source and soft-delete what is no longer there.
+
+        Returns what happened rather than raising for a source-side failure, a refusal by the
+        deletion ceiling, or a backup holding the data: each is a field of the result. A
+        ``dry_run`` consumes its inventory and changes nothing. The result names source ids in
+        ``deleted`` and ``proposed``; the service reduces them to counts.
+        """
+        ...
+
+    async def resolve_proposal(self, connector: str, *, confirm: bool) -> Reconciliation:
+        """Apply (``confirm``) or throw away the deletion proposal the ceiling refused.
+
+        Applies exactly the reviewed set, not a fresh enumeration. ``refused`` on the result
+        says no proposal was waiting for this connector's current scope.
         """
         ...
 

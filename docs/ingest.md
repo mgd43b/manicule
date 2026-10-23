@@ -1158,6 +1158,18 @@ installation for the length of it, to fix a problem no two unrelated pages have.
 dropped when the last holder leaves, so a sweep does not accumulate one lock per row it has
 finished with.
 
+**A reconciliation pass takes the derived-mutation guard and no lock of its own.** That guard is
+the runtime's process-wide barrier, the one every sync, sweep, reset, rebuild and re-embed also
+takes, and the runtime's reconcile operation (`_Ingestion.reconcile`) holds it for the whole pass,
+source enumeration included. `pipeline.run` holds the same guard for its whole walk, so a pass and a sync of the same
+connector cannot interleave in one process: the pass does not begin between a sync's publications,
+and the sync does not publish between the pass's inventory and its diff. It is not a row in the
+table because it is not per document and excludes nothing across processes, which is the
+data-directory flock's job and one a served process already holds. For the documents themselves a
+pass relies on the revision rule rather than a lock: the apply is conditioned on the revision each
+candidate was measured at (§8.5, §11.1), and a document created or observed at the source after
+the inventory began is never a candidate.
+
 **The mutation lock is not durable and is not the guard.** It is an `asyncio.Lock` on a
 pipeline object: it holds inside one event loop in one process, and a second process opened on
 the same data directory takes no part in it. That is §6.5's job, and §6.5 is now taken by every
@@ -2330,19 +2342,85 @@ than an implementation detail (`contracts.md` §3). A typed `source_deleted` aft
 enumeration is different: §8.3.1 invalidates that manifest and requires a fresh complete
 enumeration before the absence may be reconciled.
 
-**Cadence.** After every full sync, and on a schedule (`reconcile_interval_s`, default weekly)
-for connectors that only ever sync incrementally. Deletion detection that runs only when
-someone remembers is deletion detection that does not run.
+**Cadence.** After every full sync, and on a schedule for every enabled connector, whether or not
+it has a `schedule_s`. Deletion detection that runs only when someone remembers is deletion
+detection that does not run, so a served manicule runs it and `manicule.ingest.reconcile.due` is
+a computed answer rather than an operator's habit.
 
-**That cadence is the design, and nothing runs it yet.** `manicule.ingest.reconcile.reconcile`
-is implemented and tested as described below, but no command, service method or schedule
-calls it, and `reconcile_interval_s` is read nowhere but its own definition. So today a
-document that leaves a configured connector's source stays indexed until `manicule document
-delete` removes it. `manicule index --watch` is the exception for a watched directory: it
-removes a file on its delete event (§12), which is evidence of its own rather than an absence.
-[`connectors/gmail.md`](connectors/gmail.md) §7 makes wiring it in a prerequisite of the Gmail
-connector, because for a mailbox the consequence is deleted mail that stays searchable. Wiring
-it in is [#466](https://github.com/mgd43b/manicule/issues/466).
+**What runs it.**
+
+- **The interval.** `ingest.reconcile_interval_s` (default weekly) is the installation default; a
+  connector's own `reconcile_interval_s`, beside its `enabled` and `schedule_s`, overrides it, and
+  an unset one inherits. One function, `ApplicationService.reconcile_interval_s`, applies that
+  precedence for the scheduler, `connector list` and `doctor`.
+- **The loop.** The scheduler (`app/served.py`) runs one reconcile loop per *enabled* connector.
+  A loop does not sleep the interval and then run. It looks at most every `RECONCILE_POLL_S`
+  (one hour, or the interval if that is shorter) and decides from the connector's persisted
+  metadata whether a pass is due: the time since `last_clean_reconcile_at`, or since
+  `last_discarded_reconcile_at` if that is later, has reached the interval. Because the answer is
+  in the database and not in the process's clock, a restart loses nothing, a server restarted more
+  often than weekly still reconciles, and a pass an operator ran by hand counts. A connector that
+  has never reconciled is due at the first look.
+- **Not due.** A connector holding no live documents is not due, because a source nothing has been
+  synced from has nothing to lose and enumerating it would only spend requests. Neither is a
+  connector with a proposal waiting for an operator (below), whatever the clock says: a newer
+  inventory supersedes the proposal being reviewed (§11.1), so a loop that kept asking would take
+  the question away from the person answering it. A disabled connector is not scheduled at all.
+- **A missing session** is handled as a scheduled sync handles it: the loop records that the
+  connector awaits sign-in, announces it, and looks again at the next poll. Any other failure is
+  recorded and retried at the next look; nothing ends the loop.
+- **After a full sync.** A sync that enumerated the whole source from no cursor, reached the end,
+  and landed everything it accepted (`RunReport.full_enumeration`, `enumeration_completed`,
+  `complete`, and no error) and was not bounded by `--limit` or `--acquire-only` is followed by a
+  pass, whether or not the interval has elapsed. A bounded or incomplete run holds a prefix, which
+  is exactly what a pass must never be handed. The pass's counts are the `reconciliation` field of
+  the sync's own payload and the sync's own outcome is not changed by them; a pass that fails
+  there is reported as a `failed` outcome there rather than failing a sync that succeeded. It is
+  skipped when the connector has no live documents or a proposal is waiting.
+
+**The operator's command.** `manicule connector reconcile NAME` runs a pass now, whether or not
+it is due. It is a writer and is proxied to a running server like the other writers; a disabled
+connector is refused. A plain pass can end applied, refused, or failed, and the command has three
+further forms:
+
+| Command | Does |
+|---|---|
+| `connector reconcile NAME` | Runs a pass: applied (possibly deleting nothing), refused by the ceiling and recorded as a proposal, or failed because the enumeration did not complete |
+| `connector reconcile NAME --dry-run` | Enumerates and reports what would be deleted, deleting nothing. Consumes its inventory, so it cannot be applied later; applying enumerates again |
+| `connector reconcile NAME --confirm` | Deletes exactly the documents the waiting proposal named, without enumerating again. Documents republished or observed at the source since are skipped |
+| `connector reconcile NAME --discard` | Deletes nothing, clears the proposal, and restarts the interval |
+
+The three flags are mutually exclusive. Confirming and discarding are the one operation
+`connector_reconcile_resolve`; `connector_reconcile` is the pass and the dry run. A disabled
+connector is refused for a pass, but its waiting proposal can still be answered, since it may have
+been recorded before the connector was switched off. The same operations are the MCP tools
+`connector_reconcile` and `connector_reconcile_resolve` and the two HTTP routes in
+[`surfaces.md`](surfaces.md).
+
+**Discard restarts the interval and is not a clean pass.** It records `last_discarded_reconcile_at`
+and leaves `last_clean_reconcile_at` alone, so `connector list` does not report a deletion check
+that did not happen. It restarts the interval because the operator looked and decided the source
+was what was wrong, and a schedule that asked the same source the same question on its next poll
+would re-propose the same deletion within the hour.
+
+**Where it shows.** `manicule connector list` carries, per connector, `reconcile_interval_s`,
+`last_reconciled_at` (the last *clean* pass), `reconcile_overdue` (more than twice the interval,
+`OVERDUE_FACTOR`, since a pass last concluded by a clean pass or a discard, said only of an enabled
+connector that holds documents and has no proposal waiting), `reconcile_proposal_pending` and the
+proposal's `reconcile_proposal_missing` and `reconcile_proposal_live` counts; a disabled connector
+reports no interval. `doctor` has two checks, placed right after `connectors`:
+`reconciliation-overdue` degrades when such a connector is overdue, and `reconciliation-proposals`
+degrades while a refused deletion waits and names the command that answers it. Both name connectors
+and counts. Everything a pass returns is counts (`ConnectorReconciled`): never a source id, title
+or URI. An unsuccessful outcome is `ok: false` with its counts retained: a proposal is HTTP `409`
+(`ReconciliationRefusedError`), a pass held off by something else holding the data is `503`
+(`ReconciliationBlockedError`), a failed enumeration is `503` with the failure's class name only,
+and answering a proposal that is not there is `404`.
+
+`manicule index --watch` is the other route to deletion for a watched directory: it removes a file
+on its delete event (§12), which is evidence of its own rather than an absence.
+[`connectors/gmail.md`](connectors/gmail.md) §7 depends on this section, because for a mailbox the
+consequence of a missed deletion is deleted mail that stays searchable.
 
 **Mechanics.** `reconcile()` yields the `SourceId`s that currently exist. Storage journals them
 in pages under an immutable workspace, connector and configured-scope identity. Only iterator
@@ -2401,6 +2479,20 @@ an omitted or mismatched token instead of trusting the proposal's copy. Each pro
 captures the document's source-observation revision (version token plus a strictly advancing
 `last_seen_at`). A later unchanged `record_seen` therefore invalidates the candidate just as a
 new publication does: evidence that the source exists after the proposal wins over confirmation.
+
+**Newer evidence wins over a resumed inventory, too.** A completed inventory can be applied after
+a crash without contacting the source again (§11), possibly after a sync has indexed or
+re-observed documents the inventory could not have listed. So absence from the inventory is not
+enough to make a document a candidate: a document created, or observed at the source
+(`last_seen_at`), after the run began is never one, and the next full inventory will judge it.
+Without that rule a crash between completing an inventory and applying it, followed by a sync,
+would let the resumed inventory delete exactly the documents the sync had just added. The rule
+is in the candidate query (`_absent_from` in `storage/reconciliation.py`), so the preview, the
+applied pass and a recorded proposal all count the same documents.
+
+**Discarding is the proposal's other answer.** `--discard` marks the recorded run canceled, drops
+its candidates, clears the proposal and writes `last_discarded_reconcile_at`. It is claimed the
+same way as a confirmation, inside one transaction, so the two cannot both win.
 
 ### 11.2 Interaction with the grace period and the sweep
 
@@ -2745,11 +2837,12 @@ What the pipeline owes `doctor` is the *data*, and each row names something alre
 rather than something to be derived later: statuses and `updated_at` on `documents`, kill counts
 by reason on the worker pool, `last_run` counters and `last_clean_reconcile_at` on
 `connectors.metadata`, `proposed_deletion` where guard 2 fired, `original_omitted_reason` on
-every document that has no retained bytes, and the lock file's holder. Two ingest-adjacent
+every document that has no retained bytes, and the lock file's holder. Four ingest-adjacent
 checks are shipped today and are named in `surfaces.md` rather than repeated here: `connectors`,
-for documents filed under a connector *type* while an instance of that type is configured, and
-`collection-membership`, for a corpus no collection holds — the second of which the pipeline
-also reports per run, as `collected`/`uncollected` on `IngestReport` (§13.1).
+for documents filed under a connector *type* while an instance of that type is configured;
+`collection-membership`, for a corpus no collection holds — which the pipeline also reports per
+run, as `collected`/`uncollected` on `IngestReport` (§13.1); and `reconciliation-overdue` and
+`reconciliation-proposals`, for the cadence and the guard-2 refusals of §11.
 
 | Check | Detects |
 |---|---|
@@ -2757,8 +2850,8 @@ also reports per run, as `collected`/`uncollected` on `IngestReport` (§13.1).
 | Worker kill counts, by reason, per media type | A parser hanging or leaking on a particular format |
 | Fetch error rate per connector | Credential expiry, rate limiting, an endpoint change |
 | Documents whose `last_seen_at` predates the last clean reconcile | Deletion detection not running |
-| Time since last clean `reconcile` per connector | §11's cadence silently not happening |
-| Proposed-deletion refusals awaiting confirmation | §11.1 guard 2 having fired |
+| Time since last clean `reconcile` per connector | §11's cadence silently not happening. Shipped as `reconciliation-overdue` |
+| Proposed-deletion refusals awaiting confirmation | §11.1 guard 2 having fired. Shipped as `reconciliation-proposals` |
 | Documents with `original_ref IS NULL`, by reason | The set for which rung 4 is the only repair |
 | Queue depth and stage occupancy during a run (`last_run.stages`, §8.3.2) | Where the bottleneck actually is; §8.3.3 reads it |
 | `manicule.lock` holder | A second writer having been attempted (§6.5) |

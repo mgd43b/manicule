@@ -64,6 +64,10 @@ STATUS_BY_ERROR: dict[str, int] = {
     "RebuildStorageError": SERVICE_UNAVAILABLE,
     "RebuildDerivationError": UNPROCESSABLE,
     "RebuildValidationError": UNPROCESSABLE,
+    # Refused by the deletion ceiling: the request was valid and the proposal it recorded is the
+    # conflict between what the source says and what the installation will do without a person.
+    "ReconciliationRefusedError": CONFLICT,
+    "ReconciliationBlockedError": SERVICE_UNAVAILABLE,
     "RebuildLeaseError": CONFLICT,
     "RebuildTerminalError": CONFLICT,
     # A cross-workspace refusal is **not** a client error. Nothing the caller sent could have
@@ -84,7 +88,7 @@ def status_for(envelope: Envelope) -> int:
     """The HTTP status this envelope should be sent with."""
     if envelope.ok:
         return OK
-    if envelope.data is not None and envelope.data.get("outcome") == "incomplete":
+    if envelope.data is not None and envelope.data.get("outcome") in {"incomplete", "failed"}:
         return SERVICE_UNAVAILABLE
     kind = envelope.error.type if envelope.error else ""
     return STATUS_BY_ERROR.get(kind, BAD_REQUEST)

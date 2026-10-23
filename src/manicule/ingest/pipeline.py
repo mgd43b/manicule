@@ -574,6 +574,16 @@ class RunReport:
     inventory_recovery: Literal["", "reenumeration_required", "reenumerating", "reconciled"] = ""
     reconciled_deleted_items: int = 0
     full_inventory_authority: FullInventoryAuthority = ""
+    full_enumeration: bool = False
+    """Whether this run walked the whole source rather than resuming from a cursor.
+
+    True when discovery was handed no watermark, or when the connector walks its whole scope
+    whatever cursor it is handed (:func:`snapshot_enumerates_full_inventory`). Not persisted: it
+    describes this invocation, and its one reader is the caller that decides whether a
+    reconciliation should follow (``docs/ingest.md`` §11 — after every full sync). It says
+    nothing about whether the walk *completed*; that is :attr:`enumeration_completed`, and
+    :attr:`complete` says whether everything landed.
+    """
 
     @property
     def indexed(self) -> int:
@@ -1525,6 +1535,9 @@ class IngestPipeline:
             inventory_state=acquisition.inventory_state,
             reconciled_deleted_count=acquisition.reconciled_deleted_count,
             accepted=acquisition.accepted,
+        )
+        report.full_enumeration = (
+            acquisition.watermark is None or snapshot_enumerates_full_inventory(connector)
         )
         if run.snapshot_completeness is not None:
             run.report.snapshot_completeness = run.snapshot_completeness.value

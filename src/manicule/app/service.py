@@ -104,6 +104,7 @@ from manicule.core.retrieval import Candidate, Context, Filter, Query, Retrieval
 from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
 from manicule.core.version import CORE_VERSION
 from manicule.ingest.knowledge import check as check_knowledge
+from manicule.ingest.reconcile import standing
 from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
 from manicule.parsers.front_matter import FRONT_MATTER_FENCE, front_matter_end
 from manicule.research.config import ResearchLimits
@@ -140,6 +141,7 @@ if TYPE_CHECKING:
     from manicule.generation.ports import ConversationRecord
     from manicule.ingest.embedding import EmbeddingWork
     from manicule.ingest.pipeline import RunReport, Watching
+    from manicule.ingest.reconcile import Reconciliation, ReconciliationStanding
     from manicule.ingest.reembed import ReembedRecovery, ReembedRun
     from manicule.parsers.config import SourceCodeConfig
     from manicule.plugins.registry import Discovery
@@ -1927,8 +1929,145 @@ class ApplicationService:
             acquire_only=acquire_only,
             retain_source_bytes=retain_source_bytes,
         )
-        payload = _ingest_payload(report, started)
-        return _with_placement(payload, await self._placement(report.connector))
+        payload = _with_placement(
+            _ingest_payload(report, started), await self._placement(report.connector)
+        )
+        if limit is not None or acquire_only or not _walked_whole_source(report):
+            return payload
+        # After every full sync (`docs/ingest.md` §11). Only a walk that began from no cursor
+        # and finished, with everything it accepted landed: a bounded or incomplete run holds a
+        # prefix, and a prefix is exactly what reconciliation must never be handed. Reported on
+        # the sync's own payload instead of failing it, because the sync succeeded.
+        followed = await self._reconcile_after_sync(name)
+        if followed is None:
+            return payload
+        return payload.model_copy(update={"reconciliation": followed})
+
+    def reconcile_interval_s(self, name: str) -> float:
+        """Seconds between deletion-detection passes for one connector.
+
+        The connector's own ``reconcile_interval_s`` when it sets one, else
+        ``ingest.reconcile_interval_s``. One function, because the scheduler, ``connector list``
+        and ``doctor`` all ask, and three readings of one precedence rule would disagree the
+        first time it changed.
+        """
+        configured = self.settings.connectors[name].reconcile_interval_s
+        return configured if configured is not None else self.settings.ingest.reconcile_interval_s
+
+    async def _reconciliation_standing(self, name: str) -> ReconciliationStanding:
+        store = await self._backend.documents()
+        return standing(
+            await store.connector_metadata(name),
+            live_documents=await store.count_documents(source=name),
+        )
+
+    def _configured_connector(self, name: str) -> ConnectorSettings:
+        configured = self.settings.connectors.get(name)
+        if configured is None:
+            known = ", ".join(sorted(self.settings.connectors)) or "none configured"
+            msg = f"no connector named {name!r}. Configured: {known}"
+            raise UnknownEntityError(msg)
+        return configured
+
+    async def connector_reconcile(
+        self, name: str, *, dry_run: bool = False
+    ) -> r.ConnectorReconciled:
+        """Ask one connector's source what it still has, and soft-delete what has left it.
+
+        Incremental sync cannot see a deletion — a deleted document simply stops appearing — so
+        this is the operation that removes documents which left their source (``docs/ingest.md``
+        §11). It enumerates ids only, applies the diff only on a clean completion, refuses a
+        diff above ``ingest.reconcile_max_delete_fraction`` and records it as a proposal for
+        :meth:`connector_reconcile_resolve`, and only ever soft-deletes.
+
+        A served manicule runs this itself, on ``ingest.reconcile_interval_s`` or the
+        connector's own ``reconcile_interval_s``, and after every full sync. This is the same
+        pass reached by hand, and it also runs when a pass is not yet due.
+
+        ``dry_run`` enumerates the source and reports what *would* be deleted, then consumes the
+        inventory: a preview is never later replayed as authority to delete, so applying
+        afterwards enumerates again. The result is counts only — never a source id, title or URI.
+
+        Raises:
+            UnknownEntityError: Configuration has no connector by that name.
+            PolicyError: The source is configured ``enabled = false``.
+        """
+        configured = self._configured_connector(name)
+        if not configured.enabled:
+            msg = (
+                f"connector {name!r} is configured `enabled = false`. Set it to true in "
+                f"[connectors.{name}] to reconcile it."
+            )
+            raise PolicyError(msg)
+        return await self._reconcile(name, dry_run=dry_run)
+
+    async def connector_reconcile_resolve(
+        self, name: str, *, confirm: bool
+    ) -> r.ConnectorReconciled:
+        """Apply, or discard, the deletion proposal the ceiling refused for one connector.
+
+        Confirming deletes exactly the reviewed set — soft, recoverable inside the grace period
+        — and skips any document that was republished or seen at its source since; it does not
+        enumerate again. Discarding deletes nothing, clears the proposal, and restarts the
+        interval so the schedule does not re-propose the same deletion within the hour.
+
+        Not refused for a disabled connector, unlike a pass: a proposal that was waiting when
+        the connector was switched off still has to be answerable.
+
+        Raises:
+            UnknownEntityError: Configuration has no connector by that name.
+        """
+        self._configured_connector(name)
+        ingestion = await self._backend.ingestion()
+        result = await ingestion.resolve_proposal(name, confirm=confirm)
+        return _reconciled("confirm" if confirm else "discard", result)
+
+    async def reconcile_if_due(self, name: str) -> r.ConnectorReconciled | None:
+        """Run one pass if the connector is due, or return ``None`` to say it was not.
+
+        What the scheduler calls. Not due when disabled, when it holds no live documents (a
+        source nothing has been synced from has nothing to lose, and enumerating it would only
+        spend requests), when a proposal waits for an operator, or when the interval has not
+        elapsed since the last pass concluded. Raises what a pass raises before it starts —
+        notably a missing session — so the scheduler can treat that as it treats a sync's.
+        """
+        configured = self.settings.connectors.get(name)
+        if configured is None or not configured.enabled:
+            return None
+        state = await self._reconciliation_standing(name)
+        if not state.due(interval_s=self.reconcile_interval_s(name)):
+            return None
+        return await self._reconcile(name, dry_run=False)
+
+    async def _reconcile_after_sync(self, name: str) -> r.ConnectorReconciled | None:
+        """The pass that follows a completed full sync, or ``None`` when there is nothing to do.
+
+        Skipped for a connector with no documents and for one with a proposal waiting, on the
+        scheduler's own rules: a newer inventory supersedes the proposal an operator is
+        reviewing. Any failure is returned as an outcome rather than raised, since the sync it
+        follows has already succeeded.
+        """
+        state = await self._reconciliation_standing(name)
+        if state.live_documents == 0 or state.proposal_pending:
+            return None
+        try:
+            return await self._reconcile(name, dry_run=False)
+        except (ManiculeError, ValueError, OSError) as exc:
+            return r.ConnectorReconciled(
+                connector=name,
+                action="reconcile",
+                outcome="failed",
+                error_type=type(exc).__name__,
+            )
+
+    async def _reconcile(self, name: str, *, dry_run: bool) -> r.ConnectorReconciled:
+        ingestion = await self._backend.ingestion()
+        result = await ingestion.reconcile(
+            name,
+            dry_run=dry_run,
+            max_delete_fraction=self.settings.ingest.reconcile_max_delete_fraction,
+        )
+        return _reconciled("dry_run" if dry_run else "reconcile", result)
 
     async def connector_login(
         self,
@@ -2209,6 +2348,9 @@ class ApplicationService:
                 # malformed old status must not hide the configured connector itself.
                 with contextlib.suppress(ValidationError):
                     last_lifecycle = r.LifecycleProgress.model_validate(raw_lifecycle)
+            documents = await store.count_documents(source=name)
+            reconciliation = standing(metadata, live_documents=documents)
+            interval = self.reconcile_interval_s(name)
             summaries.append(
                 r.ConnectorSummary(
                     name=name,
@@ -2223,7 +2365,7 @@ class ApplicationService:
                     ),
                     last_synced_at=_text_or_none(metadata.get("last_synced_at")),
                     status=_text(metadata.get("status")),
-                    documents=await store.count_documents(source=name),
+                    documents=documents,
                     last_outcome=last_outcome,
                     retry_required=last_run.get("retry_required") is True,
                     last_error_type=_text(last_run.get("error_type")),
@@ -2237,6 +2379,17 @@ class ApplicationService:
                     ),
                     last_lifecycle=last_lifecycle,
                     full_inventory_authority=_configured_full_inventory_authority(configured),
+                    reconcile_interval_s=interval if configured.enabled else None,
+                    last_reconciled_at=(
+                        reconciliation.last_clean_at.isoformat()
+                        if reconciliation.last_clean_at is not None
+                        else None
+                    ),
+                    reconcile_overdue=configured.enabled
+                    and reconciliation.overdue(interval_s=interval),
+                    reconcile_proposal_pending=reconciliation.proposal_pending,
+                    reconcile_proposal_missing=reconciliation.proposal_missing,
+                    reconcile_proposal_live=reconciliation.proposal_live,
                 )
             )
         return r.ConnectorList(count=len(summaries), connectors=tuple(summaries))
@@ -3556,6 +3709,10 @@ class ApplicationService:
         checks.append(await self._vector_backend_check())
         checks.append(await self._glossary_check())
         checks.append(await self._connectors_check())
+        # Adjacent, and after it, because both are about what a connector's documents are doing
+        # now rather than what they are filed under: whether deletion detection is keeping up,
+        # and whether it is waiting on a person.
+        checks.extend(await self._reconciliation_checks())
         checks.append(await self._authoring_check())
         checks.append(await self._collection_membership_check())
         checks.append(await self._sessions_check())
@@ -4184,10 +4341,11 @@ class ApplicationService:
         therefore one document set. So the damage this warns about is prospective, and
         ``degraded`` says so.
 
-        **The remedy named here is one that has been run.** There is deliberately no mention of
-        reconciliation: :func:`manicule.ingest.reconcile.reconcile` exists and is tested, but
-        nothing in the product calls it and no command invokes it, so naming it would send an
-        operator looking for a regime that is not reachable.
+        **The remedy named here is one that has been run.** Reconciliation is deliberately not
+        offered as a way to clear these. ``manicule connector reconcile`` enumerates one *instance*
+        and diffs the documents filed under that instance's name; the documents this check finds
+        are filed under the connector *type's* name, which no instance's inventory contains, so
+        a pass would neither find nor remove them.
         """
         configured = self.settings.connectors
         if not configured:
@@ -4249,8 +4407,9 @@ class ApplicationService:
                 f"these pages again under new ids and leave the existing rows behind — the "
                 f"corpus will appear to have doubled, and nothing will report an error. "
                 f"Inspect them with `manicule document list --source {first}`, and remove each "
-                f"with `manicule document delete <id>` before or after re-syncing. There is no "
-                f"bulk reconciliation for this and none is implied."
+                f"with `manicule document delete <id>` before or after re-syncing. `connector "
+                f"reconcile` does not reach them: it only compares documents filed under an "
+                f"instance's own name."
             ),
             facts=cast(
                 "dict[str, JsonValue]",
@@ -4264,6 +4423,108 @@ class ApplicationService:
             # that wants to offer the action should not have to find it inside one. The
             # permissions check sets both and this is the other check with a command to give.
             remedy=f"manicule document list --source {first}",
+        )
+
+    async def _reconciliation_checks(self) -> tuple[r.Check, r.Check]:
+        """``reconciliation-overdue`` and ``reconciliation-proposals``, from one read.
+
+        Both names are contracts a monitor selects on. They are two checks rather than one
+        because they need different people: an overdue pass wants a server running (or a
+        command typed), and a waiting proposal wants somebody to look at a source and answer.
+        A single check reporting either would make the cheaper problem hide the dearer one.
+
+        Counts and connector *names* only. A connector's name is configuration the operator
+        wrote; the ids of the documents a proposal would delete are not here and never were.
+        """
+        try:
+            standings = {
+                name: await self._reconciliation_standing(name)
+                for name, configured in sorted(self.settings.connectors.items())
+                if configured.enabled
+            }
+        except Exception as exc:  # noqa: BLE001 - the exception is the diagnosis
+            detail = f"the corpus could not be examined: {type(exc).__name__}: {exc}"
+            facts: dict[str, JsonValue] = {"error_type": type(exc).__name__}
+            return (
+                r.Check(name="reconciliation-overdue", state="unknown", detail=detail, facts=facts),
+                r.Check(
+                    name="reconciliation-proposals", state="unknown", detail=detail, facts=facts
+                ),
+            )
+        return self._overdue_check(standings), self._proposals_check(standings)
+
+    def _overdue_check(self, standings: dict[str, ReconciliationStanding]) -> r.Check:
+        """Which enabled connectors have gone more than twice their interval unreconciled."""
+        overdue = {
+            name: state
+            for name, state in standings.items()
+            if state.overdue(interval_s=self.reconcile_interval_s(name))
+        }
+        if not overdue:
+            return r.Check(
+                name="reconciliation-overdue",
+                state="ok",
+                detail=(
+                    "deletion detection is keeping up for every enabled source that holds documents"
+                    if standings
+                    else "no enabled sources configured"
+                ),
+                facts={"overdue": []},
+            )
+        listed = ", ".join(
+            f"{name!r} ({_last_pass(state)}, every {self.reconcile_interval_s(name):g}s)"
+            for name, state in overdue.items()
+        )
+        first = next(iter(overdue))
+        return r.Check(
+            name="reconciliation-overdue",
+            state="degraded",
+            detail=(
+                f"deletion detection is more than twice its interval late for {listed}. "
+                f"Until a pass runs, a document deleted at its source stays searchable here. "
+                f"A running `manicule serve` does this on its own; otherwise run "
+                f"`manicule connector reconcile {first}`."
+            ),
+            facts=cast(
+                "dict[str, JsonValue]",
+                {"overdue": sorted(overdue), "count": len(overdue)},
+            ),
+            remedy=f"manicule connector reconcile {first}",
+        )
+
+    def _proposals_check(self, standings: dict[str, ReconciliationStanding]) -> r.Check:
+        """Which connectors have a deletion the ceiling refused, waiting for a person."""
+        waiting = {name: state for name, state in standings.items() if state.proposal_pending}
+        if not waiting:
+            return r.Check(
+                name="reconciliation-proposals",
+                state="ok",
+                detail="no deletion proposal is waiting for confirmation",
+                facts={"waiting": [], "missing": 0},
+            )
+        listed = ", ".join(
+            f"{name!r} ({state.proposal_missing} of {state.proposal_live} live document(s))"
+            for name, state in waiting.items()
+        )
+        first = next(iter(waiting))
+        return r.Check(
+            name="reconciliation-proposals",
+            state="degraded",
+            detail=(
+                f"deletion proposals above the ceiling are waiting: {listed}. Nothing has been "
+                f"deleted and the documents stay searchable. If the source really lost them, "
+                f"`manicule connector reconcile {first} --confirm` deletes exactly those; if the "
+                f"source is what is wrong, `--discard` keeps them. `manicule connector list` "
+                f"shows the counts."
+            ),
+            facts=cast(
+                "dict[str, JsonValue]",
+                {
+                    "waiting": sorted(waiting),
+                    "missing": sum(state.proposal_missing for state in waiting.values()),
+                },
+            ),
+            remedy="manicule connector list",
         )
 
     async def _sessions_check(self) -> r.Check:
@@ -8463,6 +8724,67 @@ def _with_placement(payload: r.IngestReport, placement: tuple[int, int] | None) 
     if placement is None:
         return payload
     return payload.model_copy(update={"collected": placement[0], "uncollected": placement[1]})
+
+
+def _last_pass(state: ReconciliationStanding) -> str:
+    """When deletion detection last concluded, as a phrase for a sentence."""
+    if state.last_attempt_at is None:
+        return "never"
+    return f"last {state.last_attempt_at.isoformat()}"
+
+
+def _walked_whole_source(report: RunReport) -> bool:
+    """Whether a sync enumerated everything and landed everything it accepted.
+
+    The three conditions reconciliation needs before it may follow: the walk began from no
+    cursor (or the connector ignores its cursor), it reached the end of the source, and nothing
+    was left behind by a limit, a fetch failure or an incomplete run.
+    """
+    return (
+        report.full_enumeration
+        and report.enumeration_completed
+        and report.complete
+        and not report.error
+    )
+
+
+def _reconciled(action: r.ReconcileAction, result: Reconciliation) -> r.ConnectorReconciled:
+    """Reduce a reconciliation to counts and an outcome. Source ids stop here.
+
+    ``Reconciliation`` carries the ids it deleted or proposed, and so may a store's error text
+    carry the URL a source client was asking for; neither crosses this function. The unsuccessful
+    outcomes set ``error_type`` to the class the envelope's error will carry.
+    """
+    resolving = action in {"confirm", "discard"}
+    outcome: r.ReconcileOutcome
+    error_type = ""
+    if result.blocked:
+        outcome, error_type = "blocked", "ReconciliationBlockedError"
+    elif result.error:
+        outcome, error_type = "failed", result.error_type or "ReconciliationError"
+    elif result.refused and resolving:
+        outcome, error_type = "none_pending", "UnknownEntityError"
+    elif result.refused:
+        outcome, error_type = "proposed", "ReconciliationRefusedError"
+    elif action == "confirm":
+        outcome = "confirmed"
+    elif action == "discard":
+        outcome = "discarded"
+    elif result.dry_run:
+        outcome = "previewed"
+    else:
+        outcome = "applied"
+    return r.ConnectorReconciled(
+        connector=result.connector,
+        action=action,
+        outcome=outcome,
+        seen=result.seen,
+        live=result.live_count,
+        missing=result.missing_count,
+        deleted=result.applied_count or len(result.deleted),
+        proposal_pending=outcome == "proposed",
+        error_type=error_type,
+    )
 
 
 def _ingest_payload(report: RunReport, started: float) -> r.IngestReport:

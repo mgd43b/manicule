@@ -145,7 +145,9 @@ So the mailbox is configuration, not a side effect of the credential:
   never resumed for another even if the check were bypassed.
 - **Indexing a different mailbox is a different instance**, under a new connector name and
   therefore a new source identity. The old instance's documents do not leave by themselves —
-  reconciliation is not wired (§7) — so they are deleted explicitly before or after the switch.
+  reconciliation (§7) compares only the documents filed under an instance's own name, and it
+  never runs for an instance that is disabled or no longer configured — so they are deleted
+  explicitly before or after the switch.
   Editing `account` on an existing instance is refused with the same instruction rather than
   treated as a scope change, because a scope change keeps the source and re-walks it, leaving
   removal to reconciliation — and what would be left behind here is someone else's mail.
@@ -230,10 +232,9 @@ sync sees that label change and acts on it.
 the stored history position, so the next sync is a complete walk under the new scope. **A walk
 does not remove anything.** Widening the scope is handled by it: newly included messages are
 yielded and fetched. Narrowing is not: messages that are now excluded stay indexed until a
-reconciliation against the new inventory removes them, and a narrowing large enough to trip the
-deletion ceiling waits for confirmation (§7). Reconciliation after every full walk is part of
-[#466](https://github.com/mgd43b/manicule/issues/466), so a scope change is deletion-capable only
-once that lands.
+reconciliation against the new inventory removes them. A completed full walk is a full sync, so
+the pass follows it (§7), and a narrowing large enough to trip the deletion ceiling waits for
+`manicule connector reconcile NAME --confirm` (§7).
 
 ---
 
@@ -420,30 +421,32 @@ about 200 requests and 1,000 units, a
 few seconds of the per-minute budget. A mail installation can afford to reconcile daily or
 hourly.
 
-**Nothing in manicule runs reconciliation today, for any connector.**
-`manicule.ingest.reconcile.reconcile` exists, is tested, and has no caller in the product; no
-command, service method or schedule invokes it, and `reconcile_interval_s` is read nowhere but
-its own definition. `connector sync` never removes a document that left its source. Two things
-do remove documents, and neither helps here: `manicule index --watch` removes a file on its
-delete event, which only a watched directory has; and offline rebuild publication
-([`ingest.md`](../ingest.md) §10.4) retires what a replacement does not contain, which needs
-retained source bytes and is not a sync. [`ingest.md`](../ingest.md) §11's
-"after every full sync, and on a schedule" describes the design, not the code.
+**Reconciliation runs in a served manicule, for every enabled connector.** The scheduler calls
+`manicule.ingest.reconcile.reconcile` on `ingest.reconcile_interval_s` (default weekly) or on the
+instance's own `reconcile_interval_s`, and a completed full sync is followed by a pass whether or
+not the interval has elapsed ([`ingest.md`](../ingest.md) §11, delivered by
+[#466](https://github.com/mgd43b/manicule/issues/466)). A mail instance sets its own interval,
+`reconcile_interval_s = 86400` for daily or `3600` for hourly, and that interval is how long
+deleted mail can stay searchable, plus at most one scheduler poll (an hour). An incremental sync
+still cannot see a deletion; the pass is what removes it. `manicule connector reconcile NAME` runs
+a pass now, `--dry-run` previews one, and `--confirm` or `--discard` answers a proposal the
+deletion ceiling refused. `connector list` and `doctor` report a pass that is overdue and a
+proposal that is waiting. Everything a pass returns is counts: never a message id, subject or
+address.
 
-For Confluence that means a deleted page lingers. For a mailbox it means deleted mail is
-searchable forever. **Wiring reconciliation into sync is therefore a prerequisite of this
-epic**, not an improvement to it: the Gmail connector does not ship to a release before
-reconciliation runs on the schedule `reconcile_interval_s` describes. That work is
-[#466](https://github.com/mgd43b/manicule/issues/466), which also adds a per-connector interval
-so a mail source can reconcile daily or hourly.
+That meets the prerequisite this section used to state: reconciliation runs on a schedule before
+the Gmail connector ships. The schedule lives in `manicule serve`, so an installation that is not
+served has no process to run it, and only the command above reconciles it.
 
-**Once it runs, two existing behaviors matter more for mail than for anything else:**
+**Two behaviors matter more for mail than for anything else:**
 
 - **The deletion ceiling.** A reconciliation that would delete more than
   `reconcile_max_delete_fraction` (default 10%) of the connector's live documents is refused and
   recorded as a proposal for confirmation (§11.1). Emptying a large folder into Trash, or adding
   a busy label to `exclude_labels`, will trip it. That is the guard working, and the proposal is
-  confirmed rather than the ceiling raised.
+  confirmed with `manicule connector reconcile NAME --confirm` rather than the ceiling raised.
+  `--discard` keeps the messages and restarts the interval, for the case where the mailbox was
+  what looked wrong.
 - **Removed from results is not removed from disk, and nothing here erases a message.** A
   reconciled message is soft-deleted. When the grace period ends (`soft_delete_grace_s`, 30 days
   by default, [`storage.md`](../storage.md) §8.2), the sweep removes its chunks and vectors — the
@@ -604,5 +607,5 @@ client already uses, imported by the factory rather than at plugin discovery.
 | Expired history | complete walk that lists ids and fetches only new mail | a full re-download, or silently lost mail |
 | Scope | labels only, tested identically on every path | a query the incremental path cannot evaluate |
 | Pacing | a metered budget under the per-user quota | a first sync spent hitting 429s |
-| Deletions | complete-inventory reconciliation, once it runs | deleted mail searchable forever |
+| Deletions | complete-inventory reconciliation, on a schedule and after every full walk | deleted mail searchable forever |
 | Exposure | refused unless served with authentication | a mailbox open to whoever can reach the port |

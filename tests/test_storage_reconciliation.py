@@ -12,9 +12,12 @@ from manicule.core.acquisition import AcquisitionRecordState, AcquisitionSource
 from manicule.core.reconciliation import CompletedInventory, ReconciliationAssessment
 from manicule.core.sources import DiscoveredDoc, DocRef
 from manicule.ingest.reconcile import (
+    LAST_DISCARDED_KEY,
+    LAST_RECONCILE_KEY,
     PROPOSED_DELETION_KEY,
     Reconciliation,
     confirm_proposed_deletion,
+    discard_proposed_deletion,
     reconcile,
 )
 from manicule.storage import models
@@ -533,3 +536,102 @@ async def test_durable_confirmation_without_a_proposal_returns_a_typed_refusal(
     assert isinstance(result, Reconciliation)
     assert result.connector == _CONNECTOR
     assert result.refused == "no durable deletion proposal exists for the current scope"
+
+
+async def test_a_resumed_inventory_cannot_delete_a_document_synced_after_it_began(
+    store: SqliteDocStore,
+) -> None:
+    """A crash between completion and apply, then a sync, then the resumed apply.
+
+    The inventory is evidence about the source as it was while the run enumerated. A document
+    indexed afterwards is newer evidence, and the resumed diff must not treat its absence from
+    the older list as a deletion.
+    """
+    await _documents(store, 4)
+    completed = await _complete(store, "resumed", ["page-0", "page-1", "page-2", "page-3"])
+    await store.upsert_document(make_document(_CONNECTOR, "synced-after"))
+
+    result = await store.assess_reconciliation_inventory(
+        completed, max_delete_fraction=1.0, now=_NOW
+    )
+
+    assert result.missing_count == 0
+    assert result.applied_count == 0
+    assert await store.find_document(_CONNECTOR, "synced-after") is not None
+
+
+async def test_a_resumed_inventory_cannot_delete_a_document_seen_again_after_it_began(
+    store: SqliteDocStore,
+) -> None:
+    await _documents(store, 4)
+    completed = await _complete(store, "resumed-seen", ["page-0"])
+    seen = await store.find_document(_CONNECTOR, "page-3")
+    assert seen is not None
+    await store.record_seen(seen.id)
+
+    result = await store.assess_reconciliation_inventory(
+        completed, max_delete_fraction=1.0, now=_NOW
+    )
+
+    assert result.missing_count == 2
+    assert result.applied_count == 2
+    assert await store.find_document(_CONNECTOR, "page-3") is not None
+
+
+async def test_a_clean_durable_pass_records_the_time_it_finished(store: SqliteDocStore) -> None:
+    await _documents(store, 2)
+    completed = await _complete(store, "clean", ["page-0", "page-1"])
+
+    await store.assess_reconciliation_inventory(completed, max_delete_fraction=0.1, now=_NOW)
+
+    assert (await store.connector_metadata(_CONNECTOR))[LAST_RECONCILE_KEY] == _NOW.isoformat()
+
+
+async def test_discarding_a_durable_proposal_deletes_nothing_and_restarts_the_interval(
+    store: SqliteDocStore,
+) -> None:
+    await _documents(store, 4)
+    completed = await _complete(store, "discarded", ["page-0"])
+    proposed = await store.assess_reconciliation_inventory(
+        completed, max_delete_fraction=0.1, now=_NOW
+    )
+    assert proposed.refused
+
+    result = await discard_proposed_deletion(_CONNECTOR, store, now=_NOW, scope=_SCOPE)
+
+    assert (result.missing_count, result.live_count, result.applied_count) == (3, 4, 0)
+    metadata = await store.connector_metadata(_CONNECTOR)
+    assert PROPOSED_DELETION_KEY not in metadata
+    assert metadata[LAST_DISCARDED_KEY] == _NOW.isoformat()
+    assert LAST_RECONCILE_KEY not in metadata
+    for number in range(4):
+        assert await store.find_document(_CONNECTOR, f"page-{number}") is not None
+    again = await confirm_proposed_deletion(_CONNECTOR, store, now=_NOW, scope=_SCOPE)
+    assert again.refused
+
+
+async def test_a_discarded_proposal_cannot_be_confirmed_and_a_confirmed_one_cannot_be_discarded(
+    store: SqliteDocStore,
+) -> None:
+    await _documents(store, 4)
+    completed = await _complete(store, "settled", ["page-0"])
+    await store.assess_reconciliation_inventory(completed, max_delete_fraction=0.1, now=_NOW)
+
+    confirmed = await confirm_proposed_deletion(_CONNECTOR, store, now=_NOW, scope=_SCOPE)
+    discarded = await discard_proposed_deletion(_CONNECTOR, store, now=_NOW, scope=_SCOPE)
+
+    assert confirmed.applied_count == 3
+    assert discarded.refused == "no durable deletion proposal exists for the current scope"
+
+
+async def test_discarding_rejects_an_omitted_or_mismatched_scope(store: SqliteDocStore) -> None:
+    await _documents(store, 4)
+    completed = await _complete(store, "scope-checked", ["page-0"])
+    await store.assess_reconciliation_inventory(completed, max_delete_fraction=0.1, now=_NOW)
+
+    with pytest.raises(ValueError, match="requires the current reconciliation scope"):
+        await discard_proposed_deletion(_CONNECTOR, store, now=_NOW)
+    mismatched = await discard_proposed_deletion(_CONNECTOR, store, now=_NOW, scope="other-scope")
+
+    assert mismatched.refused
+    assert PROPOSED_DELETION_KEY in await store.connector_metadata(_CONNECTOR)

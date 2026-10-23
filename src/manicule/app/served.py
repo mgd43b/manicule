@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
     from pydantic import JsonValue
 
+    from manicule.app import results as r
     from manicule.app.results import LifecycleProgress
     from manicule.app.service import ApplicationService
     from manicule.connectors.sessions import SessionVault
@@ -336,11 +337,44 @@ class ScheduledVectorSweep:
     last_error_type: str = ""
 
 
+@dataclass(slots=True)
+class ScheduledReconciliation:
+    """One source's deletion-detection schedule, and what its passes did. Counts only.
+
+    ``runs`` counts passes that concluded — applied, or refused by the ceiling and waiting on an
+    operator. Separate from ``failures`` because they need opposite things, and from ``blocked``
+    (a backup held the data) for the reason the sweep keeps its own: one is the design working
+    and the other wants somebody. ``deleted`` is a running total of documents soft-deleted, and
+    no id is held anywhere in this record for the life of the process.
+    """
+
+    name: str
+    interval_s: float
+    runs: int = 0
+    failures: int = 0
+    blocked: int = 0
+    proposals: int = 0
+    deleted: int = 0
+    awaiting_sign_in: bool = False
+    last_outcome: str = ""
+    last_error_type: str = ""
+
+
+RECONCILE_POLL_S = 3600.0
+"""The longest the reconcile loop sleeps between asking whether a pass is due.
+
+The answer comes from the connector's stored metadata, not from the loop's own clock, so this is
+not the interval — it is how soon after a restart, a failure or a discarded proposal a due pass
+is noticed. A loop that slept a whole weekly interval before its first look would never
+reconcile a server restarted more often than weekly."""
+
+
 class SchedulerConfiguration(dict[str, float]):
     """Connector intervals plus the separately typed maintenance cadences."""
 
     lifecycle_interval_s: float | None
     sweep_interval_s: float | None
+    reconcile_intervals: dict[str, float]
 
     def __init__(
         self,
@@ -348,10 +382,12 @@ class SchedulerConfiguration(dict[str, float]):
         *,
         lifecycle_interval_s: float | None,
         sweep_interval_s: float | None = None,
+        reconcile_intervals: Mapping[str, float] | None = None,
     ) -> None:
         super().__init__(sources)
         self.lifecycle_interval_s = lifecycle_interval_s
         self.sweep_interval_s = sweep_interval_s
+        self.reconcile_intervals = dict(reconcile_intervals or {})
 
 
 class Scheduler:
@@ -423,6 +459,13 @@ class Scheduler:
             if self._sweep_interval_s is not None
             else None
         )
+        self._reconcile_intervals = (
+            dict(sources.reconcile_intervals) if isinstance(sources, SchedulerConfiguration) else {}
+        )
+        self.reconciling: dict[str, ScheduledReconciliation] = {
+            name: ScheduledReconciliation(name=name, interval_s=interval)
+            for name, interval in self._reconcile_intervals.items()
+        }
 
     @staticmethod
     def configure(service: ApplicationService) -> SchedulerConfiguration:
@@ -447,6 +490,13 @@ class Scheduler:
             # rows SQLite has already forgotten, and an installation that never runs it grows a
             # vector table of deleted chunks that dilute every search until somebody notices.
             sweep_interval_s=service.settings.ingest.sweep_interval_s,
+            # Every enabled source, scheduled or not. A source that is only ever synced by hand
+            # still has documents leaving it, and nobody types a command to notice that.
+            reconcile_intervals={
+                name: service.reconcile_interval_s(name)
+                for name, configured in service.settings.connectors.items()
+                if configured.enabled
+            },
         )
 
     def start(self) -> None:
@@ -471,6 +521,12 @@ class Scheduler:
             task = asyncio.create_task(self._run(name, interval), name=f"schedule:{name}")
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
+        for name, interval in self._reconcile_intervals.items():
+            reconciling = asyncio.create_task(
+                self._run_reconcile(name, interval), name=f"schedule:reconcile:{name}"
+            )
+            self._tasks.add(reconciling)
+            reconciling.add_done_callback(self._tasks.discard)
 
     async def plan_lifecycle(self, command: commands.Command) -> dict[str, JsonValue]:
         """Run one scheduler-owned lifecycle dry run through the canonical dispatcher.
@@ -574,6 +630,88 @@ class Scheduler:
             record.vectors_removed += swept.vectors_removed
             record.documents_purged += swept.documents_purged
 
+    async def _run_reconcile(self, name: str, interval_s: float) -> None:
+        """One source's deletion detection: look often, reconcile when the record says it is due.
+
+        **The loop asks, and the connector's stored metadata answers.** Sleeping the whole
+        interval and then running would put the schedule in this process's memory, where a
+        restart erases it: a server restarted more often than weekly would never reconcile.
+        Persisting the last conclusion and polling it makes a restart lose nothing and makes a
+        pass an operator ran by hand count.
+
+        **Nothing here ends the loop.** A source that could not be enumerated, a session that
+        is missing, a backup holding the data — each is recorded and retried at the next look.
+        A pass the ceiling refused is recorded as a proposal and not retried: the connector is
+        not due while one waits, because a newer inventory would take it from the person
+        answering it.
+        """
+        record = self.reconciling[name]
+        poll_s = min(interval_s, RECONCILE_POLL_S)
+        while True:
+            await self._sleep(poll_s)
+            try:
+                result = await self._service.reconcile_if_due(name)
+            except asyncio.CancelledError:
+                raise
+            except SessionMissingError:
+                record.failures += 1
+                record.awaiting_sign_in = True
+                record.last_error_type = SessionMissingError.__name__
+                announce(
+                    f"scheduled reconciliation of {name!r} did not run: this server holds no "
+                    f"session for it, so it cannot authenticate. A restart ends sessions, so "
+                    f"this is expected after one. Sign in again with `manicule connector login "
+                    f"{name} --browser`; the schedule looks again within {poll_s:g}s."
+                )
+                continue
+            except (ManiculeError, ValueError, OSError) as exc:
+                record.failures += 1
+                record.last_error_type = type(exc).__name__
+                announce(
+                    f"scheduled reconciliation of {name!r} failed ({type(exc).__name__}); "
+                    f"nothing was deleted and the next look is in {poll_s:g}s"
+                )
+                continue
+            if result is None:
+                continue
+            record.awaiting_sign_in = False
+            self._record_reconciliation(record, result)
+            if result.outcome == "failed":
+                announce(
+                    f"scheduled reconciliation of {name!r} could not enumerate its source "
+                    f"({result.error_type}); nothing was deleted and the next look is in "
+                    f"{poll_s:g}s"
+                )
+
+    def _record_reconciliation(
+        self, record: ScheduledReconciliation, result: r.ConnectorReconciled
+    ) -> None:
+        """Count one pass, from the scheduler's own loop or from the sync it followed.
+
+        Counts and a class name only. A proposal is announced here because it is the one outcome
+        that waits on a person, and the pass after a full sync is as likely to produce it as the
+        scheduled one.
+        """
+        record.last_outcome = result.outcome
+        record.last_error_type = result.error_type
+        match result.outcome:
+            case "blocked":
+                record.blocked += 1
+            case "failed":
+                record.failures += 1
+            case "proposed":
+                record.runs += 1
+                record.proposals += 1
+                announce(
+                    f"reconciling {record.name!r} would soft-delete {result.missing} of "
+                    f"{result.live} live document(s), above the ceiling. Nothing was deleted. "
+                    f"Review the source, then run `manicule connector reconcile "
+                    f"{record.name} --confirm` or `--discard`."
+                )
+            case _:
+                record.runs += 1
+                record.deleted += result.deleted
+
     async def _recover_reembedding(self) -> None:
         """Resume ownerless durable runs once at startup; run status remains authoritative."""
         try:
@@ -662,6 +800,9 @@ class Scheduler:
                     )
                 else:
                     record.runs += 1
+                    followed = report.reconciliation
+                    if followed is not None and name in self.reconciling:
+                        self._record_reconciliation(self.reconciling[name], followed)
 
 
 def announce(message: str) -> None:

@@ -247,6 +247,14 @@ class ReconciliationRefusedError(ManiculeError):
     """
 
 
+class ReconciliationBlockedError(ManiculeError):
+    """A reconciliation pass did not start because a backup held the data directory.
+
+    Nothing was enumerated and nothing was deleted. The backup excludes every pass that removes
+    data from the corpus it is copying, so retrying after it finishes is the whole remedy.
+    """
+
+
 class InsecureTargetError(ManiculeError):
     """A command was asked to write a copy of the corpus somewhere other accounts can read it.
 
@@ -438,6 +446,7 @@ __all__ = [
     "ProviderRequestError",
     "ProviderTimeoutError",
     "RateLimitedError",
+    "ReconciliationBlockedError",
     "ReconciliationRefusedError",
     "RedactionError",
     "SignInRefusedError",

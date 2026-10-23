@@ -16,6 +16,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from manicule.app.results import (
+    UNSUCCESSFUL_RECONCILIATIONS,
+    ConnectorReconciled,
     DocumentCreated,
     Envelope,
     ErrorInfo,
@@ -173,13 +175,18 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
         payload = await call()
     except (ManiculeError, ValueError, OSError) as exc:
         return failed(op, workspace, error_info(exc))
-    reported = _self_reported_failure(op, payload)
+    reported = _self_reported_failure(op, payload) or _unsuccessful_reconciliation(payload)
     if reported is None:
         return succeeded(op, workspace, payload)
-    # Retained for the two payloads that carry work already done — counters an ingest committed,
-    # a file authoring left on disk. Every other failing payload describes something that did
-    # not happen, and attaching it would offer a partial result there is no partial result of.
-    retained = payload if isinstance(payload, IngestReport | DocumentCreated) else None
+    # Retained for the payloads that carry work already done — counters an ingest committed,
+    # a file authoring left on disk, the counts of a reconciliation that recorded a proposal.
+    # Every other failing payload describes something that did not happen, and attaching it
+    # would offer a partial result there is no partial result of.
+    retained = (
+        payload
+        if isinstance(payload, IngestReport | DocumentCreated | ConnectorReconciled)
+        else None
+    )
     return failed(op, workspace, reported, payload=retained)
 
 
@@ -247,6 +254,66 @@ def _self_reported_failure(op: str, payload: Payload) -> ErrorInfo | None:
     ):
         return error_info(RebuildTerminalError())
     return None
+
+
+def _unsuccessful_reconciliation(payload: Payload) -> ErrorInfo | None:
+    """The failure a reconciliation that did not conclude is admitting to, or ``None``.
+
+    Kept apart from :func:`_self_reported_failure` because it is one payload type with four
+    outcomes, which is a table rather than another branch.
+
+    Built from the payload's own fields so that the message, like the payload, holds counts and
+    a class name and nothing a source said: the text of a source client's error can carry the URL
+    it was asking for, and the envelope is returned over every surface.
+    """
+    if not isinstance(payload, ConnectorReconciled):
+        return None
+    if payload.outcome not in UNSUCCESSFUL_RECONCILIATIONS:
+        return None
+    name = payload.connector
+    match payload.outcome:
+        case "proposed":
+            return ErrorInfo(
+                type=payload.error_type,
+                message=(
+                    f"reconciling {name!r} would soft-delete {payload.missing} of "
+                    f"{payload.live} live document(s), above the deletion ceiling. The proposal "
+                    f"is recorded and nothing was deleted."
+                ),
+                hint=(
+                    f"Check the source first. `manicule connector reconcile {name} --confirm` "
+                    f"deletes exactly the reviewed documents (softly: restorable within the "
+                    f"grace period); `--discard` keeps them and restarts the interval."
+                ),
+            )
+        case "blocked":
+            return ErrorInfo(
+                type=payload.error_type,
+                message=f"reconciling {name!r} did not start: a backup holds the data directory",
+                hint="Retry once the backup has finished. Nothing was enumerated or deleted.",
+            )
+        case "none_pending":
+            return ErrorInfo(
+                type=payload.error_type,
+                message=f"no deletion proposal is waiting for connector {name!r}",
+                hint=(
+                    "A proposal exists only after a pass is refused by the deletion ceiling, "
+                    "and only for the scope the connector is configured with now. "
+                    "`manicule connector list` shows whether one is waiting."
+                ),
+            )
+        case _:
+            return ErrorInfo(
+                type=payload.error_type,
+                message=(
+                    f"the source of {name!r} could not be enumerated completely "
+                    f"({payload.error_type}), so nothing was deleted"
+                ),
+                hint=(
+                    f"Fix what the error type names and run `manicule connector reconcile "
+                    f"{name}` again. A partial inventory is never applied."
+                ),
+            )
 
 
 READ_ONLY_OPS: frozenset[str] = frozenset(

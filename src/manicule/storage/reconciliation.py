@@ -10,10 +10,13 @@ from __future__ import annotations
 from itertools import batched
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import delete, exists, func, insert, literal, select, update
+from sqlalchemy import delete, exists, func, insert, literal, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from manicule.core.reconciliation import (
+    LAST_DISCARDED_KEY,
+    LAST_RECONCILE_KEY,
+    PROPOSED_DELETION_KEY,
     CompletedInventory,
     ReconciliationAssessment,
     ReconciliationRunState,
@@ -94,7 +97,7 @@ class ReconciliationJournalMixin(WorkspaceScoped):
             # inventory makes every older question stale, even when configuration changed its
             # scope; leaving the JSON behind would let confirmation select a different run than
             # the one the operator reviewed.
-            await self._merge_metadata(session, connector, {"proposed_deletion": None})
+            await self._merge_metadata(session, connector, {PROPOSED_DELETION_KEY: None})
             await session.execute(
                 sqlite_insert(models.ReconciliationRun)
                 .values(
@@ -261,14 +264,7 @@ class ReconciliationJournalMixin(WorkspaceScoped):
         async with self._sessions.begin() as session:
             run = await self._required_completed_handle(session, inventory)
             live = self._live_documents(run)
-            absent = ~exists(
-                select(models.ReconciliationInventoryItem.source_id).where(
-                    models.ReconciliationInventoryItem.run_id == run.id,
-                    models.ReconciliationInventoryItem.workspace_id == run.workspace_id,
-                    models.ReconciliationInventoryItem.connector_id == run.connector_id,
-                    models.ReconciliationInventoryItem.source_id == models.Document.source_id,
-                )
-            )
+            absent = self._absent_from(run)
             live_count = (
                 await session.execute(
                     select(func.count()).select_from(models.Document).where(*live)
@@ -276,7 +272,7 @@ class ReconciliationJournalMixin(WorkspaceScoped):
             ).scalar_one()
             missing_count = (
                 await session.execute(
-                    select(func.count()).select_from(models.Document).where(*live, absent)
+                    select(func.count()).select_from(models.Document).where(*live, *absent)
                 )
             ).scalar_one()
             run.live_count = live_count
@@ -297,7 +293,7 @@ class ReconciliationJournalMixin(WorkspaceScoped):
                     models.Document.content_hash,
                     models.Document.version_token,
                     models.Document.last_seen_at,
-                ).where(*live, absent)
+                ).where(*live, *absent)
                 await session.execute(
                     insert(models.ReconciliationCandidate).from_select(
                         [
@@ -363,14 +359,7 @@ class ReconciliationJournalMixin(WorkspaceScoped):
                 msg = "consumed dry-run inventory no longer matches its durable identity"
                 raise ReconciliationInventoryError(msg)
             live = self._live_documents(run)
-            absent = ~exists(
-                select(models.ReconciliationInventoryItem.source_id).where(
-                    models.ReconciliationInventoryItem.run_id == run.id,
-                    models.ReconciliationInventoryItem.workspace_id == run.workspace_id,
-                    models.ReconciliationInventoryItem.connector_id == run.connector_id,
-                    models.ReconciliationInventoryItem.source_id == models.Document.source_id,
-                )
-            )
+            absent = self._absent_from(run)
             live_count = (
                 await session.execute(
                     select(func.count()).select_from(models.Document).where(*live)
@@ -378,7 +367,7 @@ class ReconciliationJournalMixin(WorkspaceScoped):
             ).scalar_one()
             missing_count = (
                 await session.execute(
-                    select(func.count()).select_from(models.Document).where(*live, absent)
+                    select(func.count()).select_from(models.Document).where(*live, *absent)
                 )
             ).scalar_one()
             run.live_count = live_count
@@ -404,39 +393,7 @@ class ReconciliationJournalMixin(WorkspaceScoped):
             msg = "confirmation requires the current non-empty reconciliation scope"
             raise ValueError(msg)
         async with self._sessions.begin() as session:
-            connector_row = await self._reconciliation_connector(session, connector)
-            metadata = dict(cast("Any", connector_row.run_metadata) or {})
-            proposal = metadata.get("proposed_deletion")
-            if not isinstance(proposal, dict):
-                return None
-            typed_proposal = cast("dict[str, Any]", proposal)
-            run_id = typed_proposal.get("run_id")
-            recorded_scope = typed_proposal.get("scope")
-            if not isinstance(run_id, str) or not isinstance(recorded_scope, str):
-                return None
-            if scope != recorded_scope:
-                return None
-            clauses = [
-                models.ReconciliationRun.id == run_id,
-                models.ReconciliationRun.workspace_id == self._workspace_id,
-                models.ReconciliationRun.connector_id == connector_row.id,
-                models.ReconciliationRun.connector_name == connector,
-                models.ReconciliationRun.scope == recorded_scope,
-                models.ReconciliationRun.state == ReconciliationRunState.PROPOSED,
-            ]
-            claimed = cast(
-                "CursorResult[Any]",
-                await session.execute(
-                    update(models.ReconciliationRun)
-                    .where(*clauses)
-                    .values(updated_at=models.ReconciliationRun.updated_at)
-                ),
-            )
-            if claimed.rowcount != 1:
-                return None
-            row = (
-                await session.execute(select(models.ReconciliationRun).where(*clauses))
-            ).scalar_one_or_none()
+            row = await self._claim_proposal(session, connector, scope)
             if row is None:
                 return None
             applied = await self._apply_candidates(session, row, now)
@@ -451,6 +408,83 @@ class ReconciliationJournalMixin(WorkspaceScoped):
                 missing_count=row.missing_count or 0,
                 applied_count=applied,
             )
+
+    async def discard_reconciliation_proposal(
+        self, connector: str, *, scope: str, now: datetime
+    ) -> ReconciliationAssessment | None:
+        """Retire a refused proposal without deleting anything, and restart the interval.
+
+        The mirror of :meth:`confirm_reconciliation_proposal`, claimed the same way, so the two
+        cannot both win: whichever commits first moves the run out of ``PROPOSED``. The
+        reviewed candidates are dropped rather than kept, because nothing may ever apply them.
+        """
+        if now.tzinfo is None:
+            msg = "discard time must be timezone-aware"
+            raise ValueError(msg)
+        if not scope:
+            msg = "discarding requires the current non-empty reconciliation scope"
+            raise ValueError(msg)
+        async with self._sessions.begin() as session:
+            row = await self._claim_proposal(session, connector, scope)
+            if row is None:
+                return None
+            await session.execute(
+                delete(models.ReconciliationCandidate).where(
+                    models.ReconciliationCandidate.run_id == row.id
+                )
+            )
+            row.state = ReconciliationRunState.CANCELED
+            row.updated_at = utcnow()
+            await self._merge_metadata(
+                session,
+                row.connector_name,
+                {PROPOSED_DELETION_KEY: None, LAST_DISCARDED_KEY: now.isoformat()},
+            )
+            return ReconciliationAssessment(
+                connector=row.connector_name,
+                scope=row.scope,
+                seen_count=row.seen_count,
+                live_count=row.live_count or 0,
+                missing_count=row.missing_count or 0,
+            )
+
+    async def _claim_proposal(
+        self, session: AsyncSession, connector: str, scope: str
+    ) -> models.ReconciliationRun | None:
+        """Take the one recorded proposal for this scope inside the caller's transaction."""
+        connector_row = await self._reconciliation_connector(session, connector)
+        metadata = dict(cast("Any", connector_row.run_metadata) or {})
+        proposal = metadata.get(PROPOSED_DELETION_KEY)
+        if not isinstance(proposal, dict):
+            return None
+        typed_proposal = cast("dict[str, Any]", proposal)
+        run_id = typed_proposal.get("run_id")
+        recorded_scope = typed_proposal.get("scope")
+        if not isinstance(run_id, str) or not isinstance(recorded_scope, str):
+            return None
+        if scope != recorded_scope:
+            return None
+        clauses = [
+            models.ReconciliationRun.id == run_id,
+            models.ReconciliationRun.workspace_id == self._workspace_id,
+            models.ReconciliationRun.connector_id == connector_row.id,
+            models.ReconciliationRun.connector_name == connector,
+            models.ReconciliationRun.scope == recorded_scope,
+            models.ReconciliationRun.state == ReconciliationRunState.PROPOSED,
+        ]
+        claimed = cast(
+            "CursorResult[Any]",
+            await session.execute(
+                update(models.ReconciliationRun)
+                .where(*clauses)
+                .values(updated_at=models.ReconciliationRun.updated_at)
+            ),
+        )
+        if claimed.rowcount != 1:
+            return None
+        return (
+            await session.execute(select(models.ReconciliationRun).where(*clauses))
+        ).scalar_one_or_none()
 
     async def _required_enumerating_run(
         self, session: AsyncSession, run_id: str, connector: str, scope: str
@@ -527,6 +561,33 @@ class ReconciliationJournalMixin(WorkspaceScoped):
             )
             raise ReconciliationInventoryError(msg)
         return row
+
+    def _absent_from(self, run: models.ReconciliationRun) -> tuple[Any, ...]:
+        """The documents a run's inventory is evidence *against*, and the ones it is not.
+
+        Absent from the inventory is not enough. An inventory is evidence about the source as
+        it was while the run enumerated, and a completed one can be resumed after a crash —
+        possibly after a sync has indexed or re-confirmed documents the inventory could not have
+        listed. A document created or observed at the source after the run began is newer
+        evidence than the inventory, so it is never a candidate; the next full inventory will
+        judge it. Without these two clauses a crash between completion and apply, followed by
+        a sync, would let the resumed inventory delete exactly the documents that sync added.
+        """
+        return (
+            ~exists(
+                select(models.ReconciliationInventoryItem.source_id).where(
+                    models.ReconciliationInventoryItem.run_id == run.id,
+                    models.ReconciliationInventoryItem.workspace_id == run.workspace_id,
+                    models.ReconciliationInventoryItem.connector_id == run.connector_id,
+                    models.ReconciliationInventoryItem.source_id == models.Document.source_id,
+                )
+            ),
+            models.Document.created_at <= run.created_at,
+            or_(
+                models.Document.last_seen_at.is_(None),
+                models.Document.last_seen_at <= run.created_at,
+            ),
+        )
 
     def _live_documents(self, run: models.ReconciliationRun) -> tuple[Any, ...]:
         """What this connector's inventory is diffed against, and what it is not.
@@ -631,7 +692,7 @@ class ReconciliationJournalMixin(WorkspaceScoped):
             session,
             run.connector_name,
             {
-                "proposed_deletion": {
+                PROPOSED_DELETION_KEY: {
                     "run_id": run.id,
                     "scope": run.scope,
                     "live": run.live_count,
@@ -645,7 +706,7 @@ class ReconciliationJournalMixin(WorkspaceScoped):
         await self._merge_metadata(
             session,
             connector,
-            {"last_clean_reconcile_at": now.isoformat(), "proposed_deletion": None},
+            {LAST_RECONCILE_KEY: now.isoformat(), PROPOSED_DELETION_KEY: None},
         )
 
     async def _merge_metadata(

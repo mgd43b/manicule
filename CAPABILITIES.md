@@ -13,11 +13,11 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | Area | Items | Ticket |
 |---|---:|---|
 | CLI capability items | 48 | #8 — **built** |
-| MCP capability items | 45 | #8 — **built** |
-| HTTP endpoints | 62 | #11 — **built** |
+| MCP capability items | 47 | #8 — **built** |
+| HTTP endpoints | 64 | #11 — **built** |
 | File types | 18 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **213** | |
+| **Total** | **217** | |
 
 ## CLI — 48
 
@@ -122,6 +122,11 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 - `connector sync --acquire-only`, `connector snapshot`, `connector verify`, and `rebuild
   plan/execute/resume/status` — a durable retained-source hand-off, aggregate verification, and
   connector-free derived publication with no separate settlement command.
+- `connector reconcile NAME [--dry-run | --confirm | --discard]` — deletion detection for a
+  configured source: ask it which documents still exist and soft-delete the rest, preview with
+  `--dry-run`, and answer a proposal the deletion ceiling refused with `--confirm` or `--discard`.
+  A served manicule also runs it on `ingest.reconcile_interval_s` (or the source's own
+  `reconcile_interval_s`) and after every full sync. `docs/ingest.md` §11.
 - `auth create-key --allow-ip <cidr>` (repeatable) and `auth create-key --rate-limit <n>` — a
   key's own address scope and its own requests-per-minute ceiling, validated at mint time.
   `docs/surfaces.md` §9.2.
@@ -135,16 +140,16 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   the member holds, in one transaction); end every session a member holds without disabling
   them. `docs/surfaces.md` §9.2.1.
 
-## MCP tools — 46
+## MCP tools — 48
 
-Ticket: #8 — **built.** Forty-five implemented tools over the same application service the command
+Ticket: #8 — **built.** Forty-seven implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
-The checklist below has forty-six capability items because it also records the deliberately
+The checklist below has forty-eight capability items because it also records the deliberately
 declined catch-all `run-command` surface; that item is not a registered MCP tool.
 
-**All forty-five over stdio; over a socket the twenty-six read-only ones plus
+**All forty-seven over stdio; over a socket the twenty-six read-only ones plus
 `document_create`.** MCP is also served at `/mcp/` on the HTTP port, and every *other* mutating
 tool is *absent* from that surface rather than refused on it — see
 [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are unreachable from a
@@ -172,6 +177,8 @@ argument raises its floor to **admin**, the floor `GET /api/v1/search?workspaces
 - [x] `config_get`
 - [x] `config_set`
 - [x] `connector_list`
+- [x] `connector_reconcile`
+- [x] `connector_reconcile_resolve`
 - [x] `connector_sync`
 - [x] `doctor`
 - [x] `document_create`
@@ -216,7 +223,7 @@ corpus where collections are optional is most of it. Asking how many there *are*
 that: `doctor`'s `collection-membership` check counts them on every surface, and a sync reports
 the figure for its own source.
 
-## HTTP endpoints — 62
+## HTTP endpoints — 64
 
 Ticket: #11 — **built.** Twelve route groups over the same application service the CLI and the
 MCP server use: health · documents · chat · conversations · collections · tags · admin ·
@@ -277,6 +284,8 @@ name — an absence with no test is an absence that comes back.
   fail with a 409 and describing cannot, and one route returning either status depending on
   which field was present is a route a caller cannot reason about
 - [x] `PATCH  /api/v1/conversations/:id`
+- [x] `POST   /api/v1/admin/connectors/:name/reconcile`
+- [x] `POST   /api/v1/admin/connectors/:name/reconcile/resolve`
 - [x] `POST   /api/v1/admin/connectors/:name/sync`
 - [ ] ~~`POST   /api/v1/admin/connectors/:type`~~ — a connector holds credentials and reaches a remote system. Sources are declared in configuration, where the whole set is reviewable in one place; `POST /admin/connectors/:name/sync` runs one that is already declared
 - [ ] ~~`POST   /api/v1/admin/connectors/github/sync`~~ — there is no per-connector route. `POST /admin/connectors/:name/sync` runs whichever connector configuration names

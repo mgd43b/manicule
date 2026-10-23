@@ -2643,6 +2643,8 @@ MINIMAL: dict[str, list[str]] = {
     "collection_rule_clear": ["collection", "rule", "clear", "col-1"],
     "config_set": ["config", "set", "rag.profile", "fast"],
     "connector_list": ["connector", "list"],
+    "connector_reconcile": ["connector", "reconcile", "handbook"],
+    "connector_reconcile_resolve": ["connector", "reconcile", "handbook", "--discard"],
     "connector_sidecar": ["connector", "sidecar", "."],
     "connector_sync": ["connector", "sync", "handbook"],
     # No ``--file``, so the body comes from standard input — which the runner leaves empty,

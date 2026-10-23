@@ -723,6 +723,8 @@ PAYLOADS: dict[str, type[Payload]] = {
     "browser_auth_install": r.MessagingHostInstalled,
     "connector_login": r.ConnectorSignedIn,
     "connector_sidecar": r.SidecarReport,
+    "connector_reconcile": r.ConnectorReconciled,
+    "connector_reconcile_resolve": r.ConnectorReconciled,
     "connector_sync": r.IngestReport,
     "config_get": r.ConfigValue,
     "config_set": r.ConfigChange,
@@ -1675,6 +1677,53 @@ def connector_sync(
             {"name": name, "limit": limit, "acquire_only": acquire_only},
         )
     )
+
+
+@connector_app.command("reconcile")
+def connector_reconcile(
+    name: Annotated[str, typer.Argument(help="The configured source's name.")],
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Enumerate the source and report what would be deleted, deleting nothing.",
+        ),
+    ] = False,
+    confirm: Annotated[
+        bool,
+        typer.Option(
+            "--confirm",
+            help="Delete exactly the documents a refused proposal named, without enumerating "
+            "again.",
+        ),
+    ] = False,
+    discard: Annotated[
+        bool,
+        typer.Option(
+            "--discard",
+            help="Throw away a refused proposal, deleting nothing, and restart the interval.",
+        ),
+    ] = False,
+) -> None:
+    """Find and soft-delete documents that have left their source.
+
+    Incremental sync cannot see a deletion, so this asks the source which ids it still has and
+    soft-deletes the live documents it does not (recoverable inside the grace period). A served
+    manicule does this on its own schedule and after every full sync; this runs it now. A pass
+    that would delete more than the configured ceiling is refused and recorded: answer it with
+    --confirm or --discard. Output is counts only.
+    """
+    chosen = [
+        flag
+        for flag, on in (("--dry-run", dry_run), ("--confirm", confirm), ("--discard", discard))
+        if on
+    ]
+    if len(chosen) > 1:
+        raise typer.BadParameter(f"{' and '.join(chosen)} cannot be combined: each is one answer")
+    if confirm or discard:
+        submit(Command("connector_reconcile_resolve", {"name": name, "confirm": confirm}))
+        return
+    submit(Command("connector_reconcile", {"name": name, "dry_run": dry_run}))
 
 
 @connector_app.command("snapshot")

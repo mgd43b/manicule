@@ -583,6 +583,12 @@ ABSENT_TOOLS: tuple[tuple[str, str], ...] = (
     ("document_delete", "removing a document, with `hard` there is no restore from"),
     ("document_reindex", "a re-parse that holds the embedder for as long as the document takes"),
     ("connector_sync", "starting a sync, which #113 refused a route for on the same grounds"),
+    (
+        "connector_reconcile",
+        "enumerating a source and soft-deleting what left it, for the same reason a sync is "
+        "absent here",
+    ),
+    ("connector_reconcile_resolve", "confirming a deletion the ceiling refused"),
     ("config_set", "rewriting the configuration file the server is running from"),
     ("workspace_switch", "changing which tenant the next start serves"),
     ("plugin_add", "enabling code that runs with this process's full authority"),

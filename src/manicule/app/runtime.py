@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
+    from manicule.ingest.reconcile import Reconciliation
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import (
         GlossarySweep,
@@ -1243,6 +1244,20 @@ async def _publication_bound_vectors(runtime: Runtime) -> PublicationBoundVector
     return vectors if isinstance(vectors, PublicationBoundVectorStore) else None
 
 
+def _confirmed(connector: str, applied: Reconciliation | Sequence[str]) -> Reconciliation:
+    """One result shape for confirming a proposal, whichever store kept it.
+
+    The durable store answers with the counts it applied; a store without a durable journal
+    answers with the source ids it removed. The ids stop here: nothing past this function
+    carries them.
+    """
+    from manicule.ingest.reconcile import Reconciliation  # noqa: PLC0415
+
+    if isinstance(applied, Reconciliation):
+        return applied
+    return Reconciliation(connector=connector, applied_count=len(applied))
+
+
 class _Ingestion:
     """The ingest operations a surface can start, over one runtime."""
 
@@ -1368,6 +1383,55 @@ class _Ingestion:
         readings of one configuration.
         """
         return await self._runtime.connector(name)
+
+    async def reconcile(
+        self, connector: str, *, dry_run: bool, max_delete_fraction: float
+    ) -> Reconciliation:
+        """Enumerate one connector's source and soft-delete what left it.
+
+        The whole pass, enumeration included, runs under the derived-mutation guard. A sync
+        holds it across its own network walk, so this adds no new kind of wait, and holding it
+        is what keeps a sync of the same connector from publishing documents between the
+        inventory and the diff — the race the inventory's own newer-evidence rule would
+        otherwise have to catch.
+
+        The connector is built first and outside the guard: building it is where a missing
+        session surfaces, and a pass that cannot authenticate should not queue behind a sync
+        to say so.
+        """
+        from manicule.ingest.reconcile import reconcile as run_reconcile  # noqa: PLC0415
+
+        built = await self._runtime.connector(connector)
+        store = cast("IngestStore", await self._runtime.documents())
+        async with self._runtime.derived_mutation_guard():
+            return await run_reconcile(
+                built,
+                store,
+                max_delete_fraction=max_delete_fraction,
+                dry_run=dry_run,
+            )
+
+    async def resolve_proposal(self, connector: str, *, confirm: bool) -> Reconciliation:
+        """Apply or discard the deletion proposal the ceiling refused.
+
+        The current scope comes from the connector, not from the recorded proposal, so a
+        configuration change since the proposal was made cannot confirm a question about a
+        different source (``docs/ingest.md`` §11.1).
+        """
+        from manicule.ingest.reconcile import (  # noqa: PLC0415
+            confirm_proposed_deletion,
+            connector_scope,
+            discard_proposed_deletion,
+        )
+
+        built = await self._runtime.connector(connector)
+        store = cast("IngestStore", await self._runtime.documents())
+        scope = connector_scope(built)
+        async with self._runtime.derived_mutation_guard():
+            if confirm:
+                confirmed = await confirm_proposed_deletion(connector, store, scope=scope)
+                return _confirmed(connector, confirmed)
+            return await discard_proposed_deletion(connector, store, scope=scope)
 
     async def snapshot_status(self, connector: str) -> tuple[AcquisitionRun, bool] | None:
         """Read the active or newest promoted manifest from durable local identity."""

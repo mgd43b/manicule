@@ -700,6 +700,10 @@ class ReconciliationStore(Protocol):
         self, connector: str, *, scope: str, now: datetime
     ) -> ReconciliationAssessment | None: ...
 
+    async def discard_reconciliation_proposal(
+        self, connector: str, *, scope: str, now: datetime
+    ) -> ReconciliationAssessment | None: ...
+
 
 @runtime_checkable
 class FencedIngestStore(Protocol):

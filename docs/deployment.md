@@ -745,7 +745,7 @@ Unix domain socket. `manicule start` is the same command under its older name; b
 | | With a server running | With none |
 |---|---|---|
 | `search`, `ask`, `doctor`, `document list`, `connector snapshot/verify`, `rebuild plan/status` | work | work |
-| `connector sync`, `index`, `document reindex`, `rebuild execute`, the repair verbs | run **in the server** | refused, naming `manicule serve` |
+| `connector sync`, `connector reconcile`, `index`, `document reindex`, `rebuild execute`, the repair verbs | run **in the server** | refused, naming `manicule serve` |
 | `connector login` | captures here, hands the session to the server | refused before it opens a browser |
 | A Confluence sync | uses the session the server holds | there is no session to use |
 
@@ -818,6 +818,47 @@ a stopped loop.
 
 `schedule_s` existed before and was deleted in #98, because it configured a scheduler that did
 not exist and would have been cited as evidence that one did. It is back because one does.
+
+**Deletion detection is scheduled separately, and for every enabled source.** A sync cannot see a
+document that left its source, so a served manicule also runs a reconciliation pass
+(`docs/ingest.md` §11): it asks the source which documents still exist and soft-deletes the ones
+that do not. It is not tied to `schedule_s`, because a source that is only ever synced by hand
+still has documents leaving it.
+
+```toml
+[ingest]
+reconcile_interval_s = 604800        # the installation default, weekly
+reconcile_max_delete_fraction = 0.1  # a pass deleting more than this is refused, not applied
+
+[connectors.handbook]
+type = "confluence"
+reconcile_interval_s = 86400         # this source daily; unset inherits the default above
+```
+
+- **A full sync is followed by a pass** whether or not the interval has elapsed. A bounded
+  (`--limit`), `--acquire-only` or incomplete sync is not, because it holds a prefix of the source.
+- **The loop polls; it does not sleep the interval.** Each enabled source is looked at every hour
+  (every interval, if that is shorter) and reconciled when its stored record says it is due: the
+  interval has elapsed since a pass last concluded, by a clean pass or an operator's
+  `--discard`. The record is in the database, so a restart loses nothing and a server restarted
+  more often than weekly still reconciles. A source that has never reconciled is due at the first
+  look after startup, one poll in.
+- **Not due:** a disabled source, a source with no live documents, and a source whose refused
+  proposal is waiting for an operator. A source whose session is missing is retried at the next
+  look, like a scheduled sync, and the server announces on its stderr that it awaits sign-in.
+- **A pass is refused above the ceiling, not retried.** Nothing is deleted, the proposal is
+  recorded and the server logs it. `manicule connector reconcile NAME --confirm` deletes exactly
+  the reviewed set (without enumerating again); `--discard` keeps everything and restarts the
+  interval. `manicule connector reconcile NAME` runs a pass now, and `--dry-run` previews one.
+- **Where to look.** `manicule connector list` shows each source's `reconcile_interval_s`,
+  `last_reconciled_at`, `reconcile_overdue` and any waiting proposal's counts. `manicule doctor`
+  has `reconciliation-overdue` (a source more than twice its interval behind) and
+  `reconciliation-proposals` (a refused deletion waiting), both `degraded` rather than `failing`,
+  and both reading the same stored record the scheduler does. Everything reported is a count or a
+  connector name: no source id, title or URI.
+- **It shares the data with a sync.** A pass runs under the same in-process barrier a sync
+  takes, so it never interleaves with a sync of the same source in this server. A source that
+  syncs for a long time delays the pass rather than racing it.
 
 ### 6.3 Running it under launchd
 

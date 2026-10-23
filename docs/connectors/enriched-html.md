@@ -446,8 +446,8 @@ $ manicule connector sync docs
 
 **Generating a manifest does not re-key the existing row.** The sync discovers the page under its
 declared id and creates a *second* document; the path-keyed one is left behind at
-`status = indexed`. Nothing removes it on its own — the connector no longer discovers it under
-that path, and no command in manicule runs reconciliation.
+`status = indexed`. The sync does not remove it — the connector no longer discovers it under
+that path, and an incremental sync never sees an absence. Only a reconciliation pass does (§5e).
 
 ### 5e. Clearing the leftovers, when you did arrive that way
 
@@ -473,8 +473,18 @@ Two things about that output are worth reading carefully:
   --source docs --json` returns 50 and shows 10 of the 40 affected. The `--limit` in the emitted
   command is not decoration.
 
-There is **no bulk delete**, by design. The removal is per document, and at this scale that means
-a loop over the listing:
+**A reconciliation pass removes them too.** The pass enumerates the same identities discovery does
+([`ingest.md`](../ingest.md) §11), so a path-keyed row the manifest has superseded is absent from
+its inventory. A served manicule runs that pass on its schedule, and
+`manicule connector reconcile docs` runs it now. The leftovers are half the corpus at forty of
+eighty, far above `ingest.reconcile_max_delete_fraction`, so the pass records a proposal instead of
+deleting, and `manicule connector reconcile docs --confirm` soft-deletes exactly the set that was
+reviewed. That deletes by the same rule as the loop below, except that it also deletes any
+other document of the source that the pass finds absent, so read the counts first with
+`--dry-run`.
+
+The alternative is deleting per document, which needs no pass and touches nothing else. There is
+**no bulk delete** by that route, by design, and at this scale it means a loop over the listing:
 
 ```console
 $ manicule document list --source docs --limit 160 --json \

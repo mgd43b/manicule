@@ -29,7 +29,7 @@ from fastapi import APIRouter, Query, Response
 
 from manicule.api.context import Service
 from manicule.api.envelopes import respond
-from manicule.api.models import SyncBody
+from manicule.api.models import ReconcileBody, ResolveProposalBody, SyncBody
 from manicule.api.security import AdminPrincipal
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
@@ -381,6 +381,49 @@ async def sync_connector(
         "connector_sync",
         service,
         lambda: service.connector_sync(name, limit=body.limit, acquire_only=body.acquire_only),
+    )
+
+
+@router.post(
+    "/connectors/{name}/reconcile",
+    name="connector_reconcile",
+    summary="Find and soft-delete documents that have left a connector's source.",
+)
+async def reconcile_connector(
+    service: Service, caller: AdminPrincipal, name: str, body: ReconcileBody
+) -> Response:
+    """Ask the source which ids it still has, and soft-delete the live documents it lacks.
+
+    Only a pass a clean, complete enumeration supports applies anything, and one that would
+    delete more than the configured ceiling is refused with ``409`` and recorded as a proposal;
+    answer it on ``reconcile/resolve``. The response is counts: no source id, title or URI.
+    """
+    del caller
+    return await respond(
+        "connector_reconcile",
+        service,
+        lambda: service.connector_reconcile(name, dry_run=body.dry_run),
+    )
+
+
+@router.post(
+    "/connectors/{name}/reconcile/resolve",
+    name="connector_reconcile_resolve",
+    summary="Confirm or discard the deletion proposal the ceiling refused.",
+)
+async def resolve_connector_proposal(
+    service: Service, caller: AdminPrincipal, name: str, body: ResolveProposalBody
+) -> Response:
+    """Delete exactly the documents the recorded proposal named, or keep them and clear it.
+
+    Confirming does not enumerate again: it applies the reviewed set, skipping any document
+    republished or seen at its source since. Both deletions are soft.
+    """
+    del caller
+    return await respond(
+        "connector_reconcile_resolve",
+        service,
+        lambda: service.connector_reconcile_resolve(name, confirm=body.action == "confirm"),
     )
 
 

@@ -221,14 +221,17 @@ class FilesystemConfig(BaseModel):
     directory because it is the record of what was tried, and must never rank beside what
     replaced it.
 
-    **It stops a document being indexed; it does not delete one already indexed.** The walk is
-    where this is enforced, so a file that starts matching simply stops being discovered — and
-    nothing in the product runs a reconciliation pass today
-    (:func:`manicule.ingest.reconcile.reconcile` exists and is tested; nothing calls it). So a
-    document that was indexed before the pattern was written stays in the index, served and
-    stale, until ``manicule document delete`` removes it. Said here rather than left to be
-    discovered, because "I excluded it and it is still in my results" is the first thing this
-    setting will be blamed for, and the answer is a command rather than a defect.
+    **It stops a document being indexed; deleting one already indexed is reconciliation's job,
+    not this setting's.** The walk is where this is enforced, so a file that starts matching
+    simply stops being discovered. A document that was indexed before the pattern was written
+    stays in the index, served and stale, until a reconciliation pass runs: the pass enumerates
+    through the same walk, so the file is absent from its inventory and is soft-deleted. A served
+    manicule runs that pass on a schedule and after every full sync, and
+    ``manicule connector reconcile`` runs it now. Excluding a large share of a source trips the
+    deletion ceiling (``ingest.reconcile_max_delete_fraction``), and the proposal then waits for
+    ``--confirm``. Said here rather than left to be discovered, because "I excluded it and it is
+    still in my results" is the first thing this setting will be blamed for, and the answer is
+    a pass rather than a defect.
 
     **Empty by default, where :class:`GitSiteConfig` ships opinions.** A website has parts that
     are structurally not pages; a directory somebody pointed this connector at is the corpus,
