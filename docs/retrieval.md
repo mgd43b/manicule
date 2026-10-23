@@ -476,7 +476,11 @@ juxtaposition, which FTS5 reads as `AND`. Before that, the words in `FUNCTION_WO
 — interrogatives, auxiliaries, pronouns, articles, common prepositions and conjunctions, about
 eighty in all. `not`, `no` and negated contractions are not among them, because dropping them
 inverts a question. A query made only of function words keeps them, so "what is it" or a bare
-`OR` is still a search for those words. Each word is matched once.
+`OR` is still a search for those words. Each word is matched once, and a typographic apostrophe
+is read as the ASCII one, so `what’s` is the function word it looks like. **The list is English**,
+like the Porter stemmer the index is built with (§13 on the multilingual case): a question in
+another language keeps its function words and needs every one of them in a chunk, as every
+question did before #481.
 
 The list exists because, without it, the conjunction required *every* word: "how do I rotate
 the signing token" matched only a chunk that also said "how", "do" and "I". A natural question

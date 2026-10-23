@@ -73,10 +73,12 @@ def test_a_question_of_function_words_alone_keeps_them() -> None:
     assert VARIANTS["or-content"]("what is it") == '"what" OR "is" OR "it"'
 
 
-def test_the_shipped_rule_is_one_of_the_measured_ones() -> None:
-    """The report compares candidates; it has to contain the one that shipped."""
-    for question in ("how do I rotate the signing token", "NOT", "what is it", "chunks_fts"):
-        assert escape_match_query(question) in {variant(question) for variant in VARIANTS.values()}
+def test_the_winning_variant_is_the_shipped_rule_and_the_baseline_is_the_old_one() -> None:
+    """A re-run measures what ships, and compares it against the rule #481 replaced."""
+    assert VARIANTS["and-content"] is escape_match_query
+    question = "how do I rotate the signing token"
+    assert VARIANTS["and"](question) == '"how" "do" "I" "rotate" "the" "signing" "token"'
+    assert VARIANTS["and"]("- token token") == '"-" "token" "token"', "verbatim, defects included"
 
 
 def test_scoring_reads_the_rank_of_the_first_labeled_chunk() -> None:

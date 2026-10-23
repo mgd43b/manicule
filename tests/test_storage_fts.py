@@ -215,12 +215,19 @@ def test_negation_is_a_subject_word_and_is_kept() -> None:
 
 def test_function_words_are_recognized_through_case_and_punctuation() -> None:
     assert escape_match_query("How does THE sweep work, then?") == '"sweep" "work"'
-    assert escape_match_query("what's it for.") == '"what\'s" "it" "for."'
+    assert escape_match_query("what's it for.") == '"what\'s" "it" "for"'
+
+
+def test_a_typographic_apostrophe_is_the_same_apostrophe() -> None:
+    """A phone or macOS keyboard types ``\u2019``; dropping it made ``whats`` a required word."""
+    assert escape_match_query("what\u2019s the retention period") == '"retention" "period"'
+    assert escape_match_query("why doesn\u2019t it publish") == '"doesn\'t" "publish"'
 
 
 def test_each_word_is_matched_once() -> None:
     """``bm25()`` scores a repeated phrase twice, so a repeated word would outweigh the rest."""
     assert escape_match_query("token Token TOKEN rotation") == '"token" "rotation"'
+    assert escape_match_query("token, token. (token) rotation") == '"token" "rotation"'
 
 
 @pytest.mark.parametrize(

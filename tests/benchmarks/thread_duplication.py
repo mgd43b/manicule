@@ -438,8 +438,14 @@ async def run_pipeline(
     overrides: Mapping[str, Any],
     discovery: Discovery | None = None,
     ks: Sequence[int] = KS,
+    counted: frozenset[str] = frozenset(),
 ) -> Run:
     """Every query through one pipeline, scored at every ``k``.
+
+    ``counted`` names further reasons a run may not be compared that are kept and scored rather
+    than refused, as an empty lexical leg always is. This program passes none; a caller that
+    measures how the shipped pipeline answers, rather than comparing two pipelines, passes the
+    reasons it accepts as ordinary outcomes.
 
     The page comes from :class:`~manicule.evaluation.systems.RetrieverSystem`, which refuses a
     run whose configuration changes midway — and so does this. The companion's place in the
@@ -471,7 +477,9 @@ async def run_pipeline(
             refused = [
                 r
                 for r in result.incomparable
-                if not r.startswith(LEXICAL_EMPTY) and not (single_leg and r == ONE_LADDER)
+                if not r.startswith(LEXICAL_EMPTY)
+                and not (single_leg and r == ONE_LADDER)
+                and r not in counted
             ]
             if refused:
                 msg = f"{item.query.id} under {name}: {'; '.join(refused)}"

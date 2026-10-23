@@ -107,7 +107,7 @@ from manicule.retrieval.lexical import DEGRADED_REASON as LEXICAL_EMPTY
 from manicule.retrieval.retriever import Retriever
 from manicule.retrieval.trace import Shortfall
 from manicule.storage import docstore as docstore_module
-from manicule.storage.fts import FUNCTION_WORDS, SEARCH_SQL, escape_match_query
+from manicule.storage.fts import FUNCTION_WORDS, SEARCH_SQL, escape_match_query, match_words
 from manicule.storage.models import FTS_TOKENIZER
 from tests.benchmarks import thread_duplication
 from tests.benchmarks.thread_corpus import build_corpus
@@ -139,25 +139,13 @@ PIPELINES: dict[str, tuple[str, ...]] = {
 
 
 def _literals(text: str) -> list[str]:
-    """Each whitespace token, cleaned the way the store cleans it, distinct and quoted."""
-    seen: set[str] = set()
-    quoted: list[str] = []
-    for raw in text.split():
-        cleaned = "".join(char for char in raw if char.isalnum() or char in "-_.'")
-        if not any(char.isalnum() for char in cleaned) or cleaned.lower() in seen:
-            continue
-        seen.add(cleaned.lower())
-        quoted.append('"' + cleaned.replace('"', '""') + '"')
-    return quoted
+    """The store's own words for ``text``, each quoted."""
+    return ['"' + word.replace('"', '""') + '"' for word in match_words(text)]
 
 
 def _content(literals: list[str]) -> list[str]:
     """Without function words, unless that leaves nothing: then the words are the subject."""
-    kept = [
-        literal
-        for literal in literals
-        if literal.strip('"').strip("-_.'").lower() not in FUNCTION_WORDS
-    ]
+    kept = [literal for literal in literals if literal.strip('"').lower() not in FUNCTION_WORDS]
     return kept or literals
 
 
@@ -685,7 +673,12 @@ async def run_threads(
         for variant in variants if pipeline != "dense" else variants[:1]:
             with matching(VARIANTS[variant]):
                 run = await thread_duplication.run_pipeline(
-                    indexed, asked, name=pipeline, overrides=overrides, ks=(10,)
+                    indexed,
+                    asked,
+                    name=pipeline,
+                    overrides=overrides,
+                    ks=(10,),
+                    counted=frozenset({EXHAUSTED_BUDGET}),
                 )
             runs[variant, pipeline] = run.outcomes
     return runs

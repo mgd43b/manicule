@@ -222,6 +222,37 @@ dense leg embeds the whole question.
 """
 
 
+_APOSTROPHES = str.maketrans(dict.fromkeys("\u2018\u2019\u02bc", "'"))
+"""Typographic apostrophes, which macOS and phone keyboards type by default, as the ASCII one.
+
+Without this ``what\u2019s`` loses its apostrophe to the cleaning below, becomes ``whats``, is
+no function word, and is required in the match — so a question typed with a smart quote would
+match nothing, exactly as every question did before #481.
+"""
+
+_INNER = "-_.'"
+"""Kept inside a word and trimmed from its ends. FTS5's ``unicode61`` splits on all four, so
+neither choice changes what a word matches; keeping them inside keeps ``re-embed`` and
+``don't`` recognizable, and trimming them makes ``token.`` the same word as ``token``."""
+
+
+def match_words(text: str) -> list[str]:
+    """Each word of ``text`` as the lexical leg reads it: cleaned, in order, each once.
+
+    Exposed so ``tests/benchmarks/lexical_questions.py`` builds every candidate rule from the
+    same words this one does; a measurement whose variants split a query differently would
+    credit the match rule with a difference the splitting made.
+    """
+    words: list[str] = []
+    seen: set[str] = set()
+    for raw in text.translate(_APOSTROPHES).split():
+        word = "".join(char for char in raw if char.isalnum() or char in _INNER).strip(_INNER)
+        if word and word.lower() not in seen:
+            seen.add(word.lower())
+            words.append(word)
+    return words
+
+
 def escape_match_query(text: str) -> str:
     """Turn user input into an FTS5 ``MATCH`` expression: every content word, each a literal.
 
@@ -243,7 +274,13 @@ def escape_match_query(text: str) -> str:
 
     **A query made only of function words keeps them.** "What is it" is then a search for those
     three words rather than no search, and ``NOT`` or ``OR`` on its own is still the word. Each
-    word is kept once: a repeated phrase is scored twice by ``bm25()``.
+    word is kept once (:func:`match_words`): a repeated phrase is scored twice by ``bm25()``.
+    Two spellings the stemmer folds together, ``token`` and ``tokens``, are still two words.
+
+    **The list is English**, like the Porter stemmer in
+    :data:`~manicule.storage.models.FTS_TOKENIZER`. A question in
+    another language keeps its function words and needs every one of them in a chunk, as every
+    question did before #481.
 
     Args:
         text: Whatever the user typed.
@@ -251,15 +288,8 @@ def escape_match_query(text: str) -> str:
     Returns:
         A ``MATCH`` expression, or the empty string when nothing searchable remains.
     """
-    words: list[str] = []
-    seen: set[str] = set()
-    for raw in text.split():
-        cleaned = "".join(char for char in raw if char.isalnum() or char in "-_.'")
-        if not any(char.isalnum() for char in cleaned) or cleaned.lower() in seen:
-            continue
-        seen.add(cleaned.lower())
-        words.append(cleaned)
-    content = [word for word in words if word.strip("-_.'").lower() not in FUNCTION_WORDS]
+    words = match_words(text)
+    content = [word for word in words if word.lower() not in FUNCTION_WORDS]
     return " ".join('"' + word.replace('"', '""') + '"' for word in content or words)
 
 
@@ -276,4 +306,5 @@ __all__ = [
     "SEARCH_SQL",
     "create_fts",
     "escape_match_query",
+    "match_words",
 ]
