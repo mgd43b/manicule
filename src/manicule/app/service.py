@@ -58,7 +58,7 @@ from manicule.app.people import (
     serving_problems,
 )
 from manicule.app.ports import RetrievingAcross, SpansWorkspaces
-from manicule.app.sensitive import sensitive_exposure
+from manicule.app.sensitive import UnreadableDatabaseError, sensitive_exposure
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
 from manicule.app.throttle import RateLimiter
 from manicule.config.loader import load_settings
@@ -3829,9 +3829,17 @@ class ApplicationService:
             exposure = await asyncio.to_thread(
                 sensitive_exposure, self.settings, self.sensitive_types()
             )
-        except PolicyError as exc:
+        except UnreadableDatabaseError as exc:
+            # Redacted like every other path in this output; the exception's own message names it
+            # in full for an operator at a terminal.
+            detail = (
+                f"refusing to serve without authentication: the database at "
+                f"{r.redacted_path(exc.path)} could not be read to tell whether it holds "
+                f"documents from a sensitive source ({exc.cause}). Set security.auth.mode to "
+                f"'api_key' or 'oauth', or fix the database."
+            )
             return r.Check(
-                name="transport", state="failing", detail=str(exc), facts=facts, remedy=remedy
+                name="transport", state="failing", detail=detail, facts=facts, remedy=remedy
             )
         facts["sensitive_sources"] = list(exposure.sources)
         if not exposure:

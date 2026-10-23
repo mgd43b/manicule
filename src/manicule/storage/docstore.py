@@ -931,17 +931,23 @@ class SqliteDocStore(
         either way. The cascade and its triggers are those of :meth:`delete_document`.
 
         Returns:
-            How many ``documents`` rows the statement removed. Idempotent: ``0`` when there
-            were none.
+            How many of this source's ``documents`` rows were removed, counted before the delete
+            so cascaded container members are included. Idempotent: ``0`` when there were none.
         """
         async with self._sessions.begin() as session:
-            result = await session.execute(
-                delete(models.Document).where(
-                    models.Document.source == source,
-                    models.Document.workspace_id == self._workspace_id,
-                )
+            # Counted first, in the same transaction: `rowcount` omits rows a foreign-key cascade
+            # removes, so an archive's members would be deleted and not reported.
+            matching = (
+                models.Document.source == source,
+                models.Document.workspace_id == self._workspace_id,
             )
-            return int(getattr(result, "rowcount", 0) or 0)
+            counted = (
+                await session.execute(
+                    select(func.count()).select_from(models.Document).where(*matching)
+                )
+            ).scalar_one()
+            await session.execute(delete(models.Document).where(*matching))
+            return int(counted)
 
     # --- ingest bookkeeping -----------------------------------------------------------------
 
@@ -1595,6 +1601,17 @@ class SqliteDocStore(
             row.watermark = watermark.model_dump(mode="json")
             row.watermark_scope_fingerprint = None
             row.last_synced_at = utcnow()
+
+    async def marked_sensitive_sources(self) -> frozenset[str]:
+        """Sources of this workspace that a sensitive connector has synced."""
+        async with self._sessions() as session:
+            rows = await session.execute(
+                select(models.Connector.name).where(
+                    models.Connector.workspace_id == self._workspace_id,
+                    models.Connector.sensitive_synced_at.is_not(None),
+                )
+            )
+            return frozenset(rows.scalars().all())
 
     async def mark_source_sensitive(self, connector: str) -> None:
         """Record, once, that a sensitive connector has synced this source.

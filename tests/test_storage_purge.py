@@ -457,3 +457,27 @@ async def test_deleting_a_source_removes_its_rows_in_every_state_and_only_its_ow
     )
     assert await store.delete_source_documents("mail") == 0, "idempotent"
     assert await store.delete_source_documents("nothing-by-this-name") == 0
+
+
+async def test_the_count_of_a_deleted_source_includes_container_members(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """``rowcount`` omits rows a cascade removes first, so the count is taken before the delete.
+
+    A message and its attachment are one container and its member, both from the one source.
+    Deleting the container cascades to the member, and the report must still say two.
+    """
+    parent = await store.upsert_document(make_document(source="mail", source_id="message"))
+    member = await store.upsert_document(
+        make_document(
+            source="mail",
+            source_id="message#attachment",
+            container_id=parent.id,
+            container_depth=1,
+        )
+    )
+    assert await _remaining(engine, "default", "mail") == sorted([parent.id, member.id])
+
+    assert await store.delete_source_documents("mail") == 2
+
+    assert await _remaining(engine, "default", "mail") == []

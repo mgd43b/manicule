@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import contextlib
 
+from manicule.core.content import RawDocument
+from tests.fakes import MEDIA_TYPE
 from tests.ingest import fakes
 from tests.ingest.test_pipeline import build
 
@@ -53,5 +55,19 @@ async def test_the_mark_is_written_before_enumeration_so_a_failed_first_sync_kee
     # However the run reports the failure, it began, and the mark was already down.
     with contextlib.suppress(RuntimeError):
         await pipeline.run(connector)
+
+    assert store.sensitive_sources == {MAIL}
+
+
+async def test_a_document_written_outside_a_run_still_marks_its_source() -> None:
+    """``ingest_raw`` is where every document is written, so a forced sync or an import cannot
+    leave mail unmarked by not going through ``run``."""
+    pipeline, store, _ = build(sensitive_sources=frozenset({MAIL}))
+
+    await pipeline.ingest_raw(
+        RawDocument(source_id="m1", uri="memory://m1", media_type=MEDIA_TYPE, content="hello"),
+        source=MAIL,
+        force=True,
+    )
 
     assert store.sensitive_sources == {MAIL}

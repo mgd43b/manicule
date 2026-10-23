@@ -656,6 +656,13 @@ answers included. Roles decide what a person may do, not what they may read.
   Checking configuration alone was the first proposal and was rejected: it stops protecting the
   mail at the moment somebody disables the connector, and the mail is still there.
 
+  **The mark follows the documents.** `ingest_raw`, which every document write passes through,
+  marks a sensitive instance's source too, so a forced sync or an archive import cannot leave
+  mail unmarked. `manicule export` writes `"sensitive": true` on the entries of a marked source
+  (and only then, so an archive with no mail is unchanged), and `manicule import` marks that
+  source before writing its documents, so mail carried to another installation arrives with the
+  refusal attached rather than leaving it behind with the configuration.
+
   **A database that cannot be read refuses; it does not pass.** Only "no database yet" and a
   database from before the mark existed are treated as holding nothing. A lock that outlasts the
   read timeout, or a corrupt file, refuses when authentication is off and is ignored when it is

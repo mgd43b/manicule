@@ -48,13 +48,20 @@ from typing import TYPE_CHECKING
 
 from manicule.config.settings import AuthMode
 from manicule.core.errors import PolicyError
-from manicule.storage.engine import database_path
 
 if TYPE_CHECKING:
     from collections.abc import Set as AbstractSet
     from pathlib import Path
 
     from manicule.config.settings import Settings
+
+DATABASE_FILENAME = "manicule.db"
+"""The database's name inside a data directory.
+
+Repeated from :data:`manicule.storage.engine.DATABASE_FILENAME` rather than imported, so that
+:mod:`manicule.app.bind` — which every server start goes through — does not load SQLAlchemy to
+learn a file name. ``tests/app/test_sensitive_sources.py`` asserts the two agree.
+"""
 
 _READ_TIMEOUT_S = 5.0
 """How long to wait on a writer's lock before refusing. Short: this runs at every start."""
@@ -126,9 +133,15 @@ def sensitive_exposure(settings: Settings, sensitive_types: AbstractSet[str]) ->
 
 def held_sources(data_dir: Path) -> tuple[str, ...]:
     """Marked sources whose documents are still in ``data_dir``'s database, in any state."""
-    path = database_path(data_dir)
-    if not path.exists():
+    path = data_dir / DATABASE_FILENAME
+    try:
+        # `stat`, not `exists`: `exists` answers False for a permission error, and a database
+        # that cannot be examined is not one that is absent.
+        path.stat()
+    except FileNotFoundError:
         return ()
+    except OSError as error:
+        raise _unreadable(path, error) from error
     try:
         # `as_uri` percent-encodes. A bare `file:{path}` truncates at a `#` or `?` in the data
         # directory's path and opens a different — empty — database, whose "no such table" would
@@ -162,17 +175,31 @@ def exposure_when_unauthenticated(
     return sensitive_exposure(settings, sensitive_types)
 
 
-def _unreadable(path: Path, error: sqlite3.Error) -> PolicyError:
-    msg = (
-        f"refusing to serve without authentication: the database at {path} could not be read "
-        f"to tell whether it holds documents from a sensitive source ({error}). Set "
-        f"security.auth.mode to 'api_key' or 'oauth', or fix the database."
-    )
-    return PolicyError(msg)
+class UnreadableDatabaseError(PolicyError):
+    """The data directory's database exists and could not be read.
+
+    A subclass so that ``doctor`` can say the same thing with the path redacted: the message
+    here names the full path for an operator at a terminal, and ``doctor``'s output is what gets
+    pasted into issues.
+    """
+
+    def __init__(self, path: Path, cause: sqlite3.Error | OSError) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(
+            f"refusing to serve without authentication: the database at {path} could not be read "
+            f"to tell whether it holds documents from a sensitive source ({cause}). Set "
+            f"security.auth.mode to 'api_key' or 'oauth', or fix the database."
+        )
+
+
+def _unreadable(path: Path, error: sqlite3.Error | OSError) -> PolicyError:
+    return UnreadableDatabaseError(path, error)
 
 
 __all__ = [
     "SensitiveExposure",
+    "UnreadableDatabaseError",
     "exposure_when_unauthenticated",
     "held_sources",
     "sensitive_exposure",

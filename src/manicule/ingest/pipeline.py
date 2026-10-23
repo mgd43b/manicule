@@ -1099,7 +1099,7 @@ class IngestPipeline:
         if chunk_fingerprint is not None:
             require_measured(chunk_fingerprint)
         self._store = store
-        self._sensitive_sources = frozenset(sensitive_sources)
+        self._sensitive_sources, self._marked_sensitive = frozenset(sensitive_sources), set[str]()
         # Explicit protocol injection keeps the legacy bounded path available to protocol-only
         # stores and unit tests. Production wires the SQLite acquisition store here, making the
         # blob-backed snapshot path the normal connector topology rather than structural guesswork.
@@ -1439,10 +1439,15 @@ class IngestPipeline:
         ``sensitive_sources`` names *instances*, resolved by the runtime from the registry's
         ``sensitive`` flag on each configured connector's type. A connector the runtime did not
         name is not marked, which is why no connector class declares this about itself: one that
-        forgot to would fail open.
+        forgot to would fail open. :meth:`ingest_raw` marks too, since it is where every document
+        is written whether or not a run is driving it (a forced sync, an import).
         """
-        if connector.name in self._sensitive_sources:
-            await self._store.mark_source_sensitive(connector.name)
+        await self._mark_sensitive_source(connector.name)
+
+    async def _mark_sensitive_source(self, source: str) -> None:
+        if source in self._sensitive_sources and source not in self._marked_sensitive:
+            await self._store.mark_source_sensitive(source)
+            self._marked_sensitive.add(source)
 
     async def _hold_pinned_identity(self, connector: Connector) -> None:
         """Refuse to sync a source that has synced as one identity under another.
@@ -3443,6 +3448,9 @@ class IngestPipeline:
         """Publish fetched bytes under the runtime-wide reset/publication barrier."""
         async with self._mutation_guard():
             await self._assert_current_reset_epoch()
+            # The choke point every document write passes through, so a path that does not go
+            # through `run` (a forced sync, an archive import) cannot leave mail unmarked.
+            await self._mark_sensitive_source(source)
             return await self._ingest_raw_guarded(
                 raw,
                 source=source,

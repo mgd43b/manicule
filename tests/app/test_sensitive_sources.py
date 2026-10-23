@@ -14,7 +14,9 @@ Google.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -41,8 +43,6 @@ from tests.app.fakes import make_document as fake_document
 from tests.storage_helpers import make_document
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 SENSITIVE = frozenset({"mailbox"})
@@ -433,3 +433,45 @@ def test_the_runtime_names_the_gmail_instances_it_hands_the_pipeline(tmp_path: P
         },
     )
     assert Runtime(settings).sensitive_instances() == {"mail"}
+
+
+async def test_doctor_redacts_the_home_directory_in_an_unreadable_database_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`doctor` output is pasted into issues, so the account name stays out of it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    database_path(data_dir).write_bytes(b"not a database" * 100)
+    service = ApplicationService(FakeBackend(settings=_settings(data_dir, configured=False)))
+
+    check = next(c for c in (await service.doctor()).checks if c.name == "transport")
+
+    assert check.state == "failing"
+    assert str(tmp_path) not in check.detail
+    assert "~/data/manicule.db" in check.detail
+
+
+def test_the_database_name_agrees_with_the_storage_engines() -> None:
+    from manicule.app.sensitive import DATABASE_FILENAME  # noqa: PLC0415
+
+    assert database_path(Path("data")).name == DATABASE_FILENAME
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX modes and a user the mode binds",
+)
+def test_a_database_that_cannot_be_examined_refuses_rather_than_reading_as_absent(
+    tmp_path: Path,
+) -> None:
+    """``Path.exists`` is False for a permission error; absent and unreadable are different."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    sqlite3.connect(database_path(data_dir)).close()
+    data_dir.chmod(0o000)
+    try:
+        with pytest.raises(PolicyError, match="could not be read"):
+            resolve_bind(_settings(data_dir, configured=False), sensitive_types=SENSITIVE)
+    finally:
+        data_dir.chmod(0o700)
