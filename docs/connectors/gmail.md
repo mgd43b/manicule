@@ -501,8 +501,9 @@ answers included. Roles decide what a person may do, not what they may read.
   is an installation of its own.
 - **That installation serves with authentication, for as long as it holds any mail.** The
   `gmail` connector type is registered as *sensitive*. An installation refuses to serve with
-  `security.auth.mode = "none"` — and `--no-authentication` does not override it — when either
-  holds ([#462](https://github.com/mgd43b/manicule/issues/462)):
+  `security.auth.mode = "none"`, on any bind including loopback — another local account or
+  process can reach a loopback port — and `--no-authentication` does not override it, when
+  either holds ([#462](https://github.com/mgd43b/manicule/issues/462)):
   - an enabled connector instance is sensitive; or
   - **the data directory holds any document, in any state, from a source a sensitive connector
     has synced.** The first sync of a sensitive source records that durably, beside the source's
