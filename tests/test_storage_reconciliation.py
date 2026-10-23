@@ -656,7 +656,12 @@ async def test_a_pass_held_off_keeps_its_inventory_and_applies_it_without_asking
         yield state["reason"]
 
     declined = await reconcile(
-        source, store, scope=_SCOPE, now=_NOW, window=window, max_delete_fraction=0.5
+        source,  # type: ignore[arg-type] - optional page-capability spy
+        store,
+        scope=_SCOPE,
+        now=_NOW,
+        window=window,
+        max_delete_fraction=0.5,
     )
     assert declined.blocked == "a backup is running"
     for number in range(4):
@@ -665,7 +670,7 @@ async def test_a_pass_held_off_keeps_its_inventory_and_applies_it_without_asking
 
     state["reason"] = ""
     applied = await reconcile(
-        _MustNotEnumerate(),
+        _MustNotEnumerate(),  # type: ignore[arg-type] - proves the source is not asked again
         store,
         scope=_SCOPE,
         now=_NOW,
