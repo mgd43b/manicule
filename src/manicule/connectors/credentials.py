@@ -585,6 +585,17 @@ class RefreshTokenCredential:
             f"put it where the configuration reads it."
         )
 
+    def rejected(self) -> TokenRejectedError:
+        """What to raise when a request is rejected again with a freshly minted access token.
+
+        For a client that owns its own retry and calls :meth:`access_token`; :meth:`send` raises
+        it itself.
+        """
+        return TokenRejectedError(
+            "Gmail rejected the request with a freshly minted access token. The grant may have "
+            "lost the gmail.readonly scope or been revoked. " + self.renewal()
+        )
+
     async def authorize(self) -> Authorization:
         """The bearer header for the next request, minting an access token if none is fresh.
 
@@ -640,11 +651,7 @@ class RefreshTokenCredential:
         authorization = await self._reauthorize(authorization)
         response = await attempt(authorization)
         if response.status_code == HTTPStatus.UNAUTHORIZED:
-            msg = (
-                "Gmail rejected the request with a freshly minted access token. The grant may "
-                "have lost the gmail.readonly scope or been revoked. " + self.renewal()
-            )
-            raise TokenRejectedError(msg)
+            raise self.rejected()
         return response
 
     async def confirm_mailbox(self, account: str) -> None:

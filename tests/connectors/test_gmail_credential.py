@@ -222,6 +222,13 @@ async def test_a_second_401_is_a_typed_credential_error_and_not_a_loop() -> None
     assert fake.refreshes == 2, "the first token, and the one minted for the retry — no more"
 
 
+def test_rejected_is_the_typed_error_a_client_raises_on_its_own_second_401() -> None:
+    error = credential(FakeGoogleOAuth()).rejected()
+
+    assert isinstance(error, TokenRejectedError)
+    assert "manicule connector login mail" in str(error)
+
+
 async def test_a_request_that_is_not_a_401_is_never_retried() -> None:
     fake = FakeGoogleOAuth()
     cred = credential(fake)
