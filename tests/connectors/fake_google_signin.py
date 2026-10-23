@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import secrets
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -51,7 +52,10 @@ class FakeGoogleSignIn(FakeGoogleOAuth):
         """The status the loopback socket answered each browser visit with.
 
         A browser stub runs inside the command's own error handling, which swallows what it
-        raises, so what it saw is recorded here and asserted on after the command returns."""
+        raises, so what it saw is recorded here and asserted on after the command returns —
+        through :meth:`settled`, because the stub runs on the command's browser thread and the
+        command can finish before the visit it answered has been written down."""
+        self._visited = threading.Condition()
         self.exchanges: list[dict[str, str]] = []
         self._codes: dict[str, _Issued] = {}
         self.granted_scope = GMAIL_READONLY_SCOPE
@@ -98,8 +102,25 @@ class FakeGoogleSignIn(FakeGoogleOAuth):
 
     def browse(self, auth_url: str, *, approve: bool = True, state: str | None = None) -> bool:
         """The whole browser step: choose, follow the redirect, and note the status it got."""
-        self.visits.append(visit(self.consent(auth_url, approve=approve, state=state)))
+        self.record(visit(self.consent(auth_url, approve=approve, state=state)))
         return True
+
+    def record(self, status: int) -> None:
+        """Note the status one browser visit got, from whichever thread made it."""
+        with self._visited:
+            self.visits.append(status)
+            self._visited.notify_all()
+
+    def settled(self, count: int = 1, *, timeout: float = 10.0) -> list[int]:
+        """The visits, once ``count`` of them have been recorded.
+
+        The command returns — or raises — as soon as its socket has answered, while the
+        browser thread is still reading that answer, so asserting on :attr:`visits` directly
+        races the thread that appends to it.
+        """
+        with self._visited:
+            self._visited.wait_for(lambda: len(self.visits) >= count, timeout=timeout)
+            return list(self.visits)
 
     @override
     def _token(self, request: httpx.Request) -> httpx.Response:
