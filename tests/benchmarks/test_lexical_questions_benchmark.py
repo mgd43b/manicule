@@ -26,10 +26,11 @@ from tests.benchmarks.lexical_questions import (
     _rank,  # pyright: ignore[reportPrivateUsage]
     index_docs,
     run_docs,
+    run_threads,
     summarize,
     time_at_scale,
 )
-from tests.benchmarks.test_thread_duplication_benchmark import CountingEmbedder
+from tests.benchmarks.test_thread_duplication_benchmark import CountingEmbedder, small
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -137,3 +138,34 @@ async def test_the_program_runs_end_to_end_through_the_runtime(
         else:
             assert row.empty == 0
             assert row.hits[5] == 1
+
+
+async def test_the_mail_half_can_run_twice_in_one_work_directory(
+    manicule_environment: Path,
+) -> None:
+    """``--work`` keeps the docs/ index; the mail index is rebuilt, so a rerun cannot fail on it."""
+    found = discover()
+    found.registry.bind("test").add(keys.EMBEDDER.named("local"), lambda _: CountingEmbedder())
+    overrides = {"embedding": {"provider": "local"}}
+    for _ in range(2):
+        runs = await run_threads(
+            manicule_environment,
+            small(),
+            variants=("and", "and-content"),
+            overrides=overrides,
+            discovery=found,
+        )
+        assert set(runs) == {
+            ("and", "dense"),
+            ("and", "hybrid"),
+            ("and-content", "hybrid"),
+            ("and", "lexical"),
+            ("and-content", "lexical"),
+        }
+        keywords = [o for o in runs["and-content", "lexical"] if o.asked.form == "keywords"]
+        assert all(not o.single_leg for o in keywords), "every keyword lookup reaches the leg"
+
+
+def test_a_narrowed_run_times_only_the_variants_it_names() -> None:
+    timings = time_at_scale([("token rotation", "Auth")], ["token"], size=20, variants=["and"])
+    assert set(timings) == {"and"}

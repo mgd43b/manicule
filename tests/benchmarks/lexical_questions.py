@@ -86,6 +86,7 @@ import asyncio
 import contextlib
 import math
 import re
+import shutil
 import sqlite3
 import statistics
 import tempfile
@@ -110,7 +111,7 @@ from manicule.storage import docstore as docstore_module
 from manicule.storage.fts import FUNCTION_WORDS, SEARCH_SQL, escape_match_query, match_words
 from manicule.storage.models import FTS_TOKENIZER
 from tests.benchmarks import thread_duplication
-from tests.benchmarks.thread_corpus import build_corpus
+from tests.benchmarks.thread_corpus import Corpus, build_corpus
 from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
@@ -663,10 +664,24 @@ async def run_docs(
 
 
 async def run_threads(
-    work: Path, *, variants: Sequence[str], overrides: Mapping[str, Any], seed: int, copies: int
+    work: Path,
+    corpus: Corpus,
+    *,
+    variants: Sequence[str],
+    overrides: Mapping[str, Any],
+    discovery: Discovery | None = None,
 ) -> dict[tuple[str, str], list[thread_duplication.Outcome]]:
-    corpus = build_corpus(seed=seed, copies=copies)
-    indexed = await thread_duplication.index(corpus, work / "threads", overrides=overrides)
+    """The mail corpus under each pipeline and variant, indexed afresh every time.
+
+    Unlike ``docs/``, it is never reused from ``--work``: the synthetic mailbox is rebuilt per
+    run, its ground truth is which message the generator gave each Gmail id, and a second sync
+    into the same directory finds nothing new to index and so has no truth to read back.
+    """
+    data_dir = work / "threads"
+    shutil.rmtree(data_dir, ignore_errors=True)
+    indexed = await thread_duplication.index(
+        corpus, data_dir, overrides=overrides, discovery=discovery
+    )
     _, asked = thread_duplication.queries(corpus)
     runs: dict[tuple[str, str], list[thread_duplication.Outcome]] = {}
     for pipeline in ("dense", "hybrid", "lexical"):
@@ -678,6 +693,7 @@ async def run_threads(
                     name=pipeline,
                     overrides=overrides,
                     ks=(10,),
+                    discovery=discovery,
                     counted=frozenset({EXHAUSTED_BUDGET}),
                 )
             runs[variant, pipeline] = run.outcomes
@@ -688,7 +704,11 @@ async def run_threads(
 
 
 def time_at_scale(
-    texts: Sequence[tuple[str, str]], questions: Sequence[str], *, size: int = SCALE
+    texts: Sequence[tuple[str, str]],
+    questions: Sequence[str],
+    *,
+    size: int = SCALE,
+    variants: Sequence[str] = tuple(VARIANTS),
 ) -> dict[str, tuple[float, float, float]]:
     """Each variant's median, p95 and mean matched rows for the shipped statement, ``size`` chunks.
 
@@ -723,7 +743,8 @@ def time_at_scale(
     db.commit()
     statement = SEARCH_SQL.format(extra="AND d.workspace_id = :workspace_id")
     timings: dict[str, tuple[float, float, float]] = {}
-    for name, variant in VARIANTS.items():
+    for name in variants:
+        variant = VARIANTS[name]
         elapsed: list[float] = []
         matched: list[int] = []
         for text in questions:
@@ -856,15 +877,14 @@ async def report(args: argparse.Namespace, work: Path, emit: Callable[[str], Non
     questions = [a.text for a in asked if a.group != "titles"]
     emit(f"\n### the statement at {args.scale} chunks, {len(questions)} queries\n")
     emit("| variant | median ms | p95 ms | mean rows matched |\n|---|---:|---:|---:|")
-    timings = time_at_scale(index.texts, questions, size=args.scale)
+    timings = time_at_scale(index.texts, questions, size=args.scale, variants=args.variants)
     for name, (median, p95, matched) in timings.items():
         emit(f"| {name} | {median:.1f} | {p95:.1f} | {matched:.0f} |")
 
     if args.no_threads:
         return
-    runs = await run_threads(
-        work, variants=args.variants, overrides=overrides, seed=args.seed, copies=args.copies
-    )
+    corpus = build_corpus(seed=args.seed, copies=args.copies)
+    runs = await run_threads(work, corpus, variants=args.variants, overrides=overrides)
     emit("\n### synthetic mail threads, k = 10\n")
     emit("| variant | pipeline | form | queries | one leg | found |")
     emit("|---|---|---|---:|---:|---:|")
@@ -890,7 +910,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--work",
         type=Path,
         default=None,
-        help="keep the indexes in this directory, so a second run skips re-embedding",
+        help="keep the docs/ index in this directory, so a second run skips re-embedding it",
     )
     parser.add_argument(
         "--chunk-tokens",
