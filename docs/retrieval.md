@@ -516,6 +516,17 @@ labeled set losing more than 0.005 of MRR; requiring all content words but one t
 identifiers and cost 0.04 to 0.07 of MRR elsewhere. No unanswerable question left the `none`
 band under any rule.
 
+**The disjunction does better on identifiers, and that is recorded rather than smoothed over.**
+Round 2's rule excluded the two disjunctions, which round 1 had already rejected, so its
+first run did not score them. A later full run of every variant did: on the identifier
+questions the content-word disjunction found **723** of 754 (MRR 0.811) against 600 (0.637)
+for the shipped rule, at a median of 11 ms at 100,000 chunks. Part of the gap is that a question
+naming an identifier often carries one more content word the section never writes — "where is
+`X` used" requires "used" — and a conjunction then misses it entirely. Shipping the disjunction
+on that evidence would mean overriding both written rules after seeing the data. It still loses
+multi-hop hits (7 of 11 against 10) and authored MRR (0.696 against 0.751), so it is the next
+candidate for a measurement of its own, not a silent swap.
+
 **What it does not do.** A prose question whose content words do not all occur in one chunk still
 matches nothing — 37 of the 54 authored questions, 48 of the 84 mail-thread ones — and that is
 the measured better outcome, not an oversight: the cases where the leg added a weak match all
