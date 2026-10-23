@@ -419,7 +419,9 @@ retained source bytes and is not a sync. [`ingest.md`](../ingest.md) §11's
 For Confluence that means a deleted page lingers. For a mailbox it means deleted mail is
 searchable forever. **Wiring reconciliation into sync is therefore a prerequisite of this
 epic**, not an improvement to it: the Gmail connector does not ship to a release before
-reconciliation runs on the schedule `reconcile_interval_s` describes.
+reconciliation runs on the schedule `reconcile_interval_s` describes. That work is
+[#466](https://github.com/mgd43b/manicule/issues/466), which also adds a per-connector interval
+so a mail source can reconcile daily or hourly.
 
 **Once it runs, two existing behaviors matter more for mail than for anything else:**
 
@@ -443,7 +445,9 @@ reconciliation runs on the schedule `reconcile_interval_s` describes.
   them and blob collection runs. For an installation that must be able to forget, the honest
   configuration is retention off (§9), which leaves no raw copy to erase — at the re-fetch cost §9
   states. Erasure that follows the source on its own is not designed here; it is a requirement
-  on the reconciliation work §7 depends on, not something this connector can add.
+  on the reconciliation work §7 depends on
+  ([#466](https://github.com/mgd43b/manicule/issues/466) decides what happens to a reconciled
+  document's retained bytes), not something this connector can add.
 
 **A message restored from Trash comes back.** Its `labelRemoved` record yields it at discovery
 (§4.2), and the pipeline must restore the soft-deleted document rather than skip it as

@@ -2341,7 +2341,8 @@ document that leaves a configured connector's source stays indexed until `manicu
 delete` removes it. `manicule index --watch` is the exception for a watched directory: it
 removes a file on its delete event (§12), which is evidence of its own rather than an absence.
 [`connectors/gmail.md`](connectors/gmail.md) §7 makes wiring it in a prerequisite of the Gmail
-connector, because for a mailbox the consequence is deleted mail that stays searchable.
+connector, because for a mailbox the consequence is deleted mail that stays searchable. Wiring
+it in is [#466](https://github.com/mgd43b/manicule/issues/466).
 
 **Mechanics.** `reconcile()` yields the `SourceId`s that currently exist. Storage journals them
 in pages under an immutable workspace, connector and configured-scope identity. Only iterator

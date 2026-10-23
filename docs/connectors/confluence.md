@@ -1076,6 +1076,7 @@ exists. The reconciliation diff is the mechanism.
 as this section says and the pipeline's diff is tested, but no command or schedule invokes it
 ([`ingest.md`](../ingest.md) §11), so a page deleted in Confluence stays indexed until
 `manicule document delete` removes it. The offline snapshot connector (§12) has the same gap.
+Wiring the pass in is [#466](https://github.com/mgd43b/manicule/issues/466).
 
 **Attachments are reconciled with pages**, because they are enumerated with pages (§2). A
 document the pass omits is a document the pipeline deletes, so "attachments are handled
