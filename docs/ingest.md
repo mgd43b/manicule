@@ -2656,6 +2656,12 @@ source's run metadata. Before a run reads a watermark or enumerates anything,
 - **Different, and the source never synced:** the pin moves freely. Deleting a source's
   documents is what releases a pin on one that has.
 
+The stored cursor is held to the identity as well. The non-durable path reads a watermark with no
+scope fingerprint, so after a pin is released the old account's cursor would still be stored and
+would be handed to the new account. A run that commits a watermark records the identity beside it
+(`watermark_identity`), and a cursor whose recorded identity is not the connector's current one
+is not used: that run does a complete walk, and its own watermark replaces the old one.
+
 The scope fingerprint cannot do this job. It includes the identity, so a different one makes
 the stored watermark invisible rather than wrong, and the run would begin a complete walk of
 the second account beside the first account's documents; and it cannot tell an edit to the

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 import logging
 import math
 import re
@@ -515,6 +516,43 @@ short costs a refresh, and guessing long costs a run of 401s.
 
 _ERROR_CODE = re.compile(r"[a-z_]{1,40}")
 
+_QUOTA_REASONS = frozenset(
+    {"ratelimitexceeded", "userratelimitexceeded", "dailylimitexceeded", "quotaexceeded"}
+)
+"""The reasons Google gives a 403 that is throttling and not a refusal. Compared case-folded."""
+
+
+def _require_httpx() -> None:
+    """Raise a ``ConfigError`` saying which extra supplies the HTTP client, if it is missing.
+
+    The client is imported where it is used rather than at module level, so plugin discovery
+    loads no HTTP stack. That also means a machine installed without the ``connectors`` extra
+    first meets the gap here, and is told what to install instead of getting a
+    ``ModuleNotFoundError`` out of a diagnostic.
+    """
+    if importlib.util.find_spec("httpx") is None:
+        msg = (
+            "the Gmail connector needs the HTTP client, which this installation lacks. Install "
+            "it with `pip install 'manicule[connectors]'`."
+        )
+        raise ConfigError(msg)
+
+
+def _forbidden_is_quota(response: httpx.Response) -> bool:
+    """Whether a 403 body names a throttling reason rather than a refusal."""
+    body = _json_object(response)
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return False
+    details = cast("dict[str, object]", error).get("errors")
+    if not isinstance(details, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(cast("dict[str, object]", item).get("reason", "")).casefold() in _QUOTA_REASONS
+        for item in cast("list[object]", details)
+    )
+
 
 class _HasStatus(Protocol):
     @property
@@ -672,6 +710,9 @@ class RefreshTokenCredential:
             RemoteError: Google failed to answer.
         """
         response = await self.send(self._get_profile)
+        if response.status_code == HTTPStatus.FORBIDDEN and _forbidden_is_quota(response):
+            msg = "Gmail is throttling users.getProfile"
+            raise RateLimitedError(msg)
         if response.status_code == HTTPStatus.FORBIDDEN:
             # Not Google failing to answer: the API is off for the OAuth client's project, or the
             # grant lacks the scope. Typed as a credential problem so ``doctor`` fails it with
@@ -721,6 +762,7 @@ class RefreshTokenCredential:
 
     async def _refresh(self) -> SecretStr:
         """Exchange the refresh token for an access token. Called with the lock held."""
+        _require_httpx()
         import httpx  # noqa: PLC0415 - no HTTP stack at plugin discovery
 
         form = {
@@ -783,6 +825,7 @@ class RefreshTokenCredential:
         return CredentialError(f"Google refused the token exchange ({code}). {self.renewal()}")
 
     async def _get_profile(self, authorization: Authorization) -> httpx.Response:
+        _require_httpx()
         import httpx  # noqa: PLC0415 - no HTTP stack at plugin discovery
 
         try:

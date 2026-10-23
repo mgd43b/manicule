@@ -970,6 +970,13 @@ JOURNAL_PAGE: Final = 64
 
 PINNED_IDENTITY_KEY: Final = "pinned_identity"
 """The connector-metadata key holding the identity a source was last synced as."""
+
+WATERMARK_IDENTITY_KEY: Final = "watermark_identity"
+"""The connector-metadata key holding the identity the stored watermark was committed under.
+
+The non-durable path reads a watermark without a scope fingerprint, so nothing else ties a
+cursor to the account it came from. See :meth:`IngestPipeline._trusted_watermark`.
+"""
 """How many acquisition records a journal reader takes per query.
 
 The three readers walked the journal with ``limit=1``, so a durable run issued one SQL query
@@ -1388,6 +1395,25 @@ class IngestPipeline:
                 retain_source_bytes=retain_source_bytes,
             )
 
+    async def _trusted_watermark(self, connector: Connector) -> Watermark | None:
+        """The stored watermark, unless it was committed under another identity.
+
+        The non-durable path reads the cursor without a scope fingerprint, so the pin alone does
+        not keep it from the wrong account: after the documents are deleted to release the pin, the
+        old account's cursor is still stored and would be handed to the new account's discovery,
+        which an incremental connector would honor by skipping everything before it. A connector
+        that declares an identity therefore has its cursor trusted only if the run that committed
+        it recorded the same identity. Nothing is deleted: the next committed run overwrites it.
+        """
+        watermark = await self._store.get_watermark(connector.name)
+        identity = declared_identity(connector)
+        if watermark is None or not identity:
+            return watermark
+        recorded = (await self._store.connector_metadata(connector.name)).get(
+            WATERMARK_IDENTITY_KEY
+        )
+        return watermark if recorded == identity else None
+
     async def _hold_pinned_identity(self, connector: Connector) -> None:
         """Refuse to sync a source that has synced as one identity under another.
 
@@ -1408,8 +1434,8 @@ class IngestPipeline:
             PinnedIdentityError: The identity differs from the one recorded and the source has
                 synced. Raised before the watermark is read or anything is enumerated.
         """
-        declared = getattr(connector, "pinned_identity", None)
-        if not isinstance(declared, str) or not declared:
+        declared = declared_identity(connector)
+        if not declared:
             return
         recorded = (await self._store.connector_metadata(connector.name)).get(PINNED_IDENTITY_KEY)
         if recorded == declared:
@@ -1527,7 +1553,7 @@ class IngestPipeline:
                 connector.name, scope_fingerprint
             )
         else:
-            watermark = await self._store.get_watermark(connector.name)
+            watermark = await self._trusted_watermark(connector)
         try:
             acquisition = await self._start_acquisition(connector, watermark, acquisitions)
         except CapacityRefusedError as error:
@@ -3308,6 +3334,13 @@ class IngestPipeline:
         )
         if reached is not None:
             await self._store.set_watermark(run.connector.name, reached)
+            identity = declared_identity(run.connector)
+            if identity:
+                # After the watermark, so an interruption between the two leaves a cursor with
+                # no matching identity, which is read as foreign and costs a complete walk.
+                await self._store.record_connector_metadata(
+                    run.connector.name, {WATERMARK_IDENTITY_KEY: identity}
+                )
             return True
         return False
 
@@ -5046,6 +5079,12 @@ def _expanded(outcome: DocumentOutcome) -> bool:
     not ``container``, and the attachment it dropped would have stayed live and searchable.
     """
     return outcome.enumerated
+
+
+def declared_identity(connector: Connector) -> str:
+    """The digest of the identity a connector was configured with, or ``""`` for one with none."""
+    declared = getattr(connector, "pinned_identity", None)
+    return declared if isinstance(declared, str) else ""
 
 
 def snapshot_scope(connector: Connector) -> tuple[str, str]:

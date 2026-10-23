@@ -39,6 +39,11 @@ from tests.connectors.fake_google_oauth import CLIENT_SECRET, REFRESH_TOKEN, Fak
 ACCOUNT = "mail@example.org"
 
 
+def _without_httpx(name: str) -> object | None:
+    """``importlib.util.find_spec`` on an installation lacking the HTTP client."""
+    return None if name == "httpx" else object()
+
+
 class Clock:
     """A clock a test moves by hand."""
 
@@ -399,6 +404,19 @@ async def test_a_403_from_the_profile_read_is_a_credential_problem_with_a_remedy
     assert "manicule connector login mail" in str(caught.value)
 
 
+@pytest.mark.parametrize("reason", ["rateLimitExceeded", "userRateLimitExceeded"])
+async def test_a_throttling_403_from_the_profile_read_is_transient_not_a_refusal(
+    reason: str,
+) -> None:
+    fake = FakeGoogleOAuth()
+    fake.profile_status = 403
+    fake.profile_error = {"error": {"code": 403, "errors": [{"reason": reason}]}}
+    cred = credential(fake)
+
+    with pytest.raises(RateLimitedError):
+        await cred.confirm_mailbox(ACCOUNT)
+
+
 async def test_a_server_error_from_the_profile_read_is_retryable() -> None:
     fake = FakeGoogleOAuth()
     fake.profile_status = 503
@@ -490,6 +508,15 @@ def test_a_resolved_config_builds_a_credential_that_remembers_the_variable_names
 
     assert cred.client_secret_env == "GMAIL_CLIENT_SECRET"  # noqa: S105 - a variable name
     assert cred.connector == "mail"
+
+
+async def test_a_missing_http_client_is_a_config_error_naming_the_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("importlib.util.find_spec", _without_httpx)
+
+    with pytest.raises(ConfigError, match=r"manicule\[connectors\]"):
+        await credential(FakeGoogleOAuth()).authorize()
 
 
 def test_importing_the_credential_module_loads_no_http_client() -> None:

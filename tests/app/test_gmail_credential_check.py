@@ -27,6 +27,11 @@ CHECK = "gmail-credential"
 OPTIONS = {"account": "mail@example.org", "client_id": "id.example.org"}
 
 
+def _without_httpx(name: str) -> object | None:
+    """``importlib.util.find_spec`` on an installation lacking the HTTP client."""
+    return None if name == "httpx" else object()
+
+
 @pytest.fixture
 def google(monkeypatch: pytest.MonkeyPatch) -> FakeGoogleOAuth:
     """Google, reachable only through the fake, with both secrets in the environment."""
@@ -212,6 +217,39 @@ async def test_the_gmail_api_being_off_fails_with_the_login_remedy_and_not_the_n
     assert check.state == "failing"
     assert check.facts == {"sources": {"mail": "credential_rejected"}}
     assert "reach Google" not in check.remedy
+
+
+async def test_a_probe_that_outlasts_the_deadline_is_unreachable_and_does_not_hold_doctor(
+    google: FakeGoogleOAuth, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio  # noqa: PLC0415
+
+    from manicule.app import service as service_module  # noqa: PLC0415
+
+    async def never(self: object, account: str) -> None:
+        del self, account
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(RefreshTokenCredential, "confirm_mailbox", never)
+    monkeypatch.setattr(service_module, "GMAIL_PROBE_DEADLINE_SECONDS", 0.05)
+
+    check = await gmail_check(alpha=mail(), beta=mail(account="other@example.org"))
+
+    assert check.state == "degraded"
+    assert check.facts == {"sources": {"alpha": "unreachable", "beta": "unreachable"}}
+
+
+async def test_a_missing_http_client_fails_with_the_extra_to_install(
+    google: FakeGoogleOAuth, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A machine installed without the connectors extra gets a diagnosis, not a traceback."""
+    monkeypatch.setattr("importlib.util.find_spec", _without_httpx)
+
+    check = await gmail_check(mail=mail())
+
+    assert check.state == "failing"
+    assert check.facts == {"sources": {"mail": "dependency_missing"}}
+    assert check.remedy == "pip install 'manicule[connectors]'"
 
 
 async def test_options_set_in_the_types_global_defaults_are_in_force_for_the_check(

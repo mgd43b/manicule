@@ -33,6 +33,7 @@ class FakeGoogleOAuth:
         self.refreshes = 0
         self.token_failure: tuple[int, dict[str, object]] | None = None
         self.profile_status = 200
+        self.profile_error: dict[str, object] = {"error": {"code": 403}}
         self._valid: set[str] = set()
         self.minted: list[str] = []
 
@@ -81,5 +82,5 @@ class FakeGoogleOAuth:
         if bearer not in self._valid:
             return httpx.Response(401, json={"error": {"code": 401}})
         if self.profile_status != 200:
-            return httpx.Response(self.profile_status, json={"error": {"code": 403}})
+            return httpx.Response(self.profile_status, json=self.profile_error)
         return httpx.Response(200, json={"emailAddress": self.address, "historyId": "1"})

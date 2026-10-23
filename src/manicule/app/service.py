@@ -4331,6 +4331,7 @@ class ApplicationService:
         first, why = next(iter(broken.items()))
         sentences = {
             "invalid_options": "has options that do not validate",
+            "dependency_missing": "cannot run because the HTTP client is not installed",
             "missing_secret": (
                 "has no client secret or refresh token in its configuration or environment"
             ),
@@ -4341,7 +4342,9 @@ class ApplicationService:
         }
         problems = "; ".join(f"{name!r} {sentences[reason]}" for name, reason in broken.items())
         only_unreachable = all(reason == "unreachable" for reason in broken.values())
-        if why == "invalid_options":
+        if why == "dependency_missing":
+            remedy = "pip install 'manicule[connectors]'"
+        elif why == "invalid_options":
             remedy = (
                 "fix the source's options: account and client_id are required, and a key "
                 "the connector does not define is refused (docs/connectors/gmail.md §1.3)"
@@ -8843,6 +8846,15 @@ def _severity(state: r.CheckState) -> int:
     return {"ok": 0, "degraded": 1, "failing": 2, "unknown": 1}.get(state, 1)
 
 
+GMAIL_PROBE_DEADLINE_SECONDS = 15.0
+"""How long ``doctor`` waits for one Gmail source's probe before calling it unreachable.
+
+The credential's own timeout is the *sync* request timeout, and it applies to each of the two
+requests a probe makes; a diagnostic's latency should not be set by a setting meant for a
+large download. Sources are probed concurrently, so this bounds the whole sweep.
+"""
+
+
 async def _gmail_source_outcome(name: str, options: Mapping[str, Any]) -> str:
     """One Gmail source's credential outcome, as a word from a closed set.
 
@@ -8874,7 +8886,12 @@ async def _gmail_source_outcome(name: str, options: Mapping[str, Any]) -> str:
         return "missing_secret"
     credential = gmail_credential(resolved, instance=name)
     try:
-        await credential.confirm_mailbox(resolved.account)
+        async with asyncio.timeout(GMAIL_PROBE_DEADLINE_SECONDS):
+            await credential.confirm_mailbox(resolved.account)
+    except TimeoutError:
+        return "unreachable"
+    except ConfigError:
+        return "dependency_missing"
     except ConnectorError as error:
         # Most specific first: each of these is a CredentialError, and anything that is not one
         # is Google failing to answer, which says nothing about the credential.

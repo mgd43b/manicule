@@ -8,20 +8,22 @@ pipeline holds the instance to it before anything is read.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, override
 
 import pytest
 
 from manicule.connectors.errors import PinnedIdentityError
 from manicule.core.errors import ConfigError
-from manicule.ingest.pipeline import PINNED_IDENTITY_KEY
+from manicule.core.sources import Watermark
+from manicule.ingest.pipeline import PINNED_IDENTITY_KEY, WATERMARK_IDENTITY_KEY
 from tests.ingest import fakes
 from tests.ingest.test_pipeline import build
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from manicule.core.sources import DiscoveredDoc, Watermark
+    from manicule.core.sources import DiscoveredDoc
 
 FIRST = "pin-of-the-first-mailbox"
 SECOND = "pin-of-the-second-mailbox"
@@ -132,3 +134,63 @@ async def test_a_connector_without_a_pin_is_unaffected() -> None:
 
     assert report.indexed == 1
     assert PINNED_IDENTITY_KEY not in await store.connector_metadata("memory")
+
+
+class Cursored(Pinned):
+    """A pinned connector with an incremental cursor, recording what it was handed."""
+
+    def __init__(self, identity: str) -> None:
+        super().__init__(identity)
+        self.handed: list[Watermark | None] = []
+
+    @property
+    @override
+    def watermark(self) -> Watermark | None:
+        return Watermark(value="cursor-1", observed_at=datetime(2026, 10, 1, tzinfo=UTC))
+
+    @override
+    async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
+        self.handed.append(watermark)
+        async for found in super().discover(watermark):
+            yield found
+
+
+async def test_the_same_identity_resumes_from_its_cursor() -> None:
+    pipeline, _, _ = build()
+    await pipeline.run(Cursored(FIRST))
+    second = Cursored(FIRST)
+
+    await pipeline.run(second)
+
+    assert second.handed[0] is not None
+    assert second.handed[0].value == "cursor-1"
+
+
+async def test_a_released_pin_does_not_hand_the_old_accounts_cursor_to_the_new_one() -> None:
+    """Deleting the documents releases the pin, but the stored cursor is still the old account's."""
+    pipeline, store, _ = build()
+    await pipeline.run(Cursored(FIRST))
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    await store.soft_delete_document(document.id)
+    switched = Cursored(SECOND)
+
+    await pipeline.run(switched)
+
+    assert switched.handed == [None], "a complete walk, not the first account's position"
+    assert (await store.connector_metadata("memory"))[WATERMARK_IDENTITY_KEY] == SECOND
+
+
+async def test_an_interrupted_switch_still_does_not_trust_the_old_cursor() -> None:
+    """The pin moves before discovery; the cursor must not become trusted just because it did."""
+    pipeline, store, _ = build()
+    await pipeline.run(Cursored(FIRST))
+    document = await store.find_document("memory", "a")
+    assert document is not None
+    await store.soft_delete_document(document.id)
+    await store.record_connector_metadata("memory", {PINNED_IDENTITY_KEY: SECOND})
+
+    retried = Cursored(SECOND)
+    await pipeline.run(retried)
+
+    assert retried.handed == [None]
