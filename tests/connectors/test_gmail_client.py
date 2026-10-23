@@ -699,7 +699,12 @@ async def test_the_http_stacks_own_request_log_does_not_name_a_message(
     logged = [record.getMessage() for record in caplog.records if record.name == "httpx"]
     gmail = [line for line in logged if "gmail.googleapis.com" in line]
     assert len(gmail) == 2
-    assert all(message.id not in line and "startHistoryId" not in line for line in gmail)
+    httpx_logger = logging.getLogger("httpx")
+    assert all(message.id not in line and "startHistoryId" not in line for line in gmail), (
+        f"filters={httpx_logger.filters!r} disabled={httpx_logger.disabled} "
+        f"module={GmailClient.__module__}@{id(sys.modules.get(GmailClient.__module__))} "
+        f"lines={gmail!r}"
+    )
     # Another client's request is logged exactly as before.
     assert any("https://example.org/unrelated/path?page=7" in line for line in logged)
 
