@@ -583,7 +583,7 @@ class FilesystemConnector:
         document is called — one yielding a path where the other yielded a page id would report
         every mirrored page deleted on every sync, and then re-index it.
         """
-        for _, identity, _ in self._identities():
+        for _, identity, _ in self._identities(strict=True):
             yield identity
 
     # --- enriched documents -------------------------------------------------------------------
@@ -734,7 +734,7 @@ class FilesystemConnector:
 
     # --- identity ------------------------------------------------------------------------------
 
-    def _identities(self) -> Iterator[tuple[Path, SourceId, str]]:
+    def _identities(self, *, strict: bool = False) -> Iterator[tuple[Path, SourceId, str]]:
         """Every file under the root, with the identity it is stored under and any conflict.
 
         Two passes over one materialized walk rather than one streaming pass, because a duplicate
@@ -746,9 +746,14 @@ class FilesystemConnector:
         The cost is bounded by the corpus rather than by the number of mirrored pages, and the
         map is not: only files whose manifest declares an identity enter it, so a directory of
         ordinary documents allocates nothing beyond the path list a walk produces anyway.
+
+        ``strict`` is for the one caller that treats a missing file as a deletion. Discovery skips
+        a directory it cannot read and moves on, which is right for indexing; reconciliation doing
+        the same would report every file beneath it as gone. Strict raises instead, so the
+        inventory is canceled and nothing is deleted.
         """
         declared: list[tuple[Path, str]] = [
-            (path, sidecar.declared_identity(path)) for path in self._walk()
+            (path, sidecar.declared_identity(path)) for path in self._walk(strict=strict)
         ]
         claims: dict[SourceId, list[Path]] = {}
         for path, identity in declared:
@@ -766,7 +771,7 @@ class FilesystemConnector:
 
     # --- walking ----------------------------------------------------------------------------
 
-    def _walk(self) -> Iterator[Path]:
+    def _walk(self, *, strict: bool = False) -> Iterator[Path]:
         """Every file under the root, in a stable order.
 
         Sorted at each level rather than left to the filesystem, so two machines indexing the
@@ -779,12 +784,14 @@ class FilesystemConnector:
         if self._root.is_file():
             yield self._root
             return
-        yield from self._walk_directory(self._root)
+        yield from self._walk_directory(self._root, strict=strict)
 
-    def _walk_directory(self, directory: Path) -> Iterator[Path]:
+    def _walk_directory(self, directory: Path, *, strict: bool = False) -> Iterator[Path]:
         try:
             entries: Sequence[Path] = sorted(directory.iterdir())
         except OSError:
+            if strict:
+                raise
             return
         for entry in entries:
             if not self._include_hidden and entry.name.startswith("."):
@@ -801,7 +808,7 @@ class FilesystemConnector:
             if entry.is_dir():
                 if entry.name in IGNORED_DIRECTORIES:
                     continue
-                yield from self._walk_directory(entry)
+                yield from self._walk_directory(entry, strict=strict)
             elif entry.is_file():
                 if sidecar.is_manifest(entry):
                     # A manifest is metadata about the document beside it, not a document. Walked

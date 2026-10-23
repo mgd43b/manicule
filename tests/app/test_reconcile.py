@@ -639,9 +639,46 @@ async def test_a_purged_document_says_its_bytes_were_released_rather_than_never_
         handle.source_id: (
             await service.document_resolve(source="wiki", source_id=handle.source_id, content=True)
         ).unavailable_reason
+        or ""
         for handle in (purged, restored, never)
     }
 
     assert reasons["gone.md"].startswith("released")
     assert reasons["back.md"].startswith("released")
     assert reasons["off.md"].startswith("never retained")
+
+
+async def test_an_automatic_pass_steps_aside_if_it_is_no_longer_eligible_under_the_guard() -> None:
+    """Two automatic passes can both see 'due' and queue; the second must not replace the first.
+
+    The port asks the eligibility test after the guard is held. Here the fake reports the state
+    the first pass left behind: a proposal waiting for a person.
+    """
+    from manicule.ingest.reconcile import ReconciliationStanding  # noqa: PLC0415
+
+    service, backend = service_with(wiki={})
+    backend.ingestion_.eligibility_state = ReconciliationStanding(
+        proposal_pending=True, proposal_missing=6, proposal_live=10, live_documents=10
+    )
+
+    scheduled = await service.reconcile_if_due("wiki")
+    chained = await service._reconcile_after_sync("wiki")  # pyright: ignore[reportPrivateUsage]
+
+    assert scheduled is None
+    assert chained is None
+    assert backend.ingestion_.reconcile_calls == []
+
+
+async def test_a_manual_pass_is_never_asked_whether_it_is_eligible() -> None:
+    """An operator may replace a proposal deliberately; only automatic passes defer to one."""
+    from manicule.ingest.reconcile import ReconciliationStanding  # noqa: PLC0415
+
+    service, backend = service_with(wiki={})
+    backend.ingestion_.eligibility_state = ReconciliationStanding(
+        proposal_pending=True, live_documents=10
+    )
+
+    result = await service.connector_reconcile("wiki")
+
+    assert result.outcome == "applied"
+    assert len(backend.ingestion_.reconcile_calls) == 1

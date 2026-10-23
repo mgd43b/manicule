@@ -77,7 +77,7 @@ from manicule.generation.ports import (
 from manicule.generation.prompt import ChatMessage
 from manicule.generation.sharing import ShareLink, redact_for_anonymous
 from manicule.ingest.pipeline import RunReport, Watching
-from manicule.ingest.reconcile import Reconciliation
+from manicule.ingest.reconcile import Reconciliation, ReconciliationStanding
 from manicule.ingest.reembed import (
     CorpusSnapshot,
     LivePublication,
@@ -1066,9 +1066,27 @@ class FakeIngestion:
     resolve_calls: list[tuple[str, bool]] = field(default_factory=list[tuple[str, bool]])
     """``(connector, confirm)`` per proposal resolution asked for."""
 
+    eligibility_state: ReconciliationStanding | None = None
+    """What the fake tells an ``eligible`` test the connector's standing is, when one is given.
+
+    ``None`` means the real answer: eligible. A test sets it to the state another pass just left
+    behind, to show an automatic pass stepping aside after it queued for the guard.
+    """
+
     async def reconcile(
-        self, connector: str, *, dry_run: bool, max_delete_fraction: float
+        self,
+        connector: str,
+        *,
+        dry_run: bool,
+        max_delete_fraction: float,
+        eligible: Callable[[ReconciliationStanding], bool] | None = None,
     ) -> Reconciliation:
+        if (
+            eligible is not None
+            and self.eligibility_state is not None
+            and not eligible(self.eligibility_state)
+        ):
+            return Reconciliation(connector=connector, skipped=True)
         self.reconcile_calls.append((connector, dry_run, max_delete_fraction))
         if self.reconcile_failure is not None:
             raise self.reconcile_failure

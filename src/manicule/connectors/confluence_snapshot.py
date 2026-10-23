@@ -418,21 +418,25 @@ class ConfluenceSnapshotConnector:
         and not the other would be reported deleted on every sync, or indexed and never
         reconciled.
         """
-        for snapshot in self._validated_walk():
+        for snapshot in self._validated_walk(strict=True):
             yield snapshot.identity(root=self._root)
 
     # --- walking ----------------------------------------------------------------------------
 
-    def _walk(self) -> Iterator[_Snapshot]:
+    def _walk(self, *, strict: bool = False) -> Iterator[_Snapshot]:
         """Every page snapshot under the root, in a stable order.
 
         Sorted at each level rather than left to the filesystem, so two machines ingesting one
         export take it in the same order — which is what makes a ``--limit`` mean the same thing
         twice.
-        """
-        yield from self._walk_directory(self._root)
 
-    def _validated_walk(self) -> Iterator[_Snapshot]:
+        ``strict`` makes a directory that cannot be listed an error instead of an empty one.
+        Reconciliation asks for it, because treating an unreadable subtree as empty would report
+        every page beneath it deleted.
+        """
+        yield from self._walk_directory(self._root, strict=strict)
+
+    def _validated_walk(self, *, strict: bool = False) -> Iterator[_Snapshot]:
         """The complete walk after refusing an ambiguous Confluence page identity.
 
         A streaming walk cannot withdraw the first page after a later directory claims the same
@@ -440,7 +444,7 @@ class ConfluenceSnapshotConnector:
         by the snapshot corpus; bodies remain unread until fetch, so materializing this walk does
         not turn discovery into loading the corpus.
         """
-        snapshots = list(self._walk())
+        snapshots = list(self._walk(strict=strict))
         claims: dict[SourceId, list[_Snapshot]] = {}
         for snapshot in snapshots:
             claims.setdefault(snapshot.identity(root=self._root), []).append(snapshot)
@@ -456,8 +460,8 @@ class ConfluenceSnapshotConnector:
             raise ConnectorError(msg)
         yield from snapshots
 
-    def _walk_directory(self, directory: Path) -> Iterator[_Snapshot]:
-        snapshot = self._read(directory)
+    def _walk_directory(self, directory: Path, *, strict: bool = False) -> Iterator[_Snapshot]:
+        snapshot = self._read(directory, strict=strict)
         if snapshot is not None:
             # A page snapshot is a leaf. Descending would let a directory of attachments beside a
             # body be mistaken for pages, and a nested manifest override its parent's.
@@ -466,6 +470,8 @@ class ConfluenceSnapshotConnector:
         try:
             entries = sorted(directory.iterdir())
         except OSError:
+            if strict:
+                raise
             return
         for entry in entries:
             if entry.name.startswith(".") or entry.is_symlink():
@@ -473,9 +479,9 @@ class ConfluenceSnapshotConnector:
                 # loop inside it is an infinite walk.
                 continue
             if entry.is_dir():
-                yield from self._walk_directory(entry)
+                yield from self._walk_directory(entry, strict=strict)
 
-    def _read(self, directory: Path) -> _Snapshot | None:
+    def _read(self, directory: Path, *, strict: bool = False) -> _Snapshot | None:
         """The snapshot in ``directory``, or ``None`` when the directory is not one.
 
         ``None`` means only "no manifest here". Every other outcome is a ``_Snapshot`` carrying
@@ -486,7 +492,9 @@ class ConfluenceSnapshotConnector:
         try:
             if not manifest.is_file():
                 return None
-        except OSError:  # pragma: no cover - an unstattable directory is not a page
+        except OSError:
+            if strict:
+                raise
             return None
         try:
             parsed = self._parse(manifest)

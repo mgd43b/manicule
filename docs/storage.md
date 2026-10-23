@@ -2473,7 +2473,9 @@ sweeps the vector store only grows.
    proposal's apply) — the passes that remove data — and anything else that takes
    `Runtime.maintenance_window()`, and nothing else. Ingest and queries continue. If a pass is
    running the backup waits for it (60 seconds by default) and then refuses, saying a maintenance
-   pass holds the lock; the wait never blocks the event loop.
+   pass holds the lock; the wait never blocks the event loop. A backup that is canceled while it
+   copies keeps the lock until the copying thread has stopped, because canceling the await does
+   not stop the thread.
    The operator-run lifecycle operations that also remove data (`reset-index`, `reset-derived`,
    `cleanup-derived-generations`, `release-source-history`, `snapshot-delete`) do not take the
    lock; do not run one while a backup is copying.

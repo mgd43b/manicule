@@ -385,3 +385,66 @@ async def test_a_replaced_credential_cannot_reconcile_one_accounts_documents_aga
         await service.connector_reconcile("docs", dry_run=True)
 
     assert await live(service) == 10, "nothing was enumerated, so nothing could be deleted"
+
+
+async def test_two_automatic_passes_queued_for_the_guard_leave_the_first_proposal_alone(
+    service: ApplicationService, source_root: Path
+) -> None:
+    """The second saw 'due' too, but by the time it holds the guard a proposal is waiting."""
+    await service.connector_sync("docs")
+    store = cast("Any", await service._backend.documents())  # pyright: ignore[reportPrivateUsage]
+    await store.record_connector_metadata("docs", {"last_clean_reconcile_at": None})
+    remove(source_root, 0, 1, 2, 3, 4)
+
+    first, second = await asyncio.gather(
+        service.reconcile_if_due("docs"), service.reconcile_if_due("docs")
+    )
+
+    outcomes = sorted(result.outcome if result else "stepped aside" for result in (first, second))
+    assert outcomes == ["proposed", "stepped aside"]
+    proposal = (await store.connector_metadata("docs"))["proposed_deletion"]
+    assert proposal["missing"] == 5
+    confirmed = await service.connector_reconcile_resolve("docs", confirm=True)
+    assert confirmed.deleted == 5, "the proposal an operator saw is the one that was applied"
+
+
+async def test_a_proposal_can_be_discarded_without_a_session_for_its_source(
+    service: ApplicationService, source_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart ends sessions; clearing a local proposal must not need one."""
+    from manicule.app.runtime import Runtime as Held  # noqa: PLC0415
+    from manicule.connectors.errors import SessionMissingError  # noqa: PLC0415
+
+    await service.connector_sync("docs")
+    remove(source_root, 0, 1, 2, 3, 4)
+    await service.connector_reconcile("docs")
+
+    async def no_session(self: object, name: str) -> object:
+        del self
+        raise SessionMissingError(f"nobody has signed in to {name}")
+
+    monkeypatch.setattr(Held, "connector", no_session)
+
+    discarded = await service.connector_reconcile_resolve("docs", confirm=False)
+
+    assert discarded.outcome == "discarded"
+    with pytest.raises(SessionMissingError):
+        await service.connector_reconcile_resolve("docs", confirm=True)
+
+
+async def test_a_proposal_stranded_by_a_scope_change_can_be_discarded_but_not_confirmed(
+    service: ApplicationService, source_root: Path
+) -> None:
+    await service.connector_sync("docs")
+    remove(source_root, 0, 1, 2, 3, 4)
+    await service.connector_reconcile("docs")
+    # The configuration changed since the proposal: the connector now has a different scope.
+    connector = await (await service._backend.ingestion()).connector("docs")  # pyright: ignore[reportPrivateUsage]
+    object.__setattr__(connector, "reconciliation_scope", "a scope the connector now has")
+
+    confirm = await service.connector_reconcile_resolve("docs", confirm=True)
+    discard = await service.connector_reconcile_resolve("docs", confirm=False)
+
+    assert confirm.outcome == "none_pending"
+    assert discard.outcome == "discarded"
+    assert await live(service) == 10

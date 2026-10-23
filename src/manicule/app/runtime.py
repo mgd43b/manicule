@@ -100,7 +100,7 @@ if TYPE_CHECKING:
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, IngestPipeline, RunReport, Watching
     from manicule.ingest.ports import IngestStore
-    from manicule.ingest.reconcile import Reconciliation
+    from manicule.ingest.reconcile import Reconciliation, ReconciliationStanding
     from manicule.ingest.reembed import ReembedPlan, ReembedRecovery, ReembedRun
     from manicule.ingest.reindex import (
         GlossarySweep,
@@ -1453,7 +1453,12 @@ class _Ingestion:
         return await self._runtime.connector(name)
 
     async def reconcile(
-        self, connector: str, *, dry_run: bool, max_delete_fraction: float
+        self,
+        connector: str,
+        *,
+        dry_run: bool,
+        max_delete_fraction: float,
+        eligible: Callable[[ReconciliationStanding], bool] | None = None,
     ) -> Reconciliation:
         """Enumerate one connector's source and soft-delete what left it.
 
@@ -1472,12 +1477,24 @@ class _Ingestion:
         session surfaces, and a pass that cannot authenticate should not queue behind a sync
         to say so.
         """
+        from manicule.ingest.reconcile import (  # noqa: PLC0415
+            Reconciliation,
+            standing,
+        )
         from manicule.ingest.reconcile import reconcile as run_reconcile  # noqa: PLC0415
 
         built = await self._runtime.connector(connector)
         store = cast("IngestStore", await self._runtime.documents())
         await _hold_pinned_identity(built, store)
         async with self._runtime.derived_mutation_guard():
+            if eligible is not None:
+                # Asked here, under the guard, and not before queuing for it: see the port.
+                state = standing(
+                    await store.connector_metadata(connector),
+                    live_documents=await store.count_documents(source=connector),
+                )
+                if not eligible(state):
+                    return Reconciliation(connector=connector, skipped=True)
             return await run_reconcile(
                 built,
                 store,
@@ -1489,25 +1506,39 @@ class _Ingestion:
     async def resolve_proposal(self, connector: str, *, confirm: bool) -> Reconciliation:
         """Apply or discard the deletion proposal the ceiling refused.
 
-        The current scope comes from the connector, not from the recorded proposal, so a
-        configuration change since the proposal was made cannot confirm a question about a
-        different source (``docs/ingest.md`` §11.1).
+        **Confirming** presents the scope the connector is configured with *now*, not the
+        recorded proposal's, so a configuration change since the proposal was made cannot confirm
+        a question about a different source (``docs/ingest.md`` §11.1). That needs the connector
+        built, which for a source that authenticates with a browser session needs the session.
+
+        **Discarding** deletes nothing, so it needs none of that: it presents the scope the
+        proposal itself recorded and never builds the connector. An operator can therefore clear
+        a proposal after a restart ended the session, and can clear one stranded by a
+        configuration change, which confirming correctly refuses.
         """
+        from manicule.ingest.ports import ReconciliationStore  # noqa: PLC0415
         from manicule.ingest.reconcile import (  # noqa: PLC0415
+            PROPOSED_DELETION_KEY,
             Reconciliation,
             confirm_proposed_deletion,
             connector_scope,
             discard_proposed_deletion,
         )
 
-        built = await self._runtime.connector(connector)
         store = cast("IngestStore", await self._runtime.documents())
-        if confirm:
-            await _hold_pinned_identity(built, store)
+        if not confirm:
+            held = (await store.connector_metadata(connector)).get(PROPOSED_DELETION_KEY)
+            recorded = held.get("scope") if isinstance(held, dict) else None
+            if isinstance(store, ReconciliationStore) and not isinstance(recorded, str):
+                return Reconciliation(connector=connector, refused="no deletion proposal exists")
+            async with self._runtime.derived_mutation_guard():
+                return await discard_proposed_deletion(
+                    connector, store, scope=recorded if isinstance(recorded, str) else None
+                )
+        built = await self._runtime.connector(connector)
+        await _hold_pinned_identity(built, store)
         scope = connector_scope(built)
         async with self._runtime.derived_mutation_guard():
-            if not confirm:
-                return await discard_proposed_deletion(connector, store, scope=scope)
             # Only the apply takes the window: it removes documents, where discarding keeps them.
             async with self._runtime.maintenance_window() as blocked:
                 if blocked:

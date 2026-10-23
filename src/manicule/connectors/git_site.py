@@ -338,9 +338,24 @@ class GitSiteConnector:
         )
 
     async def reconcile(self) -> AsyncIterator[SourceId]:
-        """Yield identities from the same pinned inventory as this task's discovery."""
-        inventory = self._run_inventory.get() or self._current
-        if inventory is None:
-            raise RuntimeError("Git site connector has not completed setup or discovery")
-        for page in inventory.pages:
-            yield page.record.identity
+        """Yield the identity of every page at the configured revision, resolved now.
+
+        Inside a run that has already discovered, this task's own pinned inventory is used, so a
+        reconciliation that follows a sync in one task agrees with what that sync saw. Anywhere
+        else — a scheduled pass after a restart, a manual command, a pass long after the last
+        sync — it pins a fresh inventory. Reusing the last sync's would be wrong in both
+        directions: after a restart there is none to reuse, and after a sync it names the commit
+        that sync pinned, so pages the revision has since dropped would still be reported present
+        and never leave the index. The fresh reader is closed when the enumeration ends.
+        """
+        inventory = self._run_inventory.get()
+        if inventory is not None:
+            for page in inventory.pages:
+                yield page.record.identity
+            return
+        fresh = await self._pin_inventory()
+        try:
+            for page in fresh.pages:
+                yield page.record.identity
+        finally:
+            await asyncio.shield(fresh.reader.aclose())

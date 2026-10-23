@@ -57,6 +57,8 @@ from manicule.storage.migrator import current, head_revision
 from manicule.storage.types import utcnow
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 MANIFEST_NAME = "backup-manifest.json"
@@ -171,15 +173,41 @@ async def create_backup(
         index_state = await _index_state(engine)
         # The filesystem work is blocking, and a backup copies the whole corpus. Running it on
         # the event loop would stall every concurrent query for the duration.
-        return await asyncio.to_thread(
-            _write_snapshot,
-            data_dir,
-            target,
-            revision,
-            counts,
-            index_state,
-            allow_insecure_target=allow_insecure_target,
+        return await _join_thread(
+            asyncio.to_thread(
+                _write_snapshot,
+                data_dir,
+                target,
+                revision,
+                counts,
+                index_state,
+                allow_insecure_target=allow_insecure_target,
+            )
         )
+
+
+async def _join_thread[T](work: Coroutine[Any, Any, T]) -> T:
+    """Await a worker thread's result, and keep waiting for it if this task is canceled.
+
+    Canceling the await of ``asyncio.to_thread`` does not stop the thread, so a bare ``await``
+    would let the caller's ``async with`` release the backup lock while the snapshot is still
+    being copied, and a sweep or blob collection could then remove what the copy is about to
+    read. The thread is shielded and joined first, through repeated cancellations too, and the
+    cancellation is re-raised only once nothing is copying. A failure in the worker during a
+    cancellation is dropped: the caller asked to stop, and the cancellation is the answer.
+    """
+    worker = asyncio.ensure_future(work)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:  # noqa: BLE001 - the cancellation is the outcome being reported
+                break
+        raise
 
 
 def _require_database(data_dir: Path) -> None:

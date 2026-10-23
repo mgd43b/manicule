@@ -75,6 +75,12 @@ class Reconciliation:
     error_type: str = ""
     blocked: str = ""
     """Why the pass did not start, when something else held the data (a backup)."""
+    skipped: bool = False
+    """Whether the pass was not run because the caller's eligibility test failed under the guard.
+
+    Not a failure and not an outcome anyone reports: a scheduled or post-sync pass that found,
+    after waiting for the guard, that another pass had already done its job (or recorded a
+    proposal that is now waiting for a person) steps aside."""
     proposed: tuple[SourceId, ...] = field(default=())
     live_count: int = 0
     missing_count: int = 0
@@ -84,7 +90,13 @@ class Reconciliation:
     @property
     def clean(self) -> bool:
         """Whether the enumeration completed and the diff was applied."""
-        return not self.error and not self.refused and not self.blocked and not self.dry_run
+        return (
+            not self.error
+            and not self.refused
+            and not self.blocked
+            and not self.skipped
+            and not self.dry_run
+        )
 
 
 @dataclass(frozen=True, slots=True)

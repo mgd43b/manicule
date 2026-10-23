@@ -1997,7 +1997,8 @@ class ApplicationService:
                 f"[connectors.{name}] to reconcile it."
             )
             raise PolicyError(msg)
-        return await self._reconcile(name, dry_run=dry_run)
+        result = await self._run_pass(name, dry_run=dry_run)
+        return _reconciled("dry_run" if dry_run else "reconcile", result)
 
     async def connector_reconcile_resolve(
         self, name: str, *, confirm: bool
@@ -2032,10 +2033,16 @@ class ApplicationService:
         configured = self.settings.connectors.get(name)
         if configured is None or not configured.enabled:
             return None
+        interval_s = self.reconcile_interval_s(name)
         state = await self._reconciliation_standing(name)
-        if not state.due(interval_s=self.reconcile_interval_s(name)):
+        if not state.due(interval_s=interval_s):
             return None
-        return await self._reconcile(name, dry_run=False)
+        # And again under the guard, which the pass takes after this look: another pass may
+        # finish, or record a proposal, while this one queues for it.
+        result = await self._run_pass(
+            name, dry_run=False, eligible=lambda standing_: standing_.due(interval_s=interval_s)
+        )
+        return None if result.skipped else _reconciled("reconcile", result)
 
     async def _reconcile_after_sync(self, name: str) -> r.ConnectorReconciled | None:
         """The pass that follows a completed full sync, or ``None`` when there is nothing to do.
@@ -2049,7 +2056,14 @@ class ApplicationService:
         if state.live_documents == 0 or state.proposal_pending:
             return None
         try:
-            return await self._reconcile(name, dry_run=False)
+            result = await self._run_pass(
+                name,
+                dry_run=False,
+                eligible=lambda standing_: (
+                    standing_.live_documents > 0 and not standing_.proposal_pending
+                ),
+            )
+            return None if result.skipped else _reconciled("reconcile", result)
         except (ManiculeError, ValueError, OSError) as exc:
             return r.ConnectorReconciled(
                 connector=name,
@@ -2058,14 +2072,21 @@ class ApplicationService:
                 error_type=type(exc).__name__,
             )
 
-    async def _reconcile(self, name: str, *, dry_run: bool) -> r.ConnectorReconciled:
+    async def _run_pass(
+        self,
+        name: str,
+        *,
+        dry_run: bool,
+        eligible: Callable[[ReconciliationStanding], bool] | None = None,
+    ) -> Reconciliation:
+        """Hand one pass to the ingest port with the configured ceiling."""
         ingestion = await self._backend.ingestion()
-        result = await ingestion.reconcile(
+        return await ingestion.reconcile(
             name,
             dry_run=dry_run,
             max_delete_fraction=self.settings.ingest.reconcile_max_delete_fraction,
+            eligible=eligible,
         )
-        return _reconciled("dry_run" if dry_run else "reconcile", result)
 
     async def connector_login(
         self,

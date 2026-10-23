@@ -2369,6 +2369,12 @@ a computed answer rather than an operator's habit.
   connector with a proposal waiting for an operator (below), whatever the clock says: a newer
   inventory supersedes the proposal being reviewed (§11.1), so a loop that kept asking would take
   the question away from the person answering it. A disabled connector is not scheduled at all.
+  The test is made twice: at the look, so a connector that is not due is never even built, and
+  again once the pass holds the derived-mutation guard (`eligible` on the ingest port), because two
+  automatic passes (the scheduled one and the one after a sync) can both see 'due' and queue for
+  the guard, and the second would otherwise begin an inventory that cancels the proposal the first
+  just recorded. A pass that finds itself no longer eligible steps aside and reports nothing. A
+  manual pass is never asked: an operator may replace a proposal deliberately.
 - **A missing session** is handled as a scheduled sync handles it: the loop records that the
   connector awaits sign-in, announces it, and looks again at the next poll. Any other failure is
   recorded and retried at the next look; nothing ends the loop.
@@ -2399,6 +2405,21 @@ connector is refused for a pass, but its waiting proposal can still be answered,
 been recorded before the connector was switched off. The same operations are the MCP tools
 `connector_reconcile` and `connector_reconcile_resolve` and the two HTTP routes in
 [`surfaces.md`](surfaces.md).
+
+**Discarding needs no session; confirming does.** Confirming presents the scope the connector is
+configured with now (§11.1), so it builds the connector, and a source that authenticates with a
+browser session needs that session. Discarding deletes nothing and presents the scope the proposal
+recorded itself, so it never builds the connector: an operator can clear a proposal after a restart
+ended the session, and can clear one a configuration change has stranded, which confirming
+correctly refuses.
+
+**A walk that cannot list a directory is not an empty directory.** Discovery skips an unreadable
+subtree and indexes the rest, which is right for indexing. Reconciliation treats absence as
+deletion, so the filesystem and Confluence-snapshot connectors walk strictly when they reconcile:
+a directory they cannot list (or a root that has vanished) raises, the inventory is canceled and
+nothing is deleted. The git-site connector pins a fresh inventory of the configured revision for a
+pass that does not follow a discovery in its own task, so a pass after a restart works and a pass
+after a sync sees the pages the revision has since dropped.
 
 **Discard restarts the interval and is not a clean pass.** It records `last_discarded_reconcile_at`
 and leaves `last_clean_reconcile_at` alone, so `connector list` does not report a deletion check

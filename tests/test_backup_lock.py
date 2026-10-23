@@ -291,3 +291,44 @@ async def test_create_backup_leaves_no_lock_file_in_a_directory_that_is_not_a_da
         await create_backup(engine, empty, tmp_path / "snapshot")
 
     assert not (empty / LOCK_FILENAME).exists()
+
+
+async def test_a_canceled_backup_keeps_the_lock_until_the_copy_has_stopped(
+    engine: AsyncEngine, data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Canceling the await does not stop the thread, so it must not release the lock.
+
+    A sweep that took the lock the moment the caller gave up would delete vectors or blobs the
+    still-running copy is about to read.
+    """
+    import threading  # noqa: PLC0415
+
+    from manicule.storage import backup as backup_module  # noqa: PLC0415
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    def blocked(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        started.set()
+        finish.wait(timeout=30)
+        return {}
+
+    monkeypatch.setattr(backup_module, "_write_snapshot", blocked)
+    task = asyncio.create_task(create_backup(engine, data_dir, tmp_path / "snapshot"))
+    await asyncio.to_thread(started.wait, 30)
+
+    task.cancel()
+    task.cancel()  # and again: a second request must not abandon the copy either
+    await asyncio.sleep(0.2)
+
+    assert not task.done(), "the cancellation waited for the copy"
+    probe = MaintenanceHold(data_dir)
+    assert "backup is running" in probe.acquire(), "a pass still declines while the copy runs"
+    probe.release()
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    after = MaintenanceHold(data_dir)
+    assert after.acquire() == "", "and the lock was given back once it stopped"
+    after.release()
