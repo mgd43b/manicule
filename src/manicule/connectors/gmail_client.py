@@ -15,7 +15,7 @@ limit by hitting it spends most of a first sync being told no.
 
 **The credential is an interface, not a class.** :class:`GmailCredential` is the whole of what the
 client needs from whatever mints access tokens: a token, a forced refresh after a 401, and a
-sentence for a person to act on when the refresh does not help. Minting a token is itself an HTTP
+error to raise when the refresh does not help. Minting a token is itself an HTTP
 call, so the method is a coroutine and the refresh logic lives with the credential.
 
 **Errors name the operation and nothing else.** The design forbids an address, a label name or a
@@ -48,7 +48,6 @@ from manicule.connectors.errors import (
     RateLimitedError,
     RemoteError,
     RequestTimeoutError,
-    SessionExpiredError,
 )
 from manicule.connectors.retry import backoff, retry_after
 from manicule.core.errors import ConfigError
@@ -179,8 +178,12 @@ class GmailCredential(Protocol):
         """
         ...
 
-    def renewal(self) -> str:
-        """What a person does to replace the credential. One sentence, imperative."""
+    def rejected(self) -> Exception:
+        """The error for a token Gmail rejected even after a refresh.
+
+        Built by the credential, not the client, because only the credential knows its own type
+        for this and what a person should do about it (the sentence naming ``connector login``).
+        """
         ...
 
 
@@ -540,11 +543,7 @@ class GmailClient:
                 # One refresh, one retry, and the retry does not spend the failure budget: a
                 # token that expired mid-run is ordinary, a second rejection is not.
                 if refreshed:
-                    msg = (
-                        f"Gmail rejected the access token for {operation} even after it was "
-                        f"refreshed. {self._credential.renewal()}"
-                    )
-                    raise SessionExpiredError(msg)
+                    raise self._credential.rejected()
                 refresh = refreshed = True
                 continue
             wait = self._judge(operation, response, attempt, missing)

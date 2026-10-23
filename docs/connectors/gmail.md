@@ -404,8 +404,8 @@ A 403 is a rate limit when its `reason` is `rateLimitExceeded` or `userRateLimit
 compared without regard to case or underscores and read from both `error.errors[]` and
 `error.details[]` (which of the two Google uses is not yet verified, §11). A 404 is typed by the
 call that received it, so a 404 from `getProfile` or `labels.list` is an ordinary unusable
-answer rather than a deleted message. A second 401 is a `SessionExpiredError` carrying the
-credential's own renewal sentence. Every message names the operation and a status, never an id,
+answer rather than a deleted message. A second 401 raises whatever the credential
+builds for it, which carries its own renewal sentence. Every message names the operation and a status, never an id,
 an address or a label name (§10), and the client redacts Gmail's request URLs from `httpx`'s
 own INFO log, which would otherwise print each message id (other clients' records are left
 alone):

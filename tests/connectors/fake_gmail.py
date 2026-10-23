@@ -39,6 +39,8 @@ from email.utils import format_datetime
 
 import httpx
 
+from manicule.connectors.errors import SessionExpiredError
+
 __all__ = [
     "ADDRESS",
     "FakeCredential",
@@ -141,8 +143,8 @@ class FakeCredential:
             self._token = self._server.issue_token()
         return self._token
 
-    def renewal(self) -> str:
-        return "Run `manicule connector login mail` to authorize it again."
+    def rejected(self) -> Exception:
+        return SessionExpiredError("rejected; run `manicule connector login mail`")
 
 
 def plain_message(subject: str = "Quarterly figures", *, sender: str = "pat@example.org") -> bytes:

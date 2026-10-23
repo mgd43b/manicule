@@ -479,7 +479,7 @@ async def test_a_401_is_refreshed_once_and_the_request_retried() -> None:
     assert credential.refreshes == 1
 
 
-async def test_a_second_401_is_a_credential_error_naming_the_renewal() -> None:
+async def test_a_second_401_raises_what_the_credential_says_it_should() -> None:
     time = SimulatedTime()
     server = _server(time)
     server.rejecting_all_tokens = True
@@ -927,7 +927,7 @@ def test_importing_the_client_loads_no_http_stack_and_setting_it_up_does() -> No
         "    request_timeout_seconds = 30.0\n"
         "class Credential:\n"
         "    async def access_token(self, *, refresh=False): return ''\n"
-        "    def renewal(self): return ''\n"
+        "    def rejected(self): return Exception()\n"
         "client = GmailClient(Settings(), Credential())\n"
         "constructed = 'httpx' in sys.modules\n"
         "asyncio.run(client.setup())\n"

@@ -190,12 +190,7 @@ class AttachmentTooLargeError(ConnectorError):
 
 
 class SessionExpiredError(ConnectorError):
-    """The credential this connector authenticates with is no longer usable.
-
-    Written for Confluence's browser session, which is the harder case and the one described
-    below. Gmail raises it too, when an access token is rejected a second time right after it
-    was refreshed (``docs/connectors/gmail.md`` §6), and its message carries the credential's
-    own renewal sentence.
+    """The browser session this connector authenticates with is no longer usable.
 
     Its own class because it is the one credential failure a person answers by going back to a
     browser rather than by editing configuration, and because it does not arrive as a 401. An
