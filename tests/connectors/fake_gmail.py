@@ -126,6 +126,8 @@ class FakeMessage:
     thread_id: str
     raw: bytes
     label_ids: list[str]
+    internal_date_ms: int = 1_760_000_000_000
+    """When Gmail received it, as ``internalDate`` reports it."""
 
 
 class FakeCredential:
@@ -255,14 +257,21 @@ class FakeGmail:
         *,
         labels: Sequence[str] = ("INBOX",),
         record_labels: bool = False,
+        thread_id: str | None = None,
+        internal_date_ms: int | None = None,
     ) -> FakeMessage:
         """Receive a message. ``labels`` are names; ``record_labels`` puts them in the history."""
         self._serial += 1
         message = FakeMessage(
             id=f"18c3f0a1b2{self._serial:06x}",
-            thread_id=f"18c3f0a1b2{self._serial:06x}",
+            thread_id=thread_id if thread_id is not None else f"18c3f0a1b2{self._serial:06x}",
             raw=raw if raw is not None else plain_message(f"Message {self._serial}"),
             label_ids=[self._labels[name] for name in labels],
+            internal_date_ms=(
+                internal_date_ms
+                if internal_date_ms is not None
+                else 1_760_000_000_000 + self._serial * 1000
+            ),
         )
         self.messages[message.id] = message
         self._record("messagesAdded", message, with_labels=record_labels)
@@ -277,6 +286,17 @@ class FakeGmail:
         label = self._labels[name]
         message.label_ids.remove(label)
         self._record("labelsRemoved", message, changed=[label], with_labels=record_labels)
+
+    def trash(self, message: FakeMessage, *, record_labels: bool = False) -> None:
+        """Move to Trash the way Gmail does: TRASH is added and INBOX is taken off."""
+        self.add_label(message, "TRASH", record_labels=record_labels)
+        if self._labels["INBOX"] in message.label_ids:
+            self.remove_label(message, "INBOX", record_labels=record_labels)
+
+    def restore(self, message: FakeMessage, *, record_labels: bool = False) -> None:
+        """Take a message out of Trash: TRASH comes off and INBOX goes back on."""
+        self.remove_label(message, "TRASH", record_labels=record_labels)
+        self.add_label(message, "INBOX", record_labels=record_labels)
 
     def delete_message(self, message: FakeMessage, *, still_listed: bool = False) -> None:
         """Delete permanently. ``still_listed`` is the race: gone from the mailbox, not yet from
@@ -493,6 +513,7 @@ class FakeGmail:
             "id": message.id,
             "threadId": message.thread_id,
             "historyId": str(self.history_id),
+            "internalDate": str(message.internal_date_ms),
             "sizeEstimate": len(message.raw),
         }
         if message.label_ids:

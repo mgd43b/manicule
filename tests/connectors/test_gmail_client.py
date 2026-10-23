@@ -205,8 +205,8 @@ async def test_raw_fetch_returns_the_rfc_5322_bytes_unpadded_base64_decoded(
     finally:
         await client.teardown()
 
-    assert fetched == raw
-    parsed = email.message_from_bytes(fetched, policy=email.policy.default)
+    assert fetched.raw == raw
+    parsed = email.message_from_bytes(fetched.raw, policy=email.policy.default)
     assert parsed["Subject"] == marker
 
 
@@ -220,7 +220,7 @@ async def test_raw_fetch_of_a_message_with_an_attachment_keeps_the_attachment() 
     finally:
         await client.teardown()
 
-    parsed = email.message_from_bytes(fetched, policy=email.policy.default)
+    parsed = email.message_from_bytes(fetched.raw, policy=email.policy.default)
     assert [part.get_filename() for part in parsed.iter_attachments()] == ["report.pdf"]
 
 
