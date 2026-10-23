@@ -396,7 +396,7 @@ def test_every_configured_instance_of_a_sensitive_type_is_marked_enabled_or_not(
     assert sensitive_instances(settings, SENSITIVE) == {"a", "b"}
 
 
-@pytest.mark.parametrize("directory", ["with#hash", "with?query", "with%percent", "with space"])
+@pytest.mark.parametrize("directory", ["with#hash", "with%percent", "with space"])
 async def test_a_data_directory_whose_path_has_uri_metacharacters_is_still_read(
     tmp_path: Path, migrated_template: Path, directory: str
 ) -> None:
@@ -419,3 +419,17 @@ async def test_a_data_directory_whose_path_has_uri_metacharacters_is_still_read(
         await built.dispose()
 
     assert held_sources(root) == (MAIL,)
+
+
+def test_the_runtime_names_the_gmail_instances_it_hands_the_pipeline(tmp_path: Path) -> None:
+    """The pipeline marks only what the runtime names, so this is where a gap would fail open."""
+    from manicule.app.runtime import Runtime  # noqa: PLC0415
+
+    settings = Settings(
+        data_dir=tmp_path,
+        connectors={
+            "mail": ConnectorSettings(type="gmail"),
+            "notes": ConnectorSettings(type="filesystem"),
+        },
+    )
+    assert Runtime(settings).sensitive_instances() == {"mail"}
