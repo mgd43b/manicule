@@ -1973,7 +1973,11 @@ def connector_login(
         raise typer.BadParameter(OVERWRITE_WITHOUT_A_FILE)
     from manicule.connectors.config import GMAIL_CONNECTOR_NAME  # noqa: PLC0415 - pydantic only
 
-    if _configured_type(name) == GMAIL_CONNECTOR_NAME:
+    kind = _configured_type(name)
+    # A type that could not be told, with an option only a Gmail source takes, goes the Gmail way
+    # too: the service then says what is actually wrong — configuration that will not load, or
+    # no source by that name — where the Confluence path would call the source "not Gmail".
+    if kind == GMAIL_CONNECTOR_NAME or (kind is None and token_file is not None):
         _gmail_login(
             name,
             token_file=token_file,

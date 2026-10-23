@@ -248,3 +248,30 @@ def test_a_gmail_source_is_routed_by_the_real_configuration_and_needs_no_server(
     assert "GMAIL_CLIENT_SECRET" in text
     assert "no manicule server" not in text
     assert not (tmp_path / "token").exists()
+
+
+@pytest.mark.parametrize(
+    ("config", "reports"),
+    [
+        ("[connectors.mail]\ntype = 'gmail'\nsurprise = 1\n", "invalid configuration"),
+        ("[connectors.other]\ntype = 'filesystem'\n", "no connector named"),
+    ],
+)
+def test_a_configuration_problem_is_reported_as_itself_not_as_a_non_gmail_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config: str, reports: str
+) -> None:
+    """The type could not be told, so the Gmail path's own report is the one the operator needs."""
+    path = tmp_path / "manicule.toml"
+    path.write_text(config)
+    monkeypatch.setenv("MANICULE_CONFIG_FILE", str(path))
+    monkeypatch.setenv("MANICULE_DATA_DIR", str(tmp_path / "data"))
+    cli.STATE.overrides = {}
+    cli.STATE.workspace = None
+
+    result = login("mail", "--token-file", str(tmp_path / "token"))
+
+    assert result.exit_code != 0
+    text = result.output.replace("\n", " ")
+    assert reports in text
+    assert "not a Gmail source" not in text
+    assert not (tmp_path / "token").exists()
