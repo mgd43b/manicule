@@ -12,6 +12,7 @@ import pytest
 from manicule.connectors import config as gmail_settings
 from manicule.connectors.errors import ConnectorError, MailboxMismatchError, RemoteError
 from manicule.core.errors import ConfigError
+from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DocRef
 from manicule.testing import closing
 from tests.connectors.fake_gmail import ADDRESS, FakeGmail, SimulatedTime
@@ -175,10 +176,10 @@ def populated_mailbox() -> tuple[FakeGmail, SimulatedTime, dict[str, str]]:
     """One message per kind: kept, and one carrying each thing that takes a message out."""
     server, time = mailbox()
     kept = server.add_message(labels=("INBOX",))
-    labelled_in_scope = server.add_message(labels=("INBOX", "STARRED"))
+    labeled_in_scope = server.add_message(labels=("INBOX", "STARRED"))
     kinds = {
         "kept": kept.id,
-        "starred": labelled_in_scope.id,
+        "starred": labeled_in_scope.id,
         "draft": server.add_message(labels=("DRAFT",)).id,
         "spam": server.add_message(labels=("SPAM",)).id,
         "trash": server.add_message(labels=("TRASH",)).id,
@@ -310,13 +311,13 @@ async def test_a_message_restored_from_trash_that_keeps_an_excluded_label_is_not
 async def test_label_added_and_message_deleted_records_cost_no_lookup() -> None:
     """They can only take a message out of scope, which reconciliation acts on."""
     server, time = mailbox()
-    labelled = server.add_message()
+    labeled = server.add_message()
     doomed = server.add_message()
 
     async with opened(server, time) as connector:
         await drain(connector)
         watermark = connector.watermark
-        server.add_label(labelled, "STARRED")
+        server.add_label(labeled, "STARRED")
         server.delete_message(doomed)
         before = len(server.requests)
         found = await drain(connector, watermark)
@@ -433,16 +434,62 @@ async def test_a_watermark_recorded_for_another_representation_is_not_resumed(
     assert {doc.version_token for doc in found} == {"rfc822/2"}
 
 
-def test_the_representation_version_and_the_excluded_labels_are_in_the_scope_fingerprint(
+async def test_the_representation_version_and_the_excluded_labels_are_in_the_scope_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    server, time, _ = populated_mailbox()
+    async with (
+        opened(server, time) as plain,
+        opened(server, time, exclude_labels=["Receipts 2026"]) as narrowed,
+        opened(server, time, exclude_labels=["Receipts 2026", "Clients/Acme Corp"]) as narrower,
+    ):
+        fingerprints = {
+            plain.scope_fingerprint,
+            narrowed.scope_fingerprint,
+            narrower.scope_fingerprint,
+        }
+        before = plain.scope_fingerprint
+        monkeypatch.setattr(gmail_settings, "REPRESENTATION_VERSION", "rfc822/2")
+
+        assert len(fingerprints) == 3
+        assert plain.scope_fingerprint != before
+
+
+async def test_a_watermark_from_another_mailbox_identity_is_not_resumed() -> None:
     server, time = mailbox()
-    plain = connector_over(server, time)
-    before = plain.scope_fingerprint
+    first = server.add_message()
 
-    monkeypatch.setattr(gmail_settings, "REPRESENTATION_VERSION", "rfc822/2")
+    async with opened(server, time) as connector:
+        await drain(connector)
+        watermark = connector.watermark
+        assert watermark is not None
+        forged = watermark.model_copy(
+            update={"metadata": {**watermark.metadata, "pinned_identity": "another-digest"}}
+        )
+        server.add_message()
+        found = await drain(connector, forged)
 
-    assert plain.scope_fingerprint != before
+    assert first.id in ids(found), "a complete walk, not a delta"
+
+
+async def test_history_that_expires_part_way_through_a_walk_restarts_as_a_complete_walk() -> None:
+    server, time = mailbox()
+    everything = [server.add_message().id for _ in range(3)]
+
+    async with opened(server, time) as connector:
+        await drain(connector)
+        watermark = connector.watermark
+        everything += [server.add_message().id for _ in range(4)]
+
+        def expires_on_the_second_page(request: httpx.Request) -> None:
+            if request.url.path.endswith("/history") and "pageToken" in request.url.params:
+                server.history_floor = server.history_id + 1
+
+        server.before_request = expires_on_the_second_page
+        found = await drain(connector, watermark)
+
+    assert set(everything) <= set(ids(found)), "the fallback walk lists the whole mailbox"
+    assert connector.watermark is not None
 
 
 # --- reconciliation (§7) ------------------------------------------------------------------------
@@ -508,12 +555,13 @@ async def test_a_token_that_changes_mailbox_after_setup_is_refused_at_the_start_
         with pytest.raises(MailboxMismatchError) as caught:
             await drain(connector)
 
-        with pytest.raises(MailboxMismatchError):
+        with pytest.raises(MailboxMismatchError) as reconciling:
             async for _ in connector.reconcile():
                 pass
 
     assert paths(server)[before:] == ["/profile", "/profile"], "no message and no label was read"
     assert "example.org" not in str(caught.value)
+    assert "example.org" not in str(reconciling.value)
 
 
 async def test_an_alias_is_a_mismatch_because_the_profile_reports_the_primary_address() -> None:
@@ -553,3 +601,104 @@ async def test_health_and_metrics_are_aggregate() -> None:
     assert health.ok
     assert set(metrics) == {"gmail_requests", "gmail_throttled", "gmail_messages_fetched"}
     assert metrics["gmail_requests"] > 0
+
+
+async def test_a_message_that_becomes_a_draft_leaves_at_reconciliation() -> None:
+    server, time = mailbox()
+    message = server.add_message()
+    kept = server.add_message()
+
+    async with opened(server, time) as connector:
+        server.add_label(message, "DRAFT")
+        inventory = {source_id async for source_id in connector.reconcile()}
+
+    assert inventory == {kept.id}
+
+
+async def test_a_failure_while_listing_an_excluded_label_raises_and_yields_nothing() -> None:
+    """The exclusion listing is part of the inventory: a failed one must not become a bigger one."""
+    server, time = mailbox()
+    for _ in range(4):
+        server.add_message(labels=("INBOX", "Receipts 2026"))
+    connector = connector_over(server, time, max_retries=0, exclude_labels=["Receipts 2026"])
+    await connector.setup()
+    try:
+
+        def fails_when_an_excluded_label_is_listed(request: httpx.Request) -> None:
+            if request.url.path.endswith("/messages") and "Label_2" in request.url.params.get_list(
+                "labelIds"
+            ):
+                server.fail(503, times=20)
+
+        server.before_request = fails_when_an_excluded_label_is_listed
+        yielded: list[str] = []
+
+        async def reconcile() -> None:
+            async for batch in connector.reconcile_batches():
+                yielded.extend(batch)
+
+        with pytest.raises(RemoteError):
+            await reconcile()
+    finally:
+        await connector.teardown()
+
+    assert yielded == []
+
+
+# --- health, metrics and what a fetch records ----------------------------------------------------
+
+
+async def test_health_fails_for_a_token_that_reads_another_mailbox_without_naming_either() -> None:
+    server, time = mailbox()
+
+    async with opened(server, time) as connector:
+        server.switch_mailbox("someone.else@example.org")
+        health = await connector.health()
+
+    assert not health.ok
+    assert health.remedy
+    assert "example.org" not in health.detail
+
+
+async def test_metrics_count_requests_throttles_and_fetches() -> None:
+    server, time = mailbox()
+    message = server.add_message()
+
+    async with opened(server, time) as connector:
+        server.throttle(1, retry_after="1")
+        await connector.fetch(DocRef(source_id=message.id, uri="https://unused.example"))
+        metrics = {metric.name: metric.value for metric in connector.metrics()}
+
+    assert metrics["gmail_messages_fetched"] == 1
+    assert metrics["gmail_throttled"] == 1
+    assert metrics["gmail_requests"] == len(server.requests)
+
+
+async def test_a_subject_that_cannot_be_a_title_leaves_the_message_indexable_by_its_link() -> None:
+    """A control character is refused as a title; the message is still fetched and cited."""
+    server, time = mailbox()
+    raw = (
+        b"From: pat@example.org\r\nSubject: bad\x07subject\r\n"
+        b"Message-ID: <c1@example.org>\r\n\r\nBody.\r\n"
+    )
+    message = server.add_message(raw)
+
+    async with opened(server, time) as connector:
+        fetched = await connector.fetch(DocRef(source_id=message.id, uri="https://unused.example"))
+
+    provenance = fetched.metadata[PROVENANCE_KEY]
+    assert fetched.uri.endswith("#search/rfc822msgid:c1%40example.org")
+    assert isinstance(provenance, dict)
+    assert "bad" not in str(provenance)
+    assert provenance.get("unavailable_reason")
+
+
+async def test_a_message_with_no_subject_is_fetched_with_an_empty_title() -> None:
+    server, time = mailbox()
+    message = server.add_message(b"From: pat@example.org\r\n\r\nJust a body.\r\n")
+
+    async with opened(server, time) as connector:
+        fetched = await connector.fetch(DocRef(source_id=message.id, uri="https://unused.example"))
+
+    assert fetched.as_bytes().endswith(b"Just a body.\r\n")
+    assert fetched.uri.endswith(f"#all/{message.id}")

@@ -162,30 +162,71 @@ async def test_the_document_is_titled_by_the_subject_and_linked_by_the_message_i
     assert document.metadata["gmail_thread_id"] == message.thread_id
 
 
-# --- change detection (§4) -----------------------------------------------------------------------
-
-
-async def test_a_second_complete_run_fetches_nothing_and_changes_nothing(
+async def test_a_message_deleted_between_discovery_and_fetch_does_not_stop_the_run(
     harness: Harness,
 ) -> None:
-    for number in range(5):
-        harness.server.add_message(mail(f"Message {number}"))
+    server = harness.server
+    kept = server.add_message(mail("Kept"))
+    gone = server.add_message(mail("Gone"))
+    server.delete_message(gone, still_listed=True)
     connector = await opened(harness)
     try:
-        first = await harness.sync(connector)
-        fetched = harness.raw_fetches()
-        before = await harness.live()
-        second = await harness.sync(connector)
-        third = await harness.sync(connector)
+        report = await harness.sync(connector)
     finally:
         await connector.teardown()
 
-    assert first.indexed == 5
-    assert fetched == 5
+    assert kept.id in await harness.live()
+    assert gone.id not in await harness.live()
+    assert gone.id not in json.dumps(report.as_metadata(), default=str)
+
+
+# --- change detection (§4) -----------------------------------------------------------------------
+
+
+async def test_repeated_complete_runs_are_idempotent(harness: Harness) -> None:
+    """Complete walks, not incremental no-ops: the history is expired before every run."""
+    server = harness.server
+    for number in range(5):
+        server.add_message(mail(f"Message {number}", attachment=number == 0))
+    connector = await opened(harness)
+
+    async def snapshot() -> list[tuple[object, ...]]:
+        found: list[tuple[object, ...]] = []
+        for d in await harness.store.list_documents(limit=1_000):
+            chunks = await harness.store.document_chunks(d.id)
+            found.append(
+                (
+                    d.source_id,
+                    d.status,
+                    d.version_token,
+                    d.content_hash,
+                    tuple(c.id for c in chunks),
+                )
+            )
+        return sorted(found, key=str)
+
+    try:
+        first = await harness.sync(connector)
+        fetched = harness.raw_fetches()
+        before = await snapshot()
+        for _ in range(2):
+            server.expire_history_through(server.history_id)
+            listings = sum(1 for r in server.requests if r.url.path.endswith("/messages"))
+            report = await harness.sync(connector)
+            assert report.error == ""
+            assert report.indexed == 0
+            assert sum(1 for r in server.requests if r.url.path.endswith("/messages")) > listings
+        assert await snapshot() == before
+        first_pass = await reconciled(harness, connector)
+        second_pass = await reconciled(harness, connector)
+    finally:
+        await connector.teardown()
+
+    assert first.discovered == 5
+    assert first.indexed == 6, "five messages and the attachment one of them carries"
     assert harness.raw_fetches() == fetched, "a stored message is never fetched again"
-    assert second.skipped_version == third.skipped_version == 0 or second.indexed == 0
-    assert second.indexed == third.indexed == 0
-    assert await harness.live() == before
+    assert first_pass.applied_count == second_pass.applied_count == 0
+    assert await snapshot() == before
 
 
 async def test_new_mail_arrives_incrementally_and_only_it_is_fetched(harness: Harness) -> None:
@@ -229,12 +270,16 @@ async def test_an_expired_history_falls_back_to_a_walk_that_fetches_only_what_is
 async def test_a_representation_bump_mid_run_starts_a_fresh_complete_walk(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The unfinished run was recorded under the old version and is not resumed under the new."""
-    for number in range(6):
-        harness.server.add_message(mail(f"Message {number}"))
+    """A history position was stored and a run under it was interrupted; the bump discards both."""
+    server = harness.server
+    for number in range(3):
+        server.add_message(mail(f"Message {number}"))
     old = await opened(harness)
     try:
-        interrupted = await harness.sync(old, limit=2)
+        await harness.sync(old)
+        for number in range(3, 6):
+            server.add_message(mail(f"Message {number}"))
+        interrupted = await harness.sync(old, limit=1)
     finally:
         await old.teardown()
     assert interrupted.limited
@@ -251,7 +296,7 @@ async def test_a_representation_bump_mid_run_starts_a_fresh_complete_walk(
     assert report.error == ""
     assert not report.retry_required
     assert len(await harness.live()) == 6
-    assert harness.raw_fetches() - fetched >= 4, "every message the old run had not stored"
+    assert harness.raw_fetches() - fetched == 6, "every in-scope message, not just the new ones"
     assert {d.version_token for d in stored if "!/" not in d.source_id} == {"rfc822/2"}
 
 
@@ -292,7 +337,7 @@ async def test_a_message_that_left_the_mailbox_leaves_the_index_at_the_next_reco
     deleted = server.add_message(mail("Deleted"))
     trashed = server.add_message(mail("Trashed"))
     spam = server.add_message(mail("Spam"))
-    labelled = server.add_message(mail("Labelled"))
+    labeled = server.add_message(mail("Labeled"))
     connector = await opened(harness, exclude_labels=[LABEL])
     try:
         await harness.sync(connector)
@@ -300,7 +345,7 @@ async def test_a_message_that_left_the_mailbox_leaves_the_index_at_the_next_reco
         server.delete_message(deleted)
         server.trash(trashed)
         server.add_label(spam, "SPAM")
-        server.add_label(labelled, LABEL)
+        server.add_label(labeled, LABEL)
         await harness.sync(connector)
         assert len(await harness.live()) == 5, "an incremental sync cannot see a deletion"
 
@@ -434,8 +479,12 @@ async def test_adding_an_excluded_label_forces_a_complete_walk_and_reconciliatio
     narrow = await opened(harness, exclude_labels=[LABEL])
     try:
         assert narrow.scope_fingerprint != wide.scope_fingerprint
+        before = len(server.requests)
         report = await harness.sync(narrow)
+        walked = [r.url.path.removeprefix("/gmail/v1/users/me") for r in server.requests[before:]]
         assert report.error == ""
+        assert "/history" not in walked, "the stored position was discarded"
+        assert "/messages" in walked, "a complete walk under the new scope"
         assert set(await harness.live()) == {keep.id, drop.id}, "a walk removes nothing"
 
         result = await reconciled(harness, narrow)
@@ -446,6 +495,35 @@ async def test_adding_an_excluded_label_forces_a_complete_walk_and_reconciliatio
     assert set(await harness.live()) == {keep.id}
 
 
+async def test_narrowing_past_the_deletion_ceiling_waits_for_confirmation(
+    harness: Harness,
+) -> None:
+    server = harness.server
+    for number in range(6):
+        server.add_message(mail(f"Keep {number}"))
+    for number in range(4):
+        server.add_message(mail(f"Drop {number}"), labels=("INBOX", LABEL))
+    wide = await opened(harness)
+    try:
+        await harness.sync(wide)
+    finally:
+        await wide.teardown()
+    narrow = await opened(harness, exclude_labels=[LABEL])
+    try:
+        await harness.sync(narrow)
+        refused = await reconcile(narrow, harness.store)
+        assert refused.refused
+        assert len(await harness.live()) == 10, "nothing leaves until a person confirms"
+        applied = await confirm_proposed_deletion(
+            narrow.name, harness.store, scope=connector_scope(narrow)
+        )
+    finally:
+        await narrow.teardown()
+
+    assert applied.applied_count == 4
+    assert len(await harness.live()) == 6
+
+
 # --- diagnostics are aggregate (§10) -------------------------------------------------------------
 
 
@@ -454,12 +532,10 @@ async def test_no_surface_carries_an_address_a_subject_a_label_or_a_message_id(
 ) -> None:
     caplog.set_level(logging.DEBUG)
     server = harness.server
-    message = server.add_message(
-        mail(SUBJECT, message_id="<secret.id@example.org>"), labels=("INBOX", LABEL)
-    )
+    message = server.add_message(mail(SUBJECT, message_id="<secret.id@example.org>"))
     other = server.add_message(mail("Another subject"))
-    server.add_message(mail("Too big " + "x" * 5_000))
-    connector = await opened(harness, exclude_labels=["Receipts 2026"])
+    excluded = server.add_message(mail("Excluded subject"), labels=("INBOX", LABEL))
+    connector = await opened(harness, exclude_labels=[LABEL])
     surfaces: list[str] = []
     try:
         surfaces.append(json.dumps((await harness.sync(connector)).as_metadata(), default=str))
@@ -494,9 +570,11 @@ async def test_no_surface_carries_an_address_a_subject_a_label_or_a_message_id(
         "another subject",
         "secret.id",
         LABEL,
-        "receipts 2026",
+        "excluded subject",
+        server.label_id(LABEL),
         message.id,
         other.id,
+        excluded.id,
     ):
         assert secret.casefold() not in everything, secret
 
