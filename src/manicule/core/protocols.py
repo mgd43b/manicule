@@ -1362,8 +1362,12 @@ class BatchedDiscoveryConnector(Protocol):
 
     A batch is one bounded source response, not an arbitrary process-sized buffer.  Durable
     ingest can therefore commit every record in that response in one transaction before asking
-    the connector to follow its next cursor.  ``Connector.discover`` remains the mandatory
-    compatibility surface; connectors without expiring page cursors need not implement this.
+    the connector to follow its next cursor.  A batch larger than
+    :data:`~manicule.core.acquisition.MAX_DISCOVERY_BATCH` is admitted as consecutive slices of
+    at most that many, all before the next batch is asked for, so a connector yields its pages
+    whole whatever their size.
+    ``Connector.discover`` remains the mandatory compatibility surface; connectors without
+    expiring page cursors need not implement this.
     """
 
     def discover_batches(

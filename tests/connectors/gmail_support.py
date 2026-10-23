@@ -76,10 +76,14 @@ def mail(
     return built.as_bytes(policy=SMTP)
 
 
-def mailbox(**options: Any) -> tuple[FakeGmail, SimulatedTime]:
-    """A synthetic mailbox whose pacing and quota share one simulated clock."""
+def mailbox(*, page_size: int = 2, **options: Any) -> tuple[FakeGmail, SimulatedTime]:
+    """A synthetic mailbox whose pacing and quota share one simulated clock.
+
+    Pages of two by default, so every walk pages. A test about what a full page does asks for
+    Gmail's own size instead.
+    """
     time = SimulatedTime()
-    return FakeGmail(clock=time, page_size=2, **options), time
+    return FakeGmail(clock=time, page_size=page_size, **options), time
 
 
 def connector_over(

@@ -69,6 +69,7 @@ from manicule.connectors.errors import (
     SessionMissingError,
 )
 from manicule.core.acquisition import (
+    MAX_DISCOVERY_BATCH,
     UNSET,
     AcquiredSource,
     AcquisitionDiagnostic,
@@ -2223,13 +2224,23 @@ class IngestPipeline:
     async def _durable_discovery_batches(
         run: _Sync,
     ) -> AsyncGenerator[Sequence[DiscoveredDoc], None]:
-        """Normalize optional source pages while retaining cancellation-safe stream closure."""
+        """Normalize optional source pages while retaining cancellation-safe stream closure.
+
+        A source page larger than :data:`~manicule.core.acquisition.MAX_DISCOVERY_BATCH` — the
+        most one journal transaction admits — is yielded as consecutive slices of at most that
+        many, in order. All of them are admitted before the connector is asked for its next page,
+        so its cursor still waits for the whole page to be durable; what is atomic is a slice.
+        """
         connector = run.connector
         if isinstance(connector, BatchedDiscoveryConnector):
             source = connector.discover_batches(run.watermark)
             try:
                 async for batch in source:
-                    yield batch
+                    if len(batch) <= MAX_DISCOVERY_BATCH:
+                        yield batch
+                        continue
+                    for start in range(0, len(batch), MAX_DISCOVERY_BATCH):
+                        yield batch[start : start + MAX_DISCOVERY_BATCH]
             finally:
                 closer = getattr(source, "aclose", None)
                 if closer is not None:

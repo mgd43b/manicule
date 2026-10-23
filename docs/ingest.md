@@ -789,7 +789,7 @@ ingest × (parse_workers + 1)               parse in the pool, chunk, embed unde
 
 | Stage | Width | Where the bound comes from |
 |---|---|---|
-| discover → journal | 1 | One cursor; one source-native page (at most 250 Confluence records) commits atomically before its next cursor is requested |
+| discover → journal | 1 | One cursor; one source-native page commits before its next cursor is requested, in transactions of at most 250 records (`MAX_DISCOVERY_BATCH`); a larger page, as Gmail's can be, is admitted in slices |
 | journal reader | 1 | Waits for hand-off room, then reads one durable record |
 | fetch | `fetch_concurrency` (8) | One task per permitted in-flight fetch |
 | parse | at most `parse_workers + 1` attempts | The ingest workers are the only callers of the pool |
@@ -823,6 +823,9 @@ stages and costs only that one archive's serialization.
 Discovery does not feed the fetch queue. A connector with expiring page cursors exposes its
 source-native response boundary; the pipeline validates and admits that bounded page in one
 capacity-guarded transaction, then and only then asks the connector to follow `_links.next`.
+One transaction holds at most 250 records (`MAX_DISCOVERY_BATCH`); a larger page is admitted as
+consecutive slices of at most that many, in order, before the connector is asked for its next
+page, so what is atomic is a slice and the cursor still waits for the whole page.
 Connectors without that optional surface retain scalar admission. On true iterator exhaustion
 the pipeline atomically records the completion marker and
 the connector's candidate watermark. A limit, cancellation, cursor/source failure or journal
@@ -832,8 +835,8 @@ The page transaction preserves scalar identity semantics. Already-durable replay
 validated and reused; only novel identities receive contiguous sequence numbers. Record and
 metadata capacity are reserved as one aggregate delta against all unsettled runs across every
 workspace under the same `BEGIN IMMEDIATE` as the inserts. A refusal, lease loss, cancellation,
-process death or SQLite rollback therefore leaves the preceding full-page prefix, never half a
-page or a counter ahead of its rows. An all-old replay page is answered by the read path without
+process death or SQLite rollback therefore leaves the preceding full-slice prefix, never half a
+slice or a counter ahead of its rows. An all-old replay page is answered by the read path without
 opening a writer transaction.
 
 The defect this replaces held one Confluence cursor while every result in its page independently

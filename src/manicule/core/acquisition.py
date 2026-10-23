@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum, StrEnum
-from typing import Self
+from typing import Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -19,6 +19,14 @@ from manicule.core.content import Metadata, RawDocument
 from manicule.core.ids import content_hash
 from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
+
+MAX_DISCOVERY_BATCH: Final = 250
+"""The most records one durable discovery batch may carry.
+
+The journal admits a batch in one writer transaction, so this bounds what one transaction holds
+and what the live record buffer can grow to. Durable ingest admits a larger source page as
+consecutive slices of at most this many, all before the connector is asked for its next page.
+"""
 
 
 class AcquisitionRunState(StrEnum):
@@ -347,6 +355,7 @@ class AcquisitionRecord(BaseModel):
 
 
 __all__ = [
+    "MAX_DISCOVERY_BATCH",
     "UNSET",
     "AcquiredSource",
     "AcquisitionDiagnostic",
