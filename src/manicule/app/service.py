@@ -106,12 +106,14 @@ from manicule.core.version import CORE_VERSION
 from manicule.ingest.knowledge import check as check_knowledge
 from manicule.ingest.reconcile import standing
 from manicule.ingest.reindex import DEFAULT_SWEEP_BATCH
+from manicule.ingest.sweeps import PURGE_DETAIL
 from manicule.parsers.front_matter import FRONT_MATTER_FENCE, front_matter_end
 from manicule.research.config import ResearchLimits
 
 # Two names, no engine: `storage.config` imports nothing heavier than pydantic, so the service
 # can say which backend it read from without acquiring a database to ask.
 from manicule.storage.config import VECTOR_STORE_NAME
+from manicule.storage.history import RESTORED_AFTER_PURGE_DETAIL
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
@@ -2880,6 +2882,11 @@ class ApplicationService:
         policy having done its job, and re-syncing is also the answer but the operator should
         not go looking for a misconfiguration first.
         """
+        if document.original_ref is None and document.status_detail in _PURGED_DETAILS:
+            return _Body(
+                reason="released: this document was purged after its soft-delete grace period "
+                "and its retained bytes were given back with it. Re-sync to fetch them again."
+            )
         if document.original_ref is None:
             return _Body(
                 reason="never retained: storage.retain_source_bytes was off when this "
@@ -8836,6 +8843,10 @@ def _with_placement(payload: r.IngestReport, placement: tuple[int, int] | None) 
     if placement is None:
         return payload
     return payload.model_copy(update={"collected": placement[0], "uncollected": placement[1]})
+
+
+_PURGED_DETAILS = frozenset({PURGE_DETAIL, RESTORED_AFTER_PURGE_DETAIL})
+"""The ``status_detail`` values that say a document's retained bytes were released by the purge."""
 
 
 def _last_pass(state: ReconciliationStanding) -> str:

@@ -382,3 +382,24 @@ async def test_collection_with_an_age_floor_leaves_a_fresh_unreferenced_blob_alo
     assert blobs.path_for(fresh.ref).exists()
 
     assert await blobs.collect_garbage() == [fresh.ref]
+
+
+async def test_writing_identical_bytes_again_restarts_the_age_floor(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """A re-ingest of bytes an earlier document orphaned must not find them collectable."""
+    blobs = BlobStore(engine, data_dir)
+    first = await blobs.retain(b"bytes an earlier document once held", "text/plain")
+    assert first.ref is not None
+    async with session_factory(engine).begin() as session:
+        await session.execute(
+            update(models.Blob)
+            .where(models.Blob.hash == first.ref)
+            .values(created_at=datetime.now(UTC) - timedelta(days=2))
+        )
+
+    again = await blobs.retain(b"bytes an earlier document once held", "text/plain")
+
+    assert again.ref == first.ref
+    assert await blobs.collect_garbage(min_age_s=24 * 3600.0) == []
+    assert blobs.path_for(first.ref).exists()

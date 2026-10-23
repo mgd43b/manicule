@@ -2474,6 +2474,9 @@ sweeps the vector store only grows.
    `Runtime.maintenance_window()`, and nothing else. Ingest and queries continue. If a pass is
    running the backup waits for it (60 seconds by default) and then refuses, saying a maintenance
    pass holds the lock; the wait never blocks the event loop.
+   The operator-run lifecycle operations that also remove data (`reset-index`, `reset-derived`,
+   `cleanup-derived-generations`, `release-source-history`, `snapshot-delete`) do not take the
+   lock; do not run one while a backup is copying.
 2. Snapshot SQLite with the online backup API (`sqlite3.Connection.backup()`) or
    `VACUUM INTO`. Both produce one consistent file from a live WAL database.
 3. Record `table.version` for the Lance table. Lance is versioned; this pins the instant.

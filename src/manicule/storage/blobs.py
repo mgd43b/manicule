@@ -577,6 +577,12 @@ class BlobStore:
                     "size_bytes": stored.size_bytes,
                     "stored_bytes": stored.stored_bytes,
                     "compression": stored.compression,
+                    # Writing identical bytes again is a write. The age floor on collection
+                    # (``collect_garbage(min_age_s=...)``) protects a blob a publication is about
+                    # to reference, and without this refresh a re-ingest of bytes an earlier
+                    # document orphaned would find the old row already past the floor and
+                    # unreferenced — collectable in the window before the new document commits.
+                    "created_at": datetime.now(UTC),
                 },
             )
         )
@@ -1823,7 +1829,8 @@ class BlobStore:
         that: the scheduled sweep passes a day, and the default of zero keeps the immediate
         collection that callers with no concurrent writer — tests, an offline repair — want.
         Intents already in progress are finished regardless of age. The age is the descriptor's
-        ``created_at``, which a later ``put`` of identical bytes does not refresh.
+        ``created_at``, which a later ``put`` of identical bytes refreshes, so the window is
+        measured from the latest write of the bytes and not the first.
 
         The descriptor remains capacity-accounting state while the owned file is unlinked and
         its parent directory fsynced. Only then is the row removed. A failed deletion therefore

@@ -606,3 +606,42 @@ def test_confirming_on_a_store_without_a_journal_distinguishes_nothing_pending()
     assert not some.refused
     assert some.applied_count == 2
     assert some.deleted == (), "ids stop at this seam"
+
+
+async def test_a_purged_document_says_its_bytes_were_released_rather_than_never_kept() -> None:
+    """Retention being off is a setting to change; a release is the policy having worked."""
+    from manicule.core.content import DocumentStatus  # noqa: PLC0415
+    from manicule.ingest.sweeps import PURGE_DETAIL  # noqa: PLC0415
+    from manicule.storage.history import RESTORED_AFTER_PURGE_DETAIL  # noqa: PLC0415
+
+    service, backend = service_with()
+    purged = backend.store.add(
+        make_document(
+            backend.workspace,
+            source="wiki",
+            source_id="gone.md",
+            status=DocumentStatus.DELETED,
+            status_detail=PURGE_DETAIL,
+        )
+    )
+    restored = backend.store.add(
+        make_document(
+            backend.workspace,
+            source="wiki",
+            source_id="back.md",
+            status=DocumentStatus.PENDING,
+            status_detail=RESTORED_AFTER_PURGE_DETAIL,
+        )
+    )
+    never = backend.store.add(make_document(backend.workspace, source="wiki", source_id="off.md"))
+
+    reasons = {
+        handle.source_id: (
+            await service.document_resolve(source="wiki", source_id=handle.source_id, content=True)
+        ).unavailable_reason
+        for handle in (purged, restored, never)
+    }
+
+    assert reasons["gone.md"].startswith("released")
+    assert reasons["back.md"].startswith("released")
+    assert reasons["off.md"].startswith("never retained")

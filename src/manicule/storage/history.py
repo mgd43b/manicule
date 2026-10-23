@@ -55,6 +55,14 @@ collection, the pass that then deletes the files, *is* scheduled: ``docs/storage
 and a setting nothing reads is a promise nothing keeps.
 """
 
+RESTORED_AFTER_PURGE_DETAIL = "restored from the trash after the sweep purged its content"
+"""The ``status_detail`` of a purged document that was brought back without its content.
+
+Named because the service reads it: a purged row's ``original_omitted_reason`` is not on the
+:class:`~manicule.core.content.Document` a surface holds, but this detail is, and it is how a
+caller tells "the bytes were released" from "retention was off".
+"""
+
 RELEASED_AFTER_GRACE_REASON = "bytes released after the soft-delete grace period expired"
 """The ``documents.original_omitted_reason`` :meth:`TrashMixin.purge_document` records.
 
@@ -487,7 +495,7 @@ class TrashMixin(WorkspaceScoped):
             # is exactly what that state means elsewhere: nothing has claimed it, retrieval does
             # not serve it, and a repair pass selects it.
             row.status = DocumentStatus.PENDING
-            row.status_detail = "restored from the trash after the sweep purged its content"
+            row.status_detail = RESTORED_AFTER_PURGE_DETAIL
             row.failed_stage = None
             return Restoration(
                 document_id=document_id,
