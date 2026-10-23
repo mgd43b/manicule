@@ -16,11 +16,10 @@ to bound how long deleted mail stays searchable. Fetches are paced under Gmail's
 about a hundred raw messages a minute, so a first sync of a large mailbox takes hours.
 
 Read [`connectors/gmail.md`](connectors/gmail.md) §9 and §10 before pointing this at a real
-mailbox: whoever can search the workspace reads every message, and
-`manicule connector login` ([#461](https://github.com/mgd43b/manicule/issues/461)) and the refusal
-to serve a mailbox with authentication off ([#462](https://github.com/mgd43b/manicule/issues/462))
-are not built yet. Until they are, keep a Gmail source in a workspace of its own and serve it with
-authentication on.
+mailbox: whoever can search the workspace reads every message, so keep a Gmail source in a
+workspace of its own. `manicule connector login`
+([#461](https://github.com/mgd43b/manicule/issues/461)) is not built yet; until it is, the refresh
+token comes from the environment.
 
 Configuration, the credential and a check in `manicule doctor` shipped first:
 

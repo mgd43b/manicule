@@ -60,11 +60,10 @@ applies when parsing, middleware or chunking concludes that a document has no ch
 > [!IMPORTANT]
 > **Five sources are built**: a local directory tree, Confluence (live, or from a directory of
 > mirrored pages), a pinned Git checkout of a site you own, and a Google Workspace mailbox. Gmail
-> is read-only and syncs from Gmail's own change log, but `manicule connector login` for it
-> ([#461](https://github.com/mgd43b/manicule/issues/461)) and the refusal to serve a mailbox
-> without authentication ([#462](https://github.com/mgd43b/manicule/issues/462)) are not built
-> yet, so a refresh token comes from the environment and a Gmail source belongs in a
-> workspace served with authentication on
+> is read-only and syncs from Gmail's own change log, and an installation holding a mailbox
+> refuses to be served without authentication. `manicule connector login` for it
+> ([#461](https://github.com/mgd43b/manicule/issues/461)) is not built yet, so a refresh token comes
+> from the environment
 > ([`docs/connectors/gmail.md`](docs/connectors/gmail.md), tracked in
 > [#464](https://github.com/mgd43b/manicule/issues/464)). Seven more — GitHub, Notion,
 > Drive, S3/GCS, Swagger, an HTTP crawler and web search — are designed in
@@ -446,7 +445,8 @@ Authoring is the one exception because it is bounded by configuration an operato
 than by arguments a caller sends, and it is off until that configuration exists. Authentication
 decides who may *call* that write, never whether the socket carries it; a socket serving
 configured authoring without authentication refuses to start unless `--no-authentication` says
-otherwise. Over stdio, where one client talks to one process down
+otherwise (team mode, and an installation holding a Gmail mailbox, refuse to serve without
+authentication whatever is typed). Over stdio, where one client talks to one process down
 a pipe, the whole surface is offered. `docs/surfaces.md` §6.1 says why.
 
 `/api/docs` is Swagger over the OpenAPI document at `/api/openapi.json`. Every response is the
@@ -543,7 +543,7 @@ Four refusals are worth knowing before you call it:
 | **Unconfigured** | Both settings empty is the default, and means authoring is off. The tool is offered on every surface and refuses every call, naming the settings it needs. |
 | **An unlisted collection** | Refused even when the workspace has it — so creating a collection is not also the act of granting write access to it. |
 | **A slug already taken** | Refused unless `overwrite` is passed, and the refusal names the document that holds it. A file nothing has indexed counts as holding it too. |
-| **A socket with no authentication** | Refuses to *start*, loopback included — so a corpus is never exposed by forgetting a setting. `manicule serve --no-authentication` waives it deliberately, for a network you own: the socket then serves authoring to anything that can route to it, and says so at startup naming the corpus. |
+| **A socket with no authentication** | Refuses to *start*, loopback included — so a corpus is never exposed by forgetting a setting. `manicule serve --no-authentication` waives it deliberately, for a network you own: the socket then serves authoring to anything that can route to it, and says so at startup naming the corpus. It waives no other refusal: team mode and a sensitive source (a Gmail mailbox) still refuse to serve without authentication. |
 
 If the file is written and the index then declines it, **the file is kept** and the result says
 so with the path — the content is not lost, and a later sync indexes it.
@@ -782,7 +782,9 @@ and authentication switched on — or a second flag, also reachable from no conf
 operator accepts serving without it. Any one missing is a refusal, and what that second flag
 produces is a surface anyone who can route to it may read — and, where authoring is configured,
 write into. That is the deployment it exists for, and it is said out loud at startup naming the
-corpus. That is a claim about what
+corpus. Two installations cannot use that flag at all: team mode, and one that holds a sensitive
+source such as a Gmail mailbox, are refused without authentication on every address, loopback
+included. That is a claim about what
 listens, not about what this process dials: a `qdrant` vector store reaches out to
 `storage.vector_db_url` the same way a remote generator or a connector does, and it is
 `Settings.policy_problems()` — not this rule — that refuses the connection when the data

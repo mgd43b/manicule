@@ -147,6 +147,18 @@ class DocumentSurface(Protocol):
 
     async def delete_document(self, document_id: str) -> None: ...
 
+    async def marked_sensitive_sources(self) -> frozenset[str]:
+        """Sources of this workspace a sensitive connector has synced."""
+        ...
+
+    async def mark_source_sensitive(self, connector: str) -> None:
+        """Record, once and for good, that a sensitive connector has synced this source."""
+        ...
+
+    async def delete_source_documents(self, source: str) -> int:
+        """Hard-delete this workspace's documents from ``source`` in every state; the count."""
+        ...
+
     async def soft_delete_document(self, document_id: str) -> None: ...
 
     async def document_statistics(self) -> Mapping[str, Mapping[str, int]]:

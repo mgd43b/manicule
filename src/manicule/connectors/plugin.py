@@ -307,6 +307,9 @@ class ConnectorsPlugin:
             config_model=GmailConfig,
             summary="A Google Workspace mailbox, read-only: history-based sync, raw messages, "
             "scoped by label id, with deletions removed by complete reconciliation.",
+            # The index is not permission-aware, so an installation holding mail must never be
+            # served without authentication (`docs/connectors/gmail.md` §10).
+            sensitive=True,
         )
 
 

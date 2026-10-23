@@ -287,6 +287,7 @@ WRITERS: frozenset[str] = frozenset(
         # other way would have an ingest running without the lock.
         "document_create",
         "document_delete",
+        "document_delete_source",
         "document_redetect_glossary",
         "document_rescan_relations",
         "document_reembed",

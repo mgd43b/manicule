@@ -482,6 +482,37 @@ def test_reset_index_runs_when_confirmed(bound: ApplicationService) -> None:
     assert json.loads(result.stdout)["op"] == "reset_index"
 
 
+def test_delete_source_refuses_without_yes_and_deletes_nothing(
+    bound: ApplicationService, service: ApplicationService
+) -> None:
+    """A bulk, unrecoverable delete is confirmed by the invocation, and says it did nothing."""
+    result = run(["document", "delete-source", "local"])
+    assert result.exit_code != 0
+    assert "nothing was deleted" in result.output.replace("\n", " ")
+    assert asyncio.run(bound.document_list()).documents, "the document is still there"
+    del service
+
+
+def test_delete_source_with_yes_submits_the_operation(bound: ApplicationService) -> None:
+    result = run(["--json", "document", "delete-source", "local", "--yes"])
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.stdout)
+    assert envelope["op"] == "document_delete_source"
+    assert envelope["data"] == {"source": "local", "deleted": 1}
+    assert not asyncio.run(bound.document_list()).documents
+
+
+def test_delete_source_renders_the_count_and_that_there_is_no_restore(
+    bound: ApplicationService,
+) -> None:
+    del bound
+    result = run(["document", "delete-source", "local", "--yes"])
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "deleted 1 document(s) from source local" in text
+    assert "no restore" in text
+
+
 def test_backup_refuses_a_request_that_is_both_a_backup_and_a_restore(
     bound: ApplicationService,
 ) -> None:
@@ -2652,6 +2683,7 @@ MINIMAL: dict[str, list[str]] = {
     # command needs, run against a backend that will usually decline them.
     "document_create": ["document", "create", "memory", "retry-policy"],
     "document_delete": ["document", "delete", "doc-1"],
+    "document_delete_source": ["document", "delete-source", "mail", "--yes"],
     "document_redetect_glossary": ["document", "reindex", "--stale-glossary"],
     "document_rescan_relations": ["document", "reindex", "--stale-relations"],
     "document_reindex": ["document", "reindex", "doc-1"],

@@ -481,5 +481,6 @@ is a feature list entry, not a feature.
   names the rest; there is deliberately no query setting. A message that is deleted, trashed,
   marked spam or given an excluded label leaves the index at the next reconciliation. `account`
   pins the mailbox, and a token for any other is refused. Listed by `connector list` like any
-  other source, which reports counts only. Not built: `connector login` for Gmail (#461) and
-  refusing to serve a mailbox with authentication off (#462). `docs/connectors/gmail.md`.
+  other source, which reports counts only. An installation that holds a mailbox
+  refuses to serve with authentication off (#462). Not built: `connector login` for Gmail (#461).
+  `docs/connectors/gmail.md`.

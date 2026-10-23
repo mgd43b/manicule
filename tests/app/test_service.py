@@ -291,6 +291,32 @@ async def test_a_hard_delete_is_asked_for_explicitly(
     assert backend.store.deleted == [(document_id, "hard")]
 
 
+async def test_deleting_a_source_hard_deletes_its_documents_and_counts_them(
+    service: ApplicationService, backend: FakeBackend
+) -> None:
+    """The connector need not exist: the source is a name, and its rows are what is removed."""
+    other = make_document(backend.workspace, source="other", source_id="keep.md")
+    backend.store.add(other, make_chunk(other))
+    mine = next(iter(backend.store.documents))
+
+    outcome = await service.document_delete_source("local")
+
+    assert outcome == r.SourceDocumentsDeleted(source="local", deleted=1)
+    assert backend.store.deleted == [(mine, "hard")]
+    assert set(backend.store.documents) == {other.id}
+    assert (await service.document_delete_source("local")).deleted == 0
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+async def test_deleting_a_source_refuses_a_blank_name(
+    service: ApplicationService, backend: FakeBackend, blank: str
+) -> None:
+    """A blank name matches nothing useful, and an unguarded one is the shape of a wildcard."""
+    with pytest.raises(ValueError, match="source name is required"):
+        await service.document_delete_source(blank)
+    assert backend.store.deleted == []
+
+
 async def test_reindexing_reports_what_could_not_be_repaired(
     service: ApplicationService, backend: FakeBackend
 ) -> None:
