@@ -9,11 +9,15 @@ the second copy of an answer is the one that drifts.
 lockstep; one self-hosted index syncing one source is not a fleet, and a deterministic delay is
 one a test can assert on.
 
+The crawler's transport keeps its own, stricter parser on purpose: it refuses a malformed
+header outright, where these fall back to :func:`backoff`.
+
 **Nothing here imports an HTTP client**, so importing it costs no HTTP stack.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -45,13 +49,15 @@ def retry_after(headers: Mapping[str, str]) -> float | None:
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        delay = float(value)
     except ValueError:
-        pass
-    try:
-        when = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return max(0.0, (when - datetime.now(tz=UTC)).total_seconds())
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        delay = (when - datetime.now(tz=UTC)).total_seconds()
+    # ``nan`` compares false with everything, so it would pass for a zero-second wait and retry
+    # straight into the limit; a header that is not a number of seconds is no instruction.
+    return max(0.0, delay) if math.isfinite(delay) else None

@@ -6,6 +6,7 @@ transport, so the real pacer, retry loop and query encoding are what is under te
 
 from __future__ import annotations
 
+import asyncio
 import email
 import email.policy
 import json
@@ -584,6 +585,22 @@ async def test_a_body_that_is_not_base64url_is_a_connector_error() -> None:
         await client.teardown()
 
 
+async def test_a_message_with_no_id_is_refused_rather_than_sent_as_a_listing() -> None:
+    """``/messages/`` is the listing endpoint; an empty id must never reach the wire."""
+    time = SimulatedTime()
+    server = _server(time)
+    client, _ = await _client(server, time)
+    try:
+        with pytest.raises(ConnectorError, match="no id"):
+            await client.get_raw("")
+        with pytest.raises(ConnectorError, match="no id"):
+            await client.get_minimal("")
+    finally:
+        await client.teardown()
+
+    assert server.requests == []
+
+
 async def test_no_error_carries_a_message_id_an_address_or_a_label_name() -> None:
     """``docs/connectors/gmail.md`` §10: a log line must not name what was in the mailbox."""
     time = SimulatedTime()
@@ -693,6 +710,20 @@ async def test_a_simulated_minute_of_raw_fetching_stays_inside_the_budget_on_the
     # 300 fetches at 90 a minute: bursts at t = 0, 60, 120 and 180.
     assert time.now == 180.0
     assert client.throttled == 0
+
+
+async def test_concurrent_fetchers_share_one_budget() -> None:
+    time = SimulatedTime()
+    server = _server(time)
+    messages = [server.add_message() for _ in range(200)]
+    client, _ = await _client(server, time)
+    try:
+        await asyncio.gather(*(client.get_raw(message.id) for message in messages))
+    finally:
+        await client.teardown()
+
+    assert server.overruns == 0
+    assert server.peak_units <= 5400
 
 
 async def test_a_smaller_budget_is_honored() -> None:

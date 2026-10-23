@@ -39,7 +39,6 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 from urllib.parse import quote
 
-from manicule.connectors.client import BoundedHistory
 from manicule.connectors.errors import (
     ConnectorError,
     CursorExpiredError,
@@ -361,6 +360,7 @@ class GmailClient:
             NotFoundError: The message was deleted between discovery and fetch.
         """
         operation = "users.messages.get"
+        _require_id(message_id, operation)
         payload = await self._get(
             operation,
             f"/messages/{quote(message_id, safe='')}",
@@ -370,8 +370,12 @@ class GmailClient:
         )
         encoded = _text(payload, "raw", operation)
         try:
-            # Gmail omits the base64 padding; urlsafe_b64decode insists on it.
-            return base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            # Gmail omits the base64 padding, which the decoder insists on. ``validate`` is what
+            # makes a stray character an error: left off, the decoder discards it and returns
+            # a message with bytes missing, which would be parsed, cited and answered from.
+            return base64.b64decode(
+                encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True
+            )
         except (binascii.Error, ValueError):
             msg = f"Gmail {operation} returned a body that is not base64url"
             raise ConnectorError(msg) from None
@@ -383,6 +387,7 @@ class GmailClient:
             NotFoundError: The message no longer exists.
         """
         operation = "users.messages.get"
+        _require_id(message_id, operation)
         payload = await self._get(
             operation,
             f"/messages/{quote(message_id, safe='')}",
@@ -438,28 +443,28 @@ class GmailClient:
         A token seen twice is a loop, and a loop over a paginated listing reads as a very large
         mailbox, so it is refused rather than followed.
         """
-        seen = BoundedHistory()
+        # Tokens are short and a walk is hundreds of pages, so a set is enough; the disk-backed
+        # guard the Confluence client uses exists for walks whose size the source chooses.
+        seen: set[str] = set()
         token: str | None = None
-        try:
-            while True:
-                query = [*params, ("pageToken", token)] if token is not None else params
-                payload = await self._get(operation, path, query, cost, missing=missing)
-                yield payload
-                following = payload.get("nextPageToken")
-                if not following:
-                    return
-                if not isinstance(following, str):
-                    msg = f"Gmail {operation} returned a page token that is not text"
-                    raise ConnectorError(msg)
-                if not seen.add(following):
-                    msg = (
-                        f"Gmail {operation} sent pagination back to a page it had already "
-                        f"followed; continuing would repeat results forever"
-                    )
-                    raise ConnectorError(msg)
-                token = following
-        finally:
-            seen.close()
+        while True:
+            query = [*params, ("pageToken", token)] if token is not None else params
+            payload = await self._get(operation, path, query, cost, missing=missing)
+            yield payload
+            following = payload.get("nextPageToken")
+            if not following:
+                return
+            if not isinstance(following, str):
+                msg = f"Gmail {operation} returned a page token that is not text"
+                raise ConnectorError(msg)
+            if following in seen:
+                msg = (
+                    f"Gmail {operation} sent pagination back to a page it had already "
+                    f"followed; continuing would repeat results forever"
+                )
+                raise ConnectorError(msg)
+            seen.add(following)
+            token = following
 
     async def _get(
         self,
@@ -584,6 +589,13 @@ class GmailClient:
             msg = "GmailClient.setup() was not called before the first request"
             raise ConnectorError(msg)
         return self._client
+
+
+def _require_id(message_id: str, operation: str) -> None:
+    """Refuse an empty id: ``/messages/`` is the listing endpoint, and would answer as one."""
+    if not message_id:
+        msg = f"Gmail {operation} was asked for a message with no id"
+        raise ConnectorError(msg)
 
 
 def _mapping(value: object) -> Json | None:

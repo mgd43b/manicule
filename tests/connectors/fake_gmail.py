@@ -203,7 +203,7 @@ class FakeGmail:
         self.loop_pagination = False
         """Send ``messages.list`` pagination back to the first page's token."""
         self.corrupt_raw = False
-        """Answer ``format=raw`` with a body that is not base64url."""
+        """Answer ``format=raw`` with a stray character in the middle of the base64url."""
         self.rejecting_all_tokens = False
         """Answer 401 to every token, however freshly minted."""
         self.peak_units = 0
@@ -486,11 +486,10 @@ class FakeGmail:
             body["labelIds"] = list(message.label_ids)
         if shape == "raw":
             # Gmail's base64url omits the padding.
-            body["raw"] = (
-                "!!not base64!!"
-                if self.corrupt_raw
-                else base64.urlsafe_b64encode(message.raw).decode().rstrip("=")
-            )
+            encoded = base64.urlsafe_b64encode(message.raw).decode().rstrip("=")
+            # One stray character inside otherwise valid base64: the kind of damage a lenient
+            # decoder discards without a word, returning a message with bytes missing.
+            body["raw"] = encoded[:8] + "*" + encoded[8:] if self.corrupt_raw else encoded
         elif shape != "minimal":
             return httpx.Response(400, json=_error(400, "INVALID_ARGUMENT", "invalidArgument"))
         return httpx.Response(200, json=body)
