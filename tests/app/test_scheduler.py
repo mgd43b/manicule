@@ -185,7 +185,7 @@ async def test_the_vector_sweep_runs_on_cadence_without_a_command_being_typed() 
     loop above.
     """
     service, ingestion = service_with({})
-    ingestion.vector_sweep = SweepResult(vectors_removed=7, documents_purged=2)
+    ingestion.vector_sweep = SweepResult(vectors_removed=7, documents_purged=2, blobs_collected=5)
     clock = Clock()
     scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
 
@@ -203,6 +203,7 @@ async def test_the_vector_sweep_runs_on_cadence_without_a_command_being_typed() 
     assert scheduler.sweeps is not None
     assert scheduler.sweeps.vectors_removed == 7
     assert scheduler.sweeps.documents_purged == 2
+    assert scheduler.sweeps.blobs_collected == 5
     assert scheduler.sweeps.failures == 0
 
 

@@ -3244,13 +3244,16 @@ async def test_the_vector_sweep_carries_the_settings_that_bound_it(
     """
     service.settings.ingest.sweep_batch = 11
     service.settings.ingest.soft_delete_grace_s = 5.0
-    backend.ingestion_.vector_sweep = SweepResult(vectors_removed=4, documents_purged=1)
+    backend.ingestion_.vector_sweep = SweepResult(
+        vectors_removed=4, documents_purged=1, blobs_collected=3
+    )
 
     report = await service.sweep_vectors()
 
     assert backend.ingestion_.vector_sweeps == [(11, 5.0)]
     assert report.vectors_removed == 4
     assert report.documents_purged == 1
+    assert report.blobs_collected == 3
     assert report.ran
     assert not report.blocked_by
 

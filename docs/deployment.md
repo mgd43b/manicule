@@ -169,6 +169,13 @@ the derived stores can only ever be *ahead* of the database snapshot, never behi
 manifest records the schema revision, the embedding and chunking fingerprints and an inventory.
 `manicule backup --restore <dir>` puts one back.
 
+A backup takes `<data_dir>/backup.lock` exclusively for as long as it copies. A served process's
+scheduled sweep — which purges soft-deleted documents and deletes retained files nothing
+references — holds the same lock shared while it runs, so a backup started during a pass waits
+for it, for up to a minute, and then refuses with a message saying a maintenance pass holds the
+lock; a pass that finds a backup running declines and tries again at its next interval. Ingest
+and queries are not affected (`storage.md` §9.1).
+
 That "vector table" is `vectors/`, and under `storage.vector_db = "qdrant"` it holds nothing to
 copy (§1, §2): the collection lives on the Qdrant server, off this filesystem, and `backup`
 never reaches out to it. A Qdrant-configured snapshot is therefore the authority and the

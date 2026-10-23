@@ -13,6 +13,13 @@ are three files captured at three instants, and a checkpoint landing between the
 result that will not open. :meth:`sqlite3.Connection.backup` is in the standard library and is
 correct against a live database.
 
+**A backup holds the backup lock, and the passes that remove data decline while it does.**
+The vector sweep (which also purges soft-deleted documents) and blob garbage collection are the
+only operations that remove data a snapshot reads, and :func:`create_backup` takes
+:mod:`manicule.storage.backup_lock` exclusively around the whole copy. The lock is an ``flock``
+on a file in the data directory rather than anything in memory, because ``backup`` runs in the
+command line's own process and the sweep runs in the server's.
+
 **A backup is a second copy of the corpus, and it is checked as one.** With retained source
 bytes a snapshot is byte-identical to what the connectors fetched (``docs/storage.md`` §7.1),
 so where it lands is a security decision rather than a filing one. :func:`create_backup`
@@ -28,6 +35,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from contextlib import AsyncExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +45,7 @@ from sqlalchemy import func, select
 
 from manicule.core.errors import ManiculeError
 from manicule.storage import models
+from manicule.storage.backup_lock import DEFAULT_WAIT_S, MaintenanceBusyError, backup_lock
 from manicule.storage.engine import (
     BLOBS_DIRNAME,
     VECTORS_DIRNAME,
@@ -115,12 +124,15 @@ async def create_backup(
     target: Path,
     *,
     allow_insecure_target: bool = False,
+    lock_wait_s: float = DEFAULT_WAIT_S,
 ) -> dict[str, Any]:
     """Snapshot a data directory into ``target``, and return the manifest.
 
-    The order is load-bearing and is argued in the module docstring. Callers must hold
-    whatever lock stops the vector sweep and the blob GC — those are the only two operations
-    that remove data, and they are the only two a hot backup has to exclude.
+    The order is load-bearing and is argued in the module docstring. The backup lock
+    (:func:`manicule.storage.backup_lock.backup_lock`) is taken here, exclusively, for the whole
+    snapshot: the vector sweep and the blob GC are the only two operations that remove data, and
+    they are the only two a hot backup has to exclude, so a caller has nothing to arrange. A
+    pass already running is waited for, up to ``lock_wait_s``.
 
     Args:
         engine: The live engine, used to read counts and the migration revision.
@@ -130,30 +142,51 @@ async def create_backup(
             :func:`manicule.storage.engine.secure_output_dir`.
         allow_insecure_target: Write into a group- or world-readable target anyway. Off by
             default, and the default is the point.
+        lock_wait_s: How long to wait for a running sweep or blob collection to finish before
+            refusing. A parameter so a test does not have to wait the default out.
 
     Returns:
         The manifest, as written.
 
     Raises:
-        BackupError: The target is unusable, or the database is missing.
+        BackupError: The target is unusable, the database is missing, or a maintenance pass
+            (or another backup) still held the backup lock when ``lock_wait_s`` ran out.
         InsecureTargetError: The target is group- or world-readable and
             ``allow_insecure_target`` was not given. A separate type because it describes the
             destination rather than the backup, and ``export`` raises the same one.
     """
-    revision = await current(engine)
-    counts = await _counts(engine)
-    index_state = await _index_state(engine)
-    # The filesystem work is blocking, and a backup copies the whole corpus. Running it on the
-    # event loop would stall every concurrent query for the duration.
-    return await asyncio.to_thread(
-        _write_snapshot,
-        data_dir,
-        target,
-        revision,
-        counts,
-        index_state,
-        allow_insecure_target=allow_insecure_target,
-    )
+    # Before the lock, so pointing this at a directory that is not a data directory refuses
+    # without leaving a lock file behind in it.
+    _require_database(data_dir)
+    async with AsyncExitStack() as held:
+        try:
+            await held.enter_async_context(backup_lock(data_dir, wait_s=lock_wait_s))
+        except MaintenanceBusyError as error:
+            raise BackupError(str(error)) from error
+        except OSError as error:
+            msg = f"the backup lock in {data_dir} could not be taken: {error}"
+            raise BackupError(msg) from error
+        revision = await current(engine)
+        counts = await _counts(engine)
+        index_state = await _index_state(engine)
+        # The filesystem work is blocking, and a backup copies the whole corpus. Running it on
+        # the event loop would stall every concurrent query for the duration.
+        return await asyncio.to_thread(
+            _write_snapshot,
+            data_dir,
+            target,
+            revision,
+            counts,
+            index_state,
+            allow_insecure_target=allow_insecure_target,
+        )
+
+
+def _require_database(data_dir: Path) -> None:
+    source_db = database_path(data_dir)
+    if not source_db.exists():
+        msg = f"no database at {source_db}; this is not a manicule data directory"
+        raise BackupError(msg)
 
 
 def _write_snapshot(
@@ -166,10 +199,8 @@ def _write_snapshot(
     allow_insecure_target: bool,
 ) -> dict[str, Any]:
     """The blocking half of :func:`create_backup`, in snapshot order."""
+    _require_database(data_dir)
     source_db = database_path(data_dir)
-    if not source_db.exists():
-        msg = f"no database at {source_db}; this is not a manicule data directory"
-        raise BackupError(msg)
     if target.exists() and any(target.iterdir()):
         msg = f"backup target is not empty: {target}"
         raise BackupError(msg)

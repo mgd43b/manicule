@@ -2324,8 +2324,9 @@ def sweep_vectors() -> None:
 
     One bounded pass of `ingest.sweep_batch` tombstones. Running it again resumes; running it
     against a clean index does nothing. It also purges documents whose soft-delete grace period
-    has expired, after which restoring one costs a re-parse from retained bytes rather than
-    being free.
+    has expired and releases the source bytes they retained, after which restoring one costs a
+    re-sync rather than being free, and it ends by deleting retained files nothing references
+    any more.
     """
     submit(Command("vector_sweep", {}))
 

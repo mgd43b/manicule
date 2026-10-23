@@ -381,7 +381,31 @@ class IngestStore(Protocol):
         ...
 
     async def soft_deleted_before(self, cutoff: datetime, *, limit: int) -> Sequence[str]:
-        """Ids of documents soft-deleted before ``cutoff``, whose grace period has expired."""
+        """Ids of documents soft-deleted before ``cutoff`` whose content has not been purged.
+
+        Documents already purged are excluded, which is what makes the sweep terminate.
+        """
+        ...
+
+    async def purge_document(
+        self, document_id: str, *, reason: str, deleted_before: datetime | None = None
+    ) -> bool:
+        """Finish a soft delete in one transaction, and say whether it did.
+
+        Deletes the document's chunks, marks it ``deleted`` with ``reason`` as the detail, and
+        releases the retained bytes: ``original_ref`` is cleared on the document and on every
+        one of its versions, and ``original_omitted_reason`` records that they were released
+        rather than never kept. One transaction because ``soft_deleted_before`` skips ``deleted``
+        documents — a crash between the status and the release would otherwise never retry.
+
+        The soft-delete check is made inside the same transaction as the write, so a restore
+        that lands after the sweep selected the document wins: nothing is changed and the
+        answer is ``False``. ``deleted_before`` makes the same check against the cutoff the
+        sweep used, so a document restored and deleted again is not purged with no grace period.
+
+        Returns:
+            ``True`` if the document was purged, ``False`` if there was nothing to purge.
+        """
         ...
 
 

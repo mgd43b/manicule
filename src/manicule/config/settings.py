@@ -1077,8 +1077,11 @@ class IngestSettings(Section):
         default=30 * 24 * 3600.0,
         ge=0,
         description="How long a soft-deleted document's chunks survive before the sweep "
-        "purges them. Free restore inside it; a re-parse from retained bytes outside it. "
-        "Unbounded free restore would mean unbounded dilution of every vector search.",
+        "purges them. Free restore inside it; a re-sync from the source outside it, because "
+        "the purge also releases the document's retained source bytes (the files are deleted "
+        "once the acquisition journal has let go of them too). Applies to every soft-deleted "
+        "document. Unbounded free restore would mean unbounded dilution of every vector "
+        "search.",
     )
     sweep_interval_s: float = Field(
         default=3600.0,

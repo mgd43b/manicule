@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     )
     from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
+    from manicule.storage.backup_lock import MaintenanceHold
     from manicule.storage.docstore import SqliteDocStore
     from manicule.storage.reembed import (
         LanceShadowGenerations,
@@ -432,6 +433,53 @@ class Runtime:
                 yield
             finally:
                 _DERIVED_MUTATION_GUARDS.reset(token)
+
+    @asynccontextmanager
+    async def maintenance_hold(self) -> AsyncGenerator[MaintenanceHold]:
+        """Hold the data directory's backup lock shared, without waiting, for the body.
+
+        The primitive under :meth:`maintenance_window` and the scheduled sweep, yielding the
+        :class:`~manicule.storage.backup_lock.MaintenanceHold` itself — which the sweep needs
+        because it is the :class:`~manicule.ingest.sweeps.SweepGate` too. Releases on every
+        exit, including cancellation.
+        """
+        from manicule.storage.backup_lock import MaintenanceHold  # noqa: PLC0415
+
+        hold = MaintenanceHold(self._settings.data_dir)
+        hold.acquire()
+        try:
+            yield hold
+        finally:
+            hold.release()
+
+    @asynccontextmanager
+    async def maintenance_window(self) -> AsyncGenerator[str]:
+        """Hold off a hot backup for the body of a pass that removes data.
+
+        **The contract:** the value yielded is ``""`` when the window is held and the body may
+        remove data, and a non-empty sentence saying what is in the way when it is not — a
+        backup is running, or the lock file cannot be opened or locked. It never raises for a
+        lock that is merely taken, and it never waits: a pass that finds a backup running
+        declines, exactly as the scheduled sweep does, and is expected to report the yielded
+        sentence as the reason. **A body that sees a non-empty value must not remove anything.**
+        The lock is released when the ``async with`` exits, however it exits.
+
+        The lock is shared, so passes taking this window do not exclude each other, and it is
+        the very lock :func:`~manicule.storage.backup.create_backup` takes exclusively: a backup
+        waits for an open window (up to its own bound) rather than copying beside it. The
+        window is advisory and cross-process (``flock`` on ``<data_dir>/backup.lock``,
+        :mod:`manicule.storage.backup_lock`). It does not take the derived-mutation guard, the
+        instance lock or any in-process lock; a pass that needs those takes them itself.
+
+        Used as::
+
+            async with runtime.maintenance_window() as blocked:
+                if blocked:
+                    return declined(blocked)
+                ...  # remove data
+        """
+        async with self.maintenance_hold() as hold:
+            yield hold.blocked_by
 
     @property
     def discovery(self) -> Discovery | None:
@@ -2052,7 +2100,12 @@ class _Ingestion:
         )
 
     async def sweep_vectors(self, *, batch: int, soft_delete_grace_s: float) -> SweepResult:
-        """One bounded pass of the tombstone sweep and the soft-delete purge.
+        """One bounded pass of the tombstone sweep, the soft-delete purge and blob collection.
+
+        Holds the backup lock shared for the whole pass (:meth:`maintenance_hold`), so a hot
+        backup waits for it and a pass that finds a backup running declines with the reason in
+        ``blocked_by``. Collection of unreferenced blobs is the last step; it is what turns the
+        references a purge released into freed files (``docs/storage.md`` §7, §8.2).
 
         Guarded like the other two sweeps, which is what serializes it against a reset, a
         rebuild and a re-embed publication — the operations that move the publication pointer
@@ -2067,6 +2120,7 @@ class _Ingestion:
         draining.
         """
         from manicule.ingest.sweeps import (  # noqa: PLC0415
+            BlobCollector,
             SweepResult,
             VectorSweepTarget,
             sweep_vectors,
@@ -2085,13 +2139,21 @@ class _Ingestion:
                         f"individual chunks, so tombstoned vectors cannot be swept from it"
                     )
                 )
-            store = await self._runtime.documents()
-            return await sweep_vectors(
-                store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
-                vectors,
-                batch=batch,
-                soft_delete_grace_s=soft_delete_grace_s,
-            )
+            async with self._runtime.maintenance_hold() as hold:
+                if not hold.held:
+                    return SweepResult(blocked_by=hold.blocked_by)
+                store = await self._runtime.documents()
+                blobs = await self._runtime.blobs()
+                return await sweep_vectors(
+                    store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore
+                    vectors,
+                    batch=batch,
+                    soft_delete_grace_s=soft_delete_grace_s,
+                    gate=hold,
+                    # `_build_blobs` is the only builder, and it makes a `BlobStore`; the check
+                    # narrows the type rather than guarding against a store that cannot happen.
+                    blobs=blobs if isinstance(blobs, BlobCollector) else None,
+                )
 
     async def glossary_fingerprint(self) -> GlossaryFingerprint:
         """What the installed detector would produce under this configuration.

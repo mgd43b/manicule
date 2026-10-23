@@ -215,9 +215,9 @@ argument raises its floor to **admin**, the floor `GET /api/v1/search?workspaces
 `stop`, `collection orphans`, `sweep-vectors`, rebuild execution/resume and the `auth` verbs are
 command-line only. Each destroys data, mints a credential, changes what the installation is or
 starts wide derived publication work, and a surface called unattended should not be able to do
-any of that. `sweep-vectors` purges soft-deleted documents whose grace period has expired, after
-which restoring one costs a re-parse rather than being free — and it needs no assistant, because
-a served installation already runs it on a schedule.
+any of that. `sweep-vectors` purges soft-deleted documents whose grace period has expired and
+releases the raw bytes they retained, after which restoring one costs a re-sync rather than being
+free — and it needs no assistant, because a served installation already runs it on a schedule.
 `collection orphans` moves every document outside every collection into the trash, which in a
 corpus where collections are optional is most of it. Asking how many there *are* needs none of
 that: `doctor`'s `collection-membership` check counts them on every surface, and a sync reports

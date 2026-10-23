@@ -405,7 +405,10 @@ async def reindex_document(
     them, which is the trade ``docs/storage.md`` §8.2 makes for not diluting every vector
     search — and :meth:`~manicule.core.protocols.TrashStore.restore_document` says so by
     returning ``needs_reparse``. This is what to run next, and it touches neither the network
-    nor the source.
+    nor the source — **when the document still holds its bytes.** The purge releases them, so a
+    document purged since that change reports :data:`NO_RETAINED_BYTES` here and only a re-sync
+    repairs it; this verb remains the repair for a document restored inside the grace period and
+    for one an older sweep purged before the release existed.
 
     It resolves the id through the store rather than taking a
     :class:`~manicule.core.content.Document`, and that is the whole reason it exists as a verb

@@ -2614,7 +2614,14 @@ class VectorSweepReport(Payload):
         default=0,
         ge=0,
         description="Soft-deleted documents whose grace period expired and whose chunks were "
-        "removed. Past this point a restore costs a re-parse from retained bytes.",
+        "removed and retained bytes released. Past this point a restore needs a re-sync "
+        "from the source.",
+    )
+    blobs_collected: int = Field(
+        default=0,
+        ge=0,
+        description="Retained blobs nothing references any more, deleted from disk by the "
+        "collection that ends the pass. A count: never a hash.",
     )
     blocked_by: str = Field(
         default="",

@@ -2503,22 +2503,34 @@ owns when that sweep runs:
 - **The sweep is scheduled, not triggered by deletion** — otherwise a large reconciliation
   produces a sweep storm during a sync.
 - **It does not run during a backup.** The backup lock blocks exactly two things — this sweep
-  and the blob GC — because they are the only two that remove data (`storage.md` §9.1).
-- **It does not run during an active sync**, so an ingest run and a purge are never competing
-  for the same vector table.
+  and the blob GC — because they are the only two that remove data (`storage.md` §9.1). The
+  lock is an `flock` on `<data_dir>/backup.lock`, because the backup is a command-line process
+  and the sweep is the server's: the sweep holds it shared for the whole pass, a backup holds it
+  exclusively, and whichever arrives second waits (the backup, for up to a minute) or declines
+  (the sweep, until its next interval).
+- **It does run during an active sync.** An ingest run and a purge are not serialized; the
+  tombstone design is what makes that safe (`storage.md` §8.2), and the blob collection that ends
+  the pass skips blobs written in the last day so it cannot delete bytes a publication is about to
+  reference.
+- **Its purge releases the document's retained bytes** along with its chunks, in one
+  transaction (`storage.md` §8.2), and the collection that follows deletes the files once the
+  acquisition journal has also let go of them. That is the only thing that ever frees the raw
+  bytes of a deleted document.
 - **`doctor` reports the soft-deleted fraction**, which is the input to tuning the vector leg's
   over-fetch factor (`storage.md` §8.2).
 
-A document that is restored inside the grace period needs no re-embed. Outside it, restore is a
-re-parse from retained bytes — rung 3, still not a re-crawl.
+A document that is restored inside the grace period needs no re-embed. Outside it, the purge has
+released the retained bytes, so restore is a re-sync from the source — rung 4, which can fail —
+and the restore says so. Only a document an older sweep purged before the release existed still
+holds its bytes and takes the re-parse, rung 3.
 
 `manicule.ingest.reindex.reindex_document` is that re-parse for one id, and it is what
 `TrashStore.restore_document` points at when it reports `needs_reparse`. It resolves the id
 through the store rather than taking a `Document`, and the lookup is workspace-scoped and skips
 the trash — so **restore first, then reindex**. The other order finds nothing and says so,
-rather than reporting a repair that did nothing. A document whose bytes were never retained
-cannot take this path at all, and the restore says that too: for it, `sync --force` is the only
-option, which is the one rung that can fail.
+rather than reporting a repair that did nothing. A document whose bytes were never retained, or
+were released by the purge, cannot take this path at all, and the restore says which: for it,
+`sync --force` is the only option, which is the one rung that can fail.
 
 ---
 
@@ -2881,7 +2893,7 @@ Calls made in the absence of a stated position.
 | Three re-ingest verbs mapped to ladder rungs; re-parse is first-class | §10 |
 | The corpus-wide re-parse is a flag on the document verb, and command line only | §10.1 |
 | Reconcile: clean-completion-only, a deletion ceiling, soft delete only | §11.1 |
-| The sweep is scheduled and yields to backup and sync | §11.2 |
+| The sweep is scheduled, yields to a backup through a cross-process lock, and does not wait for a sync | §11.2 |
 | Watch never reconciles; debounce with a post-debounce re-`stat` | §12 |
 | Enumeration coverage is journaled; continuation stays a supervisor's, under a stated contract | §13.4 |
 
