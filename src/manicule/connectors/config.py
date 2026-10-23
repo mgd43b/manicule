@@ -55,6 +55,7 @@ __all__ = [
     "GitSiteConfig",
     "GmailConfig",
     "resolve_credentials",
+    "resolve_gmail_client_secret",
     "resolve_gmail_credentials",
     "resolve_label_ids",
 ]
@@ -1086,6 +1087,32 @@ def resolve_label_ids(names: Iterable[str], name_to_id: Mapping[str, str]) -> tu
     return tuple(sorted(ids))
 
 
+def resolve_gmail_client_secret(
+    config: GmailConfig, environ: Mapping[str, str] | None = None, *, instance: str = ""
+) -> SecretStr:
+    """The OAuth client's secret: the configured value, else the environment variable.
+
+    Split out of :func:`resolve_gmail_credentials` because ``manicule connector login`` needs
+    the client secret and, by definition, has no refresh token yet — resolving both together
+    would refuse the one command that produces the second.
+
+    Raises:
+        ConfigError: Neither is set. The message names the setting and the environment
+            variable, and never a value.
+    """
+    env = os.environ if environ is None else environ
+    client_secret = config.client_secret or _secret(env.get(config.client_secret_env))
+    if client_secret is None:
+        where = _gmail_where(instance)
+        msg = (
+            f"the Gmail connector needs the OAuth client's secret. Set client_secret in {where}, "
+            f"or put it in ${config.client_secret_env}. It is the secret of the Desktop-app "
+            f"OAuth client created in docs/connectors/gmail.md §1.3."
+        )
+        raise ConfigError(msg)
+    return client_secret
+
+
 def resolve_gmail_credentials(
     config: GmailConfig, environ: Mapping[str, str] | None = None, *, instance: str = ""
 ) -> GmailConfig:
@@ -1108,27 +1135,23 @@ def resolve_gmail_credentials(
             setting and the environment variable, and never a value.
     """
     env = os.environ if environ is None else environ
-    where = f"[connectors.{instance}.options]" if instance else 'plugins.config."connector.gmail"'
-
-    client_secret = config.client_secret or _secret(env.get(config.client_secret_env))
-    if client_secret is None:
-        msg = (
-            f"the Gmail connector needs the OAuth client's secret. Set client_secret in {where}, "
-            f"or put it in ${config.client_secret_env}. It is the secret of the Desktop-app "
-            f"OAuth client created in docs/connectors/gmail.md §1.3."
-        )
-        raise ConfigError(msg)
+    client_secret = resolve_gmail_client_secret(config, env, instance=instance)
     refresh_token = config.refresh_token or _secret(env.get(config.refresh_token_env))
     if refresh_token is None:
         msg = (
-            f"the Gmail connector needs a refresh token. Set refresh_token in {where}, or put it "
-            f"in ${config.refresh_token_env}. `manicule connector login "
-            f"{instance or '<name>'}` mints one."
+            f"the Gmail connector needs a refresh token. Set refresh_token in "
+            f"{_gmail_where(instance)}, or put it in ${config.refresh_token_env}. "
+            f"`manicule connector login {instance or '<name>'}` mints one."
         )
         raise ConfigError(msg)
     return config.model_copy(
         update={"client_secret": client_secret, "refresh_token": refresh_token}
     )
+
+
+def _gmail_where(instance: str) -> str:
+    """The table a Gmail setting belongs in, for the message that asks for it."""
+    return f"[connectors.{instance}.options]" if instance else 'plugins.config."connector.gmail"'
 
 
 def _secret(value: str | None) -> SecretStr | None:

@@ -195,14 +195,14 @@ protocol is proven against a real implementation. Full Confluence design in
 [`docs/connectors/confluence.md`](docs/connectors/confluence.md).
 
 *Status.* Beyond Confluence, the local filesystem, mirrored Confluence pages and a pinned Git
-site (the first half of the web-crawler row) are built, and so is Gmail's reading side, with its
-design in [`docs/connectors/gmail.md`](docs/connectors/gmail.md): configuration, credential and a
-`doctor` check ([#458](https://github.com/mgd43b/manicule/issues/458)), the REST client
+site (the first half of the web-crawler row) are built, and so is Gmail, with its design in
+[`docs/connectors/gmail.md`](docs/connectors/gmail.md): configuration, credential and a `doctor`
+check ([#458](https://github.com/mgd43b/manicule/issues/458)), the REST client
 ([#459](https://github.com/mgd43b/manicule/issues/459)), the connector
-([#460](https://github.com/mgd43b/manicule/issues/460)) and reconciliation
-([#466](https://github.com/mgd43b/manicule/issues/466)), and the refusal to serve a mailbox
-unauthenticated ([#462](https://github.com/mgd43b/manicule/issues/462)) is in force. `connector login`
-([#461](https://github.com/mgd43b/manicule/issues/461)) is tracked.
+([#460](https://github.com/mgd43b/manicule/issues/460)), `connector login`
+([#461](https://github.com/mgd43b/manicule/issues/461)), the refusal to serve a mailbox
+unauthenticated ([#462](https://github.com/mgd43b/manicule/issues/462)) and reconciliation
+([#466](https://github.com/mgd43b/manicule/issues/466)).
 
 OpenDocuments re-enumerates nearly everything on every sync and dedups by content hash.
 Only GitHub has a real change token. Each connector below gets proper incremental sync.

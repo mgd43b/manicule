@@ -1592,6 +1592,20 @@ def render_connector_signed_in(out: Console, payload: r.ConnectorSignedIn) -> No
     out.print(f"  manicule will use it until {escape(payload.expires_at)}")
 
 
+def render_connector_token_issued(out: Console, payload: r.ConnectorTokenIssued) -> None:
+    """Where the token went and what to do with it. Never the token itself."""
+    out.print(
+        f"minted a refresh token for [bold]{escape(payload.name)}[/bold], and confirmed it reads "
+        f"the mailbox configured as [bold]{escape(payload.account)}[/bold]"
+    )
+    out.print(f"  scope: {escape(payload.scope)}")
+    out.print(f"  written to {escape(payload.written_to)}")
+    out.print(
+        "  Put it in your secret store and expose it as the variable the source's "
+        "[bold]refresh_token_env[/bold] names; never in the configuration file."
+    )
+
+
 def render_messaging_host_installed(out: Console, payload: r.MessagingHostInstalled) -> None:
     """Which browsers were set up, and the one next step this cannot do for the operator."""
     out.print(f"installed the messaging host for [bold]{len(payload.installed)}[/bold] browser(s)")
@@ -1842,6 +1856,9 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     ),
     r.ConnectorSignedIn: lambda out, p: render_connector_signed_in(
         out, _as(r.ConnectorSignedIn, p)
+    ),
+    r.ConnectorTokenIssued: lambda out, p: render_connector_token_issued(
+        out, _as(r.ConnectorTokenIssued, p)
     ),
     r.SidecarReport: lambda out, p: render_sidecar(out, _as(r.SidecarReport, p)),
     r.ConfigValue: lambda out, p: render_config_value(out, _as(r.ConfigValue, p)),

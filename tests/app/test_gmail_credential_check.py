@@ -128,7 +128,7 @@ async def test_a_revoked_grant_fails_with_the_login_command_as_the_remedy(
 
     assert check.state == "failing"
     assert check.facts["sources"] == {"mail": "grant_revoked"}
-    assert "mint a new Gmail refresh token for 'mail'" in check.remedy
+    assert "`manicule connector login mail`" in check.remedy
 
 
 async def test_a_refused_oauth_client_fails(google: FakeGoogleOAuth) -> None:
@@ -174,7 +174,7 @@ async def test_each_source_is_reported_and_the_first_broken_one_names_the_remedy
 
     assert check.state == "failing"
     assert check.facts["sources"] == {"alpha": "ok", "beta": "different_mailbox"}
-    assert "'beta'" in check.remedy
+    assert "`manicule connector login beta`" in check.remedy
 
 
 async def test_options_that_do_not_validate_fail_the_check_instead_of_vanishing(

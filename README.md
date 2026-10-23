@@ -61,10 +61,8 @@ applies when parsing, middleware or chunking concludes that a document has no ch
 > **Five sources are built**: a local directory tree, Confluence (live, or from a directory of
 > mirrored pages), a pinned Git checkout of a site you own, and a Google Workspace mailbox. Gmail
 > is read-only and syncs from Gmail's own change log, and an installation holding a mailbox
-> refuses to be served without authentication. `manicule connector login` for it
-> ([#461](https://github.com/mgd43b/manicule/issues/461)) is not built yet, so a refresh token comes
-> from the environment
-> ([`docs/connectors/gmail.md`](docs/connectors/gmail.md), tracked in
+> refuses to be served without authentication. `manicule connector login` mints its refresh
+> token ([`docs/connectors/gmail.md`](docs/connectors/gmail.md), tracked in
 > [#464](https://github.com/mgd43b/manicule/issues/464)). Seven more — GitHub, Notion,
 > Drive, S3/GCS, Swagger, an HTTP crawler and web search — are designed in
 > [`PLAN.md`](PLAN.md) and tracked in [#16](https://github.com/mgd43b/manicule/issues/16). None
