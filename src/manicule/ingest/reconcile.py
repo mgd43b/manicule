@@ -523,7 +523,7 @@ async def _journal_inventory(
     """Enumerate the source into the journal, or say why it could not be completed.
 
     Only a completed inventory is returned. A source-side failure comes back as a
-    :class:`Reconciliation` carrying the error class, with the partial rows cancelled; a
+    :class:`Reconciliation` carrying the error class, with the partial rows canceled; a
     cancellation of this task cancels them too and propagates.
     """
     run_id = uuid4().hex
