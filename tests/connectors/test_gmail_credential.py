@@ -29,6 +29,7 @@ from manicule.connectors.errors import (
     CredentialError,
     GrantRevokedError,
     MailboxMismatchError,
+    RateLimitedError,
     RemoteError,
     TokenRejectedError,
 )
@@ -296,6 +297,27 @@ async def test_a_server_error_from_the_token_endpoint_is_retryable_not_a_credent
     assert not isinstance(caught.value, CredentialError)
 
 
+async def test_a_throttled_token_endpoint_is_typed_as_rate_limiting() -> None:
+    fake = FakeGoogleOAuth()
+    fake.token_failure = (429, {})
+
+    with pytest.raises(RateLimitedError):
+        await credential(fake).authorize()
+
+
+async def test_an_infinite_lifetime_is_not_trusted() -> None:
+    clock = Clock()
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(200, content=b'{"access_token": "t", "expires_in": Infinity}')
+    )
+    cred = credential(FakeGoogleOAuth(), clock, transport=transport)
+
+    await cred.authorize()
+    clock.now += 301
+
+    assert cred._fresh() is None  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_an_unreachable_token_endpoint_is_a_connector_error() -> None:
     def refuse(_: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("no route")
@@ -358,14 +380,26 @@ async def test_the_pin_check_survives_one_expired_access_token() -> None:
     assert fake.refreshes == 2
 
 
-async def test_a_403_from_the_profile_read_says_what_to_check_and_prints_nothing_else() -> None:
+async def test_a_403_from_the_profile_read_is_a_credential_problem_with_a_remedy() -> None:
+    """The API being off for the client's project is not Google failing to answer."""
     fake = FakeGoogleOAuth()
     fake.profile_status = 403
 
-    with pytest.raises(RemoteError, match="Gmail API is enabled") as caught:
+    with pytest.raises(CredentialError, match="Gmail API is enabled") as caught:
         await credential(fake).confirm_mailbox(ACCOUNT)
 
-    assert caught.value.status_code == 403
+    assert not isinstance(caught.value, RemoteError)
+    assert "manicule connector login mail" in str(caught.value)
+
+
+async def test_a_server_error_from_the_profile_read_is_retryable() -> None:
+    fake = FakeGoogleOAuth()
+    fake.profile_status = 503
+
+    with pytest.raises(RemoteError) as caught:
+        await credential(fake).confirm_mailbox(ACCOUNT)
+
+    assert caught.value.status_code == 503
 
 
 async def test_a_profile_without_an_address_cannot_confirm_the_mailbox() -> None:

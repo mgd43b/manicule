@@ -4293,13 +4293,21 @@ class ApplicationService:
         """
         from manicule.connectors.config import GMAIL_CONNECTOR_NAME  # noqa: PLC0415
 
-        outcomes: dict[str, str] = {}
-        for name, configured in sorted(self.settings.connectors.items()):
-            if configured.type != GMAIL_CONNECTOR_NAME or not configured.enabled:
-                continue
-            outcome = await _gmail_source_outcome(name, configured.options)
-            if outcome is not None:
-                outcomes[name] = outcome
+        # Options over the type's global defaults, as the container merges them: a `client_id`
+        # set under `plugins.config."connector.gmail"` is in force for the connector, so a check
+        # reading only the instance's own options would skip a source the factory would build.
+        defaults = self.settings.component_config("connector", GMAIL_CONNECTOR_NAME)
+        sources = sorted(
+            (name, {**defaults, **configured.options})
+            for name, configured in self.settings.connectors.items()
+            if configured.type == GMAIL_CONNECTOR_NAME and configured.enabled
+        )
+        # Concurrently: each source can wait out Google's timeout twice, and a deployment with
+        # several would otherwise hold `doctor` for the sum of them.
+        found = await asyncio.gather(
+            *(_gmail_source_outcome(name, options) for name, options in sources)
+        )
+        outcomes = {name: word for (name, _), word in zip(sources, found, strict=True) if word}
 
         facts = cast("dict[str, JsonValue]", {"sources": dict(sorted(outcomes.items()))})
         if not outcomes:

@@ -187,3 +187,33 @@ async def test_the_check_follows_sessions_in_the_order_doctor_emits_them() -> No
     names = [check.name for check in diagnosis.checks]
 
     assert names.index(CHECK) == names.index("sessions") + 1
+
+
+async def test_the_gmail_api_being_off_fails_with_the_login_remedy_and_not_the_network(
+    google: FakeGoogleOAuth,
+) -> None:
+    google.profile_status = 403
+
+    check = await gmail_check(mail=mail())
+
+    assert check.state == "failing"
+    assert check.facts == {"sources": {"mail": "credential_rejected"}}
+    assert "reach Google" not in check.remedy
+
+
+async def test_options_set_in_the_types_global_defaults_are_in_force_for_the_check(
+    google: FakeGoogleOAuth,
+) -> None:
+    """The container merges ``plugins.config."connector.gmail"`` under each instance's options."""
+    backend = FakeBackend()
+    backend.settings = Settings.model_validate(
+        {
+            "plugins": {"config": {"connector.gmail": OPTIONS}},
+            "connectors": {"mail": {"type": "gmail"}},
+        }
+    )
+
+    diagnosis = await ApplicationService(backend).doctor()
+    check = next(c for c in diagnosis.checks if c.name == CHECK)
+
+    assert check.facts == {"sources": {"mail": "ok"}}

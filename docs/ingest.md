@@ -2663,6 +2663,9 @@ identity from an edit to the scope, only one of which should keep the source. A 
 without the attribute is unaffected. The only one that declares it today is Gmail's
 configuration (`GmailConfig.pinned_identity`; [`connectors/gmail.md`](connectors/gmail.md) §1.4),
 and the connector that would be held to it is [#460](https://github.com/mgd43b/manicule/issues/460).
+The hold is in `IngestPipeline.run` only: a reconciliation that deletes on behalf of a source must
+run through it, or call the same hold first, so that a replaced credential cannot reconcile one
+account's documents against another account's inventory.
 
 ### 13.3 Cancellation
 

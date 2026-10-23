@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -55,6 +56,7 @@ from manicule.connectors.errors import (
     CredentialError,
     GrantRevokedError,
     MailboxMismatchError,
+    RateLimitedError,
     RemoteError,
     RequestTimeoutError,
     SessionExpiredError,
@@ -577,9 +579,6 @@ class RefreshTokenCredential:
     def __repr__(self) -> str:
         return f"RefreshTokenCredential(connector={self.connector!r})"
 
-    def describe(self) -> str:
-        return "an OAuth refresh token"
-
     def renewal(self) -> str:
         return (
             f"Run `manicule connector login {self.connector}` to mint a new refresh token, and "
@@ -666,13 +665,18 @@ class RefreshTokenCredential:
             RemoteError: Google failed to answer.
         """
         response = await self.send(self._get_profile)
-        if response.status_code != HTTPStatus.OK:
-            msg = f"Gmail answered users.getProfile with HTTP {response.status_code}. " + (
-                "Check that the Gmail API is enabled for the OAuth client's project and "
-                "that the grant includes gmail.readonly."
-                if response.status_code == HTTPStatus.FORBIDDEN
-                else "A later attempt may succeed."
+        if response.status_code == HTTPStatus.FORBIDDEN:
+            # Not Google failing to answer: the API is off for the OAuth client's project, or the
+            # grant lacks the scope. Typed as a credential problem so ``doctor`` fails it with
+            # the right remedy instead of blaming the network.
+            msg = (
+                "Gmail refused users.getProfile (HTTP 403). Check that the Gmail API is enabled "
+                "for the OAuth client's project and that the grant includes gmail.readonly. "
+                + self.renewal()
             )
+            raise CredentialError(msg)
+        if response.status_code != HTTPStatus.OK:
+            msg = f"Gmail answered users.getProfile with HTTP {response.status_code}"
             raise RemoteError(msg, response.status_code)
         try:
             reported = response.json().get("emailAddress")
@@ -742,6 +746,9 @@ class RefreshTokenCredential:
             return self._access
         if response.status_code in (HTTPStatus.BAD_REQUEST, HTTPStatus.UNAUTHORIZED):
             raise self._refused(body.get("error"))
+        if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+            msg = "Google's token endpoint is throttling this client"
+            raise RateLimitedError(msg)
         msg = f"Google's token endpoint answered HTTP {response.status_code}"
         raise RemoteError(msg, response.status_code)
 
@@ -794,7 +801,12 @@ def _json_object(response: httpx.Response) -> dict[str, object]:
 
 def _usable_lifetime(expires_in: object) -> float:
     """Seconds an access token is offered for: its lifetime less the margin."""
-    if isinstance(expires_in, bool) or not isinstance(expires_in, int | float) or expires_in <= 0:
+    if (
+        isinstance(expires_in, bool)
+        or not isinstance(expires_in, int | float)
+        or not math.isfinite(expires_in)
+        or expires_in <= 0
+    ):
         return FALLBACK_LIFETIME_SECONDS
     if expires_in > 2 * REFRESH_MARGIN_SECONDS:
         return float(expires_in) - REFRESH_MARGIN_SECONDS

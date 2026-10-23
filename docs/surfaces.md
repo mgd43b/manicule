@@ -1024,7 +1024,7 @@ refreshes an access token and calls `users.getProfile` once, then compares the m
 answered with the configured `account` — the same `confirm_mailbox` the Gmail connector will run
 before it reads anything ([`connectors/gmail.md`](connectors/gmail.md) §1.2, §1.4). It is
 `failing` when a sync would stop on the credential: a missing client secret or refresh token, a
-grant Google no longer honors, an OAuth client Google refuses, or a token for a different
+grant Google no longer honors, an OAuth client Google refuses (or a project with the Gmail API off), or a token for a different
 mailbox. It is `degraded` when the only trouble is that Google did not answer, which says
 nothing about the credential. This check is a network call, one refresh and one `getProfile`
 per enabled Gmail source, and it is the only check besides `component:*` that contacts another
