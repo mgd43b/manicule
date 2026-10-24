@@ -517,10 +517,10 @@ identifiers and cost 0.04 to 0.07 of MRR elsewhere. No unanswerable question lef
 band under any rule.
 
 **The disjunction does better on identifiers, and that is recorded rather than smoothed over.**
-Round 2's rule excluded the two disjunctions, which round 1 had already rejected, so its
-first run did not score them. A later full run of every variant did: on the identifier
-questions the content-word disjunction found **723** of 754 (MRR 0.811) against 600 (0.637)
-for the shipped rule, at a median of 11 ms at 100,000 chunks. Part of the gap is that a question
+The content-word disjunction was excluded by round 1's pre-registered rule, so round 2 never
+considered it; it was measured on the identifier questions only afterward, in a full run of
+every variant. There it found **723** of 754 (MRR 0.811) against 600 (0.637) for the shipped
+rule, at a median of 11 ms and a p95 of 37 ms at 100,000 chunks. Part of the gap is that a question
 naming an identifier often carries one more content word the section never writes — "where is
 `X` used" requires "used" — and a conjunction then misses it entirely. Shipping the disjunction
 on that evidence would mean overriding both written rules after seeing the data. It still loses
