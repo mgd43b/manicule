@@ -396,7 +396,7 @@ class StructuralChunker:
         the parser, never guessed from the first row being bold — a guess would silently
         promote a data row on every table that does not have one.
         """
-        rows = _string_list(block.metadata.get("rows"))
+        rows = breadcrumb.string_list(block.metadata.get("rows"))
         if rows is None:
             # The parser did not describe the table's rows, so there is no row boundary to
             # split at that is not a guess about the rendering. Prose splitting keeps the
@@ -429,7 +429,7 @@ class StructuralChunker:
             # prevent. Splitting at the boundaries also keeps each part's ``CellAnchor``
             # narrowed to its own rows instead of every part claiming the whole table.
             header_rows = 0
-        refs = _string_list(block.metadata.get("row_refs"))
+        refs = breadcrumb.string_list(block.metadata.get("row_refs"))
         header = rows[:header_rows]
         header_text = "\n".join(header)
         header_tokens = self._count_or_ceiling(header_text) if header else 0
@@ -748,7 +748,7 @@ class StructuralChunker:
         for separators and tokenizer behavior at string boundaries rather than assuming token
         counts add.
         """
-        hierarchy = _source_hierarchy(document)
+        hierarchy = breadcrumb.source_hierarchy(document)
         fitted: list[list[_Unit]] = []
         for group in groups:
             heading_path = group[0].heading_path
@@ -901,7 +901,7 @@ class StructuralChunker:
         # Resolved once per document rather than once per chunk. It is a fact about the document,
         # and reading it validates the stored source record — so inside the loop a document of two
         # hundred chunks paid for two hundred identical validations of one JSON blob.
-        hierarchy = _source_hierarchy(document)
+        hierarchy = breadcrumb.source_hierarchy(document)
         for position, group in enumerate(groups):
             current_text = _join_units(group)
             heading_path = group[0].heading_path
@@ -1040,12 +1040,7 @@ class StructuralChunker:
         content: str | None = None,
     ) -> str:
         """One chunk's breadcrumb. ``hierarchy`` is the document's, resolved by the caller once."""
-        parts = breadcrumb.elements(
-            _string_list(document.metadata.get("breadcrumb_prefix")) or (),
-            hierarchy,
-            (document.title,),
-            heading_path,
-        )
+        parts = breadcrumb.parts(document, heading_path, hierarchy=hierarchy)
         if content is None:
             return breadcrumb.render(parts, self._counter, self._breadcrumb_tokens)
         # The reserve is an upper bound, not a promise to spend all of it. Separators and
@@ -1110,31 +1105,6 @@ def _join_units(units: Sequence[_Unit]) -> str:
         rendered += ("" if contiguous else BLOCK_SEPARATOR) + unit.text
         previous = unit
     return rendered
-
-
-def _source_hierarchy(document: Document) -> tuple[str, ...]:
-    """Where a document sits in its source, coarsest first.
-
-    Two spellings of one fact, in precedence order, because they arrived in that order. A
-    validated :class:`~manicule.core.provenance.SourceMetadata` is preferred when the document
-    carries one; ``metadata["ancestors"]`` is the older untyped convention that connectors
-    without a record still fill in, and it keeps working exactly as it did.
-
-    **The record wins where both are present, and that is the safe way round.** Its
-    ``section_path`` has been through depth, length and control-character validation;
-    ``ancestors`` has been through none. Preferring the unvalidated spelling would mean a
-    connector that supplied both got the weaker of its own two answers embedded into every
-    vector — and a breadcrumb is not something anybody reads afterwards to check.
-
-    This is also the whole of what propagates from a document's source record into a chunk, and
-    it propagates as *text the embedder reads* rather than as a copy on the chunk row. Nothing
-    document-level is duplicated per chunk; ``docs/contracts.md`` §2 fixes what a chunk is, and
-    a citation resolves the rest through ``document_id``.
-    """
-    record = document.provenance
-    if record is not None and record.source is not None and record.source.section_path:
-        return record.source.section_path
-    return tuple(_string_list(document.metadata.get("ancestors")) or ())
 
 
 # --- anchor merging ----------------------------------------------------------------------
@@ -1358,20 +1328,6 @@ def _shared_lang(units: Sequence[_Unit]) -> str | None:
     """
     langs = {unit.lang for unit in units}
     return langs.pop() if len(langs) == 1 else None
-
-
-def _string_list(value: object) -> list[str] | None:
-    """A metadata value as a list of strings, or ``None`` when it is anything else.
-
-    Metadata arrives as JSON, so a parser can put anything there. A malformed value means
-    the chunker has no structure to split on, which is a fallback rather than a crash.
-    """
-    if not isinstance(value, list):
-        return None
-    items = cast("list[object]", value)
-    if not all(isinstance(item, str) for item in items):
-        return None
-    return [item for item in items if isinstance(item, str)]
 
 
 def _non_negative_int(value: object) -> int:
