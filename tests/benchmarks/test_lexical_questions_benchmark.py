@@ -51,6 +51,7 @@ from tests.benchmarks.lexical_questions import (
     index_docs,
     paste_questions,
     round_four_winner,
+    round_three_latency,
     run_docs,
     run_threads,
     summarize,
@@ -246,6 +247,16 @@ def test_a_lost_lookup_is_not_paid_for_by_a_gained_one() -> None:
     """Condition 3 counts the incumbent's hits the challenger misses, paired by query."""
     assert _lost([True, True, False, False], [False, False, True, True]) == 2
     assert _lost([True, False], [True, True]) == 0
+
+
+def test_round_three_times_its_own_question_sets_only() -> None:
+    """The pastes belong to round 3b; round 3's bound was never set for them."""
+    timings = {
+        ("or-content", "multi-hop"): (48.0, 73.0, 1.0),
+        ("or-content", PASTED[1]): (291.0, 380.0, 1.0),
+        ("and-content", "multi-hop"): (1.0, 3.0, 1.0),
+    }
+    assert round_three_latency(timings) == {"multi-hop": (48.0, 73.0)}
 
 
 def test_round_three_switches_only_when_every_condition_holds() -> None:

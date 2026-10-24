@@ -1218,6 +1218,21 @@ def _lost(incumbent: Sequence[bool], challenger: Sequence[bool]) -> int:
     return sum(was and not now for was, now in zip(incumbent, challenger, strict=True))
 
 
+def round_three_latency(
+    timings: Mapping[tuple[str, str], tuple[float, float, float]],
+) -> dict[str, tuple[float, float]]:
+    """The challenger's median and p95 per question set that round 3's condition 5 reads.
+
+    Round 3's sets only: the pastes are round 3b's subject and were added after round 3's rule
+    was written, so reading them here would apply a bound round 3 never set to them.
+    """
+    return {
+        group: (median, p95)
+        for (name, group), (median, p95, _) in timings.items()
+        if name == CHALLENGER and group not in PASTED
+    }
+
+
 def round_three(
     outcomes: Mapping[tuple[str, str], Sequence[Outcome]],
     runs: Mapping[tuple[str, str], Sequence[thread_duplication.Outcome]],
@@ -1247,13 +1262,7 @@ def round_three(
         chosen = [p.difference for p in natural if p.shipped_empty is empty]
         if chosen:
             by_match[empty] = (len(chosen), statistics.fmean(chosen))
-    # Round 3's question sets only: the pastes are round 3b's subject and were added after round
-    # 3's rule was written, so reading them here would apply a bound round 3 never set to them.
-    latency = {
-        group: (median, p95)
-        for (name, group), (median, p95, _) in timings.items()
-        if name == CHALLENGER and group not in PASTED
-    }
+    latency = round_three_latency(timings)
     return RoundThree(
         gain=statistics.fmean(p.difference for p in gained),
         gain_split=(better, worse),
