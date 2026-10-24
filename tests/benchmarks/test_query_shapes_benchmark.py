@@ -22,6 +22,7 @@ from tests.benchmarks.query_shapes import (
     Gate,
     bare_identifiers,
     choose,
+    exactly_the_counted,
     gated_weighting,
     plain_lookup,
 )
@@ -99,3 +100,15 @@ def test_the_choice_needs_every_model_and_breaks_ties_by_order() -> None:
     assert choose([{"short-dense": (True, 0.0)}, {"short-dense": (False, 0.0)}]) is None
     assert next(iter(CANDIDATES)) == "shipped"
     assert not CANDIDATES["shipped"].gated("retrieval")
+
+
+def test_a_run_that_gated_other_queries_than_were_counted_is_refused() -> None:
+    """A glossary rewording changes the text fusion sees; the counted subsets would be wrong."""
+    gate = CANDIDATES["short-dense"]
+    asked = ["retrieval", "what is retrieval for", "ADF"]
+    exactly_the_counted(gate, asked, {"retrieval", "ADF"})
+    with pytest.raises(RuntimeError, match="missed"):
+        exactly_the_counted(gate, asked, {"retrieval"})
+    with pytest.raises(RuntimeError, match="should not have"):
+        exactly_the_counted(gate, asked, {"retrieval", "ADF", "Atlassian Document Format"})
+    assert Gate().most is None

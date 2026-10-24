@@ -51,7 +51,7 @@ Every other query is fused exactly as shipped. Measured by substituting the fusi
 arithmetic for the run, as round 4 did, with the query's text now read; a leg that returned
 nothing still marks the run degraded and nothing else does, and every query the gate selected is
 recorded by the substitute itself, so the gated subsets below come from the run, not from a
-recomputation.
+recomputation — and a run whose gated set differs from the one counted here is refused.
 
 **The questions.** Round 5's, plus *bare identifiers*: every identifier of round 2's set asked as
 itself, its own section the target — the lookup the lexical leg exists for, typed bare. The gate
@@ -81,17 +81,18 @@ match builder, a field in ``FusionReport`` saying whether a query was gated, the
 in the L1 cache key (which today hashes ``rrf_k`` and no other), and ``docs/retrieval.md`` §5.1's
 rule of no per-leg weighting, which this would end for one shape of query.
 
-**Round 6 returned "no change".** Nothing fixed the defect under both models.
-``short-dense`` brought titles to the dense leg's level or above — 0.844 to 0.934 under BGE-M3
-(dense alone 0.934), 0.757 to 0.965 under Qwen3 (0.895) — and failed twice: the 80 headings it
-gated moved +0.038 and +0.028 on average but split 16 better to 11 worse and 17 to 12, with lower
-bounds of -0.033 and -0.031; and under BGE-M3 one title, ``web``, ranked worse, the one title the
-dense leg alone ranks below hybrid. ``short-half`` held every family under BGE-M3 but ranked
-``web`` worse too, and under Qwen3 closed under half the gap (0.794). ``plain-half`` cost the
-thread keyword lookups -0.037 [-0.066, -0.011] and -0.071 [-0.107, -0.040], as round 4's global
-0.5 had. The gate selected 99 distinct queries for the short candidates and 260 for the wide
-one, under both models; no other family moved by any amount. Recorded from a checkout pinned at
-the commit holding this rule, over the same export as round 5, both models side by side.
+**Round 6 returned "no change".** Nothing fixed the defect under both models. ``short-dense``
+brought titles to the dense leg's level or above — 0.844 to 0.934 under BGE-M3 (dense alone
+0.934), 0.757 to 0.965 under Qwen3 (0.895) — and failed twice: the 80 headings it gated moved
++0.038 and +0.028 on average but split 16 better to 11 worse and 17 to 12, with lower bounds of
+-0.033 and -0.031; and under BGE-M3 one title, ``web``, ranked worse, the one title the dense
+leg alone ranks below hybrid. ``short-half`` held every family under BGE-M3 but ranked ``web``
+worse too, and under Qwen3 closed under half the gap (0.794). ``plain-half`` cost the thread
+keyword lookups -0.037 [-0.066, -0.011] and -0.071 [-0.107, -0.040], as round 4's global 0.5
+had. The gate selected 99 distinct queries for the short candidates and 260 for the wide one,
+under both models — 19 + 80 and 19 + 112 + 126 + 3, the counted table exactly; no other family
+moved by any amount. Recorded from a checkout pinned at the commit holding this rule, over the
+same export as round 5, both models side by side.
 
 Run it from a checkout nobody is editing, over the same export (:func:`title_lookups.unchanged`
 refuses an index that moves schema revision mid-run). Everything is local apart from the
@@ -118,8 +119,6 @@ from typing import TYPE_CHECKING, cast
 from manicule.app.runtime import Runtime
 from manicule.cli.render import console
 from manicule.core.retrieval import ConfidenceBand
-from manicule.retrieval import fusion as fusion_module
-from manicule.retrieval import trace as trace_module
 from manicule.storage.fts import FUNCTION_WORDS, match_words
 from tests.benchmarks import lexical_questions as lq
 from tests.benchmarks import thread_duplication
@@ -128,9 +127,9 @@ from tests.benchmarks.thread_corpus import build_corpus
 from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Mapping, Sequence
+    from collections.abc import Generator, Iterable, Mapping, Sequence
 
-    from manicule.core.retrieval import Candidate, Query
+    from manicule.core.retrieval import Query
     from manicule.storage.docstore import SqliteDocStore
 
 SHORT = 2
@@ -152,11 +151,12 @@ def plain_lookup(text: str, most: int) -> bool:
 class Gate:
     """Which queries are gated, and the lexical ladder's weight for them."""
 
-    most: int = 0
+    most: int | None = None
+    """The most words a gated query has; ``None`` gates nothing, which is the shipped fusion."""
     lexical_weight: float = 1.0
 
     def gated(self, text: str) -> bool:
-        return self.most > 0 and plain_lookup(text, self.most)
+        return self.most is not None and plain_lookup(text, self.most)
 
 
 CANDIDATES: dict[str, Gate] = {
@@ -195,57 +195,39 @@ def bare_identifiers(root: Path) -> list[lq.Asked]:
 
 @contextlib.contextmanager
 def gated_weighting(candidate: Gate, gated: set[str]) -> Generator[None]:
-    """Fuse a gated query with its lexical ladder weighted; record every query it gated.
+    """Fuse a gated query with its lexical ladder weighted; record every query text it gated.
 
-    The shipped stage's arithmetic, ladders, tie-break and report, with one change: the query's
-    text decides the lexical leg's weight. A weight of 0 leaves the lexical candidates in the list,
-    ordered after everything the dense leg ranked, exactly as fusion orders a zero score.
+    Round 4's substitute (:func:`~tests.benchmarks.lexical_questions.weighted_fusion`) with the
+    weight read from the query: the shipped arithmetic for every query the gate does not select.
+    The text recorded is the one the fusion stage was given, so :func:`exactly_the_counted`
+    can tell when the pipeline rewrote it on the way.
     """
-    if candidate.most == 0:
+    if candidate.most is None:
         yield
         return
-    shipped = fusion_module.RRFStage.run
 
-    async def run(
-        self: fusion_module.RRFStage, query: Query, candidates: list[Candidate]
-    ) -> list[Candidate]:
-        weight = 1.0
-        if candidate.gated(query.text):
-            gated.add(query.text)
-            weight = candidate.lexical_weight
-        fused: dict[str, float] = {}
-        per_leg: dict[str, int] = {}
-        seen: dict[str, set[str]] = {}
-        for leg in self.legs:
-            scale = weight if leg == "lexical" else 1.0
-            ladder = sorted(
-                (c for c in candidates if leg in c.scores),
-                key=lambda c: (-c.scores[leg], c.chunk.id),
-            )
-            per_leg[leg] = len(ladder)
-            for rank, item in enumerate(ladder, start=1):
-                fused[item.chunk.id] = fused.get(item.chunk.id, 0.0) + scale / (self.k + rank)
-                seen.setdefault(item.chunk.id, set()).add(leg)
-        degraded = any(count == 0 for count in per_leg.values())
-        trace_module.record(
-            trace_module.FusionReport(
-                legs=self.legs,
-                k=self.k,
-                per_leg=per_leg,
-                overlap=sum(1 for legs in seen.values() if legs == set(self.legs)),
-                degraded=degraded,
-            )
-        )
-        if degraded:
-            trace_module.not_comparable(fusion_module.DEGRADED_REASON)
-        ordered = sorted(candidates, key=lambda c: (-fused.get(c.chunk.id, 0.0), c.chunk.id))
-        return [c.scored_by(self.name, fused.get(c.chunk.id, 0.0)) for c in ordered]
+    def weight(query: Query) -> float:
+        if not candidate.gated(query.text):
+            return 1.0
+        gated.add(query.text)
+        return candidate.lexical_weight
 
-    fusion_module.RRFStage.run = run
-    try:
+    with lq.weighted_fusion(weight):
         yield
-    finally:
-        fusion_module.RRFStage.run = shipped
+
+
+def exactly_the_counted(candidate: Gate, asked: Iterable[str], gated: set[str]) -> None:
+    """Refuse a run that gated other queries than the gate selects from the questions asked.
+
+    The docstring's counts and the gated families are computed from the questions as written;
+    the substitute sees what the fusion stage is given, which a glossary rewording can change.
+    A difference means the verdict would be over subsets nobody counted.
+    """
+    expected = {text for text in asked if candidate.gated(text)}
+    if gated != expected:
+        unexpected, missing = sorted(gated - expected), sorted(expected - gated)
+        msg = f"the run gated {unexpected[:5]} it should not have and missed {missing[:5]}"
+        raise RuntimeError(msg)
 
 
 # --- the verdict ---------------------------------------------------------------------------------
@@ -393,6 +375,11 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
                     counted=frozenset({lq.EXHAUSTED_BUDGET}),
                 )
         threads[name] = run.outcomes
+        exactly_the_counted(
+            candidate,
+            [item.text for item in asked] + [item.query.text for item in thread_asked],
+            selected,
+        )
         gated[name] = frozenset(selected)
         progress(f"{name} asked, {len(selected)} distinct queries gated")
     tl.unchanged(indexes, pinned)

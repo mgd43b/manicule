@@ -1424,24 +1424,38 @@ def weighting(lexical_weight: float) -> Generator[None]:
     if lexical_weight == 1.0:
         yield
         return
+    with weighted_fusion(lambda _: lexical_weight):
+        yield
+
+
+@contextlib.contextmanager
+def weighted_fusion(lexical_weight: Callable[[Query], float]) -> Generator[None]:
+    """Fuse each query with its lexical ladder scaled by ``lexical_weight(query)``.
+
+    The one substitute for the fusion stage's arithmetic every round measuring a leg weight uses
+    — round 4's constant through :func:`weighting`, round 6's per query shape — so they measure
+    the same fusion apart from the weight. A weight of 0 leaves the lexical candidates in the
+    list, ordered after everything the dense leg ranked, as fusion orders a zero score; only a
+    leg that returned nothing marks the run degraded.
+    """
     shipped = fusion_module.RRFStage.run
 
     async def run(
         self: fusion_module.RRFStage, query: Query, candidates: list[Candidate]
     ) -> list[Candidate]:
-        del query
+        weight = lexical_weight(query)
         fused: dict[str, float] = {}
         per_leg: dict[str, int] = {}
         seen: dict[str, set[str]] = {}
         for leg in self.legs:
-            weight = lexical_weight if leg == "lexical" else 1.0
+            scale = weight if leg == "lexical" else 1.0
             ladder = sorted(
                 (c for c in candidates if leg in c.scores),
                 key=lambda c: (-c.scores[leg], c.chunk.id),
             )
             per_leg[leg] = len(ladder)
             for rank, candidate in enumerate(ladder, start=1):
-                fused[candidate.chunk.id] = fused.get(candidate.chunk.id, 0.0) + weight / (
+                fused[candidate.chunk.id] = fused.get(candidate.chunk.id, 0.0) + scale / (
                     self.k + rank
                 )
                 seen.setdefault(candidate.chunk.id, set()).add(leg)

@@ -1015,8 +1015,8 @@ and +0.028 on average but split 16 better to 11 worse and 17 to 12, lower bounds
 -0.031. And under BGE-M3 one title ranks worse: `web`, the one title the dense leg alone ranks
 below hybrid. `short-half` ranks `web` worse too, and under Qwen3 closes under half the gap.
 `plain-half` costs the thread keyword lookups -0.037 and -0.071, as round 4's global weight did.
-No other family moved at all — the code-shape exclusion kept the 756 bare identifiers, asked as
-themselves, out of every gate.
+Outside what each gate selected, no family moved at all — the code-shape exclusion kept the 756
+bare identifiers, asked as themselves, out of every gate.
 
 So the gap has a repair that works for titles — let a one- or two-word plain query rank by the
 dense leg — and its cost is a noisy, net-positive change on short headings that this corpus has
