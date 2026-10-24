@@ -81,6 +81,18 @@ match builder, a field in ``FusionReport`` saying whether a query was gated, the
 in the L1 cache key (which today hashes ``rrf_k`` and no other), and ``docs/retrieval.md`` §5.1's
 rule of no per-leg weighting, which this would end for one shape of query.
 
+**Round 6 returned "no change".** Nothing fixed the defect under both models.
+``short-dense`` brought titles to the dense leg's level or above — 0.844 to 0.934 under BGE-M3
+(dense alone 0.934), 0.757 to 0.965 under Qwen3 (0.895) — and failed twice: the 80 headings it
+gated moved +0.038 and +0.028 on average but split 16 better to 11 worse and 17 to 12, with lower
+bounds of -0.033 and -0.031; and under BGE-M3 one title, ``web``, ranked worse, the one title the
+dense leg alone ranks below hybrid. ``short-half`` held every family under BGE-M3 but ranked
+``web`` worse too, and under Qwen3 closed under half the gap (0.794). ``plain-half`` cost the
+thread keyword lookups -0.037 [-0.066, -0.011] and -0.071 [-0.107, -0.040], as round 4's global
+0.5 had. The gate selected 99 distinct queries for the short candidates and 260 for the wide
+one, under both models; no other family moved by any amount. Recorded from a checkout pinned at
+the commit holding this rule, over the same export as round 5, both models side by side.
+
 Run it from a checkout nobody is editing, over the same export (:func:`title_lookups.unchanged`
 refuses an index that moves schema revision mid-run). Everything is local apart from the
 embedding models.
