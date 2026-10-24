@@ -222,6 +222,27 @@ async def rewrite_heading_text(
     return len(values)
 
 
+def revision(data_dir: Path) -> str:
+    """The schema revision an index is at, read without opening a runtime that would upgrade it."""
+    with contextlib.closing(sqlite3.connect(data_dir / DATABASE)) as db:
+        return str(db.execute("SELECT version_num FROM alembic_version").fetchone()[0])
+
+
+def unchanged(revisions: Mapping[Path, str]) -> None:
+    """Refuse to go on if an index moved to another schema revision since it was built.
+
+    Opening a runtime applies any migration it finds, read from the checkout at that moment, so
+    a migration added to the checkout while a run is in progress rewrites the next index the
+    run opens — which is how round 5's first Qwen3 run measured its incumbent with the
+    candidate's ``heading_text``. Run from a checkout nobody is editing; this is the check that
+    says so if somebody does.
+    """
+    moved = {path: was for path, was in revisions.items() if revision(path) != was}
+    if moved:
+        msg = f"an index changed schema revision during the run: {sorted(map(str, moved))}"
+        raise RuntimeError(msg)
+
+
 def copied(source: Path, target: Path) -> Path:
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(source, target, ignore=shutil.ignore_patterns("*.lock"))
@@ -443,7 +464,17 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
     docs: dict[str, list[lq.Outcome]] = {}
     threads: dict[str, list[thread_duplication.Outcome]] = {}
     seconds: dict[str, float] = {}
+    revisions = {
+        path: revision(path)
+        for path in (
+            shipped_index.data_dir,
+            rewritten_index.data_dir,
+            shipped_threads.data_dir,
+            rewritten_threads.data_dir,
+        )
+    }
     for name, candidate in CANDIDATES.items():
+        unchanged(revisions)
         merged = candidate_overrides(overrides, candidate)
         index = rewritten_index if candidate.breadcrumb else shipped_index
         indexed = rewritten_threads if candidate.breadcrumb else shipped_threads
@@ -464,6 +495,7 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
                 )
         threads[name] = run.outcomes
         progress(f"{name} asked")
+    unchanged(revisions)
     return Measured(dense, docs, threads, seconds)
 
 

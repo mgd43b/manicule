@@ -9,7 +9,11 @@ here reads a measured number.
 
 from __future__ import annotations
 
+import contextlib
+import sqlite3
 from typing import TYPE_CHECKING
+
+import pytest
 
 from manicule.container import keys
 from manicule.plugins.registry import discover
@@ -27,7 +31,9 @@ from tests.benchmarks.title_lookups import (
     choose,
     heading_questions,
     heading_weight,
+    revision,
     rewrite_heading_text,
+    unchanged,
 )
 
 if TYPE_CHECKING:
@@ -148,3 +154,16 @@ def test_the_choice_needs_every_model_and_never_picks_the_reranker() -> None:
     assert choose([{"breadcrumb": (True, 0.0)}, {"breadcrumb": (False, 0.0)}]) is None
     assert next(iter(CANDIDATES)) == "shipped"
     assert CANDIDATES["shipped"] == Candidate()
+
+
+def test_a_run_refuses_an_index_that_changed_schema_under_it(tmp_path: Path) -> None:
+    """The first Qwen3 run of round 5 was upgraded mid-run by a migration added to the checkout."""
+    with contextlib.closing(sqlite3.connect(tmp_path / "manicule.db")) as db, db:
+        db.execute("CREATE TABLE alembic_version (version_num TEXT)")
+        db.execute("INSERT INTO alembic_version VALUES ('before')")
+    revisions = {tmp_path: revision(tmp_path)}
+    unchanged(revisions)
+    with contextlib.closing(sqlite3.connect(tmp_path / "manicule.db")) as db, db:
+        db.execute("UPDATE alembic_version SET version_num = 'after'")
+    with pytest.raises(RuntimeError, match="changed schema revision"):
+        unchanged(revisions)
