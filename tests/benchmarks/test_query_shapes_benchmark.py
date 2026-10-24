@@ -14,7 +14,8 @@ from manicule.core.retrieval import Candidate, Filter, Query
 from manicule.retrieval.config import FusionConfig
 from manicule.retrieval.fusion import RRFStage
 from manicule.retrieval.trace import installed
-from tests.benchmarks.lexical_questions import DOCS
+from tests.benchmarks import thread_duplication
+from tests.benchmarks.lexical_questions import DOCS, Asked, Outcome
 from tests.benchmarks.query_shapes import (
     CANDIDATES,
     PLAIN,
@@ -25,6 +26,7 @@ from tests.benchmarks.query_shapes import (
     exactly_the_counted,
     gated_weighting,
     plain_lookup,
+    verdicts,
 )
 from tests.storage_helpers import make_chunk, make_document
 
@@ -112,3 +114,51 @@ def test_a_run_that_gated_other_queries_than_were_counted_is_refused() -> None:
     with pytest.raises(RuntimeError, match="should not have"):
         exactly_the_counted(gate, asked, {"retrieval", "ADF", "Atlassian Document Format"})
     assert Gate().most is None
+
+
+def _outcome(asked: Asked, rank: int | None) -> Outcome:
+    return Outcome(asked, "or-first-16", "hybrid", rank, int(rank is not None), None, None, None)
+
+
+def test_a_loss_confined_to_the_gated_headings_fails_however_the_family_averages() -> None:
+    """The gated subset is scored on its own, so the whole family's average cannot hide it.
+
+    Two gated headings fall from first to tenth while 38 ungated ones rise: the family's lower
+    bound stays positive, the gated subset's does not, and the candidate fails. A gate that
+    selects nothing scores no gated family at all, rather than one of zero questions.
+    """
+    title = Asked("title-retrieval", "retrieval", "titles", documents=frozenset({"d"}))
+    gated = [
+        Asked(f"g{i}", text, "headings", (("a.md", str(i)),))
+        for i, text in enumerate(("Auth", "Scope"))
+    ]
+    ungated = [
+        Asked(f"u{i}", f"The rule that heading {i} states", "headings", (("a.md", f"9.{i}"),))
+        for i in range(38)
+    ]
+    shipped = [
+        _outcome(title, 2),
+        *(_outcome(a, 1) for a in gated),
+        *(_outcome(a, 3) for a in ungated),
+    ]
+    candidate = [
+        _outcome(title, 1),
+        *(_outcome(a, 10) for a in gated),
+        *(_outcome(a, 1) for a in ungated),
+    ]
+    dense = [_outcome(title, 1)]
+    docs = dict.fromkeys(CANDIDATES, shipped) | {"short-dense": candidate}
+    threads: dict[str, list[thread_duplication.Outcome]] = {name: [] for name in CANDIDATES}
+    selected = dict.fromkeys(CANDIDATES, frozenset({"Auth", "Scope", "retrieval"}))
+
+    found = verdicts(dense, docs, threads, selected)["short-dense"]
+    assert found.families["headings"].interval[0] > 0
+    assert found.families["headings, gated"].count == 2
+    assert found.families["headings, gated"].interval[1] < -0.02
+    assert found.closes_half
+    assert not found.fixes, "the gated loss alone fails it"
+
+    nothing = verdicts(dense, docs, threads, dict.fromkeys(CANDIDATES, frozenset()))
+    assert "headings, gated" not in nothing["short-dense"].families
+    assert "keyword, gated" not in nothing["short-dense"].families
+    assert nothing["short-dense"].fixes, "with no gated family, the whole family is the check"
