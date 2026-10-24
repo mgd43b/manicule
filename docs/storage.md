@@ -597,7 +597,7 @@ class Chunk(Base):
 
     text:         Mapped[str]                     # cited and shown
     embed_text:   Mapped[str]                     # exactly what the embedder saw
-    heading_text: Mapped[str]                     # " > "-joined breadcrumb, indexed by FTS
+    heading_text: Mapped[str]                     # " > "-joined heading_path, indexed by FTS
     heading_path: Mapped[list[str]] = mapped_column(JSON)
 
     kind:         Mapped[BlockKind]               # prose|heading|table|code|list|panel|media
@@ -610,11 +610,11 @@ class Chunk(Base):
     created_at:   Mapped[datetime]
 ```
 
-**`embed_text` is stored, not recomputed.** It is derivable from `heading_text` and `text`
-today, and that is exactly the problem: the derivation rule is code, code changes, and a
-changed rule silently produces different vectors from the same chunks. The fingerprint guard
-in §6.3 is only meaningful if the embedder's actual input is recoverable. Storing it also
-puts rung 2 of the ladder entirely inside SQLite.
+**`embed_text` is stored, not recomputed.** It is derivable from the document's breadcrumb,
+`heading_path` and `text` today, and that is exactly the problem: the derivation rule is code,
+code changes, and a changed rule silently produces different vectors from the same chunks. The
+fingerprint guard in §6.3 is only meaningful if the embedder's actual input is recoverable.
+Storing it also puts rung 2 of the ladder entirely inside SQLite.
 
 **`vector_id` makes cleanup a database invariant.** It is the exact physical Lance key for this
 chunk's active publication. The delete trigger can therefore tombstone the right vector whether
@@ -625,8 +625,8 @@ logical `id`, which was also their physical vector key.
 **`heading_text` alongside `heading_path` is a deliberate small redundancy.** FTS5 indexes a
 string, and joining a JSON array of arbitrary length is not expressible in a SQLite generated
 column. `heading_path` stays because `HeadingAnchor.path` is a list and a heading may itself
-contain the separator. Both are written from one place — a SQLAlchemy validator on
-`heading_path` — so they cannot drift.
+contain the separator. Both are written from one place, `rows.chunk_values`, which every path
+that stores a chunk goes through, so they cannot drift.
 
 **`anchor` is JSON holding the tagged union.** It is the one JSON column whose shape is
 locked (`docs/contracts.md` §1), so it is validated by a Pydantic discriminated union on
@@ -884,19 +884,20 @@ directly.
 > chunk's text, populated from the ingest path with a hand-written compensating-delete in a
 > `catch` block. Every other write path — and there are several — skips it.
 
-**Two columns, weighted.** BM25 scoring uses `bm25(chunks_fts, 1.0, 0.4)`. Note the sign:
-FTS5's `bm25()` returns a **negative** number, and a better match is *more* negative, so the
-ordering is `ORDER BY bm25(chunks_fts, 1.0, 0.4)` **ascending**. Anything that treats it as a
-similarity — or takes its absolute value — inverts the ranking or flattens it, and the result
-still looks like a plausible ranked list. The value fed to RRF is a rank, not a score, which
-sidesteps the question entirely; where a score is genuinely needed, negate it. Note also that
-`bm25()`'s first argument must be the FTS table's real name — it is parsed as a column
-reference, so a query that aliases `chunks_fts` fails with `no such column`. The breadcrumb
-has to be searchable for the same reason it is prefixed to `embed_text`: "Configuration" is
-unfindable without knowing what it configures. But it repeats on every chunk of a page, so
-indexing it at full weight both floods term frequencies and depresses the IDF of the very
-terms that identify the page. Separate columns let it contribute without dominating; a
-single concatenated column cannot.
+**Two columns, weighted.** BM25 scoring uses `bm25(chunks_fts, 1.0, 0.4)`. Note the sign: FTS5's
+`bm25()` returns a **negative** number, and a better match is *more* negative, so the ordering
+is `ORDER BY bm25(chunks_fts, 1.0, 0.4)` **ascending**. Anything that treats it as a similarity
+— or takes its absolute value — inverts the ranking or flattens it, and the result still looks
+like a plausible ranked list. The value fed to RRF is a rank, not a score, which sidesteps the
+question entirely; where a score is genuinely needed, negate it. Note also that `bm25()`'s first
+argument must be the FTS table's real name — it is parsed as a column reference, so a query that
+aliases `chunks_fts` fails with `no such column`. The heading path has to be searchable:
+"Configuration" is unfindable without knowing what it configures. But it repeats on every chunk
+of a section, so indexing it at full weight both floods term frequencies and depresses the IDF
+of the very terms that identify the page. It is the headings alone, not the breadcrumb in
+`embed_text`, which also carries the source's hierarchy and the document's title; `retrieval.md`
+§5.4 (round 5) measured adding those and found no qualifier. Separate columns let it contribute
+without dominating; a single concatenated column cannot.
 
 **Query it as one joined statement, never as MATCH-then-hydrate.** This is the canonical
 lexical query and the shape is load-bearing:
