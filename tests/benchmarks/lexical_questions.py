@@ -179,6 +179,24 @@ did lift titles to 0.896 and cost the identifier questions 0.212 (590 worse, 8 b
 not admissible. The title gap to the dense leg alone is real and stays: every way of closing it
 measured here costs more elsewhere than it gains.
 
+**Replication under a second embedder: Qwen3-Embedding-0.6B.** Every round above measured
+BGE-M3. Rounds 3, 3b and 4 are rerun unchanged with ``qwen3-embedding:0.6b`` served by the
+``ollama`` backend, ``prefix_scheme = "qwen3"`` and the model's own tokenizer
+(``--provider ollama --model qwen3-embedding:0.6b --prefix-scheme qwen3 --tokenizer <dir>``).
+What the result would change was written down before any of its output was read:
+
+- *Round 3.* Its rule is applied as written. If ``or-content`` meets every condition, the shipped
+  rule holds under both models. If it fails condition 1 or 2 under Qwen3, the match rule is not
+  model-independent, and that goes to the owner as a decision about the shipped default — it is
+  not reverted here. Conditions 3 to 5 concern the lexical statement and the confidence bands;
+  the statement's time does not involve the embedder, so condition 5 can only repeat itself.
+- *Round 3b.* The paste set's quality side could not separate the candidates under BGE-M3. If it
+  can under Qwen3 and the cap loses more than the margin, that goes to the owner too.
+- *Round 4.* ``K`` is one setting per installation (``plugins.config."retrieval_stage.rrf".k``),
+  so the rule is applied per model. The shipped default changes only if both models qualify the
+  same candidate. A candidate that qualifies under Qwen3 alone is recorded in
+  ``docs/retrieval.md`` §5.4 as the setting for an installation embedding with it, not shipped.
+
 Everything is local: no network, temporary directories, and the only thing read from outside the
 repository is the embedding model, from the local model cache.
 """
@@ -1473,18 +1491,34 @@ def round_four(
 
 def round_four_winner(verdicts: Mapping[str, RoundFour]) -> str | None:
     """The qualifier with the highest mean gain; within 0.005, the earlier in :data:`FUSIONS`."""
-    qualifying = [name for name, verdict in verdicts.items() if verdict.qualifies]
+    qualifying = [name for name in FUSIONS if name in verdicts and verdicts[name].qualifies]
     if not qualifying:
         return None
     best = max(verdicts[name].gain for name in qualifying)
     return next(name for name in qualifying if verdicts[name].gain >= best - 0.005)
 
 
+def embedding_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """The embedder the command line names, and the chunk budget it needs, as settings."""
+    embedding: dict[str, Any] = {"provider": args.provider, "model": args.model}
+    if args.prefix_scheme is not None:
+        embedding["prefix_scheme"] = args.prefix_scheme
+    config: dict[str, Any] = {}
+    if args.chunk_tokens is not None:
+        config["chunker.structural"] = {"max_tokens": args.chunk_tokens}
+    if args.provider == "ollama":
+        config["embedder.ollama"] = {"base_url": args.ollama_url}
+    if args.tokenizer is not None:
+        config.setdefault(f"embedder.{args.provider}", {})["tokenizer"] = args.tokenizer
+    overrides: dict[str, Any] = {"embedding": embedding}
+    if config:
+        overrides["plugins"] = {"config": config}
+    return overrides
+
+
 async def report_fusion(args: argparse.Namespace, work: Path, emit: Callable[[str], None]) -> None:
     """Round 4: every fusion in :data:`FUSIONS` over both corpora, then the verdict."""
-    overrides: dict[str, Any] = {"embedding": {"provider": "onnx", "model": args.model}}
-    if args.chunk_tokens is not None:
-        overrides["plugins"] = {"config": {"chunker.structural": {"max_tokens": args.chunk_tokens}}}
+    overrides = embedding_overrides(args)
     index = await index_docs(work / "docs", overrides=overrides)
     settings = settings_for(index.data_dir, overrides, PIPELINES["hybrid"])
     async with Runtime(settings) as runtime:
@@ -1566,9 +1600,7 @@ async def _report_docs(
 
 async def report(args: argparse.Namespace, work: Path, emit: Callable[[str], None]) -> None:
     """Index, ask, time and print, in the order the module docstring reads."""
-    overrides: dict[str, Any] = {"embedding": {"provider": "onnx", "model": args.model}}
-    if args.chunk_tokens is not None:
-        overrides["plugins"] = {"config": {"chunker.structural": {"max_tokens": args.chunk_tokens}}}
+    overrides = embedding_overrides(args)
     started = time.perf_counter()
     index = await index_docs(work / "docs", overrides=overrides)
     settings = settings_for(index.data_dir, overrides, PIPELINES["hybrid"])
@@ -1636,7 +1668,21 @@ async def _report_threads(
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0] if __doc__ else None)
-    parser.add_argument("--model", default="BAAI/bge-m3", help="embedding model (ONNX)")
+    parser.add_argument("--model", default="BAAI/bge-m3", help="embedding model")
+    parser.add_argument("--provider", default="onnx", help="embedding backend: onnx, mlx or ollama")
+    parser.add_argument(
+        "--prefix-scheme", default=None, help="the model's prefix scheme, e.g. qwen3"
+    )
+    parser.add_argument(
+        "--ollama-url",
+        default="http://127.0.0.1:11434",
+        help="the ollama backend's server; the default is this machine",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default=None,
+        help="a served backend's tokenizer: a directory holding tokenizer.json, or a repo id",
+    )
     parser.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=list(VARIANTS))
     parser.add_argument("--no-threads", action="store_true", help="skip the synthetic mail corpus")
     parser.add_argument(

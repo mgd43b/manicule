@@ -351,3 +351,6 @@ def test_round_four_picks_the_best_qualifier_and_breaks_ties_by_order() -> None:
     assert round_four_winner({"k30": verdict(0.03), "k10": verdict(0.034)}) == "k30"
     assert round_four_winner({"k30": verdict(0.03), "k10": verdict(0.04)}) == "k10"
     assert round_four_winner({"k30": verdict(0.05, low=-0.03)}) is None, "inadmissible"
+    assert round_four_winner({"k10": verdict(0.034), "k30": verdict(0.03)}) == "k30", (
+        "the tie-break follows FUSIONS, not the order the verdicts arrive in"
+    )
