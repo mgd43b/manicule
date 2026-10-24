@@ -545,9 +545,10 @@ hold search envelopes byte-identical across MCP, HTTP and `--json`.
 **Choose the cheapest operation that preserves the evidence.** `search` is the default when a
 client needs passages, needs to test whether the corpus supports a claim, or can do its own
 synthesis. `ask` spends a model call to synthesize prose and bind citations. Omitting `profile`
-uses the configured profile. `fast` fetches fewer candidates and skips the reranker, so its
-confidence ceiling cannot reach `high` **in the shipped definition**; `balanced` reranks a larger
-set; `precise` searches the widest set and costs the most. A profile or
+uses the configured profile. `fast` fetches fewer candidates and never reranks; `balanced`
+fetches a larger set; `precise` searches the widest set and costs the most. The latter two ask
+for reranking, which happens only when `rag.reranker` names one (it is unset by default), and
+without a reranker no profile's confidence ceiling reaches `high`. A profile or
 installation-configuration change means a different pipeline identity, and confidence from
 different pipeline identities is not compared as if it were one measurement.
 

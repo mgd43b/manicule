@@ -122,9 +122,12 @@ Two extras are **not** in `[all]`, and the reason is size rather than taste:
 | `browser-auth` | playwright, then a browser download | `uv tool install "manicule[all,browser-auth]"` |
 
 Neither is needed to index, search or ask. `rerank` buys the cross-encoder that the `balanced`
-and `precise` retrieval profiles rescore with — `fast` sets `rerank=False` and never constructs
-one — and `browser-auth` buys interactive sign-in for a Confluence Server behind an identity
-provider that has disabled tokens — manicule opens a browser and you sign in there.
+and `precise` retrieval profiles can rescore with — `fast` sets `rerank=False` and never
+constructs one. Installing the extra is not enough: nothing reranks until `rag.reranker` names
+one (`[rag] reranker = "cross_encoder"`, or `MANICULE_RAG__RERANKER=cross_encoder`), and without a
+reranker no profile reports `high` confidence. `browser-auth` buys interactive sign-in for a
+Confluence Server behind an identity provider that has disabled tokens — manicule opens a
+browser and you sign in there.
 
 **The Chrome extension needs neither**, and is the other way round: it reads the session already
 in your own browser and hands it over, so nothing is installed, nothing is downloaded and no

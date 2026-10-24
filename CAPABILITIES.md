@@ -444,6 +444,8 @@ is a feature list entry, not a feature.
   exists as a setting because the right value depends on corpus size rather than on manicule.
 - `rag.chunker`, `rag.pipeline`, `rag.reranker` — a retrieval pipeline is a declared list of
   stages, so two pipelines can be compared by configuration rather than by editing code.
+  `rag.reranker` ships unset, so nothing reranks until it names `cross_encoder` and the
+  `rerank` extra is installed.
 - `rag.cross_workspace_limit` — the most workspaces one administrator's search may span (8 by
   default, 2 to 64). Each is its own scoped search, so this bounds the work one request can ask
   for.

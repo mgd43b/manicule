@@ -60,7 +60,7 @@ can fail on.
         ├────────────────┤
         │ collapse       │   drops what a conversation repeats; §5.5
         ├────────────────┤
-        │ rerank         │   cross-encoder over the head; profile-gated
+        │ rerank         │   cross-encoder over the head; profile- and config-gated
         └───────┬────────┘
    ─────────────┼─────────────────────────────
         ┌───────▼────────┐
@@ -1048,7 +1048,9 @@ Three rules follow directly:
 
 ### 6.2 The model
 
-**`BAAI/bge-reranker-v2-m3`**, configurable, lazily loaded, never loaded under `fast`.
+**`BAAI/bge-reranker-v2-m3`** is the model once a reranker is named — `rag.reranker` ships
+unset, so on a default install no reranker runs and none is loaded. The model is configurable,
+lazily loaded, and never loaded under `fast`.
 
 It is the family pair for the embedder settled in `embeddings.md` §1, and the reason to pick a
 matched pair here is not brand tidiness: bge-m3 was chosen substantially because it is
@@ -1072,10 +1074,10 @@ Honest costs:
 
 ### 6.3 Cost is linear in `candidates`, which is what the profiles are actually buying
 
-The reranker scores `profile.candidates` pairs: 20 on `balanced`, 50 on `precise`, none on
-`fast`. Cost is linear in that count and dominates the rest of the pipeline by a wide margin —
-the two legs are one forward pass over a short query plus two indexed lookups, while this is
-`candidates` forward passes over full-length passages. So the three profiles are not three
+When a reranker is configured it scores `profile.candidates` pairs: 20 on `balanced`, 50 on
+`precise`, none on `fast`. Cost is linear in that count and dominates the rest of the pipeline by a
+wide margin — the two legs are one forward pass over a short query plus two indexed lookups, while
+this is `candidates` forward passes over full-length passages. So the three profiles are not three
 settings; they are "no second model", "a second model over 20 passages", and "a second model over
 50". #15 records the constant; this document records which term dominates.
 
@@ -1324,10 +1326,11 @@ query matches no keywords, so it had its agreement component **waived**, while a
 that matched some paid the penalty in full. Confidence must not blame the corpus for a fault in
 the pipeline — and it must not excuse a query for being too poor to match anything either.
 
-### 8.3 No fallback term, and why `fast` cannot report high confidence
+### 8.3 No fallback term, and why a pipeline without a reranker cannot report high confidence
 
 When no reranker ran, the reranker term **contributes zero and the remaining weights are not
-renormalized.** The arithmetic maximum under `fast` is therefore 0.70.
+renormalized.** The arithmetic maximum under `fast`, or under any profile on an installation
+that names no reranker (the default), is therefore 0.70 — below the 0.75 `high` threshold.
 
 > **The rule, stated as the property it protects.** A component that did not run must never be
 > filled in from one that did. Substituting the retrieval average into the reranker's empty slot
@@ -1811,12 +1814,18 @@ Named settings are only useful if the names mean something specific. What actual
 | Dense rows fetched (floor, §4.3) | 30 | 60 | 150 |
 | `min_score` on the dense leg | 0.35 | 0.35 | 0.35 |
 | Fused set, before rerank | ≤ 20 | ≤ 40 | ≤ 100 |
-| Cross-encoder | **not loaded** | 20 pairs | 50 pairs |
+| Cross-encoder, when `rag.reranker` names one | **not loaded** | 20 pairs | 50 pairs |
 | Passages into context | 3 | 5 | 10 |
 | Context / history tokens | 4096 / 512 | 5632 / 1024 | 12288 / 2048 |
 | Smallest generator window that fits | 8k | 8k | 16k |
-| Model loads on the query path | 1 (embedder) | 2 | 2 |
-| Confidence ceiling (§8.3) | **0.70 — cannot reach `high`** | 1.0 | 1.0 |
+| Model loads on the query path | 1 (embedder) | 2 with a reranker, else 1 | 2 with a reranker, else 1 |
+| Confidence ceiling (§8.3) | **0.70 — cannot reach `high`** | 1.0 with a reranker, else 0.70 | 1.0 with a reranker, else 0.70 |
+
+A profile *asks* for reranking; it happens only when `rag.reranker` names a reranker
+(`cross_encoder`; `MANICULE_RAG__RERANKER=cross_encoder` in the environment) and the `rerank`
+extra is installed. The setting ships unset, so on a default install `balanced` and `precise`
+retrieve their wider sets without a second model, and their ceiling is `fast`'s 0.70. The
+cross-encoder and ceiling rows above describe an installation that has named one.
 
 The differences that matter are the last three rows. `fast` is the profile where the second model
 is never loaded — that is the latency difference, and everything else is a rounding error beside
@@ -2381,14 +2390,14 @@ Calls made in the absence of a stated position.
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |
 | The lexical match drops function words and matches any remaining word, each quoted, with BM25 doing the weighting; a query of function words alone keeps them; chosen over a conjunction and a minimum-should-match in three pre-registered rounds | §4.1 |
 | The reranker raises rather than passing through, and truncates to what it scored | §6.1 |
-| `bge-reranker-v2-m3` by default, because a monolingual reranker would undo the embedder's choice | §6.2 |
+| `bge-reranker-v2-m3` is the model once a reranker is named (`rag.reranker` ships unset), because a monolingual reranker would undo the embedder's choice | §6.2 |
 | Context assembly is not a `RetrievalStage` — closes the second open item in `contracts.md` §6 | §2.4, §7.1 |
 | Two token counters, named; `Chunk.token_count` must never be used for context fitting | §7.2 |
 | `tiktoken` by encoding name, no sampling, safety factor, then calibrated against `prompt_eval_count` | §7.2 |
 | Assembly includes whole passages or none; skip-and-continue, never truncate | §7.3 |
 | Profile-versus-generator window is a startup refusal | §7.4 |
 | Confidence is a retrieval-support score with named components, no fallback term | §8.2, §8.3 |
-| `fast` cannot reach `high` confidence, by arithmetic and on purpose | §8.3 |
+| `fast`, and any pipeline with no reranker, cannot reach `high` confidence, by arithmetic and on purpose | §8.3 |
 | A degraded leg suppresses the agreement component rather than scoring it zero — confidence never blames the corpus for a pipeline fault | §8.2 |
 | A description is separated from an expansion only where initials evidence says where it begins; no evidence, no cut | §14.3.1 |
 | Prose is refused on its first word against a closed list, with an abbreviation exemption; a verb list is declined as a thing a word list cannot do, and the gap it leaves is recorded | §14.3.2 |
