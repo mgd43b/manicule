@@ -564,6 +564,34 @@ query is long. No question any round measured has more than nine content words, 
 changes none of the figures above. The first sixteen are kept rather than the rarest because
 rarity needs the index's term statistics, which the match builder does not read.
 
+**Replicated under a second embedder.** Every round above measured BGE-M3. Rounds 3 and 3b were
+rerun unchanged with Qwen3-Embedding-0.6B (`qwen3-embedding:0.6b` on the `ollama` backend,
+`prefix_scheme = "qwen3"`), with what a different result would change written down first.
+Hybrid pipeline, `k = 10`, every content word required → any content word:
+
+| | BGE-M3 | Qwen3-Embedding-0.6B |
+|---|---|---|
+| Identifier questions with a second word, `hit@10` | 461 → 723 | 519 → 722 |
+| the same, MRR | 0.449 → 0.725 | 0.524 → 0.781 |
+| Authored questions, MRR | 0.751 → 0.696 | 0.716 → 0.635 |
+| Multi-hop, `hit@10` and MRR | 10, 0.628 → 7, 0.636 | 9, 0.693 → 9, 0.636 |
+| Held-out mail-thread questions, found | 123 → 125 | 126 → 125 |
+| Natural questions pooled, mean change and 95% interval | -0.002 [-0.038, +0.034] | +0.012 [-0.025, +0.049] |
+| Statement at 100,000 chunks, median / p95 ms: authored | 38.0 / 66.3 | 41.7 / 71.2 |
+| multi-hop | 48.1 / 73.4 | **52.6** / 79.0 |
+| identifiers with a second word | 17.9 / 26.1 | 20.6 / 30.7 |
+| a 120-word paste, capped | 82.2 / 100.4 | 84.0 / 103.8 |
+
+The gain carries over and so does the absence of a measurable loss on the pooled natural
+questions, though prose costs more under Qwen3 — the authored questions alone lose 0.081 —
+and the held-out thread questions are what bring the pool level. **Round 3's latency condition
+did not hold under Qwen3**: multi-hop took 52.6 ms against the 50 ms bound. The statement does
+not involve the embedder, but the timed table is built from the indexed chunks, and Qwen3's
+tokenizer cuts `docs/` into 1,198 longer chunks rather than 1,352, so a prose question matches
+more rows of each. The miss is a few milliseconds on eleven questions over one corpus, and the
+owner kept the rule. Round 3b agreed under both models: the cap cost the pastes 0.005 of
+reciprocal rank under Qwen3, inside its margin, and missed the time bound either way.
+
 **It changes no identity.** The match is built at query time from the text the leg was given:
 the FTS5 index, its tokenizer, every fingerprint and the `PipelineIdentity` are unchanged, and
 nothing needs rebuilding. Like the `bm25()` column weights, the match rule belongs to the store's
@@ -901,6 +929,23 @@ under the bar. Halving the lexical ladder closed the title gap and cost the iden
 standing: every repair measured costs more than it buys. Changing `K` would change
 `PipelineIdentity.rrf_k` and every cache key; a leg weight would need a field the identity does
 not yet have.
+
+**The same under Qwen3-Embedding-0.6B** (`prefix_scheme = "qwen3"`), where the title gap is wider —
+0.895 for the dense leg alone. Round 4's rule was applied per model, since `K` is an installation's
+setting, and no candidate qualified under either:
+
+| MRR@10, Qwen3-Embedding-0.6B | `K = 60` (shipped) | `K = 30` | `K = 10` | lexical weighted 0.5 |
+|---|---:|---:|---:|---:|
+| Titles (19) | 0.764 | 0.757 | 0.765 | **0.794** |
+| Authored questions (54) | 0.635 | 0.643 | 0.645 | 0.670 |
+| Multi-hop (11) | 0.636 | 0.636 | 0.636 | 0.652 |
+| Identifier questions (756) | 0.836 | 0.836 | 0.838 | **0.667** |
+| Identifier questions, two words (756) | 0.781 | 0.780 | 0.792 | **0.630** |
+| Mail-thread questions (126) | 0.821 | 0.821 | 0.821 | 0.771 |
+| Mail-thread keyword lookups (126) | 0.917 | 0.917 | 0.917 | 0.845 |
+
+`K = 10` again gained a little on the identifier questions — 0.007, under the bar — and the halved
+lexical ladder again cost them most of what the lexical leg is for (0.160).
 
 ### 5.5 Collapse: what a conversation repeats is shown once
 

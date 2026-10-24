@@ -197,6 +197,19 @@ What the result would change was written down before any of its output was read:
   same candidate. A candidate that qualifies under Qwen3 alone is recorded in
   ``docs/retrieval.md`` §5.4 as the setting for an installation embedding with it, not shipped.
 
+**The replication.** Round 4 agreed: no candidate qualified, ``K = 10`` again gained a little on
+identifiers (0.007) and the halved lexical ladder again cost them 0.160. Round 3b agreed: the cap
+cost 0.005 of reciprocal rank on the pastes, inside the margin, and still missed the time bound.
+Round 3 met conditions 1 to 4 — identifiers +0.257 (p = 4.8e-53), natural questions +0.012 with
+a 95% interval of [-0.025, +0.049] — and missed condition 5: multi-hop took a median of 52.6 ms
+at 100,000 chunks against 48.1 under BGE-M3. The criterion above was wrong to say the time could
+only repeat itself. The statement does not involve the embedder, but the timed table is built
+from the indexed chunks, and Qwen3's tokenizer cuts ``docs/`` into 1,198 longer chunks rather than
+1,352, so a prose question matches more rows of each. The owner judged the miss small and
+specific to this corpus and kept the shipped rule. Prose costs more under Qwen3 than under
+BGE-M3 — authored MRR 0.635 against 0.716 for the conjunction — and the held-out thread questions
+are what bring the pooled figure level.
+
 Everything is local: no network, temporary directories, and the only thing read from outside the
 repository is the embedding model, from the local model cache.
 """
