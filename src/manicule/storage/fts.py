@@ -254,23 +254,29 @@ def match_words(text: str) -> list[str]:
 
 
 def escape_match_query(text: str) -> str:
-    """Turn user input into an FTS5 ``MATCH`` expression: every content word, each a literal.
+    """Turn user input into an FTS5 ``MATCH`` expression: any content word, each a literal.
 
     **Every word is quoted, so none can be an operator.** FTS5's query language has operators
     (``AND``, ``OR``, ``NOT``, ``NEAR``, ``*``, ``:``, parentheses). A user typing ``NOT``
     means the word, and a user typing an unbalanced quote means nothing at all — unquoted, both
-    are a syntax error rather than a search. The phrases are joined by juxtaposition, which
-    FTS5 reads as ``AND``; no operator is ever written here.
+    are a syntax error rather than a search. The one operator in the expression is the ``OR``
+    written here, between quoted phrases, and it never comes from the user's text.
 
-    **Function words are dropped first, and that is the difference between a question reaching
-    this leg and not.** A conjunction over "how do I rotate the signing token" matches only a
-    chunk that also says "how", "do" and "I", so a question used to match nothing and the hybrid
-    pipeline ran on its dense leg alone. Measured over this repository's ``docs/`` with BGE-M3
-    (``tests/benchmarks/lexical_questions.py``, ``docs/retrieval.md`` §4.1): on 754 questions
-    each naming an identifier, ``hit@10`` went from 506 to 603 and MRR from 0.476 to 0.643, with
-    no set losing more than 0.005 of MRR. A disjunction — the other obvious repair — lost
-    multi-hop hits and cost 82 to 98 ms a query at 100,000 chunks, because "the" and "how" match
-    nearly every row and the statement scores all of them before ``LIMIT``.
+    **Function words are dropped, and the rest are alternatives, not requirements.** BM25's IDF
+    does the weighting: a chunk holding the rare words of the question ranks above one holding
+    its common ones, and a chunk holding only some of them can still be found. Requiring every
+    word — what this did before #481 — made a question match nothing, and requiring every
+    content word (#482) still missed a question that named an identifier along with one more
+    word the section never writes, such as "when is ``X`` checked". Chosen by three
+    pre-registered rounds in ``tests/benchmarks/lexical_questions.py`` (``docs/retrieval.md``
+    §4.1); in the third, on 754 such questions over this repository's ``docs/``, mean reciprocal
+    rank rose by 0.276, with no measurable loss on 191 natural questions.
+
+    **What that costs is time, and it grows with the corpus.** ``SEARCH_SQL`` scores every row
+    the expression matches before ``LIMIT``, and a disjunction matches far more rows than a
+    conjunction: at 100,000 chunks the median prose question took 38 to 48 ms against about 1 ms
+    for the conjunction. Dropping the function words roughly halves it — with them, the same
+    questions matched nearly every row and took 77 to 98 ms.
 
     **A query made only of function words keeps them.** "What is it" is then a search for those
     three words rather than no search, and ``NOT`` or ``OR`` on its own is still the word. Each
@@ -278,9 +284,8 @@ def escape_match_query(text: str) -> str:
     Two spellings the stemmer folds together, ``token`` and ``tokens``, are still two words.
 
     **The list is English**, like the Porter stemmer in
-    :data:`~manicule.storage.models.FTS_TOKENIZER`. A question in
-    another language keeps its function words and needs every one of them in a chunk, as every
-    question did before #481.
+    :data:`~manicule.storage.models.FTS_TOKENIZER`. A question in another language keeps its
+    function words as alternatives, which BM25 weights down where they are common.
 
     Args:
         text: Whatever the user typed.
@@ -290,7 +295,7 @@ def escape_match_query(text: str) -> str:
     """
     words = match_words(text)
     content = [word for word in words if word.lower() not in FUNCTION_WORDS]
-    return " ".join('"' + word.replace('"', '""') + '"' for word in content or words)
+    return " OR ".join('"' + word.replace('"', '""') + '"' for word in content or words)
 
 
 __all__ = [

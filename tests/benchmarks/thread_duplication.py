@@ -297,11 +297,11 @@ FORMS = ("question", "keywords")
 def queries(corpus: Corpus) -> tuple[QuerySet, list[Asked]]:
     """Two lookups per queried passage — the first, middle and last message of every thread.
 
-    A natural question, and the same lookup as a few words the passage contains. The lexical leg
-    matches a chunk only when it holds every query word that is not a function word, so the
-    keywords always reach both legs and the question often reaches the dense leg alone;
-    reporting them apart is what shows which leg a cost comes from. When #463 measured this, the
-    function words were required too and no question reached the lexical leg at all (#481).
+    A natural question, and the same lookup as a few words the passage contains. Reporting them
+    apart is what shows which leg a cost comes from: when #463 measured this, the lexical leg
+    required every word of the query, function words too, so the keywords reached both legs and
+    no question reached the lexical leg at all (#481). It now matches any word that is not a
+    function word, and both forms reach it.
     """
     asked: list[Asked] = []
     for thread in corpus.threads:

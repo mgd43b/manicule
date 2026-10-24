@@ -14,9 +14,9 @@ configured with, never a key some store happened to write.
 fusion and the cross-leg agreement term are computed from.
 
 **Zero results is an event, not a warning.** An empty match is legitimate — a question whose
-content words never occur together in one chunk, a query that tokenizes to nothing — and it is
-also what a failure of the lexical index looks like. Either way the pipeline continues on one
-leg and produces a well-formed ranking, so the run records that it was single-leg and becomes
+content words occur in no chunk at all, a query that tokenizes to nothing — and it is also what
+a failure of the lexical index looks like. Either way the pipeline continues on one leg and
+produces a well-formed ranking, so the run records that it was single-leg and becomes
 inadmissible as a measurement. Logging it instead would leave an evaluation harness unable to
 tell a hard corpus from a broken index.
 """

@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
     from manicule.core.content import Chunk, Document
     from manicule.core.glossary import GlossaryEntry
-    from manicule.core.protocols import Embedder
+    from manicule.core.protocols import Embedder, RetrievalStage
     from manicule.retrieval.ports import GlossarySource
     from manicule.retrieval.router import QueryRouter
     from manicule.storage.docstore import SqliteDocStore
@@ -149,6 +149,7 @@ async def retriever_over(
     cache: L1QueryCache | None = None,
     router: QueryRouter | None = None,
     overrides: Mapping[str, object] | None = None,
+    lexical: bool = True,
 ) -> Retriever:
     """The shipped retriever, dense + lexical + RRF, over ``chunks``.
 
@@ -168,6 +169,10 @@ async def retriever_over(
     ``overrides`` extends :data:`PROFILE_OVERRIDES` rather than replacing it, so a case that
     needs one profile field — a context budget small enough to drop a passage — states that
     field and keeps the floor of zero every other case depends on.
+
+    ``lexical=False`` drops the lexical leg and fusion, for the one case that needs a search
+    unable to return a passage: the lexical leg matches any content word of a question, and the
+    glossary page holds every expansion, so with it no expanded search can miss the definition.
     """
     vectors = CosineVectorStore()
     await vectors.ensure_ready(embedder.fingerprint)
@@ -175,16 +180,18 @@ async def retriever_over(
 
     profiles = Profiles({**PROFILE_OVERRIDES, **(overrides or {})})
     dense = DenseStage(embedder=embedder, vectors=vectors, docstore=store, profiles=profiles)
-    lexical = LexicalStage(docstore=store, profiles=profiles)
     fusion = RRFStage()
+    stages: list[RetrievalStage] = [dense]
+    if lexical:
+        stages.extend([LexicalStage(docstore=store, profiles=profiles), fusion])
     return Retriever(
-        runner=PipelineRunner([dense, lexical, fusion], docstore=store),
+        runner=PipelineRunner(stages, docstore=store),
         docstore=store,
         assembler=ContextAssembler(counter=ContextTokenCounter(), profiles=profiles),
         profiles=profiles,
         router=router,
         cache=cache,
-        legs=fusion.legs,
+        legs=fusion.legs if lexical else ("dense",),
         rrf_k=fusion.k,
         embed_fingerprint=embedder.fingerprint.canonical(),
         glossary=_source(store, glossary),

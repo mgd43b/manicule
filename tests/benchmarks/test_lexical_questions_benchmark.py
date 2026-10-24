@@ -79,8 +79,8 @@ def test_a_question_of_function_words_alone_keeps_them() -> None:
 
 
 def test_the_winning_variant_is_the_shipped_rule_and_the_baseline_is_the_old_one() -> None:
-    """A re-run measures what ships, and compares it against the rule #481 replaced."""
-    assert VARIANTS["and-content"] is escape_match_query
+    """A re-run measures what ships, and compares it against the rules it replaced."""
+    assert VARIANTS["or-content"] is escape_match_query
     question = "how do I rotate the signing token"
     assert VARIANTS["and"](question) == '"how" "do" "I" "rotate" "the" "signing" "token"'
     assert VARIANTS["and"]("- token token") == '"-" "token" "token"', "verbatim, defects included"
@@ -187,7 +187,7 @@ def test_every_two_word_question_has_two_content_words_and_round_twos_target() -
     for question, _ in two:
         words = match_words(question)
         assert len([w for w in words if w.lower() not in FUNCTION_WORDS]) == 2, question
-        assert escape_match_query(question) != VARIANTS["or-content"](question)
+        assert escape_match_query(question) != VARIANTS["and-content"](question)
 
 
 def test_the_bootstrap_interval_is_reproducible_and_brackets_the_mean() -> None:

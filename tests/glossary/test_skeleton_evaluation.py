@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from manicule.core.retrieval import ConfidenceBand, Query
+from manicule.core.retrieval import Query
 from manicule.ingest.glossary import MIN_SKELETON_LENGTH, detect_entries
 from tests.evaluation.fakes import BagOfWordsEmbedder
 from tests.glossary import skeleton_corpus as labeled
@@ -217,29 +217,29 @@ async def test_hit_rate_for_definitional_questions(store: SqliteDocStore) -> Non
     ====  =============  ====================
     k     Baseline       Glossary wired
     ====  =============  ====================
-    1     7/14 = 0.500   13/14 = **0.929**
-    3     9/14 = 0.643   13/14 = **0.929**
-    10    13/14 = 0.929  14/14 = **1.000**
+    1     9/14 = 0.643   14/14 = **1.000**
+    3     12/14 = 0.857  14/14 = **1.000**
+    10    14/14 = 1.000  14/14 = **1.000**
     ====  =============  ====================
 
-    **The baseline moved when the lexical leg stopped requiring function words** (#481). It used
-    to be 0, 0 and 2 of 14: ``What is SORT?`` asked the lexical leg for "what" and "is" as well,
-    so it matched nothing and the definition had to win on the stand-in embedder's similarity
-    alone. It now asks for ``SORT``, so the page that defines it can be found by the term itself.
-    The glossary still adds six questions at k = 1 and four at k = 3, because a lookup fetches the
-    defining chunk by id rather than leaving it to win a ranking.
+    **Both columns moved with the lexical leg's match rule, and the baseline is why.** Before #481
+    the baseline was 0, 0 and 2 of 14: ``What is SORT?`` asked the lexical leg for "what" and
+    "is" as well, matched nothing, and left the definition to the stand-in embedder's similarity.
+    Requiring only the content words (#482) made it 7, 9 and 13; matching any of them (round 3 of
+    ``tests/benchmarks/lexical_questions.py``) makes it 9, 12 and 14. The glossary still adds
+    five questions at k = 1 and two at k = 3, because a lookup fetches the defining chunk by id
+    rather than leaving it to win a ranking.
 
-    The thirteen are all rank 1 exactly, and that is a property of the mechanism rather than a
-    good score: an alias hit is a **lookup**, so the defining chunk is fetched by id and promoted
-    rather than made to win a similarity contest.
+    Thirteen of the wired fourteen are rank 1 by **lookup**: an alias hit fetches the defining
+    chunk by id and promotes it rather than making it win a similarity contest.
 
     **The fourteenth is the interesting one and it is kept rather than removed.** ``What does
     SecOps Reliability Toolkit stand for?`` names the *expansion* and never writes the term, so no
-    alias fires, nothing is promoted, and the definition arrives at rank 10 by similarity alone —
-    the same rank the baseline gives it. That is a real limit of the design: the glossary is keyed
-    by term, so a question that already knows the expansion gets no help from it. Dropping the
-    query would have bought a hit rate of 1.000 at every *k* and hidden a limitation, which is
-    exactly the kind of round number this corpus exists to avoid.
+    alias fires and nothing is promoted: the glossary is keyed by term, and a question that
+    already knows the expansion gets no help from it. It reaches rank 1 anyway, because the
+    lexical leg now matches the expansion's own words on the glossary page — search doing its
+    job, not the glossary. While every word was required it arrived at rank 10, and that limit of
+    the design is still there for a question whose words the page does not hold.
 
     Three of these ask in a case the source never wrote — ``what is sort?``, ``what does safer
     stand for?``, ``what is recap?`` — and they resolve because the *key* is normalized. That is
@@ -260,8 +260,8 @@ async def test_hit_rate_for_definitional_questions(store: SqliteDocStore) -> Non
             hits[cutoff] += after is not None and after <= cutoff
             baseline_hits[cutoff] += before is not None and before <= cutoff
 
-    assert hits == {1: 13, 3: 13, 10: 14}
-    assert baseline_hits == {1: 7, 3: 9, 10: 13}, (
+    assert hits == {1: 14, 3: 14, 10: 14}
+    assert baseline_hits == {1: 9, 3: 12, 10: 14}, (
         "the baseline moved, so what the glossary adds over search has to be measured again"
     )
 
@@ -314,16 +314,23 @@ async def test_using_a_defined_token_is_not_asking_what_it_means(store: SqliteDo
 async def test_no_confidence_band_moves(store: SqliteDocStore) -> None:
     """The band is the same with the glossary wired as without it, for all 24 queries.
 
-    **Band changes: none, and no score moves either.** Measured over every query in the corpus —
-    fourteen definitional, six unsupported, four non-definitional — the reported score is
-    identical to the baseline's in each case and therefore so is the band. That is requirement 8
-    and it is by construction rather than by luck: a promoted passage carries no leg score, so it
-    contributes nothing to the arithmetic in either direction, and ``explicit_definition`` is a
-    boolean that replaces a *reason* string.
+    **Band changes: none. Score changes: one, and it is the expanded search's passages.** Measured
+    over every query in the corpus — fourteen definitional, six unsupported, four
+    non-definitional. That is requirement 8, and it holds by construction: a promoted passage
+    carries no leg score, so it contributes nothing to the arithmetic in either direction, and
+    ``explicit_definition`` is a boolean that replaces a *reason* string.
 
-    Asserted as equality rather than as "did not decrease". A test allowing the score to rise
-    would pass for an implementation that had quietly started adding detection confidence to a
-    cosine, which is the one substitution this whole feature is built to avoid.
+    The one score that moves is ``the audit trail is on the same volume as the index``, 0.610 to
+    0.625 and ``medium`` both times. ``audit`` names a glossary term, so the expanded text runs a
+    second search, and since the lexical leg matches any content word (``docs/retrieval.md``
+    §4.1) that search returns passages the first did not. A different context is different
+    evidence; while every word was required, the second search matched nothing lexically here
+    and no score moved at all.
+
+    **What is asserted exactly is the substitution this feature is built to avoid.** Every dense
+    score in the wired context must be one a search actually measured — the better of the
+    original and the expanded pass, per chunk — so a detection confidence quietly added to a
+    cosine fails here however the totals move. And a score may move only where the context did.
     """
     chunks = await _corpus(store)
     baseline, wired = await _retrievers(store, chunks)
@@ -333,16 +340,43 @@ async def test_no_confidence_band_moves(store: SqliteDocStore) -> None:
         *labeled.UNSUPPORTED_QUERIES,
         *labeled.NON_DEFINITIONAL_QUERIES,
     ]
-    moved: list[tuple[str, ConfidenceBand, float, ConfidenceBand, float]] = []
+    bands: list[str] = []
+    unexplained: list[str] = []
+    invented: list[tuple[str, str]] = []
+    moved: list[str] = []
     for text in queries:
-        before = (await baseline.retrieve(_ask(text))).confidence
-        after = (await wired.retrieve(_ask(text))).confidence
-        assert before is not None
-        assert after is not None
-        if after.band is not before.band or after.score != pytest.approx(before.score):
-            moved.append((text, before.band, before.score, after.band, after.score))
+        before = await baseline.retrieve(_ask(text))
+        after = await wired.retrieve(_ask(text))
+        assert before.confidence is not None
+        assert after.confidence is not None
+        if after.confidence.band is not before.confidence.band:
+            bands.append(text)
+        measured: dict[str, float] = {}
+        searches = [before]
+        report = after.trace.glossary
+        if report is not None and report.second_pass:
+            searches.append(await baseline.retrieve(_ask(report.expanded_query)))
+        for search in searches:
+            for candidate in search.candidates:
+                if "dense" in candidate.scores:
+                    measured[candidate.chunk.id] = max(
+                        measured.get(candidate.chunk.id, -1.0), candidate.scores["dense"]
+                    )
+        for passage in after.context.passages:
+            if "dense" in passage.scores and passage.scores["dense"] != pytest.approx(
+                measured.get(passage.chunk.id)
+            ):
+                invented.append((text, passage.chunk.id))
+        if after.confidence.score != pytest.approx(before.confidence.score):
+            moved.append(text)
+            shown = [p.chunk.id for p in after.context.passages if "glossary" not in p.scores]
+            if shown == [p.chunk.id for p in before.context.passages]:
+                unexplained.append(text)
 
-    assert not moved, f"the glossary moved a confidence band or score: {moved}"
+    assert not bands, f"the glossary moved a confidence band: {bands}"
+    assert not invented, f"a dense score no search measured: {invented}"
+    assert not unexplained, f"a score moved with the same evidence shown: {unexplained}"
+    assert moved == ["the audit trail is on the same volume as the index"]
 
 
 async def test_two_definitions_of_one_key_stay_a_conflict(store: SqliteDocStore) -> None:

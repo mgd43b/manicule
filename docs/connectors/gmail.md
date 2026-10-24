@@ -719,8 +719,9 @@ queried through the evaluation harness's `RetrieverSystem` ([`evaluation.md`](..
 **Queries.** The first, middle and last message of every thread, each asked two ways: a natural
 question, and a few words the passage contains. They are reported apart because, when this was
 measured, the lexical leg matched a chunk only when it held every query term, function words
-included, so a natural question reached the dense leg alone. It now drops function words first
-([`retrieval.md`](../retrieval.md) §4.1); the figures below predate that. 168 queries.
+included, so a natural question reached the dense leg alone. It now drops function words and
+matches any of the rest ([`retrieval.md`](../retrieval.md) §4.1); the figures below predate
+that. 168 queries.
 
 **What is scored, per query, in the top ten.** A chunk *carries* a passage when it holds at
 least half of the passage's characters, placed by the chunk's line anchor; every passage the

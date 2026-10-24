@@ -113,6 +113,15 @@ Otherwise ``and-content`` stays. As a diagnostic and not a condition, the natura
 differences are split by whether ``and-content`` matched anything, which says whether the
 disjunction's cost comes from adding weak matches where the conjunction had none.
 
+**Round 3 returned "switch", and ``or-content`` is now the shipped rule.** Every condition held.
+On the two-word identifier questions mean reciprocal rank rose by 0.276 (402 questions better, 63
+worse, p = 1.7e-61); ``hit@10`` 723 against 461. On 191 natural questions the change was -0.002,
+95% interval [-0.038, +0.034], against a margin of -0.05. No title or thread keyword lookup was
+lost and no unanswerable question left ``none``. Latency was the closest condition: the slowest
+set, multi-hop, took a median of 48.1 ms and a p95 of 73.4 ms at 100,000 chunks. The diagnostic
+found the cost where expected: -0.021 on the 68 natural questions the conjunction had matched,
++0.008 on the 123 it had not.
+
 Everything is local: no network, temporary directories, and the only thing read from outside the
 repository is the embedding model, from the local model cache.
 """
@@ -206,9 +215,9 @@ def match_any(text: str) -> str:
     return " OR ".join(_literals(text))
 
 
-def match_any_content(text: str) -> str:
-    """Any word that is not a function word."""
-    return " OR ".join(_content(_literals(text)))
+def match_all_content(text: str) -> str:
+    """Every word that is not a function word: the rule #482 shipped and round 3 replaced."""
+    return " ".join(_content(_literals(text)))
 
 
 def match_all_but_one_content(text: str) -> str:
@@ -226,14 +235,14 @@ def match_all_but_one_content(text: str) -> str:
 VARIANTS: dict[str, Callable[[str], str]] = {
     "and": match_all,
     "or": match_any,
-    "or-content": match_any_content,
-    "and-content": escape_match_query,
+    "or-content": escape_match_query,
+    "and-content": match_all_content,
     "all-but-one": match_all_but_one_content,
 }
 """Report order, simplest first, which is also rule 2's tie-break order.
 
-``and`` is the rule this was built to replace. ``and-content`` — every word but the
-:data:`~manicule.storage.fts.FUNCTION_WORDS` — won, and is the shipped
+``and`` is the rule #481 replaced and ``and-content`` the one #482 shipped. ``or-content`` — any
+word but the :data:`~manicule.storage.fts.FUNCTION_WORDS` — won round 3, and is the shipped
 :func:`~manicule.storage.fts.escape_match_query` itself rather than a copy of it, so a change to
 the shipped rule is measured by the next run without anybody remembering to edit this list."""
 
@@ -916,7 +925,8 @@ def render(rows: Sequence[tuple[str, str, Row]]) -> str:
 
 # --- round 3 ------------------------------------------------------------------------------------
 
-SHIPPED = "and-content"
+INCUMBENT = "and-content"
+"""The rule round 3 tested against: shipped by #482, replaced on round 3's result."""
 CHALLENGER = "or-content"
 HELD_OUT_SEED = 481
 """The thread corpus's seed for round 3. 463 built rounds 1 and 2, and 1729 was #463's own
@@ -960,7 +970,7 @@ def docs_pairs(
             reciprocal(challenger[o.asked.id].rank),
             o.lexical_matched == 0,
         )
-        for o in outcomes[SHIPPED, "hybrid"]
+        for o in outcomes[INCUMBENT, "hybrid"]
         if o.asked.group in groups
     ]
 
@@ -977,7 +987,7 @@ def thread_pairs(
             reciprocal(challenger[o.asked.query.id].first),
             o.single_leg,
         )
-        for o in runs[SHIPPED, "hybrid"]
+        for o in runs[INCUMBENT, "hybrid"]
         if o.asked.form == form
     ]
 
@@ -1044,10 +1054,10 @@ class RoundThree:
         lines.extend(f"  {name}: {held}" for name, held in self.conditions.items())
         for empty, (count, change) in sorted(self.by_match.items()):
             lines.append(
-                f"  diagnostic: {count} natural questions where {SHIPPED} matched "
+                f"  diagnostic: {count} natural questions where {INCUMBENT} matched "
                 f"{'nothing' if empty else 'something'}, mean change {change:+.3f}"
             )
-        lines.append(f"  -> {'switch to ' + CHALLENGER if self.switch else 'keep ' + SHIPPED}")
+        lines.append(f"  -> {'switch to ' + CHALLENGER if self.switch else 'keep ' + INCUMBENT}")
         return "\n".join(lines)
 
 
@@ -1072,11 +1082,11 @@ def round_three(
             for o in outcomes[variant, "hybrid"]
             if o.asked.group == "titles"
         ]
-        for variant in (SHIPPED, CHALLENGER)
+        for variant in (INCUMBENT, CHALLENGER)
     }
     keywords = {
         variant: [o.found for o in runs[variant, "hybrid"] if o.asked.form == "keywords"]
-        for variant in (SHIPPED, CHALLENGER)
+        for variant in (INCUMBENT, CHALLENGER)
     }
     by_match: dict[bool, tuple[int, float]] = {}
     for empty in (True, False):
@@ -1098,8 +1108,8 @@ def round_three(
         natural=statistics.fmean(differences),
         natural_interval=bootstrap_interval(differences),
         natural_count=len(natural),
-        lost_titles=lost(titles[SHIPPED], titles[CHALLENGER]),
-        lost_keywords=lost(keywords[SHIPPED], keywords[CHALLENGER]),
+        lost_titles=lost(titles[INCUMBENT], titles[CHALLENGER]),
+        lost_keywords=lost(keywords[INCUMBENT], keywords[CHALLENGER]),
         unanswerable_out_of_none=sum(
             o.band is not ConfidenceBand.NONE
             for o in outcomes[CHALLENGER, "hybrid"]
@@ -1200,8 +1210,8 @@ async def _report_threads(
                 f"{len(chosen)} | {sum(o.single_leg for o in chosen)} | "
                 f"{sum(o.found for o in chosen)} |"
             )
-    if {SHIPPED, CHALLENGER} <= set(args.variants):
-        emit(f"\n### round 3: {CHALLENGER} against {SHIPPED}\n")
+    if {INCUMBENT, CHALLENGER} <= set(args.variants):
+        emit(f"\n### round 3: {CHALLENGER} against {INCUMBENT}\n")
         emit(round_three(measured, runs, timings).describe())
 
 

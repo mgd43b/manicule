@@ -486,20 +486,17 @@ async def test_a_definition_neither_search_returned_is_still_promoted(
     only reordered what search found would return nothing. The entry names the chunk, so it is
     fetched by id.
 
-    The question asks what ``NOW`` *means*, and the glossary page never writes "mean": the
-    lexical leg needs every content word in one chunk (``docs/retrieval.md`` §4.1), so neither
-    pass matches it there, and the stand-in embedder ranks the page outside the candidates.
-    ``What is NOW?`` used to be this case, while the lexical leg also required "what" and "is";
-    since #481 the expanded pass finds the page by its expansion, which is the expansion working.
+    **The search is the dense leg alone, and that is the only way to set this up.** The lexical
+    leg matches any content word of a question (``docs/retrieval.md`` §4.1), and the glossary
+    page holds every expansion, so with it the expanded pass always finds the page by its words —
+    the expansion working, not the lookup. ``What is NOW?`` was this case while the lexical leg
+    required every word; the stand-in embedder still ranks the page outside the candidates.
     """
-    retriever = await _with_glossary(store, indexed)
+    retriever = await system.retriever_over(store, BagOfWordsEmbedder(), indexed, lexical=False)
 
     result = await retriever.retrieve(
         Query(text="What does NOW mean?", limit=1, filter=system.query_filter())
     )
-    lexical = [stage for stage in result.trace.stages if stage.name == "lexical"]
-    assert lexical[0].diagnostics["matched"] == 0, "the premise: no lexical match to reorder"
-
     assert result.trace.glossary is not None
     assert result.trace.glossary.promoted_from_store == 1
     assert system.rank_of(result.context.passages, definition) == 1

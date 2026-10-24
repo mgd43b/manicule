@@ -189,45 +189,69 @@ async def test_a_question_reaches_a_chunk_that_never_says_how_do_or_i(
     """The defect #481 fixed: every word of a question used to be required, function words too."""
     await _seed(store, "s1", ["Rotate the signing token every thirty days."])
     assert escape_match_query("how do I rotate the signing token?") == (
-        '"rotate" "signing" "token"'
+        '"rotate" OR "signing" OR "token"'
     )
     assert await store.search_lexical("how do I rotate the signing token?", k=5)
 
 
-async def test_every_content_word_is_still_required(store: SqliteDocStore) -> None:
-    """Dropping function words is not a disjunction: a chunk missing a subject word is no match."""
-    await _seed(store, "s1", ["Rotate the signing token every thirty days."])
-    assert await store.search_lexical("how do I rotate the encryption token", k=5) == []
+async def test_a_chunk_missing_a_content_word_is_found_and_ranked_below(
+    store: SqliteDocStore,
+) -> None:
+    """What round 3 changed: content words are alternatives, and BM25 does the weighting.
+
+    Requiring every content word missed a question naming the right thing in other words — the
+    chunk below says "signing token" and never "encryption". It is now found, and a chunk holding
+    more of the question's rarer words still ranks above it.
+    """
+    await _seed(
+        store,
+        "s1",
+        [
+            "Rotate the signing token every thirty days.",
+            "Rotate the encryption token whenever the signing key changes.",
+            "Thirty days is the default retention.",
+        ],
+    )
+    hits = await store.search_lexical("how do I rotate the encryption token", k=5)
+    texts = [candidate.chunk.text for candidate in hits]
+    assert texts[0].startswith("Rotate the encryption token"), "it holds all three words"
+    # Every seeded chunk matches through the stand-in breadcrumb, which says "tokens"; the one
+    # holding only that ranks last.
+    assert texts.index("Rotate the signing token every thirty days.") < texts.index(
+        "Thirty days is the default retention."
+    )
 
 
 async def test_a_query_of_function_words_alone_searches_for_them(store: SqliteDocStore) -> None:
     """Dropping every word would turn a question into no search at all."""
     await _seed(store, "s1", ["What is it that the sweep removes?"])
-    assert escape_match_query("what is it") == '"what" "is" "it"'
+    assert escape_match_query("what is it") == '"what" OR "is" OR "it"'
     assert await store.search_lexical("what is it", k=5)
 
 
 def test_negation_is_a_subject_word_and_is_kept() -> None:
     """Dropping ``not`` would make the question ask for its opposite."""
-    assert escape_match_query("why is the vector not published") == ('"vector" "not" "published"')
-    assert escape_match_query("why doesn't it publish") == '"doesn\'t" "publish"'
+    assert escape_match_query("why is the vector not published") == (
+        '"vector" OR "not" OR "published"'
+    )
+    assert escape_match_query("why doesn't it publish") == '"doesn\'t" OR "publish"'
 
 
 def test_function_words_are_recognized_through_case_and_punctuation() -> None:
-    assert escape_match_query("How does THE sweep work, then?") == '"sweep" "work"'
-    assert escape_match_query("what's it for.") == '"what\'s" "it" "for"'
+    assert escape_match_query("How does THE sweep work, then?") == '"sweep" OR "work"'
+    assert escape_match_query("what's it for.") == '"what\'s" OR "it" OR "for"'
 
 
 def test_a_typographic_apostrophe_is_the_same_apostrophe() -> None:
-    """A phone or macOS keyboard types ``\u2019``; dropping it made ``whats`` a required word."""
-    assert escape_match_query("what\u2019s the retention period") == '"retention" "period"'
-    assert escape_match_query("why doesn\u2019t it publish") == '"doesn\'t" "publish"'
+    """A phone or macOS keyboard types ``\u2019``; dropping it made ``whats`` a content word."""
+    assert escape_match_query("what\u2019s the retention period") == '"retention" OR "period"'
+    assert escape_match_query("why doesn\u2019t it publish") == '"doesn\'t" OR "publish"'
 
 
 def test_each_word_is_matched_once() -> None:
     """``bm25()`` scores a repeated phrase twice, so a repeated word would outweigh the rest."""
-    assert escape_match_query("token Token TOKEN rotation") == '"token" "rotation"'
-    assert escape_match_query("token, token. (token) rotation") == '"token" "rotation"'
+    assert escape_match_query("token Token TOKEN rotation") == '"token" OR "rotation"'
+    assert escape_match_query("token, token. (token) rotation") == '"token" OR "rotation"'
 
 
 @pytest.mark.parametrize(
@@ -235,18 +259,22 @@ def test_each_word_is_matched_once() -> None:
     [
         ("NOT", '"NOT"'),
         ("OR", '"OR"'),
-        ("AND OR", '"AND" "OR"'),
+        ("AND OR", '"AND" OR "OR"'),
         ("what is NEAR", '"NEAR"'),
-        ("published NOT deleted", '"published" "NOT" "deleted"'),
-        ('col:value "unbalanced', '"colvalue" "unbalanced"'),
-        ("token* (unclosed", '"token" "unclosed"'),
+        ("published NOT deleted", '"published" OR "NOT" OR "deleted"'),
+        ('col:value "unbalanced', '"colvalue" OR "unbalanced"'),
+        ("token* (unclosed", '"token" OR "unclosed"'),
     ],
 )
-def test_every_word_is_a_quoted_literal_and_no_operator_is_written(raw: str, expected: str) -> None:
-    """Outside the quotes there is nothing but spaces, so FTS5 can only read juxtaposition."""
+def test_every_word_is_a_quoted_literal_and_the_only_operator_is_ours(
+    raw: str, expected: str
+) -> None:
+    """Outside the quotes there is nothing but the ``OR`` this function writes between them."""
     match = escape_match_query(raw)
     assert match == expected
-    assert re.sub(r'"(?:[^"]|"")*"', "", match).strip() == ""
+    outside = re.sub(r'"(?:[^"]|"")*"', "", match)
+    assert set(outside.split()) <= {"OR"}
+    assert outside.split().count("OR") == max(0, match.count('" OR "'))
 
 
 async def test_operator_words_alone_search_for_the_words(store: SqliteDocStore) -> None:
