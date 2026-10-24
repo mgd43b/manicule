@@ -34,6 +34,7 @@ from tests.benchmarks.lexical_questions import (
     Place,
     RoundThree,
     RoundThreeB,
+    _lost,  # pyright: ignore[reportPrivateUsage]
     _rank,  # pyright: ignore[reportPrivateUsage]
     bootstrap_interval,
     identifier_questions,
@@ -222,11 +223,17 @@ def _round(**changes: object) -> RoundThree:
         "lost_titles": 0,
         "lost_keywords": 0,
         "unanswerable_out_of_none": 0,
-        "slowest": ("authored", 30.0, 60.0),
+        "latency": {"authored": (30.0, 60.0), "identifiers": (10.0, 20.0)},
         "by_match": {True: (100, 0.02), False: (90, -0.04)},
     }
     figures.update(changes)
     return RoundThree(**figures)  # pyright: ignore[reportArgumentType]
+
+
+def test_a_lost_lookup_is_not_paid_for_by_a_gained_one() -> None:
+    """Condition 3 counts the incumbent's hits the challenger misses, paired by query."""
+    assert _lost([True, True, False, False], [False, False, True, True]) == 2
+    assert _lost([True, False], [True, True]) == 0
 
 
 def test_round_three_switches_only_when_every_condition_holds() -> None:
@@ -237,7 +244,10 @@ def test_round_three_switches_only_when_every_condition_holds() -> None:
     assert not _round(gain=0.12, natural_interval=(-0.041, 0.0)).switch, "a third of 0.12"
     assert not _round(lost_titles=2).switch
     assert not _round(unanswerable_out_of_none=1).switch
-    assert not _round(slowest=("authored", 49.0, 101.0)).switch
+    assert not _round(latency={"authored": (49.0, 101.0)}).switch
+    assert not _round(latency={"authored": (49.0, 80.0), "example": (30.0, 120.0)}).switch, (
+        "the worst p95 need not belong to the slowest median"
+    )
     assert "keep and-content" in _round(lost_keywords=2).describe()
 
 

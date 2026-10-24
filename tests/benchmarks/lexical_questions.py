@@ -1085,8 +1085,9 @@ class RoundThree:
     lost_titles: int
     lost_keywords: int
     unanswerable_out_of_none: int
-    slowest: tuple[str, float, float]
-    """The question set with the highest median for the challenger: name, median, p95 ms."""
+    latency: dict[str, tuple[float, float]]
+    """The challenger's median and p95 ms at :data:`SCALE` chunks, per question set. Both limits
+    hold for every set: the set with the slowest median need not be the one with the worst p95."""
     by_match: dict[bool, tuple[int, float]]
     """Natural-question pairs by whether the shipped rule matched nothing: count, mean change."""
 
@@ -1101,7 +1102,10 @@ class RoundThree:
             "2 not inferior": self.natural_interval[0] > self.margin,
             "3 titles and keywords": self.lost_titles <= 1 and self.lost_keywords <= 1,
             "4 unanswerable": self.unanswerable_out_of_none == 0,
-            "5 latency": self.slowest[1] < 50 and self.slowest[2] < 100,
+            "5 latency": all(
+                median < 50 and p95 < 100
+                for median, p95 in self.latency.values()
+            ),
         }
 
     @property
@@ -1118,8 +1122,8 @@ class RoundThree:
             f"{self.margin:+.3f}",
             f"  3 titles lost {self.lost_titles}, thread keywords lost {self.lost_keywords}",
             f"  4 unanswerable questions out of none: {self.unanswerable_out_of_none}",
-            f"  5 slowest set for {CHALLENGER}: {self.slowest[0]}, median "
-            f"{self.slowest[1]:.1f} ms, p95 {self.slowest[2]:.1f} ms",
+            f"  5 {CHALLENGER}: slowest median {max(self.latency.items(), key=lambda t: t[1][0])}"
+            f", worst p95 {max(self.latency.items(), key=lambda t: t[1][1])}",
         ]
         lines.extend(f"  {name}: {held}" for name, held in self.conditions.items())
         for empty, (count, change) in sorted(self.by_match.items()):
@@ -1129,6 +1133,12 @@ class RoundThree:
             )
         lines.append(f"  -> {'switch to ' + CHALLENGER if self.switch else 'keep ' + INCUMBENT}")
         return "\n".join(lines)
+
+
+def _lost(incumbent: Sequence[bool], challenger: Sequence[bool]) -> int:
+    """Lookups the incumbent found and the challenger did not, paired by query: a gain elsewhere
+    does not pay for one."""
+    return sum(was and not now for was, now in zip(incumbent, challenger, strict=True))
 
 
 def round_three(
@@ -1142,11 +1152,6 @@ def round_three(
     worse = sum(p.difference < 0 for p in gained)
     natural = docs_pairs(outcomes, NATURAL) + thread_pairs(runs, "question")
     differences = [p.difference for p in natural]
-
-    def lost(incumbent: Sequence[bool], challenger: Sequence[bool]) -> int:
-        """Lookups the incumbent found and the challenger did not, per query: a gain elsewhere
-        does not pay for one."""
-        return sum(was and not now for was, now in zip(incumbent, challenger, strict=True))
 
     titles = {
         variant: [
@@ -1165,14 +1170,11 @@ def round_three(
         chosen = [p.difference for p in natural if p.shipped_empty is empty]
         if chosen:
             by_match[empty] = (len(chosen), statistics.fmean(chosen))
-    slowest = max(
-        (
-            (group, median, p95)
-            for (name, group), (median, p95, _) in timings.items()
-            if name == CHALLENGER
-        ),
-        key=lambda row: row[1],
-    )
+    latency = {
+        group: (median, p95)
+        for (name, group), (median, p95, _) in timings.items()
+        if name == CHALLENGER
+    }
     return RoundThree(
         gain=statistics.fmean(p.difference for p in gained),
         gain_split=(better, worse),
@@ -1180,20 +1182,20 @@ def round_three(
         natural=statistics.fmean(differences),
         natural_interval=bootstrap_interval(differences),
         natural_count=len(natural),
-        lost_titles=lost(titles[INCUMBENT], titles[CHALLENGER]),
-        lost_keywords=lost(keywords[INCUMBENT], keywords[CHALLENGER]),
+        lost_titles=_lost(titles[INCUMBENT], titles[CHALLENGER]),
+        lost_keywords=_lost(keywords[INCUMBENT], keywords[CHALLENGER]),
         unanswerable_out_of_none=sum(
             o.band is not ConfidenceBand.NONE
             for o in outcomes[CHALLENGER, "hybrid"]
             if o.asked.group == "unanswerable"
         ),
-        slowest=slowest,
+        latency=latency,
         by_match=by_match,
     )
 
 
 CAPPED = "or-first-16"
-PASTED = ("pasted, 40 words", "pasted, 120 words")
+PASTED: tuple[str, ...] = ("pasted, 40 words", "pasted, 120 words")
 
 
 @dataclass(frozen=True)
