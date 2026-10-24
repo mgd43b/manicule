@@ -564,6 +564,34 @@ query is long. No question any round measured has more than nine content words, 
 changes none of the figures above. The first sixteen are kept rather than the rarest because
 rarity needs the index's term statistics, which the match builder does not read.
 
+**Replicated under a second embedder.** Every round above measured BGE-M3. Rounds 3 and 3b were
+rerun unchanged with Qwen3-Embedding-0.6B (`qwen3-embedding:0.6b` on the `ollama` backend,
+`prefix_scheme = "qwen3"`), with what a different result would change written down first.
+Hybrid pipeline, `k = 10`, every content word required → any content word:
+
+| | BGE-M3 | Qwen3-Embedding-0.6B |
+|---|---|---|
+| Identifier questions with a second word, `hit@10` | 461 → 723 | 519 → 722 |
+| the same, MRR | 0.449 → 0.725 | 0.524 → 0.781 |
+| Authored questions, MRR | 0.751 → 0.696 | 0.716 → 0.635 |
+| Multi-hop, `hit@10` and MRR | 10, 0.628 → 7, 0.636 | 9, 0.693 → 9, 0.636 |
+| Held-out mail-thread questions, found | 123 → 125 | 126 → 125 |
+| Natural questions pooled, mean change and 95% interval | -0.002 [-0.038, +0.034] | +0.012 [-0.025, +0.049] |
+| Statement at 100,000 chunks, median / p95 ms: authored | 38.0 / 66.3 | 41.7 / 71.2 |
+| multi-hop | 48.1 / 73.4 | **52.6** / 79.0 |
+| identifiers with a second word | 17.9 / 26.1 | 20.6 / 30.7 |
+| a 120-word paste, capped | 82.2 / 100.4 | 84.0 / 103.8 |
+
+The gain carries over and so does the absence of a measurable loss on the pooled natural
+questions, though prose costs more under Qwen3 — the authored questions alone lose 0.081 —
+and the held-out thread questions are what bring the pool level. **Round 3's latency condition
+did not hold under Qwen3**: multi-hop took 52.6 ms against the 50 ms bound. The statement does
+not involve the embedder, but the timed table is built from the indexed chunks, and Qwen3's
+tokenizer cuts `docs/` into 1,198 longer chunks rather than 1,352, so a prose question matches
+more rows of each. The miss is a few milliseconds on eleven questions over one corpus, and the
+owner kept the rule. Round 3b agreed under both models: the cap cost the pastes 0.005 of
+reciprocal rank under Qwen3, inside its margin, and missed the time bound either way.
+
 **It changes no identity.** The match is built at query time from the text the leg was given:
 the FTS5 index, its tokenizer, every fingerprint and the `PipelineIdentity` are unchanged, and
 nothing needs rebuilding. Like the `bm25()` column weights, the match rule belongs to the store's
@@ -873,6 +901,51 @@ because the ladder is longer.
 Two things follow. Lowering `K` sharpens within-leg ranking and weakens the consensus effect,
 which is the *opposite* of why RRF was chosen. And the fused list is a good candidate set and a
 mediocre final ordering, which is exactly the job description for a cross-encoder.
+
+**Measured, and kept.** The consensus has a visible cost: on this repository's `docs/`, hybrid
+ranks a document's own title below the dense leg alone — MRR 0.853 against 0.934 — because a
+chunk both legs rank in the middle (dense 17th, lexical 15th: `1/77 + 1/75 = 0.0263`) outranks
+the dense leg's first when the lexical leg never returned it (`1/61 = 0.0164`). Round 4 of
+`tests/benchmarks/lexical_questions.py` measured the obvious repairs under the shipped lexical
+match (§4.1), by a rule committed before it ran: no family of questions — prose, keyword-shaped,
+identifier — may lose more than 0.02 of mean reciprocal rank at the lower end of a 95% paired
+bootstrap interval, and one has to gain at least 0.02 with `p < 0.01`. MRR@10, hybrid, `k = 10`:
+
+| | `K = 60` (shipped) | `K = 30` | `K = 10` | `K = 60`, lexical ladder weighted 0.5 |
+|---|---:|---:|---:|---:|
+| Titles (19) | 0.853 | 0.826 | 0.809 | **0.896** |
+| Authored questions (54) | 0.696 | 0.696 | 0.703 | 0.715 |
+| Multi-hop (11) | 0.636 | 0.636 | 0.636 | 0.655 |
+| Identifier questions (754) | 0.814 | 0.814 | 0.818 | **0.594** |
+| Identifier questions, two words (754) | 0.734 | 0.735 | 0.758 | **0.530** |
+| Mail-thread questions (126) | 0.825 | 0.826 | 0.827 | 0.801 |
+| Mail-thread keyword lookups (126) | 0.915 | 0.915 | 0.919 | 0.878 |
+
+None qualified, so `K = 60` with no leg weights stays. Lowering `K` did not close the title
+gap — it widened it, because a sharper `K` sharpens the lexical ladder's top too, and for a
+one-word title that top is often the wrong document — and its gain on identifiers, 0.014, is
+under the bar. Halving the lexical ladder closed the title gap and cost the identifier questions
+0.212, which is the lexical leg's whole reason to exist. The title gap is real and is left
+standing: every repair measured costs more than it buys. Changing `K` would change
+`PipelineIdentity.rrf_k` and every cache key; a leg weight would need a field the identity does
+not yet have.
+
+**The same under Qwen3-Embedding-0.6B** (`prefix_scheme = "qwen3"`), where the title gap is wider —
+0.895 for the dense leg alone. Round 4's rule was applied per model, since `K` is an installation's
+setting, and no candidate qualified under either:
+
+| MRR@10, Qwen3-Embedding-0.6B | `K = 60` (shipped) | `K = 30` | `K = 10` | lexical weighted 0.5 |
+|---|---:|---:|---:|---:|
+| Titles (19) | 0.764 | 0.757 | 0.765 | **0.794** |
+| Authored questions (54) | 0.635 | 0.643 | 0.645 | 0.670 |
+| Multi-hop (11) | 0.636 | 0.636 | 0.636 | 0.652 |
+| Identifier questions (756) | 0.836 | 0.836 | 0.838 | **0.667** |
+| Identifier questions, two words (756) | 0.781 | 0.780 | 0.792 | **0.630** |
+| Mail-thread questions (126) | 0.821 | 0.821 | 0.821 | 0.771 |
+| Mail-thread keyword lookups (126) | 0.917 | 0.917 | 0.917 | 0.845 |
+
+`K = 10` again gained a little on the identifier questions — 0.007, under the bar — and the halved
+lexical ladder again cost them most of what the lexical leg is for (0.160).
 
 ### 5.5 Collapse: what a conversation repeats is shown once
 
@@ -2302,6 +2375,7 @@ Calls made in the absence of a stated position.
 | Three distinct shortfall outcomes; `exhausted_budget` is a defect and the others are not | §4.4 |
 | `min_score` applies to dense cosine only, is 0.35 everywhere, and is a junk filter rather than the relevance decision | §4.5, §8.4 |
 | RRF is rank-only: no score weighting, no leg weighting, no normalization | §5.1 |
+| `K = 60` and equal leg weights kept by measurement, though hybrid ranks titles below the dense leg alone; `K = 30`, `K = 10` and a halved lexical ladder each cost more than they bought | §5.4 |
 | What a conversation repeats is dropped after fusion, within a conversation only; the copy ranked first is kept, even when it is a quotation; on by default | §5.5 |
 | Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |
