@@ -104,7 +104,10 @@ checkout, was discarded: a migration added to that checkout while it ran was app
 run opened its next index, so its incumbent was measured with the candidate's ``heading_text``.
 :func:`unchanged` now stops a run that this happens to. The first BGE-M3 run was clean and the
 rerun reproduced it figure for figure; it was rerun so both models ask the same 515 heading
-questions, after six that shared numbers were dropped.
+questions, after six that shared numbers were dropped. Three of the six were real headings of
+``deployment.md``, colliding with ``# 1.`` to ``# 3.`` comments in its fenced shell examples;
+:func:`~tests.benchmarks.lexical_questions.numbered_headings` now skips fenced code, so the set
+is 518 from here on. Three questions move the headings family by at most 0.006.
 
 Everything is local apart from the embedding and reranking models, read from the local model
 cache or the named ``ollama`` server.
@@ -140,7 +143,7 @@ from tests.benchmarks.thread_corpus import build_corpus
 from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 
     from manicule.core.content import Document
     from manicule.plugins import Discovery
@@ -190,8 +193,9 @@ GROUPS = (*lq.GROUPS, "headings")
 def heading_questions(root: Path) -> list[lq.Asked]:
     """Every numbered heading whose text occurs once in ``root``, asked as that text.
 
-    A number its document uses twice names no one section — ``deployment.md`` numbers the steps
-    of two procedures 1 to 3 — so a heading carrying one is not asked either.
+    A number its document uses twice names no one section, so a heading carrying one is not
+    asked either. Headings are read outside fenced code only: a shell comment such as ``# 1.``
+    is not one.
     """
     found = lq.numbered_headings(root)
     texts = Counter(" ".join(text.casefold().split()) for _, _, text in found)
@@ -243,18 +247,19 @@ def revision(data_dir: Path) -> str:
         return str(db.execute("SELECT version_num FROM alembic_version").fetchone()[0])
 
 
-def unchanged(revisions: Mapping[Path, str]) -> None:
-    """Refuse to go on if an index moved to another schema revision since it was built.
+def unchanged(indexes: Iterable[Path], pinned: str) -> None:
+    """Refuse to go on if any index is at a schema revision other than ``pinned``.
 
     Opening a runtime applies any migration it finds, read from the checkout at that moment, so
     a migration added to the checkout while a run is in progress rewrites the next index the
     run opens — which is how round 5's first Qwen3 run measured its incumbent with the
-    candidate's ``heading_text``. Run from a checkout nobody is editing; this is the check that
-    says so if somebody does.
+    candidate's ``heading_text``. ``pinned`` is read from the first index the moment it is built,
+    before anything reopens it, and every index is held to it at every step after. Run from a
+    checkout nobody is editing; this is the check that says so if somebody does.
     """
-    moved = {path: was for path, was in revisions.items() if revision(path) != was}
+    moved = sorted(str(path) for path in indexes if revision(path) != pinned)
     if moved:
-        msg = f"an index changed schema revision during the run: {sorted(map(str, moved))}"
+        msg = f"an index left schema revision {pinned} during the run: {moved}"
         raise RuntimeError(msg)
 
 
@@ -440,24 +445,29 @@ class Measured:
 async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], None]) -> Measured:
     """Index once per corpus, copy for the breadcrumb, and ask every candidate everything."""
     overrides = lq.embedding_overrides(args)
-    root = args.docs.resolve()
+    root = args.docs
     started = time.perf_counter()
 
     def progress(step: str) -> None:
         emit(f"[{time.perf_counter() - started:6.0f}s] {step}")
 
     shipped_index = await lq.index_docs(work / "docs", overrides=overrides, root=root)
-    progress("docs/ indexed")
+    pinned = revision(shipped_index.data_dir)
+    indexes = [shipped_index.data_dir]
+    progress(f"docs/ indexed at schema revision {pinned}")
     settings = lq.settings_for(shipped_index.data_dir, overrides, lq.PIPELINES["hybrid"])
     async with Runtime(settings) as runtime:
         store = cast("SqliteDocStore", await runtime.documents())
         asked = await lq.docs_questions(store, runtime.workspace, root)
     asked.extend(heading_questions(root))
+    unchanged(indexes, pinned)
     progress("questions built")
     rewritten_index = replace(
         shipped_index, data_dir=copied(shipped_index.data_dir, work / "docs-breadcrumb")
     )
+    indexes.append(rewritten_index.data_dir)
     rows = await rewrite_heading_text(rewritten_index.data_dir, overrides)
+    unchanged(indexes, pinned)
     emit(
         f"docs/ from {root}: {shipped_index.documents} documents, {len(shipped_index.places)} "
         f"chunks ({rows} rewritten) with {args.model}; {len(asked)} queries"
@@ -466,10 +476,14 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
     corpus = build_corpus(seed=args.seed, copies=args.copies, distractors=args.distractors)
     shutil.rmtree(work / "threads", ignore_errors=True)
     shipped_threads = await thread_duplication.index(corpus, work / "threads", overrides=overrides)
+    indexes.append(shipped_threads.data_dir)
+    unchanged(indexes, pinned)
     rewritten_threads = replace(
         shipped_threads, data_dir=copied(shipped_threads.data_dir, work / "threads-breadcrumb")
     )
+    indexes.append(rewritten_threads.data_dir)
     await rewrite_heading_text(rewritten_threads.data_dir, overrides)
+    unchanged(indexes, pinned)
     _, thread_asked = thread_duplication.queries(corpus)
     progress("mail threads indexed and rewritten")
 
@@ -479,17 +493,8 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
     docs: dict[str, list[lq.Outcome]] = {}
     threads: dict[str, list[thread_duplication.Outcome]] = {}
     seconds: dict[str, float] = {}
-    revisions = {
-        path: revision(path)
-        for path in (
-            shipped_index.data_dir,
-            rewritten_index.data_dir,
-            shipped_threads.data_dir,
-            rewritten_threads.data_dir,
-        )
-    }
     for name, candidate in CANDIDATES.items():
-        unchanged(revisions)
+        unchanged(indexes, pinned)
         merged = candidate_overrides(overrides, candidate)
         index = rewritten_index if candidate.breadcrumb else shipped_index
         indexed = rewritten_threads if candidate.breadcrumb else shipped_threads
@@ -510,7 +515,7 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
                 )
         threads[name] = run.outcomes
         progress(f"{name} asked")
-    unchanged(revisions)
+    unchanged(indexes, pinned)
     return Measured(dense, docs, threads, seconds)
 
 
@@ -588,6 +593,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
     if args.docs is None:
         parser.error("--docs is required to measure")
+    # Resolved before `_isolate` changes the working directory to the scratch one, so a relative
+    # path means what it meant to the caller and a verdict outlives a temporary work directory.
+    args.docs = args.docs.resolve()
+    if args.verdicts is not None:
+        args.verdicts = args.verdicts.resolve()
     with contextlib.ExitStack() as stack:
         if args.work is None:
             work = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="titles-")))

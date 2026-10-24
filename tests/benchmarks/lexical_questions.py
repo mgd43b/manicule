@@ -606,14 +606,30 @@ def indexed_markdown(root: Path = DOCS) -> Iterator[tuple[str, list[str]]]:
             yield relative, path.read_text(encoding="utf-8").splitlines()
 
 
+_FENCE = re.compile(r"^ {0,3}(```|~~~)")
+
+
 def numbered_headings(root: Path = DOCS) -> list[tuple[str, str, str]]:
-    """Every numbered heading as its document, its section number and its text after the number."""
-    return [
-        (relative, heading.group(1).rstrip("."), text)
-        for relative, lines in indexed_markdown(root)
-        for line in lines
-        if (heading := _NUMBERED.match(line)) and (text := line[heading.end() :].strip())
-    ]
+    """Every numbered heading as its document, its section number and its text after the number.
+
+    A line inside a fenced code block is not a heading, however it starts: ``deployment.md``'s
+    shell examples number their steps ``# 1.`` to ``# 3.``. :func:`numbered_sections` does not
+    skip fences, and keeps not skipping them, because the identifier sets rounds 2 to 4 recorded
+    were derived through it.
+    """
+    found: list[tuple[str, str, str]] = []
+    for relative, lines in indexed_markdown(root):
+        fence: str | None = None
+        for line in lines:
+            if opened := _FENCE.match(line):
+                fence = None if fence == opened.group(1) else fence or opened.group(1)
+            elif (
+                fence is None
+                and (heading := _NUMBERED.match(line))
+                and (text := line[heading.end() :].strip())
+            ):
+                found.append((relative, heading.group(1).rstrip("."), text))
+    return found
 
 
 def numbered_sections(root: Path = DOCS) -> dict[Target, str]:

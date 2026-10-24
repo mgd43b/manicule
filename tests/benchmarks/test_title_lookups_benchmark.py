@@ -50,11 +50,17 @@ def test_a_heading_is_asked_once_and_only_when_its_text_is_unique(tmp_path: Path
         encoding="utf-8",
     )
     (tmp_path / "evaluation" / "c.md").write_text("## 9. Excluded\n", encoding="utf-8")
+    (tmp_path / "d.md").write_text(
+        "# D\n\n## 4. Restore\n\n```bash\n# 4. not a heading\n# 5. nor this\n```\n",
+        encoding="utf-8",
+    )
     asked = heading_questions(tmp_path)
     assert [(a.text, a.targets) for a in asked] == [
         ("The cache key", (("a.md", "2"),)),
         ("Why a counter", (("a.md", "2.1"),)),
-    ], "a repeated heading or number has no one answer, and evaluation/ is never indexed"
+        ("Restore", (("d.md", "4"),)),
+    ], "a repeated heading or number has no one answer, fenced code holds no heading, and "
+    "evaluation/ is never indexed"
     assert {a.group for a in asked} == {"headings"}
 
 
@@ -164,13 +170,20 @@ def test_the_choice_needs_every_model_and_never_picks_the_reranker() -> None:
 
 
 def test_a_run_refuses_an_index_that_changed_schema_under_it(tmp_path: Path) -> None:
-    """The first Qwen3 run of round 5 was upgraded mid-run by a migration added to the checkout."""
-    with contextlib.closing(sqlite3.connect(tmp_path / "manicule.db")) as db, db:
-        db.execute("CREATE TABLE alembic_version (version_num TEXT)")
-        db.execute("INSERT INTO alembic_version VALUES ('before')")
-    revisions = {tmp_path: revision(tmp_path)}
-    unchanged(revisions)
-    with contextlib.closing(sqlite3.connect(tmp_path / "manicule.db")) as db, db:
+    """The first Qwen3 run of round 5 was upgraded mid-run by a migration added to the checkout.
+
+    Pinned from the first index the moment it is built, so an index built or reopened later at
+    another revision is refused too — the copy and the mail index included.
+    """
+    first, later = tmp_path / "first", tmp_path / "later"
+    for directory, version in ((first, "before"), (later, "before")):
+        directory.mkdir()
+        with contextlib.closing(sqlite3.connect(directory / "manicule.db")) as db, db:
+            db.execute("CREATE TABLE alembic_version (version_num TEXT)")
+            db.execute("INSERT INTO alembic_version VALUES (?)", (version,))
+    pinned = revision(first)
+    unchanged([first, later], pinned)
+    with contextlib.closing(sqlite3.connect(later / "manicule.db")) as db, db:
         db.execute("UPDATE alembic_version SET version_num = 'after'")
-    with pytest.raises(RuntimeError, match="changed schema revision"):
-        unchanged(revisions)
+    with pytest.raises(RuntimeError, match="left schema revision before"):
+        unchanged([first, later], pinned)
