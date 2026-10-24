@@ -340,6 +340,13 @@ async def test_weighting_scales_the_lexical_ladder_and_nothing_else() -> None:
     with installed() as frame, weighting(0.5):
         await stage.run(query, dense_only)
     assert DEGRADED_REASON in frame.incomparable, "a leg that gave nothing is still recorded"
+    with installed() as shipped_frame:
+        await stage.run(query, dense_only)
+    weighted_report = frame.take_diagnostics()
+    assert weighted_report["per_leg"] == {"dense": 2, "lexical": 0}
+    assert weighted_report == shipped_frame.take_diagnostics(), (
+        "the weighted run records the same report the shipped stage does"
+    )
 
 
 def test_round_four_picks_the_best_qualifier_and_breaks_ties_by_order() -> None:

@@ -1378,20 +1378,34 @@ def weighting(lexical_weight: float) -> Generator[None]:
     ) -> list[Candidate]:
         del query
         fused: dict[str, float] = {}
+        per_leg: dict[str, int] = {}
+        seen: dict[str, set[str]] = {}
         for leg in self.legs:
             weight = lexical_weight if leg == "lexical" else 1.0
             ladder = sorted(
                 (c for c in candidates if leg in c.scores),
                 key=lambda c: (-c.scores[leg], c.chunk.id),
             )
-            if not ladder:
-                # As the shipped stage does: a leg that contributed nothing makes the run
-                # single-leg, and the substitution must not hide that from the trace.
-                trace_module.not_comparable(fusion_module.DEGRADED_REASON)
+            per_leg[leg] = len(ladder)
             for rank, candidate in enumerate(ladder, start=1):
                 fused[candidate.chunk.id] = fused.get(candidate.chunk.id, 0.0) + weight / (
                     self.k + rank
                 )
+                seen.setdefault(candidate.chunk.id, set()).add(leg)
+        # Recorded exactly as the shipped stage records them, so a weighted run's trace carries
+        # the same leg counts, overlap and degraded flag as every other candidate's.
+        degraded = any(count == 0 for count in per_leg.values())
+        trace_module.record(
+            trace_module.FusionReport(
+                legs=self.legs,
+                k=self.k,
+                per_leg=per_leg,
+                overlap=sum(1 for legs in seen.values() if legs == set(self.legs)),
+                degraded=degraded,
+            )
+        )
+        if degraded:
+            trace_module.not_comparable(fusion_module.DEGRADED_REASON)
         ordered = sorted(candidates, key=lambda c: (-fused.get(c.chunk.id, 0.0), c.chunk.id))
         return [c.scored_by(self.name, fused.get(c.chunk.id, 0.0)) for c in ordered]
 
