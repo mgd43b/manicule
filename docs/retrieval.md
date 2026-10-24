@@ -995,20 +995,47 @@ title, so the rewrite changed none of their rows.
 The rule names query-shape-dependent fusion as the next round. A title lookup is still ranked
 below the dense leg alone, by 0.090 under BGE-M3 and 0.138 under Qwen3.
 
-**Provenance.** Every figure in this table was recorded from a checkout pinned at `a3e95685` — the
-rule as committed in `c036a4c5`, with two later changes to the instrument: the rewrite taking a
-plugin discovery so the suite can run it, and six heading questions dropped because their numbers
-repeat — over a `docs/` tree exported at `9ce34e6e`. Three of those six were `deployment.md`'s
-real §1 to §3, colliding with shell comments numbered `# 1.` to `# 3.` inside its fenced examples;
-the harness now reads headings outside fenced code only and asks 518. Three questions can move
-the headings family's mean by at most 0.006, which reaches no bound above. A first Qwen3 run was
-discarded: a migration added to the working checkout during it was applied when the run opened
-its next index, so its incumbent was measured with the candidate's `heading_text`. The harness
-now records every index's schema revision when it builds it and refuses to go on if one moves.
-Figures here differ slightly from earlier rounds' for the same configuration — the shipped
-two-word identifier MRR under BGE-M3 is 0.725 in §4.1, 0.734 in round 4 above, 0.721 here —
-because each round indexed `docs/` as it stood at its own commit, and the corpus is the
-documentation that each of those changes edited.
+**Round 6 fused a short plain lookup differently, and nothing qualified either**
+(`tests/benchmarks/query_shapes.py`, its rule pushed before it ran, over the same export). A
+*plain short lookup* is at most two words, none a function word and none spelled like code — an
+underscore, a dot, a digit, or a capital inside a word, so `escape_match_query` and `RRFStage` are
+never one. Such queries were fused with the lexical ladder weighted 0 (`short-dense`) or 0.5
+(`short-half`); a wider gate, any plain lookup up to 16 words, at 0.5 (`plain-half`). The short
+gate selects all 19 titles and 80 headings and nothing in any other family; the wide one adds the
+thread keyword lookups. The headings and lookups a gate selects were scored on their own as well
+as in their family, so a change confined to them could not be pooled out of sight. Titles, MRR@10:
+
+| | dense alone | shipped | short-dense | short-half | plain-half |
+|---|---:|---:|---:|---:|---:|
+| BGE-M3 | 0.934 | 0.844 | **0.934** | 0.896 | 0.896 |
+| Qwen3-Embedding-0.6B | 0.895 | 0.757 | **0.965** | 0.794 | 0.794 |
+
+`short-dense` closes the gap under both models and fails twice. The 80 gated headings move +0.038
+and +0.028 on average but split 16 better to 11 worse and 17 to 12, lower bounds -0.033 and
+-0.031. And under BGE-M3 one title ranks worse: `web`, the one title the dense leg alone ranks
+below hybrid. `short-half` ranks `web` worse too, and under Qwen3 closes under half the gap.
+`plain-half` costs the thread keyword lookups -0.037 and -0.071, as round 4's global weight did.
+Outside what each gate selected, no family moved at all — the code-shape exclusion kept the 756
+bare identifiers, asked as themselves, out of every gate.
+
+So the gap has a repair that works for titles — let a one- or two-word plain query rank by the
+dense leg — and its cost is a noisy, net-positive change on short headings that this corpus has
+too few of to bound. Six rounds have now measured this defect; the title gap stands.
+
+**Provenance of round 5.** Every figure in round 5's table was recorded from a checkout pinned
+at `a3e95685` — the rule as committed in `c036a4c5`, with two later changes to the instrument:
+the rewrite taking a plugin discovery so the suite can run it, and six heading questions dropped
+because their numbers repeat — over a `docs/` tree exported at `9ce34e6e`. Three of those six
+were `deployment.md`'s real §1 to §3, colliding with shell comments numbered `# 1.` to `# 3.`
+inside its fenced examples; the harness now reads headings outside fenced code only and asks
+518. Three questions can move the headings family's mean by at most 0.006, which reaches no
+bound above. A first Qwen3 run was discarded: a migration added to the working checkout during
+it was applied when the run opened its next index, so its incumbent was measured with the
+candidate's `heading_text`. The harness now records every index's schema revision when it builds
+it and refuses to go on if one moves. Figures here differ slightly from earlier rounds' for the
+same configuration — the shipped two-word identifier MRR under BGE-M3 is 0.725 in §4.1, 0.734 in
+round 4 above, 0.721 here — because each round indexed `docs/` as it stood at its own commit,
+and the corpus is the documentation that each of those changes edited.
 
 ### 5.5 Collapse: what a conversation repeats is shown once
 
@@ -2455,6 +2482,7 @@ Calls made in the absence of a stated position.
 | RRF is rank-only: no score weighting, no leg weighting, no normalization | §5.1 |
 | `K = 60` and equal leg weights kept by measurement, though hybrid ranks titles below the dense leg alone; `K = 30`, `K = 10` and a halved lexical ladder each cost more than they bought | §5.4 |
 | The lexical index holds the headings, not the title: indexing the whole breadcrumb, weighting the heading column 1.0, or reranking each failed round 5 under at least one embedder, so the title gap stands | §5.4 |
+| Fusing a plain one- or two-word lookup by the dense leg alone closed the title gap under both embedders and failed round 6 on short headings (lower bound -0.033) and one title; a half weight and a wider gate failed too, so fusion stays rank-only with equal legs | §5.4 |
 | What a conversation repeats is dropped after fusion, within a conversation only; the copy ranked first is kept, even when it is a quotation; on by default | §5.5 |
 | Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |
