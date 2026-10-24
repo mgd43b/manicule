@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.14](https://github.com/mgd43b/manicule/compare/v0.2.13...v0.2.14) (2026-10-24)
+
+
+### Bug Fixes
+
+* **deps:** bump fastmcp from 4.1.1 to 4.1.2 ([#477](https://github.com/mgd43b/manicule/issues/477)) ([2ae8cdf](https://github.com/mgd43b/manicule/commit/2ae8cdfc7f496181e5f3b71b39a8fbf715b0274d))
+* **deps:** bump fastmcp-slim from 4.1.1 to 4.1.2 ([#478](https://github.com/mgd43b/manicule/issues/478)) ([a60e794](https://github.com/mgd43b/manicule/commit/a60e794e1c63f16b5a166fa002df33022f4e3196))
+* **deps:** bump filelock from 3.32.2 to 4.2.1 ([#479](https://github.com/mgd43b/manicule/issues/479)) ([018bd3a](https://github.com/mgd43b/manicule/commit/018bd3a603ac383b05787bcc1250d724af241148))
+* **deps:** bump setuptools from 84.0.0 to 84.1.0 ([#480](https://github.com/mgd43b/manicule/issues/480)) ([8a11b83](https://github.com/mgd43b/manicule/commit/8a11b83a2b9ee501429bc3ed3436f419a652a696))
+* **retrieval:** drop function words from the lexical match so questions reach BM25 ([#482](https://github.com/mgd43b/manicule/issues/482)) ([37654a7](https://github.com/mgd43b/manicule/commit/37654a7e48961f911447c75450af1f7f2819ee7a))
+* **retrieval:** match any content word in the lexical leg, chosen by a pre-registered third round ([#485](https://github.com/mgd43b/manicule/issues/485)) ([49fff98](https://github.com/mgd43b/manicule/commit/49fff98390cdf7e825592673091e8899f781c6ca))
+
 ## [0.2.13](https://github.com/mgd43b/manicule/compare/v0.2.12...v0.2.13) (2026-10-23)
 
 
