@@ -94,9 +94,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import faulthandler
 import json
 import re
 import shutil
+import signal
 import sqlite3
 import statistics
 import tempfile
@@ -166,7 +168,11 @@ _HEADING = re.compile(r"^#+ ([0-9][0-9.]*) +(.+?)\s*$")
 
 
 def heading_questions(root: Path) -> list[lq.Asked]:
-    """Every numbered heading whose text occurs once in ``root``, asked as that text."""
+    """Every numbered heading whose text occurs once in ``root``, asked as that text.
+
+    A number its document uses twice names no one section — ``deployment.md`` numbers the steps
+    of two procedures 1 to 3 — so a heading carrying one is not asked either.
+    """
     found: list[tuple[str, str, str]] = []
     for path in sorted(root.rglob("*.md")):
         relative = path.relative_to(root).as_posix()
@@ -176,11 +182,12 @@ def heading_questions(root: Path) -> list[lq.Asked]:
             heading = _HEADING.match(line)
             if heading:
                 found.append((relative, heading.group(1).rstrip("."), heading.group(2)))
-    counts = Counter(" ".join(text.casefold().split()) for _, _, text in found)
+    texts = Counter(" ".join(text.casefold().split()) for _, _, text in found)
+    numbers = Counter((relative, number) for relative, number, _ in found)
     return [
         lq.Asked(f"heading-{relative}-{number}", text, "headings", ((relative, number),))
         for relative, number, text in found
-        if counts[" ".join(text.casefold().split())] == 1
+        if texts[" ".join(text.casefold().split())] == 1 and numbers[relative, number] == 1
     ]
 
 
@@ -398,12 +405,19 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
     """Index once per corpus, copy for the breadcrumb, and ask every candidate everything."""
     overrides = lq.embedding_overrides(args)
     root = args.docs.resolve()
+    started = time.perf_counter()
+
+    def progress(step: str) -> None:
+        emit(f"[{time.perf_counter() - started:6.0f}s] {step}")
+
     shipped_index = await lq.index_docs(work / "docs", overrides=overrides, root=root)
+    progress("docs/ indexed")
     settings = lq.settings_for(shipped_index.data_dir, overrides, lq.PIPELINES["hybrid"])
     async with Runtime(settings) as runtime:
         store = cast("SqliteDocStore", await runtime.documents())
         asked = await lq.docs_questions(store, runtime.workspace, root)
     asked.extend(heading_questions(root))
+    progress("questions built")
     rewritten_index = replace(
         shipped_index, data_dir=copied(shipped_index.data_dir, work / "docs-breadcrumb")
     )
@@ -421,6 +435,7 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
     )
     await rewrite_heading_text(rewritten_threads.data_dir, overrides)
     _, thread_asked = thread_duplication.queries(corpus)
+    progress("mail threads indexed and rewritten")
 
     dense = await lq.run_docs(
         shipped_index, asked, variant=lq.SHIPPED_MATCH, pipeline="dense", overrides=overrides
@@ -433,11 +448,11 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
         index = rewritten_index if candidate.breadcrumb else shipped_index
         indexed = rewritten_threads if candidate.breadcrumb else shipped_threads
         with heading_weight(candidate.heading_weight):
-            started = time.perf_counter()
+            before = time.perf_counter()
             docs[name] = await lq.run_docs(
                 index, asked, variant=lq.SHIPPED_MATCH, pipeline="hybrid", overrides=merged
             )
-            seconds[name] = (time.perf_counter() - started) / len(asked)
+            seconds[name] = (time.perf_counter() - before) / len(asked)
             with lq.matching(lq.VARIANTS[lq.SHIPPED_MATCH]):
                 run = await thread_duplication.run_pipeline(
                     indexed,
@@ -448,6 +463,7 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
                     counted=frozenset({lq.EXHAUSTED_BUDGET}),
                 )
         threads[name] = run.outcomes
+        progress(f"{name} asked")
     return Measured(dense, docs, threads, seconds)
 
 
@@ -514,6 +530,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     def emit(text: str) -> None:
         out.print(text, markup=False)
+
+    # A run takes a while; `kill -USR1` prints where it is without stopping it.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
     if args.choose:
         chosen = choose([loaded(path) for path in args.choose])

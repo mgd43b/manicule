@@ -39,13 +39,16 @@ def test_a_heading_is_asked_once_and_only_when_its_text_is_unique(tmp_path: Path
     (tmp_path / "a.md").write_text(
         "# A\n\n## 1. Tests\n\n## 2. The cache key\n\n### 2.1. Why a counter\n", encoding="utf-8"
     )
-    (tmp_path / "b.md").write_text("# B\n\n## 3. Tests\n\n## Unnumbered\n", encoding="utf-8")
+    (tmp_path / "b.md").write_text(
+        "# B\n\n## 3. Tests\n\n## Unnumbered\n\n### 1. First step\n\n### 1. First again\n",
+        encoding="utf-8",
+    )
     (tmp_path / "evaluation" / "c.md").write_text("## 9. Excluded\n", encoding="utf-8")
     asked = heading_questions(tmp_path)
     assert [(a.text, a.targets) for a in asked] == [
         ("The cache key", (("a.md", "2"),)),
         ("Why a counter", (("a.md", "2.1"),)),
-    ], "a repeated heading has no one answer, and evaluation/ is never indexed"
+    ], "a repeated heading or number has no one answer, and evaluation/ is never indexed"
     assert {a.group for a in asked} == {"headings"}
 
 
