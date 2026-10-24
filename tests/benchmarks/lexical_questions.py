@@ -689,11 +689,11 @@ class Place:
         return self.path == path and any(_section_matches(h, number) for h in self.heading)
 
 
-async def docs_questions(store: SqliteDocStore, workspace: str) -> list[Asked]:
+async def docs_questions(store: SqliteDocStore, workspace: str, root: Path = DOCS) -> list[Asked]:
     asked = [
         Asked(f"authored-{name}", text, "authored", (target,)) for text, name, target in AUTHORED
     ]
-    multi_hop = load_query_set(DOCS / "evaluation" / "multi-hop-queries.json")
+    multi_hop = load_query_set(root / "evaluation" / "multi-hop-queries.json")
     for query in multi_hop.queries:
         targets = MULTI_HOP_TARGETS.get(query.id, ())
         asked.append(
@@ -701,13 +701,13 @@ async def docs_questions(store: SqliteDocStore, workspace: str) -> list[Asked]:
         )
     asked.extend(
         Asked(f"identifier-{i}", text, "identifiers", (target,))
-        for i, (text, target) in enumerate(identifier_questions())
+        for i, (text, target) in enumerate(identifier_questions(root))
     )
     asked.extend(
         Asked(f"two-words-{i}", text, "identifiers, two words", (target,))
-        for i, (text, target) in enumerate(two_word_questions())
+        for i, (text, target) in enumerate(two_word_questions(root))
     )
-    example = load_query_set(DOCS / "evaluation" / "example-queries.json")
+    example = load_query_set(root / "evaluation" / "example-queries.json")
     asked.extend(Asked(query.id, query.text, "example") for query in example.queries)
     asked.extend(
         Asked(f"unanswerable-{i}", text, "unanswerable") for i, text in enumerate(UNANSWERABLE)
@@ -755,11 +755,7 @@ def paste_questions(passages: Sequence[tuple[Place, str]]) -> list[Asked]:
 
 
 def settings_for(data_dir: Path, overrides: Mapping[str, Any], pipeline: Sequence[str]) -> Settings:
-    return Settings(
-        data_dir=data_dir,
-        rag={"pipeline": tuple(pipeline), "cache": {"enabled": False}},  # pyright: ignore[reportArgumentType]
-        **overrides,
-    )
+    return thread_duplication.settings_for(data_dir, overrides, pipeline)
 
 
 @dataclass

@@ -210,13 +210,12 @@ def settings_for(
     """One configuration, differing between pipelines in ``rag.pipeline`` alone.
 
     ``overrides`` are further ``Settings`` fields — the embedder, and a chunk budget for a
-    model that attends to fewer tokens than the default budget.
+    model that attends to fewer tokens than the default budget. A ``rag`` among them — a reranker,
+    say — is merged into the pipeline's own, never replacing it.
     """
-    return Settings(
-        data_dir=data_dir,
-        rag={"pipeline": tuple(pipeline), "cache": {"enabled": False}},  # pyright: ignore[reportArgumentType]
-        **overrides,
-    )
+    fields = dict(overrides)
+    rag = {"pipeline": tuple(pipeline), "cache": {"enabled": False}, **fields.pop("rag", {})}
+    return Settings(data_dir=data_dir, rag=rag, **fields)  # pyright: ignore[reportArgumentType]
 
 
 async def index(
