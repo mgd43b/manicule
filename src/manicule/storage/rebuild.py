@@ -26,7 +26,7 @@ from manicule.core.acquisition import (
 )
 from manicule.core.errors import ManiculeError, VectorStoreStateError
 from manicule.core.fingerprints import ChunkFingerprint
-from manicule.core.ids import document_id, glossary_entry_id, vector_id
+from manicule.core.ids import document_id, glossary_entry_id
 from manicule.core.rebuild import (
     DerivedReplacement,
     MissingSnapshotInput,
@@ -62,7 +62,7 @@ from manicule.storage.fts import (
     REBUILD_FTS,
     create_fts,
 )
-from manicule.storage.rows import apply_document, to_chunk
+from manicule.storage.rows import apply_document, chunk_values, to_chunk
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import utcnow
 
@@ -2476,21 +2476,7 @@ class SqliteRebuildStore(WorkspaceScoped):
         )
         await session.flush()
         chunk_rows = [
-            {
-                "id": chunk.id,
-                "vector_id": vector_id(vector_publication, chunk.id),
-                "document_id": replacement.document.id,
-                "text": chunk.text,
-                "embed_text": chunk.embed_text,
-                "heading_text": " > ".join(chunk.heading_path),
-                "heading_path": list(chunk.heading_path),
-                "kind": chunk.kind,
-                "lang": chunk.lang,
-                "position": chunk.position,
-                "token_count": chunk.token_count,
-                "anchor": chunk.anchor.model_dump(mode="json"),
-                "chunk_metadata": dict(chunk.metadata),
-            }
+            chunk_values(chunk, replacement.document.id, vector_publication)
             for replacement in members
             for chunk in replacement.chunks
         ]

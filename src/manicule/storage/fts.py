@@ -187,9 +187,13 @@ cannot distinguish, because the workspace lives on ``documents``. Measured on a 
 three matching live chunks against five soft-deleted and five cross-workspace, ``k = 5``
 returned **zero** live results this way and all three the joined way.
 
-Column weights ``1.0`` and ``0.4``: the breadcrumb has to be searchable for the same reason
-it is prefixed to ``embed_text``, but it repeats on every chunk of a page, so at full weight
-it floods term frequencies and depresses the IDF of the terms that identify the page.
+Column weights ``1.0`` and ``0.4``: the heading path has to be searchable, because a section
+called "Configuration" is unfindable without knowing what it configures, but it repeats on every
+chunk of a section, so at full weight it floods term frequencies and depresses the IDF of the
+terms that identify the page. It is the headings alone — not the breadcrumb ``embed_text``
+carries, which adds the source's hierarchy and the document's title. Round 5 of
+``docs/retrieval.md`` §5.4 measured indexing the whole breadcrumb, and weighting this column
+1.0, and neither qualified under both embedders.
 
 ``bm25()`` returns a *negative* number and a better match is more negative, so the ordering is
 ascending. Its first argument must be the table's real name — it is parsed as a column

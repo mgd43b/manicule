@@ -79,10 +79,11 @@ verified, not that nothing was found.
 Prefer `search` when passages are the useful output, when checking whether the corpus supports
 a claim, or before spending a model call. Use `ask` only when synthesis is useful. Omit
 `profile` to use the installation's configured profile. In the shipped definitions, `fast`
-retrieves fewer passages and does not rerank, so it cannot report `high` confidence by design;
-`balanced` reranks a larger set; `precise` searches widest and costs most. Changing profile or
-installation configuration changes the pipeline identity, so do not compare its confidence
-number with one from another pipeline as though they were the same measurement.
+retrieves fewer passages and never reranks; `balanced` retrieves a larger set; `precise`
+searches widest and costs most. The latter two ask for reranking, which happens only when the
+installation names a reranker, and without one no profile can report `high` confidence. Changing
+profile or installation configuration changes the pipeline identity, so do not compare its
+confidence number with one from another pipeline as though they were the same measurement.
 
 ## Scope every question to a collection, and resolve the collection first
 

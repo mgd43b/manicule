@@ -170,14 +170,16 @@ with the highest mean of its three family gains replaces ``K = 60``; within 0.00
 :data:`FUSIONS` wins, which puts the configuration-only changes before the one that needs code.
 No qualifier: no change.
 
-**Round 4 returned "no change".** No candidate qualified. ``K = 30`` moved nothing by more than
-0.003. ``K = 10`` gained 0.014 on the identifier questions (94 better, none worse, p = 1e-28) —
-real, and under the 0.02 the rule asked for — and made titles *worse*, MRR 0.853 to 0.809, the
-opposite of what the arithmetic above predicted: a sharper ``K`` sharpens the lexical ladder's top
-as well, and for a one-word title its top is often the wrong document. The 0.5 lexical weight
-did lift titles to 0.896 and cost the identifier questions 0.212 (590 worse, 8 better), so it was
-not admissible. The title gap to the dense leg alone is real and stays: every way of closing it
-measured here costs more elsewhere than it gains.
+**Round 4 returned "no change".** No candidate qualified. ``K = 30`` moved no family's mean by more
+than 0.003, though titles alone fell from 0.853 to 0.826: pooled with 126 thread keyword lookups, 19
+titles barely move the keyword family, which is why round 5 scores them on their own
+(:mod:`tests.benchmarks.title_lookups`). ``K = 10`` gained 0.014 on the identifier questions (94
+better, none worse, p = 1e-28) — real, and under the 0.02 the rule asked for — and made titles
+*worse*, MRR 0.853 to 0.809, the opposite of what the arithmetic above predicted: a sharper ``K``
+sharpens the lexical ladder's top as well, and for a one-word title its top is often the wrong
+document. The 0.5 lexical weight did lift titles to 0.896 and cost the identifier questions 0.212
+(590 worse, 8 better), so it was not admissible. The title gap to the dense leg alone is real and
+stays: every way of closing it measured here costs more elsewhere than it gains.
 
 **Replication under a second embedder: Qwen3-Embedding-0.6B.** Every round above measured
 BGE-M3. Rounds 3, 3b and 4 are rerun unchanged with ``qwen3-embedding:0.6b`` served by the
@@ -260,7 +262,7 @@ from tests.benchmarks.thread_corpus import Corpus, build_corpus
 from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 
     from manicule.core.retrieval import Candidate
     from manicule.plugins import Discovery
@@ -596,6 +598,40 @@ def _identifier_shaped(term: str) -> bool:
     return len(term) >= 6 and ("_" in term.strip("_") or re.search(r"[a-z][A-Z]", term) is not None)
 
 
+def indexed_markdown(root: Path = DOCS) -> Iterator[tuple[str, list[str]]]:
+    """Every Markdown file the harness indexes, by path relative to ``root``, as its lines."""
+    for path in sorted(root.rglob("*.md")):
+        relative = path.relative_to(root).as_posix()
+        if not any(relative.startswith(pattern.removesuffix("**")) for pattern in EXCLUDED):
+            yield relative, path.read_text(encoding="utf-8").splitlines()
+
+
+_FENCE = re.compile(r"^ {0,3}(```|~~~)")
+
+
+def numbered_headings(root: Path = DOCS) -> list[tuple[str, str, str]]:
+    """Every numbered heading as its document, its section number and its text after the number.
+
+    A line inside a fenced code block is not a heading, however it starts: ``deployment.md``'s
+    shell examples number their steps ``# 1.`` to ``# 3.``. :func:`numbered_sections` does not
+    skip fences, and keeps not skipping them, because the identifier sets rounds 2 to 4 recorded
+    were derived through it.
+    """
+    found: list[tuple[str, str, str]] = []
+    for relative, lines in indexed_markdown(root):
+        fence: str | None = None
+        for line in lines:
+            if opened := _FENCE.match(line):
+                fence = None if fence == opened.group(1) else fence or opened.group(1)
+            elif (
+                fence is None
+                and (heading := _NUMBERED.match(line))
+                and (text := line[heading.end() :].strip())
+            ):
+                found.append((relative, heading.group(1).rstrip("."), text))
+    return found
+
+
 def numbered_sections(root: Path = DOCS) -> dict[Target, str]:
     """The text under each numbered heading, by document and section number.
 
@@ -603,12 +639,9 @@ def numbered_sections(root: Path = DOCS) -> dict[Target, str]:
     counts as an occurrence without ever being a target.
     """
     sections: dict[Target, list[str]] = defaultdict(list)
-    for path in sorted(root.rglob("*.md")):
-        relative = path.relative_to(root).as_posix()
-        if any(relative.startswith(pattern.removesuffix("**")) for pattern in EXCLUDED):
-            continue
+    for relative, lines in indexed_markdown(root):
         number = ""
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in lines:
             heading = _NUMBERED.match(line)
             if heading:
                 number = heading.group(1).rstrip(".")
@@ -689,11 +722,11 @@ class Place:
         return self.path == path and any(_section_matches(h, number) for h in self.heading)
 
 
-async def docs_questions(store: SqliteDocStore, workspace: str) -> list[Asked]:
+async def docs_questions(store: SqliteDocStore, workspace: str, root: Path = DOCS) -> list[Asked]:
     asked = [
         Asked(f"authored-{name}", text, "authored", (target,)) for text, name, target in AUTHORED
     ]
-    multi_hop = load_query_set(DOCS / "evaluation" / "multi-hop-queries.json")
+    multi_hop = load_query_set(root / "evaluation" / "multi-hop-queries.json")
     for query in multi_hop.queries:
         targets = MULTI_HOP_TARGETS.get(query.id, ())
         asked.append(
@@ -701,13 +734,13 @@ async def docs_questions(store: SqliteDocStore, workspace: str) -> list[Asked]:
         )
     asked.extend(
         Asked(f"identifier-{i}", text, "identifiers", (target,))
-        for i, (text, target) in enumerate(identifier_questions())
+        for i, (text, target) in enumerate(identifier_questions(root))
     )
     asked.extend(
         Asked(f"two-words-{i}", text, "identifiers, two words", (target,))
-        for i, (text, target) in enumerate(two_word_questions())
+        for i, (text, target) in enumerate(two_word_questions(root))
     )
-    example = load_query_set(DOCS / "evaluation" / "example-queries.json")
+    example = load_query_set(root / "evaluation" / "example-queries.json")
     asked.extend(Asked(query.id, query.text, "example") for query in example.queries)
     asked.extend(
         Asked(f"unanswerable-{i}", text, "unanswerable") for i, text in enumerate(UNANSWERABLE)
@@ -755,11 +788,7 @@ def paste_questions(passages: Sequence[tuple[Place, str]]) -> list[Asked]:
 
 
 def settings_for(data_dir: Path, overrides: Mapping[str, Any], pipeline: Sequence[str]) -> Settings:
-    return Settings(
-        data_dir=data_dir,
-        rag={"pipeline": tuple(pipeline), "cache": {"enabled": False}},  # pyright: ignore[reportArgumentType]
-        **overrides,
-    )
+    return thread_duplication.settings_for(data_dir, overrides, pipeline)
 
 
 @dataclass

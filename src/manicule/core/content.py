@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Final, Self
+from typing import Final, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
@@ -21,6 +21,21 @@ from manicule.core.provenance import Provenance
 
 Metadata = dict[str, JsonValue]
 """Free-form per-item metadata. JSON-shaped so it survives the round trip to storage."""
+
+
+def string_list(value: object) -> list[str] | None:
+    """A metadata value as a list of strings, or ``None`` when it is anything else.
+
+    Metadata arrives as JSON, so a parser or connector can put anything there. A malformed value
+    is a fallback for the reader — no structure to split on, no hierarchy to show — not a crash.
+    """
+    if not isinstance(value, list):
+        return None
+    items = cast("list[object]", value)
+    if not all(isinstance(item, str) for item in items):
+        return None
+    return [item for item in items if isinstance(item, str)]
+
 
 LEGACY_PUBLICATION: Final = "legacy"
 """Publication assigned to rows created before derived-state generations existed."""
@@ -589,4 +604,5 @@ __all__ = [
     "PipelineStage",
     "RawDocument",
     "Retention",
+    "string_list",
 ]

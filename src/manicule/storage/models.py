@@ -961,8 +961,9 @@ class Chunk(Base):
     re-chunking and cannot silently apply a changed derivation rule."""
 
     heading_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    """The breadcrumb joined for FTS. Redundant with ``heading_path`` and written from one
-    place, because FTS5 indexes a string and a JSON array is not one."""
+    """The heading path joined for FTS. Redundant with ``heading_path`` and written from one
+    place, :func:`~manicule.storage.rows.chunk_values`, because FTS5 indexes a string and a JSON
+    array is not one."""
 
     heading_path: Mapped[JsonValue] = mapped_column(JSON, nullable=False, default=list)
     kind: Mapped[BlockKind] = mapped_column(_kind_enum(), nullable=False, default=BlockKind.PROSE)
