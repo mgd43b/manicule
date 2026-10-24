@@ -947,6 +947,64 @@ setting, and no candidate qualified under either:
 `K = 10` again gained a little on the identifier questions — 0.007, under the bar — and the halved
 lexical ladder again cost them most of what the lexical leg is for (0.160).
 
+**Round 5 found the cause, and no repair that holds under both models**
+([#489](https://github.com/mgd43b/manicule/issues/489); `tests/benchmarks/title_lookups.py`,
+whose docstring holds the rule, written and pushed before any candidate ran). **The lexical index
+holds neither a document's title nor its file name.** `heading_text`, the column FTS5 indexes
+beside `text`, is the chunk's heading path alone, while the breadcrumb in front of `embed_text`
+also carries the source's hierarchy and the document's title. So the dense leg reads
+"retrieval.md" in front of every chunk of `retrieval.md`, and the lexical leg finds a one-word
+title only in the bodies of whichever documents use the word most: under BGE-M3 it put the
+titled document fifth or lower, or nowhere, for 7 of the 19 titles.
+
+The candidates were the whole breadcrumb in `heading_text`, measured by rewriting a copy of the
+index from each document's stored record; the same with the heading column weighted 1.0; the
+weight alone; and `bge-reranker-v2-m3` over the fused top 20. Titles became their own family,
+because 19 queries cannot carry round 4's significance test; a new, mechanically derived set of
+515 heading lookups — every numbered heading whose text and number are unique, asked as its text —
+is the check that is not circular, since the breadcrumb adds nothing a heading lacks. A candidate
+had to close half the title gap to the dense leg alone with no title ranked worse, keep every
+other family's 95% lower bound above -0.02, and keep every unanswerable question in `none`,
+under both models. MRR@10, hybrid, `k = 10`, over `docs/` at one commit:
+
+| | dense alone | shipped | breadcrumb | breadcrumb, heading 1.0 | heading 1.0 | rerank |
+|---|---:|---:|---:|---:|---:|---:|
+| **BGE-M3** titles (19) | 0.934 | 0.844 | 0.930 | **0.974** | 0.868 | 0.561 |
+| headings (515) | 0.904 | 0.856 | 0.855 | 0.899 | 0.901 | 0.450 |
+| authored (54) | 0.770 | 0.686 | 0.682 | 0.718 | 0.715 | 0.614 |
+| identifiers, two words (756) | 0.334 | 0.721 | 0.721 | 0.714 | 0.715 | 0.838 |
+| thread keyword lookups (126) | — | 0.915 | 0.915 | 0.911 | 0.911 | 0.984 |
+| **Qwen3** titles (19) | 0.895 | 0.757 | 0.791 | **0.904** | 0.800 | 0.598 |
+| headings (515) | 0.767 | 0.784 | 0.783 | 0.832 | 0.828 | 0.449 |
+| authored (54) | 0.742 | 0.643 | 0.646 | 0.677 | 0.679 | 0.635 |
+| identifiers, two words (756) | 0.393 | 0.780 | 0.780 | 0.772 | 0.772 | 0.820 |
+| thread keyword lookups (126) | — | 0.917 | 0.917 | 0.905 | 0.905 | 0.984 |
+
+**None qualified, so nothing changed.** The breadcrumb alone repaired titles under BGE-M3 (0.930
+against 0.934) and closed only a quarter of the gap under Qwen3. With the heading column at 1.0
+it repaired them under both, and under Qwen3 cost the thread keyword lookups a lower bound of
+-0.028 (none better, 3 worse) against the -0.02 the rule allowed; that cost is the weight's,
+since the weight alone moved them identically. The weight alone did not close half the gap under
+either model, though it gained 0.045 on headings under both. The reranker improved what the
+lexical leg already serves — identifier questions +0.089 and +0.036, keyword lookups +0.069 and
++0.067 — and broke short lookups: titles -0.283 and -0.158, headings -0.406 and -0.335, and it
+moved unanswerable questions out of `none` (all 11 under BGE-M3, 9 of 11 under Qwen3). The mail
+threads could not test the breadcrumb: a message's heading is already its subject, which is its
+title, so the rewrite changed none of their rows.
+
+The rule names query-shape-dependent fusion as the next round. A title lookup is still ranked
+below the dense leg alone, by 0.090 under BGE-M3 and 0.138 under Qwen3.
+
+**Provenance.** Every figure in this table was recorded from a checkout pinned at the commit that
+holds the rule and the harness, over a `docs/` tree exported at `9ce34e6e`. A first Qwen3 run was
+discarded: a migration added to the working checkout during it was applied when the run opened
+its next index, so its incumbent was measured with the candidate's `heading_text`. The harness
+now records every index's schema revision when it builds it and refuses to go on if one moves.
+Figures here differ slightly from earlier rounds' for the same configuration — the shipped
+two-word identifier MRR under BGE-M3 is 0.725 in §4.1, 0.734 in round 4 above, 0.721 here —
+because each round indexed `docs/` as it stood at its own commit, and the corpus is the
+documentation that each of those changes edited.
+
 ### 5.5 Collapse: what a conversation repeats is shown once
 
 A mail message keeps the reply chain it quotes ([`parsing.md`](parsing.md) §10), so a thread of
@@ -1071,6 +1129,12 @@ Honest costs:
 - Its scores are unbounded logits, model-specific, and comparable only within one model's
   rankings. Never mix them with cosine similarities, and never compare a confidence computed
   under one reranker to one computed under another (§8.2).
+- **Measured on this repository's `docs/`, it is not a free improvement** (§5.4, round 5).
+  Over the fused top 20 it raised identifier questions and keyword lookups under both embedders
+  and lowered short lookups — a document's title, a section's heading — far more, and it moved
+  most unanswerable questions out of the `none` band — the reranker's confidence component
+  (§8.2) is present only when it runs, and it lifted those questions to `low`. Configure it for a corpus whose questions look like the first
+  kind, and measure before relying on it for the second.
 
 ### 6.3 Cost is linear in `candidates`, which is what the profiles are actually buying
 
@@ -2385,6 +2449,7 @@ Calls made in the absence of a stated position.
 | `min_score` applies to dense cosine only, is 0.35 everywhere, and is a junk filter rather than the relevance decision | §4.5, §8.4 |
 | RRF is rank-only: no score weighting, no leg weighting, no normalization | §5.1 |
 | `K = 60` and equal leg weights kept by measurement, though hybrid ranks titles below the dense leg alone; `K = 30`, `K = 10` and a halved lexical ladder each cost more than they bought | §5.4 |
+| The lexical index holds the headings, not the title: indexing the whole breadcrumb, weighting the heading column 1.0, or reranking each failed round 5 under at least one embedder, so the title gap stands | §5.4 |
 | What a conversation repeats is dropped after fusion, within a conversation only; the copy ranked first is kept, even when it is a quotation; on by default | §5.5 |
 | Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |

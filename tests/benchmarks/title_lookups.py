@@ -85,6 +85,27 @@ installation does not have; if it qualifies, ``docs/retrieval.md`` §6 records i
 for an installation that has the extra, and the round's choice is the best qualifier among the
 others. Its time per query is reported beside the verdict.
 
+**Round 5 returned "no change".** Nothing fixed the defect under both models. ``breadcrumb``
+repaired titles under BGE-M3 (0.844 to 0.930, dense alone 0.934) and closed a quarter of the gap
+under Qwen3 (0.757 to 0.791, dense alone 0.895). ``breadcrumb-heading-1.0`` repaired them under
+both (0.974 and 0.904) and under Qwen3 cost the thread keyword lookups -0.012, 95% interval
+[-0.028, +0.000], 0 better and 3 worse, against the -0.02 bound; ``heading-1.0`` moved those
+lookups identically, so the cost is the weight's. ``heading-1.0`` closed under half the gap
+under either model, and gained 0.045 on headings under both. ``rerank`` gained on identifier
+questions (+0.089, +0.036) and keyword lookups (+0.069, +0.067), lost titles (-0.283, -0.158)
+and headings (-0.406, -0.335), and moved unanswerable questions out of ``none`` (all 11, and 9
+of 11). The mail threads could not test the breadcrumb: a message's only heading is its subject,
+which is also its title, so the rewrite changed none of their rows.
+
+**How the figures were recorded.** From a checkout pinned at the commit holding this rule and
+harness, over ``docs/`` exported at ``9ce34e6e``, both models run side by side — so the times
+reported per query measured contention, not cost. A first Qwen3 run, made from the working
+checkout, was discarded: a migration added to that checkout while it ran was applied when the
+run opened its next index, so its incumbent was measured with the candidate's ``heading_text``.
+:func:`unchanged` now stops a run that this happens to. The first BGE-M3 run was clean and the
+rerun reproduced it figure for figure; it was rerun so both models ask the same 515 heading
+questions, after six that shared numbers were dropped.
+
 Everything is local apart from the embedding and reranking models, read from the local model
 cache or the named ``ollama`` server.
 """
