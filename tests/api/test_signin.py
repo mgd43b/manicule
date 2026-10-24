@@ -65,6 +65,21 @@ def _signed_ago(seconds: int) -> Callable[[TimestampSigner], int]:
     return timestamp
 
 
+def _forged(cookie: str) -> str:
+    """The cookie with its signature's first character changed, which always changes the MAC.
+
+    Rewriting the signature's last characters is not reliably a forgery. The signature is
+    unpadded base64url, and its last character carries padding bits that the decoder ignores,
+    so a signature ending in ``"AB"`` rewritten to ``"AA"`` decodes to the same bytes and still
+    verifies. Every bit of the signature's first character is data.
+    """
+    payload, _, signature = cookie.rpartition(".")
+    first = "B" if signature[0] == "A" else "A"
+    forged = f"{payload}.{first}{signature[1:]}"
+    assert forged != cookie
+    return forged
+
+
 # --- the protocol ---------------------------------------------------------------------------------
 
 
@@ -151,7 +166,7 @@ def test_a_forged_sign_in_cookie_is_refused() -> None:
     provider = FakeIdentityProvider()
     with client_with(oauth_backend(), provider) as client:
         parameters = start(client)
-        forged = client.cookies[SIGNIN_COOKIE][:-2] + "AA"
+        forged = _forged(client.cookies[SIGNIN_COOKIE])
         client.cookies.set(SIGNIN_COOKIE, forged, path="/auth/callback")
         refused = client.get(
             "/auth/callback/google", params={"code": CODE, "state": parameters["state"]}
@@ -377,8 +392,7 @@ def test_a_tampered_cookie_is_refused_before_anything_is_looked_up() -> None:
         sign_in(client)
         assert client.get("/api/v1/documents").status_code == OK
         looked_up = backend.users_.resolves
-        genuine = client.cookies[SESSION_COOKIE]
-        forged = genuine[:-3] + ("AAA" if genuine[-3:] != "AAA" else "BBB")
+        forged = _forged(client.cookies[SESSION_COOKIE])
         client.cookies.set(SESSION_COOKIE, forged)
         refused = client.get("/api/v1/documents")
     assert refused.status_code == UNAUTHORIZED
