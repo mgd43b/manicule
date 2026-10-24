@@ -1234,10 +1234,12 @@ def round_three(
         chosen = [p.difference for p in natural if p.shipped_empty is empty]
         if chosen:
             by_match[empty] = (len(chosen), statistics.fmean(chosen))
+    # Round 3's question sets only: the pastes are round 3b's subject and were added after round
+    # 3's rule was written, so reading them here would apply a bound round 3 never set to them.
     latency = {
         group: (median, p95)
         for (name, group), (median, p95, _) in timings.items()
-        if name == CHALLENGER
+        if name == CHALLENGER and group not in PASTED
     }
     return RoundThree(
         gain=statistics.fmean(p.difference for p in gained),
