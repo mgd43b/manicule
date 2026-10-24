@@ -120,6 +120,7 @@ from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[repo
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Mapping, Sequence
 
+    from manicule.plugins import Discovery
     from manicule.storage.docstore import SqliteDocStore
 
 SHIPPED_WEIGHTS = "bm25(chunks_fts, 1.0, 0.4)"
@@ -186,7 +187,9 @@ def heading_questions(root: Path) -> list[lq.Asked]:
 # --- the candidates ------------------------------------------------------------------------------
 
 
-async def rewrite_heading_text(data_dir: Path, overrides: Mapping[str, Any]) -> int:
+async def rewrite_heading_text(
+    data_dir: Path, overrides: Mapping[str, Any], discovery: Discovery | None = None
+) -> int:
     """Set every chunk's ``heading_text`` to its whole breadcrumb, from its document's record.
 
     What a migration does to an installation: the stored document is the input, the update
@@ -194,7 +197,7 @@ async def rewrite_heading_text(data_dir: Path, overrides: Mapping[str, Any]) -> 
     """
     settings = thread_duplication.settings_for(data_dir, overrides)
     values: list[tuple[str, str]] = []
-    async with Runtime(settings) as runtime:
+    async with Runtime(settings, discovery=discovery) as runtime:
         store = cast("SqliteDocStore", await runtime.documents())
         for document in await store.list_documents(limit=100_000):
             hierarchy = breadcrumb.source_hierarchy(document)
