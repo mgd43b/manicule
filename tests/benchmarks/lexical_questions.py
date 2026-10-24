@@ -168,6 +168,15 @@ with the highest mean of its three family gains replaces ``K = 60``; within 0.00
 :data:`FUSIONS` wins, which puts the configuration-only changes before the one that needs code.
 No qualifier: no change.
 
+**Round 4 returned "no change".** No candidate qualified. ``K = 30`` moved nothing by more than
+0.003. ``K = 10`` gained 0.014 on the identifier questions (94 better, none worse, p = 1e-28) —
+real, and under the 0.02 the rule asked for — and made titles *worse*, MRR 0.853 to 0.809, the
+opposite of what the arithmetic above predicted: a sharper ``K`` sharpens the lexical ladder's top
+as well, and for a one-word title its top is often the wrong document. The 0.5 lexical weight
+did lift titles to 0.896 and cost the identifier questions 0.212 (590 worse, 8 better), so it was
+not admissible. The title gap to the dense leg alone is real and stays: every way of closing it
+measured here costs more elsewhere than it gains.
+
 Everything is local: no network, temporary directories, and the only thing read from outside the
 repository is the embedding model, from the local model cache.
 """

@@ -874,6 +874,34 @@ Two things follow. Lowering `K` sharpens within-leg ranking and weakens the cons
 which is the *opposite* of why RRF was chosen. And the fused list is a good candidate set and a
 mediocre final ordering, which is exactly the job description for a cross-encoder.
 
+**Measured, and kept.** The consensus has a visible cost: on this repository's `docs/`, hybrid
+ranks a document's own title below the dense leg alone — MRR 0.853 against 0.934 — because a
+chunk both legs rank in the middle (dense 17th, lexical 15th: `1/77 + 1/75 = 0.0263`) outranks
+the dense leg's first when the lexical leg never returned it (`1/61 = 0.0164`). Round 4 of
+`tests/benchmarks/lexical_questions.py` measured the obvious repairs under the shipped lexical
+match (§4.1), by a rule committed before it ran: no family of questions — prose, keyword-shaped,
+identifier — may lose more than 0.02 of mean reciprocal rank at the lower end of a 95% paired
+bootstrap interval, and one has to gain at least 0.02 with `p < 0.01`. MRR@10, hybrid, `k = 10`:
+
+| | `K = 60` (shipped) | `K = 30` | `K = 10` | `K = 60`, lexical ladder weighted 0.5 |
+|---|---:|---:|---:|---:|
+| Titles (19) | 0.853 | 0.826 | 0.809 | **0.896** |
+| Authored questions (54) | 0.696 | 0.696 | 0.703 | 0.715 |
+| Multi-hop (11) | 0.636 | 0.636 | 0.636 | 0.655 |
+| Identifier questions (754) | 0.814 | 0.814 | 0.818 | **0.594** |
+| Identifier questions, two words (754) | 0.734 | 0.735 | 0.758 | **0.530** |
+| Mail-thread questions (126) | 0.825 | 0.826 | 0.827 | 0.801 |
+| Mail-thread keyword lookups (126) | 0.915 | 0.915 | 0.919 | 0.878 |
+
+None qualified, so `K = 60` with no leg weights stays. Lowering `K` did not close the title
+gap — it widened it, because a sharper `K` sharpens the lexical ladder's top too, and for a
+one-word title that top is often the wrong document — and its gain on identifiers, 0.014, is
+under the bar. Halving the lexical ladder closed the title gap and cost the identifier questions
+0.212, which is the lexical leg's whole reason to exist. The title gap is real and is left
+standing: every repair measured costs more than it buys. Changing `K` would change
+`PipelineIdentity.rrf_k` and every cache key; a leg weight would need a field the identity does
+not yet have.
+
 ### 5.5 Collapse: what a conversation repeats is shown once
 
 A mail message keeps the reply chain it quotes ([`parsing.md`](parsing.md) §10), so a thread of
@@ -2302,6 +2330,7 @@ Calls made in the absence of a stated position.
 | Three distinct shortfall outcomes; `exhausted_budget` is a defect and the others are not | §4.4 |
 | `min_score` applies to dense cosine only, is 0.35 everywhere, and is a junk filter rather than the relevance decision | §4.5, §8.4 |
 | RRF is rank-only: no score weighting, no leg weighting, no normalization | §5.1 |
+| `K = 60` and equal leg weights kept by measurement, though hybrid ranks titles below the dense leg alone; `K = 30`, `K = 10` and a halved lexical ladder each cost more than they bought | §5.4 |
 | What a conversation repeats is dropped after fusion, within a conversation only; the copy ranked first is kept, even when it is a quotation; on by default | §5.5 |
 | Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |
