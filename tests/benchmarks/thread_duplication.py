@@ -371,6 +371,9 @@ class Outcome:
     """The lexical leg matched nothing and fusion ran on one ladder. Kept and counted rather
     than refused: for a natural question it is how the shipped pipeline behaves, and the page
     is still the page a person would see."""
+    first: int | None = None
+    """The rank of the first chunk carrying the passage, quotation or original, or ``None`` when
+    the page holds none. What a reciprocal rank is read from."""
 
     @property
     def found(self) -> bool:
@@ -418,6 +421,7 @@ def score(
         page=len(page),
         companion_pool=companion_pool,
         single_leg=single_leg,
+        first=copies[0].rank if copies else None,
     )
 
 

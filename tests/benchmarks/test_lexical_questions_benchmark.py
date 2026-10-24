@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from manicule.container import keys
 from manicule.plugins.registry import discover
-from manicule.storage.fts import escape_match_query
+from manicule.storage.fts import FUNCTION_WORDS, escape_match_query, match_words
 from tests.benchmarks.lexical_questions import (
     AUTHORED,
     DOCS,
@@ -23,12 +23,16 @@ from tests.benchmarks.lexical_questions import (
     VARIANTS,
     Asked,
     Place,
+    RoundThree,
     _rank,  # pyright: ignore[reportPrivateUsage]
+    bootstrap_interval,
+    identifier_questions,
     index_docs,
     run_docs,
     run_threads,
     summarize,
     time_at_scale,
+    two_word_questions,
 )
 from tests.benchmarks.test_thread_duplication_benchmark import CountingEmbedder, small
 
@@ -93,12 +97,14 @@ def test_scoring_reads_the_rank_of_the_first_labeled_chunk() -> None:
     assert _rank(Asked("t", "?", "titles", documents=frozenset({"a"})), places) == (1, 1)
 
 
-def test_the_statement_is_timed_for_every_variant() -> None:
+def test_the_statement_is_timed_for_every_variant_and_every_set() -> None:
+    """Per set, because a mean over all of them is a mean over whichever set is largest."""
     texts = [("authentication and token rotation", "Auth"), ("vector index builds", "Index")]
-    timings = time_at_scale(texts, ["how is a token rotated", "zzz"], size=200)
-    assert set(timings) == set(VARIANTS)
-    assert timings["and"][2] == 0, "no chunk holds every word of either question"
-    assert timings["or-content"][2] > 0
+    sets = {"prose": ["how is a token rotated", "zzz"], "identifiers": ["vector"]}
+    timings = time_at_scale(texts, sets, size=200)
+    assert set(timings) == {(variant, group) for variant in VARIANTS for group in sets}
+    assert timings["and", "prose"][2] == 0, "no chunk holds every word of either question"
+    assert timings["or-content", "prose"][2] > 0
 
 
 async def test_the_program_runs_end_to_end_through_the_runtime(
@@ -167,5 +173,55 @@ async def test_the_mail_half_can_run_twice_in_one_work_directory(
 
 
 def test_a_narrowed_run_times_only_the_variants_it_names() -> None:
-    timings = time_at_scale([("token rotation", "Auth")], ["token"], size=20, variants=["and"])
-    assert set(timings) == {"and"}
+    timings = time_at_scale(
+        [("token rotation", "Auth")], {"prose": ["token"]}, size=20, variants=["and"]
+    )
+    assert set(timings) == {("and", "prose")}
+
+
+def test_every_two_word_question_has_two_content_words_and_round_twos_target() -> None:
+    """The two rules build different matches only where there is more than one content word."""
+    two = two_word_questions()
+    one = identifier_questions()
+    assert [target for _, target in two] == [target for _, target in one]
+    for question, _ in two:
+        words = match_words(question)
+        assert len([w for w in words if w.lower() not in FUNCTION_WORDS]) == 2, question
+        assert escape_match_query(question) != VARIANTS["or-content"](question)
+
+
+def test_the_bootstrap_interval_is_reproducible_and_brackets_the_mean() -> None:
+    differences = [0.5, -0.25, 0.0, 1.0, -0.5, 0.25] * 10
+    low, high = bootstrap_interval(differences, resamples=2000)
+    assert (low, high) == bootstrap_interval(differences, resamples=2000)
+    assert low < sum(differences) / len(differences) < high
+
+
+def _round(**changes: object) -> RoundThree:
+    figures: dict[str, object] = {
+        "gain": 0.15,
+        "gain_split": (120, 10),
+        "gain_p": 1e-6,
+        "natural": -0.01,
+        "natural_interval": (-0.04, 0.02),
+        "natural_count": 190,
+        "lost_titles": 0,
+        "lost_keywords": 0,
+        "unanswerable_out_of_none": 0,
+        "slowest": ("authored", 30.0, 60.0),
+        "by_match": {True: (100, 0.02), False: (90, -0.04)},
+    }
+    figures.update(changes)
+    return RoundThree(**figures)  # pyright: ignore[reportArgumentType]
+
+
+def test_round_three_switches_only_when_every_condition_holds() -> None:
+    assert _round().switch, "a gain of 0.15 tolerates a natural-question loss down to -0.05"
+    assert not _round(gain=0.09).switch, "condition 1: a gain under 0.10 does not count"
+    assert not _round(gain_p=0.02).switch, "condition 1: nor does one a sign test cannot see"
+    assert not _round(natural_interval=(-0.051, 0.0)).switch, "condition 2: the -0.05 floor"
+    assert not _round(gain=0.12, natural_interval=(-0.041, 0.0)).switch, "a third of 0.12"
+    assert not _round(lost_titles=2).switch
+    assert not _round(unanswerable_out_of_none=1).switch
+    assert not _round(slowest=("authored", 49.0, 101.0)).switch
+    assert "keep and-content" in _round(lost_keywords=2).describe()
