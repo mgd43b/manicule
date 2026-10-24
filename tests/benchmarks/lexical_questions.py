@@ -148,6 +148,26 @@ median of 254.9 ms (p95 339.7) to 82.2 ms (p95 100.4), and a 40-word one from 10
 (p95 124.4 to 97.7): about threefold where it matters, and still over the 50 ms bound, because
 sixteen words still match about 90% of the rows. Disclosed as such in ``docs/retrieval.md`` §4.1.
 
+**Round 4: fusion, under the shipped match.** Hybrid ranked document titles worse than the dense
+leg alone under every match rule (MRR 0.853 against 0.934), and the cause is reciprocal rank
+fusion's consensus: with ``K = 60`` a chunk both legs rank in the middle — dense 17th, lexical 15th
+— scores 0.0263 and outranks the dense leg's first, which the lexical leg never returned, at
+0.0164. For a one-word title the lexical ladder is mostly noise. Candidates, run with
+``--fusion`` over the shipped match (:data:`FUSIONS`): ``K = 30``, ``K = 10``, and the lexical
+ladder weighted 0.5 at ``K = 60``. Known when this rule was written: the title, authored and
+identifier figures above, for ``K = 60``, and the arithmetic in this paragraph — which says a 0.5
+weight cannot reverse that example and a smaller ``K`` can.
+
+**The round 4 rule.** Hybrid pipeline, ``k = 10``, reciprocal rank paired by query, in three
+families: *prose* (authored, labeled multi-hop, held-out thread questions), *keyword* (titles and
+thread keyword lookups) and *identifiers* (both identifier sets). A candidate is admissible only
+if, in every family, the lower end of a 95% paired bootstrap interval on its mean difference from
+``K = 60`` is above -0.02, and no unanswerable question leaves ``none``. An admissible candidate
+qualifies if some family gains at least 0.02 with a sign test giving ``p < 0.01``. The qualifier
+with the highest mean of its three family gains replaces ``K = 60``; within 0.005, the earlier in
+:data:`FUSIONS` wins, which puts the configuration-only changes before the one that needs code.
+No qualifier: no change.
+
 Everything is local: no network, temporary directories, and the only thing read from outside the
 repository is the embedding model, from the local model cache.
 """
@@ -179,6 +199,7 @@ from manicule.core.retrieval import ConfidenceBand, Filter, Query
 from manicule.evaluation.probe import probe_from_titles
 from manicule.evaluation.queries import load_query_set
 from manicule.evaluation.statistics import sign_test, wilson_interval
+from manicule.retrieval import fusion as fusion_module
 from manicule.retrieval.lexical import DEGRADED_REASON as LEXICAL_EMPTY
 from manicule.retrieval.retriever import Retriever
 from manicule.retrieval.trace import Shortfall
@@ -198,6 +219,7 @@ from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[repo
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Mapping, Sequence
 
+    from manicule.core.retrieval import Candidate
     from manicule.plugins import Discovery
     from manicule.storage.docstore import SqliteDocStore
 
@@ -1268,6 +1290,234 @@ def round_three_b(
     )
 
 
+# --- round 4 ------------------------------------------------------------------------------------
+
+SHIPPED_MATCH = "or-first-16"
+
+
+@dataclass(frozen=True)
+class Fusion:
+    """One fusion configuration: the RRF constant and the lexical ladder's weight."""
+
+    k: int = 60
+    lexical_weight: float = 1.0
+
+
+FUSIONS: dict[str, Fusion] = {
+    "k60": Fusion(),
+    "k30": Fusion(k=30),
+    "k10": Fusion(k=10),
+    "k60-lexical-0.5": Fusion(lexical_weight=0.5),
+}
+"""Round 4's incumbent first, then its candidates in tie-break order."""
+
+FAMILIES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "prose": (("authored", "multi-hop"), ("question",)),
+    "keyword": (("titles",), ("keywords",)),
+    "identifiers": (("identifiers", TWO_WORDS), ()),
+}
+"""Each family's ``docs/`` groups and mail-thread query forms."""
+
+
+def fusion_overrides(overrides: Mapping[str, Any], fusion: Fusion) -> dict[str, Any]:
+    """``overrides`` with the RRF constant set through the fusion stage's own configuration."""
+    merged = dict(overrides)
+    plugins = dict(merged.get("plugins", {}))
+    config = dict(plugins.get("config", {}))
+    config["retrieval_stage.rrf"] = {"k": fusion.k}
+    plugins["config"] = config
+    merged["plugins"] = plugins
+    return merged
+
+
+@contextlib.contextmanager
+def weighting(lexical_weight: float) -> Generator[None]:
+    """Fuse with the lexical ladder's reciprocal ranks scaled by ``lexical_weight``.
+
+    The shipped stage has no leg weights (``docs/retrieval.md`` §5.1), so the candidate is
+    measured by substituting its arithmetic for the duration: the same ladders, recovered the
+    same way and tie-broken the same way, with one leg's contribution multiplied.
+    """
+    if lexical_weight == 1.0:
+        yield
+        return
+    shipped = fusion_module.RRFStage.run
+
+    async def run(
+        self: fusion_module.RRFStage, query: Query, candidates: list[Candidate]
+    ) -> list[Candidate]:
+        del query
+        fused: dict[str, float] = {}
+        for leg in self.legs:
+            weight = lexical_weight if leg == "lexical" else 1.0
+            ladder = sorted(
+                (c for c in candidates if leg in c.scores),
+                key=lambda c: (-c.scores[leg], c.chunk.id),
+            )
+            for rank, candidate in enumerate(ladder, start=1):
+                fused[candidate.chunk.id] = fused.get(candidate.chunk.id, 0.0) + weight / (
+                    self.k + rank
+                )
+        ordered = sorted(candidates, key=lambda c: (-fused.get(c.chunk.id, 0.0), c.chunk.id))
+        return [c.scored_by(self.name, fused.get(c.chunk.id, 0.0)) for c in ordered]
+
+    fusion_module.RRFStage.run = run
+    try:
+        yield
+    finally:
+        fusion_module.RRFStage.run = shipped
+
+
+@dataclass(frozen=True)
+class FamilyChange:
+    count: int
+    change: float
+    interval: tuple[float, float]
+    split: tuple[int, int]
+
+    @property
+    def p(self) -> float:
+        return sign_test(*self.split)
+
+
+@dataclass(frozen=True)
+class RoundFour:
+    """One candidate against ``K = 60``, per family."""
+
+    families: dict[str, FamilyChange]
+    unanswerable_out_of_none: int
+
+    @property
+    def admissible(self) -> bool:
+        return self.unanswerable_out_of_none == 0 and all(
+            family.interval[0] > -0.02 for family in self.families.values()
+        )
+
+    @property
+    def qualifies(self) -> bool:
+        return self.admissible and any(
+            family.change >= 0.02 and family.p < 0.01 for family in self.families.values()
+        )
+
+    @property
+    def gain(self) -> float:
+        return statistics.fmean(family.change for family in self.families.values())
+
+    def describe(self) -> str:
+        lines = [
+            f"  {name} ({f.count}): {f.change:+.3f} [{f.interval[0]:+.3f}, {f.interval[1]:+.3f}], "
+            f"better/worse {f.split[0]}/{f.split[1]}, p = {f.p:.2g}"
+            for name, f in self.families.items()
+        ]
+        lines.append(
+            f"  unanswerable out of none {self.unanswerable_out_of_none}; admissible "
+            f"{self.admissible}, qualifies {self.qualifies}, mean gain {self.gain:+.3f}"
+        )
+        return "\n".join(lines)
+
+
+def _reciprocals(
+    docs: Sequence[Outcome], threads: Sequence[thread_duplication.Outcome], family: str
+) -> dict[str, float]:
+    groups, forms = FAMILIES[family]
+    found = {o.asked.id: reciprocal(o.rank) for o in docs if o.asked.group in groups}
+    found.update({o.asked.query.id: reciprocal(o.first) for o in threads if o.asked.form in forms})
+    return found
+
+
+def round_four(
+    docs: Mapping[str, Sequence[Outcome]],
+    threads: Mapping[str, Sequence[thread_duplication.Outcome]],
+) -> dict[str, RoundFour]:
+    """Every candidate in :data:`FUSIONS` against the first, under round 4's rule."""
+    incumbent, *candidates = FUSIONS
+    verdicts: dict[str, RoundFour] = {}
+    for name in candidates:
+        families: dict[str, FamilyChange] = {}
+        for family in FAMILIES:
+            before = _reciprocals(docs[incumbent], threads[incumbent], family)
+            after = _reciprocals(docs[name], threads[name], family)
+            differences = [after[key] - value for key, value in before.items()]
+            families[family] = FamilyChange(
+                count=len(differences),
+                change=statistics.fmean(differences),
+                interval=bootstrap_interval(differences),
+                split=(sum(d > 0 for d in differences), sum(d < 0 for d in differences)),
+            )
+        verdicts[name] = RoundFour(
+            families,
+            sum(
+                o.band is not ConfidenceBand.NONE
+                for o in docs[name]
+                if o.asked.group == "unanswerable"
+            ),
+        )
+    return verdicts
+
+
+def round_four_winner(verdicts: Mapping[str, RoundFour]) -> str | None:
+    """The qualifier with the highest mean gain; within 0.005, the earlier in :data:`FUSIONS`."""
+    qualifying = [name for name, verdict in verdicts.items() if verdict.qualifies]
+    if not qualifying:
+        return None
+    best = max(verdicts[name].gain for name in qualifying)
+    return next(name for name in qualifying if verdicts[name].gain >= best - 0.005)
+
+
+async def report_fusion(args: argparse.Namespace, work: Path, emit: Callable[[str], None]) -> None:
+    """Round 4: every fusion in :data:`FUSIONS` over both corpora, then the verdict."""
+    overrides: dict[str, Any] = {"embedding": {"provider": "onnx", "model": args.model}}
+    if args.chunk_tokens is not None:
+        overrides["plugins"] = {"config": {"chunker.structural": {"max_tokens": args.chunk_tokens}}}
+    index = await index_docs(work / "docs", overrides=overrides)
+    settings = settings_for(index.data_dir, overrides, PIPELINES["hybrid"])
+    async with Runtime(settings) as runtime:
+        store = cast("SqliteDocStore", await runtime.documents())
+        asked = await docs_questions(store, runtime.workspace)
+    corpus = build_corpus(seed=args.seed, copies=args.copies, distractors=args.distractors)
+    data_dir = work / "threads"
+    shutil.rmtree(data_dir, ignore_errors=True)
+    indexed = await thread_duplication.index(corpus, data_dir, overrides=overrides)
+    _, thread_asked = thread_duplication.queries(corpus)
+    docs: dict[str, list[Outcome]] = {}
+    threads: dict[str, list[thread_duplication.Outcome]] = {}
+    rows: list[tuple[str, str, Row]] = []
+    for name, fusion in FUSIONS.items():
+        merged = fusion_overrides(overrides, fusion)
+        with weighting(fusion.lexical_weight):
+            docs[name] = await run_docs(
+                index, asked, variant=SHIPPED_MATCH, pipeline="hybrid", overrides=merged
+            )
+            with matching(VARIANTS[SHIPPED_MATCH]):
+                run = await thread_duplication.run_pipeline(
+                    indexed,
+                    thread_asked,
+                    name="hybrid",
+                    overrides=merged,
+                    ks=(10,),
+                    counted=frozenset({EXHAUSTED_BUDGET}),
+                )
+        threads[name] = run.outcomes
+        for group in GROUPS:
+            chosen = [o for o in docs[name] if o.asked.group == group]
+            if chosen:
+                rows.append((name, "hybrid", summarize(group, chosen)))
+    emit("\n### round 4: fusion, docs/\n")
+    emit(render(rows))
+    emit("\n### round 4: fusion, mail threads\n")
+    for name, outcomes in threads.items():
+        for form in thread_duplication.FORMS:
+            chosen = [o for o in outcomes if o.asked.form == form]
+            mrr = statistics.fmean(reciprocal(o.first) for o in chosen)
+            found = sum(o.found for o in chosen)
+            emit(f"  {name} {form}: found {found}/{len(chosen)}, MRR {mrr:.3f}")
+    verdicts = round_four(docs, threads)
+    for name, verdict in verdicts.items():
+        emit(f"\n{name} against {next(iter(FUSIONS))}:\n{verdict.describe()}")
+    winner = round_four_winner(verdicts)
+    emit(f"\n-> {'replace K = 60 with ' + winner if winner else 'no change'}")
+
+
 async def _report_docs(
     index: DocsIndex,
     asked: Sequence[Asked],
@@ -1374,6 +1624,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=list(VARIANTS))
     parser.add_argument("--no-threads", action="store_true", help="skip the synthetic mail corpus")
     parser.add_argument(
+        "--fusion", action="store_true", help="run round 4, the fusion candidates, instead"
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=HELD_OUT_SEED,
@@ -1418,7 +1671,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             work = args.work.resolve()
             work.mkdir(parents=True, exist_ok=True)
         _isolate(work)
-        asyncio.run(report(args, work, emit))
+        asyncio.run((report_fusion if args.fusion else report)(args, work, emit))
 
 
 if __name__ == "__main__":

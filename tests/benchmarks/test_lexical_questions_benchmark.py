@@ -13,9 +13,14 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+import pytest
+
 from manicule.container import keys
+from manicule.core.retrieval import Candidate, Filter, Query
 from manicule.evaluation.queries import load_query_set
 from manicule.plugins.registry import discover
+from manicule.retrieval.config import FusionConfig
+from manicule.retrieval.fusion import RRFStage
 from manicule.storage.fts import FUNCTION_WORDS, escape_match_query, match_words
 from tests.benchmarks.lexical_questions import (
     AUTHORED,
@@ -31,24 +36,31 @@ from tests.benchmarks.lexical_questions import (
     UNANSWERABLE,
     VARIANTS,
     Asked,
+    FamilyChange,
+    Fusion,
     Place,
+    RoundFour,
     RoundThree,
     RoundThreeB,
     _lost,  # pyright: ignore[reportPrivateUsage]
     _rank,  # pyright: ignore[reportPrivateUsage]
     bootstrap_interval,
+    fusion_overrides,
     identifier_questions,
     index_docs,
     paste_questions,
+    round_four_winner,
     run_docs,
     run_threads,
     summarize,
     time_at_scale,
     two_word_questions,
+    weighting,
 )
 from tests.benchmarks.test_thread_duplication_benchmark import CountingEmbedder, small
 from tests.benchmarks.thread_corpus import build_corpus
 from tests.benchmarks.thread_duplication import queries
+from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -288,3 +300,48 @@ def test_round_three_b_hands_a_trade_off_to_the_owner() -> None:
     assert "owner" in RoundThreeB(-0.05, (-0.08, -0.02), 100, fast).verdict
     slow = {**fast, PASTED[1]: (60.0, 90.0)}
     assert "owner" in RoundThreeB(0.0, (-0.01, 0.01), 100, slow).verdict
+
+
+def test_a_fusion_sets_the_constant_through_the_stage_configuration() -> None:
+    base = {"plugins": {"config": {"chunker.structural": {"max_tokens": 510}}}}
+    merged = fusion_overrides(base, Fusion(k=10))
+    assert merged["plugins"]["config"] == {
+        "chunker.structural": {"max_tokens": 510},
+        "retrieval_stage.rrf": {"k": 10},
+    }
+    assert base["plugins"]["config"] == {"chunker.structural": {"max_tokens": 510}}
+
+
+async def test_weighting_scales_the_lexical_ladder_and_nothing_else() -> None:
+    document = make_document(source_id="d")
+    chunks = [make_chunk(document, i, f"passage {i}") for i in range(3)]
+    candidates = [
+        Candidate(chunk=chunks[0], score=0.0, scores={"dense": 0.9}),
+        Candidate(chunk=chunks[1], score=0.0, scores={"dense": 0.5, "lexical": 2.0}),
+        Candidate(chunk=chunks[2], score=0.0, scores={"lexical": 3.0}),
+    ]
+    stage = RRFStage(config=FusionConfig(k=60))
+    query = Query(text="q", filter=Filter(workspace_ids=frozenset({"w"})))
+    equal = await stage.run(query, candidates)
+    with weighting(0.5):
+        halved = await stage.run(query, candidates)
+    with weighting(1.0):
+        assert [c.chunk.id for c in await stage.run(query, candidates)] == [
+            c.chunk.id for c in equal
+        ]
+    fused = {c.chunk.id: c.scores["rrf"] for c in halved}
+    assert fused[chunks[0].id] == pytest.approx(1 / 61), "the dense leg's first, untouched"
+    assert fused[chunks[1].id] == pytest.approx(1 / 62 + 0.5 / 62)
+    assert fused[chunks[2].id] == pytest.approx(0.5 / 61), "the lexical leg's first, halved"
+    assert {c.chunk.id: c.scores["rrf"] for c in equal}[chunks[2].id] == pytest.approx(1 / 61)
+
+
+def test_round_four_picks_the_best_qualifier_and_breaks_ties_by_order() -> None:
+    def verdict(change: float, low: float = -0.01) -> RoundFour:
+        family = FamilyChange(100, change, (low, change + 0.01), (60, 10))
+        return RoundFour({"prose": family, "keyword": family, "identifiers": family}, 0)
+
+    assert round_four_winner({"k30": verdict(0.0), "k10": verdict(0.0)}) is None
+    assert round_four_winner({"k30": verdict(0.03), "k10": verdict(0.034)}) == "k30"
+    assert round_four_winner({"k30": verdict(0.03), "k10": verdict(0.04)}) == "k10"
+    assert round_four_winner({"k30": verdict(0.05, low=-0.03)}) is None, "inadmissible"
