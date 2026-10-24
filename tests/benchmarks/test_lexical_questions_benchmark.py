@@ -14,20 +14,32 @@ import re
 from typing import TYPE_CHECKING
 
 from manicule.container import keys
+from manicule.evaluation.queries import load_query_set
 from manicule.plugins.registry import discover
 from manicule.storage.fts import FUNCTION_WORDS, escape_match_query, match_words
 from tests.benchmarks.lexical_questions import (
     AUTHORED,
+    CAP,
+    CAPPED,
     DOCS,
+    HELD_OUT_COPIES,
+    HELD_OUT_DISTRACTORS,
+    HELD_OUT_SEED,
     MULTI_HOP_TARGETS,
+    PASTE_STRIDE,
+    PASTED,
+    UNANSWERABLE,
     VARIANTS,
     Asked,
     Place,
     RoundThree,
+    RoundThreeB,
     _rank,  # pyright: ignore[reportPrivateUsage]
     bootstrap_interval,
     identifier_questions,
     index_docs,
+    match_any_first,
+    paste_questions,
     run_docs,
     run_threads,
     summarize,
@@ -35,6 +47,8 @@ from tests.benchmarks.lexical_questions import (
     two_word_questions,
 )
 from tests.benchmarks.test_thread_duplication_benchmark import CountingEmbedder, small
+from tests.benchmarks.thread_corpus import build_corpus
+from tests.benchmarks.thread_duplication import queries
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -225,3 +239,42 @@ def test_round_three_switches_only_when_every_condition_holds() -> None:
     assert not _round(unanswerable_out_of_none=1).switch
     assert not _round(slowest=("authored", 49.0, 101.0)).switch
     assert "keep and-content" in _round(lost_keywords=2).describe()
+
+
+def _content_words(text: str) -> int:
+    words = match_words(text)
+    return len([w for w in words if w.lower() not in FUNCTION_WORDS] or words)
+
+
+def test_round_three_questions_fit_the_cap() -> None:
+    """Round 3b's cap changes nothing round 3 measured: every question it asked fits under it."""
+    texts = [text for text, _, _ in AUTHORED]
+    texts.extend(UNANSWERABLE)
+    for name in ("multi-hop-queries.json", "example-queries.json"):
+        texts.extend(query.text for query in load_query_set(DOCS / "evaluation" / name).queries)
+    texts.extend(question for question, _ in identifier_questions())
+    texts.extend(question for question, _ in two_word_questions())
+    for seed, copies, distractors in ((HELD_OUT_SEED, HELD_OUT_COPIES, HELD_OUT_DISTRACTORS),):
+        _, asked = queries(build_corpus(seed=seed, copies=copies, distractors=distractors))
+        texts.extend(item.query.text for item in asked)
+    assert max(map(_content_words, texts)) <= CAP
+
+
+def test_a_paste_is_its_window_long_and_targets_its_own_section() -> None:
+    place = Place("retrieval.md", ("Retrieval", "6. Rerank", "6.2 The model"), "d")
+    long_text = " ".join(f"word{i}" for i in range(130))
+    passages = [(place, long_text)] + [(place, "short")] * (PASTE_STRIDE - 1)
+    passages.append((Place("intro.md", ("Introduction",), "e"), long_text))
+    pasted = paste_questions(passages)
+    assert [item.group for item in pasted] == ["pasted, 40 words", "pasted, 120 words"]
+    assert all(item.targets == (("retrieval.md", "6.2"),) for item in pasted)
+    assert len(pasted[1].text.split()) == 120
+    assert match_any_first(pasted[1].text).count(" OR ") == CAP - 1
+
+
+def test_round_three_b_hands_a_trade_off_to_the_owner() -> None:
+    fast = dict.fromkeys(PASTED, (20.0, 40.0))
+    assert RoundThreeB(-0.01, (-0.02, 0.0), 100, fast).verdict == f"ship {CAPPED}"
+    assert "owner" in RoundThreeB(-0.05, (-0.08, -0.02), 100, fast).verdict
+    slow = {**fast, PASTED[1]: (60.0, 90.0)}
+    assert "owner" in RoundThreeB(0.0, (-0.01, 0.01), 100, slow).verdict

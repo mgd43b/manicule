@@ -122,6 +122,25 @@ set, multi-hop, took a median of 48.1 ms and a p95 of 73.4 ms at 100,000 chunks.
 found the cost where expected: -0.021 on the 68 natural questions the conjunction had matched,
 +0.008 on the 123 it had not.
 
+**Round 3b: a cap on the disjunction, because a long query is not a question.** Review found
+what round 3 never asked: a pasted paragraph becomes an ``OR`` over dozens of words, matches
+nearly every row, and is scored in full before ``LIMIT`` — and nothing on any surface limits a
+query's length. Round 3's largest question had nine content words, so a cap of
+:data:`CAP` (16) leaves every figure above unchanged, which a test asserts. Two candidates:
+``or-content`` uncapped, and ``or-first-16``, the disjunction over the first 16 content words.
+
+- *pasted* — derived mechanically by :func:`paste_questions`: every ninth chunk of ``docs/``,
+  its first 40 words and, where it has them, its first 120, each with the chunk's own numbered
+  section as the target. Copied verbatim, so these favor the lexical leg; both candidates share
+  that bias.
+
+**The round 3b rule.** Hybrid pipeline, ``k = 10``, paired reciprocal rank over both windows
+pooled. ``or-first-16`` ships if the lower end of a 95% paired bootstrap interval on its mean
+difference from ``or-content`` is above -0.03, and at :data:`SCALE` chunks its median statement
+time on each window is under 50 ms and its p95 under 100 ms — round 3's bound. If it meets the
+time bound and fails the margin, the trade-off goes to the owner rather than being decided here;
+so does a cap that fails the time bound.
+
 Everything is local: no network, temporary directories, and the only thing read from outside the
 repository is the embedding model, from the local model cache.
 """
@@ -220,6 +239,15 @@ def match_all_content(text: str) -> str:
     return " ".join(_content(_literals(text)))
 
 
+CAP = 16
+"""Round 3b's cap on the disjunction, in content words. Above round 3's largest question (nine)."""
+
+
+def match_any_first(text: str) -> str:
+    """Any of the first :data:`CAP` content words: round 3b's candidate."""
+    return " OR ".join(_content(_literals(text))[:CAP])
+
+
 def match_all_but_one_content(text: str) -> str:
     """Every content word but at most one: a minimum-should-match of ``n - 1``.
 
@@ -238,6 +266,7 @@ VARIANTS: dict[str, Callable[[str], str]] = {
     "or-content": escape_match_query,
     "and-content": match_all_content,
     "all-but-one": match_all_but_one_content,
+    "or-first-16": match_any_first,
 }
 """Report order, simplest first, which is also rule 2's tie-break order.
 
@@ -608,6 +637,40 @@ async def docs_questions(store: SqliteDocStore, workspace: str) -> list[Asked]:
     return asked
 
 
+PASTE_STRIDE = 9
+PASTE_WINDOWS = (40, 120)
+
+
+def paste_questions(passages: Sequence[tuple[Place, str]]) -> list[Asked]:
+    """Round 3b's long queries: the opening words of every :data:`PASTE_STRIDE`-th chunk.
+
+    The target is the chunk's deepest numbered section; a chunk under no numbered heading is
+    skipped rather than given a target its document does not state, and a window longer than the
+    chunk is skipped rather than shortened, so every query is exactly its window's length.
+    """
+    asked: list[Asked] = []
+    for position, (place, text) in enumerate(passages[::PASTE_STRIDE]):
+        numbers = [
+            heading.split(" ", 1)[0].rstrip(".")
+            for heading in place.heading
+            if heading[:1].isdigit()
+        ]
+        if not numbers:
+            continue
+        words = text.split()
+        for window in PASTE_WINDOWS:
+            if len(words) >= window:
+                asked.append(
+                    Asked(
+                        f"pasted-{window}-{position}",
+                        " ".join(words[:window]),
+                        f"pasted, {window} words",
+                        ((place.path, numbers[-1]),),
+                    )
+                )
+    return asked
+
+
 # --- one indexed corpus --------------------------------------------------------------------------
 
 
@@ -626,6 +689,8 @@ class DocsIndex:
     documents: int
     texts: list[tuple[str, str]]
     """Every chunk's text and breadcrumb, for the table the statements are timed against."""
+    passages: list[tuple[Place, str]] = field(default_factory=list[tuple[Place, str]])
+    """Every chunk's place and text, by document path and then position in the document."""
 
 
 async def index_docs(
@@ -646,13 +711,16 @@ async def index_docs(
         store = cast("SqliteDocStore", await runtime.documents())
         places: dict[str, Place] = {}
         texts: list[tuple[str, str]] = []
+        passages: list[tuple[Place, str]] = []
         documents = await store.list_documents(limit=10_000)
         for document in documents:
             path = document.uri.removeprefix(root.as_uri() + "/")
             for chunk in await store.document_chunks(document.id):
                 places[chunk.id] = Place(path, chunk.heading_path, document.id)
                 texts.append((chunk.text, " > ".join(chunk.heading_path)))
-    return DocsIndex(data_dir, places, len(documents), texts)
+                passages.append((places[chunk.id], chunk.text))
+    passages.sort(key=lambda passage: passage[0].path)
+    return DocsIndex(data_dir, places, len(documents), texts, passages)
 
 
 # --- running a question set ----------------------------------------------------------------------
@@ -889,6 +957,8 @@ GROUPS = (
     "titles",
     "identifiers",
     "identifiers, two words",
+    "pasted, 40 words",
+    "pasted, 120 words",
     "multi-hop, unlabeled",
     "example",
     "unanswerable",
@@ -1073,8 +1143,10 @@ def round_three(
     natural = docs_pairs(outcomes, NATURAL) + thread_pairs(runs, "question")
     differences = [p.difference for p in natural]
 
-    def lost(shipped: Sequence[bool], challenger: Sequence[bool]) -> int:
-        return max(0, sum(shipped) - sum(challenger))
+    def lost(incumbent: Sequence[bool], challenger: Sequence[bool]) -> int:
+        """Lookups the incumbent found and the challenger did not, per query: a gain elsewhere
+        does not pay for one."""
+        return sum(was and not now for was, now in zip(incumbent, challenger, strict=True))
 
     titles = {
         variant: [
@@ -1120,6 +1192,68 @@ def round_three(
     )
 
 
+CAPPED = "or-first-16"
+PASTED = ("pasted, 40 words", "pasted, 120 words")
+
+
+@dataclass(frozen=True)
+class RoundThreeB:
+    """Round 3b's rule applied: the cap against the uncapped disjunction on long queries."""
+
+    change: float
+    interval: tuple[float, float]
+    count: int
+    timings: dict[str, tuple[float, float]]
+    """Per paste window: the cap's median and p95 ms at :data:`SCALE` chunks."""
+
+    @property
+    def within_margin(self) -> bool:
+        return self.interval[0] > -0.03
+
+    @property
+    def fast_enough(self) -> bool:
+        return all(median < 50 and p95 < 100 for median, p95 in self.timings.values())
+
+    @property
+    def verdict(self) -> str:
+        if self.within_margin and self.fast_enough:
+            return f"ship {CAPPED}"
+        return "a trade-off for the owner to decide"
+
+    def describe(self) -> str:
+        low, high = self.interval
+        lines = [
+            f"  pasted ({self.count}): mean reciprocal rank {self.change:+.3f}, 95% interval "
+            f"[{low:+.3f}, {high:+.3f}], margin -0.030 -> {self.within_margin}",
+            *(
+                f"  {group}: {CAPPED} median {median:.1f} ms, p95 {p95:.1f} ms"
+                for group, (median, p95) in self.timings.items()
+            ),
+            f"  time bound -> {self.fast_enough}",
+            f"  -> {self.verdict}",
+        ]
+        return "\n".join(lines)
+
+
+def round_three_b(
+    outcomes: Mapping[tuple[str, str], Sequence[Outcome]],
+    timings: Mapping[tuple[str, str], tuple[float, float, float]],
+) -> RoundThreeB:
+    """Apply the round 3b rule the module docstring states."""
+    capped = {o.asked.id: o for o in outcomes[CAPPED, "hybrid"]}
+    differences = [
+        reciprocal(capped[o.asked.id].rank) - reciprocal(o.rank)
+        for o in outcomes[CHALLENGER, "hybrid"]
+        if o.asked.group in PASTED
+    ]
+    return RoundThreeB(
+        change=statistics.fmean(differences),
+        interval=bootstrap_interval(differences),
+        count=len(differences),
+        timings={group: timings[CAPPED, group][:2] for group in PASTED},
+    )
+
+
 async def _report_docs(
     index: DocsIndex,
     asked: Sequence[Asked],
@@ -1161,6 +1295,7 @@ async def report(args: argparse.Namespace, work: Path, emit: Callable[[str], Non
     async with Runtime(settings) as runtime:
         store = cast("SqliteDocStore", await runtime.documents())
         asked = await docs_questions(store, runtime.workspace)
+    asked.extend(paste_questions(index.passages))
     emit(
         f"docs/: {index.documents} documents, {len(index.places)} chunks, indexed in "
         f"{time.perf_counter() - started:.0f}s with {args.model}; {len(asked)} queries"
@@ -1180,6 +1315,10 @@ async def report(args: argparse.Namespace, work: Path, emit: Callable[[str], Non
             f"| {name} | {group} | {len(questions[group])} | {median:.1f} | {p95:.1f} | "
             f"{matched:.0f} |"
         )
+
+    if {CHALLENGER, CAPPED} <= set(args.variants):
+        emit(f"\n### round 3b: {CAPPED} against {CHALLENGER}\n")
+        emit(round_three_b(measured, timings).describe())
 
     if not args.no_threads:
         await _report_threads(

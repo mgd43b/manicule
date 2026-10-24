@@ -192,7 +192,7 @@ async def retriever_over(
         router=router,
         cache=cache,
         legs=fusion.legs if lexical else ("dense",),
-        rrf_k=fusion.k,
+        rrf_k=fusion.k if lexical else None,
         embed_fingerprint=embedder.fingerprint.canonical(),
         glossary=_source(store, glossary),
         expansion=policy or ExpansionPolicy(),
