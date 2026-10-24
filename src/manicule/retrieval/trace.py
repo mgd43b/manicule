@@ -145,10 +145,10 @@ class DenseReport(BaseModel):
 class LexicalReport(BaseModel):
     """What the lexical leg matched.
 
-    Zero is an event, not a warning: an all-stopword query and an FTS5 failure look the same
-    from here, and either way the pipeline continues on one leg. What must not happen is the
-    difference being a line on somebody's terminal — a run that silently became single-leg is
-    a run the harness would otherwise compare against a two-leg one.
+    Zero is an event, not a warning: a question whose words no chunk holds together and an FTS5
+    failure look the same from here, and either way the pipeline continues on one leg. What must
+    not happen is the difference being a line on somebody's terminal — a run that silently
+    became single-leg is a run the harness would otherwise compare against a two-leg one.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

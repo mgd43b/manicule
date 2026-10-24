@@ -63,7 +63,7 @@ class CountingEmbedder(HashEmbedder):
 
 
 def test_every_keyword_lookup_is_made_of_words_its_statement_contains() -> None:
-    """The lexical leg matches only a chunk holding every term, so this is what reaches it."""
+    """The lexical leg needs every content word in one chunk, so this is what surely reaches it."""
     for statement, _, _, keywords in ASPECTS:
         words = set(re.findall(r"\w+", statement.lower()))
         assert set(re.findall(r"\w+", keywords.lower())) <= words, keywords

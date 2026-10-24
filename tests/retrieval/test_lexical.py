@@ -80,7 +80,7 @@ async def test_it_merges_rather_than_replaces(store: SqliteDocStore) -> None:
 async def test_zero_matches_is_recorded_and_makes_the_run_incomparable(
     store: SqliteDocStore,
 ) -> None:
-    """An all-stopword query and a failed lexical index look identical from here.
+    """A query with nothing to match and a failed lexical index look identical from here.
 
     Either way the pipeline continues on one leg and the ranking it produces is well-formed —
     so the run has to carry that it was single-leg. A line on somebody's terminal is invisible

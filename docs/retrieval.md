@@ -469,11 +469,81 @@ and returns the union: a chunk both legs found carries both scores, via `Candida
 which returns a copy. This is why the conformance suite forbids returning the input list — a
 merge is the natural place to accidentally mutate in place.
 
-**Zero results is an event, not a warning.** An empty match is legitimate: an all-stopword query,
-a query that tokenizes to nothing after `escape_match_query`. It is also what an FTS5 failure
-looks like. Either way the pipeline continues with one leg and the ranking it produces is
-well-formed, so the trace records `matched: 0` and the run is marked single-leg. §5.3 says what
-#15 must do with that.
+**It asks for a question's subject, not its grammar.** The store turns the query into an FTS5
+match in `escape_match_query` (`storage/fts.py`): every word is quoted, so `NOT`, `OR`, `NEAR`,
+`*`, `:` and parentheses are words and never operators, and the quoted words are joined by
+juxtaposition, which FTS5 reads as `AND`. Before that, the words in `FUNCTION_WORDS` are dropped
+— interrogatives, auxiliaries, pronouns, articles, common prepositions and conjunctions, about
+eighty in all. `not`, `no` and negated contractions are not among them, because dropping them
+inverts a question. A query made only of function words keeps them, so "what is it" or a bare
+`OR` is still a search for those words. Each word is matched once, and a typographic apostrophe
+is read as the ASCII one, so `what’s` is the function word it looks like. **The list is English**,
+like the Porter stemmer the index is built with (§13 on the multilingual case): a question in
+another language keeps its function words and needs every one of them in a chunk, as every
+question did before #481.
+
+The list exists because, without it, the conjunction required *every* word: "how do I rotate
+the signing token" matched only a chunk that also said "how", "do" and "I". A natural question
+therefore matched nothing, fusion ran on the dense ladder alone, and every run that looked
+hybrid was dense for exactly the queries people type
+([#481](https://github.com/mgd43b/manicule/issues/481)).
+
+**Chosen by measurement, in two rounds, each with its rule written down before it ran**
+(`tests/benchmarks/lexical_questions.py`, whose docstring holds both rules). The corpus is this
+repository's `docs/` tree — 19 documents, 1,344 chunks — indexed with BGE-M3; a synthetic mail
+corpus (`tests/benchmarks/thread_corpus.py`) was measured alongside it. Hybrid pipeline, `k = 10`:
+
+| Question set | Lexical leg empty, all words required | `hit@10` dense alone | `hit@10` hybrid, all words | `hit@10` hybrid, function words dropped | MRR@10, all words → dropped |
+|---|---:|---:|---:|---:|---:|
+| Authored, one labeled section each (54) | 49 | 53 | 53 | 53 | 0.756 → 0.751 |
+| Multi-hop, labeled from their notes (11) | 10 | 10 | 10 | 10 | 0.629 → 0.627 |
+| Document titles (19) | 0 | 19 | 19 | 19 | 0.853 → 0.853 |
+| Mail-thread questions (84) | 84 | 83 | 83 | 83 | — |
+| Mail-thread keywords (84) | 0 | 84 | 84 | 84 | — |
+| **Questions naming an identifier (754)** | 549 | 433 | 506 | **603** | **0.476 → 0.643** |
+
+The first round's sets could not separate the candidates: the dense leg alone was already at
+the `hit@10` ceiling on all of them, and its rule returned "no change". A disjunction (`OR`,
+with or without the function words) matched something for every question and **lost** —
+multi-hop `hit@10` fell from 10 to 7 and authored MRR from 0.756 to about 0.69, because a weak
+lexical ladder fused at equal weight pulls the dense one down. It is also the expensive one: at
+100,000 chunks the statement took a median of 82 to 98 ms with every function word in it,
+because "the" and "how" match nearly every row and the statement scores them all before
+`LIMIT`. The second round asked what the lexical leg exists for — a question carrying a term the
+dense leg cannot place — with questions derived mechanically from every identifier that occurs
+in exactly one section of `docs/`. Dropping function words won it by 97 questions with no
+labeled set losing more than 0.005 of MRR; requiring all content words but one tied it on
+identifiers and cost 0.04 to 0.07 of MRR elsewhere. No unanswerable question left the `none`
+band under any rule.
+
+**The disjunction does better on identifiers, and that is recorded rather than smoothed over.**
+Round 2's rule excluded the two disjunctions, which round 1 had already rejected, so its
+first run did not score them. A later full run of every variant did: on the identifier
+questions the content-word disjunction found **723** of 754 (MRR 0.811) against 600 (0.637)
+for the shipped rule, at a median of 11 ms at 100,000 chunks. Part of the gap is that a question
+naming an identifier often carries one more content word the section never writes — "where is
+`X` used" requires "used" — and a conjunction then misses it entirely. Shipping the disjunction
+on that evidence would mean overriding both written rules after seeing the data. It still loses
+multi-hop hits (7 of 11 against 10) and authored MRR (0.696 against 0.751), so it is the next
+candidate for a measurement of its own, not a silent swap.
+
+**What it does not do.** A prose question whose content words do not all occur in one chunk still
+matches nothing — 37 of the 54 authored questions, 48 of the 84 mail-thread ones — and that is
+the measured better outcome, not an oversight: the cases where the leg added a weak match all
+lost to the dense leg alone.
+
+**It changes no identity.** The match is built at query time from the text the leg was given:
+the FTS5 index, its tokenizer, every fingerprint and the `PipelineIdentity` are unchanged, and
+nothing needs rebuilding. Like the `bm25()` column weights, the match rule belongs to the store's
+statement rather than to a declared stage setting, so an evaluation record made before #481 and
+one made after name the same configuration; compare them only as two different builds. The L1
+cache is in-process and empties on restart, so it cannot serve a ranking made under the old rule.
+
+**Zero results is an event, not a warning.** An empty match is legitimate: a question whose
+content words never occur together in one chunk, a query that tokenizes to nothing after
+`escape_match_query`. It is also what an FTS5 failure looks like. Either way the pipeline continues
+with one leg and the ranking it produces is well-formed, so the trace records `matched: 0` and the
+run is marked single-leg. §5.3 says what #15 must do with that.
 
 > **Corrected while building it.** An earlier draft of §11.1 had this leg record *the escaped
 > match string*. It cannot, and should not: escaping belongs to `DocStore.search_lexical`, and a
@@ -1738,7 +1808,8 @@ defines it.
 
 It is not a threshold that needs adjusting, and it is not visible on a small fixture. Measured
 with BGE-M3 over a synthetic corpus (`tests/glossary/corpus.py`), the same question against three
-progressively more realistic versions of it:
+progressively more realistic versions of it — before [#481](https://github.com/mgd43b/manicule/issues/481),
+when the lexical leg required "what" and "is" as well and so contributed nothing to the question:
 
 | Fixture | Rank of the definition |
 |---|---|
@@ -2195,6 +2266,7 @@ Calls made in the absence of a stated position.
 | What a conversation repeats is dropped after fusion, within a conversation only; the copy ranked first is kept, even when it is a quotation; on by default | §5.5 |
 | Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |
+| The lexical match drops function words and requires every remaining word, each quoted; a query of function words alone keeps them; neither a disjunction nor a minimum-should-match, both measured | §4.1 |
 | The reranker raises rather than passing through, and truncates to what it scored | §6.1 |
 | `bge-reranker-v2-m3` by default, because a monolingual reranker would undo the embedder's choice | §6.2 |
 | Context assembly is not a `RetrievalStage` — closes the second open item in `contracts.md` §6 | §2.4, §7.1 |
