@@ -39,7 +39,6 @@ from tests.benchmarks.lexical_questions import (
     bootstrap_interval,
     identifier_questions,
     index_docs,
-    match_any_first,
     paste_questions,
     run_docs,
     run_threads,
@@ -95,7 +94,7 @@ def test_a_question_of_function_words_alone_keeps_them() -> None:
 
 def test_the_winning_variant_is_the_shipped_rule_and_the_baseline_is_the_old_one() -> None:
     """A re-run measures what ships, and compares it against the rules it replaced."""
-    assert VARIANTS["or-content"] is escape_match_query
+    assert VARIANTS["or-first-16"] is escape_match_query
     question = "how do I rotate the signing token"
     assert VARIANTS["and"](question) == '"how" "do" "I" "rotate" "the" "signing" "token"'
     assert VARIANTS["and"]("- token token") == '"-" "token" "token"', "verbatim, defects included"
@@ -279,7 +278,8 @@ def test_a_paste_is_its_window_long_and_targets_its_own_section() -> None:
     assert [item.group for item in pasted] == ["pasted, 40 words", "pasted, 120 words"]
     assert all(item.targets == (("retrieval.md", "6.2"),) for item in pasted)
     assert len(pasted[1].text.split()) == 120
-    assert match_any_first(pasted[1].text).count(" OR ") == CAP - 1
+    assert escape_match_query(pasted[1].text).count(" OR ") == CAP - 1
+    assert VARIANTS["or-content"](pasted[1].text).count(" OR ") == 119
 
 
 def test_round_three_b_hands_a_trade_off_to_the_owner() -> None:

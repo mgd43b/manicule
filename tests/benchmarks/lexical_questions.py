@@ -141,6 +141,13 @@ time on each window is under 50 ms and its p95 under 100 ms — round 3's bound.
 time bound and fails the margin, the trade-off goes to the owner rather than being decided here;
 so does a cap that fails the time bound.
 
+**Round 3b failed the time bound, and the owner shipped the cap.** Quality could not separate
+the two — every pasted query found its section at rank 1 under both, and under the dense leg
+alone, so the paste set measures time and nothing else. The cap cut a 120-word paste from a
+median of 254.9 ms (p95 339.7) to 82.2 ms (p95 100.4), and a 40-word one from 100.4 to 80.0 ms
+(p95 124.4 to 97.7): about threefold where it matters, and still over the 50 ms bound, because
+sixteen words still match about 90% of the rows. Disclosed as such in ``docs/retrieval.md`` §4.1.
+
 Everything is local: no network, temporary directories, and the only thing read from outside the
 repository is the embedding model, from the local model cache.
 """
@@ -176,7 +183,13 @@ from manicule.retrieval.lexical import DEGRADED_REASON as LEXICAL_EMPTY
 from manicule.retrieval.retriever import Retriever
 from manicule.retrieval.trace import Shortfall
 from manicule.storage import docstore as docstore_module
-from manicule.storage.fts import FUNCTION_WORDS, SEARCH_SQL, escape_match_query, match_words
+from manicule.storage.fts import (
+    FUNCTION_WORDS,
+    MAX_MATCH_WORDS,
+    SEARCH_SQL,
+    escape_match_query,
+    match_words,
+)
 from manicule.storage.models import FTS_TOKENIZER
 from tests.benchmarks import thread_duplication
 from tests.benchmarks.thread_corpus import Corpus, build_corpus
@@ -239,13 +252,13 @@ def match_all_content(text: str) -> str:
     return " ".join(_content(_literals(text)))
 
 
-CAP = 16
+CAP = MAX_MATCH_WORDS
 """Round 3b's cap on the disjunction, in content words. Above round 3's largest question (nine)."""
 
 
-def match_any_first(text: str) -> str:
-    """Any of the first :data:`CAP` content words: round 3b's candidate."""
-    return " OR ".join(_content(_literals(text))[:CAP])
+def match_any_content(text: str) -> str:
+    """Any word that is not a function word, uncapped: the rule round 3 measured and chose."""
+    return " OR ".join(_content(_literals(text)))
 
 
 def match_all_but_one_content(text: str) -> str:
@@ -263,17 +276,19 @@ def match_all_but_one_content(text: str) -> str:
 VARIANTS: dict[str, Callable[[str], str]] = {
     "and": match_all,
     "or": match_any,
-    "or-content": escape_match_query,
+    "or-content": match_any_content,
     "and-content": match_all_content,
     "all-but-one": match_all_but_one_content,
-    "or-first-16": match_any_first,
+    "or-first-16": escape_match_query,
 }
 """Report order, simplest first, which is also rule 2's tie-break order.
 
 ``and`` is the rule #481 replaced and ``and-content`` the one #482 shipped. ``or-content`` — any
-word but the :data:`~manicule.storage.fts.FUNCTION_WORDS` — won round 3, and is the shipped
-:func:`~manicule.storage.fts.escape_match_query` itself rather than a copy of it, so a change to
-the shipped rule is measured by the next run without anybody remembering to edit this list."""
+word but the :data:`~manicule.storage.fts.FUNCTION_WORDS` — won round 3, and ``or-first-16``, the
+same capped at :data:`~manicule.storage.fts.MAX_MATCH_WORDS`, shipped after round 3b. It is the
+shipped :func:`~manicule.storage.fts.escape_match_query` itself rather than a copy of it, so a
+change to the shipped rule is measured by the next run without anybody remembering to edit this
+list."""
 
 
 @contextlib.contextmanager
@@ -1102,10 +1117,7 @@ class RoundThree:
             "2 not inferior": self.natural_interval[0] > self.margin,
             "3 titles and keywords": self.lost_titles <= 1 and self.lost_keywords <= 1,
             "4 unanswerable": self.unanswerable_out_of_none == 0,
-            "5 latency": all(
-                median < 50 and p95 < 100
-                for median, p95 in self.latency.values()
-            ),
+            "5 latency": all(median < 50 and p95 < 100 for median, p95 in self.latency.values()),
         }
 
     @property

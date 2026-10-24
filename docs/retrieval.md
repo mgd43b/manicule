@@ -477,7 +477,8 @@ weighting: a chunk holding a question's rarer words ranks above one holding its 
 a chunk holding only some of them is still found. Every word is quoted, so `NOT`, `OR`, `NEAR`,
 `*`, `:` and parentheses in the query are words and never operators; the one operator in the
 expression is the `OR` the function writes between quoted phrases. `not`, `no` and negated
-contractions are not function words, because dropping them inverts a question. A query made only
+contractions are not function words, because dropping them inverts a question. At most the first
+16 content words are kept (`MAX_MATCH_WORDS`); the reason is the cost below. A query made only
 of function words keeps them, so "what is it" or a bare `OR` is still a search for those words.
 Each word is matched once, and a typographic apostrophe is read as the ASCII one, so `what’s` is
 the function word it looks like. **The list is English**, like the Porter stemmer the index is
@@ -544,6 +545,24 @@ closest condition. The time follows the rows matched, which grow with the corpus
 ten times this size should be expected to take several times as long on long prose questions —
 an extrapolation, not a measurement. Dropping the function words is what keeps it at this level:
 in rounds 1 and 2, with them, the same questions matched nearly every row and took 77 to 98 ms.
+
+**A long query is cut to its first 16 content words, and it is still slow.** Nothing on any
+surface limits a query's length, and a pasted paragraph became an `OR` over dozens of words that
+matched almost the whole index. Round 3b compared the uncapped disjunction with one over the
+first 16 content words, on the opening 40 and 120 words of every ninth chunk of `docs/`. Quality
+could not tell them apart — every paste found its section at rank 1 under both, and under the
+dense leg alone — so what the round measured is time, at 100,000 chunks:
+
+| Pasted query | uncapped, median / p95 ms | first 16 content words, median / p95 ms |
+|---|---:|---:|
+| 40 words (136) | 100.4 / 124.4 | 80.0 / 97.7 |
+| 120 words (111) | 254.9 / 339.7 | 82.2 / 100.4 |
+
+**The cap misses the 50 ms bound the questions met**, because sixteen words still match about
+90% of the rows; it was shipped anyway, by the owner's decision, for the threefold cut where the
+query is long. No question any round measured has more than nine content words, so the cap
+changes none of the figures above. The first sixteen are kept rather than the rarest because
+rarity needs the index's term statistics, which the match builder does not read.
 
 **It changes no identity.** The match is built at query time from the text the leg was given:
 the FTS5 index, its tokenizer, every fingerprint and the `PipelineIdentity` are unchanged, and

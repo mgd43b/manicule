@@ -253,6 +253,22 @@ def match_words(text: str) -> list[str]:
     return words
 
 
+MAX_MATCH_WORDS = 16
+"""The most content words a match carries; the rest of a longer query is not searched for.
+
+A disjunction matches every row holding any of its words and ``SEARCH_SQL`` scores all of them
+before ``LIMIT``, so a pasted paragraph — and nothing on any surface limits a query's length —
+became an ``OR`` over dozens of words that matched almost the whole index. Measured at 100,000
+chunks in round 3b of ``tests/benchmarks/lexical_questions.py``: a 120-word paste took a median
+of 255 ms uncapped and 82 ms with this cap, with no change in where its section ranked. That is
+still over the 50 ms the questions were held to, and the owner chose to ship it so (#485).
+
+Sixteen because it changes nothing a question does: the longest question any round measured
+has nine content words. The first sixteen are kept rather than the rarest, because rarity needs
+the index's term statistics, which this function does not read.
+"""
+
+
 def escape_match_query(text: str) -> str:
     """Turn user input into an FTS5 ``MATCH`` expression: any content word, each a literal.
 
@@ -278,6 +294,10 @@ def escape_match_query(text: str) -> str:
     for the conjunction. Dropping the function words roughly halves it — with them, the same
     questions matched nearly every row and took 77 to 98 ms.
 
+    **At most :data:`MAX_MATCH_WORDS` content words, the first ones.** A long paste is cut, not
+    refused: what the cap bounds is the time a long query costs, which it reduces about threefold
+    and does not bring under the bound a question meets.
+
     **A query made only of function words keeps them.** "What is it" is then a search for those
     three words rather than no search, and ``NOT`` or ``OR`` on its own is still the word. Each
     word is kept once (:func:`match_words`): a repeated phrase is scored twice by ``bm25()``.
@@ -295,7 +315,8 @@ def escape_match_query(text: str) -> str:
     """
     words = match_words(text)
     content = [word for word in words if word.lower() not in FUNCTION_WORDS]
-    return " OR ".join('"' + word.replace('"', '""') + '"' for word in content or words)
+    kept = (content or words)[:MAX_MATCH_WORDS]
+    return " OR ".join('"' + word.replace('"', '""') + '"' for word in kept)
 
 
 __all__ = [
@@ -307,6 +328,7 @@ __all__ = [
     "FTS_TABLE",
     "FUNCTION_WORDS",
     "INTEGRITY_CHECK_FTS",
+    "MAX_MATCH_WORDS",
     "REBUILD_FTS",
     "SEARCH_SQL",
     "create_fts",

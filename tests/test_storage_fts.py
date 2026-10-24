@@ -16,6 +16,7 @@ from manicule.storage.fts import (
     CURRENT_TRIGGERS,
     DROP_TRIGGERS,
     INTEGRITY_CHECK_FTS,
+    MAX_MATCH_WORDS,
     REBUILD_FTS,
     escape_match_query,
 )
@@ -246,6 +247,13 @@ def test_a_typographic_apostrophe_is_the_same_apostrophe() -> None:
     """A phone or macOS keyboard types ``\u2019``; dropping it made ``whats`` a content word."""
     assert escape_match_query("what\u2019s the retention period") == '"retention" OR "period"'
     assert escape_match_query("why doesn\u2019t it publish") == '"doesn\'t" OR "publish"'
+
+
+def test_a_long_query_is_cut_to_its_first_content_words() -> None:
+    """A pasted paragraph would otherwise match almost every row and be scored in full."""
+    words = [f"term{i}" for i in range(30)]
+    match = escape_match_query("how do I " + " the ".join(words))
+    assert match == " OR ".join(f'"{word}"' for word in words[:MAX_MATCH_WORDS])
 
 
 def test_each_word_is_matched_once() -> None:
