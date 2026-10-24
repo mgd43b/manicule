@@ -1,7 +1,9 @@
 """What the lexical leg contributes to a question, measured under each way of building its match.
 
-The figures in ``docs/retrieval.md`` §4.1 come from here, and so does the decision recorded there.
-Issue `#481 <https://github.com/mgd43b/manicule/issues/481>`_.
+The figures in ``docs/retrieval.md`` §4.1 and §5.4 come from here, and so do the decisions
+recorded there. Issues `#481 <https://github.com/mgd43b/manicule/issues/481>`_,
+`#484 <https://github.com/mgd43b/manicule/issues/484>`_ and
+`#486 <https://github.com/mgd43b/manicule/issues/486>`_.
 
 Run it::
 
@@ -209,6 +211,7 @@ from manicule.evaluation.probe import probe_from_titles
 from manicule.evaluation.queries import load_query_set
 from manicule.evaluation.statistics import sign_test, wilson_interval
 from manicule.retrieval import fusion as fusion_module
+from manicule.retrieval import trace as trace_module
 from manicule.retrieval.lexical import DEGRADED_REASON as LEXICAL_EMPTY
 from manicule.retrieval.retriever import Retriever
 from manicule.retrieval.trace import Shortfall
@@ -1363,6 +1366,10 @@ def weighting(lexical_weight: float) -> Generator[None]:
                 (c for c in candidates if leg in c.scores),
                 key=lambda c: (-c.scores[leg], c.chunk.id),
             )
+            if not ladder:
+                # As the shipped stage does: a leg that contributed nothing makes the run
+                # single-leg, and the substitution must not hide that from the trace.
+                trace_module.not_comparable(fusion_module.DEGRADED_REASON)
             for rank, candidate in enumerate(ladder, start=1):
                 fused[candidate.chunk.id] = fused.get(candidate.chunk.id, 0.0) + weight / (
                     self.k + rank

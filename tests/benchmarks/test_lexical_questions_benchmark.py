@@ -20,7 +20,8 @@ from manicule.core.retrieval import Candidate, Filter, Query
 from manicule.evaluation.queries import load_query_set
 from manicule.plugins.registry import discover
 from manicule.retrieval.config import FusionConfig
-from manicule.retrieval.fusion import RRFStage
+from manicule.retrieval.fusion import DEGRADED_REASON, RRFStage
+from manicule.retrieval.trace import installed
 from manicule.storage.fts import FUNCTION_WORDS, escape_match_query, match_words
 from tests.benchmarks.lexical_questions import (
     AUTHORED,
@@ -334,6 +335,11 @@ async def test_weighting_scales_the_lexical_ladder_and_nothing_else() -> None:
     assert fused[chunks[1].id] == pytest.approx(1 / 62 + 0.5 / 62)
     assert fused[chunks[2].id] == pytest.approx(0.5 / 61), "the lexical leg's first, halved"
     assert {c.chunk.id: c.scores["rrf"] for c in equal}[chunks[2].id] == pytest.approx(1 / 61)
+
+    dense_only = [candidate for candidate in candidates if "lexical" not in candidate.scores]
+    with installed() as frame, weighting(0.5):
+        await stage.run(query, dense_only)
+    assert DEGRADED_REASON in frame.incomparable, "a leg that gave nothing is still recorded"
 
 
 def test_round_four_picks_the_best_qualifier_and_breaks_ties_by_order() -> None:
