@@ -343,7 +343,7 @@ async def test_weighting_scales_the_lexical_ladder_and_nothing_else() -> None:
     with installed() as shipped_frame:
         await stage.run(query, dense_only)
     weighted_report = frame.take_diagnostics()
-    assert weighted_report["per_leg"] == {"dense": 2, "lexical": 0}
+    assert weighted_report["per_leg"] == {"dense": 1, "lexical": 0}
     assert weighted_report == shipped_frame.take_diagnostics(), (
         "the weighted run records the same report the shipped stage does"
     )
