@@ -13,7 +13,9 @@ embed_text = text                            (otherwise)
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
+
+from manicule.core.content import string_list
 
 if TYPE_CHECKING:
     from manicule.core.content import Document
@@ -91,20 +93,6 @@ def source_hierarchy(document: Document) -> tuple[str, ...]:
     if record is not None and record.source is not None and record.source.section_path:
         return record.source.section_path
     return tuple(string_list(document.metadata.get("ancestors")) or ())
-
-
-def string_list(value: object) -> list[str] | None:
-    """A metadata value as a list of strings, or ``None`` when it is anything else.
-
-    Metadata arrives as JSON, so a parser can put anything there. A malformed value means
-    the chunker has no structure to split on, which is a fallback rather than a crash.
-    """
-    if not isinstance(value, list):
-        return None
-    items = cast("list[object]", value)
-    if not all(isinstance(item, str) for item in items):
-        return None
-    return [item for item in items if isinstance(item, str)]
 
 
 def render(parts: Sequence[str], count_tokens: Callable[[str], int], budget: int) -> str:

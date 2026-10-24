@@ -28,7 +28,7 @@ from manicule.chunking import breadcrumb
 from manicule.chunking.sentences import paragraphs, sentences
 from manicule.chunking.tokens import SupportsTokenCount, TokenCounter
 from manicule.core.anchors import Anchor, CellAnchor, LineAnchor, PageAnchor, Rect
-from manicule.core.content import BlockKind, Chunk, Document, Metadata, ParsedBlock
+from manicule.core.content import BlockKind, Chunk, Document, Metadata, ParsedBlock, string_list
 from manicule.core.errors import ChunkingError, ContextOverflowError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import chunk_id
@@ -396,7 +396,7 @@ class StructuralChunker:
         the parser, never guessed from the first row being bold — a guess would silently
         promote a data row on every table that does not have one.
         """
-        rows = breadcrumb.string_list(block.metadata.get("rows"))
+        rows = string_list(block.metadata.get("rows"))
         if rows is None:
             # The parser did not describe the table's rows, so there is no row boundary to
             # split at that is not a guess about the rendering. Prose splitting keeps the
@@ -429,7 +429,7 @@ class StructuralChunker:
             # prevent. Splitting at the boundaries also keeps each part's ``CellAnchor``
             # narrowed to its own rows instead of every part claiming the whole table.
             header_rows = 0
-        refs = breadcrumb.string_list(block.metadata.get("row_refs"))
+        refs = string_list(block.metadata.get("row_refs"))
         header = rows[:header_rows]
         header_text = "\n".join(header)
         header_tokens = self._count_or_ceiling(header_text) if header else 0

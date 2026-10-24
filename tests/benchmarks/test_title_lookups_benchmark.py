@@ -79,6 +79,13 @@ def test_a_rag_override_is_merged_into_the_pipeline_not_over_it(tmp_path: Path) 
     assert settings.rag.reranker == "cross_encoder"
     assert settings.rag.pipeline == ("dense", "lexical", "rrf")
     assert not settings.rag.cache.enabled
+    overriding = thread_duplication.settings_for(
+        tmp_path,
+        {"rag": {"pipeline": ("dense",), "cache": {"enabled": True}}},
+        ("dense", "lexical", "rrf"),
+    )
+    assert overriding.rag.pipeline == ("dense", "lexical", "rrf"), "the measured pipeline wins"
+    assert not overriding.rag.cache.enabled, "and a measurement never reads a cached ranking"
 
 
 async def test_the_rewrite_puts_a_title_in_reach_of_the_lexical_leg(

@@ -211,10 +211,16 @@ def settings_for(
 
     ``overrides`` are further ``Settings`` fields — the embedder, and a chunk budget for a
     model that attends to fewer tokens than the default budget. A ``rag`` among them — a reranker,
-    say — is merged into the pipeline's own, never replacing it.
+    say — is merged in, and the two things a measurement depends on win over it: the pipeline
+    named here, and a cache that cannot hit.
     """
     fields = dict(overrides)
-    rag = {"pipeline": tuple(pipeline), "cache": {"enabled": False}, **fields.pop("rag", {})}
+    extra = cast("dict[str, Any]", fields.pop("rag", {}))
+    rag = {
+        **extra,
+        "pipeline": tuple(pipeline),
+        "cache": {**cast("dict[str, Any]", extra.get("cache", {})), "enabled": False},
+    }
     return Settings(data_dir=data_dir, rag=rag, **fields)  # pyright: ignore[reportArgumentType]
 
 

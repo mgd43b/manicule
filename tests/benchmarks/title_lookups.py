@@ -117,7 +117,6 @@ import asyncio
 import contextlib
 import faulthandler
 import json
-import re
 import shutil
 import signal
 import sqlite3
@@ -143,11 +142,13 @@ from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[repo
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Mapping, Sequence
 
+    from manicule.core.content import Document
     from manicule.plugins import Discovery
     from manicule.storage.docstore import SqliteDocStore
 
 SHIPPED_WEIGHTS = "bm25(chunks_fts, 1.0, 0.4)"
 DATABASE = "manicule.db"
+PAGE = 1000
 HALF = 0.5
 BOUND = -0.02
 TIE = 0.005
@@ -182,8 +183,6 @@ FAMILIES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 
 GROUPS = (*lq.GROUPS, "headings")
 
-_HEADING = re.compile(r"^#+ ([0-9][0-9.]*) +(.+?)\s*$")
-
 
 # --- the new question set ------------------------------------------------------------------------
 
@@ -194,15 +193,7 @@ def heading_questions(root: Path) -> list[lq.Asked]:
     A number its document uses twice names no one section — ``deployment.md`` numbers the steps
     of two procedures 1 to 3 — so a heading carrying one is not asked either.
     """
-    found: list[tuple[str, str, str]] = []
-    for path in sorted(root.rglob("*.md")):
-        relative = path.relative_to(root).as_posix()
-        if any(relative.startswith(pattern.removesuffix("**")) for pattern in lq.EXCLUDED):
-            continue
-        for line in path.read_text(encoding="utf-8").splitlines():
-            heading = _HEADING.match(line)
-            if heading:
-                found.append((relative, heading.group(1).rstrip("."), heading.group(2)))
+    found = lq.numbered_headings(root)
     texts = Counter(" ".join(text.casefold().split()) for _, _, text in found)
     numbers = Counter((relative, number) for relative, number, _ in found)
     return [
@@ -227,7 +218,10 @@ async def rewrite_heading_text(
     values: list[tuple[str, str]] = []
     async with Runtime(settings, discovery=discovery) as runtime:
         store = cast("SqliteDocStore", await runtime.documents())
-        for document in await store.list_documents(limit=100_000):
+        documents: list[Document] = []
+        while page := await store.list_documents(limit=PAGE, offset=len(documents)):
+            documents.extend(page)
+        for document in documents:
             hierarchy = breadcrumb.source_hierarchy(document)
             values.extend(
                 (
@@ -584,8 +578,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     def emit(text: str) -> None:
         out.print(text, markup=False)
 
-    # A run takes a while; `kill -USR1` prints where it is without stopping it.
-    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    # A run takes a while; `kill -USR1` prints where it is without stopping it, where there is one.
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
 
     if args.choose:
         chosen = choose([loaded(path) for path in args.choose])

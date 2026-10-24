@@ -995,8 +995,10 @@ title, so the rewrite changed none of their rows.
 The rule names query-shape-dependent fusion as the next round. A title lookup is still ranked
 below the dense leg alone, by 0.090 under BGE-M3 and 0.138 under Qwen3.
 
-**Provenance.** Every figure in this table was recorded from a checkout pinned at the commit that
-holds the rule and the harness, over a `docs/` tree exported at `9ce34e6e`. A first Qwen3 run was
+**Provenance.** Every figure in this table was recorded from a checkout pinned at `a3e95685` — the
+rule as committed in `c036a4c5`, with two later changes to the instrument: the rewrite taking a
+plugin discovery so the suite can run it, and six heading questions dropped because their numbers
+repeat — over a `docs/` tree exported at `9ce34e6e`. A first Qwen3 run was
 discarded: a migration added to the working checkout during it was applied when the run opened
 its next index, so its incumbent was measured with the candidate's `heading_text`. The harness
 now records every index's schema revision when it builds it and refuses to go on if one moves.

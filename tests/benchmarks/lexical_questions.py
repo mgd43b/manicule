@@ -262,7 +262,7 @@ from tests.benchmarks.thread_corpus import Corpus, build_corpus
 from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 
     from manicule.core.retrieval import Candidate
     from manicule.plugins import Discovery
@@ -598,6 +598,24 @@ def _identifier_shaped(term: str) -> bool:
     return len(term) >= 6 and ("_" in term.strip("_") or re.search(r"[a-z][A-Z]", term) is not None)
 
 
+def indexed_markdown(root: Path = DOCS) -> Iterator[tuple[str, list[str]]]:
+    """Every Markdown file the harness indexes, by path relative to ``root``, as its lines."""
+    for path in sorted(root.rglob("*.md")):
+        relative = path.relative_to(root).as_posix()
+        if not any(relative.startswith(pattern.removesuffix("**")) for pattern in EXCLUDED):
+            yield relative, path.read_text(encoding="utf-8").splitlines()
+
+
+def numbered_headings(root: Path = DOCS) -> list[tuple[str, str, str]]:
+    """Every numbered heading as its document, its section number and its text after the number."""
+    return [
+        (relative, heading.group(1).rstrip("."), text)
+        for relative, lines in indexed_markdown(root)
+        for line in lines
+        if (heading := _NUMBERED.match(line)) and (text := line[heading.end() :].strip())
+    ]
+
+
 def numbered_sections(root: Path = DOCS) -> dict[Target, str]:
     """The text under each numbered heading, by document and section number.
 
@@ -605,12 +623,9 @@ def numbered_sections(root: Path = DOCS) -> dict[Target, str]:
     counts as an occurrence without ever being a target.
     """
     sections: dict[Target, list[str]] = defaultdict(list)
-    for path in sorted(root.rglob("*.md")):
-        relative = path.relative_to(root).as_posix()
-        if any(relative.startswith(pattern.removesuffix("**")) for pattern in EXCLUDED):
-            continue
+    for relative, lines in indexed_markdown(root):
         number = ""
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in lines:
             heading = _NUMBERED.match(line)
             if heading:
                 number = heading.group(1).rstrip(".")
