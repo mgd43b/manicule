@@ -151,7 +151,11 @@ def test_a_forged_sign_in_cookie_is_refused() -> None:
     provider = FakeIdentityProvider()
     with client_with(oauth_backend(), provider) as client:
         parameters = start(client)
-        forged = client.cookies[SIGNIN_COOKIE][:-2] + "AA"
+        signed = client.cookies[SIGNIN_COOKIE]
+        # Different from whatever the signature ends in: a fixed "AA" was no forgery at all on the
+        # signatures that already ended in it, and the test then failed by passing the sign-in.
+        forged = signed[:-2] + ("BB" if signed.endswith("AA") else "AA")
+        assert forged != signed
         client.cookies.set(SIGNIN_COOKIE, forged, path="/auth/callback")
         refused = client.get(
             "/auth/callback/google", params={"code": CODE, "state": parameters["state"]}
