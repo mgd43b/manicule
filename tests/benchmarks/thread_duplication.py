@@ -297,11 +297,11 @@ FORMS = ("question", "keywords")
 def queries(corpus: Corpus) -> tuple[QuerySet, list[Asked]]:
     """Two lookups per queried passage — the first, middle and last message of every thread.
 
-    A natural question, and the same lookup as a few words the passage contains. The lexical leg
-    matches a chunk only when it holds every query word that is not a function word, so the
-    keywords always reach both legs and the question often reaches the dense leg alone;
-    reporting them apart is what shows which leg a cost comes from. When #463 measured this, the
-    function words were required too and no question reached the lexical leg at all (#481).
+    A natural question, and the same lookup as a few words the passage contains. Reporting them
+    apart is what shows which leg a cost comes from: when #463 measured this, the lexical leg
+    required every word of the query, function words too, so the keywords reached both legs and
+    no question reached the lexical leg at all (#481). It now matches any word that is not a
+    function word, and both forms reach it.
     """
     asked: list[Asked] = []
     for thread in corpus.threads:
@@ -371,6 +371,9 @@ class Outcome:
     """The lexical leg matched nothing and fusion ran on one ladder. Kept and counted rather
     than refused: for a natural question it is how the shipped pipeline behaves, and the page
     is still the page a person would see."""
+    first: int | None = None
+    """The rank of the first chunk carrying the passage, quotation or original, or ``None`` when
+    the page holds none. What a reciprocal rank is read from."""
 
     @property
     def found(self) -> bool:
@@ -418,6 +421,7 @@ def score(
         page=len(page),
         companion_pool=companion_pool,
         single_leg=single_leg,
+        first=copies[0].rank if copies else None,
     )
 
 

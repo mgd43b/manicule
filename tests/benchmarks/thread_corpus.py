@@ -315,10 +315,10 @@ ASPECTS: tuple[tuple[str, str, str, str], ...] = (
 """Per kind of decision: the statement, a companion's rewording, a question and a keyword lookup.
 
 Thirty-four of them, so a thirty-message thread never states two of the same kind. Every word of
-the keyword lookup appears in the statement, because the lexical leg matches a chunk only when
-it holds every query word that is not a function word — a natural question often does not. Plain
-words only — no apostrophes, emphasis or list markers — so the HTML converter cannot change a
-passage's characters and the ground truth can locate every copy exactly.
+the keyword lookup appears in the statement, so it reaches the lexical leg under any match rule
+that leg has had, including the one #463 measured, which required every word. Plain words only —
+no apostrophes, emphasis or list markers — so the HTML converter cannot change a passage's
+characters and the ground truth can locate every copy exactly.
 """
 
 GREETINGS = ("Hi {to}", "Thanks {to}", "{to}", "Hello {to}")

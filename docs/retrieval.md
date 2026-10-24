@@ -469,78 +469,110 @@ and returns the union: a chunk both legs found carries both scores, via `Candida
 which returns a copy. This is why the conformance suite forbids returning the input list — a
 merge is the natural place to accidentally mutate in place.
 
-**It asks for a question's subject, not its grammar.** The store turns the query into an FTS5
-match in `escape_match_query` (`storage/fts.py`): every word is quoted, so `NOT`, `OR`, `NEAR`,
-`*`, `:` and parentheses are words and never operators, and the quoted words are joined by
-juxtaposition, which FTS5 reads as `AND`. Before that, the words in `FUNCTION_WORDS` are dropped
-— interrogatives, auxiliaries, pronouns, articles, common prepositions and conjunctions, about
-eighty in all. `not`, `no` and negated contractions are not among them, because dropping them
-inverts a question. A query made only of function words keeps them, so "what is it" or a bare
-`OR` is still a search for those words. Each word is matched once, and a typographic apostrophe
-is read as the ASCII one, so `what’s` is the function word it looks like. **The list is English**,
-like the Porter stemmer the index is built with (§13 on the multilingual case): a question in
-another language keeps its function words and needs every one of them in a chunk, as every
-question did before #481.
+**It asks for a question's subject, not its grammar, and any part of it.** The store turns the
+query into an FTS5 match in `escape_match_query` (`storage/fts.py`). The words in
+`FUNCTION_WORDS` are dropped — interrogatives, auxiliaries, pronouns, articles, common
+prepositions and conjunctions, 86 in all — and the rest are joined by `OR`, so BM25's IDF does the
+weighting: a chunk holding a question's rarer words ranks above one holding its common ones, and
+a chunk holding only some of them is still found. Every word is quoted, so `NOT`, `OR`, `NEAR`,
+`*`, `:` and parentheses in the query are words and never operators; the one operator in the
+expression is the `OR` the function writes between quoted phrases. `not`, `no` and negated
+contractions are not function words, because dropping them inverts a question. At most the first
+16 content words are kept (`MAX_MATCH_WORDS`); the reason is the cost below. A query made only
+of function words keeps them, so "what is it" or a bare `OR` is still a search for those words.
+Each word is matched once, and a typographic apostrophe is read as the ASCII one, so `what’s` is
+the function word it looks like. **The list is English**, like the Porter stemmer the index is
+built with (§13 on the multilingual case): a question in another language keeps its function
+words as alternatives, which BM25 weights down where they are common.
 
-The list exists because, without it, the conjunction required *every* word: "how do I rotate
-the signing token" matched only a chunk that also said "how", "do" and "I". A natural question
-therefore matched nothing, fusion ran on the dense ladder alone, and every run that looked
-hybrid was dense for exactly the queries people type
-([#481](https://github.com/mgd43b/manicule/issues/481)).
+It took two changes to get here. Until [#481](https://github.com/mgd43b/manicule/issues/481) the
+quoted words were joined by juxtaposition, which FTS5 reads as `AND`, so "how do I rotate the
+signing token" matched only a chunk that also said "how", "do" and "I". A natural question
+matched nothing, fusion ran on the dense ladder alone, and every run that looked hybrid was dense
+for exactly the queries people type. [#482](https://github.com/mgd43b/manicule/pull/482) dropped
+the function words and kept the conjunction; the third round below replaced the conjunction.
 
-**Chosen by measurement, in two rounds, each with its rule written down before it ran**
-(`tests/benchmarks/lexical_questions.py`, whose docstring holds both rules). The corpus is this
-repository's `docs/` tree — 19 documents, 1,344 chunks — indexed with BGE-M3; a synthetic mail
-corpus (`tests/benchmarks/thread_corpus.py`) was measured alongside it. Hybrid pipeline, `k = 10`:
+**Chosen by measurement, in three rounds, each with its rule written down and committed before
+it ran** (`tests/benchmarks/lexical_questions.py`, whose docstring holds all three). The corpus
+is this repository's `docs/` tree — 19 documents, about 1,350 chunks — indexed with BGE-M3; a
+synthetic mail corpus (`tests/benchmarks/thread_corpus.py`) was measured alongside it, from a
+seed no earlier round had used in the third. Hybrid pipeline, `k = 10`, from the third round's
+run; `hit@10` and MRR@10:
 
-| Question set | Lexical leg empty, all words required | `hit@10` dense alone | `hit@10` hybrid, all words | `hit@10` hybrid, function words dropped | MRR@10, all words → dropped |
-|---|---:|---:|---:|---:|---:|
-| Authored, one labeled section each (54) | 49 | 53 | 53 | 53 | 0.756 → 0.751 |
-| Multi-hop, labeled from their notes (11) | 10 | 10 | 10 | 10 | 0.629 → 0.627 |
-| Document titles (19) | 0 | 19 | 19 | 19 | 0.853 → 0.853 |
-| Mail-thread questions (84) | 84 | 83 | 83 | 83 | — |
-| Mail-thread keywords (84) | 0 | 84 | 84 | 84 | — |
-| **Questions naming an identifier (754)** | 549 | 433 | 506 | **603** | **0.476 → 0.643** |
+| Question set | dense alone | every word (before #481) | every content word (#482) | **any content word (shipped)** |
+|---|---|---|---|---|
+| Authored, one labeled section each (54) | 53, 0.770 | 53, 0.756 | 53, 0.751 | 53, 0.696 |
+| Multi-hop, labeled from their notes (11) | 10, 0.630 | 10, 0.630 | 10, 0.628 | 7, 0.636 |
+| Document titles (19) | 19, 0.934 | 19, 0.853 | 19, 0.853 | 19, 0.853 |
+| Identifier questions, "what is `X` for" or "where is `X` used and why" (754) | 431, 0.371 | 502, 0.478 | 600, 0.641 | **723, 0.814** |
+| Identifier questions with a second content word, "when is `X` checked" (754) | 384, 0.330 | 401, 0.360 | 461, 0.449 | **723, 0.725** |
+| Mail-thread questions, held out (126), found | 123 | 123 | 123 | 125 |
+| Mail-thread keyword lookups (126), found | 125 | 126 | 126 | 126 |
 
-The first round's sets could not separate the candidates: the dense leg alone was already at
-the `hit@10` ceiling on all of them, and its rule returned "no change". A disjunction (`OR`,
-with or without the function words) matched something for every question and **lost** —
-multi-hop `hit@10` fell from 10 to 7 and authored MRR from 0.756 to about 0.69, because a weak
-lexical ladder fused at equal weight pulls the dense one down. It is also the expensive one: at
-100,000 chunks the statement took a median of 82 to 98 ms with every function word in it,
-because "the" and "how" match nearly every row and the statement scores them all before
-`LIMIT`. The second round asked what the lexical leg exists for — a question carrying a term the
-dense leg cannot place — with questions derived mechanically from every identifier that occurs
-in exactly one section of `docs/`. Dropping function words won it by 97 questions with no
-labeled set losing more than 0.005 of MRR; requiring all content words but one tied it on
-identifiers and cost 0.04 to 0.07 of MRR elsewhere. No unanswerable question left the `none`
-band under any rule.
+**Round 1** found no difference it could act on: the dense leg alone sat at the `hit@10` ceiling
+on every set it had, and none of them carried a term the dense leg cannot place. **Round 2**
+derived the identifier questions mechanically — every backticked identifier that occurs in
+exactly one section of `docs/` — and chose the conjunction of content words over the old rule.
+Its rule did not consider the disjunction, which round 1 had excluded, and a later run showed it
+ahead; **round 3** measured that on its own. Two instruments were corrected first, because both
+favored the disjunction: round 2's identifier questions differed between the two rules only
+where the template added "used", so round 3 gave every identifier a second content word from a
+list fixed beforehand; and eleven multi-hop questions cannot show a loss, so the held-out mail
+questions joined the natural-question side.
 
-**The disjunction does better on identifiers, and that is recorded rather than smoothed over.**
-Round 2's rule excluded the two disjunctions, which round 1 had already rejected, so its
-first run did not score them. A later full run of every variant did: on the identifier
-questions the content-word disjunction found **723** of 754 (MRR 0.811) against 600 (0.637)
-for the shipped rule, at a median of 11 ms at 100,000 chunks. Part of the gap is that a question
-naming an identifier often carries one more content word the section never writes — "where is
-`X` used" requires "used" — and a conjunction then misses it entirely. Shipping the disjunction
-on that evidence would mean overriding both written rules after seeing the data. It still loses
-multi-hop hits (7 of 11 against 10) and authored MRR (0.696 against 0.751), so it is the next
-candidate for a measurement of its own, not a silent swap.
+Round 3's rule weighed the two kinds of question explicitly: the disjunction had to gain at
+least 0.10 of mean reciprocal rank on the two-word identifier questions, and lose no more than a
+third of that on the 191 natural questions (authored, multi-hop and held-out thread questions
+pooled), measured as the lower end of a 95% paired bootstrap interval. It gained **0.276** (402
+questions better, 63 worse, sign test `p = 1.7e-61`); the natural questions moved by **-0.002**,
+95% interval [-0.038, +0.034], against a margin of -0.05. No title or keyword lookup was lost
+and no unanswerable question left the `none` band. Split by whether the conjunction had matched
+anything, the natural questions it had matched lost 0.021 and those it had not gained 0.008:
+the disjunction's cost is weak matches outranking good ones, and it is small.
 
-**What it does not do.** A prose question whose content words do not all occur in one chunk still
-matches nothing — 37 of the 54 authored questions, 48 of the 84 mail-thread ones — and that is
-the measured better outcome, not an oversight: the cases where the leg added a weak match all
-lost to the dense leg alone.
+**What it costs is time, and the cost grows with the corpus.** The statement scores every row
+the expression matches before `LIMIT`, and a disjunction matches far more rows than a
+conjunction. Timed at 100,000 chunks, per question set:
+
+| Question set | every content word, median / p95 ms | any content word, median / p95 ms | rows matched, any content word |
+|---|---:|---:|---:|
+| Authored | 0.8 / 4.3 | 38.0 / 66.3 | 53,929 |
+| Multi-hop | 1.2 / 3.0 | 48.1 / 73.4 | 70,227 |
+| Identifiers, two words | 0.5 / 1.9 | 17.9 / 26.1 | 23,190 |
+
+Round 3 required a median under 50 ms and a p95 under 100 ms on every set, and multi-hop was the
+closest condition. The time follows the rows matched, which grow with the corpus, so a corpus
+ten times this size should be expected to take several times as long on long prose questions —
+an extrapolation, not a measurement. Dropping the function words is what keeps it at this level:
+in rounds 1 and 2, with them, the same questions matched nearly every row and took 77 to 98 ms.
+
+**A long query is cut to its first 16 content words, and it is still slow.** Nothing on any
+surface limits a query's length, and a pasted paragraph became an `OR` over dozens of words that
+matched almost the whole index. Round 3b compared the uncapped disjunction with one over the
+first 16 content words, on the opening 40 and 120 words of every ninth chunk of `docs/`. Quality
+could not tell them apart — every paste found its section at rank 1 under both, and under the
+dense leg alone — so what the round measured is time, at 100,000 chunks:
+
+| Pasted query | uncapped, median / p95 ms | first 16 content words, median / p95 ms |
+|---|---:|---:|
+| 40 words (136) | 100.4 / 124.4 | 80.0 / 97.7 |
+| 120 words (111) | 254.9 / 339.7 | 82.2 / 100.4 |
+
+**The cap misses the 50 ms bound the questions met**, because sixteen words still match about
+90% of the rows; it was shipped anyway, by the owner's decision, for the threefold cut where the
+query is long. No question any round measured has more than nine content words, so the cap
+changes none of the figures above. The first sixteen are kept rather than the rarest because
+rarity needs the index's term statistics, which the match builder does not read.
 
 **It changes no identity.** The match is built at query time from the text the leg was given:
 the FTS5 index, its tokenizer, every fingerprint and the `PipelineIdentity` are unchanged, and
 nothing needs rebuilding. Like the `bm25()` column weights, the match rule belongs to the store's
-statement rather than to a declared stage setting, so an evaluation record made before #481 and
-one made after name the same configuration; compare them only as two different builds. The L1
-cache is in-process and empties on restart, so it cannot serve a ranking made under the old rule.
+statement rather than to a declared stage setting, so evaluation records made under the three
+rules name the same configuration; compare them only as different builds. The L1 cache is
+in-process and empties on restart, so it cannot serve a ranking made under an earlier rule.
 
-**Zero results is an event, not a warning.** An empty match is legitimate: a question whose
-content words never occur together in one chunk, a query that tokenizes to nothing after
+**Zero results is an event, not a warning.** An empty match is legitimate: a question none of
+whose content words occurs in any chunk, a query that tokenizes to nothing after
 `escape_match_query`. It is also what an FTS5 failure looks like. Either way the pipeline continues
 with one leg and the ranking it produces is well-formed, so the trace records `matched: 0` and the
 run is marked single-leg. §5.3 says what #15 must do with that.
@@ -1992,10 +2024,17 @@ Measured end to end over that corpus: detection precision and recall **1.000/1.0
 `origin/main`'s 1.000/0.833, expansion-boundary precision **1.000** against 0.933, zero false
 positive entries, hit rate **13/14** at k=1 and k=3 and **14/14** at k=10, unsupported-query
 rejection **6/6**, and **no confidence band or score moved on any of the 24 queries**. The one
-question that does not reach rank 1 is `What does SecOps Reliability Toolkit stand for?`: it names
+question that did not reach rank 1 was `What does SecOps Reliability Toolkit stand for?`: it names
 the expansion and never writes the term, so no alias fires and the glossary does nothing for it.
 That is a real limit of a lookup keyed by term, and the query is kept in the corpus rather than
 dropped for a rounder number.
+
+Since the lexical leg matches any content word (§4.1) the same corpus reads 14/14 at every `k`:
+that question now reaches rank 1 by search, because the glossary page holds the expansion's own
+words — the glossary still does nothing for it. Bands are still unchanged on all 24 queries; one
+score moves, `the audit trail is on the same volume as the index` from 0.610 to 0.625, because
+the expanded text's second search now returns passages the first did not. Every dense score in a
+wired context is still one a search measured (`tests/glossary/test_skeleton_evaluation.py`).
 
 ### 14.3.2 Why exact lexical matching is not enough to call something a definition
 
@@ -2266,7 +2305,7 @@ Calls made in the absence of a stated position.
 | What a conversation repeats is dropped after fusion, within a conversation only; the copy ranked first is kept, even when it is a quotation; on by default | §5.5 |
 | Per-leg ranks are recovered from `Candidate.scores`; the fusion stage is configured with leg names | §5.2 |
 | A missing leg is recorded and makes the run non-comparable rather than merely logged | §5.3 |
-| The lexical match drops function words and requires every remaining word, each quoted; a query of function words alone keeps them; neither a disjunction nor a minimum-should-match, both measured | §4.1 |
+| The lexical match drops function words and matches any remaining word, each quoted, with BM25 doing the weighting; a query of function words alone keeps them; chosen over a conjunction and a minimum-should-match in three pre-registered rounds | §4.1 |
 | The reranker raises rather than passing through, and truncates to what it scored | §6.1 |
 | `bge-reranker-v2-m3` by default, because a monolingual reranker would undo the embedder's choice | §6.2 |
 | Context assembly is not a `RetrievalStage` — closes the second open item in `contracts.md` §6 | §2.4, §7.1 |

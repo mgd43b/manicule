@@ -75,6 +75,79 @@ nothing changes.
 found in the top ten against 506, MRR 0.643 against 0.476, and no round 1 set more than 0.005 of
 MRR below ``and``. ``all-but-one`` tied it on identifiers and failed the MRR condition.
 
+**Round 3: ``or-content`` against ``and-content``, on its own.** Round 1 excluded the content-word
+disjunction and round 2 never considered it; a later full run found it ahead on the identifier
+questions (723 against 600 of 754, MRR 0.811 against 0.637) and behind on multi-hop (7 against 10
+of 11) and authored MRR (0.696 against 0.751). Those figures, and round 1's latency for it on
+prose questions (39.2 ms median, 70.2 ms p95 at 100,000 chunks), were known when this rule was
+written. Two instruments were changed first, because each favored the disjunction:
+
+- *Round 2's identifier set measures one word.* In "what is ``X`` for" every word but ``X`` is a
+  function word, so the two rules build the same match; the whole difference lives in "where is
+  ``X`` used and why", which is the word "used" asked 377 times. Round 3 asks every identifier
+  once more with a second content word from :data:`SECOND_WORDS`, fixed before any run and chosen
+  by sorted position (:func:`two_word_questions`).
+- *Eleven multi-hop questions cannot show a loss.* The natural-question side adds the synthetic
+  mail threads from a seed no earlier run used (:data:`HELD_OUT_SEED`), three copies of every
+  length and style, scored by the reciprocal rank of the first chunk carrying the passage.
+
+And latency is reported per question set, since the 11 ms quoted for the disjunction was an
+average dominated by one- and two-word identifier questions.
+
+**The round 3 rule.** Hybrid pipeline, ``k = 10``, reciprocal rank per query, paired by query.
+``or-content`` replaces ``and-content`` only if every one of these holds:
+
+1. *It gains*: on the two-word identifier questions, its mean reciprocal rank is at least 0.10
+   higher, and a two-sided sign test over the queries whose rank differs gives ``p < 0.01``.
+2. *It does not lose more than a third of that back*: on the natural questions — authored,
+   labeled multi-hop and held-out thread questions, pooled — the lower end of a 95% paired
+   bootstrap interval on the mean reciprocal-rank difference is above minus one third of the gain
+   in 1, and never below -0.05. The exchange rate is stated so that it can be argued with: a
+   question that names an identifier is worth three prose questions, no more.
+3. No title and no thread keyword lookup is lost beyond one query each.
+4. No unanswerable question leaves the ``none`` band.
+5. At :data:`SCALE` chunks, its median statement time on every question set is under 50 ms and
+   its p95 under 100 ms.
+
+Otherwise ``and-content`` stays. As a diagnostic and not a condition, the natural-question
+differences are split by whether ``and-content`` matched anything, which says whether the
+disjunction's cost comes from adding weak matches where the conjunction had none.
+
+**Round 3 returned "switch", and ``or-content`` is now the shipped rule.** Every condition held.
+On the two-word identifier questions mean reciprocal rank rose by 0.276 (402 questions better, 63
+worse, p = 1.7e-61); ``hit@10`` 723 against 461. On 191 natural questions the change was -0.002,
+95% interval [-0.038, +0.034], against a margin of -0.05. No title or thread keyword lookup was
+lost and no unanswerable question left ``none``. Latency was the closest condition: the slowest
+set, multi-hop, took a median of 48.1 ms and a p95 of 73.4 ms at 100,000 chunks. The diagnostic
+found the cost where expected: -0.021 on the 68 natural questions the conjunction had matched,
++0.008 on the 123 it had not.
+
+**Round 3b: a cap on the disjunction, because a long query is not a question.** Review found
+what round 3 never asked: a pasted paragraph becomes an ``OR`` over dozens of words, matches
+nearly every row, and is scored in full before ``LIMIT`` — and nothing on any surface limits a
+query's length. Round 3's largest question had nine content words, so a cap of
+:data:`CAP` (16) leaves every figure above unchanged, which a test asserts. Two candidates:
+``or-content`` uncapped, and ``or-first-16``, the disjunction over the first 16 content words.
+
+- *pasted* — derived mechanically by :func:`paste_questions`: every ninth chunk of ``docs/``,
+  its first 40 words and, where it has them, its first 120, each with the chunk's own numbered
+  section as the target. Copied verbatim, so these favor the lexical leg; both candidates share
+  that bias.
+
+**The round 3b rule.** Hybrid pipeline, ``k = 10``, paired reciprocal rank over both windows
+pooled. ``or-first-16`` ships if the lower end of a 95% paired bootstrap interval on its mean
+difference from ``or-content`` is above -0.03, and at :data:`SCALE` chunks its median statement
+time on each window is under 50 ms and its p95 under 100 ms — round 3's bound. If it meets the
+time bound and fails the margin, the trade-off goes to the owner rather than being decided here;
+so does a cap that fails the time bound.
+
+**Round 3b failed the time bound, and the owner shipped the cap.** Quality could not separate
+the two — every pasted query found its section at rank 1 under both, and under the dense leg
+alone, so the paste set measures time and nothing else. The cap cut a 120-word paste from a
+median of 254.9 ms (p95 339.7) to 82.2 ms (p95 100.4), and a 40-word one from 100.4 to 80.0 ms
+(p95 124.4 to 97.7): about threefold where it matters, and still over the 50 ms bound, because
+sixteen words still match about 90% of the rows. Disclosed as such in ``docs/retrieval.md`` §4.1.
+
 Everything is local: no network, temporary directories, and the only thing read from outside the
 repository is the embedding model, from the local model cache.
 """
@@ -84,7 +157,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import itertools
 import math
+import random
 import re
 import shutil
 import sqlite3
@@ -103,12 +178,18 @@ from manicule.connectors.filesystem import FilesystemConnector
 from manicule.core.retrieval import ConfidenceBand, Filter, Query
 from manicule.evaluation.probe import probe_from_titles
 from manicule.evaluation.queries import load_query_set
-from manicule.evaluation.statistics import wilson_interval
+from manicule.evaluation.statistics import sign_test, wilson_interval
 from manicule.retrieval.lexical import DEGRADED_REASON as LEXICAL_EMPTY
 from manicule.retrieval.retriever import Retriever
 from manicule.retrieval.trace import Shortfall
 from manicule.storage import docstore as docstore_module
-from manicule.storage.fts import FUNCTION_WORDS, SEARCH_SQL, escape_match_query, match_words
+from manicule.storage.fts import (
+    FUNCTION_WORDS,
+    MAX_MATCH_WORDS,
+    SEARCH_SQL,
+    escape_match_query,
+    match_words,
+)
 from manicule.storage.models import FTS_TOKENIZER
 from tests.benchmarks import thread_duplication
 from tests.benchmarks.thread_corpus import Corpus, build_corpus
@@ -166,8 +247,17 @@ def match_any(text: str) -> str:
     return " OR ".join(_literals(text))
 
 
+def match_all_content(text: str) -> str:
+    """Every word that is not a function word: the rule #482 shipped and round 3 replaced."""
+    return " ".join(_content(_literals(text)))
+
+
+CAP = MAX_MATCH_WORDS
+"""Round 3b's cap on the disjunction, in content words. Above round 3's largest question (nine)."""
+
+
 def match_any_content(text: str) -> str:
-    """Any word that is not a function word."""
+    """Any word that is not a function word, uncapped: the rule round 3 measured and chose."""
     return " OR ".join(_content(_literals(text)))
 
 
@@ -187,15 +277,18 @@ VARIANTS: dict[str, Callable[[str], str]] = {
     "and": match_all,
     "or": match_any,
     "or-content": match_any_content,
-    "and-content": escape_match_query,
+    "and-content": match_all_content,
     "all-but-one": match_all_but_one_content,
+    "or-first-16": escape_match_query,
 }
 """Report order, simplest first, which is also rule 2's tie-break order.
 
-``and`` is the rule this was built to replace. ``and-content`` — every word but the
-:data:`~manicule.storage.fts.FUNCTION_WORDS` — won, and is the shipped
-:func:`~manicule.storage.fts.escape_match_query` itself rather than a copy of it, so a change to
-the shipped rule is measured by the next run without anybody remembering to edit this list."""
+``and`` is the rule #481 replaced and ``and-content`` the one #482 shipped. ``or-content`` — any
+word but the :data:`~manicule.storage.fts.FUNCTION_WORDS` — won round 3, and ``or-first-16``, the
+same capped at :data:`~manicule.storage.fts.MAX_MATCH_WORDS`, shipped after round 3b. It is the
+shipped :func:`~manicule.storage.fts.escape_match_query` itself rather than a copy of it, so a
+change to the shipped rule is measured by the next run without anybody remembering to edit this
+list."""
 
 
 @contextlib.contextmanager
@@ -458,8 +551,8 @@ def numbered_sections(root: Path = DOCS) -> dict[Target, str]:
     return {key: "\n".join(lines) for key, lines in sections.items()}
 
 
-def identifier_questions(root: Path = DOCS) -> list[tuple[str, Target]]:
-    """Each identifier-shaped backticked term found in exactly one numbered section, asked."""
+def single_section_identifiers(root: Path = DOCS) -> list[tuple[str, Target]]:
+    """Each identifier-shaped backticked term found in exactly one numbered section, sorted."""
     sections = numbered_sections(root)
     terms = sorted(
         {
@@ -470,14 +563,38 @@ def identifier_questions(root: Path = DOCS) -> list[tuple[str, Target]]:
             if _identifier_shaped(term)
         }
     )
-    questions: list[tuple[str, Target]] = []
+    found: list[tuple[str, Target]] = []
     for term in terms:
         bounded = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])")
         where = [key for key, text in sections.items() if bounded.search(text)]
         if len(where) == 1 and where[0][1]:
-            template = TEMPLATES[len(questions) % len(TEMPLATES)]
-            questions.append((template.format(term), where[0]))
-    return questions
+            found.append((term, where[0]))
+    return found
+
+
+def identifier_questions(root: Path = DOCS) -> list[tuple[str, Target]]:
+    """Round 2's set: each identifier in one of :data:`TEMPLATES`, alternated by position."""
+    return [
+        (TEMPLATES[i % len(TEMPLATES)].format(term), target)
+        for i, (term, target) in enumerate(single_section_identifiers(root))
+    ]
+
+
+SECOND_WORDS = ("configured", "returned", "raised", "stored", "checked", "set", "read", "written")
+"""Round 3's second content words, fixed before its first run. Verbs a person asks about a name
+with, chosen without looking at which of them the sections happen to contain."""
+
+
+def two_word_questions(root: Path = DOCS) -> list[tuple[str, Target]]:
+    """Round 3's set: "when is ``X`` <word>", the word taken from :data:`SECOND_WORDS` in turn.
+
+    Every question has exactly two content words, so the two rules build different matches for
+    every one of them — unlike round 2's "what is ``X`` for", where they build the same one.
+    """
+    return [
+        (f"when is {term} {SECOND_WORDS[i % len(SECOND_WORDS)]}", target)
+        for i, (term, target) in enumerate(single_section_identifiers(root))
+    ]
 
 
 @dataclass(frozen=True)
@@ -521,6 +638,10 @@ async def docs_questions(store: SqliteDocStore, workspace: str) -> list[Asked]:
         Asked(f"identifier-{i}", text, "identifiers", (target,))
         for i, (text, target) in enumerate(identifier_questions())
     )
+    asked.extend(
+        Asked(f"two-words-{i}", text, "identifiers, two words", (target,))
+        for i, (text, target) in enumerate(two_word_questions())
+    )
     example = load_query_set(DOCS / "evaluation" / "example-queries.json")
     asked.extend(Asked(query.id, query.text, "example") for query in example.queries)
     asked.extend(
@@ -528,6 +649,40 @@ async def docs_questions(store: SqliteDocStore, workspace: str) -> list[Asked]:
     )
     for item in await probe_from_titles(store, workspace_ids=frozenset({workspace})):
         asked.append(Asked(f"title-{item.text}", item.text, "titles", documents=item.document_ids))
+    return asked
+
+
+PASTE_STRIDE = 9
+PASTE_WINDOWS = (40, 120)
+
+
+def paste_questions(passages: Sequence[tuple[Place, str]]) -> list[Asked]:
+    """Round 3b's long queries: the opening words of every :data:`PASTE_STRIDE`-th chunk.
+
+    The target is the chunk's deepest numbered section; a chunk under no numbered heading is
+    skipped rather than given a target its document does not state, and a window longer than the
+    chunk is skipped rather than shortened, so every query is exactly its window's length.
+    """
+    asked: list[Asked] = []
+    for position, (place, text) in enumerate(passages[::PASTE_STRIDE]):
+        numbers = [
+            heading.split(" ", 1)[0].rstrip(".")
+            for heading in place.heading
+            if heading[:1].isdigit()
+        ]
+        if not numbers:
+            continue
+        words = text.split()
+        for window in PASTE_WINDOWS:
+            if len(words) >= window:
+                asked.append(
+                    Asked(
+                        f"pasted-{window}-{position}",
+                        " ".join(words[:window]),
+                        f"pasted, {window} words",
+                        ((place.path, numbers[-1]),),
+                    )
+                )
     return asked
 
 
@@ -549,6 +704,8 @@ class DocsIndex:
     documents: int
     texts: list[tuple[str, str]]
     """Every chunk's text and breadcrumb, for the table the statements are timed against."""
+    passages: list[tuple[Place, str]] = field(default_factory=list[tuple[Place, str]])
+    """Every chunk's place and text, by document path and then position in the document."""
 
 
 async def index_docs(
@@ -569,13 +726,16 @@ async def index_docs(
         store = cast("SqliteDocStore", await runtime.documents())
         places: dict[str, Place] = {}
         texts: list[tuple[str, str]] = []
+        passages: list[tuple[Place, str]] = []
         documents = await store.list_documents(limit=10_000)
         for document in documents:
             path = document.uri.removeprefix(root.as_uri() + "/")
             for chunk in await store.document_chunks(document.id):
                 places[chunk.id] = Place(path, chunk.heading_path, document.id)
                 texts.append((chunk.text, " > ".join(chunk.heading_path)))
-    return DocsIndex(data_dir, places, len(documents), texts)
+                passages.append((places[chunk.id], chunk.text))
+    passages.sort(key=lambda passage: passage[0].path)
+    return DocsIndex(data_dir, places, len(documents), texts, passages)
 
 
 # --- running a question set ----------------------------------------------------------------------
@@ -705,12 +865,16 @@ async def run_threads(
 
 def time_at_scale(
     texts: Sequence[tuple[str, str]],
-    questions: Sequence[str],
+    questions: Mapping[str, Sequence[str]],
     *,
     size: int = SCALE,
     variants: Sequence[str] = tuple(VARIANTS),
-) -> dict[str, tuple[float, float, float]]:
-    """Each variant's median, p95 and mean matched rows for the shipped statement, ``size`` chunks.
+) -> dict[tuple[str, str], tuple[float, float, float]]:
+    """Median, p95 and mean matched rows of the shipped statement, at ``size`` chunks.
+
+    Keyed by variant and by question set, because a mean over every set is a mean over whichever
+    set is largest: round 2's 754 identifier questions have one or two content words each, so
+    they made the disjunction look cheap on the prose questions it costs most on.
 
     The ``docs/`` chunks are repeated until there are ``size`` of them. Repetition keeps every
     term's document frequency in proportion, and a posting list's length is what a disjunction
@@ -742,12 +906,12 @@ def time_at_scale(
     db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
     db.commit()
     statement = SEARCH_SQL.format(extra="AND d.workspace_id = :workspace_id")
-    timings: dict[str, tuple[float, float, float]] = {}
-    for name in variants:
+    timings: dict[tuple[str, str], tuple[float, float, float]] = {}
+    for name, (group, texts_asked) in itertools.product(variants, questions.items()):
         variant = VARIANTS[name]
         elapsed: list[float] = []
         matched: list[int] = []
-        for text in questions:
+        for text in texts_asked:
             match = variant(text)
             started = time.perf_counter()
             rows = db.execute(
@@ -762,7 +926,7 @@ def time_at_scale(
                 else 0
             )
         elapsed.sort()
-        timings[name] = (
+        timings[name, group] = (
             statistics.median(elapsed),
             elapsed[min(len(elapsed) - 1, math.ceil(0.95 * len(elapsed)) - 1)],
             statistics.fmean(matched),
@@ -807,6 +971,9 @@ GROUPS = (
     "multi-hop",
     "titles",
     "identifiers",
+    "identifiers, two words",
+    "pasted, 40 words",
+    "pasted, 120 words",
     "multi-hop, unlabeled",
     "example",
     "unanswerable",
@@ -841,27 +1008,282 @@ def render(rows: Sequence[tuple[str, str, Row]]) -> str:
     return "\n".join(lines)
 
 
-async def report(args: argparse.Namespace, work: Path, emit: Callable[[str], None]) -> None:
-    """Index, ask, time and print, in the order the module docstring reads."""
-    overrides: dict[str, Any] = {"embedding": {"provider": "onnx", "model": args.model}}
-    if args.chunk_tokens is not None:
-        overrides["plugins"] = {"config": {"chunker.structural": {"max_tokens": args.chunk_tokens}}}
-    started = time.perf_counter()
-    index = await index_docs(work / "docs", overrides=overrides)
-    settings = settings_for(index.data_dir, overrides, PIPELINES["hybrid"])
-    async with Runtime(settings) as runtime:
-        store = cast("SqliteDocStore", await runtime.documents())
-        asked = await docs_questions(store, runtime.workspace)
-    emit(
-        f"docs/: {index.documents} documents, {len(index.places)} chunks, indexed in "
-        f"{time.perf_counter() - started:.0f}s with {args.model}; {len(asked)} queries"
+# --- round 3 ------------------------------------------------------------------------------------
+
+INCUMBENT = "and-content"
+"""The rule round 3 tested against: shipped by #482, replaced on round 3's result."""
+CHALLENGER = "or-content"
+HELD_OUT_SEED = 481
+"""The thread corpus's seed for round 3. 463 built rounds 1 and 2, and 1729 was #463's own
+held-out check; no lexical-variant run had seen this one before round 3's rule was written."""
+HELD_OUT_COPIES = 3
+HELD_OUT_DISTRACTORS = 5
+"""Three copies of every length and style use 45 of the generator's 50 topics, which leaves five
+for distractors rather than twenty."""
+NATURAL = ("authored", "multi-hop")
+"""The labeled ``docs/`` sets that join the held-out thread questions on round 3's loss side."""
+TWO_WORDS = "identifiers, two words"
+
+
+def reciprocal(rank: int | None) -> float:
+    return 0.0 if rank is None else 1.0 / rank
+
+
+@dataclass(frozen=True)
+class Pair:
+    """One query under both rules: reciprocal ranks, and whether the shipped rule matched at all."""
+
+    id: str
+    shipped: float
+    challenger: float
+    shipped_empty: bool
+
+    @property
+    def difference(self) -> float:
+        return self.challenger - self.shipped
+
+
+def docs_pairs(
+    outcomes: Mapping[tuple[str, str], Sequence[Outcome]], groups: Sequence[str]
+) -> list[Pair]:
+    """Hybrid outcomes of the two rules on ``docs/``, paired by query id."""
+    challenger = {o.asked.id: o for o in outcomes[CHALLENGER, "hybrid"]}
+    return [
+        Pair(
+            o.asked.id,
+            reciprocal(o.rank),
+            reciprocal(challenger[o.asked.id].rank),
+            o.lexical_matched == 0,
+        )
+        for o in outcomes[INCUMBENT, "hybrid"]
+        if o.asked.group in groups
+    ]
+
+
+def thread_pairs(
+    runs: Mapping[tuple[str, str], Sequence[thread_duplication.Outcome]], form: str
+) -> list[Pair]:
+    """Hybrid outcomes of the two rules on the mail threads, paired by query id."""
+    challenger = {o.asked.query.id: o for o in runs[CHALLENGER, "hybrid"]}
+    return [
+        Pair(
+            o.asked.query.id,
+            reciprocal(o.first),
+            reciprocal(challenger[o.asked.query.id].first),
+            o.single_leg,
+        )
+        for o in runs[INCUMBENT, "hybrid"]
+        if o.asked.form == form
+    ]
+
+
+def bootstrap_interval(
+    differences: Sequence[float], *, resamples: int = 10_000, seed: int = HELD_OUT_SEED
+) -> tuple[float, float]:
+    """A 95% percentile interval on the mean of paired differences, resampled with a fixed seed."""
+    rng = random.Random(seed)  # noqa: S311 - a reproducible resample, not a key
+    count = len(differences)
+    means = sorted(statistics.fmean(rng.choices(differences, k=count)) for _ in range(resamples))
+    return means[int(0.025 * resamples)], means[int(0.975 * resamples) - 1]
+
+
+@dataclass(frozen=True)
+class RoundThree:
+    """Round 3's rule applied: every condition, its figures, and the diagnostic."""
+
+    gain: float
+    gain_split: tuple[int, int]
+    gain_p: float
+    natural: float
+    natural_interval: tuple[float, float]
+    natural_count: int
+    lost_titles: int
+    lost_keywords: int
+    unanswerable_out_of_none: int
+    latency: dict[str, tuple[float, float]]
+    """The challenger's median and p95 ms at :data:`SCALE` chunks, per question set. Both limits
+    hold for every set: the set with the slowest median need not be the one with the worst p95."""
+    by_match: dict[bool, tuple[int, float]]
+    """Natural-question pairs by whether the shipped rule matched nothing: count, mean change."""
+
+    @property
+    def margin(self) -> float:
+        return max(-0.05, -self.gain / 3)
+
+    @property
+    def conditions(self) -> dict[str, bool]:
+        return {
+            "1 gain": self.gain >= 0.10 and self.gain_p < 0.01,
+            "2 not inferior": self.natural_interval[0] > self.margin,
+            "3 titles and keywords": self.lost_titles <= 1 and self.lost_keywords <= 1,
+            "4 unanswerable": self.unanswerable_out_of_none == 0,
+            "5 latency": all(median < 50 and p95 < 100 for median, p95 in self.latency.values()),
+        }
+
+    @property
+    def switch(self) -> bool:
+        return all(self.conditions.values())
+
+    def describe(self) -> str:
+        low, high = self.natural_interval
+        lines = [
+            f"  1 two-word identifiers: mean reciprocal rank {self.gain:+.3f}, better/worse "
+            f"{self.gain_split[0]}/{self.gain_split[1]}, sign test p = {self.gain_p:.2g}",
+            f"  2 natural questions ({self.natural_count}): mean reciprocal rank "
+            f"{self.natural:+.3f}, 95% interval [{low:+.3f}, {high:+.3f}], margin "
+            f"{self.margin:+.3f}",
+            f"  3 titles lost {self.lost_titles}, thread keywords lost {self.lost_keywords}",
+            f"  4 unanswerable questions out of none: {self.unanswerable_out_of_none}",
+            f"  5 {CHALLENGER}: slowest median {max(self.latency.items(), key=lambda t: t[1][0])}"
+            f", worst p95 {max(self.latency.items(), key=lambda t: t[1][1])}",
+        ]
+        lines.extend(f"  {name}: {held}" for name, held in self.conditions.items())
+        for empty, (count, change) in sorted(self.by_match.items()):
+            lines.append(
+                f"  diagnostic: {count} natural questions where {INCUMBENT} matched "
+                f"{'nothing' if empty else 'something'}, mean change {change:+.3f}"
+            )
+        lines.append(f"  -> {'switch to ' + CHALLENGER if self.switch else 'keep ' + INCUMBENT}")
+        return "\n".join(lines)
+
+
+def _lost(incumbent: Sequence[bool], challenger: Sequence[bool]) -> int:
+    """Lookups the incumbent found and the challenger did not, paired by query: a gain elsewhere
+    does not pay for one."""
+    return sum(was and not now for was, now in zip(incumbent, challenger, strict=True))
+
+
+def round_three(
+    outcomes: Mapping[tuple[str, str], Sequence[Outcome]],
+    runs: Mapping[tuple[str, str], Sequence[thread_duplication.Outcome]],
+    timings: Mapping[tuple[str, str], tuple[float, float, float]],
+) -> RoundThree:
+    """Apply the round 3 rule the module docstring states."""
+    gained = docs_pairs(outcomes, (TWO_WORDS,))
+    better = sum(p.difference > 0 for p in gained)
+    worse = sum(p.difference < 0 for p in gained)
+    natural = docs_pairs(outcomes, NATURAL) + thread_pairs(runs, "question")
+    differences = [p.difference for p in natural]
+
+    titles = {
+        variant: [
+            o.rank is not None and o.rank <= max(KS)
+            for o in outcomes[variant, "hybrid"]
+            if o.asked.group == "titles"
+        ]
+        for variant in (INCUMBENT, CHALLENGER)
+    }
+    keywords = {
+        variant: [o.found for o in runs[variant, "hybrid"] if o.asked.form == "keywords"]
+        for variant in (INCUMBENT, CHALLENGER)
+    }
+    by_match: dict[bool, tuple[int, float]] = {}
+    for empty in (True, False):
+        chosen = [p.difference for p in natural if p.shipped_empty is empty]
+        if chosen:
+            by_match[empty] = (len(chosen), statistics.fmean(chosen))
+    latency = {
+        group: (median, p95)
+        for (name, group), (median, p95, _) in timings.items()
+        if name == CHALLENGER
+    }
+    return RoundThree(
+        gain=statistics.fmean(p.difference for p in gained),
+        gain_split=(better, worse),
+        gain_p=sign_test(better, worse),
+        natural=statistics.fmean(differences),
+        natural_interval=bootstrap_interval(differences),
+        natural_count=len(natural),
+        lost_titles=_lost(titles[INCUMBENT], titles[CHALLENGER]),
+        lost_keywords=_lost(keywords[INCUMBENT], keywords[CHALLENGER]),
+        unanswerable_out_of_none=sum(
+            o.band is not ConfidenceBand.NONE
+            for o in outcomes[CHALLENGER, "hybrid"]
+            if o.asked.group == "unanswerable"
+        ),
+        latency=latency,
+        by_match=by_match,
     )
+
+
+CAPPED = "or-first-16"
+PASTED: tuple[str, ...] = ("pasted, 40 words", "pasted, 120 words")
+
+
+@dataclass(frozen=True)
+class RoundThreeB:
+    """Round 3b's rule applied: the cap against the uncapped disjunction on long queries."""
+
+    change: float
+    interval: tuple[float, float]
+    count: int
+    timings: dict[str, tuple[float, float]]
+    """Per paste window: the cap's median and p95 ms at :data:`SCALE` chunks."""
+
+    @property
+    def within_margin(self) -> bool:
+        return self.interval[0] > -0.03
+
+    @property
+    def fast_enough(self) -> bool:
+        return all(median < 50 and p95 < 100 for median, p95 in self.timings.values())
+
+    @property
+    def verdict(self) -> str:
+        if self.within_margin and self.fast_enough:
+            return f"ship {CAPPED}"
+        return "a trade-off for the owner to decide"
+
+    def describe(self) -> str:
+        low, high = self.interval
+        lines = [
+            f"  pasted ({self.count}): mean reciprocal rank {self.change:+.3f}, 95% interval "
+            f"[{low:+.3f}, {high:+.3f}], margin -0.030 -> {self.within_margin}",
+            *(
+                f"  {group}: {CAPPED} median {median:.1f} ms, p95 {p95:.1f} ms"
+                for group, (median, p95) in self.timings.items()
+            ),
+            f"  time bound -> {self.fast_enough}",
+            f"  -> {self.verdict}",
+        ]
+        return "\n".join(lines)
+
+
+def round_three_b(
+    outcomes: Mapping[tuple[str, str], Sequence[Outcome]],
+    timings: Mapping[tuple[str, str], tuple[float, float, float]],
+) -> RoundThreeB:
+    """Apply the round 3b rule the module docstring states."""
+    capped = {o.asked.id: o for o in outcomes[CAPPED, "hybrid"]}
+    differences = [
+        reciprocal(capped[o.asked.id].rank) - reciprocal(o.rank)
+        for o in outcomes[CHALLENGER, "hybrid"]
+        if o.asked.group in PASTED
+    ]
+    return RoundThreeB(
+        change=statistics.fmean(differences),
+        interval=bootstrap_interval(differences),
+        count=len(differences),
+        timings={group: timings[CAPPED, group][:2] for group in PASTED},
+    )
+
+
+async def _report_docs(
+    index: DocsIndex,
+    asked: Sequence[Asked],
+    variants: Sequence[str],
+    overrides: Mapping[str, Any],
+    emit: Callable[[str], None],
+) -> dict[tuple[str, str], list[Outcome]]:
+    """Every pipeline and variant over ``docs/``, printed, and kept for round 3."""
     rows: list[tuple[str, str, Row]] = []
+    measured: dict[tuple[str, str], list[Outcome]] = {}
     for pipeline in ("dense", "hybrid", "lexical"):
-        for variant in args.variants if pipeline != "dense" else args.variants[:1]:
+        for variant in variants if pipeline != "dense" else variants[:1]:
             outcomes = await run_docs(
                 index, asked, variant=variant, pipeline=pipeline, overrides=overrides
             )
+            measured[variant, pipeline] = outcomes
             label = variant if pipeline != "dense" else "-"
             for group in GROUPS:
                 chosen = [o for o in outcomes if o.asked.group == group]
@@ -873,17 +1295,62 @@ async def report(args: argparse.Namespace, work: Path, emit: Callable[[str], Non
                 emit(f"{variant}/{pipeline}: lexical stage median {median:.2f} ms")
     emit("\n### docs/\n")
     emit(render(rows))
+    return measured
 
-    questions = [a.text for a in asked if a.group != "titles"]
-    emit(f"\n### the statement at {args.scale} chunks, {len(questions)} queries\n")
-    emit("| variant | median ms | p95 ms | mean rows matched |\n|---|---:|---:|---:|")
+
+async def report(args: argparse.Namespace, work: Path, emit: Callable[[str], None]) -> None:
+    """Index, ask, time and print, in the order the module docstring reads."""
+    overrides: dict[str, Any] = {"embedding": {"provider": "onnx", "model": args.model}}
+    if args.chunk_tokens is not None:
+        overrides["plugins"] = {"config": {"chunker.structural": {"max_tokens": args.chunk_tokens}}}
+    started = time.perf_counter()
+    index = await index_docs(work / "docs", overrides=overrides)
+    settings = settings_for(index.data_dir, overrides, PIPELINES["hybrid"])
+    async with Runtime(settings) as runtime:
+        store = cast("SqliteDocStore", await runtime.documents())
+        asked = await docs_questions(store, runtime.workspace)
+    asked.extend(paste_questions(index.passages))
+    emit(
+        f"docs/: {index.documents} documents, {len(index.places)} chunks, indexed in "
+        f"{time.perf_counter() - started:.0f}s with {args.model}; {len(asked)} queries"
+    )
+    measured = await _report_docs(index, asked, args.variants, overrides, emit)
+
+    questions: dict[str, list[str]] = defaultdict(list)
+    for item in asked:
+        if item.group != "titles":
+            questions[item.group].append(item.text)
+    emit(f"\n### the statement at {args.scale} chunks, per question set\n")
+    emit("| variant | set | queries | median ms | p95 ms | mean rows matched |")
+    emit("|---|---|---:|---:|---:|---:|")
     timings = time_at_scale(index.texts, questions, size=args.scale, variants=args.variants)
-    for name, (median, p95, matched) in timings.items():
-        emit(f"| {name} | {median:.1f} | {p95:.1f} | {matched:.0f} |")
+    for (name, group), (median, p95, matched) in timings.items():
+        emit(
+            f"| {name} | {group} | {len(questions[group])} | {median:.1f} | {p95:.1f} | "
+            f"{matched:.0f} |"
+        )
 
-    if args.no_threads:
-        return
-    corpus = build_corpus(seed=args.seed, copies=args.copies)
+    if {CHALLENGER, CAPPED} <= set(args.variants):
+        emit(f"\n### round 3b: {CAPPED} against {CHALLENGER}\n")
+        emit(round_three_b(measured, timings).describe())
+
+    if not args.no_threads:
+        await _report_threads(
+            args, work, overrides=overrides, emit=emit, measured=measured, timings=timings
+        )
+
+
+async def _report_threads(
+    args: argparse.Namespace,
+    work: Path,
+    *,
+    overrides: Mapping[str, Any],
+    emit: Callable[[str], None],
+    measured: Mapping[tuple[str, str], Sequence[Outcome]],
+    timings: Mapping[tuple[str, str], tuple[float, float, float]],
+) -> None:
+    """The mail half, and round 3's verdict, which needs both halves."""
+    corpus = build_corpus(seed=args.seed, copies=args.copies, distractors=args.distractors)
     runs = await run_threads(work, corpus, variants=args.variants, overrides=overrides)
     emit("\n### synthetic mail threads, k = 10\n")
     emit("| variant | pipeline | form | queries | one leg | found |")
@@ -896,6 +1363,9 @@ async def report(args: argparse.Namespace, work: Path, emit: Callable[[str], Non
                 f"{len(chosen)} | {sum(o.single_leg for o in chosen)} | "
                 f"{sum(o.found for o in chosen)} |"
             )
+    if {INCUMBENT, CHALLENGER} <= set(args.variants):
+        emit(f"\n### round 3: {CHALLENGER} against {INCUMBENT}\n")
+        emit(round_three(measured, runs, timings).describe())
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -903,8 +1373,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--model", default="BAAI/bge-m3", help="embedding model (ONNX)")
     parser.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=list(VARIANTS))
     parser.add_argument("--no-threads", action="store_true", help="skip the synthetic mail corpus")
-    parser.add_argument("--seed", type=int, default=463)
-    parser.add_argument("--copies", type=int, default=2, help="threads per length and style")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=HELD_OUT_SEED,
+        help="the mail corpus's seed; rounds 1 and 2 used 463",
+    )
+    parser.add_argument(
+        "--copies",
+        type=int,
+        default=HELD_OUT_COPIES,
+        help="mail threads per length and style; rounds 1 and 2 used 2",
+    )
+    parser.add_argument(
+        "--distractors",
+        type=int,
+        default=HELD_OUT_DISTRACTORS,
+        help="unrelated mail messages; rounds 1 and 2 used 20",
+    )
     parser.add_argument("--scale", type=int, default=SCALE, help="chunks to time statements at")
     parser.add_argument(
         "--work",

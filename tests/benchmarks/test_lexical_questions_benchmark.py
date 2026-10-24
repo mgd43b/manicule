@@ -14,23 +14,41 @@ import re
 from typing import TYPE_CHECKING
 
 from manicule.container import keys
+from manicule.evaluation.queries import load_query_set
 from manicule.plugins.registry import discover
-from manicule.storage.fts import escape_match_query
+from manicule.storage.fts import FUNCTION_WORDS, escape_match_query, match_words
 from tests.benchmarks.lexical_questions import (
     AUTHORED,
+    CAP,
+    CAPPED,
     DOCS,
+    HELD_OUT_COPIES,
+    HELD_OUT_DISTRACTORS,
+    HELD_OUT_SEED,
     MULTI_HOP_TARGETS,
+    PASTE_STRIDE,
+    PASTED,
+    UNANSWERABLE,
     VARIANTS,
     Asked,
     Place,
+    RoundThree,
+    RoundThreeB,
+    _lost,  # pyright: ignore[reportPrivateUsage]
     _rank,  # pyright: ignore[reportPrivateUsage]
+    bootstrap_interval,
+    identifier_questions,
     index_docs,
+    paste_questions,
     run_docs,
     run_threads,
     summarize,
     time_at_scale,
+    two_word_questions,
 )
 from tests.benchmarks.test_thread_duplication_benchmark import CountingEmbedder, small
+from tests.benchmarks.thread_corpus import build_corpus
+from tests.benchmarks.thread_duplication import queries
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -75,8 +93,8 @@ def test_a_question_of_function_words_alone_keeps_them() -> None:
 
 
 def test_the_winning_variant_is_the_shipped_rule_and_the_baseline_is_the_old_one() -> None:
-    """A re-run measures what ships, and compares it against the rule #481 replaced."""
-    assert VARIANTS["and-content"] is escape_match_query
+    """A re-run measures what ships, and compares it against the rules it replaced."""
+    assert VARIANTS["or-first-16"] is escape_match_query
     question = "how do I rotate the signing token"
     assert VARIANTS["and"](question) == '"how" "do" "I" "rotate" "the" "signing" "token"'
     assert VARIANTS["and"]("- token token") == '"-" "token" "token"', "verbatim, defects included"
@@ -93,12 +111,14 @@ def test_scoring_reads_the_rank_of_the_first_labeled_chunk() -> None:
     assert _rank(Asked("t", "?", "titles", documents=frozenset({"a"})), places) == (1, 1)
 
 
-def test_the_statement_is_timed_for_every_variant() -> None:
+def test_the_statement_is_timed_for_every_variant_and_every_set() -> None:
+    """Per set, because a mean over all of them is a mean over whichever set is largest."""
     texts = [("authentication and token rotation", "Auth"), ("vector index builds", "Index")]
-    timings = time_at_scale(texts, ["how is a token rotated", "zzz"], size=200)
-    assert set(timings) == set(VARIANTS)
-    assert timings["and"][2] == 0, "no chunk holds every word of either question"
-    assert timings["or-content"][2] > 0
+    sets = {"prose": ["how is a token rotated", "zzz"], "identifiers": ["vector"]}
+    timings = time_at_scale(texts, sets, size=200)
+    assert set(timings) == {(variant, group) for variant in VARIANTS for group in sets}
+    assert timings["and", "prose"][2] == 0, "no chunk holds every word of either question"
+    assert timings["or-content", "prose"][2] > 0
 
 
 async def test_the_program_runs_end_to_end_through_the_runtime(
@@ -167,5 +187,104 @@ async def test_the_mail_half_can_run_twice_in_one_work_directory(
 
 
 def test_a_narrowed_run_times_only_the_variants_it_names() -> None:
-    timings = time_at_scale([("token rotation", "Auth")], ["token"], size=20, variants=["and"])
-    assert set(timings) == {"and"}
+    timings = time_at_scale(
+        [("token rotation", "Auth")], {"prose": ["token"]}, size=20, variants=["and"]
+    )
+    assert set(timings) == {("and", "prose")}
+
+
+def test_every_two_word_question_has_two_content_words_and_round_twos_target() -> None:
+    """The two rules build different matches only where there is more than one content word."""
+    two = two_word_questions()
+    one = identifier_questions()
+    assert [target for _, target in two] == [target for _, target in one]
+    for question, _ in two:
+        words = match_words(question)
+        assert len([w for w in words if w.lower() not in FUNCTION_WORDS]) == 2, question
+        assert escape_match_query(question) != VARIANTS["and-content"](question)
+
+
+def test_the_bootstrap_interval_is_reproducible_and_brackets_the_mean() -> None:
+    differences = [0.5, -0.25, 0.0, 1.0, -0.5, 0.25] * 10
+    low, high = bootstrap_interval(differences, resamples=2000)
+    assert (low, high) == bootstrap_interval(differences, resamples=2000)
+    assert low < sum(differences) / len(differences) < high
+
+
+def _round(**changes: object) -> RoundThree:
+    figures: dict[str, object] = {
+        "gain": 0.15,
+        "gain_split": (120, 10),
+        "gain_p": 1e-6,
+        "natural": -0.01,
+        "natural_interval": (-0.04, 0.02),
+        "natural_count": 190,
+        "lost_titles": 0,
+        "lost_keywords": 0,
+        "unanswerable_out_of_none": 0,
+        "latency": {"authored": (30.0, 60.0), "identifiers": (10.0, 20.0)},
+        "by_match": {True: (100, 0.02), False: (90, -0.04)},
+    }
+    figures.update(changes)
+    return RoundThree(**figures)  # pyright: ignore[reportArgumentType]
+
+
+def test_a_lost_lookup_is_not_paid_for_by_a_gained_one() -> None:
+    """Condition 3 counts the incumbent's hits the challenger misses, paired by query."""
+    assert _lost([True, True, False, False], [False, False, True, True]) == 2
+    assert _lost([True, False], [True, True]) == 0
+
+
+def test_round_three_switches_only_when_every_condition_holds() -> None:
+    assert _round().switch, "a gain of 0.15 tolerates a natural-question loss down to -0.05"
+    assert not _round(gain=0.09).switch, "condition 1: a gain under 0.10 does not count"
+    assert not _round(gain_p=0.02).switch, "condition 1: nor does one a sign test cannot see"
+    assert not _round(natural_interval=(-0.051, 0.0)).switch, "condition 2: the -0.05 floor"
+    assert not _round(gain=0.12, natural_interval=(-0.041, 0.0)).switch, "a third of 0.12"
+    assert not _round(lost_titles=2).switch
+    assert not _round(unanswerable_out_of_none=1).switch
+    assert not _round(latency={"authored": (49.0, 101.0)}).switch
+    assert not _round(latency={"authored": (49.0, 80.0), "example": (30.0, 120.0)}).switch, (
+        "the worst p95 need not belong to the slowest median"
+    )
+    assert "keep and-content" in _round(lost_keywords=2).describe()
+
+
+def _content_words(text: str) -> int:
+    words = match_words(text)
+    return len([w for w in words if w.lower() not in FUNCTION_WORDS] or words)
+
+
+def test_round_three_questions_fit_the_cap() -> None:
+    """Round 3b's cap changes nothing round 3 measured: every question it asked fits under it."""
+    texts = [text for text, _, _ in AUTHORED]
+    texts.extend(UNANSWERABLE)
+    for name in ("multi-hop-queries.json", "example-queries.json"):
+        texts.extend(query.text for query in load_query_set(DOCS / "evaluation" / name).queries)
+    texts.extend(question for question, _ in identifier_questions())
+    texts.extend(question for question, _ in two_word_questions())
+    for seed, copies, distractors in ((HELD_OUT_SEED, HELD_OUT_COPIES, HELD_OUT_DISTRACTORS),):
+        _, asked = queries(build_corpus(seed=seed, copies=copies, distractors=distractors))
+        texts.extend(item.query.text for item in asked)
+    assert max(map(_content_words, texts)) <= CAP
+
+
+def test_a_paste_is_its_window_long_and_targets_its_own_section() -> None:
+    place = Place("retrieval.md", ("Retrieval", "6. Rerank", "6.2 The model"), "d")
+    long_text = " ".join(f"word{i}" for i in range(130))
+    passages = [(place, long_text)] + [(place, "short")] * (PASTE_STRIDE - 1)
+    passages.append((Place("intro.md", ("Introduction",), "e"), long_text))
+    pasted = paste_questions(passages)
+    assert [item.group for item in pasted] == ["pasted, 40 words", "pasted, 120 words"]
+    assert all(item.targets == (("retrieval.md", "6.2"),) for item in pasted)
+    assert len(pasted[1].text.split()) == 120
+    assert escape_match_query(pasted[1].text).count(" OR ") == CAP - 1
+    assert VARIANTS["or-content"](pasted[1].text).count(" OR ") == 119
+
+
+def test_round_three_b_hands_a_trade_off_to_the_owner() -> None:
+    fast = dict.fromkeys(PASTED, (20.0, 40.0))
+    assert RoundThreeB(-0.01, (-0.02, 0.0), 100, fast).verdict == f"ship {CAPPED}"
+    assert "owner" in RoundThreeB(-0.05, (-0.08, -0.02), 100, fast).verdict
+    slow = {**fast, PASTED[1]: (60.0, 90.0)}
+    assert "owner" in RoundThreeB(0.0, (-0.01, 0.01), 100, slow).verdict

@@ -63,7 +63,7 @@ class CountingEmbedder(HashEmbedder):
 
 
 def test_every_keyword_lookup_is_made_of_words_its_statement_contains() -> None:
-    """The lexical leg needs every content word in one chunk, so this is what surely reaches it."""
+    """A lookup made of the statement's own words reaches the lexical leg under any match rule."""
     for statement, _, _, keywords in ASPECTS:
         words = set(re.findall(r"\w+", statement.lower()))
         assert set(re.findall(r"\w+", keywords.lower())) <= words, keywords
@@ -146,6 +146,8 @@ def test_scoring_a_hand_built_page() -> None:
     assert outcome.redundant == 2, "the original and the later quote add nothing new"
     assert outcome.companion
     assert outcome.page == 4
+    assert outcome.first == 1, "a quotation carrying the passage is where it was first shown"
+    assert score(_asked(origin, companion), page[3:], pipeline="hybrid", k=1).first is None
 
     tied = [Hit(1, 0.8, page[0].truth), Hit(2, 0.8, page[1].truth)]
     assert score(_asked(origin, companion), tied, pipeline="hybrid", k=2).origin == "tied"
