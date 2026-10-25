@@ -8,8 +8,9 @@ blob store against :class:`~tests.connectors.fake_gmail.FakeGmail` holding synth
 simulated clock, so waiting for quota costs nothing and what remains is the CPU a message costs.
 
 Each window of fetched messages reports the CPU seconds, wall seconds and **SQLite virtual-machine
-steps** it took, per message. Steps are what a regression test can assert: they do not move with
-the machine, and statements per message did not move either while the cost grew sixfold.
+instructions** it took, per message (``steps``, to the nearest hundred). Instructions are what a
+regression test can assert: they do not move with the machine, and statements per message did not
+move either while the cost grew sixfold.
 
 Run the published matrix (about two minutes per 10,000 messages once the cost is flat)::
 
@@ -49,7 +50,8 @@ PAGE_SIZE = 250
 """Ids per listing page. Gmail's own is 500, which the connector admits as two journal slices;
 250 keeps the benchmark's journal batches whole."""
 STEP_PERIOD = 100
-"""SQLite calls the progress handler once per this many virtual-machine instructions."""
+"""SQLite calls the progress handler once per this many virtual-machine instructions, so a count
+of calls is multiplied by it to give instructions."""
 
 
 @dataclass(frozen=True)
@@ -117,7 +119,7 @@ class _Windows:
             fetched=self._fetched,
             cpu_ms=(now[0] - self._mark[0]) * 1000 / self._window,
             wall_ms=(now[1] - self._mark[1]) * 1000 / self._window,
-            steps=(now[2] - self._mark[2]) / self._window,
+            steps=(now[2] - self._mark[2]) * STEP_PERIOD / self._window,
         )
         self._measured.windows.append(row)
         self._mark = now

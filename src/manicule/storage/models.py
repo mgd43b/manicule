@@ -307,8 +307,28 @@ class BlobBacklogTotals(Base):
     """Unpublished rows whose ``stored_bytes`` is not an integer: a total cannot include them."""
     gc_pending_rows: Mapped[int] = mapped_column(Integer, nullable=False)
     """Rows whose ``algo`` marks them pending collection, referenced or not."""
+    inexact: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Set, and never cleared, once a sum passed what SQLite stores as an integer."""
 
     __table_args__ = (CheckConstraint("id = 1", name="blob_backlog_totals_is_singleton"),)
+
+
+class BlobBacklogMember(Base):
+    """A blob counted in :class:`BlobBacklogTotals`, and the size it added.
+
+    Recording what each blob added makes entering and leaving the total idempotent, which a
+    cascade needs: a document and its version sharing a blob are deleted by one statement, and
+    each deletion finds the blob unreferenced.
+    """
+
+    __tablename__ = "blob_backlog_members"
+
+    hash: Mapped[str] = mapped_column(Text, primary_key=True)
+    bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sized: Mapped[int] = mapped_column(Integer, nullable=False)
+    """``1`` when ``bytes`` is in the total, ``0`` when the row counts in ``unsized_rows``."""
+
+    __table_args__ = (WITHOUT_ROWID,)
 
 
 class AcquisitionMarker(Base):

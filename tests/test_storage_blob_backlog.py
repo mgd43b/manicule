@@ -37,11 +37,15 @@ _EXACT = (
 
 async def _totals(engine: AsyncEngine) -> tuple[int, int, int, int]:
     """(trigger total, exact scan, pending rows, exact pending rows)."""
+    return await _read(engine, require_exact=True)
+
+
+async def _read(engine: AsyncEngine, *, require_exact: bool) -> tuple[int, int, int, int]:
     async with engine.connect() as connection:
         kept = (
             await connection.execute(
                 text(
-                    "SELECT unpublished_bytes, unsized_rows, gc_pending_rows "
+                    "SELECT unpublished_bytes, unsized_rows, gc_pending_rows, inexact "
                     "FROM blob_backlog_totals"
                 )
             )
@@ -52,7 +56,9 @@ async def _totals(engine: AsyncEngine) -> tuple[int, int, int, int]:
                 text("SELECT count(*) FROM blobs WHERE algo LIKE 'gc_pending:%'")
             )
         ).scalar_one()
-    assert kept[1] == 0
+    if require_exact:
+        assert kept[1] == 0
+        assert kept[3] == 0
     return kept[0], exact, kept[2], pending
 
 
@@ -241,3 +247,71 @@ async def test_admitting_one_blob_reads_the_same_rows_whatever_the_backlog(
     small = await steps_for_one_put(1_000, "a")
     large = await steps_for_one_put(20_000, "b")
     assert large < small * 2, f"one admission took {small} steps at 1k and {large} at 21k"
+
+
+async def test_a_blob_shared_by_a_document_and_its_version_is_counted_once_when_both_go(
+    engine: AsyncEngine, store: SqliteDocStore, data_dir: Path
+) -> None:
+    """Deleting a document cascades to its versions; each deletion finds the blob unreferenced."""
+    blobs = BlobStore(engine, data_dir, min_disk_headroom_bytes=1)
+    shared = await blobs.put(b"s" * 100, "application/octet-stream")
+    assert isinstance(shared, StoredBlob)
+    document = make_document(source_id="shared", body=b"1").model_copy(
+        update={"original_ref": shared.hash}
+    )
+    await store.upsert_document(document)
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO document_versions "
+                "(id, document_id, version, content_hash, changes, original_ref, created_at) "
+                "VALUES ('v1', :document, 1, 'h', '{}', :ref, CURRENT_TIMESTAMP)"
+            ),
+            {"document": document.id, "ref": shared.hash},
+        )
+    assert await _agrees(engine) == 0
+
+    await store.delete_document(document.id)
+    async with engine.begin() as connection:
+        await connection.execute(text("DELETE FROM documents WHERE id = :id"), {"id": document.id})
+    assert await _agrees(engine) == shared.stored_bytes
+
+
+async def test_an_overflowed_total_stays_untrusted_after_the_big_blobs_go(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Taking the overflow back off would leave an integer total that has lost its precision."""
+    huge = 9_000_000_000_000_000_000
+    async with engine.begin() as connection:
+        for index in range(2):
+            await connection.execute(
+                text(
+                    "INSERT INTO blobs (hash, algo, media_type, size_bytes, stored_bytes, "
+                    "compression, created_at) VALUES (:hash, 'blake2b', NULL, :size, :size, "
+                    "'none', CURRENT_TIMESTAMP)"
+                ),
+                {"hash": f"{index + 10:032x}", "size": huge},
+            )
+        await connection.execute(
+            text(
+                "INSERT INTO blobs (hash, algo, media_type, size_bytes, stored_bytes, "
+                "compression, created_at) VALUES ('ff', 'blake2b', NULL, 40, 40, 'none', "
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+    async with engine.begin() as connection:
+        await connection.execute(text("DELETE FROM blobs WHERE size_bytes = :size"), {"size": huge})
+        inexact = (
+            await connection.execute(text("SELECT inexact FROM blob_backlog_totals"))
+        ).scalar_one()
+    assert inexact == 1
+
+    limited = BlobStore(
+        engine,
+        data_dir,
+        min_disk_headroom_bytes=1,
+        max_acquired_blob_backlog_bytes=40,
+    )
+    with pytest.raises(CapacityRefusedError) as caught:
+        await limited.put(b"t" * 40, "application/octet-stream")
+    assert caught.value.diagnostic.used == 40

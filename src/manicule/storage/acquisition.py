@@ -33,6 +33,7 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
+    ManifestVerdicts,
     SnapshotCompleteness,
     SnapshotItemOutcome,
     SnapshotMembership,
@@ -68,7 +69,6 @@ if TYPE_CHECKING:
         Callable,
         Coroutine,
         Mapping,
-        MutableMapping,
         Sequence,
     )
     from datetime import datetime
@@ -1365,7 +1365,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         connector: str,
         scope_fingerprint: str,
         source: AcquisitionSource,
-        verified_manifests: MutableMapping[str, bool] | None = None,
+        verified_manifests: ManifestVerdicts | None = None,
     ) -> AcquisitionRecord | None:
         """Return exact retained evidence from the newest earlier promoted run that holds it.
 
@@ -1378,9 +1378,9 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         newest manifest's.
 
         ``verified_manifests`` is the caller's memory of which runs' manifests it has already
-        checked, by run id. A manifest is hashed in full, so checking it for every document
-        that falls back to it made a complete walk quadratic in the mailbox; one sync passes the
-        same mapping for every document and each run is checked once.
+        checked. A manifest is hashed in full, so checking it for every document that falls back
+        to it made a complete walk quadratic in the mailbox; one sync passes the same memory for
+        every document and each run is checked once, however many workers ask at the same time.
         """
         if source.version_token is None:
             return None
@@ -1415,12 +1415,18 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             record, run = row
             if record.blob_ref is None or record.acquired_source is None or not run.membership_hash:
                 return None
-            verdict = None if verified_manifests is None else verified_manifests.get(run.id)
-            if verdict is None:
-                verdict = await _manifest_matches(session, run.id, run.membership_hash)
-                if verified_manifests is not None:
-                    verified_manifests[run.id] = verdict
-            if not verdict:
+            membership_hash = run.membership_hash
+            run_id = run.id
+
+            async def check() -> bool:
+                return await _manifest_matches(session, run_id, membership_hash)
+
+            matches = (
+                await check()
+                if verified_manifests is None
+                else await verified_manifests.verdict(run_id, check)
+            )
+            if not matches:
                 return None
             reusable = _record(record)
             return reusable if _source_evidence_is_reusable(source, reusable) else None

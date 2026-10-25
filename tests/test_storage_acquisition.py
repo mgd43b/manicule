@@ -25,6 +25,7 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
+    ManifestVerdicts,
     SnapshotCompleteness,
     SnapshotItemOutcome,
     SnapshotPromotionPolicy,
@@ -2816,7 +2817,7 @@ async def test_history_reuse_checks_each_manifest_once_per_memory(
         return await real(session, run_id, expected)
 
     monkeypatch.setattr(acquisition_storage, "_manifest_matches", counting)
-    verified: dict[str, bool] = {}
+    verified = ManifestVerdicts()
 
     for number in range(1, 6):
         found = await store.reusable_record_from_promoted_history(
@@ -2824,7 +2825,7 @@ async def test_history_reuse_checks_each_manifest_once_per_memory(
         )
         assert found is not None
     assert checked == ["a-full"]
-    assert verified == {"a-full": True}
+    assert verified.known == {"a-full": True}
 
     # Without a memory every call still checks, which is the contract for a caller with none.
     checked.clear()
@@ -2833,6 +2834,40 @@ async def test_history_reuse_checks_each_manifest_once_per_memory(
             "wiki", "history-scope", _retained_source(f"page-{number}", "v1")
         )
     assert checked == ["a-full", "a-full"]
+
+
+async def test_history_reuse_checks_a_manifest_once_for_workers_that_arrive_together(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _promoted_run(
+        store, engine, data_dir, "a-full", [(f"page-{n}", "v1") for n in range(1, 9)]
+    )
+    await _promoted_run(store, engine, data_dir, "z-delta", [("page-9", "v1")])
+    checked: list[str] = []
+    real = acquisition_storage._manifest_matches  # pyright: ignore[reportPrivateUsage]
+
+    async def slow(session: AsyncSession, run_id: str, expected: str) -> bool:
+        checked.append(run_id)
+        await asyncio.sleep(0.05)
+        return await real(session, run_id, expected)
+
+    monkeypatch.setattr(acquisition_storage, "_manifest_matches", slow)
+    verified = ManifestVerdicts()
+
+    found = await asyncio.gather(
+        *(
+            store.reusable_record_from_promoted_history(
+                "wiki", "history-scope", _retained_source(f"page-{number}", "v1"), verified
+            )
+            for number in range(1, 9)
+        )
+    )
+
+    assert all(record is not None for record in found)
+    assert checked == ["a-full"], "eight workers asked at once and the manifest was hashed once"
 
 
 async def test_history_reuse_remembers_a_manifest_that_failed_its_check(
@@ -2850,7 +2885,7 @@ async def test_history_reuse_remembers_a_manifest_that_failed_its_check(
         return False
 
     monkeypatch.setattr(acquisition_storage, "_manifest_matches", failing)
-    verified: dict[str, bool] = {}
+    verified = ManifestVerdicts()
 
     for number in (1, 2):
         assert (
@@ -2860,7 +2895,7 @@ async def test_history_reuse_remembers_a_manifest_that_failed_its_check(
             is None
         )
     assert checked == ["a-full"]
-    assert verified == {"a-full": False}
+    assert verified.known == {"a-full": False}
 
 
 async def test_history_reuse_never_falls_back_behind_a_newer_revision_or_another_scope(

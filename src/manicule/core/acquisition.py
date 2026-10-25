@@ -8,7 +8,8 @@ untyped dictionaries with the journal.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from enum import Enum, StrEnum
 from typing import Final, Self
@@ -354,6 +355,35 @@ class AcquisitionRecord(BaseModel):
     updated_at: datetime
 
 
+class ManifestVerdicts:
+    """Which promoted runs' manifests one sync has checked, and what each check found.
+
+    A manifest is hashed in full, so checking it for every document that falls back to it made a
+    complete walk quadratic in the mailbox. Every worker of one sync shares one of these. The
+    lock spans the check, so workers that arrive together wait for the first one's answer instead
+    of each hashing the same manifest.
+    """
+
+    def __init__(self) -> None:
+        self._known: dict[str, bool] = {}
+        self._lock = asyncio.Lock()
+
+    @property
+    def known(self) -> Mapping[str, bool]:
+        return self._known
+
+    async def verdict(self, run_id: str, check: Callable[[], Awaitable[bool]]) -> bool:
+        """The remembered answer for ``run_id``, or ``check()``'s, remembered."""
+        found = self._known.get(run_id)
+        if found is not None:
+            return found
+        async with self._lock:
+            found = self._known.get(run_id)
+            if found is None:
+                found = self._known[run_id] = await check()
+            return found
+
+
 __all__ = [
     "MAX_DISCOVERY_BATCH",
     "UNSET",
@@ -368,6 +398,7 @@ __all__ = [
     "AcquisitionRunState",
     "AcquisitionSource",
     "AcquisitionStage",
+    "ManifestVerdicts",
     "SnapshotCompleteness",
     "SnapshotItemOutcome",
     "SnapshotMembership",

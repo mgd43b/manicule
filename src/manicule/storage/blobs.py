@@ -593,7 +593,8 @@ class BlobStore:
         The unpublished part is read from the trigger-kept total
         (:mod:`manicule.storage.blob_backlog`) when it can be trusted, so admitting one blob costs
         the same however many are waiting. A total that overflowed or saw a size that is not an
-        integer is not used: that is the scan below, which is exact and linear in the backlog.
+        integer, or a sum that passed what SQLite stores as one, is not used: that is the scan
+        below, which is exact and linear in the backlog.
         """
         totals = (
             await session.execute(
@@ -602,12 +603,17 @@ class BlobStore:
                     func.typeof(models.BlobBacklogTotals.unpublished_bytes),
                     models.BlobBacklogTotals.unsized_rows,
                     models.BlobBacklogTotals.gc_pending_rows,
+                    models.BlobBacklogTotals.inexact,
                 ).where(models.BlobBacklogTotals.id == 1)
             )
         ).one_or_none()
         kept = (
             totals
-            if totals is not None and totals[1] == "integer" and totals[0] >= 0 and totals[2] == 0
+            if totals is not None
+            and totals[1] == "integer"
+            and totals[0] >= 0
+            and totals[2] == 0
+            and totals[4] == 0
             else None
         )
         normal_described = (

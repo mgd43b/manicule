@@ -555,8 +555,8 @@ a first sync of about 200,000 messages ran at 56 a minute, not 90, on an event l
 nearly saturated ([#492](https://github.com/mgd43b/manicule/issues/492)). Measured against the
 synthetic mailbox of `tests/connectors/fake_gmail.py` (200,000 small messages, retained bytes on,
 pacing on a simulated clock so only CPU shows), acquisition runs at about 87 messages a second
-and costs 12.9 SQLite steps per message in every 20,000-message window from the first to the
-last, about 58 times the 1.5 messages a second the quota allows. Rerun it with
+and costs about 1,290 SQLite virtual-machine instructions per message in every 20,000-message
+window after the first, about 58 times the 1.5 messages a second the quota allows. Rerun it with
 `.venv/bin/python -m tests.benchmarks.gmail_first_sync --messages 200000 --window 20000
 --acquire-only`. A real mailbox is not synthetic: larger messages cost more to parse and store,
 and this measures the journal, not Gmail.

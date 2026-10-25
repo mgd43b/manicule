@@ -82,6 +82,7 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
+    ManifestVerdicts,
     SnapshotCompleteness,
     SnapshotItemOutcome,
     SnapshotPromotionPolicy,
@@ -931,8 +932,8 @@ class _Sync:
     reconciled_deleted_count: int = 0
     reusable_snapshot_checked: bool = False
     reusable_snapshot_run_id: str | None = None
-    verified_history_manifests: dict[str, bool] = field(default_factory=dict[str, bool])
-    """Promoted runs whose manifests the history fallback has already checked, by run id."""
+    verified_history_manifests: ManifestVerdicts = field(default_factory=ManifestVerdicts)
+    """Promoted runs whose manifests the history fallback has already checked."""
     reusable_snapshot_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     """Held while the reusable manifest is looked up, because the memo beside it spans an await.
 
