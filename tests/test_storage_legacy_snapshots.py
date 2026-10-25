@@ -98,7 +98,25 @@ async def _pre_journal_document(
     defaults, which is what a row written then would have. The metadata block is the same one
     ``_legacy_document`` writes, because :func:`migrate_legacy_snapshots` reads it.
     """
-    retained = await blobs.put(body, "text/markdown")
+    # Admitting a blob reads the unpublished-blob total, whose table did not exist then. A stub
+    # marked inexact makes admission scan, as it does for any total it cannot trust, and goes
+    # again before the migration under test creates the real one.
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS blob_backlog_totals (id INTEGER PRIMARY KEY, "
+                "unpublished_bytes INTEGER, unsized_rows INTEGER, gc_pending_rows INTEGER, "
+                "inexact INTEGER)"
+            )
+        )
+        await connection.execute(
+            text("INSERT OR REPLACE INTO blob_backlog_totals VALUES (1, 0, 0, 0, 1)")
+        )
+    try:
+        retained = await blobs.put(body, "text/markdown")
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text("DROP TABLE blob_backlog_totals"))
     assert isinstance(retained, StoredBlob)
     document = make_document(source=source, source_id=source_id, body=body)
     metadata = (

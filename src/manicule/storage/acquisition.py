@@ -33,6 +33,7 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
+    ManifestVerdicts,
     SnapshotCompleteness,
     SnapshotItemOutcome,
     SnapshotMembership,
@@ -63,7 +64,13 @@ from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import next_observation, utcnow
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+    from collections.abc import (
+        AsyncIterator,
+        Callable,
+        Coroutine,
+        Mapping,
+        Sequence,
+    )
     from datetime import datetime
 
     from sqlalchemy import CursorResult
@@ -1358,6 +1365,7 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         connector: str,
         scope_fingerprint: str,
         source: AcquisitionSource,
+        verified_manifests: ManifestVerdicts | None = None,
     ) -> AcquisitionRecord | None:
         """Return exact retained evidence from the newest earlier promoted run that holds it.
 
@@ -1368,6 +1376,11 @@ class AcquisitionJournalMixin(WorkspaceScoped):
         the run that fetched it. This finds that run with one indexed query, newest first, in the
         same exact scope, and holds its record to the same identity and version checks as the
         newest manifest's.
+
+        ``verified_manifests`` is the caller's memory of which runs' manifests it has already
+        checked. A manifest is hashed in full, so checking it for every document that falls back
+        to it made a complete walk quadratic in the mailbox; one sync passes the same memory for
+        every document and each run is checked once, however many workers ask at the same time.
         """
         if source.version_token is None:
             return None
@@ -1400,12 +1413,20 @@ class AcquisitionJournalMixin(WorkspaceScoped):
             if row is None:
                 return None
             record, run = row
-            if (
-                record.blob_ref is None
-                or record.acquired_source is None
-                or not run.membership_hash
-                or not await _manifest_matches(session, run.id, run.membership_hash)
-            ):
+            if record.blob_ref is None or record.acquired_source is None or not run.membership_hash:
+                return None
+            membership_hash = run.membership_hash
+            run_id = run.id
+
+            async def check() -> bool:
+                return await _manifest_matches(session, run_id, membership_hash)
+
+            matches = (
+                await check()
+                if verified_manifests is None
+                else await verified_manifests.verdict(run_id, check)
+            )
+            if not matches:
                 return None
             reusable = _record(record)
             return reusable if _source_evidence_is_reusable(source, reusable) else None

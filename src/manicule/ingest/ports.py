@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         AcquisitionRun,
         AcquisitionRunState,
         AcquisitionSource,
+        ManifestVerdicts,
         SnapshotItemOutcome,
     )
     from manicule.core.content import (
@@ -647,7 +648,11 @@ class AcquisitionStore(Protocol):
     ) -> AcquisitionRecord | None: ...
 
     async def reusable_record_from_promoted_history(
-        self, connector: str, scope_fingerprint: str, source: AcquisitionSource
+        self,
+        connector: str,
+        scope_fingerprint: str,
+        source: AcquisitionSource,
+        verified_manifests: ManifestVerdicts | None = None,
     ) -> AcquisitionRecord | None: ...
 
     async def reusable_record_from_superseded_run(

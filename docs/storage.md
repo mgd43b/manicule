@@ -276,9 +276,9 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **44 relational tables**. The 32 outside the durable
+The authoritative SQLAlchemy model has **46 relational tables**. The 34 outside the durable
 re-embedding snapshot set are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`,
-`auth_sessions`, `blobs`, `acquisition_markers`, `chunk_relations`, `chunks`,
+`auth_sessions`, `blob_backlog_members`, `blob_backlog_totals`, `blobs`, `acquisition_markers`, `chunk_relations`, `chunks`,
 `collection_documents`, `collections`, `connectors`, `conversations`, `document_tags`,
 `document_versions`, `documents`, `glossary_aliases`, `glossary_entries`, `index_state`,
 `messages`, `plugins`, `query_logs`, `reconciliation_candidates`,
@@ -294,11 +294,13 @@ generation to every promoted connector scope in deterministic order, so a worksp
 resumable while publication remains one atomic corpus transition.
 Two content-addressed acquisition ledgers keep exact global backlog admission constant-time:
 `acquisition_blob_backlog` stores unfinished-record refcounts by hash, and
-`acquisition_backlog_capacity` stores their deduplicated byte total.
+`acquisition_backlog_capacity` stores their deduplicated byte total. A third pair, `blob_backlog_totals`
+and `blob_backlog_members`, holds the exact size of the retained blobs nothing has published yet,
+and which blobs it counts, which blob admission reads (§7).
 Three more carry team mode ([#13](https://github.com/mgd43b/manicule/issues/13)): `users`,
 `auth_sessions` and `security_alerts` (§4.8).
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 44.
+included in the 46.
 
 ### 4.1 The pre-#187 additions
 
@@ -512,7 +514,9 @@ has a row in any state, soft-deleted and purged included; `uq_documents_identity
 `deleted_at IS NULL` and cannot), `(content_hash)`,
 `(workspace_id, deleted_at) WHERE deleted_at IS NOT NULL` (the trash view; live-row queries
 fold `deleted_at IS NULL` into the partial indexes above), `(connector_id)`,
-`(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`, `(glossary_fp)`, `(relation_fp)`.
+`(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`, `(glossary_fp)`, `(relation_fp)`, and
+`(original_ref)` (`ix_documents_original_ref`, probed by the triggers that keep the unpublished-blob
+total of §7, and by the garbage-collection query; `document_versions` has the same index).
 
 ### 4.2.1 Authoritative source metadata, and why it is not a column
 
@@ -2132,6 +2136,25 @@ directory, fsync, rename into place, insert the `blobs` row, and only then write
 `documents.original_ref` that points at it. A reference therefore always resolves. Deletion
 runs the ordering in reverse.
 
+**Admission is constant-time, and exact.** `BlobStore` refuses a new blob when the retained
+bytes no document or version references yet, plus the new blob, would pass
+`ingest.max_acquired_blob_backlog_bytes`. During a first sync nothing is published, so that sum
+is every blob the run has retained. It is the row of `blob_backlog_totals`, kept by triggers on
+`blobs`, `documents` and `document_versions` in the transaction that changes them: a blob enters
+the total when its row appears unreferenced or loses its last reference, and leaves it when its
+row is deleted, goes `gc_pending`, or gains a reference. `blob_backlog_members` records which
+blobs are in and what each added, so entering and leaving are idempotent: a document and its
+version that share a blob are deleted by one cascade, and each deletion finds the blob
+unreferenced. A scan of `blobs` against the two
+reference tables per admitted blob made a 200,000-message first sync spend about 0.8 CPU-seconds
+per message at the end, under the writer lock ([#492](https://github.com/mgd43b/manicule/issues/492)).
+The total is a fast path, not the only path. It is read only when no unpublished row has a
+`stored_bytes` that is not an integer and no sum has passed what SQLite stores as an integer
+(`inexact`, which is never cleared: taking the overflow back off would leave an integer that has
+lost its precision). Otherwise admission scans, which is exact and linear in the backlog, and a
+corrupt size still refuses the write. The triggers live on `documents`, so a migration that rebuilt that table would drop
+them; `tests/test_storage_blob_backlog.py` fails if any is missing at head.
+
 **Compression** with zstd for text-ish media types, recorded per blob. `size_bytes` and
 `stored_bytes` are both kept because they answer different questions.
 
@@ -2968,12 +2991,17 @@ preserves their candidate watermark and retained evidence. These migrations foll
 durable-acquisition and reconciliation chain, so an offline snapshot remains reconstructable
 before any shadow vector generation is planned or published.
 
-`e41b9c07d2a5` adds team mode's three tables (§4.8), bringing the modeled total to the 44 in §4,
+`e41b9c07d2a5` adds team mode's three tables (§4.8), bringing the modeled total to 44,
 and rebuilds two: `workspace_members` gains its foreign key to `users` and `disabled_at`, and
 `api_keys` loses `scopes` and gains a real reference in `user_id`. Neither rebuild carries data
 it could not keep — no release ever wrote a membership, and every existing `api_keys.user_id` held
 the workspace's own name as a placeholder, so it becomes `NULL`, which is what a key minted at the
 command line now records.
+
+`a5c2e8f19b64` adds `blob_backlog_totals` and `blob_backlog_members`, the triggers that keep it, and the two indexes they
+probe (`documents.original_ref`, `document_versions.original_ref`), bringing the modeled total to
+the 46 in §4. It computes the total from the blobs already stored, in Python, so a mailbox whose
+sizes overflow SQLite's integers is marked `inexact` rather than failing the upgrade (§7).
 
 ---
 

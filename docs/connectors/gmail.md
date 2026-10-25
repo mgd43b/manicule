@@ -547,6 +547,20 @@ embedding. At the default pacing budget below (90 messages a minute):
 | 100,000 | about 18.5 hours |
 | 500,000 | about 3.9 days |
 
+**The quota is the bound only if the work per message does not grow with the run.** Retaining
+each message's bytes checks the backlog limit against a total the database keeps
+(`docs/storage.md` §7), so a message costs the same CPU at message 200,000 as at message 2,000.
+Before that, each retained message was checked by a scan of every message retained before it, and
+a first sync of about 200,000 messages ran at 56 a minute, not 90, on an event loop that was
+nearly saturated ([#492](https://github.com/mgd43b/manicule/issues/492)). Measured against the
+synthetic mailbox of `tests/connectors/fake_gmail.py` (200,000 small messages, retained bytes on,
+pacing on a simulated clock so only CPU shows), acquisition runs at about 100 messages a second
+and costs about 1,540 SQLite virtual-machine instructions per message in every 20,000-message
+window after the first, about 66 times the 1.5 messages a second the quota allows. Rerun it with
+`.venv/bin/python -m tests.benchmarks.gmail_first_sync --messages 200000 --window 20000
+--acquire-only`. A real mailbox is not synthetic: larger messages cost more to parse and store,
+and this measures the journal, not Gmail.
+
 After the first sync the budget is ample: a day's new mail is a few hundred fetches, history
 pages cost 2 units, and a complete inventory of 100,000 ids is about 1,000 units.
 

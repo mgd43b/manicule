@@ -807,6 +807,9 @@ fetch. Changed bytes are content-addressed, fsynced and bound to the journal rec
 record becomes acquired. The fetched URI, media type, encoding, metadata, byte length and hash
 are stored with that record, so later derivation reconstructs the connector result without the
 connector. A fetched revision newer than discovery is recorded as the acquired revision.
+Retaining those bytes is constant work per record however large the run has grown: the backlog
+limit is checked against a total the database keeps (`docs/storage.md` §7), not recomputed from
+the blobs the run has already retained.
 
 **One document is never in two stages.** The concurrency is between documents. A document's
 record, chunks, glossary and vectors are published under the keyed lock in §8.4 and guarded by

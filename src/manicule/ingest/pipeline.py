@@ -82,6 +82,7 @@ from manicule.core.acquisition import (
     AcquisitionRunState,
     AcquisitionSource,
     AcquisitionStage,
+    ManifestVerdicts,
     SnapshotCompleteness,
     SnapshotItemOutcome,
     SnapshotPromotionPolicy,
@@ -931,6 +932,8 @@ class _Sync:
     reconciled_deleted_count: int = 0
     reusable_snapshot_checked: bool = False
     reusable_snapshot_run_id: str | None = None
+    verified_history_manifests: ManifestVerdicts = field(default_factory=ManifestVerdicts)
+    """Promoted runs whose manifests the history fallback has already checked."""
     reusable_snapshot_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     """Held while the reusable manifest is looked up, because the memo beside it spans an await.
 
@@ -2717,7 +2720,10 @@ class IngestPipeline:
             # The newest manifest names only what its own run discovered, so an incremental one
             # leaves out documents whose retained bytes an earlier promoted run still holds.
             reusable = await acquisitions.reusable_record_from_promoted_history(
-                run.connector.name, run.scope_fingerprint, record.source
+                run.connector.name,
+                run.scope_fingerprint,
+                record.source,
+                run.verified_history_manifests,
             )
         if reusable is None or reusable.acquired_source is None:
             return None
