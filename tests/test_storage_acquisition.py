@@ -2797,6 +2797,72 @@ async def test_history_reuse_finds_bytes_an_incremental_manifest_leaves_out(
     assert found.source.source_id == "page-1"
 
 
+async def test_history_reuse_checks_each_manifest_once_per_memory(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A walk of unchanged documents hashed the whole older manifest for every one of them."""
+    await _promoted_run(
+        store, engine, data_dir, "a-full", [(f"page-{n}", "v1") for n in range(1, 6)]
+    )
+    await _promoted_run(store, engine, data_dir, "z-delta", [("page-9", "v1")])
+    checked: list[str] = []
+    real = acquisition_storage._manifest_matches  # pyright: ignore[reportPrivateUsage]
+
+    async def counting(session: AsyncSession, run_id: str, expected: str) -> bool:
+        checked.append(run_id)
+        return await real(session, run_id, expected)
+
+    monkeypatch.setattr(acquisition_storage, "_manifest_matches", counting)
+    verified: dict[str, bool] = {}
+
+    for number in range(1, 6):
+        found = await store.reusable_record_from_promoted_history(
+            "wiki", "history-scope", _retained_source(f"page-{number}", "v1"), verified
+        )
+        assert found is not None
+    assert checked == ["a-full"]
+    assert verified == {"a-full": True}
+
+    # Without a memory every call still checks, which is the contract for a caller with none.
+    checked.clear()
+    for number in range(1, 3):
+        await store.reusable_record_from_promoted_history(
+            "wiki", "history-scope", _retained_source(f"page-{number}", "v1")
+        )
+    assert checked == ["a-full", "a-full"]
+
+
+async def test_history_reuse_remembers_a_manifest_that_failed_its_check(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _promoted_run(store, engine, data_dir, "a-full", [("page-1", "v1"), ("page-2", "v1")])
+    await _promoted_run(store, engine, data_dir, "z-delta", [("page-9", "v1")])
+    checked: list[str] = []
+
+    async def failing(_session: AsyncSession, run_id: str, _expected: str) -> bool:
+        checked.append(run_id)
+        return False
+
+    monkeypatch.setattr(acquisition_storage, "_manifest_matches", failing)
+    verified: dict[str, bool] = {}
+
+    for number in (1, 2):
+        assert (
+            await store.reusable_record_from_promoted_history(
+                "wiki", "history-scope", _retained_source(f"page-{number}", "v1"), verified
+            )
+            is None
+        )
+    assert checked == ["a-full"]
+    assert verified == {"a-full": False}
+
+
 async def test_history_reuse_never_falls_back_behind_a_newer_revision_or_another_scope(
     store: SqliteDocStore, engine: AsyncEngine, data_dir: Path
 ) -> None:

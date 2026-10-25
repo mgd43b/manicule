@@ -233,6 +233,8 @@ class FakeGmail:
             **{name: f"Label_{index + 1}" for index, name in enumerate(USER_LABELS)},
         }
         self._serial = 0
+        self._listing: tuple[tuple[object, ...], list[str]] | None = None
+        """The last full listing, with what it was computed from; see :meth:`_list`."""
 
     # ------------------------------------------------------------------ test-side controls
 
@@ -279,6 +281,33 @@ class FakeGmail:
         self.messages[message.id] = message
         self._record("messagesAdded", message, with_labels=record_labels)
         return message
+
+    def add_many(self, count: int) -> None:
+        """Receive ``count`` small messages at once, without a history record each.
+
+        For a mailbox of a size where building each message with the standard library's writer
+        and recording its history would be most of a test: 200,000 of them, in the scale
+        benchmark. Ids sort in arrival order, as :meth:`add_message`'s do, and each message has a
+        distinct subject and ``Message-ID``.
+        """
+        for _ in range(count):
+            self._serial += 1
+            number = self._serial
+            raw = (
+                f"From: pat@example.org\r\nTo: {ADDRESS}\r\nSubject: Message {number}\r\n"
+                f"Message-ID: <m{number}@example.org>\r\n"
+                "Date: Tue, 03 Feb 2026 09:14:00 +0000\r\nContent-Type: text/plain\r\n\r\n"
+                f"The figures for item {number} are in this sentence.\r\n"
+            ).encode()
+            identifier = f"18c3f0a1b2{number:06x}"
+            self.messages[identifier] = FakeMessage(
+                identifier,
+                identifier,
+                raw,
+                [self._labels["INBOX"]],
+                1_760_000_000_000 + number * 1000,
+            )
+        self.history_id += count
 
     def add_label(self, message: FakeMessage, name: str, *, record_labels: bool = False) -> None:
         label = self._labels[name]
@@ -488,13 +517,7 @@ class FakeGmail:
         params = request.url.params
         wanted = params.get_list("labelIds")
         include_spam_trash = params.get("includeSpamTrash", "false") == "true"
-        ids = [
-            message.id
-            for message in self.messages.values()
-            if all(label in message.label_ids for label in wanted)
-            and (include_spam_trash or not {"SPAM", "TRASH"} & set(message.label_ids))
-        ]
-        ids = sorted({*ids, *self.listed_but_gone})
+        ids = self._matching(wanted, include_spam_trash=include_spam_trash)
         size = min(int(params.get("maxResults", "100")), self.page_size)
         start = _offset(params.get("pageToken"))
         if start is None:
@@ -508,6 +531,34 @@ class FakeGmail:
         elif self.loop_pagination and start > 0:
             body["nextPageToken"] = _token(size)
         return httpx.Response(200, json=body)
+
+    def _matching(self, wanted: list[str], *, include_spam_trash: bool) -> list[str]:
+        """Ids a listing walks, sorted. Remembered while the mailbox is unchanged.
+
+        A walk of 200,000 messages asks for 400 pages of the same listing; sorting the mailbox
+        for each would make the fake the slowest thing in the benchmark. The memory is keyed on
+        everything a listing reads that a test can change, so a message added, labeled or deleted
+        mid-walk still shows.
+        """
+        version = (
+            tuple(wanted),
+            include_spam_trash,
+            len(self.messages),
+            self._serial,
+            frozenset(self.listed_but_gone),
+            self.history_id,
+        )
+        if self._listing is not None and self._listing[0] == version:
+            return self._listing[1]
+        ids = [
+            message.id
+            for message in self.messages.values()
+            if all(label in message.label_ids for label in wanted)
+            and (include_spam_trash or not {"SPAM", "TRASH"} & set(message.label_ids))
+        ]
+        found = sorted({*ids, *self.listed_but_gone})
+        self._listing = (version, found)
+        return found
 
     def _get(self, request: httpx.Request, message_id: str) -> httpx.Response:
         message = self.messages.get(message_id)

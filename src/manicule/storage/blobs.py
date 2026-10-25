@@ -588,6 +588,74 @@ class BlobStore:
         )
 
     async def _pending_blob_bytes(self, session: AsyncSession) -> int:
+        """Bytes retained and not published, plus what collection has yet to reclaim.
+
+        The unpublished part is read from the trigger-kept total
+        (:mod:`manicule.storage.blob_backlog`) when it can be trusted, so admitting one blob costs
+        the same however many are waiting. A total that overflowed or saw a size that is not an
+        integer is not used: that is the scan below, which is exact and linear in the backlog.
+        """
+        totals = (
+            await session.execute(
+                select(
+                    models.BlobBacklogTotals.unpublished_bytes,
+                    func.typeof(models.BlobBacklogTotals.unpublished_bytes),
+                    models.BlobBacklogTotals.unsized_rows,
+                    models.BlobBacklogTotals.gc_pending_rows,
+                ).where(models.BlobBacklogTotals.id == 1)
+            )
+        ).one_or_none()
+        trusted = (
+            totals is not None and totals[1] == "integer" and totals[0] >= 0 and totals[2] == 0
+        )
+        if trusted and totals is not None:
+            normal_described = min(totals[0], self._max_acquired_blob_backlog_bytes + 1)
+        else:
+            normal_described = await self._scan_unpublished_bytes(session)
+        pending_claims = (
+            {}
+            if trusted and totals is not None and totals[3] == 0
+            else await self._gc_pending_claims(session)
+        )
+        pending_physical = await asyncio.to_thread(self._gc_artifact_bytes, pending_claims)
+        return normal_described + pending_physical
+
+    async def _gc_pending_claims(self, session: AsyncSession) -> dict[tuple[str, str], int]:
+        """Every blob row pending collection, refusing a table the scan cannot bound or read."""
+        pending_filter = models.Blob.algo.like(f"{GC_PENDING_PREFIX}%")
+        pending_rows = (
+            await session.execute(
+                select(
+                    models.Blob.hash,
+                    models.Blob.algo,
+                    models.Blob.stored_bytes,
+                    func.typeof(models.Blob.hash),
+                    func.typeof(models.Blob.algo),
+                    func.typeof(models.Blob.stored_bytes),
+                )
+                .where(pending_filter)
+                .limit(GC_CAPACITY_SCAN_LIMIT + 1)
+            )
+        ).all()
+        if len(pending_rows) > GC_CAPACITY_SCAN_LIMIT:
+            self._refuse_gc_pending()
+        if any(
+            type(digest) is not str
+            or type(algo) is not str
+            or type(stored_bytes) is not int
+            or stored_bytes < 0
+            or hash_type != "text"
+            or algo_type != "text"
+            or stored_type != "integer"
+            for digest, algo, stored_bytes, hash_type, algo_type, stored_type in pending_rows
+        ):
+            self._refuse_gc_pending()
+        return {
+            (digest, algo.removeprefix(GC_PENDING_PREFIX)): stored_bytes
+            for digest, algo, stored_bytes, _, _, _ in pending_rows
+        }
+
+    async def _scan_unpublished_bytes(self, session: AsyncSession) -> int:
         published_documents = select(models.Document.original_ref).where(
             models.Document.original_ref.is_not(None)
         )
@@ -624,40 +692,7 @@ class BlobStore:
                 normal_described = self._max_acquired_blob_backlog_bytes + 1
                 break
             normal_described += stored_bytes
-        pending_filter = models.Blob.algo.like(f"{GC_PENDING_PREFIX}%")
-        pending_rows = (
-            await session.execute(
-                select(
-                    models.Blob.hash,
-                    models.Blob.algo,
-                    models.Blob.stored_bytes,
-                    func.typeof(models.Blob.hash),
-                    func.typeof(models.Blob.algo),
-                    func.typeof(models.Blob.stored_bytes),
-                )
-                .where(pending_filter)
-                .limit(GC_CAPACITY_SCAN_LIMIT + 1)
-            )
-        ).all()
-        if len(pending_rows) > GC_CAPACITY_SCAN_LIMIT:
-            self._refuse_gc_pending()
-        if any(
-            type(digest) is not str
-            or type(algo) is not str
-            or type(stored_bytes) is not int
-            or stored_bytes < 0
-            or hash_type != "text"
-            or algo_type != "text"
-            or stored_type != "integer"
-            for digest, algo, stored_bytes, hash_type, algo_type, stored_type in pending_rows
-        ):
-            self._refuse_gc_pending()
-        pending_claims = {
-            (digest, algo.removeprefix(GC_PENDING_PREFIX)): stored_bytes
-            for digest, algo, stored_bytes, _, _, _ in pending_rows
-        }
-        pending_physical = await asyncio.to_thread(self._gc_artifact_bytes, pending_claims)
-        return normal_described + pending_physical
+        return normal_described
 
     def _gc_artifact_bytes(self, pending_claims: dict[tuple[str, str], int]) -> int:
         """Conservatively count pending/orphan representations without an unbounded scan."""

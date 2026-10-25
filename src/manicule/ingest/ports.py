@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from manicule.core.acquisition import UNSET, SnapshotPromotionPolicy, UnsetValue
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Collection, Mapping, Sequence
+    from collections.abc import AsyncIterator, Collection, Mapping, MutableMapping, Sequence
     from datetime import datetime
 
     from manicule.core.acquisition import (
@@ -647,7 +647,11 @@ class AcquisitionStore(Protocol):
     ) -> AcquisitionRecord | None: ...
 
     async def reusable_record_from_promoted_history(
-        self, connector: str, scope_fingerprint: str, source: AcquisitionSource
+        self,
+        connector: str,
+        scope_fingerprint: str,
+        source: AcquisitionSource,
+        verified_manifests: MutableMapping[str, bool] | None = None,
     ) -> AcquisitionRecord | None: ...
 
     async def reusable_record_from_superseded_run(

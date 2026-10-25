@@ -11,7 +11,8 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from email.message import EmailMessage
 from email.policy import SMTP
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from pydantic import SecretStr
 
@@ -19,6 +20,14 @@ from manicule.connectors.config import GmailConfig
 from manicule.connectors.gmail import GmailConnector
 from manicule.connectors.gmail_client import GmailClient
 from manicule.core.sources import DiscoveredDoc, Watermark
+from manicule.ingest.middleware import MiddlewareRunner
+from manicule.ingest.pipeline import IngestPipeline
+from manicule.ingest.workers import InProcessRunner
+from manicule.parsers.config import MailConfig
+from manicule.parsers.mail import MailParser
+from manicule.storage.blobs import BlobStore
+from manicule.storage.docstore import SqliteDocStore
+from manicule.storage.vectors import LanceVectorStore
 from tests.connectors.fake_gmail import (
     ADDRESS,
     FakeCredential,
@@ -26,6 +35,11 @@ from tests.connectors.fake_gmail import (
     FakeGmailSettings,
     SimulatedTime,
 )
+from tests.fakes import HashEmbedder
+from tests.ingest import fakes
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
 CLIENT_ID = "1234567890-example.apps.googleusercontent.com"
 
@@ -109,6 +123,30 @@ def connector_over(
         name=name,
         renewal="Run `manicule connector login mail`.",
         clock=time,
+    )
+
+
+def mail_pipeline(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    vectors: LanceVectorStore,
+    **options: Any,
+) -> IngestPipeline:
+    """The real pipeline, with the mail parser, durable acquisition and retained bytes."""
+    chunker = fakes.BlockChunker()
+    return IngestPipeline(
+        store=store,
+        acquisitions=store,
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=vectors,
+        runner=InProcessRunner({"email": MailParser(MailConfig()), "lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["email", "lines"],
+        middleware=MiddlewareRunner([]),
+        chunk_fingerprint=chunker.fingerprint,
+        blobs=BlobStore(engine, data_dir),
+        **options,
     )
 
 

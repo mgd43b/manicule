@@ -288,6 +288,29 @@ class Blob(Base):
     )
 
 
+class BlobBacklogTotals(Base):
+    """The exact size of the unpublished blobs, kept by triggers on ``blobs``, ``documents`` and
+    ``document_versions`` (:mod:`manicule.storage.blob_backlog`).
+
+    ``unpublished_bytes`` is the stored size of every blob that is not pending collection and
+    that no document or version references. It has no ``CHECK`` and no non-negative bound on
+    purpose: a trigger that failed a write because a total had drifted would turn a bookkeeping
+    fault into a refused ingest, and a total that cannot be trusted is read as untrusted instead
+    (``typeof`` is not ``integer``, or ``unsized_rows`` is not zero).
+    """
+
+    __tablename__ = "blob_backlog_totals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    unpublished_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    unsized_rows: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Unpublished rows whose ``stored_bytes`` is not an integer: a total cannot include them."""
+    gc_pending_rows: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Rows whose ``algo`` marks them pending collection, referenced or not."""
+
+    __table_args__ = (CheckConstraint("id = 1", name="blob_backlog_totals_is_singleton"),)
+
+
 class AcquisitionMarker(Base):
     """Durable inventory for a filesystem acquisition-recovery marker."""
 
@@ -887,6 +910,7 @@ class Document(Base):
         Index("ix_documents_glossary_fp", "glossary_fp"),
         Index("ix_documents_relation_fp", "relation_fp"),
         Index("ix_documents_container_id", "container_id"),
+        Index("ix_documents_original_ref", "original_ref"),
         Index(
             "ix_documents_workspace_live_id",
             "workspace_id",
@@ -1034,6 +1058,7 @@ class DocumentVersion(Base):
 
     __table_args__ = (
         UniqueConstraint("document_id", "version", name="uq_document_versions_document_id_version"),
+        Index("ix_document_versions_original_ref", "original_ref"),
     )
 
 

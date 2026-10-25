@@ -24,19 +24,13 @@ from manicule.connectors.gmail import GmailConnector
 from manicule.connectors.gmail_client import PAGE_SIZE
 from manicule.core.acquisition import MAX_DISCOVERY_BATCH, SnapshotPromotionPolicy
 from manicule.core.content import DocumentStatus
-from manicule.ingest.middleware import MiddlewareRunner
 from manicule.ingest.pipeline import IngestPipeline, RunReport
 from manicule.ingest.reconcile import confirm_proposed_deletion, connector_scope, reconcile
-from manicule.ingest.workers import InProcessRunner
-from manicule.parsers.config import MailConfig
-from manicule.parsers.mail import MailParser
-from manicule.storage.blobs import BlobStore
 from manicule.storage.docstore import SqliteDocStore
 from manicule.storage.vectors import LanceVectorStore
 from tests.connectors.fake_gmail import ADDRESS, FakeGmail, SimulatedTime
-from tests.connectors.gmail_support import connector_over, mail, mailbox
+from tests.connectors.gmail_support import connector_over, mail, mail_pipeline, mailbox
 from tests.fakes import HashEmbedder
-from tests.ingest import fakes
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -67,30 +61,6 @@ class Harness:
         """Source ids of the live documents, messages only, with their status."""
         documents = await self.store.list_documents(limit=1_000)
         return {d.source_id: d.status for d in documents if "!/" not in d.source_id}
-
-
-def mail_pipeline(
-    store: SqliteDocStore,
-    engine: AsyncEngine,
-    data_dir: Path,
-    vectors: LanceVectorStore,
-    **options: Any,
-) -> IngestPipeline:
-    """The real pipeline, with the mail parser, durable acquisition and retained bytes."""
-    chunker = fakes.BlockChunker()
-    return IngestPipeline(
-        store=store,
-        acquisitions=store,
-        chunker=chunker,
-        embedder=HashEmbedder(),
-        vectors=vectors,
-        runner=InProcessRunner({"email": MailParser(MailConfig()), "lines": fakes.LineParser()}),
-        resolve_chain=lambda _: ["email", "lines"],
-        middleware=MiddlewareRunner([]),
-        chunk_fingerprint=chunker.fingerprint,
-        blobs=BlobStore(engine, data_dir),
-        **options,
-    )
 
 
 @pytest_asyncio.fixture
