@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.15](https://github.com/mgd43b/manicule/compare/v0.2.14...v0.2.15) (2026-10-25)
+
+
+### Bug Fixes
+
+* **storage:** admit a retained blob in constant time, not by scanning every blob retained before it ([#493](https://github.com/mgd43b/manicule/issues/493)) ([944d4b0](https://github.com/mgd43b/manicule/commit/944d4b0590679f49cccfa6c6f80e51cec979c3ad))
+
 ## [0.2.14](https://github.com/mgd43b/manicule/compare/v0.2.13...v0.2.14) (2026-10-24)
 
 
