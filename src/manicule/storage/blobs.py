@@ -605,17 +605,18 @@ class BlobStore:
                 ).where(models.BlobBacklogTotals.id == 1)
             )
         ).one_or_none()
-        trusted = (
-            totals is not None and totals[1] == "integer" and totals[0] >= 0 and totals[2] == 0
+        kept = (
+            totals
+            if totals is not None and totals[1] == "integer" and totals[0] >= 0 and totals[2] == 0
+            else None
         )
-        if trusted and totals is not None:
-            normal_described = min(totals[0], self._max_acquired_blob_backlog_bytes + 1)
-        else:
-            normal_described = await self._scan_unpublished_bytes(session)
+        normal_described = (
+            await self._scan_unpublished_bytes(session)
+            if kept is None
+            else min(kept[0], self._max_acquired_blob_backlog_bytes + 1)
+        )
         pending_claims = (
-            {}
-            if trusted and totals is not None and totals[3] == 0
-            else await self._gc_pending_claims(session)
+            {} if kept is not None and kept[3] == 0 else await self._gc_pending_claims(session)
         )
         pending_physical = await asyncio.to_thread(self._gc_artifact_bytes, pending_claims)
         return normal_described + pending_physical

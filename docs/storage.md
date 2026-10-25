@@ -514,7 +514,9 @@ has a row in any state, soft-deleted and purged included; `uq_documents_identity
 `deleted_at IS NULL` and cannot), `(content_hash)`,
 `(workspace_id, deleted_at) WHERE deleted_at IS NOT NULL` (the trash view; live-row queries
 fold `deleted_at IS NULL` into the partial indexes above), `(connector_id)`,
-`(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`, `(glossary_fp)`, `(relation_fp)`.
+`(container_id)`, `(parse_fp)`, `(chunk_fp)`, `(embed_fp)`, `(glossary_fp)`, `(relation_fp)`, and
+`(original_ref)` (`ix_documents_original_ref`, probed by the triggers that keep the unpublished-blob
+total of §7, and by the garbage-collection query; `document_versions` has the same index).
 
 ### 4.2.1 Authoritative source metadata, and why it is not a column
 
