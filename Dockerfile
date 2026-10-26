@@ -44,7 +44,7 @@
 # a list copied into this file and left to drift.
 
 FROM ghcr.io/astral-sh/uv:0.13.5 AS uv
-FROM python:3.14-slim-bookworm AS deps
+FROM python:3.15-slim-bookworm AS deps
 
 COPY --from=uv /uv /usr/local/bin/uv
 
@@ -291,7 +291,7 @@ assert not missing, f'vocabularies still missing after pre-seed: {missing}'"
 
 # --- the image ------------------------------------------------------------------------------
 
-FROM python:3.14-slim-bookworm AS runtime
+FROM python:3.15-slim-bookworm AS runtime
 
 LABEL org.opencontainers.image.title="manicule" \
       org.opencontainers.image.description="Self-hosted document search and answers, with citations that resolve." \
