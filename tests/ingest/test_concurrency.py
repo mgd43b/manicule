@@ -1264,7 +1264,8 @@ async def test_the_stage_counters_reach_the_connector_row_without_any_document_c
         "a timing is named for a stage, never for anything a document said"
     )
     assert all(
-        isinstance(value, dict) and set(value) == {"seconds", "calls"} for value in timings.values()
+        isinstance(value, dict) and set(value) == {"seconds", "calls", "longest"}
+        for value in timings.values()
     )
 
 

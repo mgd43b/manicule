@@ -11,8 +11,9 @@ import os
 import sqlite3
 import stat
 import threading
+import time
 import weakref
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Concatenate, Final, override
@@ -23,9 +24,17 @@ from sqlalchemy.pool import AsyncAdaptedQueuePool
 from sqlalchemy.util import await_only, greenlet_spawn
 
 from manicule.core.errors import InsecureTargetError, StorageBusyError
+from manicule.storage.ledger import (
+    WriterLedger,
+    WriterTotals,
+    WriterVisit,
+    WriterWindow,
+    writer_ledger,
+    writer_totals_since,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import AsyncGenerator, Callable, Coroutine
     from types import CoroutineType
 
     from sqlalchemy.engine.interfaces import DBAPIConnection, Dialect
@@ -93,6 +102,30 @@ def writer_admission(engine: AsyncEngine) -> asyncio.Lock:
         return admission
 
 
+@asynccontextmanager
+async def writer_slot(engine: AsyncEngine, operation: str) -> AsyncGenerator[None]:
+    """Hold the engine's one writer slot, and record how long getting it and keeping it took.
+
+    :func:`writer_admission` with a name on it. Recorded when the block ends, however it ends,
+    including a cancellation while queued, where only the wait is real and the hold is zero.
+    """
+    ledger = writer_ledger(engine)
+    requested = time.perf_counter()
+    acquired: float | None = None
+    token = ledger.queue(operation, requested)
+    try:
+        async with writer_admission(engine):
+            acquired = time.perf_counter()
+            ledger.acquired(token, operation, acquired)
+            yield
+    finally:
+        ended = time.perf_counter()
+        if acquired is None:
+            ledger.record(operation, waited=ended - requested, held=0.0, token=token)
+        else:
+            ledger.record(operation, waited=acquired - requested, held=ended - acquired)
+
+
 def sqlite_busy(error: BaseException) -> bool:
     """Recognize SQLITE_BUSY through SQLAlchemy without retaining its SQL-shaped wrapper.
 
@@ -137,7 +170,7 @@ def admitted_writer[**P, R](
 
     @wraps(operation)
     async def admitted(store: Any, *args: P.args, **kwargs: P.kwargs) -> R:  # noqa: ANN401
-        async with writer_admission(store.engine):
+        async with writer_slot(store.engine, operation.__name__):
             for delay in SQLITE_BUSY_RETRY_DELAYS:
                 if delay:
                     await asyncio.sleep(delay)
@@ -480,6 +513,10 @@ __all__ = [
     "PRAGMAS",
     "VECTORS_DIRNAME",
     "StorageLayoutError",
+    "WriterLedger",
+    "WriterTotals",
+    "WriterVisit",
+    "WriterWindow",
     "admitted_writer",
     "attach_pragmas",
     "create_engine",
@@ -488,4 +525,7 @@ __all__ = [
     "require_supported_sqlite",
     "secure_output_dir",
     "session_factory",
+    "writer_ledger",
+    "writer_slot",
+    "writer_totals_since",
 ]

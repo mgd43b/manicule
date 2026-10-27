@@ -248,6 +248,13 @@ class Stage(StrEnum):
     is written instead of a stray bucket in a report. Containment is by time: ``embed`` holds
     ``stored_vectors`` and the embed lock's wait and hold, ``commit`` holds ``fence``,
     ``stage_vectors``, ``upsert``, ``glossary`` and ``publish``, and ``document`` holds all of it.
+
+    ``publish`` is the publication of a document with chunks and ``publish_chunkless`` of one
+    without (a refused or unsupported member, an empty document, a failure), which never reach
+    ``commit``. ``member`` holds the whole handling of one found inside another, and
+    ``store_read`` the reads of the document store between stages. ``loop_lag`` is not a visit
+    to anything: each call is one sample of how much later than asked the event loop woke a
+    timer, so its seconds are time every worker spent waiting for the loop.
     """
 
     JOURNAL_START = "journal_start"
@@ -268,6 +275,10 @@ class Stage(StrEnum):
     AFTER_STORE = "after_store"
     LINEAGE = "lineage"
     JOURNAL_SETTLE = "journal_settle"
+    MEMBER = "member"
+    STORE_READ = "store_read"
+    PUBLISH_CHUNKLESS = "publish_chunkless"
+    LOOP_LAG = "loop_lag"
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +292,8 @@ class StageTime:
 
     seconds: float = 0.0
     calls: int = 0
+    longest: float = 0.0
+    """The longest single visit seen. A mean hides a stall; this is how one is found."""
 
 
 _scope: ContextVar[StageTimings | None] = ContextVar("stage_timings_scope", default=None)
@@ -313,11 +326,37 @@ class StageTimings:
         self._seconds: dict[Stage, float] = {}
         self._calls: dict[Stage, int] = {}
         self._open: dict[object, tuple[Stage, float]] = {}
+        self._longest: dict[Stage, float] = {}
+        self._window_longest: dict[Stage, float] = {}
 
     def add(self, stage: Stage, seconds: float) -> None:
-        """Count one finished visit to ``stage`` that took ``seconds``."""
+        """Count one finished visit to ``stage`` that took ``seconds``, here and in the scope."""
+        self._record(stage, seconds)
+        scope = _scope.get()
+        if scope is not None and scope is not self:
+            scope._record(stage, seconds)  # noqa: SLF001 - the same class, one level of nesting
+
+    def _record(self, stage: Stage, seconds: float) -> None:
         self._seconds[stage] = self._seconds.get(stage, 0.0) + seconds
         self._calls[stage] = self._calls.get(stage, 0) + 1
+        if seconds > self._longest.get(stage, 0.0):
+            self._longest[stage] = seconds
+        if seconds > self._window_longest.get(stage, 0.0):
+            self._window_longest[stage] = seconds
+
+    def take_window_longest(self) -> dict[Stage, float]:
+        """The longest visit to each stage since this was last called, and start a new window.
+
+        One reader: the progress line. The cumulative maximum in a snapshot cannot be
+        subtracted, so a window's worst case has to be kept apart and cleared when read. A visit
+        still open counts for the time it has taken so far, so a stall in progress shows as the
+        maximum it already is rather than as zero until it ends.
+        """
+        window, self._window_longest = self._window_longest, {}
+        now = time.perf_counter()
+        for stage, started in self._open.values():
+            window[stage] = max(window.get(stage, 0.0), now - started)
+        return window
 
     def begin(self, stage: Stage) -> _Visit:
         """Open a visit. Close it with :meth:`end`, or use :meth:`timing`."""
@@ -337,13 +376,13 @@ class StageTimings:
         if self._open.pop(visit, None) is None:
             return
         elapsed = time.perf_counter() - visit.started
-        self.add(visit.stage, elapsed)
+        self._record(visit.stage, elapsed)
         if visit.scope is not None:
             visit.scope.end_scoped(visit, elapsed)
 
     def end_scoped(self, visit: _Visit, elapsed: float) -> None:
         if self._open.pop(visit, None) is not None:
-            self.add(visit.stage, elapsed)
+            self._record(visit.stage, elapsed)
 
     @contextmanager
     def timing(self, stage: Stage) -> Generator[None]:
@@ -370,9 +409,16 @@ class StageTimings:
         for stage, started in self._open.values():
             seconds[stage] = seconds.get(stage, 0.0) + (now - started)
         return {
-            stage: StageTime(seconds=total, calls=self._calls.get(stage, 0))
+            stage: StageTime(
+                seconds=total,
+                calls=self._calls.get(stage, 0),
+                longest=max(self._longest.get(stage, 0.0), self._open_longest(stage, now)),
+            )
             for stage, total in seconds.items()
         }
+
+    def _open_longest(self, stage: Stage, now: float) -> float:
+        return max((now - at for kind, at in self._open.values() if kind is stage), default=0.0)
 
     @staticmethod
     def since(
@@ -384,7 +430,9 @@ class StageTimings:
             before = base.get(stage, StageTime())
             if after.calls > before.calls or after.seconds > before.seconds:
                 delta[stage] = StageTime(
-                    seconds=after.seconds - before.seconds, calls=after.calls - before.calls
+                    seconds=after.seconds - before.seconds,
+                    calls=after.calls - before.calls,
+                    longest=after.longest,
                 )
         return delta
 
@@ -510,7 +558,11 @@ class StageReport:
             "peak_bodies": self.peak_bodies,
             "peak_discovery_records": self.peak_discovery_records,
             "timings": {
-                stage: {"seconds": round(spent.seconds, 3), "calls": spent.calls}
+                stage: {
+                    "seconds": round(spent.seconds, 3),
+                    "calls": spent.calls,
+                    "longest": round(spent.longest, 3),
+                }
                 for stage, spent in sorted(self.timings.items())
             },
         }

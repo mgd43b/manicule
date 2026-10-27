@@ -67,7 +67,12 @@ from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, Wa
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.middleware import MiddlewareRunner
-from manicule.ingest.pipeline import IngestPipeline, RunReport, Watching
+from manicule.ingest.pipeline import (
+    IngestPipeline,
+    RunReport,
+    Watching,
+    _Sync,  # pyright: ignore[reportPrivateUsage]
+)
 from manicule.ingest.rebuild import build_offline_rebuilder
 from manicule.ingest.recovery import requeue_interrupted
 from manicule.ingest.reembed import ReembedState, resume_reembed, start_reembed
@@ -81,6 +86,7 @@ from manicule.parsers.plaintext import PlaintextParser
 from manicule.parsers.versions import parse_fingerprint
 from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.docstore import SqliteDocStore
+from manicule.storage.ledger import writer_ledger
 from manicule.storage.models import FTS_TOKENIZER
 from manicule.storage.rebuild import SqliteRebuildStore
 from manicule.storage.vectors import LanceVectorStore
@@ -3528,8 +3534,14 @@ async def test_a_durable_run_reports_where_its_time_went(
     assert report.indexed == 3
     timings = report.stages.timings
     for stage in Stage:
-        if stage in {Stage.AFTER_STORE, Stage.GLOSSARY}:
-            continue  # no hooks and no glossary in this pipeline
+        if stage in {
+            Stage.AFTER_STORE,
+            Stage.GLOSSARY,
+            Stage.MEMBER,
+            Stage.PUBLISH_CHUNKLESS,
+            Stage.LOOP_LAG,
+        }:
+            continue  # no hooks, glossary or members here, and a short run may not sample the loop
         assert timings[stage].calls >= 3, f"{stage} was not sampled once per document"
     assert timings[Stage.PUBLISH].seconds <= timings[Stage.COMMIT].seconds
     assert timings[Stage.COMMIT].seconds <= timings[Stage.DOCUMENT].seconds
@@ -3589,7 +3601,7 @@ async def test_the_timings_are_logged_on_a_timer_even_while_nothing_finishes(
     assert any("parse " in line for line in lines), "the stages that finished are in the line"
 
 
-async def test_publishing_a_document_with_no_chunks_is_timed_as_a_publish(
+async def test_publishing_a_document_with_no_chunks_is_timed_as_a_chunkless_publish(
     engine: AsyncEngine, data_dir: Path
 ) -> None:
     """Containers, unsupported and empty documents publish through their own path."""
@@ -3624,7 +3636,8 @@ async def test_publishing_a_document_with_no_chunks_is_timed_as_a_publish(
         )
     )
 
-    assert report.stages.timings[Stage.PUBLISH].calls == 2
+    assert report.stages.timings[Stage.PUBLISH_CHUNKLESS].calls == 2
+    assert Stage.PUBLISH not in report.stages.timings, "publish is the commit path's"
     assert Stage.COMMIT not in report.stages.timings, "no chunks, so no vector commit happened"
 
 
@@ -3649,6 +3662,99 @@ async def test_two_runs_sharing_a_pipeline_each_report_only_their_own_time(
     assert first.stages.timings[Stage.DOCUMENT].calls == 3
     assert second.stages.timings[Stage.DOCUMENT].calls == 2
     assert pipeline.stage_timings()[Stage.DOCUMENT].calls == 5
+
+
+async def test_members_and_the_writer_queue_are_timed_and_logged(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A message with a member that cannot be read costs a member visit, a read and a write."""
+    monkeypatch.setattr("manicule.ingest.pipeline.TIMINGS_LOG_INTERVAL_S", 0.05)
+    monkeypatch.setattr("manicule.ingest.pipeline.LOOP_LAG_PERIOD_S", 0.005)
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    embedder = fakes.GatedEmbedder()
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=embedder,
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.ReadsAndExpands()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=fakes.ManualLeaseClock(),
+        detect_glossary=False,
+    )
+    connector = fakes.DictConnector(
+        {f"public-{n}": f"public synthetic line {n}" for n in range(3)}, name="members"
+    )
+
+    with caplog.at_level("INFO", logger="manicule.ingest.pipeline"):
+        task = asyncio.create_task(pipeline.run(connector))
+        await embedder.gate.wait_for(1)
+        await asyncio.sleep(0.2)
+        embedder.gate.open()
+        report = await task
+
+    timings = report.stages.timings
+    assert report.indexed == 3
+    assert timings[Stage.MEMBER].calls == 3
+    assert timings[Stage.PUBLISH_CHUNKLESS].calls == 3, "one failed member per message"
+    assert timings[Stage.PUBLISH].calls == 3, "and the message's own publish, counted apart"
+    assert timings[Stage.STORE_READ].calls >= 6
+    assert timings[Stage.LOOP_LAG].calls > 0
+    assert timings[Stage.MEMBER].longest >= timings[Stage.PUBLISH_CHUNKLESS].longest
+
+    operations = writer_ledger(engine).operations
+    assert operations["fenced_publish_document"].calls >= 3
+    assert operations["fenced_publish_failure"].calls == 3
+    assert all(visit.held >= 0.0 and visit.waited >= 0.0 for visit in operations.values())
+    lines = [r.getMessage() for r in caplog.records]
+    queue = [line for line in lines if "writer queue" in line]
+    assert queue, "the writer queue was logged while the run was going"
+    assert "max hold" in queue[-1]
+    assert any(" max " in line and "ms" in line for line in lines if "stage timings" in line)
+
+
+async def test_a_later_runs_first_writer_line_does_not_count_an_earlier_runs_writes(
+    engine: AsyncEngine, data_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=fakes.MemoryVectors(), clock=fakes.ManualLeaseClock()
+    )
+    await pipeline.run(
+        fakes.DictConnector({f"public-a{n}": f"line a {n}" for n in range(4)}, name="earlier")
+    )
+    earlier = writer_ledger(engine).totals()
+    assert sum(calls for calls, _, _ in earlier.values()) > 0
+    run = _Sync(
+        connector=cast("Any", fakes.DictConnector({}, name="later")),
+        report=RunReport(connector="later"),
+        limit=None,
+        acquire_only=False,
+        retain_source_bytes=False,
+        watermark=None,
+        blobs=cast("Any", None),
+        refs=cast("Any", None),
+        bodies=cast("Any", None),
+    )
+
+    pipeline._begin_writer_window(run)  # pyright: ignore[reportPrivateUsage]
+    with caplog.at_level("INFO", logger="manicule.ingest.pipeline"):
+        pipeline._log_writer_queue(run, 60.0)  # pyright: ignore[reportPrivateUsage]
+
+    assert not [r for r in caplog.records if "writer queue" in r.getMessage()], (
+        "nothing was written since this run began, so there is nothing to report"
+    )
 
 
 async def test_a_second_run_reports_only_its_own_time(engine: AsyncEngine, data_dir: Path) -> None:

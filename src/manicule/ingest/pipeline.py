@@ -151,6 +151,12 @@ from manicule.parsers.config import MARKDOWN_MEDIA_TYPES
 from manicule.parsers.expansion import ExpandedMember, MemberFailure
 from manicule.parsers.front_matter import MAX_FRONT_MATTER_CHARS
 from manicule.parsers.versions import parse_fingerprint
+from manicule.storage.ledger import (
+    WriterTotals,
+    WriterWindow,
+    writer_ledger,
+    writer_totals_since,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping, Sequence
@@ -981,6 +987,10 @@ class _Sync:
     count here as well as in the pipeline's, so a run reports its own time and not a neighbor's."""
 
     timings_logged_at: float = 0.0
+    writer_logged: WriterTotals = field(default_factory=dict[str, tuple[int, float, float]])
+    """The writer ledger's totals at the last progress line, to subtract from the next."""
+    writer_window: WriterWindow | None = None
+    """This run's own window onto the longest waits and holds, so another run cannot clear it."""
     timings_logged: Mapping[Stage, StageTime] = field(default_factory=dict[Stage, StageTime])
     """When, and at what totals, the last progress line was logged."""
 
@@ -1003,6 +1013,9 @@ class _Sync:
 
 
 _LOG = logging.getLogger(__name__)
+
+LOOP_LAG_PERIOD_S: Final = 0.1
+"""How often the loop-lag sampler asks the loop to wake it."""
 
 TIMINGS_LOG_INTERVAL_S: Final = 60.0
 """How often a running pipeline logs where its time went. A run report exists only at its end."""
@@ -1652,6 +1665,7 @@ class IngestPipeline:
         for gauge in (self._fetches, self._parsing, self._embedding.gauge):
             gauge.rebase()
         run.timings_logged_at = time.perf_counter()
+        self._begin_writer_window(run)
 
         with run.timings.scoped():
             stages = asyncio.create_task(self._drive(run), name=f"ingest:{connector.name}")
@@ -1824,10 +1838,13 @@ class IngestPipeline:
         everything a document can do is already an outcome by the time it reaches here, so what
         is left to raise is the store or a defect, and neither is survivable by carrying on.
 
-        The timings ticker is the one other child, started here and joined in the ``finally`` so
-        that it is gone when this returns, however it returns.
+        The timings ticker and the loop-lag sampler are the other children, started here and
+        joined in the ``finally`` so that they are gone when this returns, however it returns.
         """
-        ticker = asyncio.create_task(self._log_timings_every_interval(run), name="timings-log")
+        observers = [
+            asyncio.create_task(self._log_timings_every_interval(run), name="timings-log"),
+            asyncio.create_task(self._sample_loop_lag(run), name="loop-lag"),
+        ]
         try:
             if run.acquisitions is not None:
                 await self._drive_durable(run)
@@ -1837,9 +1854,11 @@ class IngestPipeline:
             refs, bodies = run.refs, run.bodies
             await self._run_local_stages(run, producer, refs, bodies)
         finally:
-            ticker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await ticker
+            for observer in observers:
+                observer.cancel()
+            for observer in observers:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await observer
 
     async def _drive_durable(  # noqa: PLR0911, PLR0912, PLR0915 - durable state machine
         self, run: _Sync
@@ -3013,9 +3032,10 @@ class IngestPipeline:
                         diagnostic=diagnostic,
                     )
                     continue
-                existing = await self._store.find_document(
-                    run.connector.name, record.source.source_id
-                )
+                with self._timings.timing(Stage.STORE_READ):
+                    existing = await self._store.find_document(
+                        run.connector.name, record.source.source_id
+                    )
                 run.bodies_held.enter()
                 await bodies.put(
                     _Fetched(
@@ -3292,27 +3312,103 @@ class IngestPipeline:
             await asyncio.sleep(TIMINGS_LOG_INTERVAL_S)
             self._log_timings(run)
 
+    async def _sample_loop_lag(self, run: _Sync) -> None:
+        """Record how much later than asked the event loop wakes a short timer.
+
+        Every worker's every ``await`` returns through this one loop, so time it spends busy
+        is time all of them wait, and no stage can see it: it is inside whichever one happened
+        to be waiting. One sample is the overshoot of a :data:`LOOP_LAG_PERIOD_S` sleep, which
+        is zero on an idle loop and the length of the longest uninterrupted run of other work
+        on a busy one. Ten wakeups a second, and nothing is kept per sample.
+        """
+        while True:
+            asked = time.perf_counter()
+            await asyncio.sleep(LOOP_LAG_PERIOD_S)
+            self._timings.add(
+                Stage.LOOP_LAG, max(0.0, time.perf_counter() - asked - LOOP_LAG_PERIOD_S)
+            )
+
     def _log_timings(self, run: _Sync) -> None:
         """Say where the time since the last line went, slowest stage first.
 
         The window is a difference of totals, which is why the lines compare with each other and
         with the wall clock they carry. A visit still open counts for the time it has taken so
         far, and as a call only once it ends, so a stage that has stalled shows its seconds
-        growing with no calls beside them.
+        growing with no calls beside them. ``max`` is the longest single visit in the window,
+        because a mean averages a stall away.
+
+        The second half is the engine's writer queue over the same window: how long writes
+        waited for the slot and how long they held it, and which operations held it longest.
         """
         now = time.perf_counter()
         window = now - run.timings_logged_at
         totals = run.timings.snapshot()
         spent = StageTimings.since(totals, run.timings_logged)
+        worst = run.timings.take_window_longest()
         run.timings_logged_at = now
         run.timings_logged = totals
         ranked = sorted(spent.items(), key=lambda item: item[1].seconds, reverse=True)
+        stages = "; ".join(
+            f"{stage} {used.seconds:.1f}/{used.calls} max {worst.get(stage, 0.0) * 1000:.0f}ms"
+            for stage, used in ranked
+        )
         _LOG.info(
             "ingest stage timings for %s over %.0fs (seconds summed across workers / calls): %s",
             run.connector.name,
             window,
-            "; ".join(f"{stage} {used.seconds:.1f}/{used.calls}" for stage, used in ranked)
-            or "no stage completed a visit",
+            stages or "no stage completed a visit",
+        )
+        self._log_writer_queue(run, window)
+
+    def _begin_writer_window(self, run: _Sync) -> None:
+        """Start the run's writer baseline now, so its first line does not count earlier runs.
+
+        The ledger is the engine's for the engine's lifetime and a run begins part-way through
+        it, so what the run's lines subtract from is what the ledger held when the run began.
+        """
+        engine = getattr(self._store, "engine", None)
+        if engine is None:
+            return
+        ledger = writer_ledger(engine)
+        run.writer_logged = ledger.totals(time.perf_counter())
+        run.writer_window = ledger.window()
+
+    def _log_writer_queue(self, run: _Sync, window: float) -> None:
+        engine = getattr(self._store, "engine", None)
+        if engine is None:
+            return
+        ledger = writer_ledger(engine)
+        asked = time.perf_counter()
+        totals = ledger.totals(asked)
+        moved = writer_totals_since(totals, run.writer_logged)
+        run.writer_logged = totals
+        window_longest = run.writer_window or ledger.window()
+        run.writer_window = window_longest
+        longest = window_longest.take(ledger.open_longest(asked))
+        now = ledger.current(asked)
+        if not moved and now is None:
+            return
+        ranked = sorted(moved.items(), key=lambda item: item[1][2], reverse=True)
+        busy = (
+            f"; now held by {now[0] or 'nobody'} for {now[1]:.1f}s with {now[2]} queued"
+            if now is not None
+            else ""
+        )
+        _LOG.info(
+            "ingest writer queue for %s over %.0fs: %d writes, waited %.1fs, held %.1fs%s; "
+            "by time held: %s",
+            run.connector.name,
+            window,
+            sum(change[0] for change in moved.values()),
+            sum(change[1] for change in moved.values()),
+            sum(change[2] for change in moved.values()),
+            busy,
+            "; ".join(
+                f"{name} {held:.1f}s/{calls} (waited {waited:.1f}s, "
+                f"max wait {longest.get(name, (0.0, 0.0))[0] * 1000:.0f}ms, "
+                f"max hold {longest.get(name, (0.0, 0.0))[1] * 1000:.0f}ms)"
+                for name, (calls, waited, held) in ranked[:6]
+            ),
         )
 
     async def _settle_indexed_record(
@@ -3681,38 +3777,39 @@ class IngestPipeline:
             derived[outcome.document_id] = set()
         while queue:
             owner, member = queue.pop(0)
-            # Only for an owner the gate above admitted. `setdefault` here would re-create the
-            # entry the gate had just refused, and fill it with a partial member list — which
-            # is the whole hazard, reintroduced one line after being guarded against.
-            if owner in derived:
-                derived[owner].add(member.source_id)
-            if isinstance(member, MemberFailure):
-                outcomes.append(
-                    await self._record_member_failure(
-                        member, source, owner=owner, depth=member.depth
+            with self._timings.timing(Stage.MEMBER):
+                # Only for an owner the gate above admitted. `setdefault` here would re-create the
+                # entry the gate had just refused, and fill it with a partial member list — which
+                # is the whole hazard, reintroduced one line after being guarded against.
+                if owner in derived:
+                    derived[owner].add(member.source_id)
+                if isinstance(member, MemberFailure):
+                    outcomes.append(
+                        await self._record_member_failure(
+                            member, source, owner=owner, depth=member.depth
+                        )
                     )
+                    continue
+                member_raw = _member_raw(member)
+                member_existing = await self._member_row(source, member_raw.source_id)
+                retry_member = force_members and _document_requires_local_retry(
+                    member_existing, member_raw
                 )
-                continue
-            member_raw = _member_raw(member)
-            member_existing = await self._store.find_document(source, member_raw.source_id)
-            retry_member = force_members and _document_requires_local_retry(
-                member_existing, member_raw
-            )
-            inner, deeper = await self._ingest_one(
-                member_raw,
-                source=source,
-                title=_member_title(member),
-                existing=member_existing,
-                force=retry_member,
-                blobs=blobs,
-                container_id=owner,
-                container_depth=member.depth,
-            )
-            outcomes.append(inner)
-            queue.extend((inner.document_id, item) for item in deeper)
-            # The same rule the top-level document gets, one level down, and the same one line.
-            if _expanded(inner):
-                derived.setdefault(inner.document_id, set())
+                inner, deeper = await self._ingest_one(
+                    member_raw,
+                    source=source,
+                    title=_member_title(member),
+                    existing=member_existing,
+                    force=retry_member,
+                    blobs=blobs,
+                    container_id=owner,
+                    container_depth=member.depth,
+                )
+                outcomes.append(inner)
+                queue.extend((inner.document_id, item) for item in deeper)
+                # The same rule the top-level document gets, one level down, and the same one line.
+                if _expanded(inner):
+                    derived.setdefault(inner.document_id, set())
         for container, present in derived.items():
             outcomes.extend(await self._retire_absent_members(container, present))
         return outcomes
@@ -3737,7 +3834,8 @@ class IngestPipeline:
         source_bytes = raw.as_bytes()
         digest = content_hash(source_bytes)
         if existing is None:
-            existing = await self._store.find_document(source, raw.source_id)
+            with self._timings.timing(Stage.STORE_READ):
+                existing = await self._store.find_document(source, raw.source_id)
 
         if not force and self._unchanged_by_hash(existing, digest, raw):
             if existing is None:  # pragma: no cover - the predicate rejects absence
@@ -3975,7 +4073,9 @@ class IngestPipeline:
         found it unchanged — which is every sync after the first.
         """
         outcomes: list[DocumentOutcome] = []
-        for member in await self._store.container_members(container_id):
+        with self._timings.timing(Stage.STORE_READ):
+            members = await self._store.container_members(container_id)
+        for member in members:
             if member.source_id in present:
                 continue
             # The whole subtree, because a soft delete does not cascade: `container_id` carries
@@ -3992,6 +4092,11 @@ class IngestPipeline:
                     )
                 )
         return outcomes
+
+    async def _member_row(self, source: str, source_id: str) -> Document | None:
+        """The stored row of a member, timed as the store read it is."""
+        with self._timings.timing(Stage.STORE_READ):
+            return await self._store.find_document(source, source_id)
 
     async def _record_member_failure(
         self, member: MemberFailure, source: str, *, owner: str | None = None, depth: int = 0
@@ -4024,7 +4129,7 @@ class IngestPipeline:
             version_token=None,
             title="",
             identifier=document_id(self._workspace, source, member.source_id),
-            existing=await self._store.find_document(source, member.source_id),
+            existing=await self._member_row(source, member.source_id),
             container_id=owner,
             container_depth=depth,
             retention=Retention(
@@ -4184,7 +4289,8 @@ class IngestPipeline:
         """
         if existing is None:
             return {}
-        stored = await self._store.document_chunks(document.id)
+        with self._timings.timing(Stage.STORE_READ):
+            stored = await self._store.document_chunks(document.id)
         return {chunk.id: chunk.embed_text for chunk in stored}
 
     async def _prepare(self, result: ChainResult, document: Document) -> list[Chunk]:
@@ -4294,7 +4400,7 @@ class IngestPipeline:
         fence = await self._publication_authority()
         publisher = self._fenced_store if fence is not None else None
         publish = publisher.fenced_publish_document if publisher is not None else None
-        with self._timings.timing(Stage.PUBLISH):
+        with self._timings.timing(Stage.PUBLISH_CHUNKLESS):
             if fence is not None and publish is not None:
                 committed = await publish(
                     fence,
@@ -4885,7 +4991,7 @@ class IngestPipeline:
             return document
         fence = await self._publication_authority()
         publisher = self._fenced_store if fence is not None else None
-        with self._timings.timing(Stage.PUBLISH):
+        with self._timings.timing(Stage.PUBLISH_CHUNKLESS):
             if fence is not None and publisher is not None:
                 committed = await publisher.fenced_publish_failure(
                     fence,
