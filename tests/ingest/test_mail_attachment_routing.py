@@ -116,6 +116,7 @@ def indexed() -> Indexer:
         ),
         ("application/json", b'{"jsonmarker": 1}\n', "7bit", "d.json", "jsonmarker"),
     ],
+    ids=lambda case: f"{case[0]}-{case[3]}",
 )
 async def test_an_attachment_is_indexed_whatever_the_client_called_it(
     indexed: Indexer, case: tuple[str, bytes, str, str, str]
