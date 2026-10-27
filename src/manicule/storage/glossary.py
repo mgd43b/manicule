@@ -30,6 +30,7 @@ from manicule.core.glossary import DefinitionForm, GlossaryEntry
 from manicule.core.ids import glossary_entry_id
 from manicule.core.retrieval import Filter
 from manicule.storage import models
+from manicule.storage.engine import admitted_writer
 from manicule.storage.organization import resolve_filter
 from manicule.storage.scoped import WorkspaceScoped
 
@@ -121,6 +122,7 @@ class GlossaryMixin(WorkspaceScoped):
     is: one handle, one workspace, one session factory, however many protocols it satisfies.
     """
 
+    @admitted_writer
     async def replace_glossary_entries(
         self, document_id: str, entries: Sequence[GlossaryEntry], *, fingerprint: str
     ) -> None:

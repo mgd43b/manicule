@@ -223,7 +223,7 @@ class _Store:
 
 def _busy() -> sqlite3.OperationalError:
     error = sqlite3.OperationalError("database is locked")
-    error.sqlite_errorcode = sqlite3.SQLITE_BUSY  # type: ignore[attr-defined]
+    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
     return error
 
 
@@ -274,5 +274,15 @@ async def test_every_document_write_the_ingest_path_makes_is_queued() -> None:
         "fenced_annotate",
         "set_lineage",
         "set_original",
+        "stage_vectors",
+        "fenced_stage_vectors",
+        "replace_chunks",
+        "record_index_fingerprints",
+        "set_watermark",
+        "mark_source_sensitive",
+        "record_connector_metadata",
+        "relate",
+        "unrelate",
+        "replace_glossary_entries",
     ):
-        assert hasattr(getattr(SqliteDocStore, name), "__wrapped__"), name
+        assert getattr(getattr(SqliteDocStore, name), "queued_writer", False), name

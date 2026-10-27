@@ -428,6 +428,7 @@ class SqliteDocStore(
                 "discard the stale writer and retry with a fresh runtime handle"
             )
 
+    @admitted_writer
     async def stage_vectors(
         self,
         publication_id: str,
@@ -442,6 +443,7 @@ class SqliteDocStore(
             await self._fence_derived_reset(session, expected_reset_epoch)
             await self._stage_vectors_in(session, publication_id, chunks)
 
+    @admitted_writer
     async def fenced_stage_vectors(
         self,
         fence: AcquisitionFence,
@@ -1302,6 +1304,7 @@ class SqliteDocStore(
                 vector_table=row.vector_table,
             )
 
+    @admitted_writer
     async def record_index_fingerprints(
         self, state: IndexFingerprints, *, expected_reset_epoch: int | None = None
     ) -> None:
@@ -1391,6 +1394,7 @@ class SqliteDocStore(
 
     # --- chunks ---------------------------------------------------------------------------
 
+    @admitted_writer
     async def replace_chunks(self, document_id: str, chunks: Sequence[Chunk]) -> None:
         """Replace a document's chunks wholesale. Re-parsing is not additive.
 
@@ -1597,6 +1601,7 @@ class SqliteDocStore(
                 return None
             return _WATERMARK.validate_python(row.watermark)
 
+    @admitted_writer
     async def set_watermark(self, connector: str, watermark: Watermark) -> None:
         """Record how far a sync got.
 
@@ -1629,6 +1634,7 @@ class SqliteDocStore(
             )
             return frozenset(rows.scalars().all())
 
+    @admitted_writer
     async def mark_source_sensitive(self, connector: str) -> None:
         """Record, once, that a sensitive connector has synced this source.
 
@@ -1669,6 +1675,7 @@ class SqliteDocStore(
             )
             return metadata
 
+    @admitted_writer
     async def record_connector_metadata(self, connector: str, updates: Mapping[str, Any]) -> None:
         """Merge keys into a connector's metadata, dropping any set to ``None``.
 

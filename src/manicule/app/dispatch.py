@@ -100,9 +100,9 @@ _HINTS: dict[type[Exception], str] = {
         "Free durable ingest capacity or raise the configured limit, then retry."
     ),
     AcquisitionLeaseHeldError: (
-        "A sync of this connector is running, or one that failed is still within its lease "
-        "(five minutes by default). Check `connector list`, then retry once it has finished "
-        "or the lease has expired; the retry resumes from the last committed prefix."
+        "A sync of this connector is running, or one that failed is still within its lease. "
+        "Check `connector list`, then retry once it has finished or the lease has expired; "
+        "the retry resumes from the last committed prefix."
     ),
     StorageBusyError: (
         "Another writer holds durable storage. Retry the same operation — durable work "

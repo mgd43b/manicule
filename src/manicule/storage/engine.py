@@ -26,6 +26,7 @@ from manicule.core.errors import InsecureTargetError, StorageBusyError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
+    from types import CoroutineType
 
     from sqlalchemy.engine.interfaces import DBAPIConnection, Dialect
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -119,7 +120,7 @@ def sqlite_busy(error: BaseException) -> bool:
 
 def admitted_writer[**P, R](
     operation: Callable[Concatenate[Any, P], Coroutine[Any, Any, R]],
-) -> Callable[Concatenate[Any, P], Coroutine[Any, Any, R]]:
+) -> Callable[Concatenate[Any, P], CoroutineType[Any, Any, R]]:
     """Queue one whole-transaction write with every other managed writer, and retry a lost slot.
 
     For a method of a store that has an ``engine`` and opens exactly one transaction, which
@@ -148,6 +149,7 @@ def admitted_writer[**P, R](
             # Outside the handler: no SQL, bound value or path survives into a durable report.
             raise StorageBusyError("the committed documents are kept") from None
 
+    admitted.queued_writer = True  # type: ignore[attr-defined]
     return admitted
 
 

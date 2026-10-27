@@ -986,7 +986,7 @@ async def test_an_unexpected_failure_does_not_end_the_sync_schedule() -> None:
     assert scheduler.scheduled["mail"].runs == 1, "the sync after the failure still ran"
 
 
-async def test_a_held_lease_is_an_ordinary_failure_the_schedule_retries() -> None:
+async def test_a_held_lease_is_skipped_not_counted_and_the_schedule_retries() -> None:
     service, ingestion = service_with({"mail": source(schedule_s=600)})
     clock = Clock()
     ingestion.failure = AcquisitionLeaseHeldError("mail")
@@ -1000,7 +1000,8 @@ async def test_a_held_lease_is_an_ordinary_failure_the_schedule_retries() -> Non
     finally:
         await scheduler.aclose()
 
-    assert scheduler.scheduled["mail"].failures == 2
+    assert scheduler.scheduled["mail"].failures == 0, "an overlap with a manual run is not a fault"
+    assert len(ingestion.synced) == 2, "the schedule kept asking"
 
 
 async def test_an_unexpected_sweep_failure_does_not_end_the_loop() -> None:

@@ -35,7 +35,7 @@ from manicule.app import commands, control
 from manicule.app.dispatch import run_op
 from manicule.connectors.credentials import BrowserSession
 from manicule.connectors.errors import SessionMissingError
-from manicule.core.errors import ManiculeError
+from manicule.core.errors import AcquisitionLeaseHeldError, ManiculeError
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -630,6 +630,10 @@ class Scheduler:
                 # silently: the exception is never retrieved.
                 record.failures += 1
                 record.last_error_type = type(exc).__name__
+                announce(
+                    f"scheduled vector sweep failed ({type(exc).__name__} at "
+                    f"{failure_site(exc)}); the next pass is in {interval_s:g}s"
+                )
                 continue
             record.runs += 1
             if not swept.ran:
@@ -685,8 +689,9 @@ class Scheduler:
                 record.failures += 1
                 record.last_error_type = type(exc).__name__
                 announce(
-                    f"scheduled reconciliation of {name!r} failed ({type(exc).__name__}); "
-                    f"nothing was deleted and the next look is in {poll_s:g}s"
+                    f"scheduled reconciliation of {name!r} failed ({type(exc).__name__} at "
+                    f"{failure_site(exc)}); nothing was deleted and the next look is in "
+                    f"{poll_s:g}s"
                 )
                 continue
             if result is None:
@@ -785,6 +790,13 @@ class Scheduler:
                     f"`manicule connector login {name} --browser`; the schedule keeps trying "
                     f"every {interval_s:g}s until you do. Details: {exc}"
                 )
+            except AcquisitionLeaseHeldError:
+                # Another run, typically one started by hand, still owns the connector. That is
+                # the ordinary overlap and not a fault, so it is not counted as a failure.
+                announce(
+                    f"scheduled sync of {name!r} skipped: a run still holds its lease; "
+                    f"trying again in {interval_s:g}s"
+                )
             except (ManiculeError, ValueError, OSError) as exc:
                 # The outcomes a caller could act on, which here means the operator reading the
                 # server's output. Recorded and carried on, because a source that was
@@ -799,8 +811,8 @@ class Scheduler:
                 record.failures += 1
                 record.last_error_type = type(exc).__name__
                 announce(
-                    f"scheduled sync of {name!r} failed unexpectedly ({type(exc).__name__}); "
-                    f"it will be tried again in {interval_s:g}s"
+                    f"scheduled sync of {name!r} failed unexpectedly ({type(exc).__name__} at "
+                    f"{failure_site(exc)}); it will be tried again in {interval_s:g}s"
                 )
             else:
                 # A returned report proves this source got past session acquisition. Keeping a
@@ -830,6 +842,21 @@ class Scheduler:
                     followed = report.reconciliation
                     if followed is not None and name in self.reconciling:
                         self._record_reconciliation(self.reconciling[name], followed)
+
+
+def failure_site(exc: BaseException) -> str:
+    """Where an unexpected exception was raised, without anything it carries.
+
+    ``module:function:line`` of the innermost frame. The message is withheld because a driver
+    error's text can hold SQL, bound values or paths; the site is enough to find the cause.
+    """
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    if tb is None:
+        return "unknown"
+    code = tb.tb_frame.f_code
+    return f"{tb.tb_frame.f_globals.get('__name__', '?')}:{code.co_name}:{tb.tb_lineno}"
 
 
 def announce(message: str) -> None:
