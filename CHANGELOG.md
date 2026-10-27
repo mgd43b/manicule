@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.18](https://github.com/mgd43b/manicule/compare/v0.2.17...v0.2.18) (2026-10-27)
+
+
+### Bug Fixes
+
+* **ingest:** queue document writes and retry a lost writer slot, and type a held acquisition lease ([#512](https://github.com/mgd43b/manicule/issues/512)) ([300fece](https://github.com/mgd43b/manicule/commit/300fece849110db9b540b6fb322e47fd5dedcd22))
+
 ## [0.2.17](https://github.com/mgd43b/manicule/compare/v0.2.16...v0.2.17) (2026-10-27)
 
 
