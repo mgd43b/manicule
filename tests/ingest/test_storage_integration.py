@@ -86,7 +86,7 @@ from manicule.parsers.plaintext import PlaintextParser
 from manicule.parsers.versions import parse_fingerprint
 from manicule.storage.blobs import BlobStore, StoredBlob
 from manicule.storage.docstore import SqliteDocStore
-from manicule.storage.engine import writer_ledger
+from manicule.storage.ledger import writer_ledger
 from manicule.storage.models import FTS_TOKENIZER
 from manicule.storage.rebuild import SqliteRebuildStore
 from manicule.storage.vectors import LanceVectorStore

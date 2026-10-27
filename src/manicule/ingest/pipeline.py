@@ -151,7 +151,7 @@ from manicule.parsers.config import MARKDOWN_MEDIA_TYPES
 from manicule.parsers.expansion import ExpandedMember, MemberFailure
 from manicule.parsers.front_matter import MAX_FRONT_MATTER_CHARS
 from manicule.parsers.versions import parse_fingerprint
-from manicule.storage.engine import (
+from manicule.storage.ledger import (
     WriterTotals,
     WriterWindow,
     writer_ledger,
