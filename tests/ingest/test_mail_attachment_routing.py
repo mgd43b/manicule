@@ -115,6 +115,20 @@ def indexed() -> Indexer:
             "readme marker",
         ),
         ("application/json", b'{"jsonmarker": 1}\n', "7bit", "d.json", "jsonmarker"),
+        (
+            "application/ics",
+            b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:icsmarker\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            "7bit",
+            "invite.ics",
+            "icsmarker",
+        ),
+        (
+            "application/octet-stream",
+            b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:sniffedics\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            "7bit",
+            "event",
+            "sniffedics",
+        ),
     ],
     ids=lambda case: f"{case[0]}-{case[3]}",
 )

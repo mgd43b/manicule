@@ -163,6 +163,7 @@ _MEDIA_TYPE_BY_SUFFIX: Final[Mapping[str, str]] = {
     ".eml": "message/rfc822",
     ".htm": "text/html",
     ".html": "text/html",
+    ".ics": "text/calendar",
     ".ipynb": "application/x-ipynb+json",
     ".json": "application/json",
     ".log": "text/plain",

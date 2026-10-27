@@ -15,9 +15,9 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | CLI capability items | 48 | #8 — **built** |
 | MCP capability items | 47 | #8 — **built** |
 | HTTP endpoints | 64 | #11 — **built** |
-| File types | 18 | #4 |
+| File types | 19 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **217** | |
+| **Total** | **218** | |
 
 ## CLI — 48
 
@@ -330,7 +330,7 @@ name — an absence with no test is an absence that comes back.
   session count; change a role or disable/enable a membership; end every session a member holds.
   Admin-only. `docs/surfaces.md` §9.2.1.
 
-## File types — 18
+## File types — 19
 
 Ticket: #4
 
@@ -339,6 +339,7 @@ Ticket: #4
 - [ ] `.eml` (parser-email)
 - [ ] `.htm` (parser-html)
 - [ ] `.html` (parser-html)
+- [ ] `.ics` (core/calendar)
 - [ ] `.ipynb` (parser-jupyter)
 - [ ] `.json` (core/structured)
 - [ ] `.md` (core/markdown)

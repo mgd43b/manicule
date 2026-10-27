@@ -2548,6 +2548,14 @@ decoder whose license has to be checked against §12 before it is added. Filed a
 if it matters on a real mailbox; sniffed as `application/vnd.ms-tnef` so that it is at least
 named.
 
+**`application/gzip` and tar.** Not built; the archive parser reads zip only (§9). A gzip attachment
+on a mailbox is almost always a gzipped DMARC report, which the decision below leaves unsupported
+whether or not it is decompressed, so decompression would spend the byte, ratio and depth limits of
+§9.3 to reach a document that is then declined. A tar needs its own hardening (symlinks, hard links
+and devices, which zip does not have) for a format that is rare in mail. Both are sniffed and named
+(`application/gzip`, `application/x-tar`) so that adding them later is a container parser and not a
+routing change; the work is filed as #504.
+
 **`application/xml`.** No generic XML parser. The attachments in this category are overwhelmingly
 DMARC aggregate reports: machine-generated tables of source addresses, counts and pass/fail
 verdicts. They do not answer questions people ask a search index in prose, they would add a
@@ -2555,6 +2563,25 @@ large number of near-identical chunks that match on a domain name and outrank th
 mentions it, and an anchor into them would cite a table of IP addresses. They stay
 `unsupported_media_type`, with no cost beyond the row, and a deployment that does want them can
 route `application/xml` to the plaintext parser under `parserFallbacks` (§6.2).
+
+### 10.4 Calendar invitations
+
+`text/calendar` (also `application/ics`, read as that type, and `.ics`) is parsed by
+`manicule.parsers.calendar.CalendarParser`. It follows the mail parser's design: the anchors
+address **one canonical text composed by the parser**, not the source file, and `resolve`
+rebuilds it from the bytes. A line anchor into the source would cite folded fragments of a
+property (`ATTENDEE;CN=...;PARTSTAT=...:mailto:...`), and the text it resolved to would not be
+what the reader sees.
+
+The canonical text is one stanza per `VEVENT`, `VTODO` or `VJOURNAL` — `Event:`/`Task:`/`Note:`
+with the summary, then `When:`, `Where:`, `Organizer:`, `Attendees:`, `Status:`, `Repeats:` and
+`Description:` where present — with a blank line between stanzas, so the paragraph rule of §4.5
+cuts at events. Lines are unfolded, `\n`, `\,`, `\;` and `\\` are unescaped, and a mailto
+address is shown with its common name. Times are printed as written (`TZID` as a suffix), never
+converted: a conversion needs the sender's zone definition, and a wrong one is worse than an
+honest zone name. Alarms and time-zone definitions are machinery and are not rendered. A stream
+with no `BEGIN:VCALENDAR` is declined, and one with more than `maxComponents` (5000) events is
+declined rather than truncated. Standard library only, so no dependency moves what is stored.
 
 **`.msg` is the one format whose obvious library is license-incompatible.** The maintained
 Python `.msg` parser, `extract-msg`, is GPL-3.0, which is disqualifying for an MIT project (§12).

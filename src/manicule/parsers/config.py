@@ -52,6 +52,7 @@ __all__ = [
     "ADF_MEDIA_TYPE",
     "ADF_MEDIA_TYPES",
     "ARCHIVE_MEDIA_TYPES",
+    "CALENDAR_MEDIA_TYPES",
     "CONFLUENCE_MEDIA_TYPE",
     "CONFLUENCE_MEDIA_TYPES",
     "CSV_MEDIA_TYPE",
@@ -77,6 +78,7 @@ __all__ = [
     "XLSX_MEDIA_TYPE",
     "ADFConfig",
     "ArchiveConfig",
+    "CalendarConfig",
     "ConfluenceConfig",
     "DiagramConfig",
     "MailConfig",
@@ -211,6 +213,10 @@ is the finest address there is.
 Declared narrowly. The global fallback tail routes by configuration, not by a parser
 claiming every media type for itself — a parser that claimed ``*`` would win documents a real
 parser was installed to handle."""
+
+CALENDAR_MEDIA_TYPES = frozenset({"text/calendar"})
+"""``application/ics`` and the other spellings are read as this type before routing
+(``docs/parsing.md`` §6.1)."""
 
 STRUCTURED_MEDIA_TYPES = frozenset(
     {
@@ -750,6 +756,23 @@ class MsgConfig(BaseModel):
         default=64 * 1024 * 1024,
         ge=1,
         description="Most bytes one attachment may hold before it is refused.",
+    )
+
+
+class CalendarConfig(BaseModel):
+    """Configuration for :class:`~manicule.parsers.calendar.CalendarParser`."""
+
+    max_block_lines: int = Field(
+        default=100,
+        ge=1,
+        description="Longest run of lines one block may span before it is split at a line "
+        "boundary into parts that each keep their own exact span.",
+    )
+    max_components: int = Field(
+        default=5000,
+        ge=1,
+        description="Most events, tasks and notes read from one calendar. A feed export can "
+        "hold years of them, and past this the document is declined rather than truncated.",
     )
 
 
