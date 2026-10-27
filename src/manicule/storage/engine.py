@@ -13,18 +13,20 @@ import stat
 import threading
 import weakref
 from contextlib import suppress
+from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, override
+from typing import TYPE_CHECKING, Any, Concatenate, Final, override
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 from sqlalchemy.util import await_only, greenlet_spawn
 
-from manicule.core.errors import InsecureTargetError
+from manicule.core.errors import InsecureTargetError, StorageBusyError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Coroutine
+    from types import CoroutineType
 
     from sqlalchemy.engine.interfaces import DBAPIConnection, Dialect
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -114,6 +116,41 @@ def sqlite_busy(error: BaseException) -> bool:
             if isinstance(related, BaseException):
                 pending.append(related)
     return False
+
+
+def admitted_writer[**P, R](
+    operation: Callable[Concatenate[Any, P], Coroutine[Any, Any, R]],
+) -> Callable[Concatenate[Any, P], CoroutineType[Any, Any, R]]:
+    """Queue one whole-transaction write with every other managed writer, and retry a lost slot.
+
+    For a method of a store that has an ``engine`` and opens exactly one transaction, which
+    commits or rolls back before the method returns — so running it again after SQLITE_BUSY
+    repeats nothing that was kept. **Never decorate a method that another decorated method
+    awaits, or that is called while ``writer_admission`` is held**: the lock is not reentrant,
+    and the second acquisition waits for the first for ever.
+
+    Exhausting the retry raises :class:`~manicule.core.errors.StorageBusyError`, which the
+    pipeline treats as an orderly, retryable stop that keeps the committed prefix. Without
+    this a document write that lost the slot ended the run with the driver's own error, its SQL
+    and bound values included.
+    """
+
+    @wraps(operation)
+    async def admitted(store: Any, *args: P.args, **kwargs: P.kwargs) -> R:  # noqa: ANN401
+        async with writer_admission(store.engine):
+            for delay in SQLITE_BUSY_RETRY_DELAYS:
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    return await operation(store, *args, **kwargs)
+                except Exception as error:
+                    if not sqlite_busy(error):
+                        raise
+            # Outside the handler: no SQL, bound value or path survives into a durable report.
+            raise StorageBusyError("the committed documents are kept") from None
+
+    admitted.queued_writer = True  # type: ignore[attr-defined]
+    return admitted
 
 
 class StorageLayoutError(Exception):
@@ -443,6 +480,7 @@ __all__ = [
     "PRAGMAS",
     "VECTORS_DIRNAME",
     "StorageLayoutError",
+    "admitted_writer",
     "attach_pragmas",
     "create_engine",
     "database_path",

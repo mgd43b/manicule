@@ -60,7 +60,7 @@ from manicule.core.content import (
     Retention,
 )
 from manicule.core.embedding import IndexFingerprints, Vector
-from manicule.core.errors import StorageBusyError
+from manicule.core.errors import AcquisitionLeaseHeldError, StorageBusyError
 from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.rebuild import RebuildCheckpoint, RebuildState, RebuildTarget
 from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, Watermark
@@ -1276,7 +1276,7 @@ async def test_mixed_exception_group_remains_a_crash_and_keeps_lease_fence(
     durable = await store.latest_unsettled_acquisition_run(connector.name)
     assert durable is not None
     assert durable.lease_owner is not None
-    with pytest.raises(RuntimeError, match="could not be claimed"):
+    with pytest.raises(AcquisitionLeaseHeldError, match="holds its lease"):
         await pipeline.run(connector)
 
 
@@ -2657,6 +2657,44 @@ async def test_heartbeat_contention_does_not_cancel_the_owned_publication(
     assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
+async def test_a_refused_publication_stops_the_run_instead_of_failing_the_document(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """A document-level handler must not turn the writer refusal into a failed document."""
+
+    class RefusingPublicationStore(SqliteDocStore):
+        @override
+        async def fenced_publish_document(self, *args: Any, **kwargs: Any) -> Commit:
+            raise StorageBusyError
+
+    store = RefusingPublicationStore(engine)
+    await store.ensure_workspace()
+    connector = fakes.DictConnector({"refused": "public synthetic line"}, name="refused-source")
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+
+    report = await asyncio.wait_for(pipeline.run(connector), timeout=30)
+
+    assert report.error_type == "StorageBusyError"
+    assert report.by_status.get("failed", 0) == 0, "the refusal became the document's failure"
+    unsettled = await store.latest_unsettled_acquisition_run(connector.name)
+    assert unsettled is not None
+    assert unsettled.lease_owner is None, "an orderly stop releases the lease"
+
+
 async def test_synchronous_document_preparation_does_not_block_lease_renewal(
     engine: AsyncEngine,
     data_dir: Path,
@@ -2947,12 +2985,13 @@ async def test_takeover_after_the_pipeline_check_is_refused_inside_publication_t
             self.release = asyncio.Event()
 
         @override
-        async def _fence_acquisition_mutation(
-            self, session: AsyncSession, fence: AcquisitionFence
-        ) -> None:
+        async def fenced_publish_document(self, *args: Any, **kwargs: Any) -> Commit:
+            # Held *before* the write enters the engine's writer queue. Holding it inside the
+            # queue would stop the successor's claim, which waits in the same queue, and the
+            # test would wait on itself. The transaction still validates ownership when it runs.
             self.arrived.set()
             await self.release.wait()
-            await super()._fence_acquisition_mutation(session, fence)
+            return await super().fenced_publish_document(*args, **kwargs)
 
     class EmptyChunker(fakes.BlockChunker):
         @override

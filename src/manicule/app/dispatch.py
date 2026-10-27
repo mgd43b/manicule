@@ -31,6 +31,7 @@ from manicule.app.results import (
 )
 from manicule.app.tenancy import CrossWorkspaceError
 from manicule.core.errors import (
+    AcquisitionLeaseHeldError,
     AmbiguousHandleError,
     ConfigError,
     FingerprintMismatchError,
@@ -97,6 +98,11 @@ _HINTS: dict[type[Exception], str] = {
     ),
     CapacityRefusedError: (
         "Free durable ingest capacity or raise the configured limit, then retry."
+    ),
+    AcquisitionLeaseHeldError: (
+        "A sync of this connector is running, or one that failed is still within its lease. "
+        "Check `connector list`, then retry once it has finished or the lease has expired; "
+        "the retry resumes from the last committed prefix."
     ),
     StorageBusyError: (
         "Another writer holds durable storage. Retry the same operation — durable work "

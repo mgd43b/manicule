@@ -101,6 +101,7 @@ from manicule.core.content import (
 )
 from manicule.core.embedding import canonical_stored_vector
 from manicule.core.errors import (
+    AcquisitionLeaseHeldError,
     AcquisitionLeaseLostError,
     ChunkingError,
     ContextOverflowError,
@@ -1380,8 +1381,7 @@ class IngestPipeline:
             expires_at=now + timedelta(seconds=self._acquisition_lease_s),
         )
         if claimed is None:
-            msg = f"an active acquisition run for connector {connector.name!r} could not be claimed"
-            raise RuntimeError(msg)
+            raise AcquisitionLeaseHeldError(connector.name)
         if claimed.state not in {
             AcquisitionRunState.ENUMERATING,
             AcquisitionRunState.ACQUIRING,
@@ -4139,7 +4139,10 @@ class IngestPipeline:
                     reuse=reuse_vectors,
                     timings=self._timings,
                 )
-        except _SupersededError:
+        except (_SupersededError, StorageBusyError):
+            # A refused writer slot is the run's to stop on, not this document's to fail:
+            # demoting writes again, and a follow-up that happened to succeed would turn the
+            # orderly, lease-releasing stop into a failed document and a run that carries on.
             raise
         except _StageError as failure:
             return await self._demote(document, existing, failure.stage, failure.detail)
@@ -4412,7 +4415,7 @@ class IngestPipeline:
                         source_dependencies=_source_dependencies(indexed_document),
                         expected_reset_epoch=self._expected_reset_epoch,
                     )
-        except (AcquisitionLeaseLostError, DerivedResetFenceLostError):
+        except (AcquisitionLeaseLostError, DerivedResetFenceLostError, StorageBusyError):
             raise
         except Exception as exc:  # noqa: BLE001 - a store failure is this document's
             return await self._demote(
@@ -5007,6 +5010,9 @@ class IngestPipeline:
         try:
             with self._timings.timing(Stage.AFTER_STORE):
                 await self._middleware.after_store(document)
+        except StorageBusyError:
+            # A hook's relation or glossary write lost the writer slot; that stops the run.
+            raise
         except Exception as exc:  # noqa: BLE001 - the document is already committed
             updates: Metadata = {"last_after_store_error": f"{type(exc).__name__}: {exc}"}
             fence = await self._publication_authority()

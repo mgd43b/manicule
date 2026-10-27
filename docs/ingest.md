@@ -2690,6 +2690,19 @@ closes the failed session, releases the logical lease after workers join, and le
 prefix immediately resumable. The public envelope contains no SQL, bound values, source identity,
 or machine path.
 
+**Document writes use the same queue.** Every write the ingest path makes to the document
+store — publication, status, lineage, vector staging, chunk and relation and glossary
+replacement, and the connector's watermark and metadata — is marked `@admitted_writer`
+(`storage/engine.py`), so it waits in the one writer queue and takes the same bounded retry.
+Before this, a lost writer slot on any of them ended a run with the driver's own error and left
+the lease fence held. The queue is not reentrant: a queued method must never await another one,
+and nothing may call one while holding `writer_admission`.
+
+A claim refused because another run still holds the connector's lease raises
+`AcquisitionLeaseHeldError` (a `ManiculeError`, rendered with a hint on every surface). A
+scheduled sync that meets one skips that tick without counting a failure; any other unexpected
+exception in a scheduler loop is recorded by type and site and the loop continues.
+
 **Every managed writer to the database queues there, not only the journal.** A second queue is
 not a queue: retained-blob marker bookkeeping — one row per acquired document — used to open its
 transaction straight against the engine while the journal's writes waited their turn, and losing

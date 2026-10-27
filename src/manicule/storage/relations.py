@@ -26,6 +26,7 @@ from sqlalchemy import delete, or_, select
 from manicule.core.errors import UnknownEntityError
 from manicule.core.organization import ChunkEdge, ChunkRelationType
 from manicule.storage import models
+from manicule.storage.engine import admitted_writer
 from manicule.storage.scoped import WorkspaceScoped
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
 class RelationsMixin(WorkspaceScoped):
     """:class:`~manicule.core.protocols.ChunkRelationStore` over SQLite."""
 
+    @admitted_writer
     async def relate(
         self, source_chunk_id: str, target_chunk_id: str, relation_type: ChunkRelationType
     ) -> None:
@@ -72,6 +74,7 @@ class RelationsMixin(WorkspaceScoped):
                     )
                 )
 
+    @admitted_writer
     async def unrelate(
         self, source_chunk_id: str, target_chunk_id: str, relation_type: ChunkRelationType
     ) -> None:
