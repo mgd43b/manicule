@@ -37,6 +37,7 @@ from starlette.responses import PlainTextResponse
 
 from manicule.app import frontdoor
 from manicule.app.bind import require_authoring_authentication, resolve_bind, stdio
+from manicule.app.ingest_logging import configure_ingest_logging
 from manicule.app.request_logging import configure_request_logging
 from manicule.app.request_logging_http import RequestLoggingMiddleware
 from manicule.app.results import ServerAddress
@@ -190,6 +191,7 @@ async def serve(
         allow_public=allow_public,
         allow_unauthenticated=allow_unauthenticated,
     )
+    configure_ingest_logging()
     if service.settings.logging.requests:
         configure_request_logging(service.settings)
     server = surface(service, transport=transport).server

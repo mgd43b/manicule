@@ -1115,8 +1115,12 @@ tasks it started, so two runs sharing a pipeline do not see each other. The repo
 a run ends, so a running pipeline also logs the last minute's totals as one line on a timer
 (`ingest stage timings for <connector> ...`, slowest stage first), including a minute in which
 no document finished, and `IngestPipeline.stage_timings()` returns the pipeline's running
-totals. Counters only: the stage names are a fixed enumeration (`Stage`) and nothing from a
-document is kept.
+totals. The line goes to standard error: `manicule serve` sets the `manicule.ingest` logger to
+`INFO` when it starts, because a logger nobody has configured drops everything below `WARNING`,
+and gives it a standard-error handler unless the host already has one on that logger or the root,
+in which case the host's own handlers receive it. A one-off command that is not a server prints
+no such line and reports through its progress output and run report. Counters only: the stage
+names are a fixed enumeration (`Stage`) and nothing from a document is kept.
 
 `blocked_puts` on the fetch hand-off is direct evidence that the bounded journal reader waited
 for local fetch capacity. It no longer describes source discovery, which has already completed.
