@@ -2548,6 +2548,14 @@ decoder whose license has to be checked against §12 before it is added. Filed a
 if it matters on a real mailbox; sniffed as `application/vnd.ms-tnef` so that it is at least
 named.
 
+**`application/gzip` and tar.** Not built; the archive parser reads zip only (§9). A gzip attachment
+on a mailbox is almost always a gzipped DMARC report, which the decision below leaves unsupported
+whether or not it is decompressed, so decompression would spend the byte, ratio and depth limits of
+§9.3 to reach a document that is then declined. A tar needs its own hardening (symlinks, hard links
+and devices, which zip does not have) for a format that is rare in mail. Both are sniffed and named
+(`application/gzip`, `application/x-tar`) so that adding them later is a container parser and not a
+routing change; the work is filed as #504.
+
 **`application/xml`.** No generic XML parser. The attachments in this category are overwhelmingly
 DMARC aggregate reports: machine-generated tables of source addresses, counts and pass/fail
 verdicts. They do not answer questions people ask a search index in prose, they would add a
