@@ -27,6 +27,7 @@ import uvicorn
 
 from manicule.api.app import ROUTE_GROUPS, build_app
 from manicule.app.bind import resolve_bind
+from manicule.app.ingest_logging import configure_ingest_logging
 from manicule.app.request_logging import configure_request_logging
 from manicule.app.results import ServerAddress
 
@@ -206,6 +207,7 @@ def server_for(
 
         msg = "an HTTP bind was resolved without a port"
         raise PolicyError(msg)
+    configure_ingest_logging()
     if service.settings.logging.requests:
         configure_request_logging(service.settings)
     config = uvicorn.Config(
