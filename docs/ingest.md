@@ -1121,8 +1121,9 @@ for the whole transaction, COMMIT included, and queues for it first, so a stage 
 cannot say whether its time was the write or the queue in front of it. The log carries, beside
 the stage line, `ingest writer queue for <connector> ...`: writes, seconds queued, seconds
 held, and per operation (named by the store method, never by a value) the time held, the time
-queued and the longest single wait and hold in the window. Because a write is only counted
-when it ends, the line also says who holds the slot right now, for how long, and how many are
+queued and the longest single wait and hold in the window. A write still waiting or holding adds the time
+it has taken so far to the window (and to its maximum), and counts as a call only when it
+ends. The line also says who holds the slot right now, for how long, and how many are
 queued behind it: a stall inside COMMIT shows there while nothing else is finishing. If the sum
 held approaches the window, the
 writer is the limit and the lines say which operations to batch; if it is a small share, the

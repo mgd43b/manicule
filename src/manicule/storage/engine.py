@@ -117,7 +117,7 @@ def writer_totals_since(now: WriterTotals, base: WriterTotals) -> WriterTotals:
     moved: WriterTotals = {}
     for name, (calls, waited, held) in now.items():
         before_calls, before_waited, before_held = base.get(name, (0, 0.0, 0.0))
-        if calls > before_calls:
+        if calls > before_calls or waited > before_waited or held > before_held:
             moved[name] = (calls - before_calls, waited - before_waited, held - before_held)
     return moved
 
@@ -146,20 +146,25 @@ class WriterLedger:
     def __init__(self) -> None:
         self.operations: dict[str, WriterVisit] = {}
         self._holder: tuple[str, float] | None = None
-        self._queued = 0
+        self._waiting: dict[object, tuple[str, float]] = {}
         self._windows: weakref.WeakSet[WriterWindow] = weakref.WeakSet()
 
-    def queue(self) -> None:
-        self._queued += 1
+    def queue(self, operation: str, at: float) -> object:
+        """A write starts waiting. The token is given back to :meth:`acquired` or :meth:`record`."""
+        token = object()
+        self._waiting[token] = (operation, at)
+        return token
 
-    def acquired(self, operation: str, at: float) -> None:
-        self._queued -= 1
+    def acquired(self, token: object, operation: str, at: float) -> None:
+        self._waiting.pop(token, None)
         self._holder = (operation, at)
 
-    def record(self, operation: str, *, waited: float, held: float, was_queued: bool) -> None:
-        """Count one finished write. ``was_queued`` is whether it left while still waiting."""
-        if was_queued:
-            self._queued -= 1
+    def record(
+        self, operation: str, *, waited: float, held: float, token: object | None = None
+    ) -> None:
+        """Count one finished write. A ``token`` still waiting means it left without the slot."""
+        if token is not None:
+            self._waiting.pop(token, None)
         else:
             self._holder = None
         visit = self.operations.setdefault(operation, WriterVisit())
@@ -171,18 +176,43 @@ class WriterLedger:
         for window in self._windows:
             window.note(operation, waited, held)
 
-    def totals(self) -> WriterTotals:
-        """Running totals, for a window by subtraction with :func:`writer_totals_since`."""
-        return {
-            name: (visit.calls, visit.waited, visit.held) for name, visit in self.operations.items()
+    def totals(self, now: float | None = None) -> WriterTotals:
+        """Running totals, for a window by subtraction with :func:`writer_totals_since`.
+
+        Given ``now``, a write still waiting or holding adds the time it has taken so far, and
+        counts as a call only when it ends. Otherwise a hold that spans a window would be
+        invisible in it and arrive whole in the next, and the ratio of held time to the window
+        would stop meaning how busy the slot was.
+        """
+        totals: dict[str, list[float]] = {
+            name: [visit.calls, visit.waited, visit.held] for name, visit in self.operations.items()
         }
+        if now is not None:
+            for operation, at in self._waiting.values():
+                totals.setdefault(operation, [0, 0.0, 0.0])[1] += now - at
+            if self._holder is not None:
+                operation, at = self._holder
+                totals.setdefault(operation, [0, 0.0, 0.0])[2] += now - at
+        return {name: (int(calls), waited, held) for name, (calls, waited, held) in totals.items()}
+
+    def open_longest(self, now: float) -> dict[str, tuple[float, float]]:
+        """``operation -> (longest wait, longest hold)`` among writes that have not ended."""
+        longest: dict[str, tuple[float, float]] = {}
+        for operation, at in self._waiting.values():
+            wait, held = longest.get(operation, (0.0, 0.0))
+            longest[operation] = (max(wait, now - at), held)
+        if self._holder is not None:
+            operation, at = self._holder
+            wait, held = longest.get(operation, (0.0, 0.0))
+            longest[operation] = (wait, max(held, now - at))
+        return longest
 
     def current(self, now: float) -> tuple[str, float, int] | None:
         """``(operation holding the slot, seconds it has held it, writers queued)``, or ``None``."""
-        if self._holder is None and not self._queued:
+        if self._holder is None and not self._waiting:
             return None
         name, at = self._holder if self._holder is not None else ("", now)
-        return name, now - at, self._queued
+        return name, now - at, len(self._waiting)
 
     def window(self) -> WriterWindow:
         """A new window onto the longest wait and hold, for one reader to take from.
@@ -205,9 +235,18 @@ class WriterWindow:
         longest_wait, longest_held = self._longest.get(operation, (0.0, 0.0))
         self._longest[operation] = (max(longest_wait, waited), max(longest_held, held))
 
-    def take(self) -> dict[str, tuple[float, float]]:
-        """``operation -> (longest wait, longest hold)`` since last asked, then start over."""
+    def take(
+        self, open_now: dict[str, tuple[float, float]] | None = None
+    ) -> dict[str, tuple[float, float]]:
+        """``operation -> (longest wait, longest hold)`` since last asked, then start over.
+
+        ``open_now`` is the same for writes that have not ended, so a hold that is still going
+        shows as the maximum it already is instead of as zero until it finishes.
+        """
         taken, self._longest = self._longest, {}
+        for operation, (wait, held) in (open_now or {}).items():
+            longest_wait, longest_held = taken.get(operation, (0.0, 0.0))
+            taken[operation] = (max(longest_wait, wait), max(longest_held, held))
         return taken
 
 
@@ -234,20 +273,18 @@ async def writer_slot(engine: AsyncEngine, operation: str) -> AsyncGenerator[Non
     ledger = writer_ledger(engine)
     requested = time.perf_counter()
     acquired: float | None = None
-    ledger.queue()
+    token = ledger.queue(operation, requested)
     try:
         async with writer_admission(engine):
             acquired = time.perf_counter()
-            ledger.acquired(operation, acquired)
+            ledger.acquired(token, operation, acquired)
             yield
     finally:
         ended = time.perf_counter()
         if acquired is None:
-            ledger.record(operation, waited=ended - requested, held=0.0, was_queued=True)
+            ledger.record(operation, waited=ended - requested, held=0.0, token=token)
         else:
-            ledger.record(
-                operation, waited=acquired - requested, held=ended - acquired, was_queued=False
-            )
+            ledger.record(operation, waited=acquired - requested, held=ended - acquired)
 
 
 def sqlite_busy(error: BaseException) -> bool:

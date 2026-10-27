@@ -94,10 +94,10 @@ async def _enter(engine: AsyncEngine, name: str) -> None:
 
 def test_a_window_is_a_difference_of_totals_and_each_reader_has_its_own_longest() -> None:
     ledger = WriterLedger()
-    ledger.record("publish", waited=0.1, held=0.2, was_queued=False)
+    ledger.record("publish", waited=0.1, held=0.2)
     reader_a, reader_b = ledger.window(), ledger.window()
     before = ledger.totals()
-    ledger.record("publish", waited=0.3, held=0.9, was_queued=False)
+    ledger.record("publish", waited=0.3, held=0.9)
 
     moved = writer_totals_since(ledger.totals(), before)
     assert moved == {"publish": (1, pytest.approx(0.3), pytest.approx(0.9))}
@@ -146,3 +146,43 @@ async def test_each_engine_has_its_own_ledger(engine: AsyncEngine, tmp_path: Pat
         assert writer_ledger(other).operations == {}
     finally:
         await other.dispose()
+
+
+async def test_a_write_in_progress_adds_its_elapsed_time_to_a_window_and_is_a_call_at_the_end(
+    engine: AsyncEngine,
+) -> None:
+    ledger = writer_ledger(engine)
+    release = asyncio.Event()
+    window = ledger.window()
+
+    async def holder() -> None:
+        async with writer_slot(engine, "stuck_commit"):
+            await release.wait()
+
+    held = asyncio.create_task(holder())
+    await asyncio.sleep(0.05)
+    waiting = asyncio.create_task(_enter(engine, "behind"))
+    await asyncio.sleep(0.03)
+    first = ledger.totals(time.perf_counter())
+    await asyncio.sleep(0.03)
+    moved = writer_totals_since(ledger.totals(time.perf_counter()), first)
+
+    assert first["stuck_commit"][0] == 0, "not a call until it ends"
+    assert first["stuck_commit"][2] >= 0.07
+    assert moved["stuck_commit"][0] == 0
+    assert moved["stuck_commit"][2] >= 0.02, "the second window sees the hold it spans"
+    assert moved["behind"][1] >= 0.02, "and the wait of the writer queued behind it"
+    longest = window.take(ledger.open_longest(time.perf_counter()))
+    assert longest["stuck_commit"][1] >= 0.1
+    assert longest["behind"][0] >= 0.06
+
+    release.set()
+    await asyncio.gather(held, waiting)
+
+
+async def test_a_zero_length_hold_still_clears_the_holder(engine: AsyncEngine) -> None:
+    ledger = writer_ledger(engine)
+    async with writer_slot(engine, "quick"):
+        assert ledger.current(time.perf_counter()) is not None
+
+    assert ledger.current(time.perf_counter()) is None

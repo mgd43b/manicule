@@ -67,7 +67,12 @@ from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, Wa
 from manicule.ingest.capacity import CapacityDiagnostic, CapacityRefusedError, CapacityResource
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.ingest.middleware import MiddlewareRunner
-from manicule.ingest.pipeline import IngestPipeline, RunReport, Watching
+from manicule.ingest.pipeline import (
+    IngestPipeline,
+    RunReport,
+    Watching,
+    _Sync,  # pyright: ignore[reportPrivateUsage]
+)
 from manicule.ingest.rebuild import build_offline_rebuilder
 from manicule.ingest.recovery import requeue_interrupted
 from manicule.ingest.reembed import ReembedState, resume_reembed, start_reembed
@@ -3716,6 +3721,40 @@ async def test_members_and_the_writer_queue_are_timed_and_logged(
     assert queue, "the writer queue was logged while the run was going"
     assert "max hold" in queue[-1]
     assert any(" max " in line and "ms" in line for line in lines if "stage timings" in line)
+
+
+async def test_a_later_runs_first_writer_line_does_not_count_an_earlier_runs_writes(
+    engine: AsyncEngine, data_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=fakes.MemoryVectors(), clock=fakes.ManualLeaseClock()
+    )
+    await pipeline.run(
+        fakes.DictConnector({f"public-a{n}": f"line a {n}" for n in range(4)}, name="earlier")
+    )
+    earlier = writer_ledger(engine).totals()
+    assert sum(calls for calls, _, _ in earlier.values()) > 0
+    run = _Sync(
+        connector=cast("Any", fakes.DictConnector({}, name="later")),
+        report=RunReport(connector="later"),
+        limit=None,
+        acquire_only=False,
+        retain_source_bytes=False,
+        watermark=None,
+        blobs=cast("Any", None),
+        refs=cast("Any", None),
+        bodies=cast("Any", None),
+    )
+
+    pipeline._begin_writer_window(run)  # pyright: ignore[reportPrivateUsage]
+    with caplog.at_level("INFO", logger="manicule.ingest.pipeline"):
+        pipeline._log_writer_queue(run, 60.0)  # pyright: ignore[reportPrivateUsage]
+
+    assert not [r for r in caplog.records if "writer queue" in r.getMessage()], (
+        "nothing was written since this run began, so there is nothing to report"
+    )
 
 
 async def test_a_second_run_reports_only_its_own_time(engine: AsyncEngine, data_dir: Path) -> None:

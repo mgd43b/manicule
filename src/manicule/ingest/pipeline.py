@@ -1665,6 +1665,7 @@ class IngestPipeline:
         for gauge in (self._fetches, self._parsing, self._embedding.gauge):
             gauge.rebase()
         run.timings_logged_at = time.perf_counter()
+        self._begin_writer_window(run)
 
         with run.timings.scoped():
             stages = asyncio.create_task(self._drive(run), name=f"ingest:{connector.name}")
@@ -3359,18 +3360,32 @@ class IngestPipeline:
         )
         self._log_writer_queue(run, window)
 
+    def _begin_writer_window(self, run: _Sync) -> None:
+        """Start the run's writer baseline now, so its first line does not count earlier runs.
+
+        The ledger is the engine's for the engine's lifetime and a run begins part-way through
+        it, so what the run's lines subtract from is what the ledger held when the run began.
+        """
+        engine = getattr(self._store, "engine", None)
+        if engine is None:
+            return
+        ledger = writer_ledger(engine)
+        run.writer_logged = ledger.totals(time.perf_counter())
+        run.writer_window = ledger.window()
+
     def _log_writer_queue(self, run: _Sync, window: float) -> None:
         engine = getattr(self._store, "engine", None)
         if engine is None:
             return
         ledger = writer_ledger(engine)
-        totals = ledger.totals()
+        asked = time.perf_counter()
+        totals = ledger.totals(asked)
         moved = writer_totals_since(totals, run.writer_logged)
         run.writer_logged = totals
-        if run.writer_window is None:
-            run.writer_window = ledger.window()
-        longest = run.writer_window.take()
-        now = ledger.current(time.perf_counter())
+        window_longest = run.writer_window or ledger.window()
+        run.writer_window = window_longest
+        longest = window_longest.take(ledger.open_longest(asked))
+        now = ledger.current(asked)
         if not moved and now is None:
             return
         ranked = sorted(moved.items(), key=lambda item: item[1][2], reverse=True)

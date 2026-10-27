@@ -348,9 +348,14 @@ class StageTimings:
         """The longest visit to each stage since this was last called, and start a new window.
 
         One reader: the progress line. The cumulative maximum in a snapshot cannot be
-        subtracted, so a window's worst case has to be kept apart and cleared when read.
+        subtracted, so a window's worst case has to be kept apart and cleared when read. A visit
+        still open counts for the time it has taken so far, so a stall in progress shows as the
+        maximum it already is rather than as zero until it ends.
         """
         window, self._window_longest = self._window_longest, {}
+        now = time.perf_counter()
+        for stage, started in self._open.values():
+            window[stage] = max(window.get(stage, 0.0), now - started)
         return window
 
     def begin(self, stage: Stage) -> _Visit:

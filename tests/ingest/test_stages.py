@@ -402,3 +402,22 @@ def test_a_sample_added_directly_counts_toward_the_scope_too() -> None:
 
     assert pipeline.snapshot()[Stage.LOOP_LAG].calls == 2
     assert run.snapshot()[Stage.LOOP_LAG] == StageTime(seconds=0.25, calls=1, longest=0.25)
+
+
+async def test_the_window_longest_includes_a_visit_that_has_not_ended() -> None:
+    """A stall in progress prints as the maximum it already is, not as zero until it ends."""
+    timings = StageTimings()
+    release = asyncio.Event()
+
+    async def parked() -> None:
+        with timings.timing(Stage.EMBED):
+            await release.wait()
+
+    task = asyncio.create_task(parked())
+    await asyncio.sleep(0.05)
+
+    assert timings.take_window_longest()[Stage.EMBED] >= 0.04
+    assert timings.take_window_longest()[Stage.EMBED] >= 0.04, "still open, so still the maximum"
+
+    release.set()
+    await task
