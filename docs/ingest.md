@@ -1093,34 +1093,53 @@ counted in `peak_parses` and `peak_embeds` too. Retained bodies belong to the ru
 
 **Where the time went is in the same record, under `stages.timings`.** Occupancy says how many
 workers were inside a stage, and not how long a visit took, so each stage also keeps a total of
-wall seconds and a count of visits, summed across workers: `journal_start`, `blob_read`,
-`parse`, `prepare`, `embed`, `stored_vectors`, `embed_lock_wait`, `embed_lock_held`, `glossary`,
-`fence`, `stage_vectors`, `upsert`, `publish`, `commit`, `after_store`, `lineage`,
-`journal_settle`, and `document`. Seconds divided by calls is one visit; seconds divided by the
-wall clock is how many workers were inside.
+wall seconds, a count of visits and the longest single visit, summed across workers:
+`journal_start`, `blob_read`, `parse`, `prepare`, `embed`, `stored_vectors`, `embed_lock_wait`,
+`embed_lock_held`, `glossary`, `fence`, `stage_vectors`, `upsert`, `publish`,
+`publish_chunkless`, `commit`, `after_store`, `lineage`, `journal_settle`, `member`,
+`store_read`, `loop_lag`, and `document`. Seconds divided by calls is one visit; seconds divided
+by the wall clock is how many workers were inside. The longest visit is there because a mean
+averages a stall away.
 
 They nest only where stated. `embed` contains `stored_vectors` and the lock's wait and hold.
 `commit` contains `fence`, `stage_vectors`, `upsert`, `glossary` and `publish`. `document`
-contains `parse`, `prepare`, `embed`, `commit`, `after_store` and `lineage`, and not the two
-journal stages, which run on either side of it. `publish` is also the publication of a document
-with no chunks, and of a failed one, which never reach `commit`. What a parent's stages leave
-over is **unmeasured**, not event-loop time: it includes the reads and middleware between stages
-(`_previous_inputs` is one), the event loop's own scheduling, and anything not listed.
+contains `parse`, `prepare`, `embed`, `commit`, `after_store`, `lineage` and every `member`, and
+not the two journal stages, which run on either side of it. `publish` is the publication of a
+document with chunks. `publish_chunkless` is one without (a member that was refused or could
+not be read, an empty document, a failure), which never reaches `commit`, so a message with
+four refused attachments has one `publish` and four `publish_chunkless`. `member` is the whole
+handling of one document found inside another, and `store_read` is the document store's reads
+between stages (the member lookups, the container's member list). `loop_lag` is a sampler and
+not a visit: ten times a second a timer asks the event loop to wake it, and each call is one
+sample of how much later than asked it did, so its seconds are time that every worker spent
+waiting for the loop and that no other stage can see. What the stages still leave over is
+**unmeasured**, not event-loop time: untimed code between awaits and anything not listed.
+
+**The writer queue has its own line.** Every managed write holds the engine's one writer slot
+for the whole transaction, COMMIT included, and queues for it first, so a stage that writes
+cannot say whether its time was the write or the queue in front of it. The log carries, beside
+the stage line, `ingest writer queue for <connector> ...`: writes, seconds queued, seconds
+held, and per operation (named by the store method, never by a value) the time held, the time
+queued and the longest single hold in the window. If the sum held approaches the window, the
+writer is the limit and the lines say which operations to batch; if it is a small share, the
+queue is not. A long maximum on a small total is the signature of a stall inside COMMIT, such as
+a checkpoint on a slow volume, which holds every waiter at once.
 
 **A visit counts while it is happening.** A snapshot adds the elapsed time of every visit still
 open to those that have ended, and counts a call only when one ends, so seconds in a window
 divided by its length is a worker count even for one parse that spans three windows. Totals are
 kept for the pipeline and, separately, for each run: a run reports only the visits begun in
-tasks it started, so two runs sharing a pipeline do not see each other. The report is built when
-a run ends, so a running pipeline also logs the last minute's totals as one line on a timer
-(`ingest stage timings for <connector> ...`, slowest stage first), including a minute in which
+tasks it started, so two runs sharing a pipeline do not see each other (the writer queue is the
+engine's, and is shared by definition). The report is built when a run ends, so a running
+pipeline also logs the last minute's totals as one line on a timer (`ingest stage timings for
+<connector> ...`, slowest stage first, each with its longest visit), including a minute in which
 no document finished, and `IngestPipeline.stage_timings()` returns the pipeline's running
-totals. The line goes to standard error: `manicule serve` sets the `manicule.ingest` logger to
+totals. The lines go to standard error: `manicule serve` sets the `manicule.ingest` logger to
 `INFO` when it starts, because a logger nobody has configured drops everything below `WARNING`,
-and gives it a standard-error handler unless the host already has one on that logger or the root,
-in which case the host's own handlers receive it. A one-off command that is not a server prints
-no such line and reports through its progress output and run report. Counters only: the stage
-names are a fixed enumeration (`Stage`) and nothing from a document is kept.
+and gives it a standard-error handler unless the host already has one on that logger or the
+root, in which case the host's own handlers receive it. A one-off command that is not a server
+prints no such line and reports through its progress output and run report. Counters only: the
+stage names are a fixed enumeration (`Stage`) and nothing from a document is kept.
 
 `blocked_puts` on the fetch hand-off is direct evidence that the bounded journal reader waited
 for local fetch capacity. It no longer describes source discovery, which has already completed.

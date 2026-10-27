@@ -11,8 +11,10 @@ import os
 import sqlite3
 import stat
 import threading
+import time
 import weakref
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Concatenate, Final, override
@@ -25,7 +27,7 @@ from sqlalchemy.util import await_only, greenlet_spawn
 from manicule.core.errors import InsecureTargetError, StorageBusyError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import AsyncGenerator, Callable, Coroutine
     from types import CoroutineType
 
     from sqlalchemy.engine.interfaces import DBAPIConnection, Dialect
@@ -93,6 +95,98 @@ def writer_admission(engine: AsyncEngine) -> asyncio.Lock:
         return admission
 
 
+@dataclass(slots=True)
+class WriterVisit:
+    """What one named write operation has cost the writer queue, in total."""
+
+    calls: int = 0
+    waited: float = 0.0
+    """Seconds spent queued behind other writers, summed over calls."""
+    held: float = 0.0
+    """Seconds spent holding the slot, summed over calls."""
+    longest_wait: float = 0.0
+    longest_held: float = 0.0
+    window_longest_held: float = 0.0
+
+
+class WriterLedger:
+    """How long each kind of write waited for, and then held, an engine's one writer slot.
+
+    **Why it exists.** Every managed write runs under :func:`writer_admission`, so a pipeline's
+    writes are one serial section, and "this stage took 50 ms" cannot say whether that was the
+    write or the queue in front of it. The slot is held across the whole transaction, COMMIT
+    included, where SQLite's autocheckpoint runs, so a slow volume stalls every waiter at once
+    and shows up only as a long maximum: totals alone average it away. Hence the longest wait
+    and the longest hold are kept beside the sums.
+
+    Keyed by the operation's function name, a code identifier and never a value, so the ledger
+    is as small as the set of write methods and says nothing about a document. Synchronous and
+    unlocked, like the stage counters: nothing between reading a total and writing it back
+    awaits.
+    """
+
+    def __init__(self) -> None:
+        self.operations: dict[str, WriterVisit] = {}
+
+    def record(self, operation: str, *, waited: float, held: float) -> None:
+        visit = self.operations.setdefault(operation, WriterVisit())
+        visit.calls += 1
+        visit.waited += waited
+        visit.held += held
+        visit.longest_wait = max(visit.longest_wait, waited)
+        visit.longest_held = max(visit.longest_held, held)
+        visit.window_longest_held = max(visit.window_longest_held, held)
+
+    def totals(self) -> dict[str, tuple[int, float, float]]:
+        """``operation -> (calls, seconds waited, seconds held)``, for a window by subtraction."""
+        return {
+            name: (visit.calls, visit.waited, visit.held) for name, visit in self.operations.items()
+        }
+
+    def take_window_longest_held(self) -> dict[str, float]:
+        """The longest hold of each operation since last asked, clearing the window."""
+        window = {name: visit.window_longest_held for name, visit in self.operations.items()}
+        for visit in self.operations.values():
+            visit.window_longest_held = 0.0
+        return window
+
+
+_LEDGERS: weakref.WeakKeyDictionary[Any, WriterLedger] = weakref.WeakKeyDictionary()
+
+
+def writer_ledger(engine: AsyncEngine) -> WriterLedger:
+    """The ledger for an engine, made on first use and gone with the engine."""
+    with _WRITER_ADMISSION_LOCK:
+        ledger = _LEDGERS.get(engine)
+        if ledger is None:
+            ledger = WriterLedger()
+            _LEDGERS[engine] = ledger
+        return ledger
+
+
+@asynccontextmanager
+async def writer_slot(engine: AsyncEngine, operation: str) -> AsyncGenerator[None]:
+    """Hold the engine's one writer slot, and record how long getting it and keeping it took.
+
+    :func:`writer_admission` with a name on it. Recorded when the block ends, however it ends,
+    including a cancellation while queued, where only the wait is real and the hold is zero.
+    """
+    ledger = writer_ledger(engine)
+    requested = time.perf_counter()
+    admission = writer_admission(engine)
+    acquired: float | None = None
+    try:
+        async with admission:
+            acquired = time.perf_counter()
+            yield
+    finally:
+        ended = time.perf_counter()
+        if acquired is None:
+            ledger.record(operation, waited=ended - requested, held=0.0)
+        else:
+            ledger.record(operation, waited=acquired - requested, held=ended - acquired)
+
+
 def sqlite_busy(error: BaseException) -> bool:
     """Recognize SQLITE_BUSY through SQLAlchemy without retaining its SQL-shaped wrapper.
 
@@ -137,7 +231,7 @@ def admitted_writer[**P, R](
 
     @wraps(operation)
     async def admitted(store: Any, *args: P.args, **kwargs: P.kwargs) -> R:  # noqa: ANN401
-        async with writer_admission(store.engine):
+        async with writer_slot(store.engine, operation.__name__):
             for delay in SQLITE_BUSY_RETRY_DELAYS:
                 if delay:
                     await asyncio.sleep(delay)
@@ -480,6 +574,8 @@ __all__ = [
     "PRAGMAS",
     "VECTORS_DIRNAME",
     "StorageLayoutError",
+    "WriterLedger",
+    "WriterVisit",
     "admitted_writer",
     "attach_pragmas",
     "create_engine",
@@ -488,4 +584,6 @@ __all__ = [
     "require_supported_sqlite",
     "secure_output_dir",
     "session_factory",
+    "writer_ledger",
+    "writer_slot",
 ]

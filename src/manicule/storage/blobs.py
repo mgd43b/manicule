@@ -48,7 +48,7 @@ from manicule.storage.engine import (
     SQLITE_BUSY_RETRY_DELAYS,
     session_factory,
     sqlite_busy,
-    writer_admission,
+    writer_slot,
 )
 
 if TYPE_CHECKING:
@@ -260,7 +260,7 @@ def _admitted_writer[**P, R](
 
     @wraps(operation)
     async def admitted(store: BlobStore, *args: P.args, **kwargs: P.kwargs) -> R:
-        async with writer_admission(store.engine):
+        async with writer_slot(store.engine, operation.__name__):
             for delay in SQLITE_BUSY_RETRY_DELAYS:
                 if delay:
                     await asyncio.sleep(delay)
@@ -991,7 +991,7 @@ class BlobStore:
         # first here would invert that order against a shared lock shard, which is a deadlock
         # rather than a slow path. File locks before admission, admission before the
         # transaction, everywhere.
-        async with writer_admission(self._engine), self._sessions() as session:
+        async with writer_slot(self._engine, "retain"), self._sessions() as session:
             # SQLite's write reservation spans the aggregate check, filesystem publication,
             # and descriptor commit. Separate BlobStore instances and processes therefore
             # cannot each spend the same observed capacity.

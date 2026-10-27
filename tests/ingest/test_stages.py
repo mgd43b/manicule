@@ -239,7 +239,7 @@ def test_a_stage_report_carries_counts_and_nothing_a_document_said() -> None:
     assert recorded["accepted"] == 12
     assert recorded["fetch_queue"] == {"capacity": 8, "peak_depth": 8, "blocked_puts": 3}
     assert recorded["peak_discovery_records"] == 7
-    assert recorded["timings"] == {"parse": {"seconds": 1.235, "calls": 3}}
+    assert recorded["timings"] == {"parse": {"seconds": 1.235, "calls": 3, "longest": 0.0}}
     assert all(isinstance(value, (int, dict)) for value in recorded.values()), (
         "every field is a count or a record of counts, so no document content can reach here"
     )
@@ -253,8 +253,8 @@ def test_timings_add_up_per_stage_and_say_how_many_visits_made_them() -> None:
     timings.add(Stage.EMBED, 2.0)
 
     assert timings.snapshot() == {
-        Stage.PARSE: StageTime(seconds=0.75, calls=2),
-        Stage.EMBED: StageTime(seconds=2.0, calls=1),
+        Stage.PARSE: StageTime(seconds=0.75, calls=2, longest=0.5),
+        Stage.EMBED: StageTime(seconds=2.0, calls=1, longest=2.0),
     }
 
 
@@ -279,8 +279,8 @@ def test_a_window_is_the_difference_of_two_snapshots_and_omits_idle_stages() -> 
     window = StageTimings.since(timings.snapshot(), base)
 
     assert window == {
-        Stage.EMBED: StageTime(seconds=2.0, calls=1),
-        Stage.PUBLISH: StageTime(seconds=0.5, calls=1),
+        Stage.EMBED: StageTime(seconds=2.0, calls=1, longest=4.0),
+        Stage.PUBLISH: StageTime(seconds=0.5, calls=1, longest=0.5),
     }, "parse did not run in the window, so it is not in it"
 
 
@@ -377,3 +377,28 @@ def test_closing_a_visit_twice_counts_it_once() -> None:
     timings.end(visit)
 
     assert timings.snapshot()[Stage.PARSE].calls == 1
+
+
+def test_the_longest_visit_is_kept_apart_from_the_total_and_a_window_can_be_read_once() -> None:
+    timings = StageTimings()
+    timings.add(Stage.PUBLISH, 0.01)
+    timings.add(Stage.PUBLISH, 0.9)
+    timings.add(Stage.PUBLISH, 0.02)
+
+    assert timings.snapshot()[Stage.PUBLISH].longest == 0.9
+    assert timings.take_window_longest() == {Stage.PUBLISH: 0.9}
+    assert timings.take_window_longest() == {}, "reading a window starts the next one"
+    timings.add(Stage.PUBLISH, 0.03)
+    assert timings.take_window_longest() == {Stage.PUBLISH: 0.03}
+    assert timings.snapshot()[Stage.PUBLISH].longest == 0.9, "the cumulative maximum stays"
+
+
+def test_a_sample_added_directly_counts_toward_the_scope_too() -> None:
+    pipeline, run = StageTimings(), StageTimings()
+
+    with run.scoped():
+        pipeline.add(Stage.LOOP_LAG, 0.25)
+    pipeline.add(Stage.LOOP_LAG, 0.5)
+
+    assert pipeline.snapshot()[Stage.LOOP_LAG].calls == 2
+    assert run.snapshot()[Stage.LOOP_LAG] == StageTime(seconds=0.25, calls=1, longest=0.25)

@@ -59,7 +59,7 @@ from manicule.ingest.capacity import (
     translate_storage_capacity_errors as _translate_storage_capacity_errors,
 )
 from manicule.storage import models
-from manicule.storage.engine import SQLITE_BUSY_RETRY_DELAYS, sqlite_busy, writer_admission
+from manicule.storage.engine import SQLITE_BUSY_RETRY_DELAYS, sqlite_busy, writer_slot
 from manicule.storage.scoped import WorkspaceScoped
 from manicule.storage.types import next_observation, utcnow
 
@@ -184,7 +184,7 @@ def translate_storage_capacity_errors[F: Callable[..., Coroutine[Any, Any, Any]]
         # asyncio.Lock queues managed writers before they open a transaction. Cancellation of a
         # waiter removes it from the queue; cancellation of an owner exits this context only
         # after the operation's session context has rolled back and closed.
-        async with writer_admission(store.engine):
+        async with writer_slot(store.engine, operation.__name__):
             exhausted = False
             for delay in SQLITE_BUSY_RETRY_DELAYS:
                 if delay:
