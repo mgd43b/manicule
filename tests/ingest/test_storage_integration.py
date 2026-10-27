@@ -6744,8 +6744,6 @@ async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_origin
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Failure retention and its guarded row are one commit, not a trailing setter."""
-    from manicule.core.content import DocumentRevision  # noqa: PLC0415
-    from manicule.storage import models  # noqa: PLC0415
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
     from tests.storage_helpers import make_document  # noqa: PLC0415
 
@@ -6768,7 +6766,6 @@ async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_origin
     loser_store = SqliteDocStore(engine)
     winner_entered = asyncio.Event()
     release_winner = asyncio.Event()
-    loser_attempted = asyncio.Event()
     replace_entries = winner_store._replace_entries  # pyright: ignore[reportPrivateUsage]
 
     async def pause_winner(*args: object, **kwargs: object) -> None:
@@ -6776,18 +6773,7 @@ async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_origin
         await release_winner.wait()
         await replace_entries(*args, **kwargs)  # pyright: ignore[reportArgumentType]
 
-    target = loser_store._publication_target  # pyright: ignore[reportPrivateUsage]
-
-    async def observe_loser(
-        session: AsyncSession,
-        document: Document,
-        expected: DocumentRevision | None,
-    ) -> tuple[models.Document | None, Commit | None]:
-        loser_attempted.set()
-        return await target(session, document, expected)
-
     monkeypatch.setattr(winner_store, "_replace_entries", pause_winner)
-    monkeypatch.setattr(loser_store, "_publication_target", observe_loser)
     winner_document = original.model_copy(
         update={
             "content_hash": content_hash(b"winner source"),
@@ -6829,7 +6815,12 @@ async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_origin
             original_omitted_reason=None,
         )
     )
-    await loser_attempted.wait()
+    # The loser now queues behind the winner's transaction instead of racing it at SQLite, so
+    # it cannot "attempt" until the winner commits. Let it reach the queue, then release; the
+    # outcome is the same, because its compare-and-swap runs against the winner's commit.
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not loser_task.done()
     release_winner.set()
     winner, loser = await asyncio.gather(winner_task, loser_task)
 
