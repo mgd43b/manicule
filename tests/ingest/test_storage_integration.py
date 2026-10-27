@@ -2655,6 +2655,44 @@ async def test_heartbeat_contention_does_not_cancel_the_owned_publication(
     assert await store.latest_unsettled_acquisition_run(connector.name) is None
 
 
+async def test_a_refused_publication_stops_the_run_instead_of_failing_the_document(
+    engine: AsyncEngine,
+    data_dir: Path,
+) -> None:
+    """A document-level handler must not turn the writer refusal into a failed document."""
+
+    class RefusingPublicationStore(SqliteDocStore):
+        @override
+        async def fenced_publish_document(self, *args: Any, **kwargs: Any) -> Commit:
+            raise StorageBusyError
+
+    store = RefusingPublicationStore(engine)
+    await store.ensure_workspace()
+    connector = fakes.DictConnector({"refused": "public synthetic line"}, name="refused-source")
+    chunker = fakes.BlockChunker()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        detect_glossary=False,
+    )
+
+    report = await asyncio.wait_for(pipeline.run(connector), timeout=30)
+
+    assert report.error_type == "StorageBusyError"
+    assert report.by_status.get("failed", 0) == 0, "the refusal became the document's failure"
+    unsettled = await store.latest_unsettled_acquisition_run(connector.name)
+    assert unsettled is not None
+    assert unsettled.lease_owner is None, "an orderly stop releases the lease"
+
+
 async def test_synchronous_document_preparation_does_not_block_lease_renewal(
     engine: AsyncEngine,
     data_dir: Path,
