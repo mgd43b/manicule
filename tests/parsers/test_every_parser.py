@@ -187,7 +187,7 @@ CORPORA: dict[str, Corpus] = {
     "calendar": Corpus(
         directory="calendar",
         media_types={".ics": "text/calendar"},
-        required=("invitation.ics", "multi.ics"),
+        required=("invitation.ics", "multi.ics", "folded-multibyte.ics"),
         min_blocks=4,
     ),
     "plaintext": Corpus(
