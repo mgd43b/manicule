@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.17](https://github.com/mgd43b/manicule/compare/v0.2.16...v0.2.17) (2026-10-27)
+
+
+### Features
+
+* **ingest:** report where a run's time went, per stage, while it runs ([#510](https://github.com/mgd43b/manicule/issues/510)) ([289ebf1](https://github.com/mgd43b/manicule/commit/289ebf178fc70acc6e72c295118330c3f6c3093d))
+* **parsers:** index calendar invitations and .ics files ([#506](https://github.com/mgd43b/manicule/issues/506)) ([9ac72b1](https://github.com/mgd43b/manicule/commit/9ac72b16301a4fa83f1d20c9185e62bc4c3a94fc))
+* **parsers:** open gzip and tar members as documents of their own ([#507](https://github.com/mgd43b/manicule/issues/507)) ([db4b041](https://github.com/mgd43b/manicule/commit/db4b0411780565ae5bb4715e2ebde9ff22351dd1))
+
+
+### Bug Fixes
+
+* **deps:** bump dnspython from 2.8.0 to 2.9.0 ([#509](https://github.com/mgd43b/manicule/issues/509)) ([1983c71](https://github.com/mgd43b/manicule/commit/1983c714b428b9229df9e0ba3d28a409a3fbd4f7))
+* **deps:** bump the runtime group with 11 updates ([#498](https://github.com/mgd43b/manicule/issues/498)) ([3e94098](https://github.com/mgd43b/manicule/commit/3e94098071eddc1e19ced03f8e945392190cedb3))
+
 ## [0.2.16](https://github.com/mgd43b/manicule/compare/v0.2.15...v0.2.16) (2026-10-27)
 
 
