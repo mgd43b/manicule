@@ -56,6 +56,11 @@ MULTI = "\r\n".join(
         "SUMMARY:Send the minutes",
         "DUE:20261105T170000Z",
         "END:VTODO",
+        "BEGIN:VTODO",
+        "SUMMARY:Prepare the handout",
+        "DTSTART:20261101T080037Z",
+        "DUE:20261103T170000Z",
+        "END:VTODO",
         "END:VCALENDAR",
         "",
     ]
@@ -64,8 +69,16 @@ MULTI = "\r\n".join(
 NOT_A_CALENDAR = "Plain words that mention nothing of the format.\n"
 
 
+FOLDED_MULTIBYTE = (
+    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Caf\xc3\r\n \xa9 sync with the team\r\n"
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+).encode("latin-1")
+"""A fold between the two octets of ``é``: RFC 5545 folds octets, not characters."""
+
+
 def build(dest: Path) -> None:
     """Write this format's fixtures into ``dest``."""
     (dest / "invitation.ics").write_bytes(INVITATION.encode())
     (dest / "multi.ics").write_bytes(MULTI.encode())
+    (dest / "folded-multibyte.ics").write_bytes(FOLDED_MULTIBYTE)
     (dest / "not-a-calendar.ics").write_text(NOT_A_CALENDAR, encoding="utf-8")

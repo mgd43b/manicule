@@ -40,6 +40,7 @@ import re
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from email import policy
+from email.errors import MissingHeaderBodySeparatorDefect
 from email.message import EmailMessage
 from email.parser import BytesParser
 
@@ -74,6 +75,7 @@ from manicule.parsers.expansion import (
 )
 from manicule.parsers.mediatype import (
     ALIASES,
+    GENERIC,
     UNINDEXED_MAIN_TYPES,
     resolve_member_media_type,
 )
@@ -259,10 +261,21 @@ class MailParser:
                 )
                 continue
             media_type = resolve_member_media_type(declared, name, payload)
+            transcoded = False
+            if media_type == declared and declared in GENERIC:
+                # Nothing established what the bytes are, which for a text attachment in a
+                # multi-byte character set is the NULs of UTF-16 reading as binary. Resolve again
+                # over the declared character set's reading, and keep it only if it is text.
+                decoded = _transcoded(part, payload)
+                if decoded != payload:
+                    retried = resolve_member_media_type(declared, name, decoded)
+                    if retried.startswith("text/"):
+                        media_type, payload, transcoded = retried, decoded, True
             if media_type.split("/", 1)[0] in UNINDEXED_MAIN_TYPES:
                 yield self._unindexed(raw, name, depth, media_type)
                 continue
-            payload = _as_utf8(part, media_type, payload)
+            if not transcoded:
+                payload = _as_utf8(part, media_type, payload)
             yield ExpandedMember(
                 source_id=member_source_id(raw.source_id, name, scheme=MAIL_SCHEME),
                 uri=member_uri(raw.uri, name, scheme=MAIL_SCHEME),
@@ -492,12 +505,42 @@ def _payload_of(part: EmailMessage) -> bytes:
     if part.get_content_maintype() == "message":
         enclosed = part.get_payload()
         if isinstance(enclosed, list) and enclosed:
-            blocks = [block.as_bytes() for block in enclosed if isinstance(block, EmailMessage)]
+            encoded = (
+                str(part.get("Content-Transfer-Encoding", "")).strip().lower() in _ENCODED_TRANSFERS
+            )
+            blocks = [
+                _unparsed(block) if encoded else block.as_bytes()
+                for block in enclosed
+                if isinstance(block, EmailMessage)
+            ]
             if not blocks:
                 return b""
             return _undone(part, b"\n".join(blocks) if len(blocks) > 1 else blocks[0])
     payload = part.get_payload(decode=True)
     return payload if isinstance(payload, bytes) else b""
+
+
+_ENCODED_TRANSFERS = frozenset({"base64", "quoted-printable"})
+
+
+def _unparsed(block: EmailMessage) -> bytes:
+    """The text the parser read as a message but which is a transfer-encoded body.
+
+    Serializing the parsed message inserts the blank line between header and body that the source
+    never had, which is harmless to base64 and corrupts quoted-printable: a soft-wrapped line
+    (``Subject: =?...=`` then ``rest``) is read as the end of the headers, and a separator put
+    in front of the continuation splits the line. The parser records exactly that case as a
+    missing separator, so the original text is the raw header lines followed directly by the body.
+    """
+    payload = block.get_payload()
+    body = payload if isinstance(payload, str) else ""
+    headers = "".join(f"{name}: {value}\n" for name, value in block.raw_items())
+    separated = not any(
+        isinstance(defect, MissingHeaderBodySeparatorDefect) for defect in block.defects
+    )
+    return (headers + ("\n" if separated and headers else "") + body).encode(
+        "utf-8", "surrogateescape"
+    )
 
 
 def _undone(part: EmailMessage, serialized: bytes) -> bytes:
@@ -518,14 +561,20 @@ def _as_utf8(part: EmailMessage, media_type: str, payload: bytes) -> bytes:
 
     The member is a document of its own and is parsed without the part that carried it, so the
     declared character set would otherwise be lost — and a Latin-1 or UTF-16 text file, which
-    the plaintext parser declines as binary, would be reported unsupported. A declared set that
-    does not decode the bytes (a mislabeled ``us-ascii`` that is really UTF-8, most often) leaves
-    them as they were, because the label is the sender's claim and the bytes are the evidence.
+    the plaintext parser declines as binary, would be reported unsupported.
+    """
+    return _transcoded(part, payload) if media_type.startswith("text/") else payload
+
+
+def _transcoded(part: EmailMessage, payload: bytes) -> bytes:
+    """``payload`` read in the part's declared character set and written as UTF-8.
+
+    A declared set that does not decode the bytes (a mislabeled ``us-ascii`` that is really
+    UTF-8, most often) leaves them as they were, because the label is the sender's claim and the
+    bytes are the evidence.
     """
     charset = part.get_content_charset()
-    if not charset or not media_type.startswith("text/"):
-        return payload
-    if charset.lower().replace("_", "-") in {"utf-8", "utf8", "us-ascii", "ascii"}:
+    if not charset or charset.lower().replace("_", "-") in {"utf-8", "utf8", "us-ascii", "ascii"}:
         return payload
     try:
         return payload.decode(charset).encode("utf-8")

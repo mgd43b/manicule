@@ -121,6 +121,13 @@ def indexed() -> Indexer:
             "m.txt",
             "mislabeled",
         ),
+        (
+            "application/octet-stream; charset=utf-16",
+            "utf16 readme marker\n".encode("utf-16"),
+            "base64",
+            "README",
+            "readme marker",
+        ),
         ("application/json", b'{"jsonmarker": 1}\n', "7bit", "d.json", "jsonmarker"),
         (
             "application/ics",
@@ -309,3 +316,58 @@ async def test_a_compressed_attachment_is_opened_and_its_content_indexed(
     (leaf,) = [key for key in members if key.endswith(f"!/{inner}")]
     assert members[leaf].status is DocumentStatus.INDEXED, members[leaf].status_detail
     assert marker in text[leaf]
+
+
+async def test_a_quoted_printable_enclosed_message_with_a_soft_wrapped_header_survives(
+    indexed: Indexer,
+) -> None:
+    inner = (
+        "From: sam@example.org\r\nSubject: A subject long enough that the encoder wrapped it "
+        "softly inside the header value\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+        "softwrapmarker body\r\n"
+    )
+    import quopri  # noqa: PLC0415 - one test's own need
+
+    encoded = quopri.encodestring(inner.encode(), header=False).replace(b"\n", b"\r\n")
+    raw = (
+        (
+            b"From: pat@example.org\r\nSubject: fwd\r\nMIME-Version: 1.0\r\n"
+            b"Content-Type: multipart/mixed; boundary=B\r\n\r\n"
+            b"--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n"
+            b"--B\r\nContent-Type: message/rfc822\r\n"
+            b"Content-Transfer-Encoding: quoted-printable\r\n"
+            b'Content-Disposition: attachment; filename="f.eml"\r\n\r\n'
+        )
+        + encoded
+        + b"\r\n--B--\r\n"
+    )
+    members, text = await indexed(raw)
+
+    assert members["f.eml"].status is DocumentStatus.INDEXED
+    assert "softwrapmarker" in text["f.eml"]
+    assert (
+        "Subject: A subject long enough that the encoder wrapped it softly inside the header value"
+        in text["f.eml"]
+    )
+
+
+async def test_refused_images_are_never_retained_while_the_message_is() -> None:
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    blobs = fakes.MemoryBlobs()
+    pipeline, store = await real_pipeline(blobs=blobs)
+    raw = message(
+        ("image/png", png, "base64", "a.png"), ("application/octet-stream", png, "base64", "b.bin")
+    )
+    await pipeline.ingest_raw(
+        RawDocument(source_id="mail:m", uri="mail://m", media_type="message/rfc822", content=raw),
+        source="mail",
+    )
+
+    parent = await store.find_document("mail", "mail:m")
+    assert parent is not None
+    assert parent.original_ref is not None, "the fixture must retain the message itself"
+    for name in ("a.png", "b.bin"):
+        member = await store.find_document("mail", f"mail:mail:m!/{name}")
+        assert member is not None
+        assert member.original_ref is None
+    assert len(blobs.data) == 1, "only the message's bytes were written"

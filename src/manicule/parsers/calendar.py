@@ -46,7 +46,8 @@ __all__ = ["CALENDAR_MEDIA_TYPES", "CalendarConfig", "CalendarParser"]
 _COMPONENTS = {"VEVENT": "Event", "VTODO": "Task", "VJOURNAL": "Note"}
 """The components that are about something. ``VTIMEZONE`` and ``VALARM`` are machinery."""
 
-_UNFOLD = re.compile(r"\r?\n[ \t]")
+_UNFOLD = re.compile(rb"\r?\n[ \t]")
+"""A fold, in bytes: RFC 5545 folds octets, so a fold can fall inside a multibyte character."""
 _ESCAPED = re.compile(r"\\([nN,;\\])")
 _DATE = re.compile(r"^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?(Z)?)?$")
 
@@ -101,7 +102,10 @@ class CalendarParser:
         return resolve_lines("\n".join(self._lines(raw)), anchor)
 
     def _lines(self, raw: RawDocument) -> list[str]:
-        components = _read(decode(raw), self._config.max_components, raw.uri)
+        # Unfolded as bytes and only then decoded: a fold may split a UTF-8 sequence, and
+        # decoding first would decline an invitation that is perfectly well formed.
+        unfolded = raw.model_copy(update={"content": _UNFOLD.sub(b"", raw.as_bytes())})
+        components = _read(decode(unfolded), self._config.max_components, raw.uri)
         stanzas = [_stanza(component) for component in components]
         lines: list[str] = []
         for stanza in stanzas:
@@ -123,7 +127,7 @@ def _read(text: str, limit: int, uri: str) -> list[_Component]:
         raise ParseError(msg)
     found: list[_Component] = []
     stack: list[_Component | None] = []
-    for line in _UNFOLD.sub("", text.replace("\r\n", "\n")).split("\n"):
+    for line in text.replace("\r\n", "\n").split("\n"):
         if not line.strip():
             continue
         prop = _property(line)
@@ -161,10 +165,25 @@ def _property(line: str) -> _Property | None:
     head, value = line[:colon], line[colon + 1 :]
     name, _, rest = head.partition(";")
     params: dict[str, str] = {}
-    for part in re.split(r';(?=(?:[^"]*"[^"]*")*[^"]*$)', rest) if rest else []:
+    for part in _split_unquoted(rest, ";") if rest else []:
         key, _, val = part.partition("=")
         params[key.upper()] = val.strip('"')
     return _Property(name.strip().upper(), params, value)
+
+
+def _split_unquoted(text: str, separator: str) -> list[str]:
+    """``text`` split at ``separator`` outside double quotes, in one pass."""
+    parts: list[str] = []
+    start = 0
+    in_quotes = False
+    for index, char in enumerate(text):
+        if char == '"':
+            in_quotes = not in_quotes
+        elif char == separator and not in_quotes:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return parts
 
 
 def _unescaped(value: str) -> str:
@@ -176,10 +195,12 @@ def _time(prop: _Property) -> str:
     match = _DATE.match(value)
     if match is None:
         return _unescaped(value)
-    year, month, day, hour, minute, _second, zulu = match.groups()
+    year, month, day, hour, minute, second, zulu = match.groups()
     out = f"{year}-{month}-{day}"
     if hour is not None:
         out += f" {hour}:{minute}"
+        if second and second != "00":
+            out += f":{second}"
         if zulu:
             out += " UTC"
         elif "TZID" in prop.params:
@@ -200,12 +221,15 @@ def _stanza(component: _Component) -> list[str]:
     lines = [
         f"{_COMPONENTS[component.kind]}: {_one_line(summary.value) if summary else ''}".rstrip()
     ]
-    start, end = component.first("DTSTART") or component.first("DUE"), component.first("DTEND")
+    start = component.first("DTSTART")
+    end = component.first("DTEND") or component.first("DUE")
     if start is not None:
         when = _time(start)
         if end is not None:
             when += f" to {_time(end)}"
         lines.append(f"When: {when}")
+    elif end is not None:
+        lines.append(f"When: {_time(end)}")
     for label, name in (("Where", "LOCATION"),):
         prop = component.first(name)
         if prop is not None and prop.value.strip():
