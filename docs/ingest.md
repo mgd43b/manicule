@@ -1091,6 +1091,33 @@ throughput during a run" is made of, and what makes each bound above checkable f
 one pool and one accelerator for the whole process, so a re-parse sweep running beside a sync is
 counted in `peak_parses` and `peak_embeds` too. Retained bodies belong to the run.
 
+**Where the time went is in the same record, under `stages.timings`.** Occupancy says how many
+workers were inside a stage, and not how long a visit took, so each stage also keeps a total of
+wall seconds and a count of visits, summed across workers: `journal_start`, `blob_read`,
+`parse`, `prepare`, `embed`, `stored_vectors`, `embed_lock_wait`, `embed_lock_held`, `glossary`,
+`fence`, `stage_vectors`, `upsert`, `publish`, `commit`, `after_store`, `lineage`,
+`journal_settle`, and `document`. Seconds divided by calls is one visit; seconds divided by the
+wall clock is how many workers were inside.
+
+They nest only where stated. `embed` contains `stored_vectors` and the lock's wait and hold.
+`commit` contains `fence`, `stage_vectors`, `upsert`, `glossary` and `publish`. `document`
+contains `parse`, `prepare`, `embed`, `commit`, `after_store` and `lineage`, and not the two
+journal stages, which run on either side of it. `publish` is also the publication of a document
+with no chunks, and of a failed one, which never reach `commit`. What a parent's stages leave
+over is **unmeasured**, not event-loop time: it includes the reads and middleware between stages
+(`_previous_inputs` is one), the event loop's own scheduling, and anything not listed.
+
+**A visit counts while it is happening.** A snapshot adds the elapsed time of every visit still
+open to those that have ended, and counts a call only when one ends, so seconds in a window
+divided by its length is a worker count even for one parse that spans three windows. Totals are
+kept for the pipeline and, separately, for each run: a run reports only the visits begun in
+tasks it started, so two runs sharing a pipeline do not see each other. The report is built when
+a run ends, so a running pipeline also logs the last minute's totals as one line on a timer
+(`ingest stage timings for <connector> ...`, slowest stage first), including a minute in which
+no document finished, and `IngestPipeline.stage_timings()` returns the pipeline's running
+totals. Counters only: the stage names are a fixed enumeration (`Stage`) and nothing from a
+document is kept.
+
 `blocked_puts` on the fetch hand-off is direct evidence that the bounded journal reader waited
 for local fetch capacity. It no longer describes source discovery, which has already completed.
 

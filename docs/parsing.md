@@ -2293,7 +2293,9 @@ so the two runs are not silently sharing vectors.
 ## 9. Archives
 
 `.zip` recurses into the parser chain. This is new work; it needs the security thinking that
-recursive extraction always needs.
+recursive extraction always needs. `.gz` and `.tar` do too, through `CompressedParser`, which
+keeps every promise in this section for a stream format (see §10.3 for what it does with a gzip
+and a tar); the zip-specific parts below (the central directory, §9.4) do not apply to them.
 
 ### 9.1 Members are documents, not chunks
 
@@ -2548,13 +2550,12 @@ decoder whose license has to be checked against §12 before it is added. Filed a
 if it matters on a real mailbox; sniffed as `application/vnd.ms-tnef` so that it is at least
 named.
 
-**`application/gzip` and tar.** Not built; the archive parser reads zip only (§9). A gzip attachment
-on a mailbox is almost always a gzipped DMARC report, which the decision below leaves unsupported
-whether or not it is decompressed, so decompression would spend the byte, ratio and depth limits of
-§9.3 to reach a document that is then declined. A tar needs its own hardening (symlinks, hard links
-and devices, which zip does not have) for a format that is rare in mail. Both are sniffed and named
-(`application/gzip`, `application/x-tar`) so that adding them later is a container parser and not a
-routing change; the work is filed as #504.
+**`application/gzip` and tar.** Read by `manicule.parsers.compressed.CompressedParser`, under the same
+member, byte, ratio, depth and cycle limits as zip (§9.2, §9.3). A gzip is a one-member container
+(`report.xml.gz` expands to `report.xml`; `bundle.tgz` to `bundle.tar`, which expands again); a tar
+yields its regular files and reports links, devices, FIFOs and names that escape the root. The value
+is bounded: a gzipped `application/xml`, which is what a gzip attachment on a mailbox usually is,
+decompresses and is then declined by the decision below.
 
 **`application/xml`.** No generic XML parser. The attachments in this category are overwhelmingly
 DMARC aggregate reports: machine-generated tables of source addresses, counts and pass/fail

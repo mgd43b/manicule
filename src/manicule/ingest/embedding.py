@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Final
 from manicule.chunking.tokens import SupportsTokenCount
 from manicule.core.embedding import VectorState, require_within_context
 from manicule.core.lifecycle import SupportsMetrics
+from manicule.ingest.stages import Stage, StageTimings
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -356,6 +357,7 @@ async def embed_or_reuse(
     maximum: int = MAX_BATCH,
     lock: AbstractAsyncContextManager[object] | None = None,
     reuse: bool = True,
+    timings: StageTimings | None = None,
 ) -> tuple[list[Vector], EmbeddingWork]:
     """Embed only the chunks whose embedding input the index does not already hold a vector for.
 
@@ -403,6 +405,8 @@ async def embed_or_reuse(
             ``refreshed``. The stored vectors are still read, so that the report can say which
             chunks were reusable and which rows the new vectors replace.
 
+        timings: Where to record the time the vector store's lookup took, as ``stored_vectors``.
+
     Returns:
         One vector per chunk, in the order the chunks were given, and what it cost.
 
@@ -413,7 +417,8 @@ async def embed_or_reuse(
     if not chunks:
         return [], EmbeddingWork()
 
-    verdicts = await vectors.stored_vectors(chunks)
+    with timings.timing(Stage.STORED_VECTORS) if timings is not None else nullcontext():
+        verdicts = await vectors.stored_vectors(chunks)
     held = previous or {}
 
     reused: dict[int, Vector] = {}

@@ -532,7 +532,9 @@ class ParserChunkerRelationalDeriver:
             return outcome.blocks, outcome.attempt
 
         result = await run_chain(self._parser_chain.resolve(raw.media_type), raw, attempt)
-        return (container_result(len(captured)) if captured else result), captured
+        if not captured:
+            return result, captured
+        return container_result(len(captured), parser=result.parser_used or "archive"), captured
 
     async def derive(
         self,

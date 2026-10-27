@@ -14,7 +14,16 @@ import inspect
 
 import pytest
 
-from manicule.ingest.stages import Conveyor, CountedLock, Gauge, QueueReport, StageReport
+from manicule.ingest.stages import (
+    Conveyor,
+    CountedLock,
+    Gauge,
+    QueueReport,
+    Stage,
+    StageReport,
+    StageTime,
+    StageTimings,
+)
 
 
 async def test_a_conveyor_bounds_what_is_waiting_and_not_what_is_held() -> None:
@@ -222,6 +231,7 @@ def test_a_stage_report_carries_counts_and_nothing_a_document_said() -> None:
         peak_embeds=1,
         peak_bodies=11,
         peak_discovery_records=7,
+        timings={Stage.PARSE: StageTime(seconds=1.23456, calls=3)},
     )
 
     recorded = report.as_metadata()
@@ -229,6 +239,141 @@ def test_a_stage_report_carries_counts_and_nothing_a_document_said() -> None:
     assert recorded["accepted"] == 12
     assert recorded["fetch_queue"] == {"capacity": 8, "peak_depth": 8, "blocked_puts": 3}
     assert recorded["peak_discovery_records"] == 7
+    assert recorded["timings"] == {"parse": {"seconds": 1.235, "calls": 3}}
     assert all(isinstance(value, (int, dict)) for value in recorded.values()), (
         "every field is a count or a record of counts, so no document content can reach here"
     )
+
+
+def test_timings_add_up_per_stage_and_say_how_many_visits_made_them() -> None:
+    timings = StageTimings()
+
+    timings.add(Stage.PARSE, 0.5)
+    timings.add(Stage.PARSE, 0.25)
+    timings.add(Stage.EMBED, 2.0)
+
+    assert timings.snapshot() == {
+        Stage.PARSE: StageTime(seconds=0.75, calls=2),
+        Stage.EMBED: StageTime(seconds=2.0, calls=1),
+    }
+
+
+def test_a_timed_block_is_counted_when_it_raises() -> None:
+    """The slow, failing visit is the one a profile most needs to see."""
+    timings = StageTimings()
+
+    with pytest.raises(RuntimeError), timings.timing(Stage.PUBLISH):
+        raise RuntimeError("synthetic failure")
+
+    assert timings.snapshot()[Stage.PUBLISH].calls == 1
+
+
+def test_a_window_is_the_difference_of_two_snapshots_and_omits_idle_stages() -> None:
+    timings = StageTimings()
+    timings.add(Stage.PARSE, 1.0)
+    timings.add(Stage.EMBED, 4.0)
+    base = timings.snapshot()
+
+    timings.add(Stage.EMBED, 2.0)
+    timings.add(Stage.PUBLISH, 0.5)
+    window = StageTimings.since(timings.snapshot(), base)
+
+    assert window == {
+        Stage.EMBED: StageTime(seconds=2.0, calls=1),
+        Stage.PUBLISH: StageTime(seconds=0.5, calls=1),
+    }, "parse did not run in the window, so it is not in it"
+
+
+async def test_a_counted_lock_with_timings_separates_waiting_from_holding() -> None:
+    """The second holder waits for as long as the first one holds, by construction."""
+    timings = StageTimings()
+    lock = CountedLock("embed", timings)
+    first_in = asyncio.Event()
+
+    async def first() -> None:
+        async with lock:
+            first_in.set()
+            await asyncio.sleep(0.05)
+
+    async def second() -> None:
+        await first_in.wait()
+        async with lock:
+            pass
+
+    await asyncio.gather(first(), second())
+    recorded = timings.snapshot()
+
+    assert recorded[Stage.EMBED_LOCK_HELD].calls == 2
+    assert recorded[Stage.EMBED_LOCK_WAIT].calls == 2
+    assert recorded[Stage.EMBED_LOCK_HELD].seconds >= 0.05
+    assert recorded[Stage.EMBED_LOCK_WAIT].seconds >= 0.04, (
+        "the second holder queued behind the first"
+    )
+
+
+async def test_a_counted_lock_without_timings_records_nothing_and_still_counts_holders() -> None:
+    lock = CountedLock("embed")
+
+    async with lock:
+        assert lock.gauge.active == 1
+
+    assert lock.gauge.peak == 1
+
+
+async def test_a_visit_still_open_counts_for_its_elapsed_time_and_not_as_a_call() -> None:
+    """One worker parked for a while is one worker's worth of seconds in every window."""
+    timings = StageTimings()
+    release = asyncio.Event()
+
+    async def parked() -> None:
+        with timings.timing(Stage.EMBED):
+            await release.wait()
+
+    task = asyncio.create_task(parked())
+    await asyncio.sleep(0.05)
+    first = timings.snapshot()
+    await asyncio.sleep(0.05)
+    window = StageTimings.since(timings.snapshot(), first)
+
+    assert first[Stage.EMBED].calls == 0
+    assert first[Stage.EMBED].seconds >= 0.04
+    assert window[Stage.EMBED].calls == 0, "nothing finished in the window"
+    assert window[Stage.EMBED].seconds >= 0.04, "the time it spent in the window is in it"
+
+    release.set()
+    await task
+    assert timings.snapshot()[Stage.EMBED].calls == 1
+
+
+async def test_a_scope_counts_only_the_visits_started_inside_it_and_the_pipeline_counts_all() -> (
+    None
+):
+    pipeline = StageTimings()
+    one, two = StageTimings(), StageTimings()
+
+    async def visit(scope: StageTimings, stage: Stage) -> None:
+        with scope.scoped():
+            await asyncio.create_task(self_visit(stage))
+
+    async def self_visit(stage: Stage) -> None:
+        with pipeline.timing(stage):
+            await asyncio.sleep(0)
+
+    await asyncio.gather(
+        visit(one, Stage.PARSE), visit(two, Stage.PUBLISH), visit(two, Stage.PUBLISH)
+    )
+
+    assert set(one.snapshot()) == {Stage.PARSE}
+    assert two.snapshot()[Stage.PUBLISH].calls == 2
+    assert pipeline.snapshot()[Stage.PARSE].calls == 1
+    assert pipeline.snapshot()[Stage.PUBLISH].calls == 2
+
+
+def test_closing_a_visit_twice_counts_it_once() -> None:
+    timings = StageTimings()
+    visit = timings.begin(Stage.PARSE)
+
+    timings.end(visit)
+    timings.end(visit)
+
+    assert timings.snapshot()[Stage.PARSE].calls == 1

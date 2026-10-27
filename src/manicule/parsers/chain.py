@@ -266,7 +266,7 @@ def classify(raw: RawDocument, attempts: Sequence[Attempt]) -> ChainResult:
     )
 
 
-def container_result(members: int) -> ChainResult:
+def container_result(members: int, *, parser: str = "archive") -> ChainResult:
     """The result for an archive whose members became documents of their own.
 
     Distinct from ``no_extractable_text``: nothing failed and nothing was missing. Conflating
@@ -277,8 +277,8 @@ def container_result(members: int) -> ChainResult:
         blocks=[],
         status=DocumentStatus.CONTAINER,
         status_detail=f"expanded into {members} member document(s)",
-        parser_used="archive",
-        attempts=(Attempt(parser="archive", outcome=Outcome.PARSED),),
+        parser_used=parser,
+        attempts=(Attempt(parser=parser, outcome=Outcome.PARSED),),
     )
 
 
