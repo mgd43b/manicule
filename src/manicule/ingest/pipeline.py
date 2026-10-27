@@ -2478,13 +2478,31 @@ class IngestPipeline:
         run.lease_expires_at = expires_at
 
     async def _fence_acquisition_publication(self, run: _Sync) -> AcquisitionFence:
-        """Prove ownership immediately before a journal consumer makes bytes servable."""
+        """Build the fence a journal consumer's next write is checked against.
+
+        **This renews only when the lease is near expiry, and it is not itself the proof.** The
+        proof is the first statement of every fenced transaction
+        (``_fence_acquisition_mutation``), which matches the exact owner and generation, an
+        unexpired lease and a run that is neither settled nor superseded, and is also the
+        statement that takes SQLite's writer lock. A takeover therefore either commits before it
+        and the write is refused, or waits until the guarded write commits. A forced renewal
+        here added a write transaction before each of those, three per document in
+        :meth:`_commit`, and proved nothing they do not.
+
+        Expiry is still caught without a read: the local expiry only ever trails the stored one,
+        so a lease that has run out locally takes the renewal below, which is refused. What a
+        lease that is not near expiry can lose is ownership ended early (released, or superseded
+        by a reconciliation), and the write that follows is the one that finds out. In
+        :meth:`_commit` the only write that can precede such a find is the vector upsert, which
+        is keyed by publication and tombstoned by the staging transaction before it, so it is
+        inert until a publish this fence refuses would have flipped it.
+        """
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover - callback exists only for journal runs
             msg = "an acquisition publication fence was requested outside a durable run"
             raise RuntimeError(msg)
         now = self._acquisition_clock()
-        await self._keep_acquisition_lease_live(run, acquisitions, now, force=True)
+        await self._keep_acquisition_lease_live(run, acquisitions, now)
         return AcquisitionFence(
             run_id=run.acquisition_run_id,
             owner=run.lease_owner,

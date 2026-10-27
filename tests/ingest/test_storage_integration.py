@@ -3245,6 +3245,224 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
     assert vectors.rows, "resume did not rebuild the staged publication from its retained blob"
 
 
+class _GatedStagingStore(SqliteDocStore):
+    """Parks a worker after its vectors are staged, before anything is upserted."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        super().__init__(engine)
+        self.staged = asyncio.Event()
+        self.release_stage = asyncio.Event()
+
+    @override
+    async def fenced_stage_vectors(
+        self,
+        fence: AcquisitionFence,
+        publication_id: str,
+        chunks: Sequence[Chunk],
+        *,
+        expected_reset_epoch: int | None = None,
+    ) -> None:
+        await super().fenced_stage_vectors(
+            fence, publication_id, chunks, expected_reset_epoch=expected_reset_epoch
+        )
+        self.staged.set()
+        await self.release_stage.wait()
+
+
+class _GatedUpsertVectors(PublicationMemoryVectors):
+    """Parks a worker after its vectors are written, before the publication flips."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.upserted = asyncio.Event()
+        self.release_upsert = asyncio.Event()
+
+    @override
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        await super().upsert(chunks, vectors, publication_id=publication_id)
+        self.upserted.set()
+        await self.release_upsert.wait()
+
+
+def _lease_pipeline(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    *,
+    vectors: fakes.MemoryVectors,
+    clock: fakes.ManualLeaseClock,
+    embedder: HashEmbedder | None = None,
+) -> IngestPipeline:
+    chunker = fakes.BlockChunker()
+    return IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=chunker,
+        embedder=embedder or HashEmbedder(),
+        vectors=vectors,
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=chunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=clock,
+        detect_glossary=False,
+    )
+
+
+async def _end_ownership_without_expiry(
+    store: SqliteDocStore, connector: str, clock: fakes.ManualLeaseClock
+) -> None:
+    """Release the run's lease while it still has most of its time left.
+
+    Expiry is the takeover the other tests use, and a worker can see it coming from its own
+    clock. A release (and a supersede, which clears the owner the same way) ends ownership with
+    the lease unexpired, so nothing local can tell: only the stored row knows.
+    """
+    durable = await store.latest_unsettled_acquisition_run(connector)
+    assert durable is not None
+    assert durable.lease_owner is not None
+    released = await store.release_acquisition_lease(
+        durable.id, durable.lease_owner, durable.lease_generation, now=clock()
+    )
+    assert released, "the lease was not released, so this asserts a fence against nothing"
+
+
+def _staged_vector_ids(vectors: PublicationMemoryVectors) -> set[str]:
+    return {
+        vector_id(publication, chunk)
+        for publication, rows in vectors.publications.items()
+        if publication != "legacy"
+        for chunk in rows
+    }
+
+
+async def test_ownership_ended_before_vector_staging_is_refused_by_the_staging_transaction(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """With no forced renewal ahead of it, the staging transaction is what finds the loss."""
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    embedder = fakes.GatedEmbedder()
+    vectors = PublicationMemoryVectors()
+    clock = fakes.ManualLeaseClock()
+    connector = fakes.DictConnector({"public-stage-loss": "public synthetic line"}, name="stage")
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=vectors, clock=clock, embedder=embedder
+    )
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await embedder.gate.wait_for(1)
+    await _end_ownership_without_expiry(store, connector.name, clock)
+    embedder.gate.open()
+    report = await task
+
+    assert report.error_type == "AcquisitionLeaseLostError"
+    assert report.indexed == 0
+    assert await store.find_document(connector.name, "public-stage-loss") is None
+    assert vectors.publications == {"legacy": {}}, "nothing was written to the vector store"
+    assert await store.take_tombstones(100) == [], "nothing was staged either"
+
+
+async def test_ownership_ended_before_upsert_leaves_only_inert_tombstoned_vectors(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """The one write the removed renewal used to guard is inert, and a sweep can find it."""
+    store = _GatedStagingStore(engine)
+    await store.ensure_workspace()
+    vectors = PublicationMemoryVectors()
+    clock = fakes.ManualLeaseClock()
+    connector = fakes.DictConnector({"public-upsert-loss": "public synthetic line"}, name="upsert")
+    pipeline = _lease_pipeline(store, engine, data_dir, vectors=vectors, clock=clock)
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await store.staged.wait()
+    await _end_ownership_without_expiry(store, connector.name, clock)
+    store.release_stage.set()
+    report = await task
+
+    assert report.error_type == "AcquisitionLeaseLostError"
+    assert report.indexed == 0
+    assert await store.find_document(connector.name, "public-upsert-loss") is None, (
+        "the vectors that were written are not attached to any servable document"
+    )
+    written = _staged_vector_ids(vectors)
+    assert written, "the upsert was meant to run: it is the write that is no longer pre-checked"
+    assert set(await store.take_tombstones(100)) == written, (
+        "every vector written after ownership ended is already recorded for the sweep"
+    )
+
+
+async def test_ownership_ended_between_upsert_and_publication_is_refused_inside_publication(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """The publish transaction refuses on its own; no earlier renewal is needed to make it."""
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    vectors = _GatedUpsertVectors()
+    clock = fakes.ManualLeaseClock()
+    connector = fakes.DictConnector(
+        {"public-publish-loss": "public synthetic line"}, name="publish"
+    )
+    pipeline = _lease_pipeline(store, engine, data_dir, vectors=vectors, clock=clock)
+
+    task = asyncio.create_task(pipeline.run(connector))
+    await vectors.upserted.wait()
+    await _end_ownership_without_expiry(store, connector.name, clock)
+    vectors.release_upsert.set()
+    report = await task
+
+    assert report.error_type == "AcquisitionLeaseLostError"
+    assert report.indexed == 0
+    assert await store.find_document(connector.name, "public-publish-loss") is None
+    assert set(await store.take_tombstones(100)) == _staged_vector_ids(vectors)
+
+
+async def test_publication_makes_no_lease_renewal_per_document(
+    engine: AsyncEngine, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run costs the same renewals however many documents it publishes.
+
+    Each publication used to renew the lease three times before its own transactions, which
+    check the lease anyway. The expiry here is far away, so the only renewals are the run's own.
+    """
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    renewals: list[str] = []
+    renew = store.renew_acquisition_lease
+
+    async def counting(*args: Any, **kwargs: Any) -> bool:
+        renewals.append("renewed")
+        return await renew(*args, **kwargs)
+
+    monkeypatch.setattr(store, "renew_acquisition_lease", counting)
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=fakes.MemoryVectors(), clock=fakes.ManualLeaseClock()
+    )
+
+    one = await pipeline.run(
+        fakes.DictConnector({"public-only": "public synthetic line"}, name="single")
+    )
+    single = len(renewals)
+    renewals.clear()
+    many = await pipeline.run(
+        fakes.DictConnector(
+            {f"public-{n}": f"public synthetic line {n}" for n in range(6)}, name="several"
+        )
+    )
+
+    assert one.indexed == 1
+    assert many.indexed == 6
+    assert len(renewals) == single, "renewals grew with the number of documents published"
+
+
 async def test_acquisition_failure_does_not_mutate_the_prior_document(
     engine: AsyncEngine,
 ) -> None:
