@@ -2679,8 +2679,14 @@ diagnostic is likewise written under the exact run generation; on an orderly ret
 and lease release are one transaction. A stale worker may return its own in-memory report, but
 it cannot overwrite the successor's connector diagnostic.
 
-The pipeline's renewal immediately before publication is only a fast failure and lease refresh;
-it is not the publication lock. Every attempt-owned relational mutation starts its own SQLite
+The pipeline's publication fence renews the lease only when it is near expiry, as every other
+journal call does. The exception is one forced renewal immediately before a document's vectors
+are written, so a document's publication costs one renewal where it used to cost three. The
+other two sat ahead of fenced transactions that prove the same thing as their first statement.
+This one stays because a vector sweep clears a tombstone whether or not its vector exists yet:
+a worker that lost its lease after staging and then wrote would leave vectors that nothing
+records. A lease that has run out locally is refused without a read. The fence is not the
+publication lock. Every attempt-owned relational mutation starts its own SQLite
 transaction with a conditional write that validates workspace, run, owner, generation, expiry,
 unsettled state and non-supersession. That first statement takes the writer lock through the
 document, status, annotation, lineage, glossary or tombstone mutation. A takeover therefore
