@@ -42,12 +42,10 @@ ALIASES: dict[str, str] = {
     "application/x-gzip": "application/gzip",
     "application/x-gunzip": "application/gzip",
     "application/ics": "text/calendar",
-    "text/x-vcalendar": "text/calendar",
     "text/xml": "application/xml",
     "application/x-sh": "text/x-shellscript",
     "application/x-shellscript": "text/x-shellscript",
     "text/x-sh": "text/x-shellscript",
-    "application/x-tar-gz": "application/gzip",
 }
 """Spellings of a type the ecosystem uses for the type manicule routes on.
 

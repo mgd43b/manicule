@@ -228,3 +228,19 @@ async def test_a_message_stored_before_the_fix_is_repaired_by_a_stale_sweep(
         == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
     assert "repairedmarker" in "\n".join(c.text for c in store.chunks[member.id])
+
+
+async def test_only_nameless_text_alternatives_that_are_documents_become_members(
+    indexed: Indexer,
+) -> None:
+    raw = (
+        "From: pat@example.org\r\nSubject: invite\r\nMIME-Version: 1.0\r\n"
+        "Content-Type: multipart/alternative; boundary=B\r\n\r\n"
+        "--B\r\nContent-Type: text/plain\r\n\r\nPlease join.\r\n"
+        "--B\r\nContent-Type: text/x-amp-html\r\n\r\n<html amp4email></html>\r\n"
+        "--B\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\n"
+        "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n--B--\r\n"
+    ).encode()
+    members, _ = await indexed(raw)
+
+    assert [m.media_type for m in members.values()] == ["text/calendar"]

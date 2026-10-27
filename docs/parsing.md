@@ -2506,9 +2506,10 @@ manicule reads to arrive as one it did not:
   types (`message/delivery-status`, `message/global-delivery-status`,
   `message/disposition-notification`, `text/rfc822-headers`) route to the plaintext parser: they
   are header fields and nothing more.
-- **A text part that is not a candidate body is an attachment.** A calendar invitation is a
-  `text/calendar` alternative beside the `text/plain` one, with no filename. It is never the
-  canonical body, and treating it as nothing made it disappear.
+- **A nameless `text/calendar`, `text/markdown`, `text/csv`, `text/rfc822-headers` or
+  `text/xml` part is an attachment.** A calendar invitation is a `text/calendar` alternative
+  beside the `text/plain` one, with no filename. It is never the canonical body, and treating it
+  as nothing made it disappear. Other nameless text alternatives (AMP HTML) stay unread.
 
 ### 10.2 Attachments no parser reads
 
@@ -2529,9 +2530,9 @@ worse for lacking them. The options and what each costs:
 
 | Option | License | Cost | Verdict |
 |---|---|---|---|
-| Tesseract | Apache-2.0 | a system binary, a subprocess per image, seconds per page on a modest CPU | good on scans and screenshots, noise on photographs |
-| An ONNX OCR model (PaddleOCR-class, run on `onnxruntime`, which manicule already ships) | Apache-2.0 code and weights | ~10-20 MB of weights, a fraction of a second per image on CPU, no new native dependency | the cheapest credible route if OCR is ever wanted |
-| An image-captioning model | varies; the small ones are MIT or Apache-2.0 | a gigabyte of weights, seconds per image on CPU, hallucinated captions that cite an image as though it said them | rejected: a citation must quote the document |
+| Tesseract | Apache-2.0 | a system binary and a subprocess per image; slow on a modest CPU | good on scans and screenshots, noise on photographs |
+| An ONNX OCR model (PaddleOCR-class, run on `onnxruntime`, which manicule already ships) | Apache-2.0 code and weights | small weights and CPU-feasible by design (to be measured, not assumed), no new native dependency | the cheapest credible route if OCR is ever wanted |
+| An image-captioning model | varies; the small ones are MIT or Apache-2.0 | large weights, slow on CPU, and generated captions that a citation would present as the image's own words | rejected: a citation must quote the document |
 | HEIF decoding | the usual decoder bundles an LGPL library | a licensing question before any engineering | blocked until a permissive decoder exists |
 
 A mailbox's images are mostly logos, signature graphics and tracking pixels, so the

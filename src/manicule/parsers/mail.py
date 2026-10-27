@@ -435,6 +435,12 @@ def _descend(part: EmailMessage, path: str) -> Iterator[tuple[str, EmailMessage]
             yield from _descend(child, f"{path}.{index}")
 
 
+_NAMELESS_ATTACHMENT_SUBTYPES = frozenset({"calendar", "markdown", "csv", "rfc822-headers", "xml"})
+"""Text subtypes that are a document even without a filename. Deliberately a list rather than
+"any text part that is not plain or HTML": mailers add machine alternatives (``text/x-amp-html``)
+that are neither the message nor anything worth a row in every mailbox message."""
+
+
 def _is_attachment(part: EmailMessage) -> bool:
     """Whether a part is an attachment rather than a candidate body.
 
@@ -451,7 +457,7 @@ def _is_attachment(part: EmailMessage) -> bool:
     failure. ``expansion.py`` is explicit that failure is an outcome and never an omission,
     and this is the one place that was quietly an omission.
 
-    **So does any text part that is not a candidate body.** A calendar invitation is a
+    **So does a nameless text part of a kind that is a document.** A calendar invitation is a
     ``text/calendar`` alternative beside the ``text/plain`` one, with no filename and no
     disposition. It is never the canonical body (only ``text/plain`` and ``text/html`` are), so
     treating it as anything but an attachment made it, like the enclosed message, vanish.
@@ -462,7 +468,7 @@ def _is_attachment(part: EmailMessage) -> bool:
         or part.get_content_maintype() == "message"
         or (
             part.get_content_maintype() == "text"
-            and part.get_content_subtype() not in {"plain", "html"}
+            and part.get_content_subtype() in _NAMELESS_ATTACHMENT_SUBTYPES
         )
     )
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 import base64
 import io
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from email.message import EmailMessage
 from email.policy import SMTP
 from pathlib import Path
@@ -30,16 +30,6 @@ from manicule.parsers.versions import parse_fingerprint
 from manicule.plugins.registry import ComponentKind
 from tests.fakes import HashEmbedder
 from tests.ingest import fakes
-
-
-class RealRoutes:
-    """``routes[media_type]``, answered by the production resolver."""
-
-    def __init__(self, resolve: object) -> None:
-        self._resolve = resolve
-
-    def __getitem__(self, media_type: str) -> Sequence[str]:
-        return list(self._resolve(media_type))  # type: ignore[operator]
 
 
 async def real_pipeline(
