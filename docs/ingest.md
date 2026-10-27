@@ -2685,7 +2685,7 @@ ahead of each of its three fenced steps was three extra writer-lock transactions
 proving what those steps prove. A lease that has run out locally is still refused before the
 write. One that was released or superseded early is found by the next fenced transaction, and
 the one write that can precede it, the vector upsert, is staged under a tombstone first and
-stays unservable until a publish that is refused would have flipped it. It is not the
+stays unservable until a publish that is refused would have flipped it. The fence is not the
 publication lock. Every attempt-owned relational mutation starts its own SQLite
 transaction with a conditional write that validates workspace, run, owner, generation, expiry,
 unsettled state and non-supersession. That first statement takes the writer lock through the

@@ -4362,7 +4362,13 @@ class IngestPipeline:
         return None if fence is None else await fence()
 
     async def _check_publication_fence(self) -> None:
-        """Run the task-local acquisition fence at the last point before publication."""
+        """Refuse a lease this worker can already see has run out, before the vector write.
+
+        Not a proof of ownership: with time left on the lease this makes no read, so a lease
+        released or superseded early is found by the next fenced transaction instead, and the
+        upsert that precedes it is tombstoned and unservable (see
+        :meth:`_fence_acquisition_publication`).
+        """
         await self._publication_authority()
 
     async def _record_seen(self, document_id: str, *, version_token: str | None = None) -> None:

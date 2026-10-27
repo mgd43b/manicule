@@ -3165,7 +3165,11 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
     engine: AsyncEngine,
     data_dir: Path,
 ) -> None:
-    """A valid tombstone stage is not authority for a later vector write after takeover."""
+    """A valid tombstone stage is not authority for a later vector write after expiry takeover.
+
+    Expiry is seen from the worker's own clock. Ownership ended with time left is covered by
+    ``test_ownership_ended_before_upsert_leaves_only_inert_tombstoned_vectors``.
+    """
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
 
     class GatedVectorStageStore(SqliteDocStore):
