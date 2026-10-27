@@ -975,9 +975,9 @@ class _Sync:
     inflating every later run's report by a number that only ever grows.
     """
 
-    timings_base: Mapping[Stage, StageTime] = field(default_factory=dict[Stage, StageTime])
-    """The pipeline's timings when this run began. Process-wide totals less this is the report,
-    so anything else using the pipeline meanwhile is in it, as it is in the peak gauges."""
+    timings: StageTimings = field(default_factory=StageTimings)
+    """This run's own stage totals. Visits in tasks started under :meth:`StageTimings.scoped`
+    count here as well as in the pipeline's, so a run reports its own time and not a neighbor's."""
 
     timings_logged_at: float = 0.0
     timings_logged: Mapping[Stage, StageTime] = field(default_factory=dict[Stage, StageTime])
@@ -1651,10 +1651,10 @@ class IngestPipeline:
         # second operation sharing this pipeline is one of them.
         for gauge in (self._fetches, self._parsing, self._embedding.gauge):
             gauge.rebase()
-        run.timings_base = run.timings_logged = self._timings.snapshot()
         run.timings_logged_at = time.perf_counter()
 
-        stages = asyncio.create_task(self._drive(run), name=f"ingest:{connector.name}")
+        with run.timings.scoped():
+            stages = asyncio.create_task(self._drive(run), name=f"ingest:{connector.name}")
         crashed = False
         try:
             # Shielded so that a cancellation arriving here does not tear the stages down before
@@ -3296,12 +3296,13 @@ class IngestPipeline:
         """Say where the time since the last line went, slowest stage first.
 
         The window is a difference of totals, which is why the lines compare with each other and
-        with the wall clock they carry. A stage is counted when a visit to it ends, so a visit
-        that has not ended is not in the line: a stall shows as the other stages going quiet.
+        with the wall clock they carry. A visit still open counts for the time it has taken so
+        far, and as a call only once it ends, so a stage that has stalled shows its seconds
+        growing with no calls beside them.
         """
         now = time.perf_counter()
         window = now - run.timings_logged_at
-        totals = self._timings.snapshot()
+        totals = run.timings.snapshot()
         spent = StageTimings.since(totals, run.timings_logged)
         run.timings_logged_at = now
         run.timings_logged = totals
@@ -3421,7 +3422,7 @@ class IngestPipeline:
             peak_embeds=self._embedding.gauge.peak,
             peak_bodies=run.bodies_held.peak,
             peak_discovery_records=run.discovery_records_held.peak,
-            timings=StageTimings.since(self._timings.snapshot(), run.timings_base),
+            timings=run.timings.snapshot(),
         )
 
     async def _advance_watermark(self, run: _Sync) -> bool:
@@ -4288,35 +4289,36 @@ class IngestPipeline:
         fence = await self._publication_authority()
         publisher = self._fenced_store if fence is not None else None
         publish = publisher.fenced_publish_document if publisher is not None else None
-        if fence is not None and publish is not None:
-            committed = await publish(
-                fence,
-                settled,
-                [],
-                expected=expected,
-                chunk_fp=None,
-                embed_fp=None,
-                parse_fp=self._parse_lineage_of(settled),
-                glossary_entries=entries,
-                glossary_fp=glossary_fp,
-                original_omitted_reason=retention.omitted_reason,
-                source_dependencies=_source_dependencies(settled),
-                expected_reset_epoch=self._expected_reset_epoch,
-            )
-        else:
-            committed = await self._store.publish_document(
-                settled,
-                [],
-                expected=expected,
-                chunk_fp=None,
-                embed_fp=None,
-                parse_fp=self._parse_lineage_of(settled),
-                glossary_entries=entries,
-                glossary_fp=glossary_fp,
-                original_omitted_reason=retention.omitted_reason,
-                source_dependencies=_source_dependencies(settled),
-                expected_reset_epoch=self._expected_reset_epoch,
-            )
+        with self._timings.timing(Stage.PUBLISH):
+            if fence is not None and publish is not None:
+                committed = await publish(
+                    fence,
+                    settled,
+                    [],
+                    expected=expected,
+                    chunk_fp=None,
+                    embed_fp=None,
+                    parse_fp=self._parse_lineage_of(settled),
+                    glossary_entries=entries,
+                    glossary_fp=glossary_fp,
+                    original_omitted_reason=retention.omitted_reason,
+                    source_dependencies=_source_dependencies(settled),
+                    expected_reset_epoch=self._expected_reset_epoch,
+                )
+            else:
+                committed = await self._store.publish_document(
+                    settled,
+                    [],
+                    expected=expected,
+                    chunk_fp=None,
+                    embed_fp=None,
+                    parse_fp=self._parse_lineage_of(settled),
+                    glossary_entries=entries,
+                    glossary_fp=glossary_fp,
+                    original_omitted_reason=retention.omitted_reason,
+                    source_dependencies=_source_dependencies(settled),
+                    expected_reset_epoch=self._expected_reset_epoch,
+                )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
         return committed.stored, glossary_detail
@@ -4878,21 +4880,22 @@ class IngestPipeline:
             return document
         fence = await self._publication_authority()
         publisher = self._fenced_store if fence is not None else None
-        if fence is not None and publisher is not None:
-            committed = await publisher.fenced_publish_failure(
-                fence,
-                document,
-                expected=expected,
-                original_omitted_reason=retention.omitted_reason,
-                expected_reset_epoch=self._expected_reset_epoch,
-            )
-        else:
-            committed = await self._store.publish_failure(
-                document,
-                expected=expected,
-                original_omitted_reason=retention.omitted_reason,
-                expected_reset_epoch=self._expected_reset_epoch,
-            )
+        with self._timings.timing(Stage.PUBLISH):
+            if fence is not None and publisher is not None:
+                committed = await publisher.fenced_publish_failure(
+                    fence,
+                    document,
+                    expected=expected,
+                    original_omitted_reason=retention.omitted_reason,
+                    expected_reset_epoch=self._expected_reset_epoch,
+                )
+            else:
+                committed = await self._store.publish_failure(
+                    document,
+                    expected=expected,
+                    original_omitted_reason=retention.omitted_reason,
+                    expected_reset_epoch=self._expected_reset_epoch,
+                )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
         return committed.stored

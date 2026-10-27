@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
@@ -282,6 +283,10 @@ class StageTime:
     calls: int = 0
 
 
+_scope: ContextVar[StageTimings | None] = ContextVar("stage_timings_scope", default=None)
+"""The run whose stage totals a visit also counts toward, inherited by the tasks it starts."""
+
+
 class StageTimings:
     """Cumulative wall time per named stage, for a pipeline that is slower than it should be.
 
@@ -290,6 +295,16 @@ class StageTimings:
     is. Read it as two snapshots and a subtraction (:meth:`since`), which is how a report says
     what one run did and a log line says what the last minute did.
 
+    **A visit counts while it is happening, not only when it ends.** A snapshot adds the elapsed
+    time of every visit still open to the time of those that have closed, and counts only the
+    closed ones as calls. Otherwise one worker embedding for two minutes would be invisible in
+    the first two windows and arrive whole in the third, and the seconds in a window divided by
+    its length would stop meaning how many workers were inside.
+
+    **Scoped to a run as well as to the pipeline.** Inside :meth:`scoped`, and in every task
+    started there, a visit also counts toward the scope's totals, so two runs sharing a pipeline
+    each report their own and the pipeline's own totals still hold both.
+
     Synchronous and unlocked, like :class:`Gauge`: nothing between reading a total and writing
     it back awaits, so two tasks cannot interleave a read-modify-write.
     """
@@ -297,25 +312,66 @@ class StageTimings:
     def __init__(self) -> None:
         self._seconds: dict[Stage, float] = {}
         self._calls: dict[Stage, int] = {}
+        self._open: dict[object, tuple[Stage, float]] = {}
 
     def add(self, stage: Stage, seconds: float) -> None:
-        """Count one visit to ``stage`` that took ``seconds``."""
+        """Count one finished visit to ``stage`` that took ``seconds``."""
         self._seconds[stage] = self._seconds.get(stage, 0.0) + seconds
         self._calls[stage] = self._calls.get(stage, 0) + 1
+
+    def begin(self, stage: Stage) -> _Visit:
+        """Open a visit. Close it with :meth:`end`, or use :meth:`timing`."""
+        now = time.perf_counter()
+        scope = _scope.get()
+        visit = _Visit(stage, now, None if scope is self else scope)
+        self._open[visit] = (stage, now)
+        if visit.scope is not None:
+            visit.scope.begin_scoped(visit)
+        return visit
+
+    def begin_scoped(self, visit: _Visit) -> None:
+        self._open[visit] = (visit.stage, visit.started)
+
+    def end(self, visit: _Visit) -> None:
+        """Close a visit opened by :meth:`begin`, once."""
+        if self._open.pop(visit, None) is None:
+            return
+        elapsed = time.perf_counter() - visit.started
+        self.add(visit.stage, elapsed)
+        if visit.scope is not None:
+            visit.scope.end_scoped(visit, elapsed)
+
+    def end_scoped(self, visit: _Visit, elapsed: float) -> None:
+        if self._open.pop(visit, None) is not None:
+            self.add(visit.stage, elapsed)
 
     @contextmanager
     def timing(self, stage: Stage) -> Generator[None]:
         """Time the block, whether it returns, raises or is canceled."""
-        started = time.perf_counter()
+        visit = self.begin(stage)
         try:
             yield
         finally:
-            self.add(stage, time.perf_counter() - started)
+            self.end(visit)
+
+    @contextmanager
+    def scoped(self) -> Generator[None]:
+        """Make visits begun in this context, and in tasks started from it, also count here."""
+        token = _scope.set(self)
+        try:
+            yield
+        finally:
+            _scope.reset(token)
 
     def snapshot(self) -> Mapping[Stage, StageTime]:
+        """Totals now, with visits still open counted for the time they have taken so far."""
+        now = time.perf_counter()
+        seconds = dict(self._seconds)
+        for stage, started in self._open.values():
+            seconds[stage] = seconds.get(stage, 0.0) + (now - started)
         return {
-            stage: StageTime(seconds=seconds, calls=self._calls[stage])
-            for stage, seconds in self._seconds.items()
+            stage: StageTime(seconds=total, calls=self._calls.get(stage, 0))
+            for stage, total in seconds.items()
         }
 
     @staticmethod
@@ -326,11 +382,20 @@ class StageTimings:
         delta: dict[Stage, StageTime] = {}
         for stage, after in now.items():
             before = base.get(stage, StageTime())
-            if after.calls > before.calls:
+            if after.calls > before.calls or after.seconds > before.seconds:
                 delta[stage] = StageTime(
                     seconds=after.seconds - before.seconds, calls=after.calls - before.calls
                 )
         return delta
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class _Visit:
+    """One open visit to a stage. Compared by identity, so each is its own key."""
+
+    stage: Stage
+    started: float
+    scope: StageTimings | None
 
 
 class CountedLock:
@@ -362,21 +427,25 @@ class CountedLock:
         self._timings = timings
         self._wait_stage = wait
         self._held_stage = held
-        self._acquired_at = 0.0
+        self._held: _Visit | None = None
 
     async def __aenter__(self) -> None:
-        requested = time.perf_counter()
-        await self._lock.acquire()
-        self._acquired_at = time.perf_counter()
+        waiting = self._timings.begin(self._wait_stage) if self._timings is not None else None
+        try:
+            await self._lock.acquire()
+        finally:
+            if waiting is not None and self._timings is not None:
+                self._timings.end(waiting)
         if self._timings is not None:
-            self._timings.add(self._wait_stage, self._acquired_at - requested)
+            self._held = self._timings.begin(self._held_stage)
         self.gauge.active += 1
         self.gauge.peak = max(self.gauge.peak, self.gauge.active)
 
     async def __aexit__(self, *_: object) -> None:
         self.gauge.active -= 1
-        if self._timings is not None:
-            self._timings.add(self._held_stage, time.perf_counter() - self._acquired_at)
+        if self._timings is not None and self._held is not None:
+            self._timings.end(self._held)
+        self._held = None
         self._lock.release()
 
     def locked(self) -> bool:

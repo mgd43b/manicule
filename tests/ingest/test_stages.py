@@ -318,3 +318,62 @@ async def test_a_counted_lock_without_timings_records_nothing_and_still_counts_h
         assert lock.gauge.active == 1
 
     assert lock.gauge.peak == 1
+
+
+async def test_a_visit_still_open_counts_for_its_elapsed_time_and_not_as_a_call() -> None:
+    """One worker parked for a while is one worker's worth of seconds in every window."""
+    timings = StageTimings()
+    release = asyncio.Event()
+
+    async def parked() -> None:
+        with timings.timing(Stage.EMBED):
+            await release.wait()
+
+    task = asyncio.create_task(parked())
+    await asyncio.sleep(0.05)
+    first = timings.snapshot()
+    await asyncio.sleep(0.05)
+    window = StageTimings.since(timings.snapshot(), first)
+
+    assert first[Stage.EMBED].calls == 0
+    assert first[Stage.EMBED].seconds >= 0.04
+    assert window[Stage.EMBED].calls == 0, "nothing finished in the window"
+    assert window[Stage.EMBED].seconds >= 0.04, "the time it spent in the window is in it"
+
+    release.set()
+    await task
+    assert timings.snapshot()[Stage.EMBED].calls == 1
+
+
+async def test_a_scope_counts_only_the_visits_started_inside_it_and_the_pipeline_counts_all() -> (
+    None
+):
+    pipeline = StageTimings()
+    one, two = StageTimings(), StageTimings()
+
+    async def visit(scope: StageTimings, stage: Stage) -> None:
+        with scope.scoped():
+            await asyncio.create_task(self_visit(stage))
+
+    async def self_visit(stage: Stage) -> None:
+        with pipeline.timing(stage):
+            await asyncio.sleep(0)
+
+    await asyncio.gather(
+        visit(one, Stage.PARSE), visit(two, Stage.PUBLISH), visit(two, Stage.PUBLISH)
+    )
+
+    assert set(one.snapshot()) == {Stage.PARSE}
+    assert two.snapshot()[Stage.PUBLISH].calls == 2
+    assert pipeline.snapshot()[Stage.PARSE].calls == 1
+    assert pipeline.snapshot()[Stage.PUBLISH].calls == 2
+
+
+def test_closing_a_visit_twice_counts_it_once() -> None:
+    timings = StageTimings()
+    visit = timings.begin(Stage.PARSE)
+
+    timings.end(visit)
+    timings.end(visit)
+
+    assert timings.snapshot()[Stage.PARSE].calls == 1

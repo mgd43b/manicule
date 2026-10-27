@@ -3550,6 +3550,68 @@ async def test_the_timings_are_logged_on_a_timer_even_while_nothing_finishes(
     assert any("parse " in line for line in lines), "the stages that finished are in the line"
 
 
+async def test_publishing_a_document_with_no_chunks_is_timed_as_a_publish(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Containers, unsupported and empty documents publish through their own path."""
+
+    class EmptyChunker(fakes.BlockChunker):
+        @override
+        def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+            del document, blocks
+            return []
+
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=EmptyChunker(),
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=fakes.BlockChunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=fakes.ManualLeaseClock(),
+        detect_glossary=False,
+    )
+
+    report = await pipeline.run(
+        fakes.DictConnector(
+            {"public-a": "public line a", "public-b": "public line b"}, name="empty"
+        )
+    )
+
+    assert report.stages.timings[Stage.PUBLISH].calls == 2
+    assert Stage.COMMIT not in report.stages.timings, "no chunks, so no vector commit happened"
+
+
+async def test_two_runs_sharing_a_pipeline_each_report_only_their_own_time(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=fakes.MemoryVectors(), clock=fakes.ManualLeaseClock()
+    )
+
+    first, second = await asyncio.gather(
+        pipeline.run(
+            fakes.DictConnector({f"public-a{n}": f"line a {n}" for n in range(3)}, name="first")
+        ),
+        pipeline.run(
+            fakes.DictConnector({f"public-b{n}": f"line b {n}" for n in range(2)}, name="second")
+        ),
+    )
+
+    assert first.stages.timings[Stage.DOCUMENT].calls == 3
+    assert second.stages.timings[Stage.DOCUMENT].calls == 2
+    assert pipeline.stage_timings()[Stage.DOCUMENT].calls == 5
+
+
 async def test_a_second_run_reports_only_its_own_time(engine: AsyncEngine, data_dir: Path) -> None:
     store = SqliteDocStore(engine)
     await store.ensure_workspace()
