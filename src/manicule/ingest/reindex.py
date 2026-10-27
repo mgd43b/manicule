@@ -792,6 +792,14 @@ async def re_parse_stale(
             # from the start of the page and correcting downwards for successes would be the
             # same arithmetic with one more way to get it wrong.
             left_behind += 1
+            # Read again, because the selection is a snapshot and a container earlier in this
+            # sweep may have re-derived this document since: a mail attachment recorded with no
+            # lineage is selected beside its message, and the message's re-parse replaces it
+            # with a current row. Re-parsing the snapshot after that is superseded by the
+            # replacement it just made, and used to leave the row `parsing` on the way.
+            if await _left_the_selection(store, document.id, current):
+                left_behind -= 1
+                continue
             before = {chunk.id for chunk in await store.document_chunks(document.id)}
             report, inside = await _re_parse_judged(document, pipeline=pipeline, blobs=blobs)
             # Folded before the branching, for the reason `re_parse` folds it before its own:

@@ -176,10 +176,11 @@ async def test_an_attachment_keeps_the_media_type_the_message_declared(
     expanded = [member for member in members if isinstance(member, ExpandedMember)]
     assert [member.raw.media_type for member in expanded] == [
         "text/csv",
-        "application/octet-stream",
+        "text/plain",
     ], (
         "the well-formed tag is honored and the one carrying a header injection is refused "
-        "back to the default rather than passed into a header verbatim"
+        "back to the generic default rather than passed into a header verbatim — and the "
+        "generic default is then resolved from the bytes, which here are text"
     )
 
 

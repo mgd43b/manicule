@@ -34,10 +34,13 @@ and it is not a parsing decision.
 
 from __future__ import annotations
 
+import base64
+import quopri
 import re
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from email import policy
+from email.errors import MissingHeaderBodySeparatorDefect
 from email.message import EmailMessage
 from email.parser import BytesParser
 
@@ -56,7 +59,6 @@ from manicule.parsers.base import ParserProfile, lines_of, resolve_lines
 from manicule.parsers.config import MAIL_MEDIA_TYPES, MailConfig, html_text_version
 from manicule.parsers.expansion import (
     CONTAINER_DEPTH,
-    OCTET_STREAM,
     PATH_HASHES,
     TREE_BYTES,
     TREE_MEMBERS,
@@ -65,12 +67,17 @@ from manicule.parsers.expansion import (
     MemberOutcome,
     container_depth_of,
     inner_path,
-    media_type_for,
     member_source_id,
     member_uri,
     path_hashes_of,
     tree_bytes_of,
     tree_members_of,
+)
+from manicule.parsers.mediatype import (
+    ALIASES,
+    GENERIC,
+    UNINDEXED_MAIN_TYPES,
+    resolve_member_media_type,
 )
 from manicule.parsers.plaintext import paragraph_spans
 from manicule.parsers.web import WebConfig, WebParser
@@ -237,6 +244,10 @@ class MailParser:
                     DocumentStatus.UNSUPPORTED_MEDIA_TYPE,
                 )
                 continue
+            declared = ALIASES.get(part.get_content_type(), part.get_content_type())
+            if declared.split("/", 1)[0] in UNINDEXED_MAIN_TYPES:
+                yield self._unindexed(raw, name, depth, declared)
+                continue
             payload = _payload_of(part)
             digest = content_hash(payload)
             if digest in hashes:
@@ -249,13 +260,29 @@ class MailParser:
                     DocumentStatus.FAILED,
                 )
                 continue
+            media_type = resolve_member_media_type(declared, name, payload)
+            transcoded = False
+            if media_type == declared and declared in GENERIC:
+                # Nothing established what the bytes are, which for a text attachment in a
+                # multi-byte character set is the NULs of UTF-16 reading as binary. Resolve again
+                # over the declared character set's reading, and keep it only if it is text.
+                decoded = _transcoded(part, payload)
+                if decoded != payload:
+                    retried = resolve_member_media_type(declared, name, decoded)
+                    if retried.startswith("text/"):
+                        media_type, payload, transcoded = retried, decoded, True
+            if media_type.split("/", 1)[0] in UNINDEXED_MAIN_TYPES:
+                yield self._unindexed(raw, name, depth, media_type)
+                continue
+            if not transcoded:
+                payload = _as_utf8(part, media_type, payload)
             yield ExpandedMember(
                 source_id=member_source_id(raw.source_id, name, scheme=MAIL_SCHEME),
                 uri=member_uri(raw.uri, name, scheme=MAIL_SCHEME),
                 raw=RawDocument(
                     source_id=member_source_id(raw.source_id, name, scheme=MAIL_SCHEME),
                     uri=member_uri(raw.uri, name, scheme=MAIL_SCHEME),
-                    media_type=_member_media_type(part, name),
+                    media_type=media_type,
                     content=payload,
                     metadata=self._member_metadata(raw, depth, digest, members, part),
                 ),
@@ -347,6 +374,25 @@ class MailParser:
             metadata={"member_filename": name},
         )
 
+    def _unindexed(self, raw: RawDocument, name: str, depth: int, media_type: str) -> MemberFailure:
+        """An attachment of a kind no parser reads, refused before its bytes are decoded.
+
+        The row stays, so the member set of the message is still complete, and the bytes do not:
+        a refused member is stored without retaining them, where an unsupported one that went
+        through the chain would have been retained and then declined (``docs/parsing.md`` §10.4).
+        """
+        return MemberFailure(
+            source_id=member_source_id(raw.source_id, name, scheme=MAIL_SCHEME),
+            uri=member_uri(raw.uri, name, scheme=MAIL_SCHEME),
+            status=DocumentStatus.UNSUPPORTED_MEDIA_TYPE,
+            reason=(
+                f"{media_type} attachments are not indexed — no text is extracted from images, "
+                f"video or audio, so the bytes were not kept"
+            ),
+            depth=depth,
+            metadata={"member_filename": name, "member_content_type": media_type},
+        )
+
 
 # --- the message -----------------------------------------------------------------------
 
@@ -402,6 +448,12 @@ def _descend(part: EmailMessage, path: str) -> Iterator[tuple[str, EmailMessage]
             yield from _descend(child, f"{path}.{index}")
 
 
+_NAMELESS_ATTACHMENT_SUBTYPES = frozenset({"calendar", "markdown", "csv", "rfc822-headers", "xml"})
+"""Text subtypes that are a document even without a filename. Deliberately a list rather than
+"any text part that is not plain or HTML": mailers add machine alternatives (``text/x-amp-html``)
+that are neither the message nor anything worth a row in every mailbox message."""
+
+
 def _is_attachment(part: EmailMessage) -> bool:
     """Whether a part is an attachment rather than a candidate body.
 
@@ -417,11 +469,20 @@ def _is_attachment(part: EmailMessage) -> bool:
     a digest of twenty messages indexes as a header block and nothing else, reporting no
     failure. ``expansion.py`` is explicit that failure is an outcome and never an omission,
     and this is the one place that was quietly an omission.
+
+    **So does a nameless text part of a kind that is a document.** A calendar invitation is a
+    ``text/calendar`` alternative beside the ``text/plain`` one, with no filename and no
+    disposition. It is never the canonical body (only ``text/plain`` and ``text/html`` are), so
+    treating it as anything but an attachment made it, like the enclosed message, vanish.
     """
     return (
         part.get_content_disposition() == "attachment"
         or part.get_filename() is not None
         or part.get_content_maintype() == "message"
+        or (
+            part.get_content_maintype() == "text"
+            and part.get_content_subtype() in _NAMELESS_ATTACHMENT_SUBTYPES
+        )
     )
 
 
@@ -433,15 +494,92 @@ def _payload_of(part: EmailMessage) -> bytes:
     the enclosed message is what makes it a document the chain can parse — and it has to be
     the *enclosed* message rather than the part, or the member would carry the wrapper's
     headers as well as its own.
+
+    **Two shapes of enclosed part are not one message.** A ``message/delivery-status`` is a list
+    of header blocks (one for the reporting server, one per recipient), and reading only the
+    first dropped every recipient's status. And a ``message/rfc822`` declared
+    ``Content-Transfer-Encoding: base64`` — forbidden by RFC 2046 and sent by real clients
+    regardless — is parsed as though its base64 text were headers, so the transfer encoding has
+    to be undone on the serialized text before it is a message.
     """
     if part.get_content_maintype() == "message":
         enclosed = part.get_payload()
         if isinstance(enclosed, list) and enclosed:
-            first = enclosed[0]
-            if isinstance(first, EmailMessage):
-                return first.as_bytes()
+            encoded = (
+                str(part.get("Content-Transfer-Encoding", "")).strip().lower() in _ENCODED_TRANSFERS
+            )
+            blocks = [
+                _unparsed(block) if encoded else block.as_bytes()
+                for block in enclosed
+                if isinstance(block, EmailMessage)
+            ]
+            if not blocks:
+                return b""
+            return _undone(part, b"\n".join(blocks) if len(blocks) > 1 else blocks[0])
     payload = part.get_payload(decode=True)
     return payload if isinstance(payload, bytes) else b""
+
+
+_ENCODED_TRANSFERS = frozenset({"base64", "quoted-printable"})
+
+
+def _unparsed(block: EmailMessage) -> bytes:
+    """The text the parser read as a message but which is a transfer-encoded body.
+
+    Serializing the parsed message inserts the blank line between header and body that the source
+    never had, which is harmless to base64 and corrupts quoted-printable: a soft-wrapped line
+    (``Subject: =?...=`` then ``rest``) is read as the end of the headers, and a separator put
+    in front of the continuation splits the line. The parser records exactly that case as a
+    missing separator, so the original text is the raw header lines followed directly by the body.
+    """
+    payload = block.get_payload()
+    body = payload if isinstance(payload, str) else ""
+    headers = "".join(f"{name}: {value}\n" for name, value in block.raw_items())
+    separated = not any(
+        isinstance(defect, MissingHeaderBodySeparatorDefect) for defect in block.defects
+    )
+    return (headers + ("\n" if separated and headers else "") + body).encode(
+        "utf-8", "surrogateescape"
+    )
+
+
+def _undone(part: EmailMessage, serialized: bytes) -> bytes:
+    """``serialized`` with the part's declared base64 or quoted-printable encoding removed."""
+    encoding = str(part.get("Content-Transfer-Encoding", "")).strip().lower()
+    try:
+        if encoding == "base64":
+            return base64.b64decode(serialized)
+        if encoding == "quoted-printable":
+            return quopri.decodestring(serialized)
+    except ValueError:
+        return serialized
+    return serialized
+
+
+def _as_utf8(part: EmailMessage, media_type: str, payload: bytes) -> bytes:
+    """A text attachment's bytes in UTF-8, using the character set its part declares.
+
+    The member is a document of its own and is parsed without the part that carried it, so the
+    declared character set would otherwise be lost — and a Latin-1 or UTF-16 text file, which
+    the plaintext parser declines as binary, would be reported unsupported.
+    """
+    return _transcoded(part, payload) if media_type.startswith("text/") else payload
+
+
+def _transcoded(part: EmailMessage, payload: bytes) -> bytes:
+    """``payload`` read in the part's declared character set and written as UTF-8.
+
+    A declared set that does not decode the bytes (a mislabeled ``us-ascii`` that is really
+    UTF-8, most often) leaves them as they were, because the label is the sender's claim and the
+    bytes are the evidence.
+    """
+    charset = part.get_content_charset()
+    if not charset or charset.lower().replace("_", "-") in {"utf-8", "utf8", "us-ascii", "ascii"}:
+        return payload
+    try:
+        return payload.decode(charset).encode("utf-8")
+    except (LookupError, UnicodeError):
+        return payload
 
 
 def _text_payload(part: EmailMessage, uri: str) -> str:
@@ -509,16 +647,3 @@ def _attachment_path(part: EmailMessage, path: str, used: set[str]) -> str:
     if candidate is None:
         return f"part-{path}"
     return candidate if candidate not in used else f"{path}/{candidate}"
-
-
-def _member_media_type(part: EmailMessage, name: str) -> str:
-    """What the part declares, falling back to what its name implies.
-
-    The declared type wins because ``docs/parsing.md`` §6.1 puts a type the source states above
-    a filename extension — except for ``application/octet-stream``, which is not a claim but
-    the absence of one, and is the one type sniffing and naming are allowed to replace.
-    """
-    declared = part.get_content_type()
-    if declared and declared != OCTET_STREAM:
-        return declared
-    return media_type_for(name)

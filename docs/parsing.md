@@ -1523,6 +1523,26 @@ exception: `application/octet-stream` is not a claim, it is the absence of one, 
 replaces it. Letting sniffing override a real declaration is how a `.docx` gets parsed as a
 zip (§9.4).
 
+**Amended for container members (#499).** A mail attachment's declaration is whatever its
+sender's client wrote, and the clients that matter write placeholders: OOXML as
+`application/msword`, `application/vnd.ms-excel` or `application/vnd.ms-powerpoint` (the
+legacy types, which no parser reads, although what is attached is very often a `.docx`),
+`application/x-download`, `application/force-download`, and `application/octet-stream`. These
+are the *generic* declarations (`manicule.parsers.mediatype.GENERIC`), and for a member that
+carries one the order above is applied to the bytes: the filename extension proposes a type
+(`manicule.parsers.expansion.media_type_for`) and the bytes confirm it where a wrong answer
+would fail rather than decline — an OLE `.doc` named `.docx` must not reach the Word parser, so
+the extension of an Office document, PDF or archive is honored only when the leading bytes agree,
+and loses to what they say otherwise. With no usable extension the bytes decide, and with neither
+the declaration is kept. Every other declared type is a claim and stands, after its common
+spellings are read as the type manicule routes on (`application/x-pdf` is `application/pdf`,
+`application/ics` is `text/calendar`).
+
+What sniffing recognizes is deliberately short: PDF, OOXML (a zip with `[Content_Types].xml` and
+a `word/`, `xl/` or `ppt/` directory), plain zip, gzip, tar, images, MP4 and HEIF, TNEF, iCalendar
+and XML by their first bytes, and **text** by the one inference the plaintext parser itself
+makes (§6.2). Bytes that are none of those stay `application/octet-stream`.
+
 **Routing reads the registration, not the parser.** Every parser declares its media types
 when the plugin registers it, so choosing one parser for a document does not construct the
 other twelve — and a parser's factory is exactly where its library import lives. That
@@ -2464,6 +2484,77 @@ document with `container_id` pointing at the message. This matches what the
 Confluence connector does with page attachments
 ([`confluence.md`](connectors/confluence.md) §6), so a PDF is a PDF wherever it arrived
 from.
+
+### 10.1 What an attachment is routed as
+
+An attachment's media type is `manicule.parsers.mediatype.resolve_member_media_type` applied to
+its declared `Content-Type`, its filename and its decoded bytes — §6.1 states the rule. Four
+details at the mail boundary make that rule reachable, each of which was a way for a type
+manicule reads to arrive as one it did not:
+
+- **A text member is transcoded to UTF-8 using the character set its part declares.** The member
+  is a document of its own and is parsed without the part that carried it, so a Latin-1 or UTF-16
+  `text/plain` or `text/markdown` file would otherwise be declined as binary by the plaintext
+  tail (§6.2). A declared set that does not decode the bytes (a mislabeled `us-ascii` that is
+  really UTF-8) leaves them untouched: the label is a claim and the bytes are the evidence.
+- **An enclosed message has its transfer encoding undone.** A `message/rfc822` part sent as
+  `Content-Transfer-Encoding: base64` is forbidden by RFC 2046 and sent regardless; the standard
+  library parses its base64 as headers. The serialized text is decoded before it is parsed as a
+  message.
+- **A `message/delivery-status` keeps every header block.** Its payload is a list of blocks (the
+  reporting server, then one per recipient), and the first alone names no recipient. The report
+  types (`message/delivery-status`, `message/global-delivery-status`,
+  `message/disposition-notification`, `text/rfc822-headers`) route to the plaintext parser: they
+  are header fields and nothing more.
+- **A nameless `text/calendar`, `text/markdown`, `text/csv`, `text/rfc822-headers` or
+  `text/xml` part is an attachment.** A calendar invitation is a `text/calendar` alternative
+  beside the `text/plain` one, with no filename. It is never the canonical body, and treating it
+  as nothing made it disappear. Other nameless text alternatives (AMP HTML) stay unread.
+
+### 10.2 Attachments no parser reads
+
+An `image/*`, `video/*` or `audio/*` attachment — by its declared type, or by its bytes when the
+declaration is generic — is refused at expansion as `unsupported_media_type` before its bytes
+are decoded or retained. The row stays (a message's member set is complete: "the message had
+nine attachments and we indexed three" is a fact someone can discover) and carries
+`member_content_type`; the bytes do not stay. Previously each was retained, queued, sent to a
+parse worker and declined, which on a mailbox is by far the most common member and the one that
+can never yield text.
+
+Whether to read them at all is a separate decision, recorded in §10.3.
+
+### 10.3 Decisions: images, HEIF, video, TNEF, XML
+
+**Images (and HEIF).** Not built, and not planned without a measurement that says search is
+worse for lacking them. The options and what each costs:
+
+| Option | License | Cost | Verdict |
+|---|---|---|---|
+| Tesseract | Apache-2.0 | a system binary and a subprocess per image; slow on a modest CPU | good on scans and screenshots, noise on photographs |
+| An ONNX OCR model (PaddleOCR-class, run on `onnxruntime`, which manicule already ships) | Apache-2.0 code and weights | small weights and CPU-feasible by design (to be measured, not assumed), no new native dependency | the cheapest credible route if OCR is ever wanted |
+| An image-captioning model | varies; the small ones are MIT or Apache-2.0 | large weights, slow on CPU, and generated captions that a citation would present as the image's own words | rejected: a citation must quote the document |
+| HEIF decoding | the usual decoder bundles an LGPL library | a licensing question before any engineering | blocked until a permissive decoder exists |
+
+A mailbox's images are mostly logos, signature graphics and tracking pixels, so the
+precondition for any of these is a size and dimension filter that discards them before the
+expensive step. Until OCR is wanted, the right behavior is the one in §10.2: refuse early and
+cheaply.
+
+**Video and audio.** Out of scope. Transcription is a separate product with its own cost model.
+
+**TNEF (`winmail.dat`).** Not built. It is Outlook's wrapper for a message's attachments and
+rich-text body, so the value is in the attachments inside it, and a reader needs a TNEF
+decoder whose license has to be checked against §12 before it is added. Filed as an enhancement
+if it matters on a real mailbox; sniffed as `application/vnd.ms-tnef` so that it is at least
+named.
+
+**`application/xml`.** No generic XML parser. The attachments in this category are overwhelmingly
+DMARC aggregate reports: machine-generated tables of source addresses, counts and pass/fail
+verdicts. They do not answer questions people ask a search index in prose, they would add a
+large number of near-identical chunks that match on a domain name and outrank the mail that
+mentions it, and an anchor into them would cite a table of IP addresses. They stay
+`unsupported_media_type`, with no cost beyond the row, and a deployment that does want them can
+route `application/xml` to the plaintext parser under `parserFallbacks` (§6.2).
 
 **`.msg` is the one format whose obvious library is license-incompatible.** The maintained
 Python `.msg` parser, `extract-msg`, is GPL-3.0, which is disqualifying for an MIT project (§12).
