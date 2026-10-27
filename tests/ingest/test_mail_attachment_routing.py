@@ -306,6 +306,7 @@ async def test_only_nameless_text_alternatives_that_are_documents_become_members
             "deepmarker",
         ),
     ],
+    ids=lambda case: f"{case[0]}-{case[2]}",
 )
 async def test_a_compressed_attachment_is_opened_and_its_content_indexed(
     indexed: Indexer, case: tuple[str, bytes, str, str, str]
