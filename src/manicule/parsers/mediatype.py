@@ -76,6 +76,9 @@ UNINDEXED_MAIN_TYPES: frozenset[str] = frozenset({"image", "video", "audio"})
 """Media types no parser reads and none is planned to (``docs/parsing.md`` §10.4)."""
 
 _ZIP = b"PK\x03\x04"
+_ZIP_END = b"PK\x05\x06"
+_ZIP_END_WINDOW = 65557
+"""The end-of-central-directory record, and the longest tail (record plus comment) it can sit in."""
 _OLE = b"\xd0\xcf\x11\xe0"
 _TNEF = b"\x22\x3e\x9f\x78"
 
@@ -120,8 +123,12 @@ _SIGNATURES: tuple[tuple[int, bytes, str], ...] = (
 
 
 def _by_signature(data: bytes) -> str | None:
-    if data.startswith(_ZIP):
-        return _zip_kind(data)
+    if data.startswith(_ZIP) or _ZIP_END in data[-_ZIP_END_WINDOW:]:
+        # A zip is read from its end, so one with a launcher or other prefix before the first
+        # entry is still a zip: `zipfile` opens it, and so must this.
+        kind = _zip_kind(data)
+        if kind != OCTET_STREAM or data.startswith(_ZIP):
+            return kind
     for offset, signature, media_type in _SIGNATURES:
         if data[offset : offset + len(signature)] == signature:
             return media_type
