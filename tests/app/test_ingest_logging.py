@@ -22,13 +22,21 @@ from tests.api.support import backend_with_a_document
 def isolated_ingest_logger() -> Iterator[logging.Logger]:
     """Give each case the logger as a fresh process has it: no handler, no level of its own."""
     logger = logging.getLogger(INGEST_LOGGER)
-    original = (logger.handlers[:], logger.level, logger.propagate)
+    root = logging.getLogger()
+    original = (logger.handlers[:], logger.level, logger.propagate, root.handlers[:])
     logger.handlers = []
     logger.setLevel(logging.NOTSET)
     logger.propagate = True
+    root.handlers = []  # pytest's capture handler is the host's configuration here
     yield logger
     logger.handlers, level, logger.propagate = original[0], original[1], original[2]
     logger.setLevel(level)
+    root.handlers = original[3]
+
+
+def _a_process_nobody_configured() -> None:
+    """Drop the root handler pytest attaches for the duration of each test body."""
+    logging.getLogger().handlers = []
 
 
 def _stream_of(logger: logging.Logger) -> StringIO:
@@ -46,6 +54,7 @@ def test_an_info_line_from_the_pipeline_is_dropped_until_a_server_configures_it(
 def test_configuring_ingest_logging_writes_the_pipelines_info_lines_once(
     isolated_ingest_logger: logging.Logger,
 ) -> None:
+    _a_process_nobody_configured()
     configure_ingest_logging()
     captured = _stream_of(isolated_ingest_logger)
 
@@ -59,6 +68,7 @@ def test_configuring_ingest_logging_writes_the_pipelines_info_lines_once(
 def test_configuring_twice_keeps_one_handler_and_an_explicit_one_wins(
     isolated_ingest_logger: logging.Logger,
 ) -> None:
+    _a_process_nobody_configured()
     configure_ingest_logging()
     configure_ingest_logging()
     assert len(isolated_ingest_logger.handlers) == 1
@@ -74,6 +84,7 @@ def test_configuring_twice_keeps_one_handler_and_an_explicit_one_wins(
 def test_starting_the_http_server_configures_ingest_logging(
     isolated_ingest_logger: logging.Logger, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _a_process_nobody_configured()
     serve = importlib.import_module("manicule.api.serve")  # the package re-exports a function
 
     backend, _ = backend_with_a_document()
@@ -99,9 +110,37 @@ def test_each_transport_configures_ingest_logging_before_it_builds_its_server(mo
     assert source.index("configure_ingest_logging()") < source.index("configure_request_logging(")
 
 
-def test_the_module_imports_without_touching_process_logging(
+def test_a_host_with_its_own_root_handler_receives_each_line_once_and_gets_no_second_sink(
     isolated_ingest_logger: logging.Logger,
 ) -> None:
-    """Importing, or building a service, must not change a host process's logging."""
-    assert ingest_logging.INGEST_LOGGER == INGEST_LOGGER
+    captured = StringIO()
+    host = logging.StreamHandler(captured)
+    logging.getLogger().addHandler(host)
+
+    configure_ingest_logging()
+    pipeline._LOG.info("ingest stage timings for example")  # pyright: ignore[reportPrivateUsage]
+    pipeline._LOG.warning("a warning the host already received")  # pyright: ignore[reportPrivateUsage]
+
+    assert isolated_ingest_logger.handlers == [], "the host's configuration is the sink"
+    assert isolated_ingest_logger.propagate, "so its warnings keep reaching the host"
+    assert captured.getvalue().count("ingest stage timings for example") == 1
+    assert "a warning the host already received" in captured.getvalue()
+
+
+def test_an_explicit_level_on_the_ingest_logger_is_not_overridden(
+    isolated_ingest_logger: logging.Logger,
+) -> None:
+    isolated_ingest_logger.setLevel(logging.ERROR)
+
+    configure_ingest_logging()
+
+    assert isolated_ingest_logger.level == logging.ERROR
+
+
+def test_importing_the_module_does_not_configure_logging(
+    isolated_ingest_logger: logging.Logger,
+) -> None:
+    importlib.reload(ingest_logging)
+
     assert isolated_ingest_logger.handlers == []
+    assert isolated_ingest_logger.level == logging.NOTSET
