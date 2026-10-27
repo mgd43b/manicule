@@ -167,6 +167,7 @@ def test_a_forged_sign_in_cookie_is_refused() -> None:
     with client_with(oauth_backend(), provider) as client:
         parameters = start(client)
         forged = _forged(client.cookies[SIGNIN_COOKIE])
+        client.cookies.delete(SIGNIN_COOKIE)
         client.cookies.set(SIGNIN_COOKIE, forged, path="/auth/callback")
         refused = client.get(
             "/auth/callback/google", params={"code": CODE, "state": parameters["state"]}
@@ -393,6 +394,7 @@ def test_a_tampered_cookie_is_refused_before_anything_is_looked_up() -> None:
         assert client.get("/api/v1/documents").status_code == OK
         looked_up = backend.users_.resolves
         forged = _forged(client.cookies[SESSION_COOKIE])
+        client.cookies.delete(SESSION_COOKIE)
         client.cookies.set(SESSION_COOKIE, forged)
         refused = client.get("/api/v1/documents")
     assert refused.status_code == UNAUTHORIZED
