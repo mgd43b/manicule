@@ -7,6 +7,9 @@ whole ``.eml`` messages through it.
 
 from __future__ import annotations
 
+import gzip
+import io
+import tarfile
 from collections.abc import Awaitable, Callable
 
 import pytest
@@ -24,6 +27,17 @@ from tests.ingest.mail_routing_support import (
     real_pipeline,
     xlsx_bytes,
 )
+
+
+def tar_bytes(entries: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, data in entries.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
 
 type Indexer = Callable[[bytes], Awaitable[tuple[dict[str, Document], dict[str, str]]]]
 
@@ -264,6 +278,46 @@ async def test_only_nameless_text_alternatives_that_are_documents_become_members
     members, _ = await indexed(raw)
 
     assert [m.media_type for m in members.values()] == ["text/calendar"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("application/gzip", gzip.compress(b"gzmarker text\n"), "n.txt.gz", "n.txt", "gzmarker"),
+        (
+            "application/octet-stream",
+            gzip.compress(b"# sniffgz\n"),
+            "readme.md.gz",
+            "readme.md",
+            "sniffgz",
+        ),
+        (
+            "application/x-tar",
+            tar_bytes({"inner.md": b"# tarmarker\n"}),
+            "bundle.tar",
+            "inner.md",
+            "tarmarker",
+        ),
+        (
+            "application/gzip",
+            gzip.compress(tar_bytes({"deep.txt": b"deepmarker\n"})),
+            "bundle.tgz",
+            "bundle.tar!/deep.txt",
+            "deepmarker",
+        ),
+    ],
+    ids=lambda case: f"{case[0]}-{case[2]}",
+)
+async def test_a_compressed_attachment_is_opened_and_its_content_indexed(
+    indexed: Indexer, case: tuple[str, bytes, str, str, str]
+) -> None:
+    content_type, data, name, inner, marker = case
+    members, text = await indexed(message((content_type, data, "base64", name)))
+
+    assert members[name].status is DocumentStatus.CONTAINER
+    (leaf,) = [key for key in members if key.endswith(f"!/{inner}")]
+    assert members[leaf].status is DocumentStatus.INDEXED, members[leaf].status_detail
+    assert marker in text[leaf]
 
 
 async def test_a_quoted_printable_enclosed_message_with_a_soft_wrapped_header_survives(

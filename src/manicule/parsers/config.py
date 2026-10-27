@@ -53,6 +53,7 @@ __all__ = [
     "ADF_MEDIA_TYPES",
     "ARCHIVE_MEDIA_TYPES",
     "CALENDAR_MEDIA_TYPES",
+    "COMPRESSED_MEDIA_TYPES",
     "CONFLUENCE_MEDIA_TYPE",
     "CONFLUENCE_MEDIA_TYPES",
     "CSV_MEDIA_TYPE",
@@ -213,6 +214,9 @@ is the finest address there is.
 Declared narrowly. The global fallback tail routes by configuration, not by a parser
 claiming every media type for itself — a parser that claimed ``*`` would win documents a real
 parser was installed to handle."""
+
+COMPRESSED_MEDIA_TYPES = frozenset({"application/gzip", "application/x-tar"})
+"""Gzip and tar, which the zip parser's central-directory reader cannot open."""
 
 CALENDAR_MEDIA_TYPES = frozenset({"text/calendar"})
 """``application/ics`` and the other spellings are read as this type before routing
