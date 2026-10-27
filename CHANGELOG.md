@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.19](https://github.com/mgd43b/manicule/compare/v0.2.18...v0.2.19) (2026-10-27)
+
+
+### Bug Fixes
+
+* **ingest:** write the ingest progress lines somewhere when a server starts ([#515](https://github.com/mgd43b/manicule/issues/515)) ([c2dc6fe](https://github.com/mgd43b/manicule/commit/c2dc6fe69c42057a4823f2df00857e72d6d85058))
+
 ## [0.2.18](https://github.com/mgd43b/manicule/compare/v0.2.17...v0.2.18) (2026-10-27)
 
 
