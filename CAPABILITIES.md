@@ -15,9 +15,9 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 | CLI capability items | 48 | #8 — **built** |
 | MCP capability items | 47 | #8 — **built** |
 | HTTP endpoints | 64 | #11 — **built** |
-| File types | 19 | #4 |
+| File types | 21 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **218** | |
+| **Total** | **220** | |
 
 ## CLI — 48
 
