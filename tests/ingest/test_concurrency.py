@@ -1256,7 +1256,33 @@ async def test_the_stage_counters_reach_the_connector_row_without_any_document_c
         "peak_embeds",
         "peak_bodies",
         "peak_discovery_records",
+        "timings",
     }, "the stage report grew a field, and every field here is read by an operator"
+    timings = stages["timings"]
+    assert isinstance(timings, dict)
+    assert set(timings) <= {
+        "journal_start",
+        "blob_read",
+        "document",
+        "parse",
+        "prepare",
+        "embed",
+        "stored_vectors",
+        "embed_lock_wait",
+        "embed_lock_held",
+        "glossary",
+        "commit",
+        "fence",
+        "stage_vectors",
+        "upsert",
+        "publish",
+        "after_store",
+        "lineage",
+        "journal_settle",
+    }, "a timing is named for a stage, never for anything a document said"
+    assert all(
+        isinstance(value, dict) and set(value) == {"seconds", "calls"} for value in timings.values()
+    )
 
 
 async def _until_indexed(store: fakes.MemoryIngestStore, source_id: str) -> None:

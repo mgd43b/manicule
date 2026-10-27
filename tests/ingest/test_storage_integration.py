@@ -3469,6 +3469,79 @@ async def test_publication_makes_one_lease_renewal_per_document(
     assert len(renewals) == single + 5, "more than one renewal per extra document"
 
 
+async def test_a_durable_run_reports_where_its_time_went_and_logs_it_while_running(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every stage on the derive path is sampled once per document, in the report and the log."""
+    monkeypatch.setattr("manicule.ingest.pipeline.TIMINGS_LOG_INTERVAL_S", 0.0)
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=fakes.MemoryVectors(), clock=fakes.ManualLeaseClock()
+    )
+    connector = fakes.DictConnector(
+        {f"public-{n}": f"public synthetic line {n}" for n in range(3)}, name="timed"
+    )
+
+    with caplog.at_level("INFO", logger="manicule.ingest.pipeline"):
+        report = await pipeline.run(connector)
+
+    assert report.indexed == 3
+    timings = report.stages.timings
+    for stage in (
+        "journal_start",
+        "blob_read",
+        "document",
+        "parse",
+        "prepare",
+        "embed",
+        "stored_vectors",
+        "embed_lock_wait",
+        "embed_lock_held",
+        "commit",
+        "fence",
+        "stage_vectors",
+        "upsert",
+        "publish",
+        "lineage",
+        "journal_settle",
+    ):
+        assert timings[stage].calls >= 3, f"{stage} was not sampled once per document"
+        assert timings[stage].seconds >= 0.0
+    assert timings["publish"].seconds <= timings["commit"].seconds, "publish is inside commit"
+    assert timings["commit"].seconds <= timings["document"].seconds, "commit is inside the document"
+    recorded = report.stages.as_metadata()["timings"]
+    assert isinstance(recorded, dict)
+    assert set(recorded) == set(timings)
+    assert pipeline.stage_timings()["document"].calls == 3
+    lines = [
+        record.getMessage() for record in caplog.records if "stage timings" in record.getMessage()
+    ]
+    assert lines, "no progress line was logged while the run was going"
+    assert all("timed" in line for line in lines)
+    assert any("document " in line for line in lines), "the whole-document stage was logged"
+
+
+async def test_a_second_run_reports_only_its_own_time(engine: AsyncEngine, data_dir: Path) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=fakes.MemoryVectors(), clock=fakes.ManualLeaseClock()
+    )
+
+    first = await pipeline.run(fakes.DictConnector({"public-a": "public line a"}, name="first"))
+    second = await pipeline.run(
+        fakes.DictConnector({"public-b": "one", "public-c": "two"}, name="second")
+    )
+
+    assert first.stages.timings["document"].calls == 1
+    assert second.stages.timings["document"].calls == 2
+    assert pipeline.stage_timings()["document"].calls == 3
+
+
 async def test_acquisition_failure_does_not_mutate_the_prior_document(
     engine: AsyncEngine,
 ) -> None:

@@ -1091,6 +1091,19 @@ throughput during a run" is made of, and what makes each bound above checkable f
 one pool and one accelerator for the whole process, so a re-parse sweep running beside a sync is
 counted in `peak_parses` and `peak_embeds` too. Retained bodies belong to the run.
 
+**Where the time went is in the same record, under `stages.timings`.** Occupancy says how many
+workers were inside a stage, and not how long a visit took, so each stage also keeps a total of
+wall seconds and a count of visits, summed across workers: `journal_start`, `blob_read`,
+`parse`, `prepare`, `embed` (which contains `stored_vectors` and the lock's `embed_lock_wait`
+and `embed_lock_held`), `glossary`, `fence`, `stage_vectors`, `upsert`, `publish`, `commit`
+(which contains the last five), `after_store`, `lineage`, `journal_settle`, and `document` around
+all of it. Seconds divided by calls is one visit; seconds divided by the wall clock is how many
+workers were inside. `commit` less its parts, and `document` less every stage, is time spent on
+the event loop or waiting for it. The report is built when a run ends, so a running pipeline
+also logs the last minute's totals as one line (`ingest stage timings for <connector> ...`,
+slowest stage first) and `IngestPipeline.stage_timings()` returns the running totals. Counters
+only: a stage name is one of a fixed few and nothing from a document is kept.
+
 `blocked_puts` on the fetch hand-off is direct evidence that the bounded journal reader waited
 for local fetch capacity. It no longer describes source discovery, which has already completed.
 

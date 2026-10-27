@@ -14,7 +14,15 @@ import inspect
 
 import pytest
 
-from manicule.ingest.stages import Conveyor, CountedLock, Gauge, QueueReport, StageReport
+from manicule.ingest.stages import (
+    Conveyor,
+    CountedLock,
+    Gauge,
+    QueueReport,
+    StageReport,
+    StageTime,
+    StageTimings,
+)
 
 
 async def test_a_conveyor_bounds_what_is_waiting_and_not_what_is_held() -> None:
@@ -222,6 +230,7 @@ def test_a_stage_report_carries_counts_and_nothing_a_document_said() -> None:
         peak_embeds=1,
         peak_bodies=11,
         peak_discovery_records=7,
+        timings={"parse": StageTime(seconds=1.23456, calls=3)},
     )
 
     recorded = report.as_metadata()
@@ -229,6 +238,80 @@ def test_a_stage_report_carries_counts_and_nothing_a_document_said() -> None:
     assert recorded["accepted"] == 12
     assert recorded["fetch_queue"] == {"capacity": 8, "peak_depth": 8, "blocked_puts": 3}
     assert recorded["peak_discovery_records"] == 7
+    assert recorded["timings"] == {"parse": {"seconds": 1.235, "calls": 3}}
     assert all(isinstance(value, (int, dict)) for value in recorded.values()), (
         "every field is a count or a record of counts, so no document content can reach here"
     )
+
+
+def test_timings_add_up_per_stage_and_say_how_many_visits_made_them() -> None:
+    timings = StageTimings()
+
+    timings.add("parse", 0.5)
+    timings.add("parse", 0.25)
+    timings.add("embed", 2.0)
+
+    assert timings.snapshot() == {
+        "parse": StageTime(seconds=0.75, calls=2),
+        "embed": StageTime(seconds=2.0, calls=1),
+    }
+
+
+def test_a_timed_block_is_counted_when_it_raises() -> None:
+    """The slow, failing visit is the one a profile most needs to see."""
+    timings = StageTimings()
+
+    with pytest.raises(RuntimeError), timings.timing("publish"):
+        raise RuntimeError("synthetic failure")
+
+    assert timings.snapshot()["publish"].calls == 1
+
+
+def test_a_window_is_the_difference_of_two_snapshots_and_omits_idle_stages() -> None:
+    timings = StageTimings()
+    timings.add("parse", 1.0)
+    timings.add("embed", 4.0)
+    base = timings.snapshot()
+
+    timings.add("embed", 2.0)
+    timings.add("publish", 0.5)
+    window = StageTimings.since(timings.snapshot(), base)
+
+    assert window == {
+        "embed": StageTime(seconds=2.0, calls=1),
+        "publish": StageTime(seconds=0.5, calls=1),
+    }, "parse did not run in the window, so it is not in it"
+
+
+async def test_a_counted_lock_with_timings_separates_waiting_from_holding() -> None:
+    """The second holder waits for as long as the first one holds, by construction."""
+    timings = StageTimings()
+    lock = CountedLock("embed", timings)
+    first_in = asyncio.Event()
+
+    async def first() -> None:
+        async with lock:
+            first_in.set()
+            await asyncio.sleep(0.05)
+
+    async def second() -> None:
+        await first_in.wait()
+        async with lock:
+            pass
+
+    await asyncio.gather(first(), second())
+    recorded = timings.snapshot()
+
+    assert recorded["embed_lock_held"].calls == 2
+    assert recorded["embed_lock_wait"].calls == 2
+    assert recorded["embed_lock_held"].seconds >= 0.05
+    assert recorded["embed_lock_wait"].seconds >= 0.04, "the second holder queued behind the first"
+
+
+async def test_a_counted_lock_without_timings_records_nothing_and_still_counts_holders() -> None:
+    lock = CountedLock("embed")
+
+    async with lock:
+        assert lock.gauge.active == 1
+
+    assert lock.gauge.peak == 1

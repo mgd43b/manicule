@@ -22,12 +22,13 @@ makes both modes' local bounds observable (``docs/ingest.md`` §8.3).
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Mapping
 
     from manicule.core.content import Metadata
 
@@ -238,6 +239,68 @@ class Gauge:
         self.peak = self.active
 
 
+@dataclass(frozen=True, slots=True)
+class StageTime:
+    """Wall time one stage took in total, and how many times it ran.
+
+    Summed across workers, so a stage that four workers occupy at once can add up to more
+    seconds than the clock on the wall. That is the point: seconds divided by calls is how long
+    one visit takes, and seconds divided by the window is how many workers were inside it.
+    """
+
+    seconds: float = 0.0
+    calls: int = 0
+
+
+class StageTimings:
+    """Cumulative wall time per named stage, for a pipeline that is slower than it should be.
+
+    **Counters, not a trace.** Nothing here keeps an event, a document id or a label drawn from
+    content: a stage name is one of a fixed few, so the memory is constant however long a run
+    is. Read it as two snapshots and a subtraction (:meth:`since`), which is how a report says
+    what one run did and a log line says what the last minute did.
+
+    Synchronous and unlocked, like :class:`Gauge`: nothing between reading a total and writing
+    it back awaits, so two tasks cannot interleave a read-modify-write.
+    """
+
+    def __init__(self) -> None:
+        self._seconds: dict[str, float] = {}
+        self._calls: dict[str, int] = {}
+
+    def add(self, stage: str, seconds: float) -> None:
+        """Count one visit to ``stage`` that took ``seconds``."""
+        self._seconds[stage] = self._seconds.get(stage, 0.0) + seconds
+        self._calls[stage] = self._calls.get(stage, 0) + 1
+
+    @contextmanager
+    def timing(self, stage: str) -> Generator[None]:
+        """Time the block, whether it returns, raises or is canceled."""
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(stage, time.perf_counter() - started)
+
+    def snapshot(self) -> Mapping[str, StageTime]:
+        return {
+            stage: StageTime(seconds=seconds, calls=self._calls[stage])
+            for stage, seconds in self._seconds.items()
+        }
+
+    @staticmethod
+    def since(now: Mapping[str, StageTime], base: Mapping[str, StageTime]) -> dict[str, StageTime]:
+        """What happened between two snapshots, leaving out stages that did not run."""
+        delta: dict[str, StageTime] = {}
+        for stage, after in now.items():
+            before = base.get(stage, StageTime())
+            if after.calls > before.calls:
+                delta[stage] = StageTime(
+                    seconds=after.seconds - before.seconds, calls=after.calls - before.calls
+                )
+        return delta
+
+
 class CountedLock:
     """An :class:`asyncio.Lock` that says how many holders it has had at once.
 
@@ -248,19 +311,33 @@ class CountedLock:
 
     A peak above one is the whole of "the embedder was called concurrently", so this is the
     measurement that assertion is made from rather than a proxy for it.
+
+    Given ``timings`` it also records ``<name>_lock_wait`` (queued behind another holder) and
+    ``<name>_lock_held``, which is the difference between an accelerator that is the limit and
+    one that is waiting for work.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, timings: StageTimings | None = None) -> None:
         self.gauge = Gauge(name)
         self._lock = asyncio.Lock()
+        self._timings = timings
+        self._wait_stage = f"{name}_lock_wait"
+        self._held_stage = f"{name}_lock_held"
+        self._acquired_at = 0.0
 
     async def __aenter__(self) -> None:
+        requested = time.perf_counter()
         await self._lock.acquire()
+        self._acquired_at = time.perf_counter()
+        if self._timings is not None:
+            self._timings.add(self._wait_stage, self._acquired_at - requested)
         self.gauge.active += 1
         self.gauge.peak = max(self.gauge.peak, self.gauge.active)
 
     async def __aexit__(self, *_: object) -> None:
         self.gauge.active -= 1
+        if self._timings is not None:
+            self._timings.add(self._held_stage, time.perf_counter() - self._acquired_at)
         self._lock.release()
 
     def locked(self) -> bool:
@@ -306,6 +383,9 @@ class StageReport:
     peak_discovery_records: int = 0
     """Journal records held by the read page and fetch hand-off together."""
 
+    timings: Mapping[str, StageTime] = field(default_factory=dict[str, StageTime])
+    """Where this run's time went, per stage, summed across workers. Empty when nothing ran."""
+
     def as_metadata(self) -> Metadata:
         return {
             "accepted": self.accepted,
@@ -316,7 +396,19 @@ class StageReport:
             "peak_embeds": self.peak_embeds,
             "peak_bodies": self.peak_bodies,
             "peak_discovery_records": self.peak_discovery_records,
+            "timings": {
+                stage: {"seconds": round(spent.seconds, 3), "calls": spent.calls}
+                for stage, spent in sorted(self.timings.items())
+            },
         }
 
 
-__all__ = ["Conveyor", "CountedLock", "Gauge", "QueueReport", "StageReport"]
+__all__ = [
+    "Conveyor",
+    "CountedLock",
+    "Gauge",
+    "QueueReport",
+    "StageReport",
+    "StageTime",
+    "StageTimings",
+]
