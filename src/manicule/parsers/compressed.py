@@ -153,70 +153,87 @@ class CompressedParser:
 
     def _tar(self, raw: RawDocument) -> Generator[MemberOutcome]:
         context = _Context(raw, TAR_SCHEME)
-        seen: set[str] = set()
+        seen = context.seen
         try:
             archive = tarfile.open(fileobj=io.BytesIO(raw.as_bytes()), mode="r:")  # noqa: SIM115
         except (tarfile.TarError, OSError) as exc:
             msg = f"{raw.uri}: declining — not a readable tar archive ({exc})."
             raise ParseError(msg) from exc
         with archive:
-            for ordinal, info in enumerate(archive):
-                if info.isdir():
-                    continue
-                context.members += 1
-                if context.members > self._config.max_members:
+            entries = iter(archive)
+            ordinal = -1
+            while True:
+                try:
+                    info = next(entries)
+                except StopIteration:
+                    break
+                except (tarfile.TarError, OSError, EOFError) as exc:
                     yield context.refusal(
-                        _unique(inner_path(info.name) or "member", ordinal, seen),
-                        f"archive member count exceeded: {context.members} members across this "
-                        f"container tree, and the limit is {self._config.max_members}.",
+                        _unique("member", ordinal + 1, seen),
+                        f"tar archive is truncated or damaged ({exc}); the members before this "
+                        f"point were read and the rest were not.",
                         DocumentStatus.FAILED,
                         truncates=True,
                     )
                     return
-                path = inner_path(info.name)
-                if path is None:
-                    yield context.refusal(
-                        _unique("member", ordinal, seen),
-                        f"archive member name escapes the archive root: {info.name!r}. Names "
-                        f"are never rewritten into a plausible one, so it is reported instead.",
-                        DocumentStatus.FAILED,
-                    )
+                ordinal += 1
+                if info.isdir():
                     continue
-                path = _unique(path, ordinal, seen)
-                if not info.isfile():
-                    yield context.refusal(
-                        path,
-                        "tar member is a link, device or FIFO and was skipped. Following one "
-                        "would let an archive name something outside itself.",
-                        DocumentStatus.FAILED,
-                    )
+                context.members += 1
+                outcome = self._tar_entry(context, archive, info, ordinal)
+                if outcome is None:
                     continue
-                refusal = self._refusal_before_reading(context, path, declared=info.size)
-                if refusal is not None:
-                    yield refusal
-                    continue
-                handle = archive.extractfile(info)
-                if handle is None:  # pragma: no cover - isfile() guarantees a handle
-                    continue
-                try:
-                    content = self._bounded(
-                        handle.read, context.used_bytes, ratio_basis=None, what="tar member"
-                    )
-                except _Refused as refused:
-                    yield context.refusal(
-                        path, refused.reason, DocumentStatus.FAILED, truncates=refused.fatal
-                    )
-                    if refused.fatal:
-                        return
-                    continue
-                except (tarfile.TarError, OSError, EOFError) as exc:
-                    reason = f"tar member could not be read ({exc})."
-                    yield context.refusal(path, reason, DocumentStatus.FAILED)
-                    continue
-                outcome = context.member(path, content, name=info.name)
-                if isinstance(outcome, ExpandedMember):
-                    context.used_bytes += len(content)
                 yield outcome
+                if isinstance(outcome, MemberFailure) and outcome.truncates:
+                    return
+
+    def _tar_entry(  # noqa: PLR0911 - one return per refusal, each with its own reason
+        self,
+        context: _Context,
+        archive: tarfile.TarFile,
+        info: tarfile.TarInfo,
+        ordinal: int,
+    ) -> MemberOutcome | None:
+        """What one tar entry becomes: a document, a reported refusal, or nothing at all."""
+        path = inner_path(info.name)
+        if path is None:
+            return context.refusal(
+                _unique("member", ordinal, context.seen),
+                f"archive member name escapes the archive root: {info.name!r}. Names are never "
+                f"rewritten into a plausible one, so it is reported instead.",
+                DocumentStatus.FAILED,
+            )
+        path = _unique(path, ordinal, context.seen)
+        if not info.isfile():
+            return context.refusal(
+                path,
+                "tar member is a link, device or FIFO and was skipped. Following one would let "
+                "an archive name something outside itself.",
+                DocumentStatus.FAILED,
+            )
+        refusal = self._refusal_before_reading(context, path, declared=info.size)
+        if refusal is not None:
+            return refusal
+        handle = archive.extractfile(info)
+        if handle is None:  # pragma: no cover - isfile() guarantees a handle
+            return None
+        try:
+            content = self._bounded(
+                handle.read, context.used_bytes, ratio_basis=None, what="tar member"
+            )
+        except _Refused as refused:
+            return context.refusal(
+                path, refused.reason, DocumentStatus.FAILED, truncates=refused.fatal
+            )
+        except (tarfile.TarError, OSError, EOFError) as exc:
+            # The stream cannot be resumed after a read error, and the next step would raise
+            # outside any handler and discard the members already read.
+            reason = f"tar member could not be read ({exc}); the rest were not read."
+            return context.refusal(path, reason, DocumentStatus.FAILED, truncates=True)
+        outcome = context.member(path, content, name=info.name)
+        if isinstance(outcome, ExpandedMember):
+            context.used_bytes += len(content)
+        return outcome
 
     # --- shared --------------------------------------------------------------------------
 
@@ -296,6 +313,8 @@ class _Context:
         self.hashes = path_hashes_of(raw)
         self.used_bytes = tree_bytes_of(raw)
         self.members = tree_members_of(raw)
+        self.seen: set[str] = set()
+        """Addresses already given to a member of this container."""
 
     def refusal(
         self, path: str, reason: str, status: DocumentStatus, *, truncates: bool = False

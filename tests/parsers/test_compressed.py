@@ -171,3 +171,33 @@ async def test_repeated_names_get_distinct_addresses_and_keep_their_type(
     assert len({m.source_id for m in members}) == 4
     assert members[0].raw.media_type == "text/csv"
     assert members[2].raw.media_type == "text/csv", "a qualified address keeps the file's own type"
+
+
+async def test_a_literal_name_matching_a_generated_qualifier_gets_its_own_address(
+    parser: CompressedParser,
+) -> None:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name in ("a.txt", "a.txt#2", "./a.txt", "a.txt"):
+            info = tarfile.TarInfo(name)
+            info.size = 1
+            archive.addfile(info, io.BytesIO(b"x"))
+
+    outcomes = await read_members(parser, _raw(buffer.getvalue(), "x!/d.tar", "application/x-tar"))
+
+    assert len({o.source_id for o in outcomes}) == 4
+
+
+async def test_a_truncated_tar_keeps_the_members_read_before_the_damage(
+    parser: CompressedParser,
+) -> None:
+    whole = _tar({"good.txt": b"readable\n", "bad.txt": b"x" * 4000})
+    cut = whole[: 512 + 512 + 512 + 100]
+
+    outcomes = await read_members(parser, _raw(cut, "x!/d.tar", "application/x-tar"))
+
+    members = [o for o in outcomes if isinstance(o, ExpandedMember)]
+    failures = [o for o in outcomes if isinstance(o, MemberFailure)]
+    assert [m.uri.rsplit("!/", 1)[1] for m in members] == ["good.txt"]
+    assert failures
+    assert failures[-1].truncates, "the listing is partial and must not reconcile as complete"
