@@ -35,6 +35,8 @@ def _zip(*names: str) -> bytes:
         (docx_bytes("a"), DOCX),
         (xlsx_bytes("a"), XLSX),
         (_zip("a.txt"), "application/zip"),
+        (b"#!/bin/sh\nexit 0\n" + _zip("a.txt"), "application/zip"),
+        (b"#!/bin/sh\nexit 0\n" + _zip("[Content_Types].xml", "word/document.xml"), DOCX),
         (_zip("[Content_Types].xml", "other/x"), "application/zip"),
         (b"\x1f\x8b\x08\x00" + b"\x00" * 20, "application/gzip"),
         (b"\x89PNG\r\n\x1a\n" + b"\x00" * 8, "image/png"),
