@@ -2680,12 +2680,12 @@ and lease release are one transaction. A stale worker may return its own in-memo
 it cannot overwrite the successor's connector diagnostic.
 
 The pipeline's publication fence renews the lease only when it is near expiry, as every other
-journal call does, and a document's publication makes no renewal of its own: a forced renewal
-ahead of each of its three fenced steps was three extra writer-lock transactions per document
-proving what those steps prove. A lease that has run out locally is still refused before the
-write. One that was released or superseded early is found by the next fenced transaction, and
-the one write that can precede it, the vector upsert, is staged under a tombstone first and
-stays unservable until a publish that is refused would have flipped it. The fence is not the
+journal call does. The exception is one forced renewal immediately before a document's vectors
+are written, so a document's publication costs one renewal where it used to cost three. The
+other two sat ahead of fenced transactions that prove the same thing as their first statement.
+This one stays because a vector sweep clears a tombstone whether or not its vector exists yet:
+a worker that lost its lease after staging and then wrote would leave vectors that nothing
+records. A lease that has run out locally is refused without a read. The fence is not the
 publication lock. Every attempt-owned relational mutation starts its own SQLite
 transaction with a conditional write that validates workspace, run, owner, generation, expiry,
 unsettled state and non-supersession. That first statement takes the writer lock through the

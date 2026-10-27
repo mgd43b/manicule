@@ -174,7 +174,7 @@ def _source_id_set() -> set[SourceId]:
     return set()
 
 
-type _PublicationFence = Callable[[], Awaitable[AcquisitionFence]]
+type _PublicationFence = Callable[[bool], Awaitable[AcquisitionFence]]
 type FullInventoryAuthority = Literal["", "search", "direct_current_content"]
 
 
@@ -2477,32 +2477,31 @@ class IngestPipeline:
             _raise_lost_acquisition_lease(run.acquisition_run_id)
         run.lease_expires_at = expires_at
 
-    async def _fence_acquisition_publication(self, run: _Sync) -> AcquisitionFence:
+    async def _fence_acquisition_publication(
+        self, run: _Sync, *, force: bool = False
+    ) -> AcquisitionFence:
         """Build the fence a journal consumer's next write is checked against.
 
-        **This renews only when the lease is near expiry, and it is not itself the proof.** The
-        proof is the first statement of every fenced transaction
-        (``_fence_acquisition_mutation``), which matches the exact owner and generation, an
-        unexpired lease and a run that is neither settled nor superseded, and is also the
-        statement that takes SQLite's writer lock. A takeover therefore either commits before it
-        and the write is refused, or waits until the guarded write commits. A forced renewal
-        here added a write transaction before each of those, three per document in
-        :meth:`_commit`, and proved nothing they do not.
+        **This renews only when the lease is near expiry, unless ``force`` asks for the stored
+        row, and it is not itself the proof.** The proof is the first statement of every fenced
+        transaction (``_fence_acquisition_mutation``), which matches the exact owner and
+        generation, an unexpired lease and a run that is neither settled nor superseded, and is
+        also the statement that takes SQLite's writer lock. A takeover therefore either commits
+        before it and the write is refused, or waits until the guarded write commits. A forced
+        renewal ahead of each of those added a write transaction and proved nothing they do not,
+        so only the check before the vector write (:meth:`_check_publication_fence`) forces one.
 
         Expiry is still caught without a read: the local expiry only ever trails the stored one,
         so a lease that has run out locally takes the renewal below, which is refused. What a
         lease that is not near expiry can lose is ownership ended early (released, or superseded
-        by a reconciliation), and the write that follows is the one that finds out. In
-        :meth:`_commit` the only write that can precede such a find is the vector upsert, which
-        is keyed by publication and tombstoned by the staging transaction before it, so it is
-        inert until a publish this fence refuses would have flipped it.
+        by a reconciliation), and the next fenced write is the one that finds out.
         """
         acquisitions = run.acquisitions
         if acquisitions is None:  # pragma: no cover - callback exists only for journal runs
             msg = "an acquisition publication fence was requested outside a durable run"
             raise RuntimeError(msg)
         now = self._acquisition_clock()
-        await self._keep_acquisition_lease_live(run, acquisitions, now)
+        await self._keep_acquisition_lease_live(run, acquisitions, now, force=force)
         return AcquisitionFence(
             run_id=run.acquisition_run_id,
             owner=run.lease_owner,
@@ -3111,7 +3110,9 @@ class IngestPipeline:
                 else:
                     discovered = source_work
                 fence_token = (
-                    _publication_fence.set(lambda: self._fence_acquisition_publication(run))
+                    _publication_fence.set(
+                        lambda force: self._fence_acquisition_publication(run, force=force)
+                    )
                     if journaled
                     else None
                 )
@@ -3198,7 +3199,9 @@ class IngestPipeline:
         """
         while (fetched := await bodies.take()) is not None:
             fence_token = (
-                _publication_fence.set(lambda: self._fence_acquisition_publication(run))
+                _publication_fence.set(
+                    lambda force: self._fence_acquisition_publication(run, force=force)
+                )
                 if run.acquisitions is not None
                 else None
             )
@@ -4357,19 +4360,20 @@ class IngestPipeline:
             raise _SupersededError(committed.stored)
         return committed.stored
 
-    async def _publication_authority(self) -> AcquisitionFence | None:
+    async def _publication_authority(self, *, force: bool = False) -> AcquisitionFence | None:
         fence = _publication_fence.get()
-        return None if fence is None else await fence()
+        return None if fence is None else await fence(force)
 
     async def _check_publication_fence(self) -> None:
-        """Refuse a lease this worker can already see has run out, before the vector write.
+        """Prove ownership against the stored row immediately before the vector write.
 
-        Not a proof of ownership: with time left on the lease this makes no read, so a lease
-        released or superseded early is found by the next fenced transaction instead, and the
-        upsert that precedes it is tombstoned and unservable (see
-        :meth:`_fence_acquisition_publication`).
+        The one forced renewal left on the publication path. The staging transaction has already
+        tombstoned these vectors, but a concurrent sweep clears a tombstone whether or not its
+        vector exists yet, so a worker that lost its lease after staging and then wrote would
+        leave vectors nothing records. Refusing here, in a transaction that checks the exact
+        owner and generation, closes that ordering for a lease released or superseded early.
         """
-        await self._publication_authority()
+        await self._publication_authority(force=True)
 
     async def _record_seen(self, document_id: str, *, version_token: str | None = None) -> None:
         fence = await self._publication_authority()

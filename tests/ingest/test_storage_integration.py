@@ -3168,7 +3168,7 @@ async def test_takeover_between_vector_staging_and_upsert_fences_the_vector_writ
     """A valid tombstone stage is not authority for a later vector write after expiry takeover.
 
     Expiry is seen from the worker's own clock. Ownership ended with time left is covered by
-    ``test_ownership_ended_before_upsert_leaves_only_inert_tombstoned_vectors``.
+    ``test_ownership_ended_after_staging_writes_no_vector_even_if_a_sweep_clears_the_tombstones``.
     """
     from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
 
@@ -3375,10 +3375,15 @@ async def test_ownership_ended_before_vector_staging_is_refused_by_the_staging_t
     assert await store.take_tombstones(100) == [], "nothing was staged either"
 
 
-async def test_ownership_ended_before_upsert_leaves_only_inert_tombstoned_vectors(
+async def test_ownership_ended_after_staging_writes_no_vector_even_if_a_sweep_clears_the_tombstones(
     engine: AsyncEngine, data_dir: Path
 ) -> None:
-    """The one write the removed renewal used to guard is inert, and a sweep can find it."""
+    """Release, then a sweep, then resume: nothing is written that nothing records.
+
+    A sweep clears a tombstone whether or not its vector exists yet, so once it has run the
+    staging transaction's record is gone. The worker must therefore be refused before the
+    write rather than after it, or the vectors it writes would have no cleanup record at all.
+    """
     store = _GatedStagingStore(engine)
     await store.ensure_workspace()
     vectors = PublicationMemoryVectors()
@@ -3389,19 +3394,15 @@ async def test_ownership_ended_before_upsert_leaves_only_inert_tombstoned_vector
     task = asyncio.create_task(pipeline.run(connector))
     await store.staged.wait()
     await _end_ownership_without_expiry(store, connector.name, clock)
+    swept = await sweep_vectors(store, vectors)
+    assert swept.vectors_removed > 0, "the sweep was meant to clear the staged tombstones"
     store.release_stage.set()
     report = await task
 
     assert report.error_type == "AcquisitionLeaseLostError"
     assert report.indexed == 0
-    assert await store.find_document(connector.name, "public-upsert-loss") is None, (
-        "the vectors that were written are not attached to any servable document"
-    )
-    written = _staged_vector_ids(vectors)
-    assert written, "the upsert was meant to run: it is the write that is no longer pre-checked"
-    assert set(await store.take_tombstones(100)) == written, (
-        "every vector written after ownership ended is already recorded for the sweep"
-    )
+    assert await store.find_document(connector.name, "public-upsert-loss") is None
+    assert _staged_vector_ids(vectors) == set(), "a vector was written with no record of it"
 
 
 async def test_ownership_ended_between_upsert_and_publication_is_refused_inside_publication(
@@ -3429,13 +3430,14 @@ async def test_ownership_ended_between_upsert_and_publication_is_refused_inside_
     assert set(await store.take_tombstones(100)) == _staged_vector_ids(vectors)
 
 
-async def test_publication_makes_no_lease_renewal_per_document(
+async def test_publication_makes_one_lease_renewal_per_document(
     engine: AsyncEngine, data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A run costs the same renewals however many documents it publishes.
+    """Each document adds exactly one renewal: the check before its vector write.
 
-    Each publication used to renew the lease three times before its own transactions, which
-    check the lease anyway. The expiry here is far away, so the only renewals are the run's own.
+    Publication used to renew three times, ahead of fenced transactions that check the lease
+    anyway. The expiry here is far away, so the only others are the run's own, which do not
+    depend on how many documents it publishes.
     """
     store = SqliteDocStore(engine)
     await store.ensure_workspace()
@@ -3464,7 +3466,7 @@ async def test_publication_makes_no_lease_renewal_per_document(
 
     assert one.indexed == 1
     assert many.indexed == 6
-    assert len(renewals) == single, "renewals grew with the number of documents published"
+    assert len(renewals) == single + 5, "more than one renewal per extra document"
 
 
 async def test_acquisition_failure_does_not_mutate_the_prior_document(
