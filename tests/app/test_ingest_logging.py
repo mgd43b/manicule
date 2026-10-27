@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import logging
+import subprocess
+import sys
 from collections.abc import Iterator
 from io import StringIO
 from pathlib import Path
@@ -144,3 +146,21 @@ def test_importing_the_module_does_not_configure_logging(
 
     assert isolated_ingest_logger.handlers == []
     assert isolated_ingest_logger.level == logging.NOTSET
+
+
+def test_a_fresh_process_importing_the_module_and_its_transports_has_an_untouched_logger(
+    tmp_path: Path,
+) -> None:
+    """In a process of its own, so nothing a fixture or an earlier import did can hide it."""
+    probe = (
+        "import logging, manicule.app.ingest_logging, manicule.ingest.pipeline\n"
+        "ingest = logging.getLogger('manicule.ingest')\n"
+        "assert not ingest.handlers and ingest.level == logging.NOTSET and ingest.propagate\n"
+        "assert not logging.getLogger().handlers\n"
+    )
+
+    done = subprocess.run(  # noqa: S603 - fixed arguments, this interpreter
+        [sys.executable, "-c", probe], cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+
+    assert done.returncode == 0, done.stderr
