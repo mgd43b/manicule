@@ -29,7 +29,7 @@ from manicule.ingest.pipeline import (
     RunReport,
     _Sync,  # pyright: ignore[reportPrivateUsage] - the run state the unit under test takes
 )
-from manicule.ingest.stages import Conveyor
+from manicule.ingest.stages import Conveyor, Stage
 from manicule.ingest.workers import InProcessRunner
 from tests.fakes import MEDIA_TYPE, HashEmbedder
 from tests.ingest import fakes
@@ -1260,26 +1260,9 @@ async def test_the_stage_counters_reach_the_connector_row_without_any_document_c
     }, "the stage report grew a field, and every field here is read by an operator"
     timings = stages["timings"]
     assert isinstance(timings, dict)
-    assert set(timings) <= {
-        "journal_start",
-        "blob_read",
-        "document",
-        "parse",
-        "prepare",
-        "embed",
-        "stored_vectors",
-        "embed_lock_wait",
-        "embed_lock_held",
-        "glossary",
-        "commit",
-        "fence",
-        "stage_vectors",
-        "upsert",
-        "publish",
-        "after_store",
-        "lineage",
-        "journal_settle",
-    }, "a timing is named for a stage, never for anything a document said"
+    assert set(timings) <= {str(stage) for stage in Stage}, (
+        "a timing is named for a stage, never for anything a document said"
+    )
     assert all(
         isinstance(value, dict) and set(value) == {"seconds", "calls"} for value in timings.values()
     )

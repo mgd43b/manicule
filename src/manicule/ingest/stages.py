@@ -25,6 +25,7 @@ import asyncio
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
@@ -239,6 +240,35 @@ class Gauge:
         self.peak = self.active
 
 
+class Stage(StrEnum):
+    """The stages a pipeline keeps time for: a fixed few, which keeps the report content-free.
+
+    A member rather than a string at each call site, so a misspelled stage is an error where it
+    is written instead of a stray bucket in a report. Containment is by time: ``embed`` holds
+    ``stored_vectors`` and the embed lock's wait and hold, ``commit`` holds ``fence``,
+    ``stage_vectors``, ``upsert``, ``glossary`` and ``publish``, and ``document`` holds all of it.
+    """
+
+    JOURNAL_START = "journal_start"
+    BLOB_READ = "blob_read"
+    DOCUMENT = "document"
+    PARSE = "parse"
+    PREPARE = "prepare"
+    EMBED = "embed"
+    STORED_VECTORS = "stored_vectors"
+    EMBED_LOCK_WAIT = "embed_lock_wait"
+    EMBED_LOCK_HELD = "embed_lock_held"
+    GLOSSARY = "glossary"
+    COMMIT = "commit"
+    FENCE = "fence"
+    STAGE_VECTORS = "stage_vectors"
+    UPSERT = "upsert"
+    PUBLISH = "publish"
+    AFTER_STORE = "after_store"
+    LINEAGE = "lineage"
+    JOURNAL_SETTLE = "journal_settle"
+
+
 @dataclass(frozen=True, slots=True)
 class StageTime:
     """Wall time one stage took in total, and how many times it ran.
@@ -265,16 +295,16 @@ class StageTimings:
     """
 
     def __init__(self) -> None:
-        self._seconds: dict[str, float] = {}
-        self._calls: dict[str, int] = {}
+        self._seconds: dict[Stage, float] = {}
+        self._calls: dict[Stage, int] = {}
 
-    def add(self, stage: str, seconds: float) -> None:
+    def add(self, stage: Stage, seconds: float) -> None:
         """Count one visit to ``stage`` that took ``seconds``."""
         self._seconds[stage] = self._seconds.get(stage, 0.0) + seconds
         self._calls[stage] = self._calls.get(stage, 0) + 1
 
     @contextmanager
-    def timing(self, stage: str) -> Generator[None]:
+    def timing(self, stage: Stage) -> Generator[None]:
         """Time the block, whether it returns, raises or is canceled."""
         started = time.perf_counter()
         try:
@@ -282,16 +312,18 @@ class StageTimings:
         finally:
             self.add(stage, time.perf_counter() - started)
 
-    def snapshot(self) -> Mapping[str, StageTime]:
+    def snapshot(self) -> Mapping[Stage, StageTime]:
         return {
             stage: StageTime(seconds=seconds, calls=self._calls[stage])
             for stage, seconds in self._seconds.items()
         }
 
     @staticmethod
-    def since(now: Mapping[str, StageTime], base: Mapping[str, StageTime]) -> dict[str, StageTime]:
+    def since(
+        now: Mapping[Stage, StageTime], base: Mapping[Stage, StageTime]
+    ) -> dict[Stage, StageTime]:
         """What happened between two snapshots, leaving out stages that did not run."""
-        delta: dict[str, StageTime] = {}
+        delta: dict[Stage, StageTime] = {}
         for stage, after in now.items():
             before = base.get(stage, StageTime())
             if after.calls > before.calls:
@@ -312,17 +344,24 @@ class CountedLock:
     A peak above one is the whole of "the embedder was called concurrently", so this is the
     measurement that assertion is made from rather than a proxy for it.
 
-    Given ``timings`` it also records ``<name>_lock_wait`` (queued behind another holder) and
-    ``<name>_lock_held``, which is the difference between an accelerator that is the limit and
-    one that is waiting for work.
+    Given ``timings`` it also records how long each holder queued behind another and how long it
+    held the lock, under the two stages named, which is the difference between an accelerator
+    that is the limit and one that is waiting for work.
     """
 
-    def __init__(self, name: str, timings: StageTimings | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        timings: StageTimings | None = None,
+        *,
+        wait: Stage = Stage.EMBED_LOCK_WAIT,
+        held: Stage = Stage.EMBED_LOCK_HELD,
+    ) -> None:
         self.gauge = Gauge(name)
         self._lock = asyncio.Lock()
         self._timings = timings
-        self._wait_stage = f"{name}_lock_wait"
-        self._held_stage = f"{name}_lock_held"
+        self._wait_stage = wait
+        self._held_stage = held
         self._acquired_at = 0.0
 
     async def __aenter__(self) -> None:
@@ -383,8 +422,13 @@ class StageReport:
     peak_discovery_records: int = 0
     """Journal records held by the read page and fetch hand-off together."""
 
-    timings: Mapping[str, StageTime] = field(default_factory=dict[str, StageTime])
-    """Where this run's time went, per stage, summed across workers. Empty when nothing ran."""
+    timings: Mapping[Stage, StageTime] = field(default_factory=dict[Stage, StageTime])
+    """Where this run's time went, per stage, summed across workers. Empty when nothing ran.
+
+    **Process-wide, like the peaks above:** the totals belong to the pipeline, so a re-parse sweep
+    running beside a sync is counted in this run's too. Subtracting what was already there when
+    the run began is as far as attribution goes.
+    """
 
     def as_metadata(self) -> Metadata:
         return {
@@ -408,6 +452,7 @@ __all__ = [
     "CountedLock",
     "Gauge",
     "QueueReport",
+    "Stage",
     "StageReport",
     "StageTime",
     "StageTimings",

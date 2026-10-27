@@ -1100,9 +1100,13 @@ and `embed_lock_held`), `glossary`, `fence`, `stage_vectors`, `upsert`, `publish
 all of it. Seconds divided by calls is one visit; seconds divided by the wall clock is how many
 workers were inside. `commit` less its parts, and `document` less every stage, is time spent on
 the event loop or waiting for it. The report is built when a run ends, so a running pipeline
-also logs the last minute's totals as one line (`ingest stage timings for <connector> ...`,
-slowest stage first) and `IngestPipeline.stage_timings()` returns the running totals. Counters
-only: a stage name is one of a fixed few and nothing from a document is kept.
+also logs the last minute's totals as one line on a timer (`ingest stage timings for <connector> ...`, slowest stage first),
+including a minute in which no document finished, and `IngestPipeline.stage_timings()` returns
+the running totals. A visit is counted when it ends, so a stall shows as the other stages going
+quiet rather than as the stalled one growing. Like the peaks above, the totals are the
+pipeline's and not the run's: what a run reports is the difference from when it began, and a
+sweep running beside it is in that difference. Counters only: the stage names are a fixed
+enumeration (`Stage`) and nothing from a document is kept.
 
 `blocked_puts` on the fetch hand-off is direct evidence that the bounded journal reader waited
 for local fetch capacity. It no longer describes source discovery, which has already completed.

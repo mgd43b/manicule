@@ -19,6 +19,7 @@ from manicule.ingest.stages import (
     CountedLock,
     Gauge,
     QueueReport,
+    Stage,
     StageReport,
     StageTime,
     StageTimings,
@@ -230,7 +231,7 @@ def test_a_stage_report_carries_counts_and_nothing_a_document_said() -> None:
         peak_embeds=1,
         peak_bodies=11,
         peak_discovery_records=7,
-        timings={"parse": StageTime(seconds=1.23456, calls=3)},
+        timings={Stage.PARSE: StageTime(seconds=1.23456, calls=3)},
     )
 
     recorded = report.as_metadata()
@@ -247,13 +248,13 @@ def test_a_stage_report_carries_counts_and_nothing_a_document_said() -> None:
 def test_timings_add_up_per_stage_and_say_how_many_visits_made_them() -> None:
     timings = StageTimings()
 
-    timings.add("parse", 0.5)
-    timings.add("parse", 0.25)
-    timings.add("embed", 2.0)
+    timings.add(Stage.PARSE, 0.5)
+    timings.add(Stage.PARSE, 0.25)
+    timings.add(Stage.EMBED, 2.0)
 
     assert timings.snapshot() == {
-        "parse": StageTime(seconds=0.75, calls=2),
-        "embed": StageTime(seconds=2.0, calls=1),
+        Stage.PARSE: StageTime(seconds=0.75, calls=2),
+        Stage.EMBED: StageTime(seconds=2.0, calls=1),
     }
 
 
@@ -261,25 +262,25 @@ def test_a_timed_block_is_counted_when_it_raises() -> None:
     """The slow, failing visit is the one a profile most needs to see."""
     timings = StageTimings()
 
-    with pytest.raises(RuntimeError), timings.timing("publish"):
+    with pytest.raises(RuntimeError), timings.timing(Stage.PUBLISH):
         raise RuntimeError("synthetic failure")
 
-    assert timings.snapshot()["publish"].calls == 1
+    assert timings.snapshot()[Stage.PUBLISH].calls == 1
 
 
 def test_a_window_is_the_difference_of_two_snapshots_and_omits_idle_stages() -> None:
     timings = StageTimings()
-    timings.add("parse", 1.0)
-    timings.add("embed", 4.0)
+    timings.add(Stage.PARSE, 1.0)
+    timings.add(Stage.EMBED, 4.0)
     base = timings.snapshot()
 
-    timings.add("embed", 2.0)
-    timings.add("publish", 0.5)
+    timings.add(Stage.EMBED, 2.0)
+    timings.add(Stage.PUBLISH, 0.5)
     window = StageTimings.since(timings.snapshot(), base)
 
     assert window == {
-        "embed": StageTime(seconds=2.0, calls=1),
-        "publish": StageTime(seconds=0.5, calls=1),
+        Stage.EMBED: StageTime(seconds=2.0, calls=1),
+        Stage.PUBLISH: StageTime(seconds=0.5, calls=1),
     }, "parse did not run in the window, so it is not in it"
 
 
@@ -302,10 +303,12 @@ async def test_a_counted_lock_with_timings_separates_waiting_from_holding() -> N
     await asyncio.gather(first(), second())
     recorded = timings.snapshot()
 
-    assert recorded["embed_lock_held"].calls == 2
-    assert recorded["embed_lock_wait"].calls == 2
-    assert recorded["embed_lock_held"].seconds >= 0.05
-    assert recorded["embed_lock_wait"].seconds >= 0.04, "the second holder queued behind the first"
+    assert recorded[Stage.EMBED_LOCK_HELD].calls == 2
+    assert recorded[Stage.EMBED_LOCK_WAIT].calls == 2
+    assert recorded[Stage.EMBED_LOCK_HELD].seconds >= 0.05
+    assert recorded[Stage.EMBED_LOCK_WAIT].seconds >= 0.04, (
+        "the second holder queued behind the first"
+    )
 
 
 async def test_a_counted_lock_without_timings_records_nothing_and_still_counts_holders() -> None:

@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Final
 from manicule.chunking.tokens import SupportsTokenCount
 from manicule.core.embedding import VectorState, require_within_context
 from manicule.core.lifecycle import SupportsMetrics
+from manicule.ingest.stages import Stage, StageTimings
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -41,7 +42,6 @@ if TYPE_CHECKING:
     from manicule.core.embedding import Vector
     from manicule.core.fingerprints import ChunkFingerprint
     from manicule.core.protocols import Embedder, VectorStore
-    from manicule.ingest.stages import StageTimings
 
 MAX_BATCH = 64
 """Upper clamp on a derived batch size, so a tiny budget cannot ask for a huge batch."""
@@ -417,7 +417,7 @@ async def embed_or_reuse(
     if not chunks:
         return [], EmbeddingWork()
 
-    with timings.timing("stored_vectors") if timings is not None else nullcontext():
+    with timings.timing(Stage.STORED_VECTORS) if timings is not None else nullcontext():
         verdicts = await vectors.stored_vectors(chunks)
     held = previous or {}
 
