@@ -234,9 +234,7 @@ async def test_a_message_stored_before_the_fix_is_repaired_by_a_stale_sweep(
     assert sweep.reparsed == 1
     member = await store.find_document("mail", "mail:mail:m!/a.docx")
     assert member is not None
-    # Not the member's ``status``: the sweep also selects the member's stale row (it has no
-    # lineage of its own), reads the old snapshot, and is superseded by the message's re-derive —
-    # leaving the row ``parsing`` for the recovery sweep. That ordering is not this change's.
+    assert member.status is DocumentStatus.INDEXED, "the sweep must not supersede its own repair"
     assert (
         member.media_type
         == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
