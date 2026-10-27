@@ -195,6 +195,14 @@ PARSERS: tuple[_Registration, ...] = (
         summary="Line spans and key paths for JSON, YAML and TOML.",
     ),
     _Registration(
+        name="compressed",
+        module="manicule.parsers.compressed",
+        factory="CompressedParser",
+        config_model=parser_config.ArchiveConfig,
+        media_types=parser_config.COMPRESSED_MEDIA_TYPES,
+        summary="Expands gzip and tar members into documents of their own. Emits no chunks.",
+    ),
+    _Registration(
         name="archive",
         module="manicule.parsers.archive",
         factory="ArchiveParser",

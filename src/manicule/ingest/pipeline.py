@@ -3777,7 +3777,9 @@ class IngestPipeline:
             # says: zero chunks, its content being the documents its members became. A message
             # with a body and an attachment is not that — it has text a reader would cite, and
             # calling it a container would throw the body away to describe the attachment.
-            result = container_result(len(members))
+            # Named for the parser that expanded it, so the lineage recorded is its own: a gzip
+            # recorded as `archive` would be re-parsed by a zip version bump and not by its own.
+            result = container_result(len(members), parser=result.parser_used or "archive")
 
         document = await self._store_record(
             result,

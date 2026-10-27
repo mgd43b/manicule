@@ -226,7 +226,7 @@ CORPORA: dict[str, Corpus] = {
 no blocks at all, so there is no anchor to round-trip; ``tests/parsers/test_archive.py``
 holds it to the obligations that do apply to it."""
 
-BLOCKLESS = frozenset({"archive"})
+BLOCKLESS = frozenset({"archive", "compressed"})
 """Registered parsers that emit no blocks, and so have nothing for this sweep to check."""
 
 

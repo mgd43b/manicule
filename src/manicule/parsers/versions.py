@@ -85,8 +85,8 @@ class ParserVersions:
     """PEP 503 canonical names of the libraries whose behavior decides text or anchors.
 
     Empty where a parser is built on the standard library alone. That is a real answer, not a
-    gap: ``adf`` reads JSON, ``archive`` reads zip, ``plaintext`` splits lines, and
-    none of them can be moved by a dependency bump.
+    gap: ``adf`` reads JSON, ``archive`` and ``compressed`` read zip, gzip and tar,
+    ``plaintext`` splits lines, and none of them can be moved by a dependency bump.
     """
 
 
@@ -209,6 +209,7 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # would produce today. Measured at 0 of 4 definitions found on a `<dl>` glossary before and
     # 4 of 4 after; the detector rule was correct throughout and had no input.
     "calendar": ParserVersions(rules="1"),
+    "compressed": ParserVersions(rules="1"),
     "confluence": ParserVersions(rules="5", distributions=("selectolax",)),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
     # Its rules history is on `_EMAIL`, above, because `msg` is built from it.
