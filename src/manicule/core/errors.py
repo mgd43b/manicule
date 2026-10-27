@@ -156,6 +156,18 @@ class VectorMigrationError(ManiculeError):
     """
 
 
+class AcquisitionLeaseHeldError(ManiculeError):
+    """Another acquisition run for this connector still holds its lease.
+
+    A run that is in progress, or one that crashed and keeps its fence until the lease expires
+    (``docs/ingest.md`` §6). Typed so a caller can wait and ask again, and so a scheduler loop
+    records it as the ordinary outcome it is rather than as a defect.
+    """
+
+    def __init__(self, connector: str) -> None:
+        super().__init__(f"an active acquisition run for connector {connector!r} holds its lease")
+
+
 class StorageBusyError(ManiculeError):
     """SQLite writer ownership stayed unavailable beyond the bounded retry policy.
 
@@ -414,6 +426,7 @@ class TokenStateError(ManiculeError):
 
 
 __all__ = [
+    "AcquisitionLeaseHeldError",
     "AcquisitionLeaseLostError",
     "AmbiguousHandleError",
     "ChunkingError",

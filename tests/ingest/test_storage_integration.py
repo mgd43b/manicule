@@ -59,7 +59,7 @@ from manicule.core.content import (
     Retention,
 )
 from manicule.core.embedding import IndexFingerprints, Vector
-from manicule.core.errors import StorageBusyError
+from manicule.core.errors import AcquisitionLeaseHeldError, StorageBusyError
 from manicule.core.ids import content_hash, document_id, vector_id
 from manicule.core.rebuild import RebuildCheckpoint, RebuildState, RebuildTarget
 from manicule.core.sources import DiscoveredDoc, DocRef, EnumerationProgress, Watermark
@@ -1274,7 +1274,7 @@ async def test_mixed_exception_group_remains_a_crash_and_keeps_lease_fence(
     durable = await store.latest_unsettled_acquisition_run(connector.name)
     assert durable is not None
     assert durable.lease_owner is not None
-    with pytest.raises(RuntimeError, match="could not be claimed"):
+    with pytest.raises(AcquisitionLeaseHeldError, match="holds its lease"):
         await pipeline.run(connector)
 
 
@@ -2945,12 +2945,13 @@ async def test_takeover_after_the_pipeline_check_is_refused_inside_publication_t
             self.release = asyncio.Event()
 
         @override
-        async def _fence_acquisition_mutation(
-            self, session: AsyncSession, fence: AcquisitionFence
-        ) -> None:
+        async def fenced_publish_document(self, *args: Any, **kwargs: Any) -> Commit:
+            # Held *before* the write enters the engine's writer queue. Holding it inside the
+            # queue would stop the successor's claim, which waits in the same queue, and the
+            # test would wait on itself. The transaction still validates ownership when it runs.
             self.arrived.set()
             await self.release.wait()
-            await super()._fence_acquisition_mutation(session, fence)
+            return await super().fenced_publish_document(*args, **kwargs)
 
     class EmptyChunker(fakes.BlockChunker):
         @override

@@ -19,6 +19,7 @@ from manicule.app.served import RECONCILE_POLL_S, Scheduler, SchedulerConfigurat
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings
 from manicule.connectors.errors import ConnectorError, SessionMissingError
+from manicule.core.errors import AcquisitionLeaseHeldError
 from manicule.ingest.pipeline import RunReport
 from manicule.ingest.reconcile import LAST_RECONCILE_KEY, PROPOSED_DELETION_KEY, Reconciliation
 from manicule.ingest.reembed import ReembedRecovery
@@ -957,3 +958,75 @@ async def test_the_pass_after_a_scheduled_sync_is_counted_in_the_same_record() -
     assert ingestion.synced == ["handbook"]
     assert ingestion.reconcile_calls == [("handbook", False, 0.1)]
     assert scheduler.reconciling["handbook"].deleted == 3
+
+
+async def test_an_unexpected_failure_does_not_end_the_sync_schedule() -> None:
+    """An error that is none of ours must not end the loop, or the schedule stops unseen.
+
+    This is what a held lease looked like before it had a type: a ``RuntimeError`` that escaped
+    the clause above, ended the task, and was never retrieved. No scheduled sync ran again until
+    the process restarted, and nothing said so.
+    """
+    service, ingestion = service_with({"mail": source(schedule_s=600)})
+    clock = Clock()
+    ingestion.failure = RuntimeError("SQL and a bound value that must not be announced")
+    scheduler = Scheduler(service, {"mail": 600}, sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        assert scheduler.scheduled["mail"].failures == 1
+        assert scheduler.scheduled["mail"].last_error_type == "RuntimeError"
+        ingestion.failure = None
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert scheduler.scheduled["mail"].runs == 1, "the sync after the failure still ran"
+
+
+async def test_a_held_lease_is_an_ordinary_failure_the_schedule_retries() -> None:
+    service, ingestion = service_with({"mail": source(schedule_s=600)})
+    clock = Clock()
+    ingestion.failure = AcquisitionLeaseHeldError("mail")
+    scheduler = Scheduler(service, {"mail": 600}, sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert scheduler.scheduled["mail"].failures == 2
+
+
+async def test_an_unexpected_sweep_failure_does_not_end_the_loop() -> None:
+    service, ingestion = service_with({})
+    calls = 0
+
+    async def failing(*, batch: int, soft_delete_grace_s: float) -> SweepResult:
+        del batch, soft_delete_grace_s
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("database is locked")
+        return SweepResult(vectors_removed=2)
+
+    ingestion.sweep_vectors = failing
+    clock = Clock()
+    scheduler = Scheduler(service, Scheduler.configure(service), sleep=clock.sleep)
+
+    scheduler.start()
+    try:
+        await asyncio.wait_for(clock.arrived.wait(), timeout=5)
+        await clock.tick()
+        await clock.tick()
+    finally:
+        await scheduler.aclose()
+
+    assert scheduler.sweeps is not None
+    assert scheduler.sweeps.failures == 1
+    assert scheduler.sweeps.vectors_removed == 2

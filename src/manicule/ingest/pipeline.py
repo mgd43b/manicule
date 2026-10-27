@@ -99,6 +99,7 @@ from manicule.core.content import (
 )
 from manicule.core.embedding import canonical_stored_vector
 from manicule.core.errors import (
+    AcquisitionLeaseHeldError,
     AcquisitionLeaseLostError,
     ChunkingError,
     ContextOverflowError,
@@ -1357,8 +1358,7 @@ class IngestPipeline:
             expires_at=now + timedelta(seconds=self._acquisition_lease_s),
         )
         if claimed is None:
-            msg = f"an active acquisition run for connector {connector.name!r} could not be claimed"
-            raise RuntimeError(msg)
+            raise AcquisitionLeaseHeldError(connector.name)
         if claimed.state not in {
             AcquisitionRunState.ENUMERATING,
             AcquisitionRunState.ACQUIRING,

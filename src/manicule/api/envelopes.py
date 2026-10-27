@@ -61,6 +61,7 @@ STATUS_BY_ERROR: dict[str, int] = {
     "ValueError": BAD_REQUEST,
     "CapacityRefusedError": SERVICE_UNAVAILABLE,
     "StorageBusyError": SERVICE_UNAVAILABLE,
+    "AcquisitionLeaseHeldError": SERVICE_UNAVAILABLE,
     "RebuildStorageError": SERVICE_UNAVAILABLE,
     "RebuildDerivationError": UNPROCESSABLE,
     "RebuildValidationError": UNPROCESSABLE,

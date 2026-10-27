@@ -31,6 +31,7 @@ from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
 from manicule.storage.acquisition import AcquisitionJournalMixin
+from manicule.storage.engine import admitted_writer
 from manicule.storage.fts import SEARCH_SQL, escape_match_query
 from manicule.storage.glossary import GlossaryMixin
 from manicule.storage.history import TrashMixin, VersionsMixin
@@ -302,10 +303,12 @@ class SqliteDocStore(
             )
             return tuple(rows.scalars())
 
+    @admitted_writer
     async def upsert_document(self, document: Document) -> Document:
         async with self._sessions.begin() as session:
             return await self._write_document(session, document)
 
+    @admitted_writer
     async def commit_document(self, document: Document, *, expected: DocumentRevision) -> Commit:
         """Replace a document's row, but only while it still reads as ``expected``.
 
@@ -371,6 +374,7 @@ class SqliteDocStore(
                 return Commit(committed=False, stored=stored)
             return Commit(committed=True, stored=await self._write_document(session, document))
 
+    @admitted_writer
     async def fenced_publish_record(
         self,
         fence: AcquisitionFence,
@@ -480,6 +484,7 @@ class SqliteDocStore(
                 .on_conflict_do_nothing(index_elements=[models.VectorTombstone.chunk_id])
             )
 
+    @admitted_writer
     async def publish_document(
         self,
         document: Document,
@@ -512,6 +517,7 @@ class SqliteDocStore(
                 source_dependencies=source_dependencies,
             )
 
+    @admitted_writer
     async def fenced_publish_document(
         self,
         fence: AcquisitionFence,
@@ -662,6 +668,7 @@ class SqliteDocStore(
                 )
             )
 
+    @admitted_writer
     async def publish_failure(
         self,
         document: Document,
@@ -680,6 +687,7 @@ class SqliteDocStore(
                 original_omitted_reason=original_omitted_reason,
             )
 
+    @admitted_writer
     async def fenced_publish_failure(
         self,
         fence: AcquisitionFence,
@@ -821,6 +829,7 @@ class SqliteDocStore(
         await session.flush()
         return to_document(row)
 
+    @admitted_writer
     async def set_status(self, document_id: str, status: DocumentStatus, detail: str = "") -> None:
         """Record an outcome, keeping ``failed_stage`` consistent with ``status``.
 
@@ -856,6 +865,7 @@ class SqliteDocStore(
             if status is DocumentStatus.INDEXED:
                 row.indexed_at = utcnow()
 
+    @admitted_writer
     async def fenced_set_status(
         self, fence: AcquisitionFence, document_id: str, status: DocumentStatus, detail: str = ""
     ) -> None:
@@ -951,6 +961,7 @@ class SqliteDocStore(
 
     # --- ingest bookkeeping -----------------------------------------------------------------
 
+    @admitted_writer
     async def record_seen(self, document_id: str, *, version_token: str | None = None) -> None:
         """Mark a document as still present at the source. The write a skip must not omit.
 
@@ -966,6 +977,7 @@ class SqliteDocStore(
             if version_token is not None:
                 row.version_token = version_token
 
+    @admitted_writer
     async def fenced_record_seen(
         self,
         fence: AcquisitionFence,
@@ -982,6 +994,7 @@ class SqliteDocStore(
             if version_token is not None:
                 row.version_token = version_token
 
+    @admitted_writer
     async def annotate(self, document_id: str, updates: Mapping[str, Any]) -> None:
         """Merge keys into a document's metadata, leaving everything else alone.
 
@@ -997,6 +1010,7 @@ class SqliteDocStore(
             merged.update(updates)
             row.doc_metadata = cast("Any", merged)
 
+    @admitted_writer
     async def fenced_annotate(
         self, fence: AcquisitionFence, document_id: str, updates: Mapping[str, Any]
     ) -> None:
@@ -1009,6 +1023,7 @@ class SqliteDocStore(
             merged.update(updates)
             row.doc_metadata = cast("Any", merged)
 
+    @admitted_writer
     async def set_lineage(
         self,
         document_id: str,
@@ -1050,6 +1065,7 @@ class SqliteDocStore(
             if relation_fp is not None:
                 row.relation_fp = relation_fp
 
+    @admitted_writer
     async def set_original(
         self, document_id: str, *, ref: str | None, omitted_reason: str | None
     ) -> None:

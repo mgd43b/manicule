@@ -22,8 +22,9 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.pool import QueuePool
 
+from manicule.core.errors import StorageBusyError
 from manicule.storage import models
-from manicule.storage.engine import session_factory
+from manicule.storage.engine import SQLITE_BUSY_RETRY_DELAYS, admitted_writer, session_factory
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -195,3 +196,83 @@ async def test_every_connection_the_pool_opens_is_configured_once(
     configured = [key for key, sql in statements if sql == "PRAGMA foreign_keys = ON"]
     assert len(set(configured)) == 3, "three connections were held at once, so three opened"
     assert sorted(configured) == sorted(set(configured)), "one connection was configured twice"
+
+
+# --- document writes join the writer queue and refuse rather than crash -------------------------
+
+
+class _Engine:
+    """Stands in for an engine: the admission queue is keyed by identity and needs no more."""
+
+
+class _Store:
+    engine = _Engine()
+
+    def __init__(self, outcomes: list[BaseException | str]) -> None:
+        self.outcomes = outcomes
+        self.calls = 0
+
+    @admitted_writer
+    async def write(self) -> str:
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _busy() -> sqlite3.OperationalError:
+    error = sqlite3.OperationalError("database is locked")
+    error.sqlite_errorcode = sqlite3.SQLITE_BUSY  # type: ignore[attr-defined]
+    return error
+
+
+async def test_a_write_that_lost_the_slot_once_is_retried() -> None:
+    store = _Store([_busy(), "done"])
+
+    assert await store.write() == "done"
+    assert store.calls == 2
+
+
+async def test_a_write_that_keeps_losing_the_slot_is_refused_without_the_drivers_text() -> None:
+    store = _Store([_busy(), _busy(), _busy()])
+
+    with pytest.raises(StorageBusyError) as refused:
+        await store.write()
+
+    assert store.calls == len(SQLITE_BUSY_RETRY_DELAYS)
+    assert "locked" not in str(refused.value)
+    assert refused.value.__cause__ is None
+
+
+async def test_an_error_that_is_not_contention_is_not_retried() -> None:
+    store = _Store([ValueError("not busy"), "unreachable"])
+
+    with pytest.raises(ValueError, match="not busy"):
+        await store.write()
+
+    assert store.calls == 1
+
+
+async def test_every_document_write_the_ingest_path_makes_is_queued() -> None:
+    """A method added to this list's neighbors without the decorator is the bug again."""
+    from manicule.storage.docstore import SqliteDocStore  # noqa: PLC0415
+
+    for name in (
+        "upsert_document",
+        "commit_document",
+        "fenced_publish_record",
+        "publish_document",
+        "fenced_publish_document",
+        "publish_failure",
+        "fenced_publish_failure",
+        "set_status",
+        "fenced_set_status",
+        "record_seen",
+        "fenced_record_seen",
+        "annotate",
+        "fenced_annotate",
+        "set_lineage",
+        "set_original",
+    ):
+        assert hasattr(getattr(SqliteDocStore, name), "__wrapped__"), name
