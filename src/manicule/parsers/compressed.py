@@ -27,7 +27,7 @@ import gzip
 import io
 import tarfile
 import zlib
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Generator
 
 from manicule.core.anchors import Anchor
 from manicule.core.content import DocumentStatus, Metadata, ParsedBlock, RawDocument
@@ -105,16 +105,25 @@ class CompressedParser:
             ParseError: The bytes are neither a gzip nor a tar.
         """
         kind = _kind(raw)
-        walk = self._gzip if kind == GZIP_SCHEME else self._tar
-        for outcome in walk(raw):
-            yield outcome
-            if isinstance(outcome, MemberFailure) and outcome.truncates:
-                return
+        walk: Callable[[RawDocument], Generator[MemberOutcome]] = (
+            self._gzip if kind == GZIP_SCHEME else self._tar
+        )
+        outcomes = walk(raw)
+        try:
+            for outcome in outcomes:
+                yield outcome
+                if isinstance(outcome, MemberFailure) and outcome.truncates:
+                    return
+        finally:
+            # Closed here because a consumer that stops early throws GeneratorExit in at the
+            # `yield`, which finishes this generator and leaves the inner one (and the tar it
+            # holds open) to be finalized whenever the collector gets to it.
+            outcomes.close()
 
     # --- gzip ----------------------------------------------------------------------------
 
-    def _gzip(self, raw: RawDocument) -> Iterator[MemberOutcome]:
-        context = _Context.of(raw, GZIP_SCHEME)
+    def _gzip(self, raw: RawDocument) -> Generator[MemberOutcome]:
+        context = _Context(raw, GZIP_SCHEME)
         name = _gunzipped_name(raw.uri)
         context.members += 1
         refusal = self._refusal_before_reading(context, name)
@@ -138,12 +147,12 @@ class CompressedParser:
             )
             yield context.refusal(name, reason, DocumentStatus.FAILED)
             return
-        yield context.member(self._config, name, content)
+        yield context.member(name, content)
 
     # --- tar -----------------------------------------------------------------------------
 
-    def _tar(self, raw: RawDocument) -> Iterator[MemberOutcome]:
-        context = _Context.of(raw, TAR_SCHEME)
+    def _tar(self, raw: RawDocument) -> Generator[MemberOutcome]:
+        context = _Context(raw, TAR_SCHEME)
         seen: set[str] = set()
         try:
             archive = tarfile.open(fileobj=io.BytesIO(raw.as_bytes()), mode="r:")  # noqa: SIM115
@@ -204,7 +213,7 @@ class CompressedParser:
                     reason = f"tar member could not be read ({exc})."
                     yield context.refusal(path, reason, DocumentStatus.FAILED)
                     continue
-                outcome = context.member(self._config, path, content)
+                outcome = context.member(path, content)
                 if isinstance(outcome, ExpandedMember):
                     context.used_bytes += len(content)
                 yield outcome
@@ -288,10 +297,6 @@ class _Context:
         self.used_bytes = tree_bytes_of(raw)
         self.members = tree_members_of(raw)
 
-    @classmethod
-    def of(cls, raw: RawDocument, scheme: str) -> _Context:
-        return cls(raw, scheme)
-
     def refusal(
         self, path: str, reason: str, status: DocumentStatus, *, truncates: bool = False
     ) -> MemberFailure:
@@ -306,8 +311,7 @@ class _Context:
             metadata={"member_name": path},
         )
 
-    def member(self, config: ArchiveConfig, path: str, content: bytes) -> MemberOutcome:
-        del config
+    def member(self, path: str, content: bytes) -> MemberOutcome:
         digest = content_hash(content)
         if digest in self.hashes:
             return self.refusal(
