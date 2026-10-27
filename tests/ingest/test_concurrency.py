@@ -29,7 +29,7 @@ from manicule.ingest.pipeline import (
     RunReport,
     _Sync,  # pyright: ignore[reportPrivateUsage] - the run state the unit under test takes
 )
-from manicule.ingest.stages import Conveyor
+from manicule.ingest.stages import Conveyor, Stage
 from manicule.ingest.workers import InProcessRunner
 from tests.fakes import MEDIA_TYPE, HashEmbedder
 from tests.ingest import fakes
@@ -1256,7 +1256,16 @@ async def test_the_stage_counters_reach_the_connector_row_without_any_document_c
         "peak_embeds",
         "peak_bodies",
         "peak_discovery_records",
+        "timings",
     }, "the stage report grew a field, and every field here is read by an operator"
+    timings = stages["timings"]
+    assert isinstance(timings, dict)
+    assert set(timings) <= {str(stage) for stage in Stage}, (
+        "a timing is named for a stage, never for anything a document said"
+    )
+    assert all(
+        isinstance(value, dict) and set(value) == {"seconds", "calls"} for value in timings.values()
+    )
 
 
 async def _until_indexed(store: fakes.MemoryIngestStore, source_id: str) -> None:

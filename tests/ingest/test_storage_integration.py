@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import resource
 import sqlite3
 import threading
@@ -71,6 +72,7 @@ from manicule.ingest.rebuild import build_offline_rebuilder
 from manicule.ingest.recovery import requeue_interrupted
 from manicule.ingest.reembed import ReembedState, resume_reembed, start_reembed
 from manicule.ingest.reindex import NO_RETAINED_BYTES, re_parse, reindex_document
+from manicule.ingest.stages import Stage
 from manicule.ingest.sweeps import sweep_vectors
 from manicule.ingest.workers import InProcessRunner
 from manicule.parsers.chain import ParserChain
@@ -3467,6 +3469,164 @@ async def test_publication_makes_one_lease_renewal_per_document(
     assert one.indexed == 1
     assert many.indexed == 6
     assert len(renewals) == single + 5, "more than one renewal per extra document"
+
+
+async def test_a_durable_run_reports_where_its_time_went(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Every stage on the derive path is sampled once per document, and nests as documented."""
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=fakes.MemoryVectors(), clock=fakes.ManualLeaseClock()
+    )
+    connector = fakes.DictConnector(
+        {f"public-{n}": f"public synthetic line {n}" for n in range(3)}, name="timed"
+    )
+
+    report = await pipeline.run(connector)
+
+    assert report.indexed == 3
+    timings = report.stages.timings
+    for stage in Stage:
+        if stage in {Stage.AFTER_STORE, Stage.GLOSSARY}:
+            continue  # no hooks and no glossary in this pipeline
+        assert timings[stage].calls >= 3, f"{stage} was not sampled once per document"
+    assert timings[Stage.PUBLISH].seconds <= timings[Stage.COMMIT].seconds
+    assert timings[Stage.COMMIT].seconds <= timings[Stage.DOCUMENT].seconds
+    recorded = report.stages.as_metadata()["timings"]
+    assert isinstance(recorded, dict)
+    assert set(recorded) == {str(stage) for stage in timings}
+    assert pipeline.stage_timings()[Stage.DOCUMENT].calls == 3
+
+
+async def test_the_timings_are_logged_on_a_timer_even_while_nothing_finishes(
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A document parked in the embedder is exactly when a line is wanted, and none finished."""
+    monkeypatch.setattr("manicule.ingest.pipeline.TIMINGS_LOG_INTERVAL_S", 0.05)
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    embedder = fakes.GatedEmbedder()
+    pipeline = _lease_pipeline(
+        store,
+        engine,
+        data_dir,
+        vectors=fakes.MemoryVectors(),
+        clock=fakes.ManualLeaseClock(),
+        embedder=embedder,
+    )
+    connector = fakes.DictConnector({"public-stalled": "public synthetic line"}, name="stalled")
+
+    logged = asyncio.Event()
+
+    class _Notice(logging.Handler):
+        @override
+        def emit(self, record: logging.LogRecord) -> None:
+            message = record.getMessage()
+            if "stage timings" in message and "parse " in message:
+                logged.set()
+
+    logger = logging.getLogger("manicule.ingest.pipeline")
+    notice = _Notice()
+    logger.addHandler(notice)
+    try:
+        with caplog.at_level("INFO", logger="manicule.ingest.pipeline"):
+            task = asyncio.create_task(pipeline.run(connector))
+            await embedder.gate.wait_for(1)
+            await asyncio.wait_for(logged.wait(), timeout=10)
+            assert not task.done(), "the document is parked, so no per-document line could exist"
+            embedder.gate.open()
+            report = await task
+    finally:
+        logger.removeHandler(notice)
+
+    lines = [r.getMessage() for r in caplog.records if "stage timings" in r.getMessage()]
+    assert report.indexed == 1
+    assert all("stalled" in line for line in lines)
+    assert any("parse " in line for line in lines), "the stages that finished are in the line"
+
+
+async def test_publishing_a_document_with_no_chunks_is_timed_as_a_publish(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """Containers, unsupported and empty documents publish through their own path."""
+
+    class EmptyChunker(fakes.BlockChunker):
+        @override
+        def chunk(self, document: Document, blocks: Iterable[ParsedBlock]) -> list[Chunk]:
+            del document, blocks
+            return []
+
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = IngestPipeline(
+        store=store,
+        acquisitions=store,
+        blobs=BlobStore(engine, data_dir),
+        chunker=EmptyChunker(),
+        embedder=HashEmbedder(),
+        vectors=fakes.MemoryVectors(),
+        runner=InProcessRunner({"lines": fakes.LineParser()}),
+        resolve_chain=lambda _: ["lines"],
+        middleware=MiddlewareRunner(()),
+        chunk_fingerprint=fakes.BlockChunker.fingerprint,
+        acquisition_lease_s=300,
+        acquisition_clock=fakes.ManualLeaseClock(),
+        detect_glossary=False,
+    )
+
+    report = await pipeline.run(
+        fakes.DictConnector(
+            {"public-a": "public line a", "public-b": "public line b"}, name="empty"
+        )
+    )
+
+    assert report.stages.timings[Stage.PUBLISH].calls == 2
+    assert Stage.COMMIT not in report.stages.timings, "no chunks, so no vector commit happened"
+
+
+async def test_two_runs_sharing_a_pipeline_each_report_only_their_own_time(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=fakes.MemoryVectors(), clock=fakes.ManualLeaseClock()
+    )
+
+    first, second = await asyncio.gather(
+        pipeline.run(
+            fakes.DictConnector({f"public-a{n}": f"line a {n}" for n in range(3)}, name="first")
+        ),
+        pipeline.run(
+            fakes.DictConnector({f"public-b{n}": f"line b {n}" for n in range(2)}, name="second")
+        ),
+    )
+
+    assert first.stages.timings[Stage.DOCUMENT].calls == 3
+    assert second.stages.timings[Stage.DOCUMENT].calls == 2
+    assert pipeline.stage_timings()[Stage.DOCUMENT].calls == 5
+
+
+async def test_a_second_run_reports_only_its_own_time(engine: AsyncEngine, data_dir: Path) -> None:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    pipeline = _lease_pipeline(
+        store, engine, data_dir, vectors=fakes.MemoryVectors(), clock=fakes.ManualLeaseClock()
+    )
+
+    first = await pipeline.run(fakes.DictConnector({"public-a": "public line a"}, name="first"))
+    second = await pipeline.run(
+        fakes.DictConnector({"public-b": "one", "public-c": "two"}, name="second")
+    )
+
+    assert first.stages.timings[Stage.DOCUMENT].calls == 1
+    assert second.stages.timings[Stage.DOCUMENT].calls == 2
+    assert pipeline.stage_timings()[Stage.DOCUMENT].calls == 3
 
 
 async def test_acquisition_failure_does_not_mutate_the_prior_document(

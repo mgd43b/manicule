@@ -47,6 +47,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -126,7 +128,15 @@ from manicule.ingest.ports import (
     GlossaryWriter,
 )
 from manicule.ingest.refusals import require_measured
-from manicule.ingest.stages import Conveyor, CountedLock, Gauge, StageReport
+from manicule.ingest.stages import (
+    Conveyor,
+    CountedLock,
+    Gauge,
+    Stage,
+    StageReport,
+    StageTime,
+    StageTimings,
+)
 from manicule.ingest.workers import AttemptResult, default_worker_count
 from manicule.parsers.chain import (
     Attempt,
@@ -142,7 +152,7 @@ from manicule.parsers.front_matter import MAX_FRONT_MATTER_CHARS
 from manicule.parsers.versions import parse_fingerprint
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping, Sequence
     from collections.abc import Set as AbstractSet
 
     from manicule.core.content import Chunk, Metadata
@@ -965,6 +975,14 @@ class _Sync:
     inflating every later run's report by a number that only ever grows.
     """
 
+    timings: StageTimings = field(default_factory=StageTimings)
+    """This run's own stage totals. Visits in tasks started under :meth:`StageTimings.scoped`
+    count here as well as in the pipeline's, so a run reports its own time and not a neighbor's."""
+
+    timings_logged_at: float = 0.0
+    timings_logged: Mapping[Stage, StageTime] = field(default_factory=dict[Stage, StageTime])
+    """When, and at what totals, the last progress line was logged."""
+
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     """Set on cancellation so discovery or journal reading stops admitting new work."""
 
@@ -982,6 +1000,11 @@ class _Sync:
     dependency_discovered_sources: set[SourceId] = field(default_factory=_source_id_set)
     """Ordinary durable records, used to force their fresher source evidence in place."""
 
+
+_LOG = logging.getLogger(__name__)
+
+TIMINGS_LOG_INTERVAL_S: Final = 60.0
+"""How often a running pipeline logs where its time went. A run report exists only at its end."""
 
 JOURNAL_PAGE: Final = 64
 
@@ -1229,9 +1252,9 @@ class IngestPipeline:
         self._preparation = ThreadPoolExecutor(
             max_workers=self._ingest_workers, thread_name_prefix="manicule-prepare"
         )
-        self._embedding = CountedLock("embed")
-        self._parsing = Gauge("parse")
-        self._fetches = Gauge("fetch")
+        self._timings = StageTimings()
+        self._embedding = CountedLock("embed", self._timings)
+        self._parsing, self._fetches = Gauge("parse"), Gauge("fetch")
         self._mutations: dict[str, tuple[asyncio.Lock, int]] = {}
 
     # --- the two locks, and what each one is for ------------------------------------------
@@ -1628,8 +1651,10 @@ class IngestPipeline:
         # second operation sharing this pipeline is one of them.
         for gauge in (self._fetches, self._parsing, self._embedding.gauge):
             gauge.rebase()
+        run.timings_logged_at = time.perf_counter()
 
-        stages = asyncio.create_task(self._drive(run), name=f"ingest:{connector.name}")
+        with run.timings.scoped():
+            stages = asyncio.create_task(self._drive(run), name=f"ingest:{connector.name}")
         crashed = False
         try:
             # Shielded so that a cancellation arriving here does not tear the stages down before
@@ -1798,14 +1823,23 @@ class IngestPipeline:
         A stage task raising cancels its siblings, and that is deliberate rather than tolerated:
         everything a document can do is already an outcome by the time it reaches here, so what
         is left to raise is the store or a defect, and neither is survivable by carrying on.
-        """
-        if run.acquisitions is not None:
-            await self._drive_durable(run)
-            return
-        producer = self._discover_into
 
-        refs, bodies = run.refs, run.bodies
-        await self._run_local_stages(run, producer, refs, bodies)
+        The timings ticker is the one other child, started here and joined in the ``finally`` so
+        that it is gone when this returns, however it returns.
+        """
+        ticker = asyncio.create_task(self._log_timings_every_interval(run), name="timings-log")
+        try:
+            if run.acquisitions is not None:
+                await self._drive_durable(run)
+                return
+            producer = self._discover_into
+
+            refs, bodies = run.refs, run.bodies
+            await self._run_local_stages(run, producer, refs, bodies)
+        finally:
+            ticker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ticker
 
     async def _drive_durable(  # noqa: PLR0911, PLR0912, PLR0915 - durable state machine
         self, run: _Sync
@@ -2953,17 +2987,19 @@ class IngestPipeline:
                     AcquisitionRecordState.ACQUIRED,
                     AcquisitionRecordState.RETRY,
                 }:
-                    record = await acquisitions.transition_acquisition_record(
-                        run.acquisition_run_id,
-                        record.source.source_id,
-                        record.state,
-                        AcquisitionRecordState.INDEXING,
-                        lease_owner=run.lease_owner,
-                        lease_generation=run.lease_generation,
-                        now=now,
-                    )
+                    with self._timings.timing(Stage.JOURNAL_START):
+                        record = await acquisitions.transition_acquisition_record(
+                            run.acquisition_run_id,
+                            record.source.source_id,
+                            record.state,
+                            AcquisitionRecordState.INDEXING,
+                            lease_owner=run.lease_owner,
+                            lease_generation=run.lease_generation,
+                            now=now,
+                        )
                 try:
-                    raw = await self._raw_from_acquisition(run, record)
+                    with self._timings.timing(Stage.BLOB_READ):
+                        raw = await self._raw_from_acquisition(run, record)
                 except Exception as exc:  # noqa: BLE001 - safe typed retry outcome
                     diagnostic = _snapshot_diagnostic(exc)
                     await acquisitions.transition_acquisition_record(
@@ -3206,17 +3242,18 @@ class IngestPipeline:
                 else None
             )
             try:
-                outcomes = await self.ingest_raw(
-                    fetched.raw,
-                    source=run.connector.name,
-                    version_token=fetched.discovered.version_token,
-                    title=fetched.discovered.title,
-                    existing=fetched.existing,
-                    retention=fetched.retention,
-                    force=fetched.force,
-                    force_members=fetched.force,
-                    blobs=run.blobs,
-                )
+                with self._timings.timing(Stage.DOCUMENT):
+                    outcomes = await self.ingest_raw(
+                        fetched.raw,
+                        source=run.connector.name,
+                        version_token=fetched.discovered.version_token,
+                        title=fetched.discovered.title,
+                        existing=fetched.existing,
+                        retention=fetched.retention,
+                        force=fetched.force,
+                        force_members=fetched.force,
+                        blobs=run.blobs,
+                    )
             finally:
                 if fence_token is not None:
                     _publication_fence.reset(fence_token)
@@ -3229,11 +3266,54 @@ class IngestPipeline:
                 # the inside of it.
                 run.report.record(outcome, expanded=position > 0)
             if fetched.acquisition_record is not None:
-                await self._settle_indexed_record(run, fetched.acquisition_record, outcomes)
+                with self._timings.timing(Stage.JOURNAL_SETTLE):
+                    await self._settle_indexed_record(run, fetched.acquisition_record, outcomes)
             # After the whole document, not per outcome: a container that expanded into five
             # hundred members is one thing that happened to somebody watching, and five hundred
             # lines of it is not progress.
             _report_progress(run)
+
+    def stage_timings(self) -> Mapping[Stage, StageTime]:
+        """Cumulative time per stage since this pipeline was built, summed across workers.
+
+        Readable while a run is in progress, which the run report is not: it is built once, at
+        the end. Take two readings and subtract with :meth:`StageTimings.since` to see a window.
+        """
+        return self._timings.snapshot()
+
+    async def _log_timings_every_interval(self, run: _Sync) -> None:
+        """Log where the last interval went, on a timer rather than when a document finishes.
+
+        A timer because the interval that most needs explaining is the one in which nothing
+        finished: every worker parked on the embedding lock, or on a vector store that has
+        stopped answering, logs nothing at all from a per-document check.
+        """
+        while True:
+            await asyncio.sleep(TIMINGS_LOG_INTERVAL_S)
+            self._log_timings(run)
+
+    def _log_timings(self, run: _Sync) -> None:
+        """Say where the time since the last line went, slowest stage first.
+
+        The window is a difference of totals, which is why the lines compare with each other and
+        with the wall clock they carry. A visit still open counts for the time it has taken so
+        far, and as a call only once it ends, so a stage that has stalled shows its seconds
+        growing with no calls beside them.
+        """
+        now = time.perf_counter()
+        window = now - run.timings_logged_at
+        totals = run.timings.snapshot()
+        spent = StageTimings.since(totals, run.timings_logged)
+        run.timings_logged_at = now
+        run.timings_logged = totals
+        ranked = sorted(spent.items(), key=lambda item: item[1].seconds, reverse=True)
+        _LOG.info(
+            "ingest stage timings for %s over %.0fs (seconds summed across workers / calls): %s",
+            run.connector.name,
+            window,
+            "; ".join(f"{stage} {used.seconds:.1f}/{used.calls}" for stage, used in ranked)
+            or "no stage completed a visit",
+        )
 
     async def _settle_indexed_record(
         self, run: _Sync, record: AcquisitionRecord, outcomes: Sequence[DocumentOutcome]
@@ -3342,6 +3422,7 @@ class IngestPipeline:
             peak_embeds=self._embedding.gauge.peak,
             peak_bodies=run.bodies_held.peak,
             peak_discovery_records=run.discovery_records_held.peak,
+            timings=run.timings.snapshot(),
         )
 
     async def _advance_watermark(self, run: _Sync) -> bool:
@@ -3792,7 +3873,8 @@ class IngestPipeline:
 
         await self._advance(existing, DocumentStatus.PARSING)
 
-        result, members, enumerated = await self._parse(raw)
+        with self._timings.timing(Stage.PARSE):
+            result, members, enumerated = await self._parse(raw)
         if members and not result.blocks:
             # A container is a document with nothing of its own, and that is what the status
             # says: zero chunks, its content being the documents its members became. A message
@@ -4026,7 +4108,8 @@ class IngestPipeline:
                 failure.
         """
         try:
-            chunks = await self._prepare(result, document)
+            with self._timings.timing(Stage.PREPARE):
+                chunks = await self._prepare(result, document)
             if not chunks:
                 return await self._nothing_to_index(
                     result,
@@ -4043,17 +4126,19 @@ class IngestPipeline:
             # shares while they run would serialize a sweep against a concurrent sync on work
             # neither of them needs the model for.
             previous = await self._previous_inputs(document, existing)
-            vectors, work = await embed_or_reuse(
-                self._embedder,
-                chunks,
-                vectors=self._vectors,
-                chunk_fingerprint=self._chunk_fingerprint,
-                previous=previous,
-                target_batch_tokens=self._target_batch_tokens,
-                maximum=self._max_embed_batch,
-                lock=self._embedding,
-                reuse=reuse_vectors,
-            )
+            with self._timings.timing(Stage.EMBED):
+                vectors, work = await embed_or_reuse(
+                    self._embedder,
+                    chunks,
+                    vectors=self._vectors,
+                    chunk_fingerprint=self._chunk_fingerprint,
+                    previous=previous,
+                    target_batch_tokens=self._target_batch_tokens,
+                    maximum=self._max_embed_batch,
+                    lock=self._embedding,
+                    reuse=reuse_vectors,
+                    timings=self._timings,
+                )
         except _SupersededError:
             raise
         except _StageError as failure:
@@ -4070,15 +4155,16 @@ class IngestPipeline:
         # commit has to get right, and threading it through would put another argument in the
         # one function whose ordering is the crash contract — which now also carries
         # `expected`, and has earned the right to be left alone.
-        outcome = await self._commit(
-            document,
-            chunks,
-            vectors,
-            raw=raw,
-            existing=existing,
-            retention=retention,
-            expected=expected,
-        )
+        with self._timings.timing(Stage.COMMIT):
+            outcome = await self._commit(
+                document,
+                chunks,
+                vectors,
+                raw=raw,
+                existing=existing,
+                retention=retention,
+                expected=expected,
+            )
         return replace(outcome, embedding=work)
 
     async def _previous_inputs(
@@ -4205,35 +4291,36 @@ class IngestPipeline:
         fence = await self._publication_authority()
         publisher = self._fenced_store if fence is not None else None
         publish = publisher.fenced_publish_document if publisher is not None else None
-        if fence is not None and publish is not None:
-            committed = await publish(
-                fence,
-                settled,
-                [],
-                expected=expected,
-                chunk_fp=None,
-                embed_fp=None,
-                parse_fp=self._parse_lineage_of(settled),
-                glossary_entries=entries,
-                glossary_fp=glossary_fp,
-                original_omitted_reason=retention.omitted_reason,
-                source_dependencies=_source_dependencies(settled),
-                expected_reset_epoch=self._expected_reset_epoch,
-            )
-        else:
-            committed = await self._store.publish_document(
-                settled,
-                [],
-                expected=expected,
-                chunk_fp=None,
-                embed_fp=None,
-                parse_fp=self._parse_lineage_of(settled),
-                glossary_entries=entries,
-                glossary_fp=glossary_fp,
-                original_omitted_reason=retention.omitted_reason,
-                source_dependencies=_source_dependencies(settled),
-                expected_reset_epoch=self._expected_reset_epoch,
-            )
+        with self._timings.timing(Stage.PUBLISH):
+            if fence is not None and publish is not None:
+                committed = await publish(
+                    fence,
+                    settled,
+                    [],
+                    expected=expected,
+                    chunk_fp=None,
+                    embed_fp=None,
+                    parse_fp=self._parse_lineage_of(settled),
+                    glossary_entries=entries,
+                    glossary_fp=glossary_fp,
+                    original_omitted_reason=retention.omitted_reason,
+                    source_dependencies=_source_dependencies(settled),
+                    expected_reset_epoch=self._expected_reset_epoch,
+                )
+            else:
+                committed = await self._store.publish_document(
+                    settled,
+                    [],
+                    expected=expected,
+                    chunk_fp=None,
+                    embed_fp=None,
+                    parse_fp=self._parse_lineage_of(settled),
+                    glossary_entries=entries,
+                    glossary_fp=glossary_fp,
+                    original_omitted_reason=retention.omitted_reason,
+                    source_dependencies=_source_dependencies(settled),
+                    expected_reset_epoch=self._expected_reset_epoch,
+                )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
         return committed.stored, glossary_detail
@@ -4274,53 +4361,57 @@ class IngestPipeline:
             fence = await self._publication_authority()
             publisher = self._fenced_store if fence is not None else None
             if existing is None or existing.publication_id != publication:
-                if fence is not None and publisher is not None:
-                    await publisher.fenced_stage_vectors(
-                        fence,
-                        publication,
-                        chunks,
-                        expected_reset_epoch=self._expected_reset_epoch,
-                    )
-                else:
-                    await self._store.stage_vectors(
-                        publication,
-                        chunks,
-                        expected_reset_epoch=self._expected_reset_epoch,
-                    )
+                with self._timings.timing(Stage.STAGE_VECTORS):
+                    if fence is not None and publisher is not None:
+                        await publisher.fenced_stage_vectors(
+                            fence,
+                            publication,
+                            chunks,
+                            expected_reset_epoch=self._expected_reset_epoch,
+                        )
+                    else:
+                        await self._store.stage_vectors(
+                            publication,
+                            chunks,
+                            expected_reset_epoch=self._expected_reset_epoch,
+                        )
             await self._check_publication_fence()
-            await self._vectors.upsert(chunks, vectors, publication_id=publication)
+            with self._timings.timing(Stage.UPSERT):
+                await self._vectors.upsert(chunks, vectors, publication_id=publication)
             entries, glossary_fp, glossary_detail = await self._derive_definitions(document, chunks)
             fence = await self._publication_authority()
             publisher = self._fenced_store if fence is not None else None
             if fence is not None and publisher is not None:
-                committed = await publisher.fenced_publish_document(
-                    fence,
-                    indexed_document,
-                    chunks,
-                    expected=expected,
-                    chunk_fp=self._chunk_fingerprint.canonical(),
-                    embed_fp=self._embedder.fingerprint.canonical(),
-                    parse_fp=self._parse_lineage_of(document),
-                    glossary_entries=entries,
-                    glossary_fp=glossary_fp,
-                    original_omitted_reason=retention.omitted_reason,
-                    source_dependencies=_source_dependencies(indexed_document),
-                    expected_reset_epoch=self._expected_reset_epoch,
-                )
+                with self._timings.timing(Stage.PUBLISH):
+                    committed = await publisher.fenced_publish_document(
+                        fence,
+                        indexed_document,
+                        chunks,
+                        expected=expected,
+                        chunk_fp=self._chunk_fingerprint.canonical(),
+                        embed_fp=self._embedder.fingerprint.canonical(),
+                        parse_fp=self._parse_lineage_of(document),
+                        glossary_entries=entries,
+                        glossary_fp=glossary_fp,
+                        original_omitted_reason=retention.omitted_reason,
+                        source_dependencies=_source_dependencies(indexed_document),
+                        expected_reset_epoch=self._expected_reset_epoch,
+                    )
             else:
-                committed = await self._store.publish_document(
-                    indexed_document,
-                    chunks,
-                    expected=expected,
-                    chunk_fp=self._chunk_fingerprint.canonical(),
-                    embed_fp=self._embedder.fingerprint.canonical(),
-                    parse_fp=self._parse_lineage_of(document),
-                    glossary_entries=entries,
-                    glossary_fp=glossary_fp,
-                    original_omitted_reason=retention.omitted_reason,
-                    source_dependencies=_source_dependencies(indexed_document),
-                    expected_reset_epoch=self._expected_reset_epoch,
-                )
+                with self._timings.timing(Stage.PUBLISH):
+                    committed = await self._store.publish_document(
+                        indexed_document,
+                        chunks,
+                        expected=expected,
+                        chunk_fp=self._chunk_fingerprint.canonical(),
+                        embed_fp=self._embedder.fingerprint.canonical(),
+                        parse_fp=self._parse_lineage_of(document),
+                        glossary_entries=entries,
+                        glossary_fp=glossary_fp,
+                        original_omitted_reason=retention.omitted_reason,
+                        source_dependencies=_source_dependencies(indexed_document),
+                        expected_reset_epoch=self._expected_reset_epoch,
+                    )
         except (AcquisitionLeaseLostError, DerivedResetFenceLostError):
             raise
         except Exception as exc:  # noqa: BLE001 - a store failure is this document's
@@ -4364,7 +4455,10 @@ class IngestPipeline:
 
     async def _publication_authority(self, *, force: bool = False) -> AcquisitionFence | None:
         fence = _publication_fence.get()
-        return None if fence is None else await fence(force)
+        if fence is None:
+            return None
+        with self._timings.timing(Stage.FENCE):
+            return await fence(force)
 
     async def _check_publication_fence(self) -> None:
         """Prove ownership against the stored row immediately before the vector write.
@@ -4401,9 +4495,12 @@ class IngestPipeline:
         if not self._detect_glossary:
             return None, self._glossary_lineage, ""
         try:
-            entries = await self._prepared(
-                lambda: detect_entries(chunks, title=document.title, media_type=document.media_type)
-            )
+            with self._timings.timing(Stage.GLOSSARY):
+                entries = await self._prepared(
+                    lambda: detect_entries(
+                        chunks, title=document.title, media_type=document.media_type
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 - a detector bug costs this document's glossary
             return None, None, f"glossary detection failed: {type(exc).__name__}: {exc}"
         return entries, self._glossary_lineage, ""
@@ -4785,21 +4882,22 @@ class IngestPipeline:
             return document
         fence = await self._publication_authority()
         publisher = self._fenced_store if fence is not None else None
-        if fence is not None and publisher is not None:
-            committed = await publisher.fenced_publish_failure(
-                fence,
-                document,
-                expected=expected,
-                original_omitted_reason=retention.omitted_reason,
-                expected_reset_epoch=self._expected_reset_epoch,
-            )
-        else:
-            committed = await self._store.publish_failure(
-                document,
-                expected=expected,
-                original_omitted_reason=retention.omitted_reason,
-                expected_reset_epoch=self._expected_reset_epoch,
-            )
+        with self._timings.timing(Stage.PUBLISH):
+            if fence is not None and publisher is not None:
+                committed = await publisher.fenced_publish_failure(
+                    fence,
+                    document,
+                    expected=expected,
+                    original_omitted_reason=retention.omitted_reason,
+                    expected_reset_epoch=self._expected_reset_epoch,
+                )
+            else:
+                committed = await self._store.publish_failure(
+                    document,
+                    expected=expected,
+                    original_omitted_reason=retention.omitted_reason,
+                    expected_reset_epoch=self._expected_reset_epoch,
+                )
         if not committed.committed or committed.stored is None:
             raise _SupersededError(committed.stored)
         return committed.stored
@@ -4907,7 +5005,8 @@ class IngestPipeline:
         current" state the column exists to prevent.
         """
         try:
-            await self._middleware.after_store(document)
+            with self._timings.timing(Stage.AFTER_STORE):
+                await self._middleware.after_store(document)
         except Exception as exc:  # noqa: BLE001 - the document is already committed
             updates: Metadata = {"last_after_store_error": f"{type(exc).__name__}: {exc}"}
             fence = await self._publication_authority()
@@ -4918,9 +5017,10 @@ class IngestPipeline:
                 await self._store.annotate(document.id, updates)
             return
         if self._relation_lineage is not None and document.status is not DocumentStatus.FAILED:
-            await self._store.set_lineage(
-                document.id, chunk_fp=None, embed_fp=None, relation_fp=self._relation_lineage
-            )
+            with self._timings.timing(Stage.LINEAGE):
+                await self._store.set_lineage(
+                    document.id, chunk_fp=None, embed_fp=None, relation_fp=self._relation_lineage
+                )
 
     async def _fail(
         self,

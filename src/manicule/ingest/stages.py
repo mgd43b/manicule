@@ -22,12 +22,15 @@ makes both modes' local bounds observable (``docs/ingest.md`` §8.3).
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Mapping
 
     from manicule.core.content import Metadata
 
@@ -238,6 +241,163 @@ class Gauge:
         self.peak = self.active
 
 
+class Stage(StrEnum):
+    """The stages a pipeline keeps time for: a fixed few, which keeps the report content-free.
+
+    A member rather than a string at each call site, so a misspelled stage is an error where it
+    is written instead of a stray bucket in a report. Containment is by time: ``embed`` holds
+    ``stored_vectors`` and the embed lock's wait and hold, ``commit`` holds ``fence``,
+    ``stage_vectors``, ``upsert``, ``glossary`` and ``publish``, and ``document`` holds all of it.
+    """
+
+    JOURNAL_START = "journal_start"
+    BLOB_READ = "blob_read"
+    DOCUMENT = "document"
+    PARSE = "parse"
+    PREPARE = "prepare"
+    EMBED = "embed"
+    STORED_VECTORS = "stored_vectors"
+    EMBED_LOCK_WAIT = "embed_lock_wait"
+    EMBED_LOCK_HELD = "embed_lock_held"
+    GLOSSARY = "glossary"
+    COMMIT = "commit"
+    FENCE = "fence"
+    STAGE_VECTORS = "stage_vectors"
+    UPSERT = "upsert"
+    PUBLISH = "publish"
+    AFTER_STORE = "after_store"
+    LINEAGE = "lineage"
+    JOURNAL_SETTLE = "journal_settle"
+
+
+@dataclass(frozen=True, slots=True)
+class StageTime:
+    """Wall time one stage took in total, and how many times it ran.
+
+    Summed across workers, so a stage that four workers occupy at once can add up to more
+    seconds than the clock on the wall. That is the point: seconds divided by calls is how long
+    one visit takes, and seconds divided by the window is how many workers were inside it.
+    """
+
+    seconds: float = 0.0
+    calls: int = 0
+
+
+_scope: ContextVar[StageTimings | None] = ContextVar("stage_timings_scope", default=None)
+"""The run whose stage totals a visit also counts toward, inherited by the tasks it starts."""
+
+
+class StageTimings:
+    """Cumulative wall time per named stage, for a pipeline that is slower than it should be.
+
+    **Counters, not a trace.** Nothing here keeps an event, a document id or a label drawn from
+    content: a stage name is one of a fixed few, so the memory is constant however long a run
+    is. Read it as two snapshots and a subtraction (:meth:`since`), which is how a report says
+    what one run did and a log line says what the last minute did.
+
+    **A visit counts while it is happening, not only when it ends.** A snapshot adds the elapsed
+    time of every visit still open to the time of those that have closed, and counts only the
+    closed ones as calls. Otherwise one worker embedding for two minutes would be invisible in
+    the first two windows and arrive whole in the third, and the seconds in a window divided by
+    its length would stop meaning how many workers were inside.
+
+    **Scoped to a run as well as to the pipeline.** Inside :meth:`scoped`, and in every task
+    started there, a visit also counts toward the scope's totals, so two runs sharing a pipeline
+    each report their own and the pipeline's own totals still hold both.
+
+    Synchronous and unlocked, like :class:`Gauge`: nothing between reading a total and writing
+    it back awaits, so two tasks cannot interleave a read-modify-write.
+    """
+
+    def __init__(self) -> None:
+        self._seconds: dict[Stage, float] = {}
+        self._calls: dict[Stage, int] = {}
+        self._open: dict[object, tuple[Stage, float]] = {}
+
+    def add(self, stage: Stage, seconds: float) -> None:
+        """Count one finished visit to ``stage`` that took ``seconds``."""
+        self._seconds[stage] = self._seconds.get(stage, 0.0) + seconds
+        self._calls[stage] = self._calls.get(stage, 0) + 1
+
+    def begin(self, stage: Stage) -> _Visit:
+        """Open a visit. Close it with :meth:`end`, or use :meth:`timing`."""
+        now = time.perf_counter()
+        scope = _scope.get()
+        visit = _Visit(stage, now, None if scope is self else scope)
+        self._open[visit] = (stage, now)
+        if visit.scope is not None:
+            visit.scope.begin_scoped(visit)
+        return visit
+
+    def begin_scoped(self, visit: _Visit) -> None:
+        self._open[visit] = (visit.stage, visit.started)
+
+    def end(self, visit: _Visit) -> None:
+        """Close a visit opened by :meth:`begin`, once."""
+        if self._open.pop(visit, None) is None:
+            return
+        elapsed = time.perf_counter() - visit.started
+        self.add(visit.stage, elapsed)
+        if visit.scope is not None:
+            visit.scope.end_scoped(visit, elapsed)
+
+    def end_scoped(self, visit: _Visit, elapsed: float) -> None:
+        if self._open.pop(visit, None) is not None:
+            self.add(visit.stage, elapsed)
+
+    @contextmanager
+    def timing(self, stage: Stage) -> Generator[None]:
+        """Time the block, whether it returns, raises or is canceled."""
+        visit = self.begin(stage)
+        try:
+            yield
+        finally:
+            self.end(visit)
+
+    @contextmanager
+    def scoped(self) -> Generator[None]:
+        """Make visits begun in this context, and in tasks started from it, also count here."""
+        token = _scope.set(self)
+        try:
+            yield
+        finally:
+            _scope.reset(token)
+
+    def snapshot(self) -> Mapping[Stage, StageTime]:
+        """Totals now, with visits still open counted for the time they have taken so far."""
+        now = time.perf_counter()
+        seconds = dict(self._seconds)
+        for stage, started in self._open.values():
+            seconds[stage] = seconds.get(stage, 0.0) + (now - started)
+        return {
+            stage: StageTime(seconds=total, calls=self._calls.get(stage, 0))
+            for stage, total in seconds.items()
+        }
+
+    @staticmethod
+    def since(
+        now: Mapping[Stage, StageTime], base: Mapping[Stage, StageTime]
+    ) -> dict[Stage, StageTime]:
+        """What happened between two snapshots, leaving out stages that did not run."""
+        delta: dict[Stage, StageTime] = {}
+        for stage, after in now.items():
+            before = base.get(stage, StageTime())
+            if after.calls > before.calls or after.seconds > before.seconds:
+                delta[stage] = StageTime(
+                    seconds=after.seconds - before.seconds, calls=after.calls - before.calls
+                )
+        return delta
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class _Visit:
+    """One open visit to a stage. Compared by identity, so each is its own key."""
+
+    stage: Stage
+    started: float
+    scope: StageTimings | None
+
+
 class CountedLock:
     """An :class:`asyncio.Lock` that says how many holders it has had at once.
 
@@ -248,19 +408,44 @@ class CountedLock:
 
     A peak above one is the whole of "the embedder was called concurrently", so this is the
     measurement that assertion is made from rather than a proxy for it.
+
+    Given ``timings`` it also records how long each holder queued behind another and how long it
+    held the lock, under the two stages named, which is the difference between an accelerator
+    that is the limit and one that is waiting for work.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        timings: StageTimings | None = None,
+        *,
+        wait: Stage = Stage.EMBED_LOCK_WAIT,
+        held: Stage = Stage.EMBED_LOCK_HELD,
+    ) -> None:
         self.gauge = Gauge(name)
         self._lock = asyncio.Lock()
+        self._timings = timings
+        self._wait_stage = wait
+        self._held_stage = held
+        self._held: _Visit | None = None
 
     async def __aenter__(self) -> None:
-        await self._lock.acquire()
+        waiting = self._timings.begin(self._wait_stage) if self._timings is not None else None
+        try:
+            await self._lock.acquire()
+        finally:
+            if waiting is not None and self._timings is not None:
+                self._timings.end(waiting)
+        if self._timings is not None:
+            self._held = self._timings.begin(self._held_stage)
         self.gauge.active += 1
         self.gauge.peak = max(self.gauge.peak, self.gauge.active)
 
     async def __aexit__(self, *_: object) -> None:
         self.gauge.active -= 1
+        if self._timings is not None and self._held is not None:
+            self._timings.end(self._held)
+        self._held = None
         self._lock.release()
 
     def locked(self) -> bool:
@@ -306,6 +491,14 @@ class StageReport:
     peak_discovery_records: int = 0
     """Journal records held by the read page and fetch hand-off together."""
 
+    timings: Mapping[Stage, StageTime] = field(default_factory=dict[Stage, StageTime])
+    """Where this run's time went, per stage, summed across workers. Empty when nothing ran.
+
+    **Process-wide, like the peaks above:** the totals belong to the pipeline, so a re-parse sweep
+    running beside a sync is counted in this run's too. Subtracting what was already there when
+    the run began is as far as attribution goes.
+    """
+
     def as_metadata(self) -> Metadata:
         return {
             "accepted": self.accepted,
@@ -316,7 +509,20 @@ class StageReport:
             "peak_embeds": self.peak_embeds,
             "peak_bodies": self.peak_bodies,
             "peak_discovery_records": self.peak_discovery_records,
+            "timings": {
+                stage: {"seconds": round(spent.seconds, 3), "calls": spent.calls}
+                for stage, spent in sorted(self.timings.items())
+            },
         }
 
 
-__all__ = ["Conveyor", "CountedLock", "Gauge", "QueueReport", "StageReport"]
+__all__ = [
+    "Conveyor",
+    "CountedLock",
+    "Gauge",
+    "QueueReport",
+    "Stage",
+    "StageReport",
+    "StageTime",
+    "StageTimings",
+]
