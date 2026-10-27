@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from manicule.storage.engine import (
     prepare_data_dir,
     writer_ledger,
     writer_slot,
+    writer_totals_since,
 )
 
 
@@ -90,15 +92,48 @@ async def _enter(engine: AsyncEngine, name: str) -> None:
         pass
 
 
-def test_a_window_is_a_difference_of_totals_and_its_longest_hold_is_read_once() -> None:
+def test_a_window_is_a_difference_of_totals_and_each_reader_has_its_own_longest() -> None:
     ledger = WriterLedger()
-    ledger.record("publish", waited=0.1, held=0.2)
+    ledger.record("publish", waited=0.1, held=0.2, was_queued=False)
+    reader_a, reader_b = ledger.window(), ledger.window()
     before = ledger.totals()
-    ledger.record("publish", waited=0.3, held=0.9)
+    ledger.record("publish", waited=0.3, held=0.9, was_queued=False)
 
-    assert ledger.totals()["publish"][0] - before["publish"][0] == 1
-    assert ledger.take_window_longest_held() == {"publish": 0.9}
-    assert ledger.take_window_longest_held() == {"publish": 0.0}
+    moved = writer_totals_since(ledger.totals(), before)
+    assert moved == {"publish": (1, pytest.approx(0.3), pytest.approx(0.9))}
+    assert writer_totals_since(ledger.totals(), ledger.totals()) == {}
+    assert reader_a.take() == {"publish": (0.3, 0.9)}
+    assert reader_a.take() == {}, "read once, then a new window"
+    assert reader_b.take() == {"publish": (0.3, 0.9)}, "another reader's window is its own"
+
+
+async def test_a_write_still_in_progress_is_visible_with_what_is_queued_behind_it(
+    engine: AsyncEngine,
+) -> None:
+    ledger = writer_ledger(engine)
+    release = asyncio.Event()
+    assert ledger.current(0.0) is None
+
+    async def holder() -> None:
+        async with writer_slot(engine, "stuck_commit"):
+            await release.wait()
+
+    held = asyncio.create_task(holder())
+    await asyncio.sleep(0.01)
+    waiting = asyncio.create_task(_enter(engine, "behind"))
+    await asyncio.sleep(0.03)
+
+    current = ledger.current(time.perf_counter())
+    assert current is not None
+    operation, seconds_held, queued = current
+    assert operation == "stuck_commit"
+    assert seconds_held >= 0.03
+    assert queued == 1
+    assert "stuck_commit" not in ledger.operations, "nothing has finished, which is the point"
+
+    release.set()
+    await asyncio.gather(held, waiting)
+    assert ledger.current(time.perf_counter()) is None
 
 
 async def test_each_engine_has_its_own_ledger(engine: AsyncEngine, tmp_path: Path) -> None:

@@ -151,7 +151,12 @@ from manicule.parsers.config import MARKDOWN_MEDIA_TYPES
 from manicule.parsers.expansion import ExpandedMember, MemberFailure
 from manicule.parsers.front_matter import MAX_FRONT_MATTER_CHARS
 from manicule.parsers.versions import parse_fingerprint
-from manicule.storage.engine import writer_ledger
+from manicule.storage.engine import (
+    WriterTotals,
+    WriterWindow,
+    writer_ledger,
+    writer_totals_since,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping, Sequence
@@ -982,10 +987,10 @@ class _Sync:
     count here as well as in the pipeline's, so a run reports its own time and not a neighbor's."""
 
     timings_logged_at: float = 0.0
-    writer_logged: dict[str, tuple[int, float, float]] = field(
-        default_factory=dict[str, tuple[int, float, float]]
-    )
+    writer_logged: WriterTotals = field(default_factory=dict[str, tuple[int, float, float]])
     """The writer ledger's totals at the last progress line, to subtract from the next."""
+    writer_window: WriterWindow | None = None
+    """This run's own window onto the longest waits and holds, so another run cannot clear it."""
     timings_logged: Mapping[Stage, StageTime] = field(default_factory=dict[Stage, StageTime])
     """When, and at what totals, the last progress line was logged."""
 
@@ -1837,7 +1842,7 @@ class IngestPipeline:
         """
         observers = [
             asyncio.create_task(self._log_timings_every_interval(run), name="timings-log"),
-            asyncio.create_task(self._sample_loop_lag(), name="loop-lag"),
+            asyncio.create_task(self._sample_loop_lag(run), name="loop-lag"),
         ]
         try:
             if run.acquisitions is not None:
@@ -3306,7 +3311,7 @@ class IngestPipeline:
             await asyncio.sleep(TIMINGS_LOG_INTERVAL_S)
             self._log_timings(run)
 
-    async def _sample_loop_lag(self) -> None:
+    async def _sample_loop_lag(self, run: _Sync) -> None:
         """Record how much later than asked the event loop wakes a short timer.
 
         Every worker's every ``await`` returns through this one loop, so time it spends busy
@@ -3360,32 +3365,33 @@ class IngestPipeline:
             return
         ledger = writer_ledger(engine)
         totals = ledger.totals()
-        longest = ledger.take_window_longest_held()
-        previous = run.writer_logged
+        moved = writer_totals_since(totals, run.writer_logged)
         run.writer_logged = totals
-        moved = {
-            name: (
-                calls - previous.get(name, (0, 0.0, 0.0))[0],
-                waited - previous.get(name, (0, 0.0, 0.0))[1],
-                held - previous.get(name, (0, 0.0, 0.0))[2],
-            )
-            for name, (calls, waited, held) in totals.items()
-        }
-        moved = {name: change for name, change in moved.items() if change[0] > 0}
-        if not moved:
+        if run.writer_window is None:
+            run.writer_window = ledger.window()
+        longest = run.writer_window.take()
+        now = ledger.current(time.perf_counter())
+        if not moved and now is None:
             return
         ranked = sorted(moved.items(), key=lambda item: item[1][2], reverse=True)
+        busy = (
+            f"; now held by {now[0] or 'nobody'} for {now[1]:.1f}s with {now[2]} queued"
+            if now is not None
+            else ""
+        )
         _LOG.info(
-            "ingest writer queue for %s over %.0fs: %d writes, waited %.1fs, held %.1fs; "
+            "ingest writer queue for %s over %.0fs: %d writes, waited %.1fs, held %.1fs%s; "
             "by time held: %s",
             run.connector.name,
             window,
             sum(change[0] for change in moved.values()),
             sum(change[1] for change in moved.values()),
             sum(change[2] for change in moved.values()),
+            busy,
             "; ".join(
-                f"{name} {held:.1f}s/{calls} (waited {waited:.1f}s, max hold "
-                f"{longest.get(name, 0.0) * 1000:.0f}ms)"
+                f"{name} {held:.1f}s/{calls} (waited {waited:.1f}s, "
+                f"max wait {longest.get(name, (0.0, 0.0))[0] * 1000:.0f}ms, "
+                f"max hold {longest.get(name, (0.0, 0.0))[1] * 1000:.0f}ms)"
                 for name, (calls, waited, held) in ranked[:6]
             ),
         )

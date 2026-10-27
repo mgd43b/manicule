@@ -1112,7 +1112,8 @@ handling of one document found inside another, and `store_read` is the document 
 between stages (the member lookups, the container's member list). `loop_lag` is a sampler and
 not a visit: ten times a second a timer asks the event loop to wake it, and each call is one
 sample of how much later than asked it did, so its seconds are time that every worker spent
-waiting for the loop and that no other stage can see. What the stages still leave over is
+waiting for the loop and that no other stage can see. Each run
+samples for itself, so it is in a run's report and log and not in the pipeline's running totals. What the stages still leave over is
 **unmeasured**, not event-loop time: untimed code between awaits and anything not listed.
 
 **The writer queue has its own line.** Every managed write holds the engine's one writer slot
@@ -1120,7 +1121,10 @@ for the whole transaction, COMMIT included, and queues for it first, so a stage 
 cannot say whether its time was the write or the queue in front of it. The log carries, beside
 the stage line, `ingest writer queue for <connector> ...`: writes, seconds queued, seconds
 held, and per operation (named by the store method, never by a value) the time held, the time
-queued and the longest single hold in the window. If the sum held approaches the window, the
+queued and the longest single wait and hold in the window. Because a write is only counted
+when it ends, the line also says who holds the slot right now, for how long, and how many are
+queued behind it: a stall inside COMMIT shows there while nothing else is finishing. If the sum
+held approaches the window, the
 writer is the limit and the lines say which operations to batch; if it is a small share, the
 queue is not. A long maximum on a small total is the signature of a stall inside COMMIT, such as
 a checkpoint on a slow volume, which holds every waiter at once.
