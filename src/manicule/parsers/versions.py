@@ -208,6 +208,7 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # `<dl>` produces different characters, and a stored chunk of one is a rendering no parser
     # would produce today. Measured at 0 of 4 definitions found on a `<dl>` glossary before and
     # 4 of 4 after; the detector rule was correct throughout and had no input.
+    "calendar": ParserVersions(rules="1"),
     "confluence": ParserVersions(rules="5", distributions=("selectolax",)),
     "docx": ParserVersions(rules="1", distributions=("python-docx", "lxml")),
     # Its rules history is on `_EMAIL`, above, because `msg` is built from it.

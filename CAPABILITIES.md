@@ -330,7 +330,7 @@ name — an absence with no test is an absence that comes back.
   session count; change a role or disable/enable a membership; end every session a member holds.
   Admin-only. `docs/surfaces.md` §9.2.1.
 
-## File types — 18
+## File types — 19
 
 Ticket: #4
 
@@ -339,6 +339,7 @@ Ticket: #4
 - [ ] `.eml` (parser-email)
 - [ ] `.htm` (parser-html)
 - [ ] `.html` (parser-html)
+- [ ] `.ics` (core/calendar)
 - [ ] `.ipynb` (parser-jupyter)
 - [ ] `.json` (core/structured)
 - [ ] `.md` (core/markdown)

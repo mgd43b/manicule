@@ -184,6 +184,12 @@ CORPORA: dict[str, Corpus] = {
         required=("typical.eml", "multipart.eml", "html-only.eml"),
         min_blocks=10,
     ),
+    "calendar": Corpus(
+        directory="calendar",
+        media_types={".ics": "text/calendar"},
+        required=("invitation.ics", "multi.ics"),
+        min_blocks=4,
+    ),
     "plaintext": Corpus(
         directory="plaintext",
         # .bin is mapped deliberately: not-text.bin is a fixture that must be *declined*

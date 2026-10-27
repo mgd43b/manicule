@@ -171,6 +171,14 @@ PARSERS: tuple[_Registration, ...] = (
         summary="Line anchors within the canonical body part, headers included.",
     ),
     _Registration(
+        name="calendar",
+        module="manicule.parsers.calendar",
+        factory="CalendarParser",
+        config_model=parser_config.CalendarConfig,
+        media_types=parser_config.CALENDAR_MEDIA_TYPES,
+        summary="Events as searchable sentences, with line anchors into the composed text.",
+    ),
+    _Registration(
         name="plaintext",
         module="manicule.parsers.plaintext",
         factory="PlaintextParser",

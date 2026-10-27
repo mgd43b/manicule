@@ -2556,6 +2556,25 @@ mentions it, and an anchor into them would cite a table of IP addresses. They st
 `unsupported_media_type`, with no cost beyond the row, and a deployment that does want them can
 route `application/xml` to the plaintext parser under `parserFallbacks` (§6.2).
 
+### 10.4 Calendar invitations
+
+`text/calendar` (also `application/ics`, read as that type, and `.ics`) is parsed by
+`manicule.parsers.calendar.CalendarParser`. It follows the mail parser's design: the anchors
+address **one canonical text composed by the parser**, not the source file, and `resolve`
+rebuilds it from the bytes. A line anchor into the source would cite folded fragments of a
+property (`ATTENDEE;CN=...;PARTSTAT=...:mailto:...`), and the text it resolved to would not be
+what the reader sees.
+
+The canonical text is one stanza per `VEVENT`, `VTODO` or `VJOURNAL` — `Event:`/`Task:`/`Note:`
+with the summary, then `When:`, `Where:`, `Organizer:`, `Attendees:`, `Status:`, `Repeats:` and
+`Description:` where present — with a blank line between stanzas, so the paragraph rule of §4.5
+cuts at events. Lines are unfolded, `\n`, `\,`, `\;` and `\\` are unescaped, and a mailto
+address is shown with its common name. Times are printed as written (`TZID` as a suffix), never
+converted: a conversion needs the sender's zone definition, and a wrong one is worse than an
+honest zone name. Alarms and time-zone definitions are machinery and are not rendered. A stream
+with no `BEGIN:VCALENDAR` is declined, and one with more than `maxComponents` (5000) events is
+declined rather than truncated. Standard library only, so no dependency moves what is stored.
+
 **`.msg` is the one format whose obvious library is license-incompatible.** The maintained
 Python `.msg` parser, `extract-msg`, is GPL-3.0, which is disqualifying for an MIT project (§12).
 It is **not** the PyMuPDF case — GPL is not AGPL, and no network obligation follows — but a
