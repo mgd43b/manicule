@@ -153,3 +153,21 @@ async def test_the_parser_emits_no_blocks_and_satisfies_the_expansion_protocol(
 
     assert await read_blocks(parser, raw) == []
     assert isinstance(parser, SupportsExpansion)
+
+
+async def test_repeated_names_get_distinct_addresses_and_keep_their_type(
+    parser: CompressedParser,
+) -> None:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name in ("data.csv", "data.csv#1", "data.csv", "data.csv"):
+            info = tarfile.TarInfo(name)
+            info.size = 4
+            archive.addfile(info, io.BytesIO(b"a,b\n"))
+
+    outcomes = await read_members(parser, _raw(buffer.getvalue(), "x!/d.tar", "application/x-tar"))
+
+    members = [o for o in outcomes if isinstance(o, ExpandedMember)]
+    assert len({m.source_id for m in members}) == 4
+    assert members[0].raw.media_type == "text/csv"
+    assert members[2].raw.media_type == "text/csv", "a qualified address keeps the file's own type"

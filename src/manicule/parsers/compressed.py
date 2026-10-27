@@ -213,7 +213,7 @@ class CompressedParser:
                     reason = f"tar member could not be read ({exc})."
                     yield context.refusal(path, reason, DocumentStatus.FAILED)
                     continue
-                outcome = context.member(path, content)
+                outcome = context.member(path, content, name=info.name)
                 if isinstance(outcome, ExpandedMember):
                     context.used_bytes += len(content)
                 yield outcome
@@ -311,7 +311,7 @@ class _Context:
             metadata={"member_name": path},
         )
 
-    def member(self, path: str, content: bytes) -> MemberOutcome:
+    def member(self, path: str, content: bytes, *, name: str | None = None) -> MemberOutcome:
         digest = content_hash(content)
         if digest in self.hashes:
             return self.refusal(
@@ -334,7 +334,9 @@ class _Context:
             raw=RawDocument(
                 source_id=source_id,
                 uri=uri,
-                media_type=resolve_member_media_type(OCTET_STREAM, path, content),
+                # Read from the member's own name: the address may carry a `#n` qualifier that
+                # would turn `data.csv` into a suffix nobody recognizes.
+                media_type=resolve_member_media_type(OCTET_STREAM, name or path, content),
                 content=content,
                 metadata=metadata,
             ),
@@ -375,9 +377,15 @@ def _gunzipped_name(uri: str) -> str:
 
 
 def _unique(path: str, ordinal: int, seen: set[str]) -> str:
-    if path not in seen:
-        seen.add(path)
-        return path
-    qualified = f"{path}#{ordinal}"
-    seen.add(qualified)
-    return qualified
+    """``path``, qualified by its position if the name is taken, and never equal to another.
+
+    The qualified name is itself checked, because an archive can hold ``a.txt``, ``a.txt#2`` and
+    ``a.txt`` again, and two members sharing a ``source_id`` are one document in storage.
+    """
+    candidate = path
+    attempt = ordinal
+    while candidate in seen:
+        candidate = f"{path}#{attempt}"
+        attempt += 1
+    seen.add(candidate)
+    return candidate
