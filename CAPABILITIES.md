@@ -486,3 +486,9 @@ is a feature list entry, not a feature.
   other source, which reports counts only. An installation that holds a mailbox
   refuses to serve with authentication off (#462). `connector login` mints the
   refresh token (#461). `docs/connectors/gmail.md`.
+- Mail attachments are routed by what they are rather than what the sender's client called
+  them: a generic or legacy declaration (`application/octet-stream`, `application/msword` on a
+  `.docx`) yields to the filename extension, confirmed by the bytes, then to the bytes; declared
+  character sets are honored; a base64 `message/rfc822` and every block of a
+  `message/delivery-status` are read; and image, video and audio attachments are refused before
+  their bytes are retained. `docs/parsing.md` §6.1, §10.1-10.3 (#499, #500).

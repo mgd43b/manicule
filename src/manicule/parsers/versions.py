@@ -85,7 +85,7 @@ class ParserVersions:
     """PEP 503 canonical names of the libraries whose behavior decides text or anchors.
 
     Empty where a parser is built on the standard library alone. That is a real answer, not a
-    gap: ``adf`` reads JSON, ``archive`` reads zip and tar, ``plaintext`` splits lines, and
+    gap: ``adf`` reads JSON, ``archive`` reads zip, ``plaintext`` splits lines, and
     none of them can be moved by a dependency bump.
     """
 
@@ -120,7 +120,20 @@ class ParserVersions:
 # instead of two `- ` lines, so an HTML-only body holding a `<dl>` produces different
 # characters and every `LineAnchor` after that list addresses a different line. Confirmed by
 # parsing a message, not by reading the call graph.
-_EMAIL: Final = ParserVersions(rules="4", distributions=("selectolax",))
+#
+# 4 -> 5: which attachments become members, and what each one is routed as (#499). The
+# message's own text is unchanged — nothing here moves a `LineAnchor` — but the member set is
+# what this parser extracts from a message too, and it changed in several ways: an attachment the
+# sender labeled `application/msword`, `application/x-pdf` or `application/octet-stream` is
+# now routed by its name and bytes; a text member is transcoded to UTF-8 from its declared
+# character set; a `message/rfc822` sent in base64 and every block of a `message/delivery-status`
+# are now read; a `text/calendar` alternative is a member instead of being dropped; and image,
+# video and audio members are refused at expansion. A stored message re-expands only when it is
+# re-parsed, and its unsupported members have no `parse_fp` of their own to compare, so this
+# bump is the only thing that reaches them (`document reindex --stale`). `msg` follows through
+# `_EMAIL`.
+
+_EMAIL: Final = ParserVersions(rules="5", distributions=("selectolax",))
 """The ``email`` entry of :data:`PARSERS`, named because ``msg`` is built from it."""
 
 
@@ -132,7 +145,12 @@ PARSERS: Final[dict[str, ParserVersions]] = {
     # anything `_split_table` could use. See the shared note under `markdown` below for the
     # measurement and for why `email` does not move with these four.
     "adf": ParserVersions(rules="2"),
-    "archive": ParserVersions(rules="1"),
+    # 1 -> 2: the suffix table a member's media type is read from gained `.docx`, `.xlsx`, `.pptx`,
+    # `.log`, `.rst`, `.adoc`, `.mdx`, `.markdown`, `.sh`, `.ics`, `.gz`, `.tgz` and `.tar`. A
+    # `report.docx` inside a zip was `application/octet-stream` and so unsupported; it is now a
+    # Word document. The archive's own blocks (none) are unchanged, and the members it yields
+    # are what moved.
+    "archive": ParserVersions(rules="2"),
     # No distributions, and that is the whole point of the entry rather than a gap in it. An
     # `mxfile` is XML with a deflate stream inside it, so `base64`, `zlib` and `xml.etree` are
     # the reader — all standard library, all versioned with the interpreter, none of them a

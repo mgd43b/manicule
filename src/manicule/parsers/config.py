@@ -195,8 +195,20 @@ MAIL_MEDIA_TYPES = frozenset({"message/rfc822"})
 permissively-licensed libraries is specified in ``docs/parsing.md`` §10, and it is
 [#21](https://github.com/mgd43b/manicule/issues/21) rather than part of v1."""
 
-PLAINTEXT_MEDIA_TYPES = frozenset({"text/plain"})
-"""Declared narrowly. The global fallback tail routes by configuration, not by a parser
+PLAINTEXT_MEDIA_TYPES = frozenset(
+    {
+        "text/plain",
+        "message/delivery-status",
+        "message/global-delivery-status",
+        "message/disposition-notification",
+        "text/rfc822-headers",
+    }
+)
+"""The mail report types are header-field text (RFC 3464, RFC 8098) with no structure worth a
+parser of its own: a bounce is a handful of ``Field: value`` lines, and a line anchor into them
+is the finest address there is.
+
+Declared narrowly. The global fallback tail routes by configuration, not by a parser
 claiming every media type for itself — a parser that claimed ``*`` would win documents a real
 parser was installed to handle."""
 
