@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.16](https://github.com/mgd43b/manicule/compare/v0.2.15...v0.2.16) (2026-10-27)
+
+
+### Bug Fixes
+
+* **deps:** bump selectolax ([#496](https://github.com/mgd43b/manicule/issues/496)) ([8cca5ee](https://github.com/mgd43b/manicule/commit/8cca5ee37bb56cfdecbc879a5d85dea0db2f0585))
+
+
+### Performance Improvements
+
+* **ingest:** stop renewing the lease three times before each document is published ([#502](https://github.com/mgd43b/manicule/issues/502)) ([2fe22c7](https://github.com/mgd43b/manicule/commit/2fe22c7ea687ec6590f363abfa435c7bcccf058c))
+
 ## [0.2.15](https://github.com/mgd43b/manicule/compare/v0.2.14...v0.2.15) (2026-10-25)
 
 
