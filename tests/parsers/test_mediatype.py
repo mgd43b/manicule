@@ -20,6 +20,14 @@ XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 OLE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 512
 
 
+def _case_id(value: object) -> str | None:
+    """Deterministic ids: generated documents embed timestamps, and an id built from their bytes
+    differs between xdist workers, which refuses to run when workers collect different tests."""
+    if isinstance(value, bytes):
+        return "bytes"
+    return value if isinstance(value, str) else None
+
+
 def _zip(*names: str) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -50,6 +58,7 @@ def _zip(*names: str) -> bytes:
         (b"\x00\x01\x02\x03" * 100, OCTET_STREAM),
         (b"", OCTET_STREAM),
     ],
+    ids=_case_id,
 )
 def test_sniffing_names_only_what_the_bytes_establish(data: bytes, expected: str) -> None:
     assert sniff_media_type(data) == expected
@@ -83,6 +92,7 @@ def test_sniffing_names_only_what_the_bytes_establish(data: bytes, expected: str
         # Nothing established anything.
         (OCTET_STREAM, "blob.bin", b"\x00\x01" * 100, OCTET_STREAM),
     ],
+    ids=_case_id,
 )
 def test_resolution_order(declared: str, name: str, data: bytes, expected: str) -> None:
     assert resolve_member_media_type(declared, name, data) == expected
