@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.20](https://github.com/mgd43b/manicule/compare/v0.2.19...v0.2.20) (2026-10-28)
+
+
+### Features
+
+* **ingest:** time the writer queue, members, store reads and the event loop ([#517](https://github.com/mgd43b/manicule/issues/517)) ([3b63d76](https://github.com/mgd43b/manicule/commit/3b63d761eba5419508ec9cec9fba1d2f17c022a0))
+
 ## [0.2.19](https://github.com/mgd43b/manicule/compare/v0.2.18...v0.2.19) (2026-10-27)
 
 
