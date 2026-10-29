@@ -472,7 +472,7 @@ async def test_a_dry_run_counts_its_selection_rather_than_paging_it() -> None:
         offsets.append(kwargs.get("offset", 0))
         return await original(**kwargs)
 
-    store.select_documents = counting  # type: ignore[method-assign]
+    store.select_documents = counting
 
     planned = await plan_stale(store=store, parse_fingerprints=fingerprints("2"))
 
