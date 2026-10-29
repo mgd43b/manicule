@@ -3882,6 +3882,7 @@ class ApplicationService:
             # few would be dropped, leave the last yes standing, and report a broken store ready.
             _log.debug("readiness probe failed", exc_info=True)
             self._ready_answer = (False, time.monotonic())
+            self._ready_last_ok = None
             return
         now = time.monotonic()
         self._ready_answer = (True, now)
@@ -4038,12 +4039,19 @@ class ApplicationService:
             if remaining <= 0:
                 work.close()
                 return self._unfinished(names, "the diagnosis ran out of time before reaching it")
-            try:
-                outcome = await asyncio.wait_for(work, remaining)
-            except TimeoutError:
+            # `wait`, not `wait_for`: cancelling a check that is opening a SQLite connection
+            # waits for the open to finish (the pool does not let a cancellation interrupt
+            # one), so `wait_for` would hold the diagnosis past its own deadline. The late
+            # task is cancelled and left to finish on its own; nothing waits for it.
+            task = asyncio.ensure_future(work)
+            await asyncio.wait({task}, timeout=remaining)
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_discard_outcome)
                 return self._unfinished(
                     names, f"it did not finish within {remaining:.0f}s; the system may be busy"
                 )
+            outcome = task.result()
         return [outcome] if isinstance(outcome, r.Check) else list(outcome)
 
     @staticmethod
@@ -9554,6 +9562,12 @@ async def _documents_in(
 
 def _millis(started: float) -> int:
     return max(int((time.monotonic() - started) * 1000), 0)
+
+
+def _discard_outcome(task: asyncio.Future[Any]) -> None:
+    """Collect a late check's result or error so the loop does not warn about it."""
+    if not task.cancelled():
+        task.exception()
 
 
 def _severity(state: r.CheckState) -> int:

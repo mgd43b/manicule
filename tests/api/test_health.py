@@ -213,3 +213,24 @@ def test_an_unexpected_failure_is_unready_not_a_stale_yes(
     backend.store = BrokenStore(workspace_id=backend.settings.workspace)
     with client_for(backend) as client:
         assert client.get("/readyz").status_code == SERVER_ERROR
+
+
+def test_an_error_after_a_yes_withdraws_the_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed probe must not leave an old yes to be served when the next one stalls."""
+    _bounded_probe(monkeypatch)
+    backend, _ = backend_with_a_document()
+    store = HungStore(backend.settings.workspace)
+    backend.store = store
+    with client_for(backend) as client:
+        store.release.set()
+        assert client.get("/readyz").status_code == OK
+
+        async def fail() -> None:
+            msg = "gone"
+            raise ManiculeError(msg)
+
+        monkeypatch.setattr(store, "ping", fail)
+        assert client.get("/readyz").status_code == SERVER_ERROR
+        store.release.clear()
+        monkeypatch.setattr(store, "ping", HungStore.ping.__get__(store))
+        assert client.get("/readyz").status_code == SERVER_ERROR
