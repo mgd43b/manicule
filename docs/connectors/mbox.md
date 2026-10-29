@@ -6,9 +6,9 @@ Design for the `mbox` connector. Design ticket
 ([`gmail.md`](gmail.md), epic [#464](https://github.com/mgd43b/manicule/issues/464)), which this page
 reuses wherever the problem is the same.
 
-> **Status: design.** Nothing on this page is implemented yet. The build PR changes this banner to
-> a map from section to module, as `gmail.md` does, and edits whatever here the code turned out to
-> do differently.
+> **Status: implemented.** [#522](https://github.com/mgd43b/manicule/issues/522) is the
+> connector, with the code for each section named in §11. Where the build found the design wrong it
+> changed this page; the changes are the sniff's time-of-day test (§2) and the refreshed address (§4).
 
 A person with twenty years of mail has it in two places that no connector reads: **unix mbox
 files** (Thunderbird folders, Mutt and Pine archives, `fetchmail` spools, Apple Mail exports,
@@ -45,9 +45,10 @@ size for that contract in every dimension:
 So the unit the pipeline sees is the message, and the thing that turns a file into messages is a
 connector. **`type = "mbox"` walks a configured root, finds the mbox files, streams each one
 once, and yields one `message/rfc822` document per message.** It never holds a file, or a
-message it is not delivering, in memory. The cap on one message is the pipeline's own
-`ingest.max_fetch_bytes`, enforced on the message and not on the archive; the connector adds no
-second one.
+message it is not delivering, in memory. The cap on one message is `ingest.max_fetch_bytes`, enforced on the message and not on the
+archive. The pipeline checks it only after a fetch returns, so the connector is given the same
+value and refuses to read a message whose recorded length exceeds it (§5.2); a multi-gigabyte
+message is never loaded to be rejected.
 
 ```toml
 [connectors.oldmail]
@@ -81,16 +82,17 @@ as one mbox file and `exclude` has nothing to name.
 extension (`Inbox`, `Sent`, `Archives`), Mutt's are whatever the user called them, Apple Mail's
 Export Mailbox writes a `.mbox` *directory* with a file named `mbox` inside, and a Maildir
 neighbor of any of them is a directory of single messages that must not be mistaken for one. So a
-regular file is an mbox file when it begins with a `From ` line (§3) whose next line is a header
-field, `Name: value`. That test reads the first few hundred bytes and rejects:
+regular file is an mbox file when it begins with a `From ` line (§3) that carries a time of day
+(`09:14`, as every writer's envelope line does) and whose next line is a header field,
+`Name: value`. That test reads the first 4 KiB and rejects:
 
 - **`.msf`** (Thunderbird's summary file, a cache of what the mbox says, and a text format that
   starts with `// <!-- <mdb:mork`) and every other Thunderbird side file (`.dat`, `.json`). The
   `.sbd` directories are not files: they are *descended into* like any directory, since they are
   where subfolders live. `.msf` is also skipped by name before it is opened, so an archive of
   ten thousand folders costs ten thousand `stat`s and not ten thousand `open`s of cache files.
-- **Anything that merely contains the word "From".** A text file starting `From the desk of…`
-  has no header on its next line.
+- **Anything that merely starts with the word "From".** A text file starting `From the desk of…`
+  has no time of day on that line, and usually no header field on the next.
 - **An empty file or one under a few bytes.** Not an error; there is nothing in it.
 
 A file that fails the test is skipped silently, which is right for indexing and is the same
@@ -241,10 +243,11 @@ fragment says *which message* in a file of ten thousand, and it is the message's
 because an offset in a citation becomes a wrong citation the first time the file is compacted: the
 version token is constant, so an unchanged message is never fetched again and its stored address
 is never refreshed, and `#offset=N` would then name some other message. The hash fragment stays
-true under any rewrite. What can go stale is the *path*, after a rename or move of the file; the
-message itself is not lost, and the walk still finds it (§5.1). Whether a token-equal record
-refreshes the stored address is a pipeline behavior the build verifies and records here rather than
-assumes.
+true under any rewrite. The *path* is the part that can change, after a rename or move of the
+file, and it is refreshed: the pipeline stores the address discovery reports for an unchanged
+record, so the messages of a renamed file cite the new path after the next sync
+(`test_reordering_and_moving_a_message_between_files_keeps_its_document` pins it). The message
+is not lost, and a document keeps its tags and collections.
 
 **Citations inside a message are the mail parser's**: line anchors into the canonical header block
 and body, and `mail:<uri>!/name` members for attachments. They reach the pipeline
@@ -285,15 +288,23 @@ position first, with the same reasoning: seeing a message again costs a version 
 missing it costs the message. The watermark is the connector's `watermark` property, so it is
 only handed out after an enumeration that completed.
 
+**A file still being written is left for the next sync.** Taking the size first guarantees whole
+lines, not a whole message: a mail program can be partway through appending when the size is taken,
+and the unfinished final message would be hashed and indexed under an identity the completed
+message never has. So a file whose modification time is within the last 60 seconds is **skipped
+this sync and not recorded in the watermark**, and is read in full once it has been quiet for that
+long. The cost is that a live inbox is indexed a minute behind; the alternative is a partial copy
+that stays until reconciliation.
+
 | What happens to the archive | Discovery | Then |
 |---|---|---|
 | Nothing | Every file skipped by `stat`. No messages yielded | Free |
 | A file is **appended to** (a live Inbox) | The file's token differs, so it is scanned from the top. Every message is yielded again, but each unchanged one carries the constant token and the pipeline skips it, so the cost is one sequential read of that file and a journal record per message, and not a re-index | The new messages are indexed. A tail-only re-scan (resume where the last scan ended, once the bytes before it were checked) would make this proportional to what was added; it is not built, because it needs a stored digest of the prefix to be safe and an archive that is appended to is the exception |
 | A file is **rewritten** (compaction, an expunge, a restore) | Same: rescanned | A message that is no longer in any file leaves through reconciliation (§5.4) |
 | A file is **touched** (restored from a backup, copied without preserving times) | Rescanned; nothing is new | Nothing changes in the index |
-| A file is **renamed or moved** | Its entry is absent under the new path, so it is scanned; its messages' identities are unchanged | The documents stay. Their stored path is the old one until the pipeline refreshes an unchanged record's address (§4) |
+| A file is **renamed or moved** | Its entry is absent under the new path, so it is scanned; its messages' identities are unchanged | The documents stay, and their stored address is refreshed to the new path (§4) |
 | A file is **removed** | Nothing at discovery: an absence is invisible to an incremental sync | Reconciliation (§5.4) |
-| A file is **unreadable** (permissions, I/O error) | The error is logged by file *index*, not name, the file is not in the watermark, and the walk continues | It is tried again next sync. The run finishes; an enumeration that skipped a file never writes a watermark that claims the file was read |
+| A file or directory is **unreadable** (permissions, I/O error) | In an **incremental** walk the count is logged (never a name), the file is not in the watermark, and the walk continues. In a **full** walk (no usable watermark) the walk **fails**, because a full walk is recorded as the whole inventory and a rebuild retires documents it omits | The file is tried again next sync. Fix the permissions or `exclude` it; a full walk never completes over an archive it could not read |
 | The **root vanishes** | Discovery yields nothing and **raises**; a vanished root is not an empty archive | |
 
 **The scope is in the fingerprint.** The pipeline reuses a stored watermark only under the scope
@@ -335,9 +346,11 @@ or finds it gone. The cost of a file being rewritten mid-run is therefore one ex
 of the files that changed. A message is never indexed from bytes that are not the bytes its
 identity names.
 
-`fetch` reads only the message, so a 3 GB file costs one message's worth of memory per fetch, and
-the `size_bytes` it declared lets the pipeline's `ingest.max_fetch_bytes` refuse a message that is
-itself too large without reading it.
+`fetch` reads only the message, so a 3 GB file costs one message's worth of memory per fetch. The
+pipeline compares a fetched message with `ingest.max_fetch_bytes` only after `fetch` returns, so it
+cannot protect memory by itself: the connector is constructed with that same limit and raises
+before reading when the span it was given is longer. The message then fails alone, as an oversized
+file does for the filesystem connector.
 
 ### 5.3 Duplicates inside one run
 
@@ -624,17 +637,17 @@ writes every message in the clear, and deleting the PST does not delete them.
 
 ---
 
-## 11. Where this will be implemented
+## 11. Where this is implemented
 
 | Part | Module |
 |---|---|
-| Configuration, scope fingerprint | `manicule/connectors/config.py` (`MboxConfig`) |
-| The reader, canonicalization, identity | `manicule/connectors/mbox_reader.py` |
-| The connector: walk, watermark, discover, fetch, reconcile | `manicule/connectors/mbox.py` |
-| Registration (sensitive) | `manicule/connectors/plugin.py` |
-| Sensitive by content | `manicule/app/sensitive.py` |
-| The Message-ID read | `manicule/storage/docstore.py` (a streaming method beside `known_source_ids`) |
-| Fixture generator | `tests/connectors/mbox_support.py` |
-| Tests | `tests/connectors/test_mbox_*.py` |
-
-The build PR replaces this table with the real one and moves the status banner.
+| Configuration, scope fingerprint (§1, §5.1) | `manicule/connectors/config.py` (`MboxConfig`) |
+| The reader: separators, `Content-Length`, quoting, canonical bytes, identity (§2–§4) | `manicule/connectors/mbox_reader.py` |
+| The connector: walk, watermark, `discover`, `fetch`, `reconcile` (§5, §6) | `manicule/connectors/mbox.py` |
+| The `Message-ID` normalization and the Gmail link (§4, §6) | `manicule/core/mail_ids.py` |
+| The streaming read of other sources' ids (§6) | `manicule/storage/docstore.py` (`known_mail_message_ids`), `MailMessageIdIndex` in `manicule/core/protocols.py` |
+| Registration, as a sensitive type (§7) | `manicule/connectors/plugin.py` (`build_mbox`) |
+| Sensitive by content (§7) | `manicule/app/sensitive.py` (`mail_sources`), `manicule/app/bind.py` |
+| The shared exclude matching (§2) | `manicule/connectors/globs.py` (`covers`), used by the filesystem connector too |
+| Fixture generator (§8) | `tests/connectors/mbox_support.py` |
+| Tests (§8) | `tests/connectors/test_mbox_reader.py`, `test_mbox_pipeline.py`, `test_mbox_factory.py`; `tests/app/test_sensitive_sources.py` |
