@@ -193,6 +193,7 @@ class MemoryIngestStore:
 
         self.originals: dict[str, tuple[str | None, str | None]] = {}
         self.seen: dict[str, int] = {}
+        self.rows_read = 0
         self.deleted_at: dict[str, datetime] = {}
         self.updated_at: dict[str, datetime] = {}
         self.watermarks: dict[str, Watermark] = {}
@@ -510,6 +511,7 @@ class MemoryIngestStore:
         relation_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> Sequence[Document]:
         chosen = [
             self._with_lineage(d) for d in self.documents.values() if d.id not in self.deleted_at
@@ -545,10 +547,29 @@ class MemoryIngestStore:
             chosen = [
                 d for d in chosen if self.relation_lineage_by_id.get(d.id) != relation_fp_other_than
             ]
+        if after is not None:
+            # Insertion order stands in for `(created_at, id)`: a row the store re-creates is a
+            # new row at the end, exactly as a dict re-insertion after a pop is.
+            placed = {d.id: n for n, d in enumerate(self.documents.values())}
+            chosen = [d for d in chosen if (self._position(placed[d.id]), d.id) > after]
         # Sliced after every predicate, in that order, because the store applies `OFFSET` to the
         # filtered result and a fake that skipped first would page through a different set.
         chosen = chosen[offset:]
-        return chosen[:limit] if limit is not None else chosen
+        page = chosen[:limit] if limit is not None else chosen
+        # What a real store reads to answer this: it counts past `offset` rows to start, whereas
+        # `after` is a seek and reads only what it returns. The sweeps' cost is asserted on this.
+        self.rows_read += offset + len(page)
+        return page
+
+    @staticmethod
+    def _position(index: int) -> datetime:
+        return datetime(2000, 1, 1, tzinfo=UTC) + timedelta(seconds=index)
+
+    async def selection_cursor(self, document_id: str) -> tuple[datetime, str] | None:
+        for index, known in enumerate(self.documents):
+            if known == document_id:
+                return (self._position(index), document_id)
+        return None
 
     # sync state
 

@@ -1211,6 +1211,7 @@ class SqliteDocStore(
         relation_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> Sequence[Document]:
         """The selection a repair verb runs over. A query, never a scan.
 
@@ -1245,6 +1246,11 @@ class SqliteDocStore(
         mean anything: ``created_at`` alone is not unique, so two documents written in the same
         millisecond could swap places between pages and one of them would never be returned.
         The id breaks the tie, so the order is total and stable across calls.
+
+        ``after`` is the same cursor without the counting: documents strictly past a
+        ``(created_at, id)`` position, found by seeking ``ix_documents_workspace_id_created_at_id``
+        rather than by reading and discarding ``offset`` rows. Use it for a sweep over a corpus
+        too large for the offset to be cheap, which :meth:`selection_cursor` supplies.
         """
         statement = (
             select(models.Document)
@@ -1274,6 +1280,12 @@ class SqliteDocStore(
             statement = statement.where(_glossary_is_not(glossary_fp_other_than))
         if relation_fp_other_than is not None:
             statement = statement.where(_relation_is_not(relation_fp_other_than))
+        if after is not None:
+            position_at, position_id = after
+            statement = statement.where(
+                (models.Document.created_at > position_at)
+                | ((models.Document.created_at == position_at) & (models.Document.id > position_id))
+            )
         if limit is not None:
             statement = statement.limit(limit)
         if offset:
@@ -1281,6 +1293,20 @@ class SqliteDocStore(
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
             return [to_document(row) for row in rows]
+
+    async def selection_cursor(self, document_id: str) -> tuple[datetime, str] | None:
+        """Where a document sits in :meth:`select_documents`' order, or ``None`` if it is gone.
+
+        Soft-deleted rows still have a position: it is the row, not its visibility, that the
+        order is made of.
+        """
+        statement = select(models.Document.created_at).where(
+            models.Document.workspace_id == self._workspace_id,
+            models.Document.id == document_id,
+        )
+        async with self._sessions() as session:
+            created_at = (await session.execute(statement)).scalar_one_or_none()
+        return None if created_at is None else (created_at, document_id)
 
     # --- index state ------------------------------------------------------------------------
 
