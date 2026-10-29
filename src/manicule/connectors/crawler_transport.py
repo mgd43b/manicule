@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 
@@ -514,10 +514,38 @@ def _parse_robots(body: bytes) -> _RobotsRules:
         raise CrawlerRobotsError("crawler robots policy is not valid UTF-8") from exc
     parser = RobotFileParser()
     parser.parse(text.splitlines())
+    _most_specific_rule_first(parser)
     return _RobotsRules(
         parser=parser,
         crawl_delay_s=_robots_crawl_delay(text, CRAWLER_USER_AGENT),
     )
+
+
+class _RuleLine(Protocol):
+    path: str
+    allowance: bool
+
+
+def _rule_precedence(rule: _RuleLine) -> tuple[int, bool]:
+    return (-len(rule.path), not rule.allowance)
+
+
+def _most_specific_rule_first(parser: RobotFileParser) -> None:
+    """Make the stdlib parser decide by longest match, whatever its version does.
+
+    RFC 9309 says the most specific (longest) matching rule wins, and an ``Allow`` beats a
+    ``Disallow`` of the same length. ``RobotFileParser`` before CPython 3.14.10 answers with the
+    first rule that matches in file order, so ``Disallow: /docs/`` listed before
+    ``Allow: /docs/public`` refused a page the file allows. Sorting each group's rules into that
+    order makes first-match equal to longest-match, and is a no-op on a version that already
+    does the right thing.
+    """
+    # `entries` and `default_entry` are not in typeshed, but have been public attributes of the
+    # parser since it was written.
+    state: Any = parser
+    groups: list[Any] = [*state.entries, *([state.default_entry] if state.default_entry else [])]
+    for group in groups:
+        group.rulelines.sort(key=_rule_precedence)
 
 
 def _allow_all_robots() -> _RobotsRules:
