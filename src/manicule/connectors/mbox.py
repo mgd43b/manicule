@@ -355,9 +355,7 @@ class MboxConnector:
         try:
             while True:
                 try:
-                    batch = await asyncio.to_thread(
-                        lambda: list(itertools.islice(stream, MAX_DISCOVERY_BATCH))
-                    )
+                    batch = await _pull(stream)
                 except OSError:
                     # A full walk is recorded as the whole inventory, so one that could not read
                     # part of the archive must not complete (§5.1). No path in the message.
@@ -538,13 +536,27 @@ class MboxConnector:
         seen = _KeySet(self._cache_dir)
         stream = self._messages(seen, previous=None, current=None, strict=True)
         try:
-            while batch := await asyncio.to_thread(
-                lambda: list(itertools.islice(stream, MAX_DISCOVERY_BATCH))
-            ):
+            while batch := await _pull(stream):
                 yield [candidate.located.digest for candidate in batch]
         finally:
             stream.close()
             seen.close()
+
+
+async def _pull(stream: Iterator[_Candidate]) -> list[_Candidate]:
+    """The next batch of a walk, read in a worker thread.
+
+    If this task is canceled the worker is waited for before the cancellation propagates, so the
+    caller's cleanup never closes a generator or a database a thread is still using.
+    """
+    work = asyncio.ensure_future(
+        asyncio.to_thread(lambda: list(itertools.islice(stream, MAX_DISCOVERY_BATCH)))
+    )
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        await asyncio.wait({work})
+        raise
 
 
 def _summarize(content: bytes) -> tuple[str, datetime | None, str | None]:

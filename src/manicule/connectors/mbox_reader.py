@@ -227,7 +227,10 @@ class _Facts:
         raw = self.values.get(b"content-length")
         if raw is None or not raw.isdigit():
             return None
-        return int(raw)
+        try:
+            return int(raw)
+        except ValueError:  # more digits than the interpreter will convert
+            return None
 
     @property
     def dropped(self) -> bool:
@@ -350,6 +353,14 @@ def _read_message(lines: _Lines, *, collect: bool) -> _Message:
     return _Message(separator.offset, head.offset if head else lines.position, canonical, facts)
 
 
+def _starts_message(data: bytes) -> bool:
+    """Whether ``data`` begins with a complete separator: ``From ``, then a header field."""
+    first, newline, following = data.partition(b"\n")
+    return (
+        first.startswith(b"From ") and bool(newline) and _HEADER_LIKE.match(following) is not None
+    )
+
+
 def _body_by_length(lines: _Lines, canonical: _Canonical, length: int) -> bool:
     """Read ``length`` bytes of body if that lands on a message boundary (``mbox.md`` §3.2).
 
@@ -361,10 +372,10 @@ def _body_by_length(lines: _Lines, canonical: _Canonical, length: int) -> bool:
     end = start + length
     if end > lines.limit:
         return False
-    after = lines.raw_at(end, 8)
+    after = lines.raw_at(end, _SNIFF_BYTES)
     blank = 2 if after[:2] == b"\r\n" else 1 if after[:1] == b"\n" else 0
     rest = after[blank:]
-    if rest and not rest.startswith(b"From "):
+    if rest and not _starts_message(rest):
         return False
     limit = lines.limit
     lines.limit = end

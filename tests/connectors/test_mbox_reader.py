@@ -246,3 +246,31 @@ def test_a_very_long_line_is_read_in_fragments_and_cannot_start_a_message(tmp_pa
     )
     # The fake separator sits in the middle of a long line's second fragment, not at a line start.
     assert len(scanned(path)) == 1
+
+
+def test_a_content_length_before_a_paragraph_that_starts_with_from_is_not_believed(
+    tmp_path: Path,
+) -> None:
+    """A stale length landing on prose that begins ``From `` must not end the message there."""
+    body = "Line one.\n\nFrom the desk of nobody\nand the rest of the paragraph.\n"
+    raw = write_mbox(tmp_path / "box", [message(1, body=body)], Filing(dialect="mboxcl"))
+    # Make the length land exactly before "From the desk": 11 bytes of "Line one.\n\n".
+    stale = re.sub(rb"Content-Length: \d+", b"Content-Length: 11", raw.read_bytes())
+    path = tmp_path / "stale"
+    path.write_bytes(stale)
+    (located,) = scanned(path)
+    content = reader.read(path, located.offset, located.length, located.digest)
+    assert b"and the rest of the paragraph." in content
+
+
+def test_an_absurdly_long_content_length_is_unusable_rather_than_fatal(tmp_path: Path) -> None:
+    path = tmp_path / "box"
+    path.write_bytes(
+        SEPARATOR
+        + b"\nContent-Length: "
+        + b"9" * 5000
+        + b"\nSubject: x\n\nbody\n\n"
+        + SEPARATOR
+        + b"\nSubject: y\n\nbody\n"
+    )
+    assert len(scanned(path)) == 2
