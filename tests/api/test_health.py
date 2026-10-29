@@ -12,8 +12,11 @@ be wrong.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import TYPE_CHECKING, override
 
+from manicule.app import service as service_module
 from manicule.core.errors import ManiculeError
 from tests.api.support import backend_with_a_document, client_for
 from tests.app.fakes import FakeStore
@@ -21,10 +24,14 @@ from tests.app.fakes import FakeStore
 if TYPE_CHECKING:
     from collections.abc import Collection
 
+    import pytest
+
     from manicule.core.content import DocumentStatus
 
 OK = 200
 SERVER_ERROR = 500
+PROBE_CEILING = 1.5
+"""Seconds. Far above the 0.2 the tests configure and far below a stall that never ends."""
 
 
 class UnreachableStore(FakeStore):
@@ -33,6 +40,11 @@ class UnreachableStore(FakeStore):
     What a locked database, a missing file or a half-applied migration looks like from the
     surface: the process is fine and the store is not.
     """
+
+    @override
+    async def ping(self) -> None:
+        msg = "database is locked"
+        raise ManiculeError(msg)
 
     @override
     async def count_documents(
@@ -109,3 +121,76 @@ def test_the_probes_answer_without_an_envelope() -> None:
         for path in ("/healthz", "/readyz"):
             body: dict[str, object] = client.get(path).json()
             assert set(body) == {"status"}
+
+
+# --- a busy process -------------------------------------------------------------------------
+
+
+class HungStore(FakeStore):
+    """A store whose probe never returns until released. **Deliberately stalled.**"""
+
+    def __init__(self, workspace_id: str) -> None:
+        super().__init__(workspace_id=workspace_id)
+        self.release = asyncio.Event()
+        self.probes = 0
+
+    @override
+    async def ping(self) -> None:
+        self.probes += 1
+        await self.release.wait()
+
+
+def _bounded_probe(monkeypatch: pytest.MonkeyPatch, seconds: float = 0.2) -> None:
+    monkeypatch.setattr(service_module, "READY_PROBE_SECONDS", seconds)
+    monkeypatch.setattr(service_module, "READY_REUSE_SECONDS", 0.0)
+
+
+def test_readiness_answers_within_a_bound_while_the_store_is_stalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store that never replies must not hold the probe: it answers, and answers *unready*.
+
+    Nothing has ever been seen ready here, so there is no earlier yes to fall back on.
+    """
+    _bounded_probe(monkeypatch)
+    backend, _ = backend_with_a_document()
+    backend.store = HungStore(backend.settings.workspace)
+    with client_for(backend) as client:
+        started = time.monotonic()
+        response = client.get("/readyz")
+        elapsed = time.monotonic() - started
+    assert response.status_code == SERVER_ERROR
+    assert elapsed < PROBE_CEILING
+
+
+def test_a_stalled_store_that_was_ready_recently_is_still_reported_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slow is not down: a busy store keeps its last yes for the grace, then loses it."""
+    _bounded_probe(monkeypatch)
+    backend, _ = backend_with_a_document()
+    store = HungStore(backend.settings.workspace)
+    backend.store = store
+    with client_for(backend) as client:
+        store.release.set()
+        assert client.get("/readyz").status_code == OK
+        store.release.clear()
+        started = time.monotonic()
+        busy = client.get("/readyz")
+        elapsed = time.monotonic() - started
+        assert busy.status_code == OK
+        assert elapsed < PROBE_CEILING
+        monkeypatch.setattr(service_module, "READY_STALE_GRACE_SECONDS", 0.0)
+        assert client.get("/readyz").status_code == SERVER_ERROR
+
+
+def test_concurrent_probes_share_one_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stalled store must not collect a connection per probe the orchestrator sends."""
+    _bounded_probe(monkeypatch, seconds=0.3)
+    backend, _ = backend_with_a_document()
+    store = HungStore(backend.settings.workspace)
+    backend.store = store
+    with client_for(backend) as client:
+        for _ in range(3):
+            client.get("/readyz")
+    assert store.probes == 1
