@@ -304,11 +304,7 @@ that stays until reconciliation.
 | A file is **touched** (restored from a backup, copied without preserving times) | Rescanned; nothing is new | Nothing changes in the index |
 | A file is **renamed or moved** | Its entry is absent under the new path, so it is scanned; its messages' identities are unchanged | The documents stay, and their stored address is refreshed to the new path (§4) |
 | A file is **removed** | Nothing at discovery: an absence is invisible to an incremental sync | Reconciliation (§5.4) |
-<<<<<<< HEAD
-| A file is **unreadable** (permissions, I/O error) | The count of unreadable files is logged (never a name), the file is not in the watermark, and the walk continues | It is tried again next sync. The run finishes; an enumeration that skipped a file never writes a watermark that claims the file was read |
-=======
 | A file or directory is **unreadable** (permissions, I/O error) | In an **incremental** walk the count is logged (never a name), the file is not in the watermark, and the walk continues. In a **full** walk (no usable watermark) the walk **fails**, because a full walk is recorded as the whole inventory and a rebuild retires documents it omits | The file is tried again next sync. Fix the permissions or `exclude` it; a full walk never completes over an archive it could not read |
->>>>>>> origin/mbox-design
 | The **root vanishes** | Discovery yields nothing and **raises**; a vanished root is not an empty archive | |
 
 **The scope is in the fingerprint.** The pipeline reuses a stored watermark only under the scope
