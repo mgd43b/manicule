@@ -3877,7 +3877,10 @@ class ApplicationService:
         try:
             store = await self._backend.documents()
             await store.ping()
-        except (ManiculeError, ValueError, OSError, SQLAlchemyError):
+        except Exception:  # noqa: BLE001 - whatever stopped the store opening means not ready
+            # Broad because this runs as a task nobody awaits: an exception outside the usual
+            # few would be dropped, leave the last yes standing, and report a broken store ready.
+            logger.debug("readiness probe failed", exc_info=True)
             self._ready_answer = (False, time.monotonic())
             return
         now = time.monotonic()

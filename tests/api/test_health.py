@@ -194,3 +194,22 @@ def test_concurrent_probes_share_one_query(monkeypatch: pytest.MonkeyPatch) -> N
         for _ in range(3):
             client.get("/readyz")
     assert store.probes == 1
+
+
+class BrokenStore(FakeStore):
+    """A store that fails in a way no handler lists. **Deliberately broken.**"""
+
+    @override
+    async def ping(self) -> None:
+        msg = "unexpected"
+        raise RuntimeError(msg)
+
+
+def test_an_unexpected_failure_is_unready_not_a_stale_yes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bounded_probe(monkeypatch)
+    backend, _ = backend_with_a_document()
+    backend.store = BrokenStore(workspace_id=backend.settings.workspace)
+    with client_for(backend) as client:
+        assert client.get("/readyz").status_code == SERVER_ERROR
