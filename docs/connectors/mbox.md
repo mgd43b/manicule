@@ -45,9 +45,10 @@ size for that contract in every dimension:
 So the unit the pipeline sees is the message, and the thing that turns a file into messages is a
 connector. **`type = "mbox"` walks a configured root, finds the mbox files, streams each one
 once, and yields one `message/rfc822` document per message.** It never holds a file, or a
-message it is not delivering, in memory. The cap on one message is the pipeline's own
-`ingest.max_fetch_bytes`, enforced on the message and not on the archive; the connector adds no
-second one.
+message it is not delivering, in memory. The cap on one message is `ingest.max_fetch_bytes`, enforced on the message and not on the
+archive. The pipeline checks it only after a fetch returns, so the connector is given the same
+value and refuses to read a message whose recorded length exceeds it (§5.2); a multi-gigabyte
+message is never loaded to be rejected.
 
 ```toml
 [connectors.oldmail]
@@ -287,6 +288,14 @@ position first, with the same reasoning: seeing a message again costs a version 
 missing it costs the message. The watermark is the connector's `watermark` property, so it is
 only handed out after an enumeration that completed.
 
+**A file still being written is left for the next sync.** Taking the size first guarantees whole
+lines, not a whole message: a mail program can be partway through appending when the size is taken,
+and the unfinished final message would be hashed and indexed under an identity the completed
+message never has. So a file whose modification time is within the last 60 seconds is **skipped
+this sync and not recorded in the watermark**, and is read in full once it has been quiet for that
+long. The cost is that a live inbox is indexed a minute behind; the alternative is a partial copy
+that stays until reconciliation.
+
 | What happens to the archive | Discovery | Then |
 |---|---|---|
 | Nothing | Every file skipped by `stat`. No messages yielded | Free |
@@ -295,7 +304,11 @@ only handed out after an enumeration that completed.
 | A file is **touched** (restored from a backup, copied without preserving times) | Rescanned; nothing is new | Nothing changes in the index |
 | A file is **renamed or moved** | Its entry is absent under the new path, so it is scanned; its messages' identities are unchanged | The documents stay, and their stored address is refreshed to the new path (§4) |
 | A file is **removed** | Nothing at discovery: an absence is invisible to an incremental sync | Reconciliation (§5.4) |
+<<<<<<< HEAD
 | A file is **unreadable** (permissions, I/O error) | The count of unreadable files is logged (never a name), the file is not in the watermark, and the walk continues | It is tried again next sync. The run finishes; an enumeration that skipped a file never writes a watermark that claims the file was read |
+=======
+| A file or directory is **unreadable** (permissions, I/O error) | In an **incremental** walk the count is logged (never a name), the file is not in the watermark, and the walk continues. In a **full** walk (no usable watermark) the walk **fails**, because a full walk is recorded as the whole inventory and a rebuild retires documents it omits | The file is tried again next sync. Fix the permissions or `exclude` it; a full walk never completes over an archive it could not read |
+>>>>>>> origin/mbox-design
 | The **root vanishes** | Discovery yields nothing and **raises**; a vanished root is not an empty archive | |
 
 **The scope is in the fingerprint.** The pipeline reuses a stored watermark only under the scope
@@ -337,9 +350,11 @@ or finds it gone. The cost of a file being rewritten mid-run is therefore one ex
 of the files that changed. A message is never indexed from bytes that are not the bytes its
 identity names.
 
-`fetch` reads only the message, so a 3 GB file costs one message's worth of memory per fetch, and
-the `size_bytes` it declared lets the pipeline's `ingest.max_fetch_bytes` refuse a message that is
-itself too large without reading it.
+`fetch` reads only the message, so a 3 GB file costs one message's worth of memory per fetch. The
+pipeline compares a fetched message with `ingest.max_fetch_bytes` only after `fetch` returns, so it
+cannot protect memory by itself: the connector is constructed with that same limit and raises
+before reading when the span it was given is longer. The message then fails alone, as an oversized
+file does for the filesystem connector.
 
 ### 5.3 Duplicates inside one run
 
