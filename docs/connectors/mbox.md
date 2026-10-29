@@ -7,8 +7,8 @@ Design for the `mbox` connector. Design ticket
 reuses wherever the problem is the same.
 
 > **Status: implemented.** [#522](https://github.com/mgd43b/manicule/issues/522) is the
-> connector, with the code for each section named in §11. Where the build found the design wrong it
-> changed this page; the changes are the sniff's time-of-day test (§2) and the refreshed address (§4).
+> connector, with the code for each section named in §11. Where the build or its review found the
+> design wrong, the section it touches was changed to say what the code does.
 
 A person with twenty years of mail has it in two places that no connector reads: **unix mbox
 files** (Thunderbird folders, Mutt and Pine archives, `fetchmail` spools, Apple Mail exports,
