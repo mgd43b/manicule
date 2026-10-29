@@ -3877,7 +3877,7 @@ class ApplicationService:
         try:
             store = await self._backend.documents()
             await store.ping()
-        except Exception:
+        except Exception:  # noqa: BLE001 - any failure to open the store means not ready
             # Broad because this runs as a task nobody awaits: an exception outside the usual
             # few would be dropped, leave the last yes standing, and report a broken store ready.
             _log.debug("readiness probe failed", exc_info=True)
