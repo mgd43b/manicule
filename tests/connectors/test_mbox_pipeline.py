@@ -362,13 +362,42 @@ async def test_a_file_still_being_written_is_left_for_the_next_sync(harness: Har
             clock=lambda: now[0],
         )
 
+    old = write_mbox(harness.root / "Old", messages(1, start=50))
+    os.utime(old, (now[0] - 3_600, now[0] - 3_600))
+    await harness.sync(connector())
+    assert len(await harness.live()) == 1
+
     path = write_mbox(harness.root / "Inbox", messages(2))
     os.utime(path, (now[0] - 5, now[0] - 5))
     await harness.sync(connector())
-    assert await harness.live() == {}, "modified five seconds ago"
+    assert len(await harness.live()) == 1, "modified five seconds ago"
 
     now[0] += 120
     await harness.sync(connector())
+    assert len(await harness.live()) == 3
+
+
+async def test_a_full_walk_will_not_stand_for_the_archive_while_a_file_is_being_written(
+    harness: Harness,
+) -> None:
+    path = write_mbox(harness.root / "Inbox", messages(2))
+    now = path.stat().st_mtime + 5
+    connector = MboxConnector(MboxConfig(root=str(harness.root)), name=NAME, clock=lambda: now)
+    with pytest.raises(ConnectorError, match="modified within"):
+        _ = [batch async for batch in connector.discover_batches(None)]
+
+
+async def test_a_file_dated_in_the_future_is_still_read(harness: Harness) -> None:
+    path = write_mbox(harness.root / "Inbox", messages(2))
+    ahead = path.stat().st_mtime + 86_400
+    os.utime(path, (ahead, ahead))
+    connector = MboxConnector(
+        MboxConfig(root=str(harness.root)),
+        name=NAME,
+        store=harness.store,
+        cache_dir=harness.data_dir / "cache",
+    )
+    await harness.sync(connector)
     assert len(await harness.live()) == 2
 
 

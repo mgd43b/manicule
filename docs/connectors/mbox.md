@@ -294,7 +294,9 @@ and the unfinished final message would be hashed and indexed under an identity t
 message never has. So a file whose modification time is within the last 60 seconds is **skipped
 this sync and not recorded in the watermark**, and is read in full once it has been quiet for that
 long. The cost is that a live inbox is indexed a minute behind; the alternative is a partial copy
-that stays until reconciliation.
+that stays until reconciliation. A **full** walk, which is recorded as the whole inventory, does not skip: it fails
+with a request to try again shortly, as it does for an unreadable file. A modification time in the
+future is not recent, so a file restored from a backup is read.
 
 | What happens to the archive | Discovery | Then |
 |---|---|---|

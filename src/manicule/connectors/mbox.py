@@ -254,6 +254,7 @@ class MboxConnector:
         except OSError:
             if strict:
                 raise
+            _log.warning("mbox %s: a directory could not be listed and was skipped", self.name)
             return
         for entry in entries:
             if not self._config.include_hidden and entry.name.startswith("."):
@@ -297,9 +298,17 @@ class MboxConnector:
                     if current is not None:
                         current[key] = token
                     continue
-                if settle and self._clock() - status.st_mtime < settle:
-                    continue
                 if not mbox_reader.is_mbox(path):
+                    continue
+                if settle and 0 <= self._clock() - status.st_mtime < settle:
+                    # A future modification time is not "recent": it would never settle.
+                    if strict:
+                        msg = (
+                            f"a file under the root was modified within the last {settle:g} "
+                            f"seconds, so this walk cannot yet stand for the whole archive. "
+                            f"Try again shortly"
+                        )
+                        raise ConnectorError(msg)
                     continue
                 for located in mbox_reader.scan(path, status.st_size):
                     if seen.add(bytes.fromhex(located.digest)):
