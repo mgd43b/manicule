@@ -233,15 +233,18 @@ Within one source, then, a message that appears in several files is **one docume
 and the locator that fetch uses (below) are those of the first file in walk order that holds it.
 Discovery yields each identity once per run (§5.3).
 
-**`uri` is `file://` + the absolute path (percent-encoded) + `#offset=<n>`**, where `n` is the
-byte offset of the message's separator line in that file. A `file:` URI is what a person (or the
-pipeline's other local-file sources) can resolve; the fragment is the locator that says *which
-message*, and the offset is chosen over an ordinal because it is what lets `fetch` seek straight
-to the message, and over nothing at all because a file of ten thousand messages cited as one path
-would not say which. Neither is part of the identity: moving a file, or compaction that shifts a
-message, changes the locator and leaves the document. The consequence is that a citation of a
-message that has since moved names where it *was* when it was indexed; the message is not lost,
-and a re-sync after the document changes refreshes it (§5.2).
+**`uri` is `file://` + the absolute path (percent-encoded) of the first file in walk order that
+holds the message + `#sha256=<source_id>`.** A `file:` URI is what a person can resolve; the
+fragment says *which message* in a file of ten thousand, and it is the message's identity, so it
+**cannot point at a different message than the one indexed**. The byte offset and length that
+`fetch` seeks to are deliberately **not** in it. They travel only in `DocRef.metadata` (§5.2),
+because an offset in a citation becomes a wrong citation the first time the file is compacted: the
+version token is constant, so an unchanged message is never fetched again and its stored address
+is never refreshed, and `#offset=N` would then name some other message. The hash fragment stays
+true under any rewrite. What can go stale is the *path*, after a rename or move of the file; the
+message itself is not lost, and the walk still finds it (§5.1). Whether a token-equal record
+refreshes the stored address is a pipeline behavior the build verifies and records here rather than
+assumes.
 
 **Citations inside a message are the mail parser's**: line anchors into the canonical header block
 and body, and `mail:<uri>!/name` members for attachments. They reach the pipeline
@@ -255,9 +258,6 @@ locator, as `gmail.md` §2 does. **Discovery carries no title, subject, address 
 the journal holds `DiscoveredDoc`s, and everything that can name a person stays in the
 document it belongs to. `Message-ID` is recorded in the document's metadata as `mail_message_id`
 (angle brackets stripped) for §6, and nowhere else.
-
-**Metadata** also carries `mbox_path` (the path relative to the root) and `mbox_offset`, so a
-report can say where a message came from without parsing `uri`.
 
 ---
 
@@ -290,7 +290,7 @@ only handed out after an enumeration that completed.
 | A file is **appended to** (a live Inbox) | The file's token differs, so it is scanned from the top. Every message is yielded again, but each unchanged one carries the constant token and the pipeline skips it, so the cost is one sequential read of that file and a journal record per message, and not a re-index | The new messages are indexed. A tail-only re-scan (resume where the last scan ended, once the bytes before it were checked) would make this proportional to what was added; it is not built, because it needs a stored digest of the prefix to be safe and an archive that is appended to is the exception |
 | A file is **rewritten** (compaction, an expunge, a restore) | Same: rescanned | A message that is no longer in any file leaves through reconciliation (§5.4) |
 | A file is **touched** (restored from a backup, copied without preserving times) | Rescanned; nothing is new | Nothing changes in the index |
-| A file is **renamed or moved** | Its entry is absent under the new path, so it is scanned; its messages' identities are unchanged | The documents stay; the locator is refreshed when the document next changes |
+| A file is **renamed or moved** | Its entry is absent under the new path, so it is scanned; its messages' identities are unchanged | The documents stay. Their stored path is the old one until the pipeline refreshes an unchanged record's address (§4) |
 | A file is **removed** | Nothing at discovery: an absence is invisible to an incremental sync | Reconciliation (§5.4) |
 | A file is **unreadable** (permissions, I/O error) | The error is logged by file *index*, not name, the file is not in the watermark, and the walk continues | It is tried again next sync. The run finishes; an enumeration that skipped a file never writes a watermark that claims the file was read |
 | The **root vanishes** | Discovery yields nothing and **raises**; a vanished root is not an empty archive | |
@@ -322,10 +322,16 @@ message's raw bytes in the file.
 `fetch(ref)` **seeks to the offset, reads `length` bytes, re-applies the canonicalization of §3 and
 verifies that the SHA-256 of the result equals `ref.source_id`.** The offset is an optimization
 and the hash is the authority. A file that was rewritten between discovery and fetch fails the
-check, and `fetch` raises `NotFoundError`: the message is where discovery said it was no longer.
-The pipeline records a fetch failure against that document, not against the run, and because the
-file's token now differs from the watermark the next sync scans it again and finds the message at
-its new offset or does not. A message is never indexed from bytes that are not the bytes its
+check, and `fetch` raises `NotFoundError`: the message is no longer where discovery said it was.
+That is chosen deliberately and its effect is not small. The pipeline maps `NotFoundError` to a
+typed `source_deleted`, which retries the document and **invalidates the completed inventory**
+([`ingest.md`](../ingest.md) §8.3.1): the run is recorded as `reenumeration_required`, its
+watermark is not committed, and the next sync enumerates again from the last committed watermark.
+That is the right response here and a plain fetch failure would not be: the journal holds the
+stale offset, so retrying the fetch would fail identically for ever, while a fresh enumeration
+reads the rewritten file (its size and mtime differ from the watermark) and re-locates the message,
+or finds it gone. The cost of a file being rewritten mid-run is therefore one extra enumeration,
+of the files that changed. A message is never indexed from bytes that are not the bytes its
 identity names.
 
 `fetch` reads only the message, so a 3 GB file costs one message's worth of memory per fetch, and
@@ -336,11 +342,15 @@ itself too large without reading it.
 
 One message in two files would be yielded twice under one `source_id` with two locators, and the
 journal rejects a replayed identity whose record differs. So **a run yields each identity once**,
-the first in walk order. The set of identities seen is **not held in memory**: a quarter-million
+the first live copy in walk order. A copy flagged deleted (§3.4) is skipped *before* it claims the
+identity, so a later live copy of the same message is still indexed. The set of identities seen is
+**not held in memory**: a quarter-million
 messages is tens of megabytes of digests as Python objects, and an archive of years of
-mail is more. It is a temporary SQLite table in the cache directory, keyed on the digest, created
-when a run starts and removed when it ends, so the working set is a batch and the rest is on
-disk. `discover` and `reconcile` use the same mechanism.
+mail is more. It is a temporary SQLite table in the cache directory, keyed on the digest, **created by each walk
+and removed when that walk ends**, so the working set is a batch and the rest is on disk. It
+belongs to the walk and not to the connector, because the connector is one object for the life of
+the process and a discovery and a reconciliation can overlap (`gmail.md` §3 makes the same point
+about its exclusion set). `discover` and `reconcile` use the same mechanism.
 
 ### 5.4 `reconcile`
 
@@ -361,10 +371,18 @@ deletion ceiling (`ingest.reconcile_max_delete_fraction`) holds a large removal 
 `manicule connector reconcile NAME --confirm` applies.
 
 **Reconciliation does not apply `skip_known_message_ids`.** Its inventory is a superset of what
-discovery yields, and that is the safe direction: a pass that applied the skip would delete a
-mbox copy the moment the Gmail connector indexed the same mail, which is a deletion nobody asked
-for and one the ceiling would then have to catch. A message that was indexed before another source
-held it stays indexed (§6).
+discovery yields, and that is the safe direction: a pass that applied the skip would delete an mbox
+copy the moment the Gmail connector indexed the same mail, which is a deletion nobody asked for and
+one the ceiling would then have to catch. A message that was indexed before another source held it
+stays indexed (§6).
+
+**Discovery agrees with the inventory about everything this source already holds**, which is the
+condition that makes "superset" true in the direction that matters. A full walk is a full
+inventory: the pipeline records it as one, and a rebuild led by a full run retires the documents it
+does not contain ([`ingest.md`](../ingest.md) §8.3, "deletion authority"). So a skip never removes a
+document the source holds: discovery skips a message for a known `Message-ID` only if **this**
+source does not already hold that identity (§6). Every document the source holds that is still in
+a file is therefore in both discovery's manifest and the reconciliation inventory.
 
 ---
 
@@ -376,7 +394,10 @@ and `ask` quotes it twice as if two sources agreed.
 
 **`skip_known_message_ids` (default `true`)** makes discovery skip a message whose `Message-ID`
 is already held by **another mail source**: another configured instance of type `gmail` or
-`mbox`, and not itself. Mail the other source holds is, for the purpose of this option, what that
+`mbox`, and not itself. **A message this source already holds is never skipped** (`find_document`
+by identity, asked only of the few messages whose `Message-ID` is known elsewhere), so turning the
+option on, or syncing Gmail later, never makes a document this source indexed disappear from a full
+walk (§5.4). Mail the other source holds is, for the purpose of this option, what that
 source's live documents say it holds.
 
 How the other source's `Message-ID` values are known:
@@ -388,8 +409,14 @@ How the other source's `Message-ID` values are known:
   the Gmail connector and no re-fetch of a mailbox. A Gmail message without a `Message-ID` was
   given the `#all/<gmail id>` link, carries no id, and can never match.
 
-The ids are read from the document store once per run, the first time a message with a
-`Message-ID` needs judging, into an on-disk table beside the one §5.3 uses. A run with nothing to
+The ids are read from the document store once per walk, the first time a message with a
+`Message-ID` needs judging, into an on-disk table beside the one §5.3 uses. The read is a new
+**streaming method on the SQLite document store**, shaped like `known_source_ids`
+(an async generator over a column selection, closed with `aclosing`, no `Document` loaded), and it
+yields the ids of **live documents only** (`deleted_at IS NULL`) of the named sources. It cannot be
+`list_documents(offset=…)`: that pages whole documents, is quadratic over a large Gmail source, and
+loads every chunk-less row's metadata to read one field. A trashed Gmail message therefore stops
+suppressing its archived copy, which is what trash means. A run with nothing to
 judge (an archive whose files are all unchanged) does not read the store.
 
 **The default is to skip, because the failure it prevents is the common one.** An archive and a
@@ -433,30 +460,41 @@ guardrail.** `type = "filesystem"`, and `manicule index <path>`, will index a di
 and `.msg` files today with the installation free to serve them to anyone who can reach the port.
 The registry marks a connector *type*, and the type cannot know what is in a directory.
 
-**Content decides, then, and the decision is made where every document is written.**
-`IngestPipeline.ingest_raw` already marks a source sensitive when its instance is of a sensitive
-type, and it is the choke point every document write passes through. It will also mark the source
-when the document being written has a **mail media type: `message/rfc822` or
-`application/vnd.ms-outlook`**. The mark is the existing one (`connectors.sensitive_synced_at`),
-is never cleared, and is lifted only by `delete-source`; the refusal that reads it does not
-change. It does not matter which connector produced the document, so it also covers a web crawler
-that fetches an `.eml`, `manicule index` of a folder, and anything a plugin adds.
+**Content decides, then, and the question is asked of the documents that are there.** The refusal
+already reads `documents` with plain `sqlite3`, read-only (`manicule/app/sensitive.py`), for the
+sources a sensitive connector marked. It gains a second clause: **a source is also held when it has
+a document whose `media_type` is `message/rfc822` or `application/vnd.ms-outlook`**, in any state
+(deleted and purged rows count, as for the first clause, because they keep their title). Nothing
+is marked and nothing is written; the fact is read from the rows.
+
+That is deliberately a read and not a mark made as documents are written, for three reasons that
+the mark would have lost:
+
+- **It covers mail already indexed.** An installation that indexed a folder of `.eml` files last
+  year is refused on upgrade, which a mark made at write time would not do for rows it never saw.
+- **It covers every write path and attachments.** `documents.media_type` is stored for members as
+  well as containers, so an `.eml` inside a `.zip` or a `.tar`, a message attached to a message, and
+  a document a plugin added are all rows with a mail media type, found whichever connector or
+  command wrote them (`manicule index`, a crawler, a forced sync, an import).
+- **It needs no new state.** `delete-source` removes the rows, and the refusal lifts with them.
+
+It is the same refusal for the same reason, with the same remedy (`manicule document delete-source
+<name> --yes`), on every address, with no override, and `doctor`'s `transport` check reports it
+beside the other sensitive sources.
 
 What this does not do, so nobody leans on it:
 
-- **It marks a source after the first mail document is written, not before.** Unlike a sensitive
-  type, a filesystem source cannot be known sensitive before it is read. The refusal takes effect
-  the next time the server starts, or the next time anything builds an app. A server that is already
-  serving unauthenticated when a mail file appears in an indexed directory keeps serving until it
-  restarts, and the document is searchable until then. Run mail through `type = "mbox"` or a
-  separate installation, where the guarantee is complete; this closes the quiet way into a
-  mixed one.
-- **Mail inside an archive** (an `.eml` in a `.zip`, a `.tar` of messages) is a member of a document
-  whose media type is the archive's, so does not by itself mark the source.
+- **It is a refusal to serve, decided when a server starts or an application is built.** A server
+  that is already serving unauthenticated when a mail file appears in an indexed directory keeps
+  serving until it restarts, and the document is searchable until then. Mail indexed through
+  `type = "mbox"` is covered earlier, because its type is known sensitive before the first message
+  is read; use it, or a separate installation, where the guarantee is complete.
 - **A corpus that happens to contain one sample `.eml`** (a test-fixtures directory, a mail
   library's repository) now needs an authenticated server, or an `exclude` of the file. That is
   the price of failing closed for the case where it was real mail, and it is the same trade the
   guardrail made for Gmail.
+- **It looks at what the pipeline routed as mail.** A message saved as `.txt` is text, and a PST,
+  which this project cannot read (§9), is not indexed at all.
 
 ---
 
@@ -480,6 +518,8 @@ is generated, and nothing is real mail or resembles it.
 | An attachment (text, a calendar invitation, a nested message, a `.zip`) | The parser and attachment routing unchanged |
 | A file larger than the pipeline's fetch limit made of small messages | §1: the archive is read, no message is refused |
 | 3,000 messages in one file | Batches of 250 at the boundary (§5.2) |
+| A filesystem source holding an `.eml`, one holding a `.zip` of them, and an index made before this change | §7: the server refuses to start unauthenticated |
+| A file rewritten between discovery and fetch | §5.2: `NotFoundError` and one re-enumeration |
 
 Every one is driven **through the pipeline runner**, over the real stores, with durable
 acquisition on, and not through `parse()` alone: the Gmail work shipped a parser whose suite
@@ -508,22 +548,29 @@ effort:
   image or imported by its code would be.
 
 **The recipe is a conversion outside manicule, and then an ordinary index.** On a machine that
-has `readpst` (usually the `pst-utils` or `libpst` package of a Linux distribution, or Homebrew's
-`libpst`), convert each PST to mbox or to one `.eml` per message, then point manicule at the output.
-Check the flags against `readpst -h` for your version: the program is not part of manicule or
-its test suite, so this page cannot promise them.
+has `readpst` (the `pst-utils` package on Debian and Ubuntu, `libpst` elsewhere), convert each PST to
+mbox or to one `.eml` per message, then point manicule at the output. The flags below are those of
+the `readpst(1)` manual page; the program is not part of manicule or its test suite, so check
+`readpst -h` for your version and expect to adjust.
 
 ```console
-$ # one mbox file per folder, in a directory tree mirroring the PST's folders
-$ readpst -r -o /srv/archive/mail/outlook-2019 /path/to/archive.pst
-$ # or: one .eml file per message, one directory per folder
-$ readpst -r -M -e -o /srv/archive/mail/outlook-2019 /path/to/archive.pst
+$ mkdir -p /srv/archive/mail/outlook-2019
+$ # mbox: a directory per PST folder, each holding a file named "mbox"
+$ readpst -r -t e -o /srv/archive/mail/outlook-2019 /path/to/archive.pst
+$ # or one .eml per message: a directory per folder, files numbered 1 to n
+$ readpst -e -t e -o /srv/archive/mail/outlook-2019 /path/to/archive.pst
 ```
 
-`readpst` writes mbox files named `mbox` inside a directory per folder, which the connector's
-sniff (§2) accepts; contact, calendar and journal items it also converts are folders of their own
-and are not mail, so keep them out of the root with `exclude` or delete them. Its output is mboxo,
-so the quoting caveat in §3.3 applies.
+- `-r` writes the folders named as in the PST and, in each, the mail in a file called `mbox`, which
+  the connector's sniff (§2) accepts. Without `-t e` it also writes the PST's calendar, contacts
+  and journal items as files named `calendar`, `contacts` and `journal` beside it, and those are
+  written in a mail-compatible form the sniff would accept as well. `-t e` asks for mail only, and
+  is why the recipe passes it.
+- `-e` writes each message as its own `.eml` file. `-o` must name a directory that exists.
+- `-D` includes deleted items. Leave it off: the PST's deleted items are the mail its owner
+  chose to throw away, the same reasoning as §3.4's flagged-deleted messages.
+- `readpst`'s single-file output uses mboxrd quoting, which §3.3 reads exactly. Its per-message
+  `.eml` output does no `From ` quoting at all, since there is no `From ` line to protect.
 
 Then, for the mbox form:
 
@@ -546,8 +593,10 @@ root = "/srv/archive/mail/outlook-2019"
 **Prefer the mbox form.** A filesystem source of `.eml` files is one document per file with an
 identity that is its path, so it has none of §4's properties (a moved file is a delete and a
 create; the same message in two folders is two documents; it has no `skip_known_message_ids`), and
-it is marked sensitive only by content (§7), after the first message is written, not by type. The
-mbox connector is the better target for the same data, and the recipe exists so that both work.
+it is known sensitive only by content (§7), once the first message is indexed, and not by type.
+The mbox connector is the better target for the same data, and the recipe exists so that both
+work. This recipe has been checked against the manual page and not run against a PST in CI: the
+GPL boundary is the reason there is no `readpst` in the test environment.
 
 Keep the intermediate files on storage you would trust with the mail itself: the conversion
 writes every message in the clear, and deleting the PST does not delete them.
@@ -558,11 +607,12 @@ writes every message in the clear, and deleting the PST does not delete them.
 
 - **A PST/`.msg` reader in-product.** §9.
 - **`Message-ID` as the identity.** §4.
-- **Offset or ordinal as the identity.** §4.
+- **Offset or ordinal as the identity, or an offset in the citation.** §4.
 - **Holding a file's table of contents in memory** (the `mailbox` module's approach). §3.5.
 - **Re-reading only an appended tail.** §5.1; the digest of the prefix it needs is a feature of its
   own, and an archive is rarely appended to.
 - **A parser for the mbox media type.** §1.
+- **Marking a source sensitive when a mail document is written** (in `ingest_raw`). It would miss mail already indexed, mail inside an archive and every path that does not pass there; the read in §7 covers all three.
 - **Deciding sensitivity from the file extension.** `.eml` content is mail whatever it is called, and
   a name is a thing a person changes; the media type the pipeline routed the bytes by is what the
   parser will treat as mail.
@@ -581,7 +631,8 @@ writes every message in the clear, and deleting the PST does not delete them.
 | The reader, canonicalization, identity | `manicule/connectors/mbox_reader.py` |
 | The connector: walk, watermark, discover, fetch, reconcile | `manicule/connectors/mbox.py` |
 | Registration (sensitive) | `manicule/connectors/plugin.py` |
-| Sensitive by content | `manicule/ingest/pipeline.py` (`ingest_raw`) |
+| Sensitive by content | `manicule/app/sensitive.py` |
+| The Message-ID read | `manicule/storage/docstore.py` (a streaming method beside `known_source_ids`) |
 | Fixture generator | `tests/connectors/mbox_support.py` |
 | Tests | `tests/connectors/test_mbox_*.py` |
 
