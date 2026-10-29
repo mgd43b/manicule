@@ -43,6 +43,8 @@ __all__ = [
     "FILESYSTEM_CONNECTOR_NAME",
     "GIT_SITE_CONNECTOR_NAME",
     "GMAIL_CONNECTOR_NAME",
+    "MBOX_CONNECTOR_NAME",
+    "MBOX_REPRESENTATION_VERSION",
     "REPRESENTATION_VERSION",
     "SNAPSHOT_CONNECTOR_NAME",
     "AuthMethod",
@@ -54,6 +56,7 @@ __all__ = [
     "FullInventoryAuthority",
     "GitSiteConfig",
     "GmailConfig",
+    "MboxConfig",
     "resolve_credentials",
     "resolve_gmail_client_secret",
     "resolve_gmail_credentials",
@@ -65,6 +68,18 @@ CONNECTOR_NAME = "confluence"
 
 FILESYSTEM_CONNECTOR_NAME = "filesystem"
 """The registered name of the local-directory connector."""
+
+MBOX_CONNECTOR_NAME = "mbox"
+"""The registered name of the mbox-archive connector."""
+
+MBOX_REPRESENTATION_VERSION = "mbox/1"
+"""What the mbox connector delivers a message as, and every message's version token.
+
+A message's identity is the digest of its bytes (``docs/connectors/mbox.md`` §4), so a stored
+message can never have changed and one constant stands for all of them. It is part of the scope
+fingerprint, so changing what is delivered discards the watermark and the next sync reads every
+file again.
+"""
 
 SNAPSHOT_CONNECTOR_NAME = "confluence-snapshot"
 """The registered name of the offline Confluence-snapshot connector.
@@ -294,6 +309,67 @@ class FilesystemConfig(BaseModel):
     @classmethod
     def _patterns(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(dict.fromkeys(globs.path_glob(value) for value in values))
+
+
+class MboxConfig(BaseModel):
+    """Configuration for :class:`~manicule.connectors.mbox.MboxConnector`.
+
+    Every other key is refused, which is how the settings that are deliberately absent (a date
+    range, a folder list, a ``Message-ID`` identity) stay absent: a filter evaluated on a full
+    walk and not on a re-walk is the failure ``docs/connectors/gmail.md`` §3 states for labels,
+    and a path glob already says which files count (``docs/connectors/mbox.md`` §1).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    root: str = Field(
+        default="",
+        description="A directory to search for mbox files, or one mbox file. Resolved to an "
+        "absolute path, because a document's address is built from where its file is.",
+    )
+    include_hidden: bool = Field(
+        default=False,
+        description="Whether to walk dot-files and dot-directories. Off, as for the filesystem "
+        "connector.",
+    )
+    exclude: tuple[str, ...] = Field(
+        default=(),
+        max_length=256,
+        description="Root-relative POSIX globs this source never walks, read exactly as the "
+        "filesystem connector reads them. Applied by the walk, so discovery and reconciliation "
+        "refuse the same paths.",
+    )
+    skip_known_message_ids: bool = Field(
+        default=True,
+        description="Skip a message whose Message-ID another mail source (a configured gmail or "
+        "mbox instance) already holds, unless this source holds it already "
+        "(docs/connectors/mbox.md §6). A message with no Message-ID is never skipped.",
+    )
+
+    @field_validator("exclude")
+    @classmethod
+    def _patterns(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(globs.path_glob(value) for value in values))
+
+    def scope_fingerprint(self, source_scope: str) -> str:
+        """The scope a stored per-file watermark is valid for.
+
+        Everything that changes which messages discovery yields is in it, so editing any option
+        discards the stored file map and the next sync reads every file again — which is what
+        brings back the messages ``skip_known_message_ids`` had skipped.
+        """
+        material = json.dumps(
+            {
+                "source_scope": source_scope,
+                "include_hidden": self.include_hidden,
+                "exclude": sorted(self.exclude),
+                "skip_known_message_ids": self.skip_known_message_ids,
+                "representation": MBOX_REPRESENTATION_VERSION,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.blake2b(material.encode(), digest_size=20).hexdigest()
 
 
 class Deployment(StrEnum):

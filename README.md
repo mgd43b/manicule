@@ -58,10 +58,11 @@ vectors are filtered during hydration and reclaimed by the normal sweep. The sam
 applies when parsing, middleware or chunking concludes that a document has no chunks.
 
 > [!IMPORTANT]
-> **Five sources are built**: a local directory tree, Confluence (live, or from a directory of
-> mirrored pages), a pinned Git checkout of a site you own, and a Google Workspace mailbox. Gmail
-> is read-only and syncs from Gmail's own change log, and an installation holding a mailbox
-> refuses to be served without authentication. `manicule connector login` mints its refresh
+> **Six sources are built**: a local directory tree, Confluence (live, or from a directory of
+> mirrored pages), a pinned Git checkout of a site you own, a Google Workspace mailbox, and old
+> mail archives in unix mbox files ([`docs/connectors/mbox.md`](docs/connectors/mbox.md), which
+> also says how to index an Outlook PST). Gmail is read-only and syncs from Gmail's own change
+> log, and an installation holding mail refuses to be served without authentication. `manicule connector login` mints its refresh
 > token ([`docs/connectors/gmail.md`](docs/connectors/gmail.md), tracked in
 > [#464](https://github.com/mgd43b/manicule/issues/464)). Seven more — GitHub, Notion,
 > Drive, S3/GCS, Swagger, an HTTP crawler and web search — are designed in

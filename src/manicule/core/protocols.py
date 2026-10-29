@@ -1376,6 +1376,20 @@ class BatchedDiscoveryConnector(Protocol):
 
 
 @runtime_checkable
+class MailMessageIdIndex(Protocol):
+    """Optionally answers which ``Message-ID`` values other mail sources hold.
+
+    Asked by the mbox connector's ``skip_known_message_ids`` (``docs/connectors/mbox.md`` §6). A
+    streaming read in the shape of :meth:`DocStore.known_source_ids`, so a large mailbox is never
+    collected in memory and no ``Document`` is loaded to read one field.
+    """
+
+    def known_mail_message_ids(self, sources: Sequence[str]) -> AsyncGenerator[str]:
+        """Normalized ``Message-ID`` values of the live documents of ``sources``."""
+        ...
+
+
+@runtime_checkable
 class BatchedReconciliationConnector(Protocol):
     """Optionally preserves source-native cursor pages during deletion enumeration."""
 
@@ -1524,6 +1538,7 @@ __all__ = [
     "Embedder",
     "Generator",
     "InspectableVectorStore",
+    "MailMessageIdIndex",
     "Middleware",
     "MultiWorkspaceVectorStore",
     "Parser",

@@ -21,6 +21,7 @@ from __future__ import annotations
 import glob
 import re
 from functools import lru_cache
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 __all__ = [
     "MAX_PATTERN_LENGTH",
     "admitted",
+    "covers",
     "matches",
     "matches_any",
     "path_glob",
@@ -111,3 +113,24 @@ def admitted(path: str, *, include: Sequence[str], exclude: Sequence[str]) -> bo
     written once and corrected in place rather than being restated as a list of exceptions.
     """
     return matches_any(path, include) and not matches_any(path, exclude)
+
+
+_ROOT: Final = PurePosixPath(".")
+"""What a path relative to itself is; never a candidate for a pattern."""
+
+
+def covers(relative: PurePosixPath, patterns: Sequence[str]) -> bool:
+    """Whether ``patterns`` name ``relative`` or any directory above it.
+
+    An excluded directory excludes everything beneath it, so every ancestor up to the root is
+    asked and not only the path itself. Both spellings of a directory are tried (``archive`` and
+    ``archive/``) so that ``archive`` and ``archive/**`` name one subtree. The root itself is
+    never asked about. Shared by the connectors that walk a directory, because two readings of
+    "excluded" would let one source index what another refuses.
+    """
+    return any(
+        matches_any(candidate, patterns)
+        for part in (relative, *relative.parents)
+        if part != _ROOT
+        for candidate in (str(part), f"{part}/")
+    )

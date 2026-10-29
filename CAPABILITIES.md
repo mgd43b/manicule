@@ -489,6 +489,18 @@ is a feature list entry, not a feature.
   other source, which reports counts only. An installation that holds a mailbox
   refuses to serve with authentication off (#462). `connector login` mints the
   refresh token (#461). `docs/connectors/gmail.md`.
+- `connectors.<name>` with `type = "mbox"` — old mail archives: every message in the unix mbox
+  files under a root (Thunderbird folders, Mutt and Pine archives, Apple Mail exports; the file
+  is recognized by its first bytes, not its name) as one `message/rfc822` document, so the mail
+  parser and attachment routing apply unchanged. Read as a stream, so a multi-gigabyte file
+  never has to fit the 256 MB fetch limit. A message is identified by a digest of its bytes
+  rather than its `Message-ID`, so reordering a file or filing a message in several leaves one
+  document. An unchanged file costs a `stat`; a message that left every file leaves the index at
+  the next reconciliation. `skip_known_message_ids` (default on) skips a message another `gmail`
+  or `mbox` source already holds. Registered as sensitive like `gmail`, and any source holding a
+  `message/rfc822` or `application/vnd.ms-outlook` document refuses an unauthenticated server
+  too, whichever connector indexed it. Outlook PST has no reader: the documented recipe
+  converts with `readpst` outside manicule. `docs/connectors/mbox.md`.
 - Mail attachments are routed by what they are rather than what the sender's client called
   them: a generic or legacy declaration (`application/octet-stream`, `application/msword` on a
   `.docx`) yields to the filename extension, confirmed by the bytes, then to the bytes; declared

@@ -98,9 +98,6 @@ sets would drift, and the drift is invisible — a suffix in one and not the oth
 corpus that re-ingests itself for ever or a page that is never adapted.
 """
 
-_SELF: Final = PurePosixPath(".")
-"""What ``relative_to`` returns for the root compared with itself, and for nothing else."""
-
 SNAPSHOT_PATH: Final = "snapshot_path"
 """``DocRef.metadata`` key carrying the file this document was walked to.
 
@@ -407,12 +404,7 @@ class FilesystemConnector:
             relative = PurePosixPath(path.relative_to(self._root))
         except ValueError:
             return False
-        return any(
-            globs.matches_any(candidate, self._exclude)
-            for part in (relative, *relative.parents)
-            if part != _SELF
-            for candidate in (str(part), f"{part}/")
-        )
+        return globs.covers(relative, self._exclude)
 
     @property
     def profiles(self) -> tuple[EnrichedProfile, ...]:

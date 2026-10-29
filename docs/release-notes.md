@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Old mail archives: the `mbox` source, and mail is now sensitive wherever it came from
+
+A `type = "mbox"` source indexes the unix mbox files under a root, one document per message,
+through the same mail parser as Gmail. A file is recognized by its first bytes, so Thunderbird
+folders with no extension, Mutt archives and an Apple Mail "Export Mailbox" folder all work. The
+files are read as a stream: a ten-gigabyte `Inbox` is fine, because the fetch limit applies to one
+message and not to the archive. A message is identified by a digest of its bytes, so a message
+filed in several folders is one document and rearranging a file loses nothing. After the first
+sync an unchanged file costs a `stat`.
+
+`skip_known_message_ids` is on by default: a message whose `Message-ID` is already held by a
+`gmail` or another `mbox` source is not indexed again. Turn it off to keep both copies, for
+instance when the archive is the only record of mail that shares an id. Messages with no
+`Message-ID` are never skipped.
+
+Outlook PST files have no reader and will not get one in the product, because the libraries that
+read them are LGPL or GPL. [`connectors/mbox.md`](connectors/mbox.md) §9 is the recipe: convert with
+`readpst` outside manicule, then index the output.
+
+**An installation holding mail now refuses to be served without authentication, whichever
+connector indexed it.** The refusal that already covered Gmail also fires when any document in the
+data directory is a mail message (`message/rfc822`) or an Outlook message
+(`application/vnd.ms-outlook`), so a directory of `.eml` files indexed through the filesystem
+connector is covered too. This applies to mail you indexed before upgrading: the check reads the
+documents that are already there. A directory that merely contains a sample `.eml` is covered as
+well; exclude the file or serve with authentication. `manicule document delete-source NAME --yes`
+lifts it, as before. [`connectors/mbox.md`](connectors/mbox.md) §7.
+
 ### A reply chain no longer fills a search with copies of one message
 
 Mail is indexed one document per message, and each message keeps the reply chain it quotes, so a
