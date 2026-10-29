@@ -1037,7 +1037,7 @@ loopback included, because every server start will be refused (§6); `facts.inst
 says which mode was read. It is likewise `failing` on loopback when authentication is off and the
 installation holds a sensitive source (§6, "Sensitive sources take the way out away"), without
 serving, and `--no-authentication` does not change that. In that case `facts.sensitive_sources`
-lists the connector instance names; with authentication on, the key is absent.
+lists the source names (connector instances); with authentication on, the key is absent.
 
 `sign_in` is `ok` when `security.auth.mode` is not `oauth` — there is no browser sign-in to get
 wrong — and otherwise lists every condition `build_app` would refuse to serve with (§9.2.1): a
@@ -1279,14 +1279,22 @@ the wide-bind rule is not: `manicule index` in a team installation opens no sock
 
 The index is not permission-aware: whoever can search a workspace reads everything in it. A
 connector type can register as **sensitive** (`ComponentRegistry.add(..., sensitive=True)`;
-`gmail` is the only one that does), because a mailbox is one person's and loopback reaches every
-other local account and process. An installation with `security.auth.mode = none` is then refused
-wherever a socket is made, **loopback included**, when either of these is true:
+`gmail` and `mbox` do), because a mailbox is one person's and loopback reaches every other local
+account and process. An installation with `security.auth.mode = none` is then refused wherever a
+socket is made, **loopback included**, when any of these is true:
 
 1. an enabled connector instance is of a sensitive type; or
 2. the data directory holds any `documents` row, in any state (soft-deleted and purged rows
    count), whose source is a connector instance that a sensitive connector has synced, in any
-   workspace of its SQLite database.
+   workspace of its SQLite database; or
+3. the data directory holds any `documents` row, in any state, whose media type is
+   `message/rfc822` or `application/vnd.ms-outlook`, whichever connector indexed it — the
+   filesystem connector and `manicule index` are not sensitive types and cannot know what a
+   directory holds, and a member of an archive is a row with its own media type
+   ([`connectors/mbox.md`](connectors/mbox.md) §7). This is read from the rows, not marked as
+   they are written, so it covers mail indexed before the rule existed; it takes effect when a
+   server starts, so a server already serving unauthenticated when mail first appears keeps
+   serving until it restarts.
 
 `--no-authentication` is refused rather than allowed to waive it; the error says the flag does
 not apply. The second condition is why the refusal outlives the configuration. The pipeline records

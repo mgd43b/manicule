@@ -23,6 +23,15 @@ enough.**
    rows count — a purged row keeps its title, which for mail is the subject — so only deleting
    the source's documents outright (``manicule document delete-source``) lifts the refusal.
 
+**A third fact catches mail no sensitive connector brought.** The filesystem connector, a crawler
+and ``manicule index`` are not sensitive types and cannot know what a directory holds, so the data
+directory is also asked whether any ``documents`` row has a mail media type (``message/rfc822`` or
+``application/vnd.ms-outlook``), in any state. It is a read, not a mark written as documents
+arrive: it covers mail indexed before the rule existed, mail inside an archive (members are rows
+with their own media type) and every write path (``docs/connectors/mbox.md`` §7). It takes effect
+when a server starts or an application is built, so a server already serving unauthenticated when
+mail first appears keeps serving until it restarts.
+
 **Read with plain ``sqlite3``, read-only, and not through the document store.** The refusal is
 decided by :func:`~manicule.app.bind.resolve_bind` and
 :func:`~manicule.api.app.build_app`, which are synchronous and run before the server's event
@@ -75,6 +84,13 @@ _HELD = (
 )
 """Marked sources with at least one document row of any state. No ``deleted_at`` filter."""
 
+_MAIL = (
+    "SELECT DISTINCT d.source FROM documents AS d "
+    "WHERE d.media_type IN ('message/rfc822', 'application/vnd.ms-outlook') "
+    "ORDER BY d.source"
+)
+"""Sources with a document of a mail media type, in any state: ``.eml`` and ``.msg`` as routed."""
+
 _PRE_MARK = ("no such table", "no such column")
 """What SQLite says about a database that predates the mark: it cannot hold one."""
 
@@ -87,14 +103,16 @@ class SensitiveExposure:
     """Enabled connector instances whose registered type is sensitive."""
     held: tuple[str, ...] = ()
     """Sources a sensitive connector has synced that still have a document row."""
+    mail: tuple[str, ...] = ()
+    """Sources, of any connector, holding a document of a mail media type in any state."""
 
     @property
     def sources(self) -> tuple[str, ...]:
         """Every name, once, sorted."""
-        return tuple(sorted({*self.configured, *self.held}))
+        return tuple(sorted({*self.configured, *self.held, *self.mail}))
 
     def __bool__(self) -> bool:
-        return bool(self.configured or self.held)
+        return bool(self.configured or self.held or self.mail)
 
 
 def sensitive_instances(settings: Settings, sensitive_types: AbstractSet[str]) -> frozenset[str]:
@@ -128,11 +146,24 @@ def sensitive_exposure(settings: Settings, sensitive_types: AbstractSet[str]) ->
             if instance.enabled and instance.type in sensitive_types
         )
     )
-    return SensitiveExposure(configured=configured, held=held_sources(settings.data_dir))
+    return SensitiveExposure(
+        configured=configured,
+        held=held_sources(settings.data_dir),
+        mail=mail_sources(settings.data_dir),
+    )
 
 
 def held_sources(data_dir: Path) -> tuple[str, ...]:
     """Marked sources whose documents are still in ``data_dir``'s database, in any state."""
+    return _sources(data_dir, _HELD)
+
+
+def mail_sources(data_dir: Path) -> tuple[str, ...]:
+    """Sources with a document of a mail media type in ``data_dir``'s database, in any state."""
+    return _sources(data_dir, _MAIL)
+
+
+def _sources(data_dir: Path, query: str) -> tuple[str, ...]:
     path = data_dir / DATABASE_FILENAME
     try:
         # `stat`, not `exists`: `exists` answers False for a permission error, and a database
@@ -151,7 +182,7 @@ def held_sources(data_dir: Path) -> tuple[str, ...]:
     except sqlite3.Error as error:
         raise _unreadable(path, error) from error
     try:
-        return tuple(name for (name,) in connection.execute(_HELD))
+        return tuple(name for (name,) in connection.execute(query))
     except sqlite3.OperationalError as error:
         if any(fragment in str(error) for fragment in _PRE_MARK):
             return ()
@@ -202,6 +233,7 @@ __all__ = [
     "UnreadableDatabaseError",
     "exposure_when_unauthenticated",
     "held_sources",
+    "mail_sources",
     "sensitive_exposure",
     "sensitive_instances",
 ]

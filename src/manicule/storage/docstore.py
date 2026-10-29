@@ -26,6 +26,7 @@ from sqlalchemy import (
     func,
     insert,
     literal,
+    or_,
     select,
     tuple_,
     type_coerce,
@@ -39,6 +40,8 @@ from manicule.core.embedding import EmbedFingerprint, IndexFingerprints
 from manicule.core.errors import DerivedResetFenceLostError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.ids import vector_id
+from manicule.core.mail_ids import MAIL_MESSAGE_ID_KEY, message_id_of
+from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.retrieval import Candidate, Filter
 from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
@@ -1811,6 +1814,39 @@ class SqliteDocStore(
             )
             async for (source_id,) in result:
                 yield source_id
+
+    async def known_mail_message_ids(self, sources: Sequence[str]) -> AsyncIterator[str]:
+        """The ``Message-ID`` of every live mail document the named sources hold.
+
+        ``docs/connectors/mbox.md`` §6. A document records its id under ``mail_message_id``
+        (the mbox connector does), or else carries it in its link (a Gmail message does,
+        ``gmail.md`` §2), so both are read in SQL and :func:`message_id_of` decides which counts.
+        Members of a container are not messages and are excluded; so are trashed documents, so
+        mail the owner deleted stops suppressing its archived copy.
+
+        Only two columns' worth of JSON per row is selected, and rows are streamed. **Close it**
+        with :func:`contextlib.aclosing`, as :meth:`known_source_ids` says and for its reason.
+        """
+        if not sources:
+            return
+        recorded = models.Document.doc_metadata[MAIL_MESSAGE_ID_KEY].as_string()
+        link = models.Document.doc_metadata[PROVENANCE_KEY]["source"]["canonical_uri"].as_string()
+        async with self._sessions() as session:
+            result = await session.stream(
+                select(recorded, link).where(
+                    models.Document.workspace_id == self._workspace_id,
+                    models.Document.source.in_(list(sources)),
+                    models.Document.deleted_at.is_(None),
+                    models.Document.container_id.is_(None),
+                    or_(recorded.is_not(None), link.is_not(None)),
+                )
+            )
+            async for mail_id, canonical_uri in result:
+                found = message_id_of(
+                    {MAIL_MESSAGE_ID_KEY: mail_id} if mail_id else {}, canonical_uri or ""
+                )
+                if found is not None:
+                    yield found
 
     # --- internals ------------------------------------------------------------------------
 

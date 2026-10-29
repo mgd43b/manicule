@@ -299,9 +299,14 @@ def require_sensitive_source_authentication(
             f"rows count), from {', '.join(map(repr, exposure.held))}, which a sensitive "
             f"connector has synced — disabling or removing the connector does not lift this"
         )
+    if exposure.mail:
+        lines.append(
+            f"the data directory holds mail (documents of a mail media type, in some state) "
+            f"from {', '.join(map(repr, exposure.mail))}, whichever connector indexed it"
+        )
     joined = "\n  - ".join(lines)
     ways_back: list[str] = []
-    if exposure.held:
+    if exposure.held or exposure.mail:
         ways_back.append(
             "delete the source's documents outright from an authenticated server with "
             "`manicule document delete-source <name> --yes`"

@@ -27,7 +27,7 @@ from manicule.app.bind import (
     require_sensitive_source_authentication,
     resolve_bind,
 )
-from manicule.app.sensitive import held_sources, sensitive_instances
+from manicule.app.sensitive import held_sources, mail_sources, sensitive_instances
 from manicule.app.service import ApplicationService
 from manicule.config.settings import ConnectorSettings, Settings
 from manicule.container import keys
@@ -74,12 +74,13 @@ def _refused_everywhere(settings: Settings) -> None:
 # --- the registry says which types are sensitive ---------------------------------------------
 
 
-def test_only_gmail_is_registered_as_sensitive() -> None:
+def test_only_the_mail_connectors_are_registered_as_sensitive() -> None:
     from manicule.plugins import discover  # noqa: PLC0415
 
     registry = discover().registry
-    assert registry.sensitive_names(ComponentKind.CONNECTOR) == {"gmail"}
-    assert not any(record.sensitive for record in registry.records() if record.name != "gmail")
+    mail = {"gmail", "mbox"}
+    assert registry.sensitive_names(ComponentKind.CONNECTOR) == mail
+    assert not any(record.sensitive for record in registry.records() if record.name not in mail)
 
 
 def test_a_component_is_not_sensitive_unless_it_says_so() -> None:
@@ -475,3 +476,99 @@ def test_a_database_that_cannot_be_examined_refuses_rather_than_reading_as_absen
             resolve_bind(_settings(data_dir, configured=False), sensitive_types=SENSITIVE)
     finally:
         data_dir.chmod(0o700)
+
+
+# --- mail is sensitive by what it is, whichever connector indexed it (mbox.md §7) -----------------
+
+
+async def _indexed(
+    engine: AsyncEngine, source: str, source_id: str, media_type: str
+) -> SqliteDocStore:
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    await store.upsert_document(make_document(source, source_id, media_type=media_type))
+    return store
+
+
+@pytest.mark.parametrize("media_type", ["message/rfc822", "application/vnd.ms-outlook"])
+async def test_a_source_holding_a_mail_document_refuses_whichever_connector_wrote_it(
+    engine: AsyncEngine, data_dir: Path, media_type: str
+) -> None:
+    await _indexed(engine, "files", "letter", media_type)
+    settings = _settings(data_dir, configured=False)
+
+    assert held_sources(data_dir) == (), "no sensitive connector marked it"
+    assert mail_sources(data_dir) == ("files",)
+    with pytest.raises(PolicyError, match="holds mail") as caught:
+        resolve_bind(settings, sensitive_types=SENSITIVE)
+    assert "'files'" in str(caught.value)
+    assert "delete-source" in str(caught.value)
+    _refused_everywhere_with(settings, "files")
+
+
+def _refused_everywhere_with(settings: Settings, source: str) -> None:
+    with pytest.raises(PolicyError, match=repr(source)):
+        resolve_bind(
+            settings,
+            sensitive_types=SENSITIVE,
+            host=EVERYWHERE,
+            allow_public=True,
+            allow_unauthenticated=True,
+        )
+
+
+async def test_a_member_of_an_archive_with_a_mail_type_counts(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    """An ``.eml`` inside a ``.zip`` is a row with its own media type, and is found."""
+    store = SqliteDocStore(engine)
+    await store.ensure_workspace()
+    container = make_document("files", "bundle.zip", media_type="application/zip")
+    await store.upsert_document(container)
+    await store.upsert_document(
+        make_document(
+            "files",
+            "zip:bundle.zip!/letter.eml",
+            media_type="message/rfc822",
+            container_id=container.id,
+            container_depth=1,
+        )
+    )
+    assert mail_sources(data_dir) == ("files",)
+
+
+async def test_deleting_the_source_lifts_it_and_authentication_overrides_it(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    store = await _indexed(engine, "files", "letter", "message/rfc822")
+    assert mail_sources(data_dir) == ("files",)
+    assert resolve_bind(
+        _settings(data_dir, configured=False, authenticated=True), sensitive_types=SENSITIVE
+    ).loopback
+
+    assert await store.delete_source_documents("files") == 1
+
+    assert mail_sources(data_dir) == ()
+    assert resolve_bind(_settings(data_dir, configured=False), sensitive_types=SENSITIVE).loopback
+
+
+async def test_a_trashed_mail_document_still_counts(engine: AsyncEngine, data_dir: Path) -> None:
+    store = await _indexed(engine, "files", "letter", "message/rfc822")
+    await store.soft_delete_document(make_document("files", "letter").id)
+    assert mail_sources(data_dir) == ("files",)
+
+
+async def test_documents_that_are_not_mail_do_not_refuse(
+    engine: AsyncEngine, data_dir: Path
+) -> None:
+    await _indexed(engine, "files", "page", "text/markdown")
+    assert mail_sources(data_dir) == ()
+    assert resolve_bind(_settings(data_dir, configured=False), sensitive_types=SENSITIVE).loopback
+
+
+def test_doctor_reports_the_source_that_holds_mail() -> None:
+    from manicule.app.sensitive import SensitiveExposure  # noqa: PLC0415
+
+    exposure = SensitiveExposure(mail=("files",))
+    assert exposure
+    assert exposure.sources == ("files",)

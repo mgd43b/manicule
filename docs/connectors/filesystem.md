@@ -10,6 +10,13 @@ they belong because each is a trap the code has to keep avoiding.
 
 This page is the configuration.
 
+**Mail is sensitive wherever it is indexed.** This connector is not a sensitive type, because a
+directory can hold anything. An installation that holds a document of a mail media type
+(`.eml` as `message/rfc822`, `.msg` as `application/vnd.ms-outlook`) from this source, or any
+other, refuses to be served without authentication, and `exclude` is how a sample message in a
+corpus is kept out of that. Mbox files are not read here: use [`mbox.md`](mbox.md), which
+registers as sensitive from the first sync.
+
 ## 1. Configuration
 
 ```toml
