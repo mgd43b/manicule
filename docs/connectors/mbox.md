@@ -85,9 +85,9 @@ regular file is an mbox file when it begins with a `From ` line (§3) whose next
 field, `Name: value`. That test reads the first few hundred bytes and rejects:
 
 - **`.msf`** (Thunderbird's summary file, a cache of what the mbox says, and a text format that
-  starts with `// <!-- <mdb:mork`) and every other Thunderbird side file (`.dat`, `.json`,
-  `.sbd` directories are *descended into* as ordinary directories, since they are where
-  subfolders live). `.msf` is also skipped by name before it is opened, so an archive of
+  starts with `// <!-- <mdb:mork`) and every other Thunderbird side file (`.dat`, `.json`). The
+  `.sbd` directories are not files: they are *descended into* like any directory, since they are
+  where subfolders live. `.msf` is also skipped by name before it is opened, so an archive of
   ten thousand folders costs ten thousand `stat`s and not ten thousand `open`s of cache files.
 - **Anything that merely contains the word "From".** A text file starting `From the desk of…`
   has no header on its next line.
@@ -252,7 +252,8 @@ unchanged.
 
 **Title and provenance** are the `Subject` (the parser makes it the first heading element) and, in
 the provenance record (`PROVENANCE_KEY`), the title, the `Date` header as `created_at` when it is
-a valid timestamp, and the message's local path as the record's snapshot. A header that does not
+a valid timestamp (the sender's claim, which is the only date a message carries, and recorded as
+such), and the message's local path as the record's snapshot. A header that does not
 validate (a control character in a subject) leaves the message indexed and cited by its
 locator, as `gmail.md` §2 does. **Discovery carries no title, subject, address or `Message-ID`**:
 the journal holds `DiscoveredDoc`s, and everything that can name a person stays in the
@@ -394,7 +395,7 @@ and `ask` quotes it twice as if two sources agreed.
 
 **`skip_known_message_ids` (default `true`)** makes discovery skip a message whose `Message-ID`
 is already held by **another mail source**: another configured instance of type `gmail` or
-`mbox`, and not itself. **A message this source already holds is never skipped** (`find_document`
+`mbox`, enabled or not (its documents stay in the index either way), and not itself. **A message this source already holds is never skipped** (`find_document`
 by identity, asked only of the few messages whose `Message-ID` is known elsewhere), so turning the
 option on, or syncing Gmail later, never makes a document this source indexed disappear from a full
 walk (§5.4). Mail the other source holds is, for the purpose of this option, what that
@@ -431,7 +432,7 @@ live mailbox overlap by default and identically; a duplicate hit is noise in eve
 | **Deliberately different copies** (the archive has the message as received, with a `Received:` trail and the tracking footer; Gmail has the version after a list's rewriting) | One is skipped; **which one depends on which source synced first**, and the content that remains is that source's | Same: turn it off, and accept both |
 | **The decision is made once, at the walk** | A message skipped because Gmail held it stays unindexed if Gmail later deletes it, because a file that has not changed is not walked again | Any change to the source's options changes the fingerprint and forces the re-walk |
 | **Order of arrival** | An mbox source synced before the Gmail source indexes everything, and Gmail then indexes it too: only the later source can skip (§5.4 explains why reconciliation does not undo the earlier one) | Sync Gmail first, or delete the archive's documents that Gmail now holds |
-| **A skip is silent per message** | An archive reads as complete and is not | The run's aggregate count of skipped messages is logged and in the sync result (a number, never an id); `manicule connector list` is unchanged |
+| **A skip is silent per message** | An archive reads as complete and is not | The run logs an aggregate count of skipped messages (a number, never an id) |
 
 The decision to skip is made at discovery, from the stored documents as they are then; it is
 never revisited for a file whose `stat` has not changed. This is the one place `discover` and
@@ -564,8 +565,8 @@ $ readpst -e -t e -o /srv/archive/mail/outlook-2019 /path/to/archive.pst
 - `-r` writes the folders named as in the PST and, in each, the mail in a file called `mbox`, which
   the connector's sniff (§2) accepts. Without `-t e` it also writes the PST's calendar, contacts
   and journal items as files named `calendar`, `contacts` and `journal` beside it, and those are
-  written in a mail-compatible form the sniff would accept as well. `-t e` asks for mail only, and
-  is why the recipe passes it.
+  written in a form the manual page describes only as compatible with mbox clients, which the sniff
+  may well accept as mail. `-t e` asks for mail only, and is why the recipe passes it.
 - `-e` writes each message as its own `.eml` file. `-o` must name a directory that exists.
 - `-D` includes deleted items. Leave it off: the PST's deleted items are the mail its owner
   chose to throw away, the same reasoning as §3.4's flagged-deleted messages.
